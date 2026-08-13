@@ -1,0 +1,367 @@
+{
+  "schema_version": 1,
+  "endpoint": {
+    "base_url": "http://127.0.0.1:8188",
+    "allowed_hosts": [
+      "127.0.0.1",
+      "localhost"
+    ],
+    "connect_timeout_seconds": 2,
+    "read_timeout_seconds": 30,
+    "websocket_path": "/ws"
+  },
+  "launch": {
+    "enabled_by_default": false,
+    "working_directory": "C:\\path\\to\\ComfyUI_windows_portable",
+    "command": [
+      "C:\\path\\to\\ComfyUI_windows_portable\\python_embeded\\python.exe",
+      "-s",
+      "C:\\path\\to\\ComfyUI_windows_portable\\ComfyUI\\main.py",
+      "--windows-standalone-build",
+      "--listen",
+      "127.0.0.1",
+      "--port",
+      "8188"
+    ],
+    "startup_timeout_seconds": 120,
+    "auto_update": false
+  },
+  "probe": {
+    "health_path": "/system_stats",
+    "feature_path": "/features",
+    "node_info_path_template": "/object_info/{node_class}",
+    "models_path_template": "/models/{folder}",
+    "case_insensitive_model_match": true,
+    "generation_smoke_test_enabled": false,
+    "required_nodes": {
+      "local_base": [
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
+        "MiniMaxH3ImageToVideo",
+        "RandomNoise",
+        "BasicGuider",
+        "KSamplerSelect",
+        "BasicScheduler",
+        "SamplerCustomAdvanced",
+        "VAEDecode",
+        "VAEDecodeAudio",
+        "LoadImage",
+        "CreateVideo",
+        "SaveVideo"
+      ],
+      "local_reference": [
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
+        "MiniMaxH3ReferenceToVideo",
+        "RandomNoise",
+        "BasicGuider",
+        "KSamplerSelect",
+        "BasicScheduler",
+        "SamplerCustomAdvanced",
+        "VAEDecode",
+        "VAEDecodeAudio",
+        "LoadImage",
+        "LoadVideo",
+        "GetVideoComponents",
+        "LoadAudio",
+        "CreateVideo",
+        "SaveVideo"
+      ],
+      "local_reference_t8_dual_clock": [
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
+        "LoraLoaderBypassModelOnly",
+        "MiniMaxH3AudioConditioningT8",
+        "MiniMaxH3DualClockSamplerT8",
+        "MiniMaxH3AVDecodeT8",
+        "RandomNoise",
+        "BasicGuider",
+        "KSamplerSelect",
+        "SamplerCustomAdvanced",
+        "LoadImage",
+        "LoadVideo",
+        "GetVideoComponents",
+        "LoadAudio",
+        "CreateVideo",
+        "SaveVideo"
+      ],
+      "local_reference_turbo_lora": [
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader",
+        "LoraLoaderModelOnly",
+        "MiniMaxH3ReferenceToVideo",
+        "RandomNoise",
+        "BasicGuider",
+        "KSamplerSelect",
+        "BasicScheduler",
+        "SamplerCustomAdvanced",
+        "VAEDecode",
+        "VAEDecodeAudio",
+        "LoadImage",
+        "LoadVideo",
+        "GetVideoComponents",
+        "LoadAudio",
+        "CreateVideo",
+        "SaveVideo"
+      ],
+      "partner_text": [
+        "MinimaxHailuo03TextToVideoNode",
+        "SaveVideo"
+      ],
+      "partner_first_last_frame": [
+        "MinimaxHailuo03FirstLastFrameNode",
+        "SaveVideo"
+      ],
+      "partner_reference": [
+        "MinimaxHailuo03ReferenceNode",
+        "SaveVideo"
+      ]
+    }
+  },
+  "profiles": {
+    "local_h3_t2va_official": {
+      "backend": "comfy_local_h3",
+      "modes": [
+        "t2va"
+      ],
+      "models": {
+        "diffusion_models": [
+          "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+        ],
+        "text_encoders": [
+          "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        ],
+        "vae": [
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors"
+        ]
+      },
+      "admin_smoke_test_required": true
+    },
+    "local_h3_i2v_official": {
+      "backend": "comfy_local_h3",
+      "modes": [
+        "t2va",
+        "i2va",
+        "fl2va",
+        "l2va"
+      ],
+      "models": {
+        "diffusion_models": [
+          "minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+        ],
+        "text_encoders": [
+          "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        ],
+        "vae": [
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors"
+        ]
+      },
+      "admin_smoke_test_required": true
+    },
+    "local_h3_ref2va_official": {
+      "backend": "comfy_local_h3",
+      "modes": [
+        "ref2va"
+      ],
+      "models": {
+        "diffusion_models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        ],
+        "text_encoders": [
+          "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        ],
+        "vae": [
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors"
+        ]
+      },
+      "fixed_loader_nodes": [
+        "UNETLoader",
+        "CLIPLoader",
+        "VAELoader:video",
+        "VAELoader:audio"
+      ],
+      "dynamic_reference_nodes": {
+        "image": "LoadImage",
+        "video": "LoadVideo -> GetVideoComponents",
+        "audio": "LoadAudio",
+        "create_only_when_connected": true
+      },
+      "reference_image_size_default": "match",
+      "admin_smoke_test_required": true
+    },
+    "local_h3_ref2va_t8_dual_clock_4step": {
+      "backend": "comfy_local_h3",
+      "modes": [
+        "ref2va"
+      ],
+      "source_workflow": "video_minimax_h3_r2v_t8_dual_clock_4step.json",
+      "maturity": "experimental",
+      "models": {
+        "diffusion_models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        ],
+        "text_encoders": [
+          "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        ],
+        "vae": [
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors"
+        ],
+        "loras": [
+          "MiniMax-H3-Turbo-Lora-Pruned-ComfyUI\\minimax_h3_turbo_4step_ckpt600_ema_V4.safetensors"
+        ]
+      },
+      "parameters": {
+        "steps": {
+          "default": 4,
+          "minimum": 1,
+          "maximum": 20
+        },
+        "lora_strength": {
+          "default": 1.0,
+          "minimum": 0.0,
+          "maximum": 2.2,
+          "step": 0.05
+        },
+        "video_shift": 12,
+        "audio_shift": 3
+      },
+      "capability_preflight_required": true,
+      "gpu_e2e_verified": false,
+      "admin_smoke_test_required": true
+    },
+    "local_h3_ref2va_turbo_lora": {
+      "backend": "comfy_local_h3",
+      "modes": [
+        "ref2va"
+      ],
+      "source_workflow": "video_minimax_h3_r2v_turbo_lora.json",
+      "maturity": "experimental",
+      "models": {
+        "diffusion_models": [
+          "minimax_h3_ref2va_pruned_int8_convrot.safetensors"
+        ],
+        "text_encoders": [
+          "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"
+        ],
+        "vae": [
+          "minimax_h3_video_vae_fp16.safetensors",
+          "minimax_h3_audio_vae_fp32.safetensors"
+        ],
+        "loras": [
+          "MiniMax-H3-Turbo-Lora-Pruned-ComfyUI\\minimax_h3_turbo_4step_ckpt600_ema_V4.safetensors"
+        ]
+      },
+      "parameters": {
+        "steps": {
+          "default": 10,
+          "minimum": 1,
+          "maximum": 20
+        },
+        "lora_strength": {
+          "default": 1.0,
+          "minimum": 0.0,
+          "maximum": 2.2,
+          "step": 0.05
+        }
+      },
+      "capability_preflight_required": true,
+      "gpu_e2e_verified": false,
+      "admin_smoke_test_required": true
+    },
+    "partner_h3": {
+      "backend": "comfy_partner_h3",
+      "modes": [
+        "t2va",
+        "fl2va",
+        "ref2va"
+      ],
+      "requires_comfy_org_api_key": true,
+      "requires_explicit_user_opt_in": true,
+      "allow_silent_fallback": false
+    }
+  },
+  "generation": {
+    "fps": 24,
+    "audio_sample_rate_hz": 32000,
+    "audio_channels": 2,
+    "duration_seconds": {
+      "minimum": 5,
+      "maximum": 15
+    },
+    "frame_alignment": {
+      "modulus": 17,
+      "remainder": 5,
+      "formula": "n=max(5,round(seconds*24)); n=n+(5-(n%17)+17)%17"
+    },
+    "resolution_multiple": 32,
+    "default_resolution": {
+      "width": 416,
+      "height": 256,
+      "purpose": "admin_smoke_test_only"
+    },
+    "production_target_resolution": {
+      "width": 1344,
+      "height": 768,
+      "requires_admin_benchmark": true
+    },
+    "sampling": {
+      "sampler": "res_multistep",
+      "scheduler": "simple",
+      "steps": 20,
+      "denoise": 1.0
+    }
+  },
+  "reference_limits": {
+    "images": 9,
+    "videos": 3,
+    "paired_video_audios": 3,
+    "standalone_audios": 3,
+    "video_duration_seconds": {
+      "minimum": 2,
+      "maximum": 15
+    },
+    "audio_duration_seconds": {
+      "minimum": 2,
+      "maximum": 15
+    },
+    "audio_only_reference_supported": true
+  },
+  "execution_policy": {
+    "max_concurrent_local_h3_jobs": 1,
+    "max_pending_local_h3_jobs": 20,
+    "poll_interval_seconds": 2,
+    "generation_timeout_seconds": 21600,
+    "idempotent_prompt_id": true,
+    "automatic_interrupt": false,
+    "automatic_free_memory": false
+  },
+  "api_paths": {
+    "upload_input": {
+      "path": "/upload/image",
+      "multipart_field": "image",
+      "supports": ["image", "video", "audio"]
+    },
+    "queue_prompt": "/prompt",
+    "queue": "/queue",
+    "history_template": "/history/{prompt_id}",
+    "view": "/view",
+    "interrupt": "/interrupt"
+  },
+  "security": {
+    "browser_direct_access": false,
+    "enable_wildcard_cors": false,
+    "allow_non_loopback_comfyui": false,
+    "store_api_key_in_workflow": false,
+    "log_raw_prompts": false,
+    "sanitize_filename_prefix": true,
+    "validate_output_ownership": true
+  }
+}

@@ -1,0 +1,14 @@
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import App from './App.vue'
+import router from './router'
+import './styles.css'
+import './series.css'
+import './storyboard.css'
+import './workflow-settings.css'
+import './workflow-export.css'
+import './script-workbench.css'
+import './production-manual.css'
+import './responsive.css'
+
+createApp(App).use(createPinia()).use(router).mount('#app')

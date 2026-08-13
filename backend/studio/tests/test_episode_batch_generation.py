@@ -1,0 +1,427 @@
+from pathlib import Path
+import tempfile
+
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.test import TestCase, override_settings
+from rest_framework.test import APIClient
+
+from studio.models import (
+    Asset,
+    GeneratedWorkflow,
+    GenerationTask,
+    PromptArtifact,
+    Shot,
+)
+from studio.tests.factories import build_story
+
+
+class WholeEpisodeGenerationTests(TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        root = Path(self.temp.name)
+        self.settings = override_settings(
+            MEDIA_ROOT=root / "media",
+            ASSET_LIBRARY_ROOT=root / "library",
+            H3_PROMPT_LANGUAGE_GATE="warn",
+        )
+        self.settings.enable()
+        self.addCleanup(self.settings.disable)
+        (root / "media").mkdir()
+        (root / "library").mkdir()
+        call_command("seed_data", verbosity=0)
+        (
+            self.user,
+            self.project,
+            self.character,
+            self.scene,
+            self.episode,
+            self.shot1,
+            self.shot2,
+        ) = build_story("episode-batch")
+        self.shot1.duration_ms = 5000
+        self.shot1.h3_mode = Shot.H3Mode.T2VA
+        self.shot1.save(update_fields=("duration_ms", "h3_mode", "updated_at"))
+        self.shot2.duration_ms = 5000
+        self.shot2.h3_mode = Shot.H3Mode.FL2VA
+        self.shot2.save(update_fields=("duration_ms", "h3_mode", "updated_at"))
+        self.first_frame = Asset.objects.create(
+            owner=self.user,
+            style=self.project.style,
+            kind=Asset.Kind.REFERENCE,
+            name="第二镜首帧",
+            file=SimpleUploadedFile("shot-two-first.png", b"local-image-fixture"),
+            mime_type="image/png",
+            checksum="shot-two-first",
+        )
+        self.shot2.reference_assets.add(self.first_frame)
+        self.shot2.reference_bindings = {
+            "first_frame_asset_id": str(self.first_frame.id),
+        }
+        self.shot2.save(update_fields=("reference_bindings", "updated_at"))
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def payload(self, key="episode-batch-key", **overrides):
+        return {
+            "episode_ids": [str(self.episode.id)],
+            "whole_episode": True,
+            # The server must still split per shot when an older caller sends
+            # the historical default value.
+            "multi_shot": True,
+            "enqueue": True,
+            "idempotency_key": key,
+            **overrides,
+        }
+
+    def test_whole_episode_creates_one_traceable_task_per_ordered_shot(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload(),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["counts"], {"prompts": 2, "workflows": 2, "tasks": 2})
+        self.assertFalse(response.data["idempotent_replay"])
+        self.assertEqual(response.data["batch_kind"], "episode")
+        self.assertEqual(response.data["episode_number"], self.episode.number)
+        self.assertEqual(response.data["episode_title"], self.episode.title)
+
+        units = response.data["production_units"]
+        self.assertEqual([item["batch_index"] for item in units], [1, 2])
+        self.assertEqual([item["batch_size"] for item in units], [2, 2])
+        self.assertEqual([item["shot_id"] for item in units], [str(self.shot1.id), str(self.shot2.id)])
+        self.assertEqual([item["shot_number"] for item in units], [1, 2])
+        self.assertEqual([item["shot_order"] for item in units], [1, 2])
+        self.assertEqual([item["shot_title"] for item in units], [self.shot1.title, self.shot2.title])
+        self.assertEqual([item["h3_mode"] for item in units], ["T2VA", "FL2VA"])
+        self.assertEqual(
+            [item["template_slug"] for item in units],
+            ["minimax-h3-base-video", "minimax-h3-first-last-video"],
+        )
+
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        self.assertEqual(len(tasks), 2)
+        self.assertEqual(
+            [task.generated_workflow.prompt_artifact.shot_id for task in tasks],
+            [self.shot1.id, self.shot2.id],
+        )
+        self.assertEqual(
+            tasks[1].capability_snapshot["reference_assets"][0]["id"],
+            str(self.first_frame.id),
+        )
+        self.assertEqual({task.capability_snapshot["batch_id"] for task in tasks}, {response.data["batch_id"]})
+
+        serialized = response.data["tasks"]
+        self.assertEqual([item["episode_number"] for item in serialized], [1, 1])
+        self.assertEqual([item["episode_title"] for item in serialized], [self.episode.title] * 2)
+        self.assertEqual([item["shot_order"] for item in serialized], [1, 2])
+        self.assertEqual([item["shot_ids"] for item in serialized], [
+            [str(self.shot1.id)], [str(self.shot2.id)],
+        ])
+
+        by_batch = self.client.get("/api/v1/tasks/", {"batch_id": response.data["batch_id"]})
+        self.assertEqual(by_batch.status_code, 200, by_batch.data)
+        batch_results = by_batch.data.get("results", by_batch.data)
+        self.assertEqual(len(batch_results), 2)
+        self.assertEqual([item["batch_index"] for item in batch_results], [1, 2])
+        by_shot = self.client.get("/api/v1/tasks/", {"shot_id": str(self.shot2.id)})
+        self.assertEqual(by_shot.status_code, 200, by_shot.data)
+        shot_results = by_shot.data.get("results", by_shot.data)
+        self.assertEqual([item["shot_id"] for item in shot_results], [str(self.shot2.id)])
+
+    def test_whole_episode_reuses_each_latest_unchanged_shot_preview(self):
+        preview_ids = []
+        for shot in (self.shot1, self.shot2):
+            preview = self.client.post("/api/v1/prompts/generate/", {
+                "project_id": str(self.project.id),
+                "episode_id": str(self.episode.id),
+                "shot_ids": [str(shot.id)],
+                "prompt_type": "video",
+                "h3_mode": shot.h3_mode,
+                "multi_shot": False,
+                "include_audio": shot.include_audio,
+                "shot_durations": [{
+                    "shot_id": str(shot.id),
+                    "duration_ms": shot.duration_ms,
+                }],
+                "overall_soundscape": shot.sound_effects,
+                "non_diegetic_music": shot.music,
+            }, format="json")
+            self.assertEqual(preview.status_code, 201, preview.data)
+            preview_ids.append(preview.data[0]["id"])
+        baseline_prompts = PromptArtifact.objects.count()
+
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("reuse-shot-previews"),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["prompt_artifact_ids"], preview_ids)
+        self.assertTrue(all(
+            unit["prompt_artifact_reused"]
+            for unit in response.data["production_units"]
+        ))
+        self.assertEqual(PromptArtifact.objects.count(), baseline_prompts)
+
+    def test_whole_episode_ignores_script_breakdown_multi_shot_preference(self):
+        self.episode.prompt_settings = {
+            "multi_shot": True,
+            "include_audio": True,
+            "default_h3_mode": Shot.H3Mode.T2VA,
+            "breakdown_method": "deterministic-script-breakdown-v1",
+        }
+        self.episode.save(update_fields=("prompt_settings", "updated_at"))
+        self.shot2.h3_mode = Shot.H3Mode.T2VA
+        self.shot2.reference_bindings = {}
+        self.shot2.save(update_fields=("h3_mode", "reference_bindings", "updated_at"))
+        self.shot2.reference_assets.clear()
+
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("script-breakdown-whole-episode"),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["counts"], {"prompts": 2, "workflows": 2, "tasks": 2})
+        prompts = list(PromptArtifact.objects.order_by("created_at"))
+        self.assertEqual([prompt.shot_id for prompt in prompts], [self.shot1.id, self.shot2.id])
+        self.assertTrue(all(not prompt.is_multi_shot for prompt in prompts))
+        self.assertEqual(
+            [task.capability_snapshot["shot_ids"] for task in GenerationTask.objects.order_by(
+                "capability_snapshot__batch_index"
+            )],
+            [[str(self.shot1.id)], [str(self.shot2.id)]],
+        )
+
+    def test_normal_build_still_respects_episode_multi_shot_preference(self):
+        self.episode.prompt_settings = {
+            "multi_shot": True,
+            "include_audio": True,
+            "default_h3_mode": Shot.H3Mode.T2VA,
+            "breakdown_method": "deterministic-script-breakdown-v1",
+        }
+        self.episode.save(update_fields=("prompt_settings", "updated_at"))
+        self.shot2.h3_mode = Shot.H3Mode.T2VA
+        self.shot2.reference_bindings = {}
+        self.shot2.save(update_fields=("h3_mode", "reference_bindings", "updated_at"))
+        self.shot2.reference_assets.clear()
+
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            {
+                "episode_ids": [str(self.episode.id)],
+                "whole_episode": False,
+                "multi_shot": False,
+                "enqueue": False,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["counts"], {"prompts": 1, "workflows": 1, "tasks": 0})
+        prompt = PromptArtifact.objects.get()
+        self.assertTrue(prompt.is_multi_shot)
+        self.assertIsNone(prompt.shot_id)
+        self.assertEqual(
+            prompt.request_options["shot_ids"],
+            [str(self.shot1.id), str(self.shot2.id)],
+        )
+
+    def test_whole_episode_ref2va_children_inject_only_their_own_shot_prompt(self):
+        self.episode.synopsis = (
+            "第一镜（0:00-0:05）为“发现线索”，"
+            "第二镜（0:05-0:10）为“追击脱离”。"
+        )
+        self.episode.save(update_fields=("synopsis", "updated_at"))
+        for shot in (self.shot1, self.shot2):
+            shot.h3_mode = Shot.H3Mode.REF2VA
+            shot.reference_bindings = {}
+            shot.save(update_fields=("h3_mode", "reference_bindings", "updated_at"))
+            shot.reference_assets.clear()
+
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("scoped-ref2va-prompts"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+
+        tasks = list(
+            GenerationTask.objects.select_related(
+                "generated_workflow__prompt_artifact__shot",
+            ).order_by("capability_snapshot__batch_index")
+        )
+        self.assertEqual(len(tasks), 2)
+        for index, (task, own_shot, other_shot) in enumerate((
+            (tasks[0], self.shot1, self.shot2),
+            (tasks[1], self.shot2, self.shot1),
+        ), start=1):
+            workflow = task.generated_workflow
+            prompt = workflow.prompt_artifact
+            self.assertEqual(prompt.shot_id, own_shot.id)
+            self.assertFalse(prompt.is_multi_shot)
+            self.assertEqual(prompt.total_duration_ms, 5000)
+            self.assertEqual(prompt.structured_payload["shot_durations_ms"], [5000])
+            summary = prompt.structured_payload["fields"]["summary"]
+            self.assertTrue(summary.startswith("[reference generation]"), summary)
+            self.assertNotIn(own_shot.title, summary)
+            self.assertNotIn(other_shot.title, summary)
+            self.assertNotIn(self.episode.synopsis, prompt.prompt_text)
+            # A short title can legitimately occur in a continuity Bible
+            # field (for example a shot named "闪电" and scene lighting
+            # containing "窗外闪电").  The other shot's narrative is the
+            # unambiguous cross-shot leakage marker.
+            self.assertNotIn(other_shot.narrative, prompt.prompt_text)
+            detailed_lines = prompt.structured_payload["fields"]["detailed_description"]
+            # Ref2VA keeps one or two style/color sentences before [Shot 1]
+            # as required by the official prompt contract.  Scope isolation is
+            # therefore measured by shot entries, not by every prose line in
+            # the detailed_description section.
+            self.assertEqual(
+                len([line for line in detailed_lines if line.startswith("[Shot ")]),
+                1,
+            )
+            self.assertEqual(workflow.injected_values["PROMPT"], prompt.prompt_text)
+            self.assertEqual(workflow.injected_values["REQUESTED_DURATION_MS"], 5000)
+            self.assertEqual(task.capability_snapshot["shot_id"], str(own_shot.id))
+            self.assertEqual(task.capability_snapshot["batch_index"], index)
+
+    def test_same_idempotency_request_reuses_batch_and_changed_request_conflicts(self):
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        first = self.client.post(url, self.payload(), format="json")
+        self.assertEqual(first.status_code, 201, first.data)
+        replay = self.client.post(url, self.payload(), format="json")
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertTrue(replay.data["idempotent_replay"])
+        self.assertEqual(replay.data["batch_id"], first.data["batch_id"])
+        self.assertEqual(replay.data["task_ids"], first.data["task_ids"])
+        self.assertEqual(GenerationTask.objects.count(), 2)
+        self.assertEqual(PromptArtifact.objects.count(), 2)
+        self.assertEqual(GeneratedWorkflow.objects.count(), 2)
+
+        conflict = self.client.post(url, self.payload(priority=7), format="json")
+        self.assertEqual(conflict.status_code, 400, conflict.data)
+        self.assertIn("idempotency_key", str(conflict.data))
+        self.assertEqual(GenerationTask.objects.count(), 2)
+
+        self.shot1.continuity_notes = "新的连续性约束会改变提示词"
+        self.shot1.save(update_fields=("continuity_notes", "updated_at"))
+        stale_source = self.client.post(url, self.payload(), format="json")
+        self.assertEqual(stale_source.status_code, 400, stale_source.data)
+        self.assertIn("idempotency_key", str(stale_source.data))
+        self.assertEqual(GenerationTask.objects.count(), 2)
+
+    def test_retry_preserves_episode_shot_batch_identity_without_breaking_replay(self):
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        created = self.client.post(url, self.payload(), format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        source = GenerationTask.objects.get(pk=created.data["task_ids"][0])
+        source.status = GenerationTask.Status.FAILED
+        source.submission_state = GenerationTask.SubmissionState.TERMINAL_FAILED
+        source.error_message = "verified remote failure"
+        source.save(update_fields=("status", "submission_state", "error_message", "updated_at"))
+
+        retry = self.client.post(f"/api/v1/tasks/{source.id}/retry/", {}, format="json")
+        self.assertEqual(retry.status_code, 201, retry.data)
+        self.assertEqual(retry.data["retry_of"], str(source.id))
+        self.assertEqual(retry.data["batch_id"], created.data["batch_id"])
+        self.assertEqual(retry.data["batch_role"], "retry")
+        self.assertEqual(retry.data["shot_id"], str(self.shot1.id))
+        self.assertEqual(retry.data["shot_order"], 1)
+        self.assertEqual(retry.data["episode_number"], 1)
+
+        replay = self.client.post(url, self.payload(), format="json")
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(replay.data["task_ids"], created.data["task_ids"])
+        self.assertNotIn(str(retry.data["id"]), replay.data["task_ids"])
+
+    def test_legacy_task_without_batch_snapshot_still_exposes_episode_and_shot(self):
+        created = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("legacy-display-key"),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        legacy = GenerationTask.objects.get(pk=created.data["task_ids"][1])
+        legacy.capability_snapshot = {}
+        legacy.status = GenerationTask.Status.RUNNING
+        legacy.save(update_fields=("capability_snapshot", "status", "updated_at"))
+
+        response = self.client.get(f"/api/v1/tasks/{legacy.id}/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIsNone(response.data["batch_id"])
+        self.assertEqual(response.data["episode_id"], str(self.episode.id))
+        self.assertEqual(response.data["episode_number"], self.episode.number)
+        self.assertEqual(response.data["episode_title"], self.episode.title)
+        self.assertEqual(response.data["shot_ids"], [str(self.shot2.id)])
+        self.assertEqual(response.data["shot_id"], str(self.shot2.id))
+        self.assertEqual(response.data["shot_number"], self.shot2.number)
+        self.assertEqual(response.data["shot_order"], self.shot2.number)
+        self.assertEqual(response.data["shot_title"], self.shot2.title)
+        filtered = self.client.get("/api/v1/tasks/", {"shot_id": str(self.shot2.id)})
+        self.assertEqual(filtered.status_code, 200, filtered.data)
+        filtered_results = filtered.data.get("results", filtered.data)
+        self.assertIn(str(legacy.id), [item["id"] for item in filtered_results])
+
+    @override_settings(TASK_MAX_PENDING=1, TASK_MAX_ACTIVE_PER_USER=1)
+    def test_capacity_preflight_is_all_or_none_for_episode_batch(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("capacity-key"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(GenerationTask.objects.count(), 0)
+        self.assertEqual(GeneratedWorkflow.objects.count(), 0)
+        self.assertEqual(PromptArtifact.objects.count(), 0)
+
+    def test_creation_error_rolls_back_all_preceding_children(self):
+        # Bypass API validation to simulate an invalid legacy row appearing
+        # after the first valid child in episode order.
+        Shot.objects.filter(pk=self.shot2.pk).update(duration_ms=4000)
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("atomic-error-key"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(GenerationTask.objects.count(), 0)
+        self.assertEqual(GeneratedWorkflow.objects.count(), 0)
+        self.assertEqual(PromptArtifact.objects.count(), 0)
+
+    def test_whole_episode_contract_requires_one_episode_and_idempotency_key(self):
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        missing_key = self.client.post(url, {
+            "episode_ids": [str(self.episode.id)],
+            "whole_episode": True,
+            "enqueue": True,
+        }, format="json")
+        self.assertEqual(missing_key.status_code, 400, missing_key.data)
+        self.assertIn("idempotency_key", str(missing_key.data))
+
+        selected_shot = self.client.post(url, self.payload(
+            "selected-shot-key", shot_ids=[str(self.shot1.id)],
+        ), format="json")
+        self.assertEqual(selected_shot.status_code, 400, selected_shot.data)
+        self.assertIn("shot_ids", str(selected_shot.data))
+
+    def test_workflow_generate_rejects_non_object_overrides_without_server_error(self):
+        created = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("workflow-overrides-key"),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        unit = created.data["production_units"][0]
+        response = self.client.post("/api/v1/workflows/generate/", {
+            "prompt_artifact_id": unit["prompt_artifact_id"],
+            "template_id": unit["template_id"],
+            "overrides": ["not", "an", "object"],
+        }, format="json")
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("overrides", str(response.data))

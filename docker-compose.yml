@@ -1,0 +1,236 @@
+x-backend-environment: &backend-environment
+  AUTOPROMPT_DEPLOYMENT_PROFILE: "production"
+  DATABASE_URL: "postgresql://${POSTGRES_USER:-autoprompt}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-autoprompt}"
+  DJANGO_SECRET_KEY: "${DJANGO_SECRET_KEY:?set a unique 50+ character DJANGO_SECRET_KEY in .env}"
+  DJANGO_DEBUG: "false"
+  DJANGO_ALLOWED_HOSTS: "${DJANGO_ALLOWED_HOSTS:?set the public hostname and backend in .env}"
+  CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:?set the exact HTTPS frontend origin in .env}"
+  CSRF_TRUSTED_ORIGINS: "${CSRF_TRUSTED_ORIGINS:?set the exact HTTPS frontend origin in .env}"
+  SECURE_SSL_REDIRECT: "true"
+  SESSION_COOKIE_SECURE: "true"
+  CSRF_COOKIE_SECURE: "true"
+  SECURE_HSTS_SECONDS: "${SECURE_HSTS_SECONDS:-31536000}"
+  SECURE_HSTS_INCLUDE_SUBDOMAINS: "${SECURE_HSTS_INCLUDE_SUBDOMAINS:-false}"
+  SECURE_HSTS_PRELOAD: "${SECURE_HSTS_PRELOAD:-false}"
+  ALLOW_PUBLIC_REGISTRATION: "${ALLOW_PUBLIC_REGISTRATION:-false}"
+  SERVE_ASSETS_WITH_DJANGO: "false"
+  THROTTLE_ANON_RATE: "${THROTTLE_ANON_RATE:-60/minute}"
+  THROTTLE_USER_RATE: "${THROTTLE_USER_RATE:-600/minute}"
+  THROTTLE_REGISTRATION_RATE: "${THROTTLE_REGISTRATION_RATE:-5/hour}"
+  THROTTLE_ASSET_UPLOAD_RATE: "${THROTTLE_ASSET_UPLOAD_RATE:-30/hour}"
+  DRF_NUM_PROXIES: "${DRF_NUM_PROXIES:-2}"
+  ASSET_UPLOAD_MAX_BYTES: "${ASSET_UPLOAD_MAX_BYTES:-10485760}"
+  ASSET_VIDEO_MAX_BYTES: "${ASSET_VIDEO_MAX_BYTES:-262144000}"
+  ASSET_AUDIO_MAX_BYTES: "${ASSET_AUDIO_MAX_BYTES:-52428800}"
+  ASSET_TENANT_QUOTA_BYTES: "${ASSET_TENANT_QUOTA_BYTES:-2147483648}"
+  ASSET_IMAGE_MAX_WIDTH: "${ASSET_IMAGE_MAX_WIDTH:-8192}"
+  ASSET_IMAGE_MAX_HEIGHT: "${ASSET_IMAGE_MAX_HEIGHT:-8192}"
+  ASSET_IMAGE_MAX_PIXELS: "${ASSET_IMAGE_MAX_PIXELS:-40000000}"
+  MEDIA_SIGNED_URL_MAX_AGE_SECONDS: "${MEDIA_SIGNED_URL_MAX_AGE_SECONDS:-900}"
+  COMFYUI_BASE_URL: "${COMFYUI_BASE_URL:-http://host.docker.internal:8188}"
+  COMFYUI_CLIENT_ID: "${COMFYUI_CLIENT_ID:-autoprompt-studio}"
+  COMFYUI_TIMEOUT_SECONDS: "${COMFYUI_TIMEOUT_SECONDS:-30}"
+  COMFYUI_ALLOW_NON_LOOPBACK: "${COMFYUI_ALLOW_NON_LOOPBACK:-true}"
+  COMFYUI_EXTRA_ALLOWED_NODE_TYPES: "${COMFYUI_EXTRA_ALLOWED_NODE_TYPES:-}"
+  COMFYUI_OUTPUT_DIR: "/comfyui-output"
+  MINIMAX_H3_MODEL: "${MINIMAX_H3_MODEL:-minimax-h3}"
+  H3_PROMPT_OPTIMIZER_ENABLED: "${H3_PROMPT_OPTIMIZER_ENABLED:-false}"
+  H3_PROMPT_OPTIMIZER_BASE_URL: "${H3_PROMPT_OPTIMIZER_BASE_URL:-}"
+  H3_PROMPT_OPTIMIZER_API_KEY: "${H3_PROMPT_OPTIMIZER_API_KEY:-}"
+  H3_PROMPT_OPTIMIZER_MODEL: "${H3_PROMPT_OPTIMIZER_MODEL:-MiniMax-M2.7}"
+  H3_PROMPT_OPTIMIZER_ALLOW_NON_LOOPBACK: "${H3_PROMPT_OPTIMIZER_ALLOW_NON_LOOPBACK:-false}"
+  H3_PROMPT_OPTIMIZER_TIMEOUT_SECONDS: "${H3_PROMPT_OPTIMIZER_TIMEOUT_SECONDS:-60}"
+  H3_PROMPT_OPTIMIZER_FAILURE_MODE: "${H3_PROMPT_OPTIMIZER_FAILURE_MODE:-warn}"
+  H3_PROMPT_LANGUAGE_GATE: "${H3_PROMPT_LANGUAGE_GATE:-block}"
+  TASK_WORKER_POLL_SECONDS: "${TASK_WORKER_POLL_SECONDS:-2}"
+  TASK_MAX_CONCURRENT: "1"
+  TASK_MAX_PENDING: "${TASK_MAX_PENDING:-20}"
+  TASK_MAX_ACTIVE_PER_USER: "${TASK_MAX_ACTIVE_PER_USER:-5}"
+  TASK_GENERATION_TIMEOUT_SECONDS: "${TASK_GENERATION_TIMEOUT_SECONDS:-21600}"
+  TASK_REMOTE_POLL_SECONDS: "${TASK_REMOTE_POLL_SECONDS:-1}"
+  TASK_HEARTBEAT_SECONDS: "${TASK_HEARTBEAT_SECONDS:-5}"
+  TASK_HEALTH_CHECK_INTERVAL_SECONDS: "${TASK_HEALTH_CHECK_INTERVAL_SECONDS:-5}"
+  TASK_HEALTH_FAILURE_LIMIT: "${TASK_HEALTH_FAILURE_LIMIT:-3}"
+  TASK_REMOTE_MISSING_GRACE_SECONDS: "${TASK_REMOTE_MISSING_GRACE_SECONDS:-5}"
+  TASK_CANCEL_GRACE_SECONDS: "${TASK_CANCEL_GRACE_SECONDS:-30}"
+  TASK_STALL_THRESHOLD_SECONDS: "${TASK_STALL_THRESHOLD_SECONDS:-30}"
+  TASK_STALE_RECOVERY_INTERVAL_SECONDS: "${TASK_STALE_RECOVERY_INTERVAL_SECONDS:-5}"
+  WORKER_HEARTBEAT_INTERVAL_SECONDS: "${WORKER_HEARTBEAT_INTERVAL_SECONDS:-5}"
+  READINESS_WORKER_MAX_AGE_SECONDS: "${READINESS_WORKER_MAX_AGE_SECONDS:-30}"
+  READINESS_MIN_DISK_FREE_BYTES: "${READINESS_MIN_DISK_FREE_BYTES:-536870912}"
+  READINESS_COMFYUI_REQUIRED: "true"
+  READINESS_COMFYUI_TIMEOUT_SECONDS: "${READINESS_COMFYUI_TIMEOUT_SECONDS:-2}"
+  READINESS_GENERATION_WORKER_REQUIRED: "true"
+  READINESS_ASSEMBLY_WORKER_REQUIRED: "true"
+  FFMPEG_BINARY: "${FFMPEG_BINARY:-ffmpeg}"
+  FFPROBE_BINARY: "${FFPROBE_BINARY:-ffprobe}"
+  ASSEMBLY_TIMEOUT_SECONDS: "${ASSEMBLY_TIMEOUT_SECONDS:-7200}"
+  ASSEMBLY_WORKER_POLL_SECONDS: "${ASSEMBLY_WORKER_POLL_SECONDS:-1}"
+  ASSEMBLY_HEARTBEAT_SECONDS: "${ASSEMBLY_HEARTBEAT_SECONDS:-5}"
+  ASSEMBLY_STALE_MINUTES: "${ASSEMBLY_STALE_MINUTES:-30}"
+  ASSEMBLY_RECOVERY_INTERVAL_SECONDS: "${ASSEMBLY_RECOVERY_INTERVAL_SECONDS:-60}"
+  ASSEMBLY_AI_LABEL_ENABLED: "true"
+  ASSEMBLY_AI_LABEL_TEXT: "${ASSEMBLY_AI_LABEL_TEXT:-AI-generated · MiniMax H3}"
+  ASSEMBLY_AI_LABEL_FONTFILE: "${ASSEMBLY_AI_LABEL_FONTFILE:-}"
+  TASK_DISTRIBUTION_ENABLED: "true"
+  TASK_DISTRIBUTION_LABEL_TEXT: "${TASK_DISTRIBUTION_LABEL_TEXT:-AI-generated · MiniMax H3}"
+  TASK_IMAGE_DISTRIBUTION_LABEL_TEXT: "${TASK_IMAGE_DISTRIBUTION_LABEL_TEXT:-AI-generated · SDXL 1.0}"
+  TASK_DISTRIBUTION_FONTFILE: "${TASK_DISTRIBUTION_FONTFILE:-}"
+  TASK_DISTRIBUTION_VERSION: "${TASK_DISTRIBUTION_VERSION:-shot-public-v1}"
+  TASK_DISTRIBUTION_TIMEOUT_SECONDS: "${TASK_DISTRIBUTION_TIMEOUT_SECONDS:-100}"
+  TASK_DISTRIBUTION_LOCK_STALE_SECONDS: "${TASK_DISTRIBUTION_LOCK_STALE_SECONDS:-180}"
+x-app-security: &app-security
+  init: true
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 256
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=512m
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-autoprompt}"
+      POSTGRES_USER: "${POSTGRES_USER:-autoprompt}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set a unique URL-safe 20+ character POSTGRES_PASSWORD in .env}"
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    shm_size: 256m
+
+  backend:
+    <<: *app-security
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      <<: *backend-environment
+      AUTOPROMPT_BOOTSTRAP: "true"
+      # Keep the remote-provider credential in the API process only. Dedicated
+      # generation/assembly workers never call this synchronous prompt API.
+      DEEPSEEK_ENABLED: "${DEEPSEEK_ENABLED:-false}"
+      DEEPSEEK_BASE_URL: "${DEEPSEEK_BASE_URL:-https://api.deepseek.com}"
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      DEEPSEEK_MODEL: "${DEEPSEEK_MODEL:-deepseek-v4-flash}"
+      DEEPSEEK_TIMEOUT_SECONDS: "${DEEPSEEK_TIMEOUT_SECONDS:-180}"
+      DEEPSEEK_MAX_RETRIES: "${DEEPSEEK_MAX_RETRIES:-1}"
+      DEEPSEEK_MAX_TOKENS: "${DEEPSEEK_MAX_TOKENS:-4096}"
+      PROMPT_TRANSLATION_DEFAULT_PROVIDER: "${PROMPT_TRANSLATION_DEFAULT_PROVIDER:-local_qwen}"
+      PROMPT_CREATIVE_DEFAULT_PROVIDER: "${PROMPT_CREATIVE_DEFAULT_PROVIDER:-local_qwen}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./assets:/app/assets:ro
+      - "${COMFYUI_OUTPUT_HOST_DIR:?set COMFYUI_OUTPUT_HOST_DIR in .env}:/comfyui-output:ro"
+      - backend-media:/app/backend/media
+      - backend-static:/app/backend/staticfiles
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; request=urllib.request.Request('http://127.0.0.1:8000/api/v1/health/live/', headers={'Host':'backend','X-Forwarded-Proto':'https'}); urllib.request.urlopen(request, timeout=2)"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+      start_period: 20s
+
+  worker:
+    <<: *app-security
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 60s
+    command: ["python", "manage.py", "run_generation_worker"]
+    environment:
+      <<: *backend-environment
+      AUTOPROMPT_BOOTSTRAP: "false"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./assets:/app/assets:ro
+      - "${COMFYUI_OUTPUT_HOST_DIR:?set COMFYUI_OUTPUT_HOST_DIR in .env}:/comfyui-output:ro"
+      - backend-media:/app/backend/media
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  assembly-worker:
+    <<: *app-security
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    restart: unless-stopped
+    stop_grace_period: 60s
+    command: ["python", "manage.py", "run_assembly_worker"]
+    environment:
+      <<: *backend-environment
+      AUTOPROMPT_BOOTSTRAP: "false"
+    volumes:
+      - "${COMFYUI_OUTPUT_HOST_DIR:?set COMFYUI_OUTPUT_HOST_DIR in .env}:/comfyui-output:ro"
+      - backend-media:/app/backend/media
+    depends_on:
+      backend:
+        condition: service_healthy
+
+  readiness:
+    <<: *app-security
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    restart: unless-stopped
+    command: ["python", "-c", "import time; time.sleep(1000000000)"]
+    environment:
+      AUTOPROMPT_BOOTSTRAP: "false"
+    depends_on:
+      backend:
+        condition: service_healthy
+      worker:
+        condition: service_started
+      assembly-worker:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; request=urllib.request.Request('http://backend:8000/api/v1/health/ready/', headers={'Host':'backend','X-Forwarded-Proto':'https'}); urllib.request.urlopen(request, timeout=4)"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 15s
+
+  frontend:
+    <<: *app-security
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${FRONTEND_PORT:-8080}:8080"
+    volumes:
+      - ./assets:/srv/autoprompt-assets:ro
+      - backend-static:/srv/autoprompt-static:ro
+    depends_on:
+      readiness:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "2", "-O", "-", "http://127.0.0.1:8080/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  postgres-data:
+  backend-media:
+  backend-static:

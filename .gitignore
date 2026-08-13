@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+backend/.venv/
+backend/staticfiles/
+backend/media/
+backend/db.sqlite3
+backend/*.sqlite3-journal
+/db.sqlite3
+
+# Node / Vue
+node_modules/
+frontend/node_modules/
+frontend/dist/
+*.log
+frontend/.vite-qa*.log
+
+# Local secrets, downloaded model weights, and runtime state
+.env
+backend/.env
+frontend/.env.local
+*.pid
+.runtime/
+backups/
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -22,6 +22,7 @@ from studio.services.prompt_translation import (
     TranslationResult,
     TranslationValidationError,
     source_text_hash,
+    translate_text_once,
     translate_texts_once,
     translation_context_hash,
     validate_manual_translation,
@@ -116,6 +117,47 @@ class PromptTranslationProtectionTests(SimpleTestCase):
         self.assertEqual(run_runtime.call_count, 1)
         self.assertEqual(results[0].text, "A slow push-in ends on the blade.")
         self.assertIn("<d>[Chinese] 别动。</d>", results[1].text)
+
+    @patch("studio.services.prompt_translation._require_runtime")
+    @patch("studio.services.prompt_translation._run_runtime")
+    @patch("studio.services.prompt_translation._config")
+    def test_single_translation_deterministically_preserves_canonical_target(
+        self, config, run_runtime, require_runtime,
+    ):
+        config.return_value = {
+            "enabled": True, "model_id": "Qwen/Qwen3-4B-GGUF",
+            "model_dir": None, "runtime_script": None, "runtime_python": None,
+            "device": "cpu", "timeout_seconds": 300, "max_new_tokens": 768,
+        }
+        context = json.dumps({
+            "canonical_identity_mappings": {
+                "断刃": "prop:broken-blade",
+            },
+        }, ensure_ascii=False)
+
+        def response(request, _config):
+            self.assertNotIn("断刃", request["text"])
+            token = request["protected_tokens"][0]
+            self.assertEqual(request["text"].count(token), 1)
+            return {
+                "ok": True,
+                "model": "Qwen/Qwen3-4B-GGUF",
+                "elapsed_ms": 20,
+                "translation": f"The left hand always holds {token}.",
+            }
+
+        run_runtime.side_effect = response
+        result = translate_text_once(
+            "左手始终持有断刃。",
+            field_key="character.visual_identity",
+            label="人物视觉锚点",
+            context=context,
+        )
+
+        self.assertEqual(
+            result.text,
+            "The left hand always holds prop:broken-blade.",
+        )
 
 
 class PromptTranslationApiTests(TestCase):
@@ -623,6 +665,41 @@ class PromptTranslationApiTests(TestCase):
         self.assertEqual(entry.translated_text, "She draws her sword in front of the doorway.")
         self.assertEqual(entry.runtime_metadata["last_attempt_error"], "runtime stopped")
 
+    @patch("studio.views.translate_text_once")
+    def test_successful_retranslation_returns_current_canonical_candidate(self, translate):
+        source = "她左手始终握住断刃。"
+        canonical_target = "Broken Blade"
+        self.shot.narrative = source
+        self.shot.save(update_fields=("narrative", "updated_at"))
+        self.project.production_settings = {
+            **(self.project.production_settings or {}),
+            "translation_glossary": {"断刃": canonical_target},
+        }
+        self.project.save(update_fields=("production_settings", "updated_at"))
+        entry = self._translation_entry(
+            "shot.narrative", source, "She keeps hold of a broken blade.",
+            status=PromptFieldTranslation.Status.CONFIRMED,
+        )
+        translate.return_value = TranslationResult(
+            text=f"She keeps her left hand on the {canonical_target}.",
+            provider="local_qwen",
+            model="Qwen/Qwen3-4B-GGUF",
+            metadata={"elapsed_ms": 20},
+        )
+
+        response = self.client.post(
+            reverse("translation-retranslate", args=[entry.id]), {}, format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["status"], PromptFieldTranslation.Status.DRAFT_TRANSLATION)
+        self.assertEqual(response.data["revision"], entry.revision + 1)
+        self.assertTrue(response.data["context_current"])
+        self.assertIn(canonical_target, response.data["translated_text"])
+        self.assertEqual(response.data["error_message"], "")
+        entry.refresh_from_db()
+        self.assertEqual(entry.translated_text, response.data["translated_text"])
+
     def test_confirmation_rejects_stale_source(self):
         entry = PromptFieldTranslation.objects.create(
             project=self.project,
@@ -987,12 +1064,86 @@ class PromptTranslationApiTests(TestCase):
 
         self.assertEqual(response.status_code, 409, response.data)
         self.assertEqual(
-            response.data["error"]["details"]["code"], "context_changed",
+            response.data["error"]["details"]["code"], "canonical_target_missing",
+        )
+        self.assertEqual(
+            response.data["error"]["details"]["missing_mappings"],
+            [{"source_term": "玄纹剑", "canonical_target": "Xuanwen Sword"}],
         )
         self.shot.refresh_from_db()
         entry.refresh_from_db()
         self.assertEqual(self.shot.narrative, original)
         self.assertEqual(entry.revision, 1)
+
+    def test_character_visual_edit_requires_glossary_for_fallback_prop_identity(self):
+        prop = PropBible.objects.create(
+            project=self.project,
+            slug="broken-blade",
+            name="断刃",
+            visual_identity="锈迹斑斑的短柄断刃。",
+        )
+        original_visual = "左手常持一把短柄断刃，五官和断刃样式不得改变。"
+        self.character.visual_identity = original_visual
+        self.character.save(update_fields=("visual_identity", "updated_at"))
+        canonical_target = f"prop:{prop.slug}"
+        entry = PromptFieldTranslation.objects.create(
+            project=self.project,
+            scope_type=PromptFieldTranslation.ScopeType.CHARACTER,
+            scope_id=self.character.id,
+            field_key="character.visual_identity",
+            source_text=original_visual,
+            source_hash=source_text_hash(original_visual),
+            translated_text=f"He holds the short-handled {canonical_target} in his left hand.",
+            status=PromptFieldTranslation.Status.CONFIRMED,
+            runtime_metadata=self._context_metadata(
+                PromptFieldTranslation.ScopeType.CHARACTER,
+                self.character.id,
+                "character.visual_identity",
+            ),
+        )
+
+        rejected = self.client.post(
+            reverse("translation-confirm", args=[entry.id]),
+            {
+                "expected_revision": entry.revision,
+                "translation": "He holds a short-handled broken blade in his left hand.",
+            },
+            format="json",
+        )
+
+        self.assertEqual(rejected.status_code, 409, rejected.data)
+        details = rejected.data["error"]["details"]
+        self.assertEqual(details["code"], "canonical_target_missing")
+        self.assertEqual(
+            details["missing_mappings"],
+            [{"source_term": "断刃", "requires_glossary": True}],
+        )
+        self.assertNotIn("entry_id", details)
+        self.assertNotIn("field_key", details)
+        entry.refresh_from_db()
+        self.character.refresh_from_db()
+        self.assertEqual(entry.revision, 1)
+        self.assertEqual(self.character.visual_identity, original_visual)
+
+        accepted = self.client.post(
+            reverse("translation-confirm", args=[entry.id]),
+            {
+                "expected_revision": entry.revision,
+                "translation": (
+                    f"A young swordsman keeps the short-handled {canonical_target} "
+                    "in his left hand at all times."
+                ),
+            },
+            format="json",
+        )
+
+        self.assertEqual(accepted.status_code, 200, accepted.data)
+        entry.refresh_from_db()
+        self.character.refresh_from_db()
+        self.assertEqual(entry.status, PromptFieldTranslation.Status.CONFIRMED)
+        self.assertEqual(entry.revision, 2)
+        self.assertEqual(entry.revision_history[-1]["event"], "translation_confirmed")
+        self.assertEqual(self.character.visual_identity, original_visual)
 
     def test_confirm_hard_blocks_cross_entity_canonical_target_collision(self):
         prop = PropBible.objects.create(

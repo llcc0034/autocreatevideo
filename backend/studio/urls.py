@@ -5,6 +5,7 @@ from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
 from studio.capability_views import (
     CreativeDraftCapabilityView,
     H3PromptOptimizerCapabilityView,
+    ProductionCapabilityView,
     PromptTranslationCapabilityView,
 )
 from studio.creative_views import (
@@ -16,6 +17,11 @@ from studio.shot_detail_draft_views import (
     ProjectShotDetailDraftGenerateView,
     ProjectShotDetailDraftListView,
     ShotDetailDraftViewSet,
+)
+from studio.shot_detail_batch_views import (
+    ProjectShotDetailDraftBatchListCreateView,
+    ShotDetailDraftBatchApplyView,
+    ShotDetailDraftBatchDetailView,
 )
 from studio.health_views import ReadinessView
 from studio.asset_draft_views import ProjectAssetBibleDraftGenerateView
@@ -87,6 +93,11 @@ urlpatterns = [
         name="creative-draft-capability",
     ),
     path(
+        "capabilities/production/",
+        ProductionCapabilityView.as_view(),
+        name="production-capability",
+    ),
+    path(
         "projects/<uuid:project_id>/creative-drafts/generate/",
         ProjectCreativeDraftGenerateView.as_view(),
         name="project-creative-draft-generate",
@@ -105,6 +116,21 @@ urlpatterns = [
         "projects/<uuid:project_id>/shot-detail-drafts/",
         ProjectShotDetailDraftListView.as_view(),
         name="project-shot-detail-draft-list",
+    ),
+    path(
+        "projects/<uuid:project_id>/shot-detail-draft-batches/",
+        ProjectShotDetailDraftBatchListCreateView.as_view(),
+        name="project-shot-detail-draft-batch-list-create",
+    ),
+    path(
+        "shot-detail-draft-batches/<uuid:batch_id>/",
+        ShotDetailDraftBatchDetailView.as_view(),
+        name="shot-detail-draft-batch-detail",
+    ),
+    path(
+        "shot-detail-draft-batches/<uuid:batch_id>/apply/",
+        ShotDetailDraftBatchApplyView.as_view(),
+        name="shot-detail-draft-batch-apply",
     ),
     path(
         "projects/<uuid:project_id>/bible-drafts/from-assets/",

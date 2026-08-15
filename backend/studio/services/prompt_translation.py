@@ -351,6 +351,41 @@ def relevant_canonical_identity_mappings(
     }
 
 
+def missing_relevant_canonical_identity_mappings(
+    project: SeriesProject, source_text: str, translated_text: str,
+) -> list[dict[str, object]]:
+    """Describe required canonical identities removed by a manual edit.
+
+    Explicit glossary values are safe to show to the operator.  Stable
+    character/scene/prop identifiers remain an internal fallback; for those we
+    expose only the Chinese source term and require the operator to configure a
+    human-readable canonical English name through the glossary workflow.
+    """
+
+    candidate = str(translated_text or "")
+    production_settings = project.production_settings or {}
+    raw_glossary = (
+        production_settings.get("translation_glossary", {})
+        if isinstance(production_settings, dict) else {}
+    )
+    glossary = raw_glossary if isinstance(raw_glossary, dict) else {}
+    missing: list[dict[str, object]] = []
+    for source_term, canonical_target in sorted(
+        relevant_canonical_identity_mappings(project, source_text).items(),
+        key=lambda item: item[0],
+    ):
+        if canonical_target in candidate:
+            continue
+        configured_target = str(glossary.get(source_term) or "").strip()
+        item: dict[str, object] = {"source_term": source_term}
+        if configured_target and configured_target == canonical_target:
+            item["canonical_target"] = canonical_target
+        else:
+            item["requires_glossary"] = True
+        missing.append(item)
+    return missing
+
+
 def build_translation_context(
     project: SeriesProject, *, scope_type: str, scope_id, field_key: str,
     source_text: str | None = None,
@@ -773,15 +808,73 @@ def _protect_authored_blocks(text: str) -> tuple[str, dict[str, str]]:
     return _PROTECTED_BLOCK_RE.sub(replace, text), blocks
 
 
+def _canonical_mappings_from_context(context: str) -> dict[str, str]:
+    """Read the server-owned canonical map from one translation context.
+
+    The context is also sent to the model as reference prose, but small models
+    may paraphrase a required canonical target even after being told to copy it
+    verbatim.  Extracting only this allow-listed object lets the transport
+    protect each applicable source term as an exact token instead of relying
+    on prompt compliance.
+    """
+
+    try:
+        payload = json.loads(str(context or ""))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    raw = payload.get("canonical_identity_mappings") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        source: target
+        for source, target in raw.items()
+        if isinstance(source, str) and source
+        and isinstance(target, str) and target
+    }
+
+
+def _protect_translation_contract(
+    text: str, context: str,
+) -> tuple[str, dict[str, str]]:
+    """Protect authored literals and canonical identities in source order."""
+
+    protected, replacements = _protect_authored_blocks(text)
+    mappings = _canonical_mappings_from_context(context)
+    active_terms = sorted(
+        (source for source in mappings if source in protected),
+        key=len,
+        reverse=True,
+    )
+    if active_terms:
+        salt = source_text_hash(text)[:12].upper()
+        pattern = re.compile("|".join(re.escape(source) for source in active_terms))
+
+        def replace_canonical(match: re.Match) -> str:
+            token = (
+                f"__AUTOPROMPT_LITERAL_{salt}_"
+                f"{len(replacements) + 1:04d}__"
+            )
+            replacements[token] = mappings[match.group(0)]
+            return token
+
+        protected = pattern.sub(replace_canonical, protected)
+
+    # Authored blocks are protected before canonical terms, so rebuild the
+    # dictionary in actual source order for the existing order guard.
+    token_order = _PROTECTED_TOKEN_RE.findall(protected)
+    replacements = {token: replacements[token] for token in token_order}
+    return protected, replacements
+
+
 def _restore_authored_blocks(candidate: str, blocks: dict[str, str]) -> str:
     for token in blocks:
         if candidate.count(token) != 1:
             raise TranslationValidationError(
-                f"翻译结果修改、删除或复制了受保护原文块占位符 {token}"
+                f"翻译结果修改、删除或复制了受保护占位符 {token}"
             )
     unknown = set(_PROTECTED_TOKEN_RE.findall(candidate)) - set(blocks)
     if unknown:
-        raise TranslationValidationError("翻译结果新增了未知受保护原文块占位符")
+        raise TranslationValidationError("翻译结果新增了未知受保护占位符")
     if _PROTECTED_TOKEN_RE.findall(candidate) != list(blocks):
         raise TranslationValidationError("翻译结果改变了受保护原文块的顺序")
     restored = candidate
@@ -884,7 +977,7 @@ def translate_text_once(
     )
     config = _config()
 
-    protected_text, blocks = _protect_authored_blocks(source)
+    protected_text, blocks = _protect_translation_contract(source, context)
     request = {
         "request_id": source_text_hash(source)[:24],
         "text": protected_text,
@@ -962,7 +1055,7 @@ def translate_texts_once(
             prepared.append(None)
             continue
         request_id = f"{index:04d}-{source_text_hash(source)[:20]}"
-        protected, blocks = _protect_authored_blocks(source)
+        protected, blocks = _protect_translation_contract(source, contexts[index])
         blocks_by_id[request_id] = blocks
         sources_by_id[request_id] = source
         prepared.append({

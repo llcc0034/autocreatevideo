@@ -13,6 +13,49 @@ import { formatDialogueLines, parseDialogueText, type DialogueCharacterOption } 
 
 type Raw = Record<string, unknown>
 
+const rawRecord = (value: unknown): Raw => value && typeof value === 'object' ? value as Raw : {}
+
+/** Convert translation-review API conflicts into operator actions without exposing internal ids. */
+export const translationReviewRequestError = (cause: unknown, fallback: string): string => {
+  const response = rawRecord(rawRecord(cause).response)
+  const data = rawRecord(response.data)
+  const apiError = rawRecord(data.error)
+  const details = rawRecord(apiError.details)
+  const code = String(details.code || apiError.code || '')
+
+  if (code === 'canonical_target_missing') {
+    const rows = Array.isArray(details.missing_mappings)
+      ? details.missing_mappings.map(rawRecord)
+      : []
+    const glossaryTerms = rows
+      .filter((row) => String(row.requires_glossary || '').toLowerCase() === 'true')
+      .map((row) => String(row.source_term || '').trim())
+      .filter(Boolean)
+    const configuredMappings = rows
+      .map((row) => ({
+        source: String(row.source_term || '').trim(),
+        target: String(row.canonical_target || '').trim(),
+      }))
+      .filter((row) => row.source && row.target)
+    const messages: string[] = []
+    if (glossaryTerms.length) {
+      messages.push(`源文中的“${glossaryTerms.join('”“')}”尚未配置英文 canonical 名称。请先到“项目总览 → 全剧视觉规则”补全术语，然后重新翻译并确认。`)
+    }
+    if (configuredMappings.length) {
+      messages.push(`修改后的英文缺少必须逐字保留的 canonical 名称：${configuredMappings.map((row) => `${row.source} = ${row.target}`).join('；')}。请补回后再确认。`)
+    }
+    return messages.join(' ') || '修改后的英文缺少必须保留的 canonical 名称，请核对全剧视觉规则后重试。'
+  }
+  if (code === 'context_changed') return '中文源文或 canonical 术语上下文已变化，请先重新翻译生成候选，再核对并确认。'
+  if (code === 'source_changed') return '中文源文已变化，请刷新页面并重新翻译生成候选后再确认。'
+  if (code === 'revision_conflict') return '该译文已被其他操作更新，请刷新后基于最新修订继续编辑。'
+  if (code === 'canonical_target_collision') return 'canonical 英文名称存在冲突，请先到“项目总览 → 全剧视觉规则”修正后再确认。'
+
+  const message = cause instanceof Error ? cause.message.trim() : ''
+  if (message && !/\b(?:entry_id|field_key|scope_id)\s*:/i.test(message)) return message
+  return fallback
+}
+
 /** Prevents an older translations GET from overwriting a later mutation response. */
 export const createTranslationLoadGate = () => {
   let sequence = 0

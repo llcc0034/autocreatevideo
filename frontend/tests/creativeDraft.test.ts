@@ -3,19 +3,25 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
-  CREATIVE_DRAFT_ENGLISH_LIMITS,
   adaptCreativeDraft,
   adaptCreativeDraftApplyResult,
   creativeDraftDataPayload,
   creativeDraftEditorWarnings,
   creativeFailureRecovery,
+  creativeGenerationConfirmationContext,
   creativeDraftIsEditable,
   creativeDraftIsEmptyFailure,
   creativeDraftRequestError,
   creativeDraftReviewIssueAction,
   creativeDraftReviewIssueTitle,
+  creativeProviderFailureFallback,
+  creativeSafeFailureCode,
   creativeSafeFailureDiagnostic,
 } from '../src/services/creativeDraft.ts'
+import {
+  adaptPromptProviderCapability,
+  creativeShotCountDecision,
+} from '../src/services/providerCapabilities.ts'
 
 const rawDraft = {
   id: 'draft-1', project: 'project-1', episode: 'episode-1', status: 'draft', revision: 3,
@@ -69,7 +75,7 @@ test('episode copy is a read-only formal source, with optional empty English syn
   })
   assert.equal(withoutSynopsis.draftData.episode.synopsisEn, '')
   assert.equal(creativeDraftDataPayload(withoutSynopsis.draftData).episode.synopsis_en, '')
-  assert.deepEqual(creativeDraftEditorWarnings(withoutSynopsis.draftData), [])
+  assert.deepEqual(creativeDraftEditorWarnings(withoutSynopsis.draftData, { minShotDurationMs: 5000, maxShotDurationMs: 15000 }), [])
 
   withoutSynopsis.draftData.shots[0].narrativeEn = ''
   assert.ok(creativeDraftEditorWarnings(withoutSynopsis.draftData).some((message) => message.includes('缺少中英叙事结构')))
@@ -83,44 +89,45 @@ test('episode copy is a read-only formal source, with optional empty English syn
   assert.ok((workbench.match(/readonly aria-readonly="true"/g) || []).length >= 4)
 })
 
-test('editor warnings enforce the 5-15 second and structured-field quality contract', () => {
+test('editor warnings enforce the provider duration and structured-field quality contract', () => {
   const draft = adaptCreativeDraft(rawDraft)
-  assert.deepEqual(creativeDraftEditorWarnings(draft.draftData), [])
+  assert.deepEqual(creativeDraftEditorWarnings(draft.draftData, { minShotDurationMs: 5000, maxShotDurationMs: 15000 }), [])
   draft.draftData.shots[0].durationMs = 4000
   draft.draftData.shots[0].cameraEn = ''
-  const warnings = creativeDraftEditorWarnings(draft.draftData)
+  const warnings = creativeDraftEditorWarnings(draft.draftData, { minShotDurationMs: 5000, maxShotDurationMs: 15000 })
   assert.ok(warnings.some((message) => message.includes('5–15 秒')))
   assert.ok(warnings.some((message) => message.includes('单一运镜')))
 })
 
-test('creative English editors keep tighter Qwen generation budgets and explicit post-repair caps', () => {
-  assert.deepEqual(CREATIVE_DRAFT_ENGLISH_LIMITS, {
-    narrative: { generation: 1000, editor: 1000 },
-    action: { generation: 1000, editor: 1000 },
-  })
+test('creative English editors use capability recommendations without blocking longer edits', () => {
+  const reviewPolicy = adaptPromptProviderCapability({
+    id: 'deepseek_api', enabled: true, configured: true,
+    recommended_narrative_en_chars: 1200,
+    recommended_action_en_chars: 900,
+  }, 'deepseek_api')
+  assert.equal(reviewPolicy.recommendedNarrativeEnChars, 1200)
+  assert.equal(reviewPolicy.recommendedActionEnChars, 900)
 
   const draft = adaptCreativeDraft(rawDraft)
-  draft.draftData.shots[0].narrativeEn = 'n'.repeat(1000)
-  draft.draftData.shots[0].actionEn = 'a'.repeat(1000)
-  assert.ok(!creativeDraftEditorWarnings(draft.draftData).some((message) => message.includes('超过')))
+  draft.draftData.shots[0].narrativeEn = 'n'.repeat(1200)
+  draft.draftData.shots[0].actionEn = 'a'.repeat(900)
+  assert.ok(!creativeDraftEditorWarnings(draft.draftData, reviewPolicy).some((message) => message.includes('超过')))
 
   draft.draftData.shots[0].narrativeEn += 'n'
   draft.draftData.shots[0].actionEn += 'a'
-  const warnings = creativeDraftEditorWarnings(draft.draftData)
-  assert.ok(warnings.some((message) => message.includes('英文叙事结构超过 1000 字符')))
-  assert.ok(warnings.some((message) => message.includes('英文主动作超过 1000 字符')))
+  const warnings = creativeDraftEditorWarnings(draft.draftData, reviewPolicy)
+  assert.ok(warnings.some((message) => message.includes('英文叙事结构超过 1200 字符')))
+  assert.ok(warnings.some((message) => message.includes('英文主动作超过 900 字符')))
 
   const source = readFileSync(new URL('../src/components/CreativeDraftWorkbench.vue', import.meta.url), 'utf8')
-  assert.match(source, /v-model="shot\.narrativeEn"[^>]*:maxlength="CREATIVE_DRAFT_ENGLISH_LIMITS\.narrative\.editor"/)
-  assert.match(source, /v-model="shot\.actionEn"[^>]*:maxlength="CREATIVE_DRAFT_ENGLISH_LIMITS\.action\.editor"/)
-  assert.ok(source.includes('{{ shot.narrativeEn.length }}/{{ CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor }}'))
-  assert.ok(source.includes('{{ shot.actionEn.length }}/{{ CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor }}'))
-  assert.ok(source.includes('生成≤{{ CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.generation }}'))
-  assert.ok(source.includes('生成≤{{ CREATIVE_DRAFT_ENGLISH_LIMITS.action.generation }}'))
+  assert.ok(source.includes("selectedProviderCapability?.recommendedNarrativeEnChars ?? '—'"))
+  assert.ok(source.includes("selectedProviderCapability?.recommendedActionEnChars ?? '—'"))
+  assert.ok(source.includes('当前 {{ shot.narrativeEn.length }}'))
+  assert.ok(source.includes('当前 {{ shot.actionEn.length }}'))
   assert.ok(source.includes('!dirty||!editable" title="保存始终允许'))
   assert.ok(!source.includes('hasEnglishFieldOverflow'))
-  assert.equal(source.match(/:maxlength=/g)?.length, 2)
-  assert.doesNotMatch(source, /v-model="shot\.(?:narrativeZh|actionZh|cameraEn|continuityEn)"[^>]*maxlength/)
+  assert.doesNotMatch(source, /v-model="shot\.(?:narrativeEn|actionEn)"[^>]*maxlength/)
+  assert.ok(!source.includes('CREATIVE_DRAFT_ENGLISH_LIMITS'))
 })
 
 test('structured review issues are adapted, safely titled and targeted without backend prose', () => {
@@ -224,7 +231,7 @@ test('script action coverage is an advisory Chinese action-chain review target',
   assert.ok(source.includes('动作：{{ firstActionSentence(shot.actionZh) }}'))
   assert.ok(source.includes('当前没有可核实的逐动作总数，因此不显示推测性的 X/Y'))
   assert.ok(source.includes('多个快速动作可组成一条连续动作链'))
-  assert.ok(source.includes('2 镜最多可承载 30 秒'))
+  assert.ok(source.includes('系统会按所选通道当前配置的 {{ shotDurationGuide }} 分配每镜时长'))
   assert.ok(source.includes('动作密集时可提高每镜时长，或压缩单个动作节奏'))
 })
 
@@ -303,22 +310,126 @@ test('creative failure diagnostics expose only safe code and field path identifi
     error_code: 'creative_storyboard_validation_failed',
     validation_error: { code: 'field_too_long', path: 'shots[0].narrative_en', detail: 'secret model output' },
   }), { code: 'field_too_long', path: 'shots[0].narrative_en' })
+  assert.equal(creativeSafeFailureCode({
+    error_code: 'creative_storyboard_validation_failed',
+    validation_error: { code: 'field_too_long' },
+  }), 'creative_storyboard_validation_failed')
   assert.deepEqual(creativeSafeFailureDiagnostic({
     error_code: 'BAD CODE: raw parser detail', validation_path: 'Traceback: /tmp/key',
   }), { code: '', path: '' })
   assert.match(creativeFailureRecovery('creative_storyboard_validation_failed') || '', /字段长度校验/)
   assert.match(creativeFailureRecovery('deepseek_api_authentication_failed') || '', /鉴权失败/)
+  assert.equal(creativeSafeFailureCode({ error_code: 'BAD CODE: raw parser detail' }), '')
 })
 
 test('creative request errors distinguish timeout, busy, unavailable and safely redact runtime parser details', () => {
   const timeout = creativeDraftRequestError(
     { code: 'ECONNABORTED', message: 'timeout of 1020000ms exceeded' }, 'fallback',
+    'local_qwen',
+    { runtimeTimeoutSeconds: 1320, processTimeoutSeconds: 1380 },
   )
   assert.match(timeout, /不等于服务端已取消/)
   assert.match(timeout, /一键重试整稿/)
-  assert.match(timeout, /17 分钟/)
-  assert.match(timeout, /16 分钟硬上限/)
+  assert.match(timeout, /模型运行时限 1320 秒/)
+  assert.match(timeout, /服务进程时限 1380 秒/)
+  assert.doesNotMatch(timeout, /16 分钟|17 分钟/)
   assert.doesNotMatch(timeout, /1020000ms/)
+
+  const remoteTimeout = creativeDraftRequestError(
+    { code: 'ECONNABORTED', message: 'timeout of 1020000ms exceeded' },
+    'fallback',
+    'deepseek_api',
+  )
+  assert.match(remoteTimeout, /DeepSeek API/)
+  assert.doesNotMatch(remoteTimeout, /本地 Qwen|1020000ms/)
+
+  const capacity = creativeDraftRequestError({
+    response: {
+      status: 400,
+      data: {
+        error: {
+          code: 'invalid',
+          details: {
+            code: 'creative_dialogue_capacity_exceeded',
+            detail: 'raw script text must stay hidden',
+            required_dialogue_count: 13,
+            target_shot_count: 4,
+            dialogue_capacity: 8,
+          },
+        },
+      },
+    },
+  }, 'fallback', 'deepseek_api')
+  assert.match(capacity, /13 句/)
+  assert.match(capacity, /4 个镜头/)
+  assert.match(capacity, /8 句/)
+  assert.match(capacity, /可配置的创作提醒/)
+  assert.match(capacity, /确认后继续/)
+  assert.doesNotMatch(capacity, /拆分本集片段/)
+  assert.doesNotMatch(capacity, /每镜最多 2 句/)
+  assert.doesNotMatch(capacity, /本地 Qwen|raw script text/)
+
+  const extendedConfirmation = creativeDraftRequestError({
+    response: {
+      status: 400,
+      data: {
+        error: {
+          code: 'invalid',
+          details: {
+            code: 'creative_generation_confirmation_required',
+            detail: 'raw backend detail',
+            target_shot_count: 11,
+            recommended_max_shots: 4,
+            batch_shots: 24,
+          },
+        },
+      },
+    },
+  }, 'fallback', 'deepseek_api')
+  assert.match(extendedConfirmation, /DeepSeek API/)
+  assert.match(extendedConfirmation, /11 镜/)
+  assert.match(extendedConfirmation, /建议单次 4 镜/)
+  assert.match(extendedConfirmation, /单次批次能力参考为 24 镜/)
+  assert.match(extendedConfirmation, /按原镜数和完整剧本继续/)
+  assert.doesNotMatch(extendedConfirmation, /raw backend detail|本地 Qwen/)
+  assert.deepEqual(creativeGenerationConfirmationContext({
+    response: {
+      data: {
+        error: {
+          details: {
+            code: 'creative_generation_confirmation_required',
+            target_shot_count: 11,
+            recommended_max_shots: 4,
+            batch_shots: 24,
+            required_dialogue_count: 13,
+            dialogue_capacity: 8,
+            max_dialogue_per_shot: 2,
+            effective_max_dialogue_per_shot: 4,
+            detail: 'must stay hidden',
+          },
+        },
+      },
+    },
+  }), {
+    targetShotCount: 11,
+    recommendedMaxShots: 4,
+    batchShots: 24,
+    requiredDialogueCount: 13,
+    dialogueCapacity: 8,
+    maxDialoguePerShot: 2,
+    effectiveMaxDialoguePerShot: 4,
+  })
+  assert.equal(creativeGenerationConfirmationContext({
+    response: { data: { error: { details: {
+      code: 'creative_generation_confirmation_required', target_shot_count: 'not-public-integer',
+    } } } },
+  }), undefined)
+  assert.deepEqual(creativeGenerationConfirmationContext({
+    response: { data: { error: { details: {
+      code: 'creative_generation_confirmation_required',
+      targetShotCount: 13, recommendedMaxShots: 6, batchShots: 18,
+    } } } },
+  }), { targetShotCount: 13, recommendedMaxShots: 6, batchShots: 18 })
 
   const busy = creativeDraftRequestError({
     response: { status: 409, data: { error: { code: 'creative_resource_busy', details: { detail: 'busy' } } } },
@@ -336,7 +447,8 @@ test('creative request errors distinguish timeout, busy, unavailable and safely 
   }, 'fallback')
   assert.match(malformedOutput, /格式不完整/)
   assert.match(malformedOutput, /一键重试整稿/)
-  assert.match(malformedOutput, /1–2 镜/)
+  assert.match(malformedOutput, /减少本次镜数/)
+  assert.doesNotMatch(malformedOutput, /1–2 镜/)
   assert.match(malformedOutput, /缩短本次创作要求/)
   assert.match(malformedOutput, /正式分镜未修改/)
   assert.doesNotMatch(malformedOutput, /Invalid control character/)
@@ -348,6 +460,18 @@ test('creative request errors distinguish timeout, busy, unavailable and safely 
   assert.match(failed, /一键重试整稿/)
   assert.match(failed, /正式分镜未修改/)
   assert.doesNotMatch(failed, /strict JSON validation failed/)
+
+  const remoteFailed = creativeDraftRequestError({
+    response: { status: 502, data: { code: 'creative_runtime_failed', detail: 'remote internals' } },
+  }, 'fallback', 'deepseek_api')
+  assert.match(remoteFailed, /DeepSeek API 运行失败/)
+  assert.doesNotMatch(remoteFailed, /本地 Qwen|remote internals/)
+
+  assert.match(
+    creativeFailureRecovery('creative_storyboard_repair_validation_failed', true, 'deepseek_api') || '',
+    /DeepSeek 修复后的候选/,
+  )
+  assert.doesNotMatch(creativeProviderFailureFallback('deepseek_api'), /本地 Qwen/)
 
   const runtimeJson = creativeDraftRequestError({
     response: { status: 502, data: { code: 'creative_invalid_runtime_json', detail: 'JSONDecodeError: line 1 column 14' } },
@@ -377,7 +501,8 @@ test('creative request errors distinguish timeout, busy, unavailable and safely 
     response: { status: 502, data: { error: { code: 'creative_output_budget_exhausted' } } },
   }, 'fallback')
   assert.match(exhausted, /动态输出容量/)
-  assert.match(exhausted, /1–2 镜/)
+  assert.match(exhausted, /减少本次镜数/)
+  assert.doesNotMatch(exhausted, /1–2 镜/)
   assert.match(exhausted, /权威对白边界/)
   assert.match(exhausted, /不要按原设置重复提交/)
 
@@ -394,11 +519,14 @@ test('creative workbench hides the editor for zero-shot failures and keeps one-c
   assert.ok(source.includes('v-if="emptyFailedDraft"'))
   assert.ok(source.includes('0 镜”只是保留用于追踪的失败记录，不是可保存的空草稿'))
   assert.ok(source.includes('一键重试整稿'))
-  assert.ok(source.includes('creativeFailureRecovery(failedDraftErrorCode.value, activeDraft.value?.contextCurrent !== false)'))
+  assert.ok(source.includes('creativeFailureRecovery('))
+  assert.ok(source.includes('failedDraftProvider.value'))
+  assert.ok(source.includes('creativeSafeFailureCode(activeDraft.value?.runtimeMetadata)'))
   assert.ok(source.includes('creativeSafeFailureDiagnostic(activeDraft.value?.runtimeMetadata)'))
   assert.ok(source.includes('failedDraftDiagnostic.code'))
   assert.ok(source.includes('failedDraftDiagnostic.path'))
-  assert.ok(source.includes('本地 Qwen 未返回可审核的结构化镜头。请一键重试整稿；若持续失败，改为 1–2 镜或缩短本次创作要求。正式分镜未修改。'))
+  assert.ok(source.includes('creativeProviderFailureFallback(failedDraftProvider.value)'))
+  assert.ok(!source.includes('本地 Qwen 创作草稿生成失败，正式分镜未被修改。'))
   assert.ok(!source.includes('|| activeDraft.value?.errorMessage'))
   assert.ok(!source.includes('|| activeDraft.value?.validation.errors[0]'))
   assert.ok(source.includes('<template v-else>'))
@@ -408,22 +536,145 @@ test('creative workbench hides the editor for zero-shot failures and keeps one-c
   assert.ok(checkScript.includes("Assert-NativeSuccess 'Creative draft failure recovery tests'"))
 })
 
-test('creative generation and regeneration wait 17 minutes and expose the CPU 1-4 shot limit', () => {
+test('creative provider capabilities keep recommendations configurable and allow confirmed 11-shot requests', () => {
+  const deepseek = adaptPromptProviderCapability({
+    id: 'deepseek_api', enabled: true, configured: true,
+    min_shots: 1, default_shots: 4, recommended_max_shots: 4, batch_shots: 24,
+    max_dialogue_per_shot: 3, max_source_chars: 24000,
+    baseline_max_new_tokens: 4992, configured_max_new_tokens: 16384,
+    runtime_timeout_seconds: 1200, process_timeout_seconds: 1260,
+    min_shot_duration_ms: 6000, max_shot_duration_ms: 18000,
+    cuda_requested: true, gpu_ready: false, gpu_layers: 0,
+    runtime_probe_error_code: 'cuda_runtime_unavailable',
+  }, 'deepseek_api')
+  assert.equal(deepseek.minShots, 1)
+  assert.equal(deepseek.defaultShots, 4)
+  assert.equal(deepseek.recommendedMaxShots, 4)
+  assert.equal(deepseek.batchShots, 24)
+  assert.equal(deepseek.minShotDurationMs, 6000)
+  assert.equal(deepseek.maxShotDurationMs, 18000)
+  assert.equal(deepseek.maxDialoguePerShot, 3)
+  assert.equal(deepseek.maxSourceChars, 24000)
+  assert.equal(deepseek.baselineMaxNewTokens, 4992)
+  assert.equal(deepseek.configuredMaxNewTokens, 16384)
+  assert.equal(deepseek.runtimeTimeoutSeconds, 1200)
+  assert.equal(deepseek.processTimeoutSeconds, 1260)
+  assert.equal(deepseek.cudaRequested, true)
+  assert.equal(deepseek.gpuReady, false)
+  assert.equal(deepseek.gpuLayers, 0)
+  assert.equal(deepseek.runtimeProbeErrorCode, 'cuda_runtime_unavailable')
+
+  assert.deepEqual(creativeShotCountDecision(4, deepseek), {
+    valid: true, confirmationRequired: false, minimum: 1, recommendedMaximum: 4, batchReference: 24,
+  })
+  assert.deepEqual(creativeShotCountDecision(11, deepseek), {
+    valid: true, confirmationRequired: true, minimum: 1, recommendedMaximum: 4, batchReference: 24,
+  })
+  const aboveBatchReference = creativeShotCountDecision(25, deepseek)
+  assert.equal(aboveBatchReference.valid, true)
+  assert.equal(aboveBatchReference.confirmationRequired, true)
+  assert.equal(aboveBatchReference.reason, undefined)
+  const noInventedMaximum = creativeShotCountDecision(11, adaptPromptProviderCapability({
+    id: 'deepseek_api', enabled: true, configured: true,
+  }, 'deepseek_api'))
+  assert.equal(noInventedMaximum.valid, true)
+  assert.equal(noInventedMaximum.confirmationRequired, false)
+  const recommendationAboveBatch = adaptPromptProviderCapability({
+    id: 'deepseek_api', enabled: true, configured: true,
+    min_shots: 1, recommended_max_shots: 11, batch_shots: 4,
+  }, 'deepseek_api')
+  assert.equal(creativeShotCountDecision(5, recommendationAboveBatch).confirmationRequired, false)
+  assert.equal(creativeShotCountDecision(12, recommendationAboveBatch).confirmationRequired, true)
+
   const repositorySource = readFileSync(new URL('../src/services/creativeDraftRepository.ts', import.meta.url), 'utf8')
   const componentSource = readFileSync(new URL('../src/components/CreativeDraftWorkbench.vue', import.meta.url), 'utf8')
-  assert.ok(repositorySource.includes('const CREATIVE_GENERATION_TIMEOUT_MS = 1_020_000'))
-  assert.equal(repositorySource.match(/timeout: CREATIVE_GENERATION_TIMEOUT_MS/g)?.length, 2)
-  assert.ok(repositorySource.includes('maxShots: Number(raw.max_shots || 4)'))
-  assert.ok(repositorySource.includes("device: 'cpu', minShots: 1, maxShots: 4"))
-  assert.ok(repositorySource.includes('baselineMaxNewTokens: Number(raw.baseline_max_new_tokens || 0)'))
-  assert.ok(repositorySource.includes('configuredMaxNewTokens: Number(raw.configured_max_new_tokens || raw.max_new_tokens || 0)'))
-  assert.ok(repositorySource.includes('baselineMaxNewTokens: 2304'))
-  assert.ok(repositorySource.includes('configuredMaxNewTokens: 3072'))
+  assert.equal(repositorySource.match(/timeout: 0/g)?.length, 2)
+  assert.ok(!repositorySource.includes('CREATIVE_GENERATION_TIMEOUT_MS'))
+  assert.ok(!repositorySource.includes('1_020_000'))
+  assert.equal(repositorySource.match(/extended_generation_confirmed: options\.extendedGenerationConfirmed === true/g)?.length, 2)
+  assert.equal(repositorySource.match(/provider: options\.provider,/g)?.length, 2)
+  assert.ok(!repositorySource.includes("options.provider || 'local_qwen'"))
+  assert.ok(repositorySource.includes('batchShots: defaultCapability?.batchShots'))
+  assert.ok(!repositorySource.includes('defaultCapability?.minShots || 1'))
+  assert.ok(!repositorySource.includes('episode.shots.slice(0, targetShotCount)'))
+  assert.ok(!repositorySource.includes('Number(raw.batch_shots || 4)'))
+  assert.ok(repositorySource.includes('mockCreativePromptProviderCapability()'))
+  assert.ok(!repositorySource.includes('recommendedMaxShots: 4'))
+  assert.ok(!repositorySource.includes('configuredMaxNewTokens: 3072'))
   assert.ok(!repositorySource.includes('660_000'))
-  assert.ok(componentSource.includes('capability.value?.maxShots || 4'))
-  assert.ok(componentSource.includes('镜总时长约 {{ targetDurationRange.min }}–{{ targetDurationRange.max }} 秒（每镜 5–15 秒）'))
-  assert.ok(componentSource.includes('页面等待至 17 分钟'))
-  assert.ok(componentSource.includes('1–2 镜更适合反复迭代；4 镜实测约 12 分钟'))
+  assert.ok(componentSource.includes('selectedProviderCapability.value?.recommendedMaxShots'))
+  assert.ok(componentSource.includes('selectedProviderCapability.value?.batchShots'))
+  assert.ok(!componentSource.includes('capability.value?.batchShots'))
+  assert.ok(componentSource.includes('targetShotCountError'))
+  assert.ok(componentSource.includes('targetShotCountNeedsConfirmation'))
+  assert.ok(componentSource.includes('providerTimingGuide'))
+  assert.ok(componentSource.includes('selectedProviderCapability.value?.runtimeTimeoutSeconds'))
+  assert.ok(componentSource.includes('selectedProviderCapability.value?.processTimeoutSeconds'))
+  assert.ok(componentSource.includes('pendingExtendedGeneration'))
+  assert.ok(componentSource.includes('recoverExtendedGenerationConfirmation'))
+  assert.ok(componentSource.includes('creativeGenerationConfirmationContext(cause)'))
+  assert.ok(componentSource.includes('continueExtendedGeneration'))
+  assert.ok(componentSource.includes('<BaseModal'))
+  assert.ok(componentSource.includes('仍然生成 {{ pendingExtendedGeneration?.targetShotCount }} 镜'))
+  assert.ok(!componentSource.includes(':max="batchShots"'))
+  assert.ok(!componentSource.includes('targetShotCount: Math.min(batchShots.value'))
+  assert.ok(!componentSource.includes('targetShotCount.value = Math.min(batchShots.value'))
+  assert.ok(!componentSource.includes('visibleSourceTooLong'))
+  assert.ok(componentSource.includes('visibleSourceExceedsBatchReference'))
+  assert.ok(componentSource.includes('authoritativeVisibleSourceChars'))
+  assert.ok(componentSource.includes("episode?.script || ''"))
+  assert.ok(componentSource.includes("props.project.masterScript || ''"))
+  const requestGenerateSource = componentSource.slice(
+    componentSource.indexOf('const requestGenerate ='),
+    componentSource.indexOf('const replaceDraft ='),
+  )
+  const requestRegenerateSource = componentSource.slice(
+    componentSource.indexOf('const requestRegenerate ='),
+    componentSource.indexOf('const continueExtendedGeneration ='),
+  )
+  assert.ok(requestGenerateSource.includes(
+    'decision.confirmationRequired || visibleSourceExceedsBatchReference.value',
+  ))
+  assert.ok(!requestGenerateSource.includes('shotKeys.length'))
+  assert.ok(requestRegenerateSource.includes(
+    'decision.confirmationRequired || (!shotKeys.length && visibleSourceExceedsBatchReference.value)',
+  ))
+  assert.ok(componentSource.includes('pendingExtendedIsBatchable'))
+  assert.ok(componentSource.includes('选镜重生成需携带完整旧草稿'))
+  assert.ok(componentSource.includes('权威剧本 {{ pendingExtendedSourceCharCount }} 字符超过单批 {{ pendingExtendedMaxSourceChars }} 字符参考值'))
+  assert.ok(!componentSource.includes('contextEstimate'))
+  assert.ok(componentSource.includes('服务端会按连续片段自动拆批并保留完整剧本与原镜数'))
+  assert.ok(componentSource.includes(':min="minShotDurationSeconds"'))
+  assert.ok(componentSource.includes(':max="maxShotDurationSeconds"'))
+  assert.ok(componentSource.includes('每镜 {{ shotDurationGuide }}'))
+  assert.ok(!componentSource.includes('每镜 5–15 秒'))
   assert.ok(componentSource.includes('输出容量由镜数 + 剧本中的权威对白共同决定'))
-  assert.ok(componentSource.includes('预计超过上限会在加载模型前要求拆段'))
+  assert.ok(componentSource.includes('超过建议镜数不会被自动改小或直接阻止'))
+  assert.ok(componentSource.includes('平台后续按分集、批次和逐镜执行生产'))
+
+  const sourceConfirmationCause = {
+    response: { data: { error: { code: 'invalid', details: {
+      code: 'creative_generation_confirmation_required',
+      target_shot_count: 1,
+      recommended_max_shots: 4,
+      batch_shots: 4,
+      source_char_count: 28000,
+      max_source_chars: 24000,
+    } } } },
+  }
+  assert.deepEqual(creativeGenerationConfirmationContext(sourceConfirmationCause), {
+    targetShotCount: 1,
+    recommendedMaxShots: 4,
+    batchShots: 4,
+    sourceCharCount: 28000,
+    maxSourceChars: 24000,
+  })
+  const sourceConfirmationMessage = creativeDraftRequestError(
+    sourceConfirmationCause,
+    'fallback',
+    'deepseek_api',
+  )
+  assert.match(sourceConfirmationMessage, /权威剧本 28000 字符超过单批 24000 字符参考值/)
+  assert.match(sourceConfirmationMessage, /不会截断镜数或剧本/)
+  assert.doesNotMatch(sourceConfirmationMessage, /1 镜超过当前建议单次 4 镜/)
 })

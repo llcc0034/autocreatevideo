@@ -26,7 +26,7 @@ import type { SeriesProject, StylePreset, VisualRulesColorDesign } from '../src/
 
 const project = (): SeriesProject => ({
   id: '11111111-1111-4111-8111-111111111111',
-  title: '听雨不归人', logline: '雨夜追查旧案', masterScript: '第1集：雨夜试剑',
+  title: '听雨不归人', logline: '雨夜追查旧案', masterScript: '第1集：雨夜试剑', isFavorite: false,
   continuitySummary: 'Current continuity', translationGlossary: { 玄纹剑: 'Xuanwen Sword' },
   styleId: 'wuxia', status: 'writing', aspectRatio: '9:16', resolution: '720p',
   width: 768, height: 1344, defaultMode: 'Ref2VA',

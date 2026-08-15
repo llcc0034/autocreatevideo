@@ -38,7 +38,7 @@ const submit = async () => {
         </div>
       </div>
       <div class="auth-frame-card"><div class="frame-image"><span>SCENE 07 · SHOT 03</span><i></i></div><div><strong>听雨不归人</strong><span>角色一致性 98.4%</span></div></div>
-      <footer>© 2026 CineForge Studio</footer>
+      <footer>AutoPrompt Studio</footer>
     </section>
     <section class="auth-panel">
       <div class="auth-form-wrap">

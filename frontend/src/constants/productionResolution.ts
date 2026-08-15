@@ -18,7 +18,7 @@ export const IMAGE_PRODUCTION_RESOLUTION_MULTIPLE_STEP = 8
 export const PRODUCTION_RESOLUTION_OPTIONS: readonly ProductionResolutionOption[] = [
   { value: '0.1', label: '0.1 MP', shortHint: '最省显存', group: 'common', risk: 'low' },
   { value: '0.2', label: '0.2 MP', shortHint: '低显存', group: 'common', risk: 'low' },
-  { value: '0.3', label: '0.3 MP', shortHint: '8GB 推荐', group: 'common', risk: 'recommended' },
+  { value: '0.3', label: '0.3 MP', shortHint: '低显存起点', group: 'common', risk: 'recommended' },
   { value: '0.4', label: '0.4 MP', shortHint: '标准档位', group: 'more', risk: 'standard' },
   { value: '0.5', label: '0.5 MP', shortHint: '标准档位', group: 'more', risk: 'standard' },
   { value: '0.6', label: '0.6 MP', shortHint: '显存增加', group: 'more', risk: 'standard' },

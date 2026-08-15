@@ -33,6 +33,7 @@ from studio.services.shot_detail_drafts import (
     create_failed_shot_detail_draft,
     create_shot_detail_draft,
     patch_shot_detail_draft,
+    shot_detail_provider_label,
 )
 
 
@@ -72,7 +73,7 @@ def _owned_shot(project: SeriesProject, shot_id) -> Shot:
     )
 
 
-def _raise_error(exc: CreativeDraftError):
+def _raise_error(exc: CreativeDraftError, *, provider: str | None = None):
     if isinstance(exc, CreativeResourceBusy):
         raise ShotDetailBusy(str(exc)) from exc
     if isinstance(exc, (CreativeContextConflict, CreativeRevisionConflict)):
@@ -91,7 +92,10 @@ def _raise_error(exc: CreativeDraftError):
             "code": exc.code,
             "detail": safe_messages.get(exc.code, "高细节候选暂不能继续，请检查可编辑内容后重试。"),
         }) from exc
-    error = APIException("本地 Qwen 未返回可审核的高细节候选；正式镜头未修改。")
+    selected = provider or (exc.runtime_metadata or {}).get("provider") or "local_qwen"
+    error = APIException(
+        f"{shot_detail_provider_label(selected)} 未返回可审核的高细节候选；正式镜头未修改。",
+    )
     error.status_code = status.HTTP_502_BAD_GATEWAY
     error.default_code = "shot_detail_runtime_failed"
     raise error from exc
@@ -141,7 +145,7 @@ class ProjectShotDetailDraftGenerateView(APIView):
             CreativeResourceBusy, CreativeContextConflict, CreativeRevisionConflict,
             CreativeValidationError, CreativeRuntimeUnavailable,
         ) as exc:
-            _raise_error(exc)
+            _raise_error(exc, provider=provider)
         except CreativeDraftError as exc:
             failed = create_failed_shot_detail_draft(
                 project=project, episode=shot.episode, shot=shot, user=request.user,
@@ -158,7 +162,11 @@ class ProjectShotDetailDraftGenerateView(APIView):
                     status=status.HTTP_201_CREATED,
                 )
             return Response({
-                "detail": "本地 Qwen 未返回可审核的高细节候选；正式镜头未修改。", "code": exc.code,
+                "detail": (
+                    f"{shot_detail_provider_label(provider)} 未返回可审核的高细节候选；"
+                    "正式镜头未修改。"
+                ),
+                "code": exc.code,
                 "draft": ShotDetailDraftSerializer(failed).data,
             }, status=status.HTTP_502_BAD_GATEWAY)
         return Response(ShotDetailDraftSerializer(draft).data, status=status.HTTP_201_CREATED)
@@ -220,7 +228,7 @@ class ShotDetailDraftViewSet(
             CreativeResourceBusy, CreativeContextConflict, CreativeRevisionConflict,
             CreativeValidationError, CreativeRuntimeUnavailable,
         ) as exc:
-            _raise_error(exc)
+            _raise_error(exc, provider=provider)
         except CreativeDraftError as exc:
             try:
                 failed = create_failed_shot_detail_draft(
@@ -234,14 +242,18 @@ class ShotDetailDraftViewSet(
                     provider=provider,
                 )
             except CreativeDraftError as save_exc:
-                _raise_error(save_exc)
+                _raise_error(save_exc, provider=provider)
             if failed.status == ShotDetailDraft.Status.DRAFT:
                 return Response(
                     ShotDetailDraftSerializer(failed).data,
                     status=status.HTTP_201_CREATED,
                 )
             return Response({
-                "detail": "本地 Qwen 未返回可审核的高细节候选；正式镜头未修改。", "code": exc.code,
+                "detail": (
+                    f"{shot_detail_provider_label(provider)} 未返回可审核的高细节候选；"
+                    "正式镜头未修改。"
+                ),
+                "code": exc.code,
                 "draft": ShotDetailDraftSerializer(failed).data,
             }, status=status.HTTP_502_BAD_GATEWAY)
         return Response(ShotDetailDraftSerializer(draft).data, status=status.HTTP_201_CREATED)

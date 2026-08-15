@@ -474,6 +474,10 @@ def create_assembly(
     preparation_failure: AssemblyError | None = None
     preparation_cause: BaseException | None = None
     with transaction.atomic():
+        try:
+            project = SeriesProject.objects.select_for_update().get(pk=project.pk)
+        except SeriesProject.DoesNotExist as exc:
+            raise AssemblyError("连续剧项目不存在") from exc
         WorkerLease.objects.get_or_create(key="assembly-enqueue")
         WorkerLease.objects.select_for_update().get(key="assembly-enqueue")
         if not dry_run:

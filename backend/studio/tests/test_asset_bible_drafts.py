@@ -215,7 +215,7 @@ class AssetBibleDraftAPITests(TestCase):
         self.assertEqual(duplicate.status_code, 400, duplicate.data)
         self.assertIn("name", duplicate.data["error"]["details"])
 
-    def test_asset_kind_is_immutable_after_creation(self):
+    def test_unreferenced_asset_kind_can_be_corrected_after_creation(self):
         owned = Asset.objects.create(
             owner=self.user, kind=Asset.Kind.CHARACTER, name="用户人物",
             description="人物描述", prompt_hint="人物视觉锚点",
@@ -224,9 +224,9 @@ class AssetBibleDraftAPITests(TestCase):
         response = self.client.patch(
             f"/api/v1/assets/{owned.id}/", {"kind": "scene"}, format="json",
         )
-        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(response.status_code, 200, response.data)
         owned.refresh_from_db()
-        self.assertEqual(owned.kind, Asset.Kind.CHARACTER)
+        self.assertEqual(owned.kind, Asset.Kind.SCENE)
 
     def test_owner_classified_image_create_requires_description_and_prompt(self):
         missing_description = self.client.post("/api/v1/assets/", {

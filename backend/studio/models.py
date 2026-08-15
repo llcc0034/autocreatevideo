@@ -112,6 +112,13 @@ class SeriesProject(UUIDTimeStampedModel):
     master_script = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
     style = models.ForeignKey(Style, null=True, blank=True, on_delete=models.SET_NULL, related_name="projects")
+    cover_asset = models.ForeignKey(
+        Asset,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="cover_projects",
+    )
     target_model = models.CharField(max_length=80, default="minimax-h3")
     language = models.CharField(max_length=32, default="Chinese")
     aspect_ratio = models.CharField(max_length=16, default="9:16")
@@ -123,6 +130,7 @@ class SeriesProject(UUIDTimeStampedModel):
     continuity_summary = models.TextField(blank=True)
     production_settings = models.JSONField(default=dict, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
+    is_favorite = models.BooleanField(default=False)
 
     class Meta:
         ordering = ("-updated_at",)
@@ -295,6 +303,11 @@ class Shot(UUIDTimeStampedModel):
     # ``reference_assets`` remains the selectable asset pool only; it must not
     # be used to infer first/last/character/scene/prop meaning.
     reference_bindings = models.JSONField(default=dict, blank=True)
+    # These flags express a continuity requirement only. They never imply
+    # that a concrete first/last-frame Asset has already been generated or
+    # bound in ``reference_bindings``.
+    requires_first_frame_continuity = models.BooleanField(default=False)
+    requires_last_frame_continuity = models.BooleanField(default=False)
     continuity_notes = models.TextField(blank=True)
     metadata = models.JSONField(default=dict, blank=True)
 
@@ -568,6 +581,134 @@ class ShotDetailDraft(UUIDTimeStampedModel):
 
     def __str__(self) -> str:
         return f"E{self.episode.number}S{self.shot.number} detail v{self.generation_no} ({self.status})"
+
+
+class ShotDetailDraftBatch(UUIDTimeStampedModel):
+    """Durable episode-level orchestration for independent shot detail drafts."""
+
+    class GenerationStatus(models.TextChoices):
+        QUEUED = "queued", "排队中"
+        RUNNING = "running", "生成中"
+        COMPLETED = "completed", "已完成"
+        COMPLETED_WITH_ERRORS = "completed_with_errors", "部分完成"
+        FAILED = "failed", "已失败"
+        CANCELLED = "cancelled", "已取消"
+
+    class ApplyStatus(models.TextChoices):
+        NOT_STARTED = "not_started", "未应用"
+        COMPLETE = "complete", "已全部应用"
+
+    project = models.ForeignKey(
+        SeriesProject, on_delete=models.CASCADE, related_name="shot_detail_batches",
+    )
+    episode = models.ForeignKey(
+        Episode, on_delete=models.CASCADE, related_name="shot_detail_batches",
+    )
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
+        related_name="shot_detail_batches",
+    )
+    request_id = models.UUIDField(unique=True, editable=False)
+    provider = models.CharField(max_length=80, default="local_qwen")
+    variation_note = models.TextField(blank=True)
+    source_manifest_hash = models.CharField(max_length=64, db_index=True)
+    policy_snapshot = models.JSONField(default=dict)
+    config_hash = models.CharField(max_length=64)
+    generation_status = models.CharField(
+        max_length=32, choices=GenerationStatus.choices,
+        default=GenerationStatus.QUEUED, db_index=True,
+    )
+    apply_status = models.CharField(
+        max_length=20, choices=ApplyStatus.choices,
+        default=ApplyStatus.NOT_STARTED,
+    )
+    revision = models.PositiveIntegerField(default=1)
+    total_count = models.PositiveIntegerField(default=0)
+    pending_count = models.PositiveIntegerField(default=0)
+    succeeded_count = models.PositiveIntegerField(default=0)
+    failed_count = models.PositiveIntegerField(default=0)
+    stale_count = models.PositiveIntegerField(default=0)
+    skipped_count = models.PositiveIntegerField(default=0)
+    applied_count = models.PositiveIntegerField(default=0)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        constraints = [
+            models.UniqueConstraint(
+                fields=("episode",),
+                condition=Q(generation_status__in=("queued", "running")),
+                name="unique_active_shot_detail_batch",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("project", "episode", "generation_status", "created_at"),
+                name="studio_sdbatch_scope_idx",
+            ),
+        ]
+
+
+class ShotDetailDraftBatchItem(UUIDTimeStampedModel):
+    """One frozen shot input and its independently persisted batch outcome."""
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待处理"
+        RUNNING = "running", "处理中"
+        SUCCEEDED = "succeeded", "已生成"
+        FAILED = "failed", "失败"
+        STALE = "stale", "源数据已变化"
+        SKIPPED = "skipped", "已跳过"
+
+    batch = models.ForeignKey(
+        ShotDetailDraftBatch, on_delete=models.CASCADE, related_name="items",
+    )
+    shot = models.ForeignKey(
+        Shot, on_delete=models.CASCADE, related_name="detail_batch_items",
+    )
+    ordinal = models.PositiveIntegerField()
+    source_context_hash = models.CharField(max_length=64, db_index=True)
+    before_snapshot = models.JSONField(default=dict)
+    draft = models.OneToOneField(
+        ShotDetailDraft, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name="batch_item",
+    )
+    status = models.CharField(
+        max_length=20, choices=Status.choices, default=Status.PENDING,
+        db_index=True,
+    )
+    attempts = models.PositiveSmallIntegerField(default=0)
+    max_attempts = models.PositiveSmallIntegerField(
+        default=3, validators=[MinValueValidator(1)],
+    )
+    next_attempt_at = models.DateTimeField(default=timezone.now, db_index=True)
+    worker_id = models.CharField(max_length=160, blank=True)
+    claim_token = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=80, blank=True)
+    error_message = models.TextField(blank=True)
+    apply_run_id = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
+    applied_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("batch", "ordinal")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("batch", "shot"), name="unique_shot_detail_batch_shot",
+            ),
+            models.UniqueConstraint(
+                fields=("batch", "ordinal"), name="unique_shot_detail_batch_ordinal",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("status", "next_attempt_at", "created_at"),
+                name="studio_sdbitem_claim_idx",
+            ),
+        ]
 
 
 class WorkflowTemplate(UUIDTimeStampedModel):

@@ -64,10 +64,17 @@ class DeepSeekAPIError(RuntimeError):
         *,
         code: str = "deepseek_api_failed",
         runtime_metadata: dict[str, Any] | None = None,
+        structured_candidate: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = _safe_code(code)
         self.runtime_metadata = _safe_metadata(runtime_metadata or {})
+        candidate = structured_candidate if isinstance(structured_candidate, dict) else {}
+        self.structured_candidate = {
+            key: candidate[key]
+            for key in ("schema_version", "detail_zh", "detail_en")
+            if key in candidate and isinstance(candidate[key], (str, int))
+        }
 
 
 class DeepSeekConfigurationError(DeepSeekAPIError):
@@ -108,6 +115,8 @@ def _safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
         "all_items_ok", "repair_attempted", "repair_succeeded",
         "repair_reason_code", "review_required", "review_issue_count",
         "validation_error_code", "validation_path",
+        "requested_max_tokens", "configured_max_tokens",
+        "incomplete",
     ):
         item = value.get(key)
         if isinstance(item, (str, int, float, bool)) and not isinstance(item, bytes):
@@ -140,7 +149,7 @@ def _config() -> dict[str, Any]:
     except (TypeError, ValueError):
         retries = -1
     try:
-        max_tokens = int(configured.get("max_tokens", 4096))
+        max_tokens = int(configured.get("max_tokens", 16384))
     except (TypeError, ValueError):
         max_tokens = 0
     return {
@@ -187,7 +196,7 @@ def get_deepseek_capability() -> dict[str, Any]:
         and config["model"]
         and 0 < config["timeout_seconds"] <= 3600
         and 0 <= config["max_retries"] <= 5
-        and 1 <= config["max_tokens"] <= 32768
+        and config["max_tokens"] >= 1
     )
     return {
         "id": PROVIDER_ID,
@@ -261,14 +270,42 @@ def _chat_completion(
     operation: str,
     response_format: dict[str, str] | None = None,
     temperature: float = 0.0,
+    accept_incomplete_content: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     config = _require_config()
+    if isinstance(max_tokens, bool):
+        requested_max_tokens = 0
+    else:
+        try:
+            requested_max_tokens = int(max_tokens)
+        except (TypeError, ValueError):
+            requested_max_tokens = 0
+    if requested_max_tokens < 1:
+        raise DeepSeekConfigurationError(
+            "DeepSeek API output budget must be greater than zero.",
+            code="deepseek_output_budget_invalid",
+            runtime_metadata={
+                "operation": operation,
+                "requested_max_tokens": requested_max_tokens,
+                "configured_max_tokens": config["max_tokens"],
+            },
+        )
+    if requested_max_tokens > config["max_tokens"]:
+        raise DeepSeekConfigurationError(
+            "DeepSeek API output budget exceeds the configured maximum.",
+            code="deepseek_output_budget_exceeded",
+            runtime_metadata={
+                "operation": operation,
+                "requested_max_tokens": requested_max_tokens,
+                "configured_max_tokens": config["max_tokens"],
+            },
+        )
     started = time.monotonic()
     body: dict[str, Any] = {
         "model": config["model"],
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": min(max_tokens, config["max_tokens"]),
+        "max_tokens": requested_max_tokens,
         "stream": False,
         "thinking": {"type": "disabled"},
     }
@@ -333,7 +370,18 @@ def _chat_completion(
             },
         ) from exc
     elapsed = round((time.monotonic() - started) * 1000)
-    if finish_reason != "stop":
+    incomplete = finish_reason != "stop"
+    if not isinstance(content, str) or not content.strip():
+        raise DeepSeekAPIError(
+            "DeepSeek API returned no content.", code=f"{operation}_empty_output",
+            runtime_metadata={
+                "operation": operation, "attempts": attempts,
+                "elapsed_ms": elapsed, "finish_reason": finish_reason,
+                "incomplete": incomplete,
+                "usage": _safe_usage(payload.get("usage")),
+            },
+        )
+    if incomplete and not accept_incomplete_content:
         code = (
             f"{operation}_output_budget_exhausted"
             if finish_reason == "length"
@@ -344,15 +392,7 @@ def _chat_completion(
             runtime_metadata={
                 "operation": operation, "attempts": attempts,
                 "elapsed_ms": elapsed, "finish_reason": finish_reason,
-                "usage": _safe_usage(payload.get("usage")),
-            },
-        )
-    if not isinstance(content, str) or not content.strip():
-        raise DeepSeekAPIError(
-            "DeepSeek API returned no content.", code=f"{operation}_empty_output",
-            runtime_metadata={
-                "operation": operation, "attempts": attempts,
-                "elapsed_ms": elapsed, "finish_reason": finish_reason,
+                "incomplete": True,
                 "usage": _safe_usage(payload.get("usage")),
             },
         )
@@ -364,6 +404,7 @@ def _chat_completion(
         "attempts": attempts,
         "elapsed_ms": elapsed,
         "finish_reason": finish_reason,
+        "incomplete": incomplete,
         "usage": payload.get("usage"),
     })
 
@@ -552,7 +593,9 @@ def _deepseek_creative_messages(protocol: Any, request: Any) -> list[dict[str, s
 
 def _deepseek_creative_max_tokens(request: Any) -> int:
     """Give remote prose bounded headroom without changing local budgets."""
-    return int(request.max_tokens) + (384 * int(request.shot_count))
+    return int(request.max_tokens) + (
+        int(request.output_headroom_per_shot) * int(request.shot_count)
+    )
 
 
 def _deepseek_review_issues(issues: list[dict[str, str]]) -> list[dict[str, str]]:
@@ -724,6 +767,7 @@ def _repair_creative_length_once(
         operation="creative_storyboard_repair",
         response_format={"type": "json_object"},
         temperature=0.0,
+        accept_incomplete_content=True,
     )
     try:
         patch = json.loads(protocol._clean_translation(content))
@@ -732,6 +776,7 @@ def _repair_creative_length_once(
             "DeepSeek API returned invalid repair JSON.",
             code="creative_storyboard_repair_invalid_json",
             runtime_metadata={
+                **metadata,
                 "operation": protocol.CREATIVE_OPERATION,
                 "repair_attempted": True,
                 "repair_succeeded": False,
@@ -769,6 +814,7 @@ def _repair_creative_length_once(
             "The structured repair candidate failed validation.",
             code="creative_storyboard_repair_validation_failed",
             runtime_metadata={
+                **metadata,
                 "operation": protocol.CREATIVE_OPERATION,
                 "repair_attempted": True,
                 "repair_succeeded": False,
@@ -799,7 +845,7 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
     elif operation == protocol.SHOT_DETAIL_OPERATION:
         normalise = protocol._normalise_shot_high_detail_request
         build_messages = protocol._build_shot_high_detail_messages
-        schema_builder = lambda _request: protocol.SHOT_DETAIL_DRAFT_SCHEMA
+        schema_builder = protocol._shot_detail_draft_schema
         validator = protocol._validate_shot_high_detail
     else:
         raise DeepSeekAPIError(
@@ -815,6 +861,7 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
     schema = schema_builder(request)
     messages = [*build_messages(request), {"role": "user", "content": _schema_instruction(schema)}]
     started = time.monotonic()
+    call_metadata: dict[str, Any] = {}
     try:
         content, call_metadata = _chat_completion(
             messages=messages,
@@ -824,6 +871,7 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
             ),
             operation=operation, response_format={"type": "json_object"},
             temperature=0.3,
+            accept_incomplete_content=True,
         )
         decoded = json.loads(protocol._clean_translation(content))
     except DeepSeekAPIError:
@@ -831,10 +879,11 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
         raise DeepSeekAPIError(
             "DeepSeek API returned invalid JSON.", code=f"{operation}_output_invalid_json",
-            runtime_metadata={
+            runtime_metadata=_safe_metadata({
+                **call_metadata,
                 "operation": operation,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
-            },
+            }),
         ) from exc
     review_issues: list[dict[str, str]] = []
     repair_attempted = False
@@ -854,7 +903,11 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
             raise DeepSeekAPIError(
                 "The structured candidate failed validation.",
                 code=f"{operation}_validation_failed",
+                structured_candidate=(
+                    decoded if operation == protocol.SHOT_DETAIL_OPERATION else None
+                ),
                 runtime_metadata={
+                    **call_metadata,
                     "operation": operation,
                     "elapsed_ms": round((time.monotonic() - started) * 1000),
                     "review_required": bool(review_issues),
@@ -876,6 +929,13 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
             ),
             "attempts": int(call_metadata.get("attempts", 0))
             + int(repair_metadata.get("attempts", 0)),
+            "incomplete": bool(call_metadata.get("incomplete"))
+            or bool(repair_metadata.get("incomplete")),
+            "finish_reason": (
+                repair_metadata.get("finish_reason")
+                if repair_metadata.get("incomplete")
+                else call_metadata.get("finish_reason")
+            ),
         }
         review_issues = []
         try:
@@ -887,7 +947,11 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
             raise DeepSeekAPIError(
                 "The structured repair candidate failed validation.",
                 code=f"{operation}_repair_validation_failed",
+                structured_candidate=(
+                    decoded if operation == protocol.SHOT_DETAIL_OPERATION else None
+                ),
                 runtime_metadata={
+                    **call_metadata,
                     "operation": operation,
                     "elapsed_ms": round((time.monotonic() - started) * 1000),
                     "review_required": bool(review_issues),
@@ -905,6 +969,18 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
     candidate = dict(candidate)
     if operation == protocol.CREATIVE_OPERATION:
         candidate["source_fingerprint"] = request.source_fingerprint
+    if call_metadata.get("incomplete"):
+        incomplete_issue = {
+            "path": "result",
+            "code": "model_output_incomplete_finish_reason",
+            "severity": "risk",
+            "suggestion_zh": (
+                "模型返回了可解析且通过结构校验的正文，但完成原因显示输出可能不完整；"
+                "请人工核对内容完整性后再确认应用。"
+            ),
+        }
+        if incomplete_issue not in review_issues:
+            review_issues.append(incomplete_issue)
     elapsed = round((time.monotonic() - started) * 1000)
     if operation == protocol.SHOT_DETAIL_OPERATION:
         review_summary = protocol._shot_detail_review_summary(review_issues)

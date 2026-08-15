@@ -29,6 +29,8 @@ class DialogueContractTests(TestCase):
             "text": "谁在等我！？",
             "delivery": "in a low, restrained voice",
             "voiceover": True,
+            "start_ms": 1000,
+            "end_ms": 3500,
         }]
         self.assertEqual(normalize_dialogue(value), value)
         self.assertEqual(
@@ -41,6 +43,8 @@ class DialogueContractTests(TestCase):
             [{"speaker_id": "S1", "text": "line", "cutoff": True}],
             [{"speaker_id": "S1", "text": "line", "delivery": 1}],
             [{"speaker_id": "S1", "text": "line", "voiceover": 1}],
+            [{"speaker_id": "S1", "text": "line", "start_ms": 0}],
+            [{"speaker_id": "S1", "text": "line", "start_ms": 2000, "end_ms": 1000}],
             [{"speaker_id": "S1", "text": "x" * 2_001}],
             [{"speaker_id": "speaker-one", "text": "line"}],
         )
@@ -49,24 +53,33 @@ class DialogueContractTests(TestCase):
                 normalize_dialogue(value)
 
     def test_shot_api_persists_strict_dialogue_contract(self):
-        self.shot1.duration_ms = 5_000
+        self.shot1.duration_ms = 8_000
         self.shot1.save(update_fields=("duration_ms", "updated_at"))
         dialogue = [{
             "speaker_id": "S1", "text": "原文。",
             "delivery": "softly", "voiceover": True,
+            "start_ms": 500, "end_ms": 6500,
         }]
         response = self.client.patch(
             f"/api/v1/shots/{self.shot1.id}/",
-            {"duration_ms": 5_000, "dialogue": dialogue},
+            {"duration_ms": 8_000, "dialogue": dialogue},
             format="json",
         )
         self.assertEqual(response.status_code, 200, response.data)
         self.shot1.refresh_from_db()
         self.assertEqual(self.shot1.dialogue, dialogue)
 
+        timing_rejected = self.client.patch(
+            f"/api/v1/shots/{self.shot1.id}/",
+            {"duration_ms": 5000},
+            format="json",
+        )
+        self.assertEqual(timing_rejected.status_code, 400, timing_rejected.data)
+        self.assertIn("不能超过镜头时长", str(timing_rejected.data))
+
         rejected = self.client.patch(
             f"/api/v1/shots/{self.shot1.id}/",
-            {"duration_ms": 5_000, "dialogue": [{
+            {"duration_ms": 8_000, "dialogue": [{
                 "speaker_id": "S1", "text": "原文。", "scenetrans": True,
             }]},
             format="json",
@@ -78,21 +91,49 @@ class DialogueContractTests(TestCase):
         self.episode.delete()
         result = breakdown_script(
             self.project,
-            "第1集：归来\n镜头1：林默站在窗边。\n"
-            "林默（voiceover; softly, with controlled breath）：我又回到了这里。\n"
+            "第1集：归来\n镜头1【时长=8秒】【首帧连续=否】【尾帧连续=是】：林默站在窗边。\n"
+            "[0-2.5秒] 动作：林默抬手触碰窗框。\n"
+            "[2.5-6秒] 林默（voiceover; softly, with controlled breath）：我又回到了这里。\n"
             "镜头2：林默转身。\nS1（in a low, restrained voice）：别动。",
         )
         shots = list(result.episodes[0].shots.order_by("number"))
+        self.assertEqual(shots[0].duration_ms, 8000)
+        self.assertFalse(shots[0].requires_first_frame_continuity)
+        self.assertTrue(shots[0].requires_last_frame_continuity)
+        self.assertIn("[0s–2.5s] 林默抬手触碰窗框。", shots[0].narrative)
         self.assertEqual(shots[0].dialogue, [{
             "speaker_id": "S1",
             "text": "我又回到了这里。",
+            "start_ms": 2500,
+            "end_ms": 6000,
             "delivery": "softly, with controlled breath",
             "voiceover": True,
         }])
         self.assertEqual(shots[1].dialogue, [{
             "speaker_id": "S1", "text": "别动。",
+            "start_ms": 0, "end_ms": 5000,
             "delivery": "in a low, restrained voice",
         }])
+
+    def test_script_breakdown_warns_and_uses_configured_defaults_for_invalid_ranges(self):
+        self.episode.delete()
+        result = breakdown_script(
+            self.project,
+            "第1集：回退\n镜头1【时长=99秒】【首帧连续=未知】：林默停下。\n"
+            "[4-2秒] 动作：林默回头。\n[7-9秒] 林默：别动。",
+            default_shot_duration_ms=5000,
+            default_first_frame_continuity=True,
+            default_last_frame_continuity=False,
+        )
+        shot = result.episodes[0].shots.get(number=1)
+        self.assertEqual(shot.duration_ms, 5000)
+        self.assertTrue(shot.requires_first_frame_continuity)
+        self.assertFalse(shot.requires_last_frame_continuity)
+        self.assertIn("[0s–5s] 林默回头。", shot.narrative)
+        self.assertEqual(shot.dialogue[0]["start_ms"], 0)
+        self.assertEqual(shot.dialogue[0]["end_ms"], 5000)
+        self.assertTrue(any("已使用默认" in warning for warning in result.warnings))
+        self.assertTrue(any("整镜范围" in warning for warning in result.warnings))
 
     def test_h3_prompt_keeps_delivery_outside_verbatim_dialogue_and_closes_lips_for_vo(self):
         self.shot1.dialogue = [{
@@ -100,16 +141,22 @@ class DialogueContractTests(TestCase):
             "text": "别动！？“原样”",
             "delivery": "in a low, restrained voice",
             "voiceover": True,
+            "start_ms": 500,
+            "end_ms": 2500,
         }]
+        self.shot1.requires_first_frame_continuity = True
+        self.shot1.requires_last_frame_continuity = True
         result = build_h3_video_prompt(
             self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
         )
+        self.assertIn("From 0.500s to 2.500s", result.text)
         self.assertIn(
             "(S1) says in an off-screen voiceover, in a low, restrained voice: "
-            "<d>[Chinese] 别动！？“原样”</d>",
-            result.text,
+            "<d>[Chinese] 别动！？“原样”</d>", result.text,
         )
         self.assertIn("keeps their lips closed and does not speak on camera", result.text)
+        self.assertIn("opening frame must visibly continue the previous shot", result.text)
+        self.assertIn("final frame must hold a stable, matchable subject state", result.text)
         self.assertNotIn("in a low, restrained voice</d>", result.text)
 
     def test_ref2va_voiceover_keeps_subject_and_speaker_binding(self):
@@ -132,7 +179,8 @@ class DialogueContractTests(TestCase):
                 self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.REF2VA),
             )
         self.assertIn(
-            "<Subject 1> (S1) says in an off-screen voiceover: <d>[Chinese] 原文。</d>",
+            "From 0.000s to 3.500s, <Subject 1> (S1) says in an off-screen "
+            "voiceover: <d>[Chinese] 原文。</d>",
             result.text,
         )
         self.assertIn("<Subject 1> (S1) keeps their lips closed", result.text)

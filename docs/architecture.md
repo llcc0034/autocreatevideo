@@ -56,7 +56,10 @@ SeriesProject
 └─ ConsistencyLock (scope + target + key 唯一，带 version)
 ```
 
-- Project 保存生产规格、风格、连续性种子、术语表和视觉规则。
+- Project 保存生产规格、风格、连续性种子、术语表、视觉规则、用户收藏标记和可空 `cover_asset`。封面是当前租户受控上传的 `reference` Asset；API 返回短期签名 `cover_url`，数据库不持久化签名 URL。列表管理中的“重做”通过创建只含故事基础与生产规格的新 Project 实现，不克隆封面、生产聚合、不可变审计记录或媒体，也不提交生成任务。
+- Project 列表通过单次集合请求读取项目字段与服务端聚合计数，不逐项目加载 Bible、剧集、分镜或工作流子资源；用户进入项目详情或在生产操作中选定项目后，前端再按需加载这些完整子资源，避免列表规模扩大时产生逐项目请求。
+- Project 删除由服务端在同一事务内锁定并检查从属 GenerationTask / AssemblyJob；活动任务或未终结远端提交会阻止删除，ReleaseBundle 的保护关系继续阻止删除发行证据仍在引用的项目。删除级联作用于数据库记录；物理产物按存储保留和清理策略另行处置。
+- 封面上传先创建带 `metadata.usage=project_cover` 与 `project_id` 的专用 Asset。服务端验证原文件后按 EXIF 方向归一化并重新编码为同类静态格式，剥离 EXIF/GPS，同时在 metadata 记录 manifest schema、来源、处理后字节数与处理版本；Asset 本身保存 owner、object key、MIME、checksum、状态和时间。随后 API 在项目行锁事务内绑定。专用标记不可改写；服务端拒绝把专用封面绑定到 Bible、Shot 或生成参考输入，前端通用素材查询也过滤该类记录。替换、移除、直接删除封面或删除项目时，服务端在数据库提交后清理无引用的专用文件；普通 reference、Bible/Shot 引用及发行证据不会被该自动清理误删。
 - Episode 保存剧本单元和跨集连续性边界。
 - Shot 保存生产最小单元。`media_type` 决定视频或图片链路，`h3_mode` 与 `reference_bindings` 决定视频输入语义。
 - Bible 的 anchor/reference assets 是身份锚点；锁定的 Bible 只能通过显式解锁后修改。
@@ -67,6 +70,7 @@ SeriesProject
 - `PromptFieldTranslation` 以 scope、字段、源文哈希、上下文哈希、候选译文、状态和修订组织逐字段翻译。
 - `EpisodeCreativeDraft` 保存整集分镜候选、上下文快照、校验结果、确认者和应用者。
 - `ShotDetailDraft` 保存单镜高细节候选、相邻连续性边界、相关 Bible 快照、确认者和应用者。
+- `ShotDetailDraftBatch` 保存整集 provider、幂等 request ID、源清单指纹、resolved policy、生成/应用状态和计数；`ShotDetailDraftBatchItem` 保存每镜冻结输入、claim/heartbeat、尝试、失败、候选关联和应用运行 ID。
 - 全剧视觉规则候选由请求返回；应用接口使用上下文指纹和生成指纹复核后写入允许字段。
 - 素材 Bible 候选由素材的文字元数据生成；返回的 provenance 包含素材 checksum、元数据哈希和更新时间，正式保存时再次复核。
 
@@ -93,8 +97,8 @@ SeriesProject
 | `minimax-h3-base-video` | `text_to_video` | `video_minimax_h3_i2v.json` 的安全审核 API 等价图 | 默认 |
 | `minimax-h3-first-last-video` | `first_last_to_video` | `video_minimax_h3_i2v.json` 的安全审核 API 等价图 | 默认 |
 | `minimax-h3-reference-video` | `reference_to_video` | `video_minimax_h3_r2v.json` 的安全审核 API 等价图 | 默认 |
-| `minimax-h3-r2v-t8-dual-clock-4step` | `reference_to_video` | `video_minimax_h3_r2v_t8_dual_clock_4step.json` 的安全审核 API 等价图 | 实验；未通过 GPU 端到端生成验收 |
-| `minimax-h3-r2v-turbo-lora` | `reference_to_video` | `video_minimax_h3_r2v_turbo_lora.json` 的安全审核 API 等价图 | 实验；未通过 GPU 端到端生成验收 |
+| `minimax-h3-r2v-t8-dual-clock-4step` | `reference_to_video` | `video_minimax_h3_r2v_t8_dual_clock_4step.json` 的安全审核 API 等价图 | 实验；需在目标环境完成 GPU 端到端、稳定性、容量与画质验收 |
+| `minimax-h3-r2v-turbo-lora` | `reference_to_video` | `video_minimax_h3_r2v_turbo_lora.json` 的安全审核 API 等价图 | 实验；需在目标环境完成 GPU 端到端、稳定性、容量与画质验收 |
 
 模板声明允许模式、模型、节点、参数范围、参考策略和输出类型。路由优先使用请求中显式选择且兼容的模板，再选择相应模式的默认模板；不兼容、未启用或不可执行时立即失败，不做隐式降级。
 
@@ -145,8 +149,8 @@ GenerationTask 引用 GeneratedWorkflow，并冻结执行参数：
 
 1. API 在项目行锁内同步 ConsistencyLock，编译或复用 PromptArtifact。
 2. API 依据媒体类型、H3 模式和显式选择解析 WorkflowTemplate，物化 GeneratedWorkflow。
-3. 语言门禁、队列容量和整集幂等检查通过后，API 创建 GenerationTask。
-4. 生成 worker 取得本地 Qwen 共享资源锁，再通过数据库互斥领取一条任务。
+3. 语言门禁、队列确认和生产批次幂等检查通过后，API 创建 GenerationTask。
+4. 生成 worker 优先取得本地 Qwen 共享资源锁并领取一条 ComfyUI 任务；没有媒体任务时释放外层锁并串行领取一条整集高细节 item，单镜服务在需要本地 Qwen 时自行取得同一共享锁，DeepSeek item 走远程 provider。
 5. worker 对每个参考素材重新核对 owner、授权快照、允许根目录和 checksum；视频统一暂存为 CFR 24，配对音频按有效视频时长归一化。
 6. worker 将每次成功上传的 token → ComfyUI 路径立即写入 `staged_inputs`，重启后可按内容哈希验证并复用。
 7. worker 对完整执行图调用实时 `/object_info` 与模型枚举，校验节点类、必需/自增长输入、输出槽和类型、连线、数值范围、widget/模型枚举及环路。
@@ -154,31 +158,32 @@ GenerationTask 引用 GeneratedWorkflow，并冻结执行参数：
 9. worker 使用 WebSocket 读取可用的节点进度，同时以 HTTP queue/history 作为终态依据。
 10. 成功后提取输出、封存来源清单并更新任务终态；取消、明确失败、遥测不可用和连接不确定分别保存可区分状态。
 
-实时模板可见性检查和执行图预检都不提交 GPU 任务，也不构成 GPU 端到端验收。T8 Dual-Clock 与 Turbo LoRA 的架构状态保持实验。
+实时模板可见性检查和执行图预检都不提交 GPU 任务，也不构成 GPU 端到端验收。T8 Dual-Clock 与 Turbo LoRA 均保持实验状态，是否可用以对应目标环境的实时 GPU 验收为准。
 
 ## 7. 并发、幂等与恢复
 
 ### 7.1 领取与容量
 
 - `WorkerLease` 为生成容量、生成领取、装配入队和装配领取提供数据库互斥。
-- 生成任务按优先级和入队时间领取，`TASK_MAX_CONCURRENT` 默认约束单 GPU 串行执行；API 同时限制全局待处理量和单用户活动任务量。
+- 生成任务按优先级和入队时间领取，`TASK_MAX_CONCURRENT` 控制实际 worker 并发；全局待处理量和单用户活动任务量使用可配置推荐阈值，超过时要求用户明确确认后仍完整入队，不构成整集或整剧业务上限。
 - 本地 Qwen 与生成 worker 共享文件锁。Qwen 占用资源时生成任务保持 queued；生成任务持锁时本地 Qwen 请求返回资源忙。
+- 整集高细节 item 使用独立 claim token、heartbeat 和可配置重试；`shared_resource_busy` 只恢复为 pending，不消耗失败次数。批次生成允许逐镜部分失败并保留所有候选/失败记录；整集应用不允许部分写入，必须统一预检后在一个事务内写全或零写。
 
-### 7.2 整集幂等
+### 7.2 整集、选区与整剧幂等
 
-整集生产把项目、剧集、连续性快照、顺序分镜、参考绑定、分辨率、模板选择和参数规范化后计算请求指纹。`idempotency_key + request_fingerprint` 唯一标识批次：
+生产入口把项目、最终剧集范围、连续性快照、顺序分镜、参考绑定、分辨率、模板选择和参数规范化后计算请求指纹。`idempotency_key + request_fingerprint` 唯一标识整集、单集选区或整剧批次：
 
 - 相同键与相同指纹返回同一完整子任务集合；
 - 相同键与不同指纹返回冲突；
 - 批次不完整时拒绝复用并要求新的键；
-- 整集批次固定为一镜一子任务，便于独立重试和审计。
+- 整集批次固定为一镜一子任务；正式整剧页面同样逐镜提交，便于独立重试和审计。
 
 ### 7.3 ComfyUI 提交恢复
 
 - submission token 在 POST 前持久化，避免 API 返回丢失导致无法识别远端任务。
 - 已有 token 的任务先查询 ComfyUI history 与 queue；存在时接续同一 prompt，不再次 POST。
 - POST 响应不确定、远端健康不可确认或 token 无法核实时，任务进入失败/降级状态并保留 token。队列的 unresolved-token 断路器阻止继续领取，避免同一 GPU 上存在不可见任务时叠加工作。
-- 失联领取在没有 token 时可安全重新排队；有 token 且远端存在时恢复；有 token 但远端明确不存在时停止自动重投，由人工核对后决定重试。
+- 失联领取在没有 token 时可安全重新排队；有 token 且远端存在时恢复；健康的 ComfyUI 明确报告 token 不在队列和历史中时保留原失败记录并终结该 token，不自动重投，允许操作者通过显式重试创建新任务。
 - 重试前必须证明远端明确失败、明确取消或在健康 ComfyUI 中不存在；远端仍在执行或已有成功结果时拒绝克隆任务。
 
 ### 7.4 FFmpeg 装配恢复

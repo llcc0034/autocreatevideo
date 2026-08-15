@@ -5,7 +5,7 @@ defineProps<{ compact?: boolean }>()
 <template>
   <div class="brand-mark" :class="{ compact }">
     <div class="brand-symbol"><span></span><span></span><span></span></div>
-    <div v-if="!compact" class="brand-copy"><strong>CineForge</strong><small>AI PRODUCTION</small></div>
+    <div v-if="!compact" class="brand-copy"><strong>AutoPrompt</strong><small>AI PRODUCTION</small></div>
   </div>
 </template>
 

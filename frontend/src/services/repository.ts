@@ -3,11 +3,12 @@ import { mockAssets, mockProjects, mockSettings, mockWorkflows, stylePresets } f
 import { DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, normalizeImageProductionResolutionMultiple, normalizeProductionResolutionMultiple } from '@/constants/productionResolution'
 import type { AssemblyResult, Asset, BibleAssetDraftResult, BibleDraftEntityType, BibleDraftLanguage, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, ComfySettings, ComfyUIWorkflowSyncResult, Episode, GeneratedImageAssetTarget, GeneratedWorkflowExport, H3Mode, H3PromptOptimizerCapability, H3PromptPayload, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, ReleaseSelection, ScriptBreakdownOptions, SeriesProject, Shot, ShotTranslationPromotionResult, StylePreset, TaskInputPrompt, TranslationCapability, VisualRulesColorDesign, VisualRulesDraftApplyResult, VisualRulesDraftResult, Workflow, WorkflowUserParameterDefinition } from '@/types'
 import type { PromptProviderId } from '@/types'
-import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptPromptArtifact, adaptStyles, adaptTasks, backendStyleId, isBackendId, projectPayload, referenceAssetIdsForShot, referenceBindingsPayload, syncBible, syncEpisode } from './backendAdapters'
+import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptProjectSummary, adaptPromptArtifact, adaptStyles, adaptTasks, backendStyleId, isBackendId, projectPayload, referenceAssetIdsForShot, referenceBindingsPayload, syncBible, syncEpisode, syncShot } from './backendAdapters'
 import { buildGeneratedImageAssetPromotionPayload } from './outputAssetPromotion'
 import { adaptCanonicalGlossaryEnsureResult, adaptShotTranslationPromotionResult, adaptTranslationEntry } from './translationReview'
 import { adaptVisualRulesDraftApplyResult, adaptVisualRulesDraftResult, visualRulesDraftApplyPayload, visualRulesDraftGeneratePayload } from './visualRulesDraft'
 import { adaptPromptProviders } from './providerCapabilities'
+import { parseDialogueText } from './dialogue'
 
 const sleep = (ms = 180) => new Promise((resolve) => setTimeout(resolve, ms))
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
@@ -29,6 +30,13 @@ const loadLocal = <T>(key: string, fallback: T): T => {
 }
 const saveLocal = <T>(key: string, value: T) => localStorage.setItem(key, JSON.stringify(value))
 
+const fileDataUrl = (file: File): Promise<string> => new Promise((resolve, reject) => {
+  const reader = new FileReader()
+  reader.onload = () => resolve(String(reader.result || ''))
+  reader.onerror = () => reject(new Error('无法读取封面文件，请重新选择'))
+  reader.readAsDataURL(file)
+})
+
 const useMock = import.meta.env.VITE_USE_MOCK === 'true'
 // Enqueue performs tenant/path validation and ffprobe snapshots before the
 // durable job is returned. Give long episodes enough time without tying the
@@ -39,6 +47,111 @@ const ASSEMBLY_ENQUEUE_TIMEOUT_MS = 120_000
 // timeout does not prove that the content-addressed publication failed.
 const TASK_DISTRIBUTION_TIMEOUT_MS = 115_000
 const TASK_DISTRIBUTION_RECONCILE_ATTEMPTS = 6
+
+const strictMockBoolean = (name: string, value: unknown): boolean => {
+  const normalized = String(value ?? '').trim().toLowerCase()
+  if (normalized === 'true') return true
+  if (normalized === 'false') return false
+  throw new Error(`Mock 生产策略缺少有效布尔配置 ${name}`)
+}
+
+export interface ProductionCapability {
+  recommendedMaxPending: number
+  recommendedMaxActivePerUser: number
+  maxConcurrent: number
+  taskTimeoutSeconds: number
+  videoShotMinDurationMs: number
+  videoShotMaxDurationMs: number
+  scriptBreakdownDefaultShotDurationMs: number
+  scriptBreakdownDefaultFirstFrameContinuity: boolean
+  scriptBreakdownDefaultLastFrameContinuity: boolean
+  scriptBreakdownAutoSplitTriggerChars: number
+  scriptBreakdownAutoSplitTargetChars: number
+  activeTaskCount: number
+  userActiveTaskCount: number
+  confirmationRequired: boolean
+  businessVolumeLimited: boolean
+}
+
+export interface ScriptBreakdownResult {
+  project: SeriesProject
+  method: string
+  warnings: string[]
+  counts: { episodes: number; shots: number }
+  cleared: {
+    episodes: number
+    shots: number
+    generationTasks: number
+    assemblyJobs: number
+    promptArtifacts: number
+    generatedWorkflows: number
+    creativeDrafts: number
+    shotDetailDrafts: number
+    shotDetailBatches: number
+    shotDetailBatchItems: number
+    promptFieldTranslations: number
+    draftReleaseBundles: number
+    physicalOutputsRetained: boolean
+  }
+}
+
+export const productionErrorCode = (error: unknown): string => {
+  const candidate = error as { response?: { data?: { code?: unknown; error?: { code?: unknown } } } }
+  const code = String(candidate?.response?.data?.error?.code ?? candidate?.response?.data?.code ?? '').trim().toLowerCase()
+  return /^[a-z][a-z0-9_]{0,79}$/.test(code) ? code : ''
+}
+
+const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapability => {
+  const positiveInteger = (key: string): number => {
+    const value = Number(raw[key])
+    if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`生产策略缺少有效字段 ${key}`)
+    return value
+  }
+  const positiveNumber = (key: string): number => {
+    const value = Number(raw[key])
+    if (!Number.isFinite(value) || value <= 0) throw new Error(`生产策略缺少有效字段 ${key}`)
+    return value
+  }
+  const nonNegativeInteger = (key: string): number => {
+    const value = Number(raw[key])
+    if (!Number.isSafeInteger(value) || value < 0) throw new Error(`生产策略缺少有效字段 ${key}`)
+    return value
+  }
+  const boolean = (key: string): boolean => {
+    if (typeof raw[key] !== 'boolean') throw new Error(`生产策略缺少有效字段 ${key}`)
+    return raw[key] as boolean
+  }
+  const videoShotMinDurationMs = positiveInteger('video_shot_min_duration_ms')
+  const videoShotMaxDurationMs = positiveInteger('video_shot_max_duration_ms')
+  if (videoShotMinDurationMs > videoShotMaxDurationMs) throw new Error('生产策略返回的视频镜头时长范围无效')
+  const scriptBreakdownDefaultShotDurationMs = positiveInteger('script_breakdown_default_shot_duration_ms')
+  if (
+    scriptBreakdownDefaultShotDurationMs < videoShotMinDurationMs
+    || scriptBreakdownDefaultShotDurationMs > videoShotMaxDurationMs
+  ) throw new Error('生产策略返回的母稿默认镜头时长无效')
+  const scriptBreakdownAutoSplitTriggerChars = positiveInteger('script_breakdown_auto_split_trigger_chars')
+  const scriptBreakdownAutoSplitTargetChars = positiveInteger('script_breakdown_auto_split_target_chars')
+  if (scriptBreakdownAutoSplitTargetChars > scriptBreakdownAutoSplitTriggerChars) {
+    throw new Error('生产策略返回的母稿自动分段阈值无效')
+  }
+  return {
+    recommendedMaxPending: positiveInteger('recommended_max_pending'),
+    recommendedMaxActivePerUser: positiveInteger('recommended_max_active_per_user'),
+    maxConcurrent: positiveInteger('max_concurrent'),
+    taskTimeoutSeconds: positiveNumber('task_timeout_seconds'),
+    videoShotMinDurationMs,
+    videoShotMaxDurationMs,
+    scriptBreakdownDefaultShotDurationMs,
+    scriptBreakdownDefaultFirstFrameContinuity: boolean('script_breakdown_default_first_frame_continuity'),
+    scriptBreakdownDefaultLastFrameContinuity: boolean('script_breakdown_default_last_frame_continuity'),
+    scriptBreakdownAutoSplitTriggerChars,
+    scriptBreakdownAutoSplitTargetChars,
+    activeTaskCount: nonNegativeInteger('active_task_count'),
+    userActiveTaskCount: nonNegativeInteger('user_active_task_count'),
+    confirmationRequired: boolean('confirmation_required'),
+    businessVolumeLimited: boolean('business_volume_limited'),
+  }
+}
 
 const isAmbiguousPublicationFailure = (error: unknown): boolean => {
   if (!error || typeof error !== 'object') return false
@@ -197,8 +310,10 @@ const workflowSelectionsPayload = (selections: ProductionWorkflowSelection[]) =>
   return { output_kind: selection.outputKind, h3_mode: selection.h3Mode, template_id: selection.templateId, parameters }
 })
 
-const mockBreakdown = (project: SeriesProject, options: ScriptBreakdownOptions): SeriesProject => {
+const mockBreakdown = (project: SeriesProject, options: ScriptBreakdownOptions): ScriptBreakdownResult => {
   const script = project.masterScript.trim()
+  const previousEpisodeCount = project.episodes.length
+  const previousShotCount = project.episodes.reduce((sum, episode) => sum + episode.shots.length, 0)
   if (!script) throw new Error('请先粘贴完整剧本')
   if (project.episodes.length && !options.replaceExisting) throw new Error('项目已有剧集；请勾选“替换现有剧集”或手工追加')
 
@@ -210,26 +325,90 @@ const mockBreakdown = (project: SeriesProject, options: ScriptBreakdownOptions):
   const timestamp = new Date().toISOString()
 
   project.episodes = chunks.map((chunk, episodeIndex) => {
-    const shotMatches = [...chunk.body.matchAll(/^(?:镜头|SHOT)\s*\d*\s*[：:.-]\s*(.+)$/gim)]
-    const actions = shotMatches.length
-      ? shotMatches.map((item) => item[1].trim())
+    const shotMatches = [...chunk.body.matchAll(/^(?:镜头|分镜|SHOT)\s*\d*\s*(.*)$/gim)]
+    const blocks = shotMatches.length
+      ? shotMatches.map((item, index) => `${item[1] || ''}${chunk.body.slice((item.index || 0) + item[0].length, shotMatches[index + 1]?.index ?? chunk.body.length)}`.trim())
       : chunk.body.split(/\n\s*\n|\n/).map((item) => item.trim()).filter(Boolean)
-    const shots: Shot[] = (actions.length ? actions : ['根据本集剧本建立开场镜头']).map((action, shotIndex) => ({
+    const plans = (blocks.length ? blocks : ['根据本集剧本建立开场镜头']).map((block) => {
+      const durationRaw = block.match(/[【[]\s*(?:时长|duration)\s*[=：:]\s*([^】\]]+)[】\]]/i)?.[1]?.trim()
+      const normalizedDuration = durationRaw?.replace(/\s+/g, '') || ''
+      const durationValue = normalizedDuration.includes(':')
+        ? (() => { const [minutes, seconds] = normalizedDuration.split(':', 2); return Number(minutes) * 60 + Number(seconds.replace(/(?:秒|s)$/i, '')) })()
+        : Number(normalizedDuration.replace(/(?:毫秒|ms|秒|s)$/i, ''))
+      const duration = Number.isFinite(durationValue) && durationValue > 0
+        ? (/(?:毫秒|ms)$/i.test(durationRaw || '') ? durationValue / 1000 : durationValue)
+        : options.defaultShotDuration
+      const booleanDirective = (name: string, fallback: boolean) => {
+        const value = block.match(new RegExp(`[【[]\\s*${name}\\s*[=：:]\\s*([^】\\]]+)[】\\]]`, 'i'))?.[1]?.trim().toLowerCase()
+        if (!value) return fallback
+        if (['是', 'true', '1', 'yes', 'on', '需要'].includes(value)) return true
+        if (['否', 'false', '0', 'no', 'off', '无', '不需要'].includes(value)) return false
+        return fallback
+      }
+      const cleaned = block.replace(
+        /[【[]\s*(?:时长|duration|首帧连续|尾帧连续|连续)\s*[=：:][^】\]]+[】\]]/gi,
+        '',
+      ).replace(/^\s*[：:.-]\s*/, '').trim()
+      const dialogueLines: string[] = []
+      const actionLines: string[] = []
+      for (const line of cleaned.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)) {
+        const parsedDialogue = parseDialogueText(line, project.bible.characters)
+        if (parsedDialogue?.length) { dialogueLines.push(line); continue }
+        const visible = line.replace(
+          /^(\s*[【[][^】\]]+[】\]]\s*)?(?:动作|ACTION)\s*[：:]\s*/i,
+          '$1',
+        )
+        actionLines.push(/^[【[]/.test(visible) ? visible : `[0s–${duration}s] ${visible}`)
+      }
+      return {
+        action: actionLines.join('\n') || `[0s–${duration}s] 根据本集剧本建立镜头`,
+        dialogue: dialogueLines.join('\n'),
+        duration,
+        firstFrame: booleanDirective('首帧连续', options.defaultFirstFrameContinuity),
+        lastFrame: booleanDirective('尾帧连续', options.defaultLastFrameContinuity),
+      }
+    })
+    const shots: Shot[] = plans.map((plan, shotIndex) => ({
       id: `shot-${Date.now()}-${episodeIndex}-${shotIndex}`, order: shotIndex + 1, title: `镜头 ${shotIndex + 1}`, mediaType: 'video',
-      duration: options.defaultShotDuration, mode: project.defaultMode, framing: '中景', camera: '稳定推轨，保持动作与视线连续', action, prompt: '', negativePrompt: project.bible.negativePrompt,
-      characterIds: project.bible.characters.filter((item) => action.includes(item.name)).map((item) => item.id),
-      sceneId: project.bible.scenes.find((item) => action.includes(item.name))?.id || project.bible.scenes[0]?.id,
-      propIds: project.bible.props.filter((item) => action.includes(item.name)).map((item) => item.id), referenceAssetIds: [], referenceBindings: { characters: [], props: [], videos: [], audios: [] },
-      audioEnabled: options.includeAudio, audio: { dialogue: '', soundscape: '依据场景生成连续环境声', music: '克制的叙事配乐' }, status: 'draft'
+      duration: plan.duration, mode: project.defaultMode, framing: '中景', camera: '稳定推轨，保持动作与视线连续', action: plan.action, prompt: '', negativePrompt: project.bible.negativePrompt,
+      characterIds: project.bible.characters.filter((item) => `${plan.action}\n${plan.dialogue}`.includes(item.name)).map((item) => item.id),
+      sceneId: project.bible.scenes.find((item) => plan.action.includes(item.name))?.id || project.bible.scenes[0]?.id,
+      propIds: project.bible.props.filter((item) => plan.action.includes(item.name)).map((item) => item.id), referenceAssetIds: [], referenceBindings: { characters: [], props: [], videos: [], audios: [] },
+      requiresFirstFrameContinuity: plan.firstFrame,
+      requiresLastFrameContinuity: plan.lastFrame,
+      audioEnabled: options.includeAudio, audio: { dialogue: plan.dialogue, soundscape: '依据场景生成连续环境声', music: '克制的叙事配乐' }, status: 'draft'
     }))
-    return { id: `episode-${Date.now()}-${episodeIndex}`, number: episodeIndex + 1, title: chunk.title || `第 ${episodeIndex + 1} 集`, synopsis: actions[0] || '', script: chunk.body.trim(), status: 'draft', multiShot: options.multiShot, audioEnabled: options.includeAudio, shots, createdAt: timestamp }
+    return { id: `episode-${Date.now()}-${episodeIndex}`, number: episodeIndex + 1, title: chunk.title || `第 ${episodeIndex + 1} 集`, synopsis: plans[0]?.action || '', script: chunk.body.trim(), status: 'draft', multiShot: options.multiShot, audioEnabled: options.includeAudio, shots, createdAt: timestamp }
   })
   project.updatedAt = timestamp
   const projects = loadLocal('cineforge_projects', mockProjects)
   const index = projects.findIndex((item) => item.id === project.id)
   if (index >= 0) projects[index] = project
   saveLocal('cineforge_projects', projects)
-  return clone(project)
+  return {
+    project: clone(project),
+    method: 'deterministic-script-breakdown-v2-mock',
+    warnings: [],
+    counts: {
+      episodes: project.episodes.length,
+      shots: project.episodes.reduce((sum, episode) => sum + episode.shots.length, 0),
+    },
+    cleared: {
+      episodes: options.replaceExisting ? previousEpisodeCount : 0,
+      shots: options.replaceExisting ? previousShotCount : 0,
+      generationTasks: 0,
+      assemblyJobs: 0,
+      promptArtifacts: 0,
+      generatedWorkflows: 0,
+      creativeDrafts: 0,
+      shotDetailDrafts: 0,
+      shotDetailBatches: 0,
+      shotDetailBatchItems: 0,
+      promptFieldTranslations: 0,
+      draftReleaseBundles: 0,
+      physicalOutputsRetained: true,
+    },
+  }
 }
 
 export const repository = {
@@ -275,6 +454,30 @@ export const repository = {
       model: '',
       failureMode: 'warn',
       languageGate: 'block',
+    }))
+  },
+  async getProductionCapability(): Promise<ProductionCapability> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<Record<string, unknown>>(
+        (await api.get('/capabilities/production/')).data,
+      )
+      return adaptProductionCapability(raw)
+    }, () => adaptProductionCapability({
+      recommended_max_pending: import.meta.env.VITE_MOCK_PRODUCTION_RECOMMENDED_MAX_PENDING,
+      recommended_max_active_per_user: import.meta.env.VITE_MOCK_PRODUCTION_RECOMMENDED_MAX_ACTIVE_PER_USER,
+      max_concurrent: import.meta.env.VITE_MOCK_PRODUCTION_MAX_CONCURRENT,
+      task_timeout_seconds: import.meta.env.VITE_MOCK_PRODUCTION_TASK_TIMEOUT_SECONDS,
+      video_shot_min_duration_ms: import.meta.env.VITE_MOCK_VIDEO_SHOT_MIN_DURATION_MS,
+      video_shot_max_duration_ms: import.meta.env.VITE_MOCK_VIDEO_SHOT_MAX_DURATION_MS,
+      script_breakdown_default_shot_duration_ms: import.meta.env.VITE_MOCK_SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS,
+      script_breakdown_default_first_frame_continuity: strictMockBoolean('VITE_MOCK_SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY', import.meta.env.VITE_MOCK_SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY),
+      script_breakdown_default_last_frame_continuity: strictMockBoolean('VITE_MOCK_SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY', import.meta.env.VITE_MOCK_SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY),
+      script_breakdown_auto_split_trigger_chars: import.meta.env.VITE_MOCK_SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS,
+      script_breakdown_auto_split_target_chars: import.meta.env.VITE_MOCK_SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS,
+      active_task_count: 0,
+      user_active_task_count: 0,
+      confirmation_required: true,
+      business_volume_limited: false,
     }))
   },
   async getTranslationCapability(): Promise<TranslationCapability> {
@@ -483,6 +686,7 @@ export const repository = {
       // would silently hide classified generic references (and `image` is not
       // a backend kind), so adapt first and filter the complete result here.
       const rows=adaptAssets(await fetchAllPages('/assets/', { style: backendStyleId(params?.style), search: params?.search, page_size: 500 }))
+        .filter((asset)=>asset.metadata?.usage !== 'project_cover')
       return params?.type?rows.filter((asset)=>asset.type===params.type):rows
     }, () => {
       const query = params?.search?.toLowerCase()
@@ -517,11 +721,68 @@ export const repository = {
       mimeType: payload.file.type, metadata: {}, tags: [payload.kind, '用户素材'],
     }))
   },
+  async setProjectCover(project: SeriesProject, file: File | null): Promise<SeriesProject> {
+    return fromConfiguredSource(async () => {
+      if (!file) {
+        const raw = unwrap<Record<string, unknown>>((await api.patch(`/projects/${project.id}/`, { cover_asset: null })).data)
+        return {
+          ...project,
+          coverAssetId: relationId(raw.cover_asset) || undefined,
+          coverUrl: String(raw.cover_url || '') || undefined,
+          updatedAt: String(raw.updated_at || project.updatedAt),
+        }
+      }
+
+      const form = new FormData()
+      const assetName = Array.from(`${project.title.trim() || '连续剧'} · 封面`).slice(0, 160).join('')
+      form.append('file', file, file.name)
+      form.append('kind', 'reference')
+      form.append('name', assetName)
+      form.append('metadata', JSON.stringify({ usage: 'project_cover', project_id: project.id }))
+      const rawAsset = unwrap<Record<string, unknown>>((await api.post('/assets/', form, {
+        headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120_000,
+      })).data)
+      const uploadedAssetId = relationId(rawAsset.id)
+      if (!uploadedAssetId) throw new Error('封面上传成功，但服务端未返回素材 ID')
+
+      try {
+        const raw = unwrap<Record<string, unknown>>((await api.patch(`/projects/${project.id}/`, {
+          cover_asset: uploadedAssetId,
+        })).data)
+        return {
+          ...project,
+          coverAssetId: relationId(raw.cover_asset) || uploadedAssetId,
+          coverUrl: String(raw.cover_url || '') || undefined,
+          updatedAt: String(raw.updated_at || project.updatedAt),
+        }
+      } catch (bindingError) {
+        try {
+          await api.delete(`/assets/${uploadedAssetId}/`)
+        } catch {
+          throw new Error('封面绑定失败，且已上传的临时封面未能自动清理，请稍后在素材管理中检查。')
+        }
+        throw bindingError
+      }
+    }, async () => {
+      const projects = loadLocal('cineforge_projects', mockProjects)
+      const index = projects.findIndex((item) => item.id === project.id)
+      if (index < 0) throw new Error('项目不存在')
+      const next: SeriesProject = {
+        ...projects[index],
+        coverAssetId: file ? `cover-${Date.now()}` : undefined,
+        coverUrl: file ? await fileDataUrl(file) : undefined,
+        updatedAt: new Date().toISOString(),
+      }
+      projects[index] = next
+      saveLocal('cineforge_projects', projects)
+      return clone(next)
+    })
+  },
   async updateAssetMetadata(assetId: string, payload: { name: string; description: string; promptHint: string; kind: BibleDraftEntityType | 'reference'; styleId?: string }): Promise<Asset> {
     return fromConfiguredSource(async () => {
       const raw = unwrap<Record<string, unknown>>((await api.patch(`/assets/${assetId}/`, {
         name: payload.name.trim(), description: payload.description.trim(), prompt_hint: payload.promptHint.trim(),
-        style: backendStyleId(payload.styleId) || null,
+        kind: payload.kind, style: backendStyleId(payload.styleId) || null,
       })).data)
       const asset = adaptAssets([raw])[0]
       if (!asset) throw new Error('保存成功，但服务端未返回可用的素材信息')
@@ -531,6 +792,11 @@ export const repository = {
       if (!existing) throw new Error('素材不存在')
       return { ...clone(existing), name: payload.name.trim(), description: payload.description.trim(), promptHint: payload.promptHint.trim(), type: payload.kind === 'reference' ? 'image' : payload.kind, backendKind: payload.kind, styleId: payload.styleId || '' }
     })
+  },
+  async deleteAsset(assetId: string): Promise<void> {
+    return fromConfiguredSource(async () => {
+      await api.delete(`/assets/${assetId}/`)
+    }, () => { if (!assetId.trim()) throw new Error('素材不存在') })
   },
   async generateBibleDraftFromAssets(
     projectId: string,
@@ -579,15 +845,21 @@ export const repository = {
   },
   async getProjects(): Promise<SeriesProject[]> {
     return fromConfiguredSource(async () => {
-      const raw = await fetchAllPages<Record<string, unknown>>('/projects/', { page_size: 500 })
-      return Promise.all(raw.map(adaptProject))
-    }, () => loadLocal('cineforge_projects', mockProjects))
+      const raw = await fetchAllPages<Record<string, unknown>>('/projects/', { page_size: 200 })
+      return raw.map((project) => adaptProjectSummary(project))
+    }, () => loadLocal('cineforge_projects', mockProjects).map((project) => ({
+      ...project,
+      episodeCount: project.episodes.length,
+      completedEpisodeCount: project.episodes.filter((episode) => episode.status === 'completed').length,
+      totalDurationSeconds: project.episodes.reduce((total, episode) => total + episode.shots.reduce((sum, shot) => sum + shot.duration, 0), 0),
+      detailLoaded: true,
+    })))
   },
   async getProject(id: string): Promise<SeriesProject> {
     return fromConfiguredSource(async () => adaptProject(unwrap<Record<string, unknown>>((await api.get(`/projects/${id}/`)).data)), () => {
       const project = loadLocal('cineforge_projects', mockProjects).find((item) => item.id === id)
       if (!project) throw new Error('项目不存在')
-      return project
+      return { ...project, episodeCount: project.episodes.length, completedEpisodeCount: project.episodes.filter((episode) => episode.status === 'completed').length, totalDurationSeconds: project.episodes.reduce((total, episode) => total + episode.shots.reduce((sum, shot) => sum + shot.duration, 0), 0), detailLoaded: true }
     })
   },
   async generateVisualRulesDraft(projectId: string, payload: {
@@ -663,12 +935,12 @@ export const repository = {
     })
   },
   async createProject(payload: Partial<SeriesProject>): Promise<SeriesProject> {
-    return fromConfiguredSource(async () => adaptProject(unwrap<Record<string, unknown>>((await api.post('/projects/', projectPayload(payload))).data)), () => {
+    return fromConfiguredSource(async () => adaptProjectSummary(unwrap<Record<string, unknown>>((await api.post('/projects/', projectPayload(payload))).data), true), () => {
       const projects = loadLocal('cineforge_projects', mockProjects)
       const timestamp = new Date().toISOString()
       const project: SeriesProject = {
-        id: `project-${Date.now()}`, title: payload.title || '未命名连续剧', logline: payload.logline || '', masterScript: payload.masterScript || '', continuitySummary: payload.continuitySummary || '', translationGlossary: payload.translationGlossary || {}, styleId: payload.styleId || 'wuxia', status: 'draft', aspectRatio: payload.aspectRatio || '9:16', resolution: payload.resolution || '720p', defaultMode: payload.defaultMode || 'Ref2VA',
-        bible: payload.bible || { characters: [], scenes: [], props: [], negativePrompt: '身份漂移，面部变化，服装变化，低清晰度，文字水印', colorScript: '' }, episodes: [], createdAt: timestamp, updatedAt: timestamp
+        id: `project-${Date.now()}`, title: payload.title || '未命名连续剧', logline: payload.logline || '', masterScript: payload.masterScript || '', isFavorite: payload.isFavorite === true, continuitySummary: payload.continuitySummary || '', translationGlossary: payload.translationGlossary || {}, styleId: payload.styleId || 'wuxia', status: 'draft', aspectRatio: payload.aspectRatio || '9:16', resolution: payload.resolution || '720p', defaultMode: payload.defaultMode || 'Ref2VA',
+        bible: payload.bible || { characters: [], scenes: [], props: [], negativePrompt: '身份漂移，面部变化，服装变化，低清晰度，文字水印', colorScript: '' }, episodes: [], episodeCount: 0, completedEpisodeCount: 0, totalDurationSeconds: 0, detailLoaded: true, createdAt: timestamp, updatedAt: timestamp
       }
       projects.unshift(project); saveLocal('cineforge_projects', projects); return clone(project)
     })
@@ -676,13 +948,42 @@ export const repository = {
   async updateProject(project: SeriesProject): Promise<SeriesProject> {
     return fromConfiguredSource(async () => {
       await api.patch(`/projects/${project.id}/`, projectPayload(project)); await syncBible(project)
-      return { ...project, updatedAt: new Date().toISOString() }
+      return adaptProject(unwrap<Record<string, unknown>>(
+        (await api.get(`/projects/${project.id}/`)).data,
+      ))
     }, () => {
       const projects = loadLocal('cineforge_projects', mockProjects)
       const next = { ...project, updatedAt: new Date().toISOString() }
       const index = projects.findIndex((item) => item.id === project.id)
       if (index >= 0) projects[index] = next; else projects.unshift(next)
       saveLocal('cineforge_projects', projects); return clone(next)
+    })
+  },
+  async setProjectFavorite(project: SeriesProject, favorite: boolean): Promise<SeriesProject> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<Record<string, unknown>>((await api.patch(`/projects/${project.id}/`, { is_favorite: favorite })).data)
+      return { ...project, isFavorite: raw.is_favorite === true, updatedAt: String(raw.updated_at || project.updatedAt) }
+    }, () => {
+      const projects = loadLocal('cineforge_projects', mockProjects)
+      const index = projects.findIndex((item) => item.id === project.id)
+      if (index < 0) throw new Error('项目不存在')
+      projects[index] = { ...projects[index], isFavorite: favorite, updatedAt: new Date().toISOString() }
+      saveLocal('cineforge_projects', projects)
+      return clone(projects[index])
+    })
+  },
+  async deleteProject(projectId: string): Promise<void> {
+    return fromConfiguredSource(async () => { await api.delete(`/projects/${projectId}/`) }, () => {
+      const workflows = loadLocal('cineforge_workflows', mockWorkflows)
+      const activeWorkflow = workflows.some((workflow) => (
+        workflow.projectId === projectId && ['queued', 'running', 'paused'].includes(workflow.status)
+      ))
+      if (activeWorkflow) throw new Error('项目仍有排队、运行或暂停中的任务，请等待任务结束后再删除')
+      const projects = loadLocal('cineforge_projects', mockProjects)
+      const next = projects.filter((item) => item.id !== projectId)
+      if (next.length === projects.length) throw new Error('项目不存在')
+      saveLocal('cineforge_projects', next)
+      saveLocal('cineforge_workflows', workflows.filter((workflow) => workflow.projectId !== projectId))
     })
   },
   async addEpisode(projectId: string, payload: Pick<Episode, 'title' | 'synopsis'> & { script?: string }): Promise<Episode> {
@@ -709,25 +1010,70 @@ export const repository = {
       storedProject.updatedAt = new Date().toISOString(); saveLocal('cineforge_projects', projects); return clone(episode)
     })
   },
-  async breakdownScript(project: SeriesProject, options: ScriptBreakdownOptions): Promise<SeriesProject> {
+  async saveShot(project: SeriesProject, episode: Episode, shot: Shot): Promise<Shot> {
+    return fromConfiguredSource(async () => syncShot(project, episode, shot), () => {
+      const projects = loadLocal('cineforge_projects', mockProjects)
+      const storedProject = projects.find((item) => item.id === project.id)
+      const storedEpisode = storedProject?.episodes.find((item) => item.id === episode.id)
+      if (!storedProject || !storedEpisode) throw new Error('项目或剧集不存在')
+      const index = storedEpisode.shots.findIndex((item) => item.id === shot.id)
+      if (index >= 0) storedEpisode.shots[index] = clone(shot); else storedEpisode.shots.push(clone(shot))
+      storedProject.updatedAt = new Date().toISOString()
+      saveLocal('cineforge_projects', projects)
+      return clone(shot)
+    })
+  },
+  async breakdownScript(project: SeriesProject, options: ScriptBreakdownOptions): Promise<ScriptBreakdownResult> {
     return fromConfiguredSource(async () => {
       if (!isBackendId(project.id)) throw new Error('当前项目不是后端项目，无法执行真实剧本拆解')
-      await api.post(`/projects/${project.id}/breakdown-script/`, {
+      const response = unwrap<Record<string, unknown>>((await api.post(`/projects/${project.id}/breakdown-script/`, {
         script: project.masterScript,
         episode_count_hint: options.episodeCountHint,
         default_shot_duration_ms: Math.round(options.defaultShotDuration * 1000),
         multi_shot: options.multiShot,
         include_audio: options.includeAudio,
-        replace_existing: options.replaceExisting
-      })
-      return adaptProject(unwrap<Record<string, unknown>>((await api.get(`/projects/${project.id}/`)).data))
+        default_first_frame_continuity: options.defaultFirstFrameContinuity,
+        default_last_frame_continuity: options.defaultLastFrameContinuity,
+        replace_existing: options.replaceExisting,
+        discard_existing_production: options.discardExistingProduction,
+      })).data)
+      const counts = response.counts && typeof response.counts === 'object'
+        ? response.counts as Record<string, unknown>
+        : {}
+      const cleared = response.cleared && typeof response.cleared === 'object'
+        ? response.cleared as Record<string, unknown>
+        : {}
+      return {
+        project: await adaptProject(unwrap<Record<string, unknown>>((await api.get(`/projects/${project.id}/`)).data)),
+        method: String(response.method || 'deterministic-script-breakdown-v2'),
+        warnings: Array.isArray(response.warnings) ? response.warnings.map(String) : [],
+        counts: {
+          episodes: Number(counts.episodes || 0),
+          shots: Number(counts.shots || 0),
+        },
+        cleared: {
+          episodes: Number(cleared.episodes || 0),
+          shots: Number(cleared.shots || 0),
+          generationTasks: Number(cleared.generation_tasks || 0),
+          assemblyJobs: Number(cleared.assembly_jobs || 0),
+          promptArtifacts: Number(cleared.prompt_artifacts || 0),
+          generatedWorkflows: Number(cleared.generated_workflows || 0),
+          creativeDrafts: Number(cleared.creative_drafts || 0),
+          shotDetailDrafts: Number(cleared.shot_detail_drafts || 0),
+          shotDetailBatches: Number(cleared.shot_detail_batches || 0),
+          shotDetailBatchItems: Number(cleared.shot_detail_batch_items || 0),
+          promptFieldTranslations: Number(cleared.prompt_field_translations || 0),
+          draftReleaseBundles: Number(cleared.draft_release_bundles || 0),
+          physicalOutputsRetained: cleared.physical_outputs_retained !== false,
+        },
+      }
     }, () => mockBreakdown(clone(project), options))
   },
   async generatePrompt(project: SeriesProject, episode: Episode, shot: Shot): Promise<H3PromptPayload> {
     return fromConfiguredSource(async () => {
       const isVideo = shot.mediaType !== 'image'
-      const safeDuration = Math.min(15, Math.max(5, Number(shot.duration || 5)))
-      if (isVideo) shot.duration = safeDuration
+      const safeDuration = Number(shot.duration)
+      if (isVideo && (!Number.isFinite(safeDuration) || safeDuration <= 0)) throw new Error('镜头时长必须是正数；允许范围以生产能力配置为准')
       const artifacts = unwrap<Array<Record<string, any>>>((await api.post('/prompts/generate/', { project_id: project.id, episode_id: episode.id, shot_ids: [shot.id], prompt_type: isVideo ? 'video' : 'image', h3_mode: shot.mode, reference_bindings: isVideo ? referenceBindingsPayload(shot.referenceBindings) : {}, reference_asset_ids: referenceAssetIdsForShot(shot), multi_shot: false, include_audio: isVideo && shot.audioEnabled, shot_durations: isVideo ? [{ shot_id: shot.id, duration_ms: Math.round(safeDuration * 1000) }] : [], overall_soundscape: isVideo ? shot.audio.soundscape : '', non_diegetic_music: isVideo ? shot.audio.music : '', extra_direction: '' })).data)
       const artifact = artifacts[0]
       if (!artifact) throw new Error('服务端未返回提示词产物')
@@ -983,7 +1329,7 @@ export const repository = {
       throw new Error('Mock 模式不会写入本地 ComfyUI 工作流库')
     })
   },
-  async createWorkflow(project: SeriesProject, episodeIds: string[], resolutionProfile: ProductionResolutionProfile = 'project', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = []): Promise<Workflow> {
+  async createWorkflow(project: SeriesProject, episodeIds: string[], resolutionProfile: ProductionResolutionProfile = 'project', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false, idempotencyKey = ''): Promise<Workflow> {
     const makeWorkflow = (taskIds: string[] = [], persist = false) => {
       const workflows = loadLocal('cineforge_workflows', mockWorkflows)
       const mockNodes: Workflow['nodes'] = [
@@ -998,7 +1344,10 @@ export const repository = {
       if (!isBackendId(project.id)) throw new Error('当前项目不是后端项目，无法提交真实生产任务')
       const payload = {
         ...(episodeIds.length ? { episode_ids: episodeIds } : {}),
+        multi_shot: false,
         enqueue: true,
+        idempotency_key: idempotencyKey,
+        extended_generation_confirmed: extendedGenerationConfirmed,
         priority: 0,
         max_attempts: 3,
         resolution_profile: resolutionProfile,
@@ -1008,16 +1357,26 @@ export const repository = {
         workflow_overrides: {},
         ...(workflowSelections.length ? { workflow_selections: workflowSelectionsPayload(workflowSelections) } : {})
       }
-      const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload)).data)
+      const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload, { timeout: 0 })).data)
       const taskIds = Array.isArray(result.task_ids)
         ? result.task_ids.map(String)
         : (result.production_units || []).map((unit: Record<string, any>) => unit.task_id).filter(Boolean).map(String)
       const flow = makeWorkflow(taskIds)
+      const batchId = String(result.batch_id || '')
+      const batchSize = Number(result.batch_size || taskIds.length || 0)
+      if (batchId) {
+        flow.batchId = batchId
+        flow.batchKind = String(result.batch_kind || 'series')
+        flow.batchIndex = 1
+        flow.batchSize = batchSize
+        flow.batchTaskIds = taskIds
+        flow.currentStep = `整剧生产批次 1/${batchSize} · 等待调度`
+      }
       if (!taskIds.length) flow.currentStep = '工作流已生成，暂无可执行镜头'
       return flow
     }, () => makeWorkflow([], true))
   },
-  async generateWholeEpisode(project: SeriesProject, episode: Episode, idempotencyKey: string, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = []): Promise<Workflow> {
+  async generateWholeEpisode(project: SeriesProject, episode: Episode, idempotencyKey: string, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false): Promise<Workflow> {
     const workflowFromUnit = (taskId: string, unit: Record<string, any>, index: number, taskIds: string[], batchId: string): Workflow => {
       const shotIds = Array.isArray(unit.shot_ids) ? unit.shot_ids.map(String) : []
       const shot = episode.shots.find((item) => shotIds.includes(item.id)) || episode.shots[index]
@@ -1046,6 +1405,7 @@ export const repository = {
         idempotency_key: idempotencyKey,
         multi_shot: false,
         enqueue: true,
+        extended_generation_confirmed: extendedGenerationConfirmed,
         priority: 0,
         max_attempts: 3,
         resolution_profile: resolutionProfile,
@@ -1055,7 +1415,7 @@ export const repository = {
         workflow_overrides: {},
         ...(workflowSelections.length ? { workflow_selections: workflowSelectionsPayload(workflowSelections) } : {})
       }
-      const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload)).data)
+      const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload, { timeout: 0 })).data)
       const units = Array.isArray(result.production_units) ? result.production_units as Record<string, any>[] : []
       const taskIds = Array.isArray(result.task_ids)
         ? result.task_ids.map(String)
@@ -1073,7 +1433,7 @@ export const repository = {
       return clone(flows[0])
     })
   },
-  async regenerateShot(project: SeriesProject, episode: Episode, shot: Shot, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = []): Promise<{ taskId: string; taskIds: string[] }> {
+  async regenerateShot(project: SeriesProject, episode: Episode, shot: Shot, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false): Promise<{ taskId: string; taskIds: string[] }> {
     return fromConfiguredSource(async () => {
       if (!isBackendId(project.id) || !isBackendId(episode.id) || !isBackendId(shot.id)) {
         throw new Error('请先保存项目和分镜，再提交真实视频生成任务')
@@ -1085,6 +1445,7 @@ export const repository = {
         include_audio: shot.mediaType === 'video' && shot.audioEnabled,
         h3_mode: shot.mode,
         enqueue: true,
+        extended_generation_confirmed: extendedGenerationConfirmed,
         priority: 0,
         max_attempts: 3,
         resolution_profile: resolutionProfile,
@@ -1096,7 +1457,7 @@ export const repository = {
         workflow_overrides: {},
         ...(workflowSelections.length ? { workflow_selections: workflowSelectionsPayload(workflowSelections) } : {})
       }
-      const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload)).data)
+      const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload, { timeout: 0 })).data)
       const taskIds = Array.isArray(result.task_ids)
         ? result.task_ids.map(String)
         : (result.production_units || []).map((unit: Record<string, any>) => unit.task_id).filter(Boolean).map(String)
@@ -1146,9 +1507,11 @@ export const repository = {
       return { id: taskId }
     })
   },
-  async retryGenerationTask(taskId: string): Promise<{ id: string }> {
+  async retryGenerationTask(taskId: string, extendedGenerationConfirmed = false): Promise<{ id: string }> {
     return fromConfiguredSource(async () => {
-      const raw = unwrap<Record<string, any>>((await api.post(`/tasks/${taskId}/retry/`, {})).data)
+      const raw = unwrap<Record<string, any>>((await api.post(`/tasks/${taskId}/retry/`, {
+        extended_generation_confirmed: extendedGenerationConfirmed,
+      })).data)
       return { id: String(raw.id || taskId) }
     }, () => {
       const workflows = loadLocal('cineforge_workflows', mockWorkflows)

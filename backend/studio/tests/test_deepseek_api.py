@@ -25,7 +25,48 @@ CONFIG = {
     "model": "deepseek-v4-flash",
     "timeout_seconds": 12,
     "max_retries": 0,
-    "max_tokens": 4096,
+    "max_tokens": 16384,
+}
+
+SHOT_DETAIL_POLICY = {
+    "recommended_zh_chars": 500,
+    "recommended_en_chars": 750,
+    "transport_zh_max_chars": 3000,
+    "transport_en_max_chars": 4500,
+    "output_tokens": 2304,
+    "context_max_chars": 18000,
+    "max_dialogue_per_shot": 2,
+    "minimum_duration_ms": 5000,
+    "maximum_duration_ms": 15000,
+    "maximum_generation_number": 1000000,
+    "project_title_max_chars": 200,
+    "project_logline_max_chars": 2000,
+    "project_continuity_summary_max_chars": 3000,
+    "project_color_script_max_chars": 2000,
+    "project_aspect_ratio_max_chars": 16,
+    "style_max_chars": 8000,
+    "glossary_max_terms": 200,
+    "glossary_source_max_chars": 160,
+    "glossary_target_max_chars": 240,
+    "reference_bindings_max_chars": 4000,
+    "shot_title_max_chars": 200,
+    "shot_narrative_max_chars": 2000,
+    "shot_detailed_description_max_chars": 3500,
+    "shot_camera_max_chars": 1000,
+    "shot_continuity_notes_max_chars": 1000,
+    "target_action_max_chars": 2000,
+    "target_sound_effects_max_chars": 1000,
+    "target_music_max_chars": 1000,
+    "target_h3_mode_max_chars": 16,
+    "dialogue_speaker_id_max_chars": 16,
+    "dialogue_text_max_chars": 240,
+    "dialogue_delivery_max_chars": 160,
+    "bible_max_characters": 20,
+    "bible_max_scenes": 1,
+    "bible_max_props": 30,
+    "bible_speaker_id_max_chars": 16,
+    "bible_entity_field_max_chars": 2000,
+    "feedback_max_chars": 2000,
 }
 
 
@@ -61,11 +102,15 @@ def shot_request():
             "action": "S1 watches the door", "dialogue": [],
             "sound_effects": "", "music": "", "continuity_notes": "",
             "duration_ms": 5000, "media_type": "video", "h3_mode": "T2VA",
-            "include_audio": False, "scene_id": None,
+            "include_audio": False,
+            "requires_first_frame_continuity": False,
+            "requires_last_frame_continuity": True,
+            "scene_id": None,
             "character_ids": [], "prop_ids": [], "reference_bindings": {},
         },
         "boundaries": {"previous": None, "next": None},
         "bible": {"characters": [], "scenes": [], "props": []},
+        "shot_detail_policy": SHOT_DETAIL_POLICY,
         "attempt": 1, "seed": 44, "max_new_tokens": 2304, "feedback": "",
     }
 
@@ -234,30 +279,90 @@ class DeepSeekStructuredTests(SimpleTestCase):
         self.assertNotIn("test-secret-key", json.dumps(result))
 
     @patch("studio.services.deepseek_api.requests.post")
-    def test_structured_empty_or_length_output_is_rejected(self, post):
+    def test_strict_validation_error_carries_bounded_structured_candidate(self, post):
+        detail_zh = "镜头缓慢推进，S1 注视门边阴影，最后保持静止。"
+        detail_en = (
+            "The camera slowly pushes in as S1 watches the shadow by the door "
+            "and finally remains still."
+        )
+        post.return_value = response(json.dumps({
+            "schema_version": 2,
+            "detail_zh": detail_zh,
+            "detail_en": detail_en,
+            "unexpected_transport_field": "must not cross the error boundary",
+        }))
+
+        with self.assertRaises(DeepSeekAPIError) as caught:
+            run_structured_operation(shot_request())
+
+        error = caught.exception
+        self.assertEqual(error.code, "shot_high_detail_validation_failed")
+        self.assertEqual(error.structured_candidate, {
+            "schema_version": 2,
+            "detail_zh": detail_zh,
+            "detail_en": detail_en,
+        })
+        self.assertNotIn("unexpected_transport_field", error.structured_candidate)
+        self.assertNotIn(detail_zh, json.dumps(error.runtime_metadata, ensure_ascii=False))
+        self.assertNotIn(detail_en, str(error))
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_structured_empty_or_unparseable_incomplete_output_is_rejected(self, post):
         post.side_effect = [
             response("", finish_reason="stop"),
-            response("{}", finish_reason="length"),
+            response("{", finish_reason="length"),
         ]
 
         with self.assertRaises(DeepSeekAPIError) as empty:
             run_structured_operation(shot_request())
-        with self.assertRaises(DeepSeekAPIError) as length:
+        with self.assertRaises(DeepSeekAPIError) as invalid_json:
             run_structured_operation(shot_request())
 
         self.assertEqual(empty.exception.code, "shot_high_detail_empty_output")
-        self.assertEqual(length.exception.code, "shot_high_detail_output_budget_exhausted")
+        self.assertEqual(invalid_json.exception.code, "shot_high_detail_output_invalid_json")
+        self.assertTrue(invalid_json.exception.runtime_metadata["incomplete"])
+        self.assertEqual(invalid_json.exception.runtime_metadata["finish_reason"], "length")
+        self.assertEqual(invalid_json.exception.runtime_metadata["usage"]["total_tokens"], 10)
 
     @patch("studio.services.deepseek_api.requests.post")
-    def test_structured_transport_never_exceeds_configured_max_tokens(self, post):
-        post.return_value = response(json.dumps({
-            "schema_version": 1, "detail_zh": "镜头推近。", "detail_en": "The camera pushes in.",
-        }))
+    def test_parseable_nonstop_structured_output_becomes_reviewable_candidate(self, post):
+        candidate = json.dumps({
+            "schema_version": 1,
+            "detail_zh": "镜头缓慢推进，S1 注视门边阴影，最后保持静止。",
+            "detail_en": (
+                "The camera slowly pushes in as S1 watches the shadow by the door "
+                "and finally remains still."
+            ),
+        })
+        post.side_effect = [
+            response(candidate, finish_reason="length"),
+            response(candidate, finish_reason="content_filter"),
+        ]
 
+        for reason in ("length", "content_filter"):
+            with self.subTest(reason=reason):
+                result = run_structured_operation(shot_request())
+
+                self.assertTrue(result["ok"])
+                self.assertTrue(result["metadata"]["incomplete"])
+                self.assertEqual(result["metadata"]["finish_reason"], reason)
+                self.assertEqual(result["metadata"]["usage"]["total_tokens"], 10)
+                issue = next(
+                    item for item in result["review_issues"]
+                    if item["code"] == "model_output_incomplete_finish_reason"
+                )
+                self.assertEqual(issue["severity"], "risk")
+                self.assertEqual(issue["path"], "result")
+                self.assertNotIn(candidate, json.dumps(issue, ensure_ascii=False))
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_structured_transport_rejects_oversized_budget_before_http(self, post):
         with override_settings(DEEPSEEK_API={**CONFIG, "max_tokens": 2100}):
-            run_structured_operation(shot_request())
+            with self.assertRaises(DeepSeekConfigurationError) as caught:
+                run_structured_operation(shot_request())
 
-        self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 2100)
+        self.assertEqual(caught.exception.code, "deepseek_output_budget_exceeded")
+        post.assert_not_called()
 
     @patch("studio.services.deepseek_api._protocol_module")
     def test_remote_creative_schema_uses_1000_without_widening_local_schema(
@@ -316,12 +421,22 @@ class DeepSeekStructuredTests(SimpleTestCase):
         from studio.services.deepseek_api import _deepseek_creative_max_tokens
 
         self.assertEqual(
-            _deepseek_creative_max_tokens(SimpleNamespace(max_tokens=1664, shot_count=2)),
+            _deepseek_creative_max_tokens(SimpleNamespace(
+                max_tokens=1664, shot_count=2, output_headroom_per_shot=384,
+            )),
             2432,
         )
         self.assertEqual(
-            _deepseek_creative_max_tokens(SimpleNamespace(max_tokens=2304, shot_count=4)),
+            _deepseek_creative_max_tokens(SimpleNamespace(
+                max_tokens=2304, shot_count=4, output_headroom_per_shot=384,
+            )),
             3840,
+        )
+        self.assertEqual(
+            _deepseek_creative_max_tokens(SimpleNamespace(
+                max_tokens=6656, shot_count=11, output_headroom_per_shot=384,
+            )),
+            10880,
         )
 
     @patch("studio.services.deepseek_api._protocol_module")
@@ -331,7 +446,7 @@ class DeepSeekStructuredTests(SimpleTestCase):
     ):
         request = SimpleNamespace(
             request_id="creative-test", source_fingerprint="b" * 64,
-            max_tokens=1664, shot_count=1,
+            max_tokens=1664, shot_count=1, output_headroom_per_shot=384,
         )
         decoded = {
             "schema_version": 1,
@@ -405,7 +520,7 @@ class DeepSeekStructuredTests(SimpleTestCase):
     ):
         request = SimpleNamespace(
             request_id="creative-test", source_fingerprint="c" * 64,
-            max_tokens=1664, shot_count=2,
+            max_tokens=1664, shot_count=2, output_headroom_per_shot=384,
         )
         decoded = {
             "schema_version": 1,
@@ -478,7 +593,7 @@ class DeepSeekStructuredTests(SimpleTestCase):
     ):
         request = SimpleNamespace(
             request_id="creative-test", source_fingerprint="b" * 64,
-            max_tokens=1664, shot_count=1,
+            max_tokens=1664, shot_count=1, output_headroom_per_shot=384,
         )
         secret_prose = "private candidate prose"
 

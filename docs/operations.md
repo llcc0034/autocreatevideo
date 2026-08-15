@@ -8,7 +8,7 @@
 
 - Windows PowerShell、Python 3.11、Node.js 22 与 npm。
 - `ffmpeg.exe` 和 `ffprobe.exe` 均可从 `Path` 找到。
-- 可访问的 ComfyUI；由仓库脚本管理便携版时，通过 `AUTOPROMPT_COMFYUI_ROOT` 指定其根目录。
+- 可访问的 ComfyUI；由仓库脚本管理便携版时，提供可解析的便携版根目录或对应的 `ComfyUI\output` 绝对路径。
 - 足够容纳 Django 媒体、ComfyUI 输出、模型、临时文件和备份的磁盘空间。
 - SQLite 只用于单机开发。生产部署使用 PostgreSQL。
 
@@ -31,6 +31,8 @@
 
 - 本地 `COMFYUI_OUTPUT_DIR` 指向 ComfyUI 的真实输出目录。
 - Docker 的 `COMFYUI_OUTPUT_HOST_DIR` 是宿主机绝对路径，容器内固定读取 `/comfyui-output`。
+- 本地重启脚本解析便携版根目录的优先级为：显式 `-ComfyUIRoot` 或 `AUTOPROMPT_COMFYUI_ROOT`；进程环境的 `COMFYUI_OUTPUT_DIR`；`backend/.env` 的 `COMFYUI_OUTPUT_DIR`；进程环境的 `COMFYUI_OUTPUT_HOST_DIR`；根目录 `.env` 的 `COMFYUI_OUTPUT_HOST_DIR`。
+- 通过输出目录反推时只接受绝对路径 `<portable-root>\ComfyUI\output`。目录名按该层级严格匹配；候选根目录只有同时存在 `python_embeded\python.exe` 与 `ComfyUI\main.py` 才有效。显式便携版根目录在启动前也必须通过相同的文件校验。
 - `MEDIA_ROOT`、ComfyUI 输出目录、备份目录不得互相重叠。
 - 同一台机器上的 API、生成 worker 与本地 Qwen 必须解析到同一个 `LOCAL_QWEN_LOCK_PATH`。
 
@@ -110,7 +112,7 @@ try {
 
 ## 本地启动与停止
 
-由脚本管理 ComfyUI 时先提供便携版根目录：
+由脚本管理 ComfyUI 时，可以直接提供便携版根目录：
 
 ```powershell
 $ComfyUIRoot = Read-Host '请输入 ComfyUI 便携版根目录'
@@ -118,7 +120,16 @@ $env:AUTOPROMPT_COMFYUI_ROOT = (Resolve-Path -LiteralPath $ComfyUIRoot).Path
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart.ps1 -OpenBrowser
 ```
 
-也可以双击 `restart-all.cmd`。启动顺序为数据库迁移、seed、装配记录恢复、ComfyUI 探测、Django API、生成 worker、装配 worker 和 Vue。脚本仅监听回环地址，运行状态写入 `.runtime/services.json`，标准输出和错误输出写入 `.runtime/logs/`。只有 `/api/v1/health/ready/` 返回成功，脚本才报告就绪。
+也可以由输出目录反推。以下值可放在进程环境；本地 Django 常用的 `COMFYUI_OUTPUT_DIR` 也可写入 `backend/.env`，Docker 宿主机的 `COMFYUI_OUTPUT_HOST_DIR` 也可写入根目录 `.env`：
+
+```powershell
+$env:COMFYUI_OUTPUT_DIR = 'C:\path\to\ComfyUI_windows_portable\ComfyUI\output'
+powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\restart.ps1 -OpenBrowser
+```
+
+输出目录不符合 `<portable-root>\ComfyUI\output`，或反推根目录缺少 `python_embeded\python.exe` / `ComfyUI\main.py` 时，该候选无效。所有候选均无效且未使用 `-SkipComfyUI` 时，脚本停止并报告配置错误。
+
+也可以双击 `restart-all.cmd`。脚本先根据 `.runtime/services.json` 逐项核对并停止已登记服务；若某项停止失败，会继续尝试其余项，但只要对应 PID 仍存活就会在启动新服务前中止，避免重复运行 worker。随后顺序为数据库迁移、seed、装配记录恢复、ComfyUI 探测、Django API、生成 worker、装配 worker 和 Vue。脚本仅监听回环地址，运行状态写入 `.runtime/services.json`，标准输出和错误输出写入 `.runtime/logs/`。只有 `/api/v1/health/ready/` 返回成功，脚本才报告就绪。
 
 常用选项：
 
@@ -181,12 +192,64 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 DeepSeek 为可选远程通道：
 
 - 设置 `DEEPSEEK_ENABLED=true` 时必须提供 `DEEPSEEK_API_KEY`。
-- `DEEPSEEK_BASE_URL`、模型、超时、重试和 token 上限由对应环境变量控制。
+- `DEEPSEEK_BASE_URL`、模型、超时、重试和 token 上限由对应环境变量控制；默认 `DEEPSEEK_MAX_TOKENS=16384`，低于本次结构化草稿所需预算时会在发送前失败，不会静默截断。
 - 选择 DeepSeek 会向外部服务发送完成操作所需的提示词和项目上下文。
 - 远程失败会直接报告，不会静默切换到本地 Qwen。
-- 标准 Compose 只把 DeepSeek 密钥注入 backend，不注入生成 worker、装配 worker 或前端；本地进程共用 `backend/.env`，应按包含密钥的后端进程统一保护。
+- 标准 Compose 把 DeepSeek 密钥注入 backend 和 generation worker，因为整集高细节批次由 worker 调用该服务；不注入装配 worker或前端。两类进程和本地 `backend/.env` 都按含密钥的后端进程保护。
+
+正式镜头与 H3 生产共用 `VIDEO_SHOT_MIN_DURATION_MS`、`VIDEO_SHOT_MAX_DURATION_MS` 这一组权威时长范围，默认分别为 5000 与 15000。两者必须为正数且有序，并落在默认 124 至 362 的 `H3_MIN_ALIGNED_FRAMES` / `H3_MAX_ALIGNED_FRAMES` 可表达范围内；四项都可通过环境配置修改。各 provider 的 `*_CREATIVE_MIN_SHOT_DURATION_MS` 与 `*_CREATIVE_MAX_SHOT_DURATION_MS` 还必须位于该全局时长范围内。修改后重启所有 backend/worker 进程，并从生产能力接口读取生效值；页面、拆稿和 H3 参数校验不得保留另一组固定秒数。
 
 `PROMPT_TRANSLATION_DEFAULT_PROVIDER` 和 `PROMPT_CREATIVE_DEFAULT_PROVIDER` 只接受 `local_qwen` 或 `deepseek_api`。远程同步请求还受 Gunicorn 120 秒与 Nginx 125 秒限制；提供方客户端超时不是可用的 HTTP 等待时长证明。
+
+创作容量按 provider 独立配置。`*_RECOMMENDED_MAX_SHOTS` 是需要用户确认的耗时/成本阈值，并不是失败上限；`*_BATCH_SHOTS` 是一次模型调用处理的镜数，同样不是单集、整剧或业务总镜数上限。默认 DeepSeek 为推荐 4、每次调用 1 镜，本地 Qwen 为推荐 4、每次调用 4 镜。页面从能力 API 的 `providers[]` 读取当前值；镜数超出建议范围、权威剧本超过单批参考值、对白密度超过建议值，或权威标题/对白长度超过建议值时必须发送 `extended_generation_confirmed=true`，服务端仍保留完整业务镜数、剧本和对白。初次整稿 `generate` 与不带 `shot_keys` 的整稿 `regenerate` 会优先保留母稿中的显式镜头或空行段落边界，再按配置逐次调用；DeepSeek 默认逐镜生成，后一镜只接收前一镜的已校验连续性边界。可解析的完整或部分返回都保存为审核草稿，带 `shot_keys` 的选镜重生成仍为单次协议。
+
+| 配置 | DeepSeek 默认 | 本地 Qwen 默认 | 作用 |
+| --- | ---: | ---: | --- |
+| `*_CREATIVE_MIN_SHOTS` | 1 | 1 | 最小镜数 |
+| `*_CREATIVE_RECOMMENDED_MAX_SHOTS` | 4 | 4 | 超出时要求用户确认 |
+| `*_CREATIVE_BATCH_SHOTS` | 1 | 4 | 单次模型调用镜数；不得作为业务总镜数拒绝条件 |
+| `*_CREATIVE_MAX_DIALOGUE_PER_SHOT` | 2 | 2 | 每镜权威对白密度建议；确认后可按本次实际需要扩展 |
+| `*_CREATIVE_MAX_EPISODE_TITLE_CHARS` | 80 | 80 | 剧集标题长度建议；超出需确认 |
+| `*_CREATIVE_MAX_DIALOGUE_TEXT_CHARS` | 240 | 240 | 单句权威对白正文长度建议；超出需确认 |
+| `*_CREATIVE_MAX_DIALOGUE_DELIVERY_CHARS` | 100 | 100 | 单句中文表演描述长度建议；超出需确认 |
+| `*_CREATIVE_MAX_DIALOGUE_DELIVERY_EN_CHARS` | 150 | 150 | 单句英文表演描述字符预算 |
+| `*_CREATIVE_MIN_SHOT_DURATION_MS` | 5000 | 5000 | 生成镜头最短时长 |
+| `*_CREATIVE_MAX_SHOT_DURATION_MS` | 15000 | 15000 | 生成镜头最长时长；不得低于最短时长 |
+| `*_CREATIVE_OUTPUT_MIN_TOKENS` | 1024 | 1024 | 动态输出预算下限 |
+| `*_CREATIVE_OUTPUT_BASE_TOKENS` | 768 | 768 | 动态输出预算固定基数 |
+| `*_CREATIVE_OUTPUT_TOKENS_PER_SHOT` | 384 | 384 | 每个目标镜头追加的输出预算 |
+| `*_CREATIVE_OUTPUT_TOKENS_PER_DIALOGUE` | 128 | 128 | 每句权威对白追加的输出预算 |
+| `*_CREATIVE_OUTPUT_DIALOGUE_CHAR_THRESHOLD` | 32 | 32 | 超过该字符数后继续增加对白预算；允许为 0 |
+| `*_CREATIVE_MAX_SOURCE_CHARS` | 24000 | 16000 | 源故事上下文字符预算 |
+| `*_CREATIVE_MAX_REGENERATION_CONTEXT_CHARS` | 96000 | 16000 | 重生成草稿字符预算 |
+| `*_CREATIVE_MAX_INPUT_CHARS` | 120000 | 24000 | 总输入字符预算 |
+| `*_CREATIVE_OUTPUT_HEADROOM_PER_SHOT` | 384 | 0 | provider 传输层每镜额外输出余量；允许为 0 |
+
+表中 DeepSeek 前缀是 `DEEPSEEK`，本地 Qwen 前缀是 `QWEN`。推荐镜数是用户确认阈值，单批规划值是初次生成与整稿重生成的内部单次调用规划值，两者相互独立；配置只要求二者分别不低于最小镜数，因此“推荐 11、单批 4”是合法配置。另要求最短镜头时长 ≤ 最长镜头时长，源与重生成预算不能超过总输入预算；正数项、允许为 0 的阈值及格式关系错误都会阻止后端启动。修改后重启 backend，并重新读取能力接口确认生效。不要修改已落盘草稿的 `input_settings`，其中保存的是生成当时的确认、策略和本次有效容量快照。初次整稿与整稿重生成会尝试安全分批；对白差异会由权威 manifest 回填，后续批次失败时保留已获得的可解析镜头。只有调用前无法规划或完全没有可物化镜头时显式失败。选镜重生成不自动分批，token 不足会在外部 HTTP 前以 `creative_output_budget_exceeded` 或 `deepseek_output_budget_exceeded` 显式失败；应调整 provider 配置或选用具备足够能力的通道，不应减少业务目标镜数。
+
+草稿内容审核建议统一使用 `CREATIVE_REVIEW_*` 环境变量：14 个 `CREATIVE_REVIEW_RECOMMENDED_{TITLE|NARRATIVE|CAMERA|ACTION|CONTINUITY|SOUNDSCAPE|MUSIC}_{ZH|EN}_CHARS` 分别控制中英文字段的建议字符数，`CREATIVE_REVIEW_MAX_CAMERA_MOVEMENTS`、`CREATIVE_REVIEW_MAX_ACTION_SEQUENCE_MARKERS` 和 `CREATIVE_REVIEW_MIN_SCRIPT_ACTION_COVERAGE_PERCENT` 控制运镜密度、动作序列密度和脚本动作覆盖提醒。字符数与数量必须为正整数，覆盖率必须在 1–100；非法值会阻止后端启动。这些值会随每个 provider 能力行返回并写入草稿策略快照。超过建议值只生成可确认的 `review_issues`，不会丢弃模型返回、截断字段或阻止保存草稿；前端编辑器不设置对应 `maxlength`。
+
+本地 Qwen 的上下文与清理余量同样只从环境配置读取：`QWEN_CREATIVE_CONTEXT_SIZE=8192` 必须位于 `QWEN_CREATIVE_MIN_CONTEXT_SIZE=8192` 与 `QWEN_CREATIVE_MAX_CONTEXT_SIZE=32768` 之间，并至少为输入保留 `QWEN_CREATIVE_RESERVED_INPUT_TOKENS=2048`；父进程等待时间为 `QWEN_CREATIVE_TIMEOUT_SECONDS` 加 `QWEN_CREATIVE_PROCESS_CLEANUP_GRACE_SECONDS=60`。这些值会随本地 provider 能力行返回，页面不得复制固定阈值。非法关系会阻止后端启动，不能在运行时回退到旧常量。
+
+逐镜/整集高细节扩写统一使用 `SHOT_DETAIL_*` 公共策略，并由 `QWEN_SHOT_DETAIL_*`、`DEEPSEEK_SHOT_DETAIL_*` 覆盖 provider 预算。`GET /api/v1/capabilities/creative-drafts/` 返回每个 provider 的最终 resolved policy；每份 draft 的 `input_settings.policy` 和每个批次的 `policy_snapshot` 保存生成当时实际值。
+
+| 配置 | 默认 | 作用 |
+| --- | ---: | --- |
+| `SHOT_DETAIL_RECOMMENDED_ZH_CHARS` / `SHOT_DETAIL_RECOMMENDED_EN_CHARS` | 500 / 750 | 人工审核建议；超过只产生提示 |
+| `SHOT_DETAIL_TRANSPORT_ZH_MAX_CHARS` / `SHOT_DETAIL_TRANSPORT_EN_MAX_CHARS` | 3000 / 4500 | 应用前配置阈值；模型正文超过时完整保留为 `requires_edit` 候选，不截断、不直接丢弃 |
+| `SHOT_DETAIL_OUTPUT_TOKENS` / `SHOT_DETAIL_CONTEXT_MAX_CHARS` | 2304 / 18000 | provider 未覆盖时的公共输出与上下文预算 |
+| `SHOT_DETAIL_REVIEW_MIN_*_CHARS` / `SHOT_DETAIL_REVIEW_NEAR_*_MARGIN_CHARS` | 100/160 / 20/30 | 中英文过短和接近推荐长度的审核提示阈值；margin 可为 0 |
+| `QWEN_SHOT_DETAIL_OUTPUT_TOKENS` / `QWEN_SHOT_DETAIL_CONTEXT_MAX_CHARS` | 2304 / 18000 | 本地 provider 实际预算 |
+| `DEEPSEEK_SHOT_DETAIL_OUTPUT_TOKENS` / `DEEPSEEK_SHOT_DETAIL_CONTEXT_MAX_CHARS` | 2304 / 18000 | DeepSeek provider 实际预算 |
+| `QWEN_SHOT_DETAIL_RECOMMENDED_MAX_SHOTS` / `DEEPSEEK_SHOT_DETAIL_RECOMMENDED_MAX_SHOTS` | 4 / 16 | 整集创建的耗时/成本确认阈值，不是总镜数上限 |
+| `QWEN_SHOT_DETAIL_*` / `DEEPSEEK_SHOT_DETAIL_*` 请求 envelope | 见 `.env.example` | 分 provider 配置项目、风格、术语、参考绑定、镜头字段、对白、Bible 与 feedback 的 29 项输入范围；不存在代码内第二套固定值 |
+| `SHOT_DETAIL_MAX_GENERATION_NUMBER` | 1000000 | 单镜草稿版本/尝试序号协议范围 |
+| `SHOT_DETAIL_MAX_ATTEMPTS` / `SHOT_DETAIL_RETRY_SECONDS` | 3 / 5 | worker 每镜失败重试次数与间隔秒数 |
+| `SHOT_DETAIL_STALE_MINUTES` | 30 | 失联 item claim 恢复阈值 |
+| `SHOT_DETAIL_LEASE_SAFETY_SECONDS` | 60 | provider 最长执行时间之外的 claim 安全余量；启动时强制 stale 时长更长 |
+| `VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS` | 示例 720000；未提供为 0 | 浏览器等待同步单镜扩写的超时；设为 `0` 表示由服务端超时负责，整集异步批次不依赖此值 |
+
+所有数值关系在 Django 启动时校验。修改后同时重启 backend 和 generation worker；只重启一个进程会造成能力响应、入队快照与执行预算不一致。`shared_resource_busy` 是瞬时调度状态：允许批次入队并由 worker 重试，不得当成 provider 未配置。generation worker 每轮先领取 ComfyUI 任务，没有媒体任务时才串行领取一个逐镜扩写 item；不要再启动同步 HTTP 模型旁路。
 
 H3 提示词优化器是独立的可选外部通道。保持 `H3_PROMPT_OPTIMIZER_ENABLED=false` 可阻止该通道外发；启用非回环地址时需要 HTTPS、密钥和显式的非回环许可。
 
@@ -194,10 +257,12 @@ H3 提示词优化器是独立的可选外部通道。保持 `H3_PROMPT_OPTIMIZE
 
 长耗时 GPU 与 FFmpeg 工作都由持久 worker 执行，浏览器只负责创建任务和读取状态。操作要求如下：
 
-- 通过 UI 或 API 创建、取消和重试任务，不直接修改队列表。
-- `TASK_MAX_PENDING`、`TASK_MAX_ACTIVE_PER_USER` 和 `TASK_MAX_CONCURRENT` 控制容量；单 GPU 配置保持 `TASK_MAX_CONCURRENT=1`。
-- 仅对具有明确终态的任务执行重试；重试创建引用同一不可变工作流的新任务记录。
-- worker 启动时核对失联任务，并以持久 Prompt ID 与 ComfyUI 队列和结果接口为依据处理。
+- 通过 UI 或 API 创建、取消和重试任务，不直接修改队列表。`POST /tasks/`、`POST /tasks/{id}/retry/` 与整集/整剧构建共用队列推荐策略；收到 `production_queue_confirmation_required` 后必须由用户决定取消或以 `extended_generation_confirmed=true` 原样重发，服务端不会自动确认。
+- `TASK_RECOMMENDED_MAX_PENDING` 与 `TASK_RECOMMENDED_MAX_ACTIVE_PER_USER` 只控制长队列确认提示，不限制整剧总集数或总镜数；确认后完整排队。`TASK_MAX_CONCURRENT` 控制真实执行并发，单 GPU 配置保持为 `1`。`SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS` 控制单次母稿输入字符预算，可通过环境配置调整。
+- 母稿拆解默认值由 `SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS`、`SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY` 与 `SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY` 控制；默认时长必须位于 `VIDEO_SHOT_MIN_DURATION_MS` 和 `VIDEO_SHOT_MAX_DURATION_MS` 之间。`SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS` 与 `SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS` 控制没有显式镜头标记时的确定性长段落切分，必须满足 `1 <= target <= trigger`。布尔配置只接受 true/false、1/0、yes/no 或 on/off。非法配置会阻止后端启动；修改后重启并读取 `/api/v1/capabilities/production/` 核对实际值。
+- 仅对具有明确终态的任务执行重试；重试创建引用同一不可变工作流的新任务记录。队列确认只允许继续排队，不会改变该工作流参数或提高 worker 并发。
+- generation worker 启动时同时核对失联 ComfyUI 任务和逐镜扩写 item；前者以持久 Prompt ID 与 ComfyUI 队列/结果接口恢复，后者以 claim token、heartbeat 和已关联 draft 恢复。
+- 已持久化 Prompt ID 的 `/history` 或 `/queue` 单次轮询错误按远端降级记录；worker 保持同一 ID 并继续核对，不因此再次调用 `/prompt`。保留 token 且提交状态未进入终态的记录由恢复循环核对：远端仍存在时接续同一任务；健康的 ComfyUI 明确报告 ID 不在队列和历史中时，将原任务保留为失败记录并终结该 ID，之后只能通过显式重试创建新任务。
 - 装配 API 返回持久 job；通过 job 状态确认成功，不以 HTTP 请求持续时间判断 FFmpeg 是否完成。
 - 单镜公开副本由受管分发流程生成，并包含配置的 AI 标识和完整性信息。不要把私有 ComfyUI 路径或原始媒体路径当作发行地址。
 

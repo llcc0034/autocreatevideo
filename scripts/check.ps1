@@ -85,11 +85,21 @@ try {
     Assert-NativeSuccess 'Global visual rules draft tests'
     npm run test:manual
     Assert-NativeSuccess 'Versioned production operator manual tests'
+    npm run test:workflow-selection
+    Assert-NativeSuccess 'Production workflow selection entry tests'
+    npm run test:projects
+    Assert-NativeSuccess 'Series project management tests'
+    npm run test:assets
+    Assert-NativeSuccess 'Asset management tests'
 } finally {
     Pop-Location
 }
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_backup_restore.ps1')
 Assert-NativeSuccess 'Backup and restore safety tests'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_restart_config.ps1')
+Assert-NativeSuccess 'Restart configuration tests'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_restart_processes.ps1')
+Assert-NativeSuccess 'Restart process cleanup tests'
 
 Write-Host 'All checks passed.'

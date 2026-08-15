@@ -5,6 +5,8 @@ import test from 'node:test'
 import {
   adaptShotDetailDraft,
   adaptShotDetailDraftApplyResult,
+  adaptShotDetailDraftBatchApplyResult,
+  adaptShotDetailDraftBatchDetail,
   shotDetailDraftDataPayload,
   shotDetailDraftEditorWarnings,
   shotDetailDraftIsEditable,
@@ -58,18 +60,39 @@ test('parseable high-detail candidates retain structured review issues for human
   assert.equal(candidate.reviewIssues[0].suggestionZh, '核对镜头向右移动是否与中文候选一致。')
 })
 
-test('single-shot detail payload and local checks enforce 500 Chinese and 750 English limits', () => {
+test('high-detail protocol salvage and missing-language issues use accurate operator copy', () => {
+  assert.match(shotDetailDraftReviewIssueTitle({
+    code: 'model_output_protocol_validation_failed', severity: 'requires_edit',
+    path: 'result', field: 'detailZh',
+  }), /模型已返回可编辑正文/)
+  assert.match(shotDetailDraftReviewIssueTitle({
+    code: 'detail_en_missing', severity: 'requires_edit',
+    path: 'detail_en', field: 'detailEn',
+  }), /候选内容不完整/)
+})
+
+test('single-shot detail payload and local checks use capability policy limits', () => {
   const draft = adaptShotDetailDraft(rawDraft)
   const payload = shotDetailDraftDataPayload(draft.draftData)
   assert.equal(payload.schema_version, 1)
   assert.equal(payload.detail_zh, draft.draftData.detailZh)
   assert.equal(shotDetailDraftEditorWarnings(draft.draftData).length, 0)
+  const policy = {
+    recommendedZhChars: 500, recommendedEnChars: 750,
+    transportZhMaxChars: 3000, transportEnMaxChars: 6000,
+  }
   assert.ok(shotDetailDraftEditorWarnings({
     schemaVersion: 1, detailZh: '中'.repeat(501), detailEn: 'a'.repeat(751),
-  }).some((message) => message.includes('500')))
+  }, policy).some((message) => message.includes('500')))
   assert.ok(shotDetailDraftEditorWarnings({
     schemaVersion: 1, detailZh: '中'.repeat(501), detailEn: 'a'.repeat(751),
-  }).some((message) => message.includes('750')))
+  }, policy).some((message) => message.includes('750')))
+  assert.ok(shotDetailDraftEditorWarnings({
+    schemaVersion: 1, detailZh: '中'.repeat(3001), detailEn: 'a'.repeat(6001),
+  }, policy).some((message) => message.includes('应用前配置阈值 3000')))
+  assert.equal(shotDetailDraftEditorWarnings({
+    schemaVersion: 1, detailZh: '中'.repeat(501), detailEn: 'a'.repeat(751),
+  }).length, 0)
 })
 
 test('apply response exposes only the authoritative formal shot patch', () => {
@@ -120,7 +143,9 @@ test('single-shot detail errors keep resource contention and formal-shot safety 
   const busy = shotDetailDraftRequestError({
     response: { data: { error: { code: 'shot_detail_resource_busy', details: { detail: 'busy' } } } },
   }, 'fallback')
-  assert.match(busy, /正在占用资源/)
+  assert.match(busy, /资源暂时占用/)
+  assert.match(busy, /单镜可稍后重试/)
+  assert.match(busy, /整集扩写会入队/)
   assert.match(busy, /正式分镜未修改/)
   const stale = shotDetailDraftRequestError({ response: { data: { code: 'shot_detail_draft_conflict' } } }, 'fallback')
   assert.match(stale, /上下文已变化/)
@@ -130,12 +155,82 @@ test('single-shot detail errors keep resource contention and formal-shot safety 
   assert.equal(raw, 'safe fallback')
 })
 
+test('episode detail batch adapter preserves frozen before snapshots and atomic candidate revisions', () => {
+  const result = adaptShotDetailDraftBatchDetail({
+    batch: {
+      id: 'batch-1', project: 'project-1', episode: 'episode-1', request_id: 'request-1',
+      provider: 'deepseek_api', generation_status: 'completed', apply_status: 'not_started',
+      revision: 4, total_count: 2, pending_count: 0, succeeded_count: 1,
+      failed_count: 0, stale_count: 0, skipped_count: 1, applied_count: 0,
+      policy_snapshot: { recommended_max_shots: 16 },
+    },
+    items: [{
+      id: 'item-1', batch: 'batch-1', shot: 'shot-1', ordinal: 1, status: 'succeeded',
+      attempts: 1, max_attempts: 2,
+      before_snapshot: { target_shot: { title: '冻结标题', camera: 'slow push' } },
+      draft: rawDraft,
+    }, {
+      id: 'item-2', batch: 'batch-1', shot: 'shot-image', ordinal: 2, status: 'skipped',
+      attempts: 0, max_attempts: 2, before_snapshot: { shot: { title: '图片镜头' } },
+    }],
+    pagination: { count: 2, next: null, previous: null },
+    applied_shots: [],
+    translation_written: false,
+  })
+  assert.equal(result.batch.provider, 'deepseek_api')
+  assert.equal(result.batch.revision, 4)
+  assert.equal(result.items[0].beforeSnapshot.targetShot.title, '冻结标题')
+  assert.equal(result.items[0].draft?.revision, 3)
+  assert.equal(result.items[1].status, 'skipped')
+  assert.deepEqual(result.appliedShots, [])
+  assert.equal(result.translationWritten, false)
+})
+
+test('episode detail batch detail exposes committed shots for lost-apply-response recovery', () => {
+  const result = adaptShotDetailDraftBatchDetail({
+    batch: {
+      id: 'batch-applied', project: 'project-1', episode: 'episode-1', request_id: 'request-2',
+      provider: 'deepseek_api', generation_status: 'completed', apply_status: 'complete',
+      revision: 6, total_count: 1, applied_count: 1,
+    },
+    items: [],
+    pagination: { count: 0, next: null, previous: null },
+    applied_shots: [{
+      id: 'shot-1', detailed_description: 'Authoritative recovered detail.',
+      metadata: { shot_detail_provenance: { applied_language_mode: 'bilingual_confirmed' } },
+    }],
+    translation_written: true,
+  })
+  assert.equal(result.appliedShots[0].detailedDescription, 'Authoritative recovered detail.')
+  assert.equal(result.translationWritten, true)
+})
+
+test('episode detail apply uses the committed formal shots returned by the server', () => {
+  const result = adaptShotDetailDraftBatchApplyResult({
+    batch: {
+      id: 'batch-1', project: 'project-1', episode: 'episode-1', request_id: 'request-1',
+      provider: 'deepseek_api', generation_status: 'completed', apply_status: 'complete',
+      revision: 5, total_count: 1, applied_count: 1,
+    },
+    items: [],
+    applied_shots: [{
+      id: 'shot-1', detailed_description: '数据库最终写入的英文描述',
+      metadata: { shot_detail_provenance: { shot_detail_draft_id: 'detail-1' } },
+    }],
+    translation_written: true,
+  })
+  assert.equal(result.appliedShots[0].id, 'shot-1')
+  assert.equal(result.appliedShots[0].detailedDescription, '数据库最终写入的英文描述')
+  assert.equal(result.translationWritten, true)
+})
+
 test('Storyboard uses one current-shot drawer, retains stale-response protection, and invalidates the prompt after apply', () => {
   const panel = readFileSync(new URL('../src/components/ShotDetailDraftPanel.vue', import.meta.url), 'utf8')
   const storyboard = readFileSync(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8')
   const adapters = readFileSync(new URL('../src/services/backendAdapters.ts', import.meta.url), 'utf8')
   const translations = readFileSync(new URL('../src/services/translationReview.ts', import.meta.url), 'utf8')
   const workbench = readFileSync(new URL('../src/components/CreativeDraftWorkbench.vue', import.meta.url), 'utf8')
+  const episodeModal = readFileSync(new URL('../src/components/EpisodeDetailDraftModal.vue', import.meta.url), 'utf8')
   assert.ok(panel.includes('let loadSequence = 0'))
   assert.ok(panel.includes('let actionSequence = 0'))
   assert.ok(panel.includes('const stillCurrent = () => requestSequence === loadSequence'))
@@ -153,6 +248,20 @@ test('Storyboard uses one current-shot drawer, retains stale-response protection
   assert.ok(adapters.includes('...shotDetailedDescriptionPayload(shot)'))
   assert.ok(translations.includes("field.fieldKey === 'shot.detailed_description'"))
   assert.ok(!workbench.includes('ShotDetailDraftPanel'))
+  assert.ok(storyboard.includes('class="episode-tool-group"'))
+  assert.ok(storyboard.indexOf('整集扩写') < storyboard.indexOf('整集应用'))
+  assert.ok(storyboard.indexOf('整集应用') < storyboard.indexOf('生成全部提示词'))
+  assert.ok(episodeModal.includes('batchDetailAll'))
+  assert.ok(episodeModal.includes("next.batch.applyStatus === 'complete'"))
+  assert.ok(episodeModal.includes('appliedShots: next.appliedShots'))
+  assert.ok(episodeModal.includes('expectedBatchRevision'))
+  assert.ok(episodeModal.includes('itemId: item.id, draftId: item.draft!.id, expectedRevision: item.draft!.revision'))
+  assert.ok(episodeModal.includes('当前后端没有逐镜重试接口'))
+  assert.ok(panel.includes('void loadCapability(); void load()'))
+  assert.ok(panel.includes('provider.temporarilyBusy'))
+  assert.ok(panel.includes(':disabled="!provider.ready"'))
+  assert.ok(panel.includes('资源占用，请稍后重试'))
+  assert.ok(!panel.includes('资源占用，可排队'))
 })
 
 test('detail repository forwards explicit review acknowledgement for confirm and apply', () => {
@@ -161,4 +270,6 @@ test('detail repository forwards explicit review acknowledgement for confirm and
   assert.ok(repository.includes('review_acknowledged: reviewAcknowledged'))
   assert.ok(repository.includes('review_acknowledged: options.reviewAcknowledged === true'))
   assert.ok(repository.includes('current.reviewSummary.requiresEditCount'))
+  assert.ok(repository.includes('VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS'))
+  assert.ok(!repository.includes('720_000'))
 })

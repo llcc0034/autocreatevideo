@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute } from 'vue-router'
 import { AlertTriangle, ArrowRight, AudioLines, Ban, Check, CheckCircle2, ChevronDown, Clapperboard, Clipboard, Clock3, Code2, Cpu, Download, ExternalLink, Eye, FileJson, FileText, Film, FolderInput, Image, Layers3, LoaderCircle, MoreHorizontal, Pause, Play, Plus, RefreshCw, Server, Sparkles, Trash2, Workflow as WorkflowIcon } from 'lucide-vue-next'
 import BaseModal from '@/components/BaseModal.vue'
@@ -7,7 +7,7 @@ import StatusBadge from '@/components/StatusBadge.vue'
 import ResolutionProfilePicker from '@/components/ResolutionProfilePicker.vue'
 import ProductionWorkflowPicker from '@/components/ProductionWorkflowPicker.vue'
 import { useStudioStore } from '@/stores/studio'
-import { repository } from '@/services/repository'
+import { productionErrorCode, repository, type ProductionCapability } from '@/services/repository'
 import { workflowProgressPresentation } from '@/services/taskProgress'
 import type { BibleItem, ComfyUIWorkflowSyncResult, GeneratedImageAssetTarget, GeneratedWorkflowExport, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, Ref2VAReferenceCategory, SeriesProject, TaskInputPrompt, TaskOutputMedia, TaskReferenceAssetSummary, Workflow, WorkflowNode } from '@/types'
 
@@ -17,9 +17,12 @@ type RuntimeAlert = { level: 'info' | 'warning' | 'danger'; title: string; messa
 type ParameterItem = { key: string; label: string; value: string }
 type ReferenceAssetGroup = { key: 'model-input' | 'continuity'; title: string; description: string; assets: TaskReferenceAssetSummary[]; continuity: boolean }
 type OutputPromotionSelection = { taskId: string; workflowId: string; projectId: string; media: TaskOutputMedia; index: number }
+type SeriesProductionRetryState = { idempotencyKey:string; projectId:string; episodeIds:string[]; resolutionProfile:ProductionResolutionProfile; resolutionMultiple:number; imageResolutionProfile:ProductionResolutionProfile; imageResolutionMultiple:number; workflowSelections:ProductionWorkflowSelection[] }
 
 const studio = useStudioStore(); const route = useRoute(); const createOpen = ref(false); const workflowInspectOpen = ref(false); const workflowInspectLoading = ref(false); const workflowInspectError = ref(''); const workflowExport = ref<GeneratedWorkflowExport|null>(null); const workflowExportFormat = ref<'ui'|'api'>('ui'); const workflowSyncing = ref(false); const workflowSyncResult = ref<ComfyUIWorkflowSyncResult|null>(null); const inspectedTaskId = ref(''); const selectedId = ref(''); const taskFilter = ref<TaskFilter>('all'); const failureExpanded = ref(false); const parametersExpanded = ref(false); const taskMenuOpen = ref(false); const taskMenuRoot = ref<HTMLElement|null>(null); const promptOpen = ref(false); const promptLoading = ref(false); const promptError = ref(''); const inputPrompt = ref<TaskInputPrompt|null>(null); const promptTaskId = ref(''); const referencePreviewOpen = ref(false); const referencePreviewAsset = ref<TaskReferenceAssetSummary|null>(null); const referenceImageFailures = ref<Record<string,boolean>>({}); const outputPromotionOpen = ref(false); const outputPromotionSelection = ref<OutputPromotionSelection|null>(null); const outputPromotionMode = ref<'frame'|'classified'>('frame'); const outputPromotionCategory = ref<Ref2VAReferenceCategory>('character'); const outputPromotionEntityId = ref(''); const outputPromotionName = ref(''); const selectedProjectId = ref(''); const episodeIds = ref<string[]>([]); const resolutionProfile = ref<ProductionResolutionProfile>('0.3'); const resolutionMultiple = ref(32); const imageResolutionProfile = ref<ProductionResolutionProfile>('0.98'); const imageResolutionMultiple = ref(32); const createLoading = ref(false); const retryLoading = ref(false); const cancelLoading = ref(false); const deleteConfirmOpen = ref(false); const deleteLoading = ref(false); const deleteTargetId = ref(''); const publishingOutputKey = ref(''); const promotingAssetKey = ref(''); const healthChecking = ref(false); const health = ref<{ok:boolean;message:string;latency?:number}|null>(null); const pollError = ref(''); const nowMs = ref(Date.now()); const outputMediaRecoveryAttempts = new Map<string,number>(); const referenceImageRecoveryAttempts = new Map<string,number>(); let ticker = 0; let clockTicker = 0; let healthTicker = 0; let promptRequestSequence = 0; let detailRequestSequence = 0; let workflowInspectRequestSequence = 0
 const productionWorkflowTemplates = ref<ProductionWorkflowTemplate[]>([]); const productionWorkflowTemplatesLoading = ref(false); const productionWorkflowTemplatesError = ref(''); const ref2vaTemplateId = ref(''); const ref2vaWorkflowParameters = ref<Record<string,number>>({})
+const productionCapability = ref<ProductionCapability|null>(null); const productionCapabilityError = ref(''); const extendedProductionConfirmed = ref(false); const serverProductionConfirmationRequired = ref(false); const seriesProductionIdempotencyKey = ref(''); const seriesProductionIdempotencyConflict = ref(''); const retryExtendedConfirmedTaskId = ref('')
+let restoringSeriesProductionRetryState = false
 const mockMode = import.meta.env.VITE_USE_MOCK === 'true'
 const healthLevel = computed<HealthLevel>(()=>{
   if (!health.value) return 'checking'
@@ -393,6 +396,23 @@ const selectedProductionEpisodes = computed(() => {
   if (!project) return []
   return episodeIds.value.length ? project.episodes.filter((episode) => episodeIds.value.includes(episode.id)) : project.episodes
 })
+const selectedProductionTaskCount = computed(() => selectedProductionEpisodes.value.reduce(
+  (total, episode) => total + episode.shots.length,
+  0,
+))
+const productionConfirmationRequired = computed(() => {
+  if (serverProductionConfirmationRequired.value) return true
+  const capability = productionCapability.value
+  if (!capability || !capability.confirmationRequired) return false
+  return capability.activeTaskCount + selectedProductionTaskCount.value > capability.recommendedMaxPending
+    || capability.userActiveTaskCount + selectedProductionTaskCount.value > capability.recommendedMaxActivePerUser
+})
+const productionQueueWaveCount = computed(() => {
+  const capability = productionCapability.value
+  return capability
+    ? Math.ceil((capability.activeTaskCount + selectedProductionTaskCount.value) / capability.maxConcurrent)
+    : undefined
+})
 const selectedProductionHasVideo = computed(() => selectedProductionEpisodes.value.some((episode) => episode.shots.some((shot) => shot.mediaType === 'video')))
 const selectedProductionHasImage = computed(() => selectedProductionEpisodes.value.some((episode) => episode.shots.some((shot) => shot.mediaType === 'image')))
 const selectedProductionHasRef2VA = computed(() => selectedProductionEpisodes.value.some((episode) => episode.shots.some((shot) => shot.mediaType === 'video' && shot.mode === 'Ref2VA')))
@@ -418,8 +438,8 @@ const safeComfyUrl = computed(()=>{
 const resolutionProfiles: Array<{value:ProductionResolutionProfile;label:string;hint:string;badge:string}> = [
   { value: '0.1', label: '官方 0.1 MP', hint: '416×256（16:9），最省显存的验证档位', badge: '最省显存' },
   { value: '0.2', label: '官方 0.2 MP', hint: '最低显存占用，首次烟测最稳', badge: '最稳' },
-  { value: '0.3', label: '官方 0.3 MP', hint: 'GTX 1070 8GB 推荐，已有历史成功产物', badge: '8GB 推荐' },
-  { value: 'project', label: '项目默认', hint: '沿用项目目标尺寸；当前机器曾发生显存不足', badge: '高显存' }
+  { value: '0.3', label: '官方 0.3 MP', hint: '低显存环境的常用起点；上线前需在目标 GPU 烟测', badge: '低显存' },
+  { value: 'project', label: '项目默认', hint: '沿用项目目标尺寸；高分辨率可能显著增加显存占用', badge: '高显存' }
 ]
 const advancedResolutionProfiles: Array<{value:ProductionResolutionProfile;label:string}> = [
   { value: '0.4', label: '0.4 MP · 显存占用增加' }, { value: '0.5', label: '0.5 MP · 显存占用增加' },
@@ -464,6 +484,42 @@ const normalizeResolutionMultiple=()=>{const value=Number(resolutionMultiple.val
 const advancedProfileSelected = computed(()=>advancedResolutionProfiles.some((item)=>item.value===resolutionProfile.value))
 const selectAdvancedProfile=(event:Event)=>{const value=(event.target as HTMLSelectElement).value as ProductionResolutionProfile;if(value)resolutionProfile.value=value}
 const isHighMemoryProfile=(profile:ProductionResolutionProfile)=>profile==='project'||(Number.isFinite(Number(profile))&&Number(profile)>=0.98)
+const isKnownProductionProfile=(value:unknown):value is ProductionResolutionProfile=>value==='project'||resolutionProfiles.some((item)=>item.value===value)||advancedResolutionProfiles.some((item)=>item.value===value)
+const seriesProductionStorageKey=(projectId:string)=>`cineforge_series_production_idempotency_${projectId}`
+const clearSeriesProductionRetryState=(projectId=selectedProjectId.value)=>{
+  seriesProductionIdempotencyKey.value='';seriesProductionIdempotencyConflict.value=''
+  if(projectId)sessionStorage.removeItem(seriesProductionStorageKey(projectId))
+}
+const abandonSeriesProductionRetry=()=>{
+  clearSeriesProductionRetryState();extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false
+  studio.notify('已明确放弃旧的整剧提交；下一次会使用新的幂等键创建新批次。','info')
+}
+const persistSeriesProductionRetryState=(projectId:string,idempotencyKey:string)=>{
+  const state:SeriesProductionRetryState={
+    idempotencyKey,projectId,episodeIds:[...episodeIds.value],resolutionProfile:resolutionProfile.value,
+    resolutionMultiple:resolutionMultiple.value,imageResolutionProfile:imageResolutionProfile.value,
+    imageResolutionMultiple:imageResolutionMultiple.value,workflowSelections:productionWorkflowSelections.value,
+  }
+  sessionStorage.setItem(seriesProductionStorageKey(projectId),JSON.stringify(state))
+}
+const restoreSeriesProductionRetryState=(projectId:string)=>{
+  seriesProductionIdempotencyKey.value=''
+  const raw=sessionStorage.getItem(seriesProductionStorageKey(projectId));if(!raw)return
+  try{
+    const state=JSON.parse(raw) as Partial<SeriesProductionRetryState>
+    if(state.projectId!==projectId||typeof state.idempotencyKey!=='string'||!state.idempotencyKey.trim())throw new Error('invalid retry state')
+    restoringSeriesProductionRetryState=true
+    episodeIds.value=Array.isArray(state.episodeIds)?state.episodeIds.filter((id):id is string=>typeof id==='string'):[]
+    if(isKnownProductionProfile(state.resolutionProfile))resolutionProfile.value=state.resolutionProfile
+    if(isKnownProductionProfile(state.imageResolutionProfile))imageResolutionProfile.value=state.imageResolutionProfile
+    if(Number.isFinite(state.resolutionMultiple))resolutionMultiple.value=Number(state.resolutionMultiple)
+    if(Number.isFinite(state.imageResolutionMultiple))imageResolutionMultiple.value=Number(state.imageResolutionMultiple)
+    const selection=Array.isArray(state.workflowSelections)?state.workflowSelections.find((item)=>item?.outputKind==='video'&&item?.h3Mode==='Ref2VA'&&typeof item?.templateId==='string'):undefined
+    ref2vaTemplateId.value=selection?.templateId||'';ref2vaWorkflowParameters.value=selection?.parameters&&typeof selection.parameters==='object'?{...selection.parameters}:{}
+    normalizeResolutionMultiple();seriesProductionIdempotencyKey.value=state.idempotencyKey
+  }catch{sessionStorage.removeItem(seriesProductionStorageKey(projectId))}
+  finally{restoringSeriesProductionRetryState=false}
+}
 const nodeIcons:Record<WorkflowNode['type'],typeof FileText>={script:FileText,prompt:Sparkles,image:Image,video:Film,audio:AudioLines,compose:Layers3,export:Download}
 const nodeStatusCount=(status:WorkflowNode['status'])=>selected.value?.nodes.filter((node)=>node.status===status).length||0
 const nodeStatusLabel=(node:WorkflowNode)=>node.status==='completed'?'已完成':node.status==='running'?'正在执行':node.status==='failed'?'执行失败':'等待执行'
@@ -584,10 +640,11 @@ const hydrateSelectedTask=async(workflowId=selectedId.value,quiet=true,preserveM
   if(!workflow)return
   const taskId=workflow.taskId||workflow.id
   const requestSequence=++detailRequestSequence
+  const requestEpoch=studio.captureSessionEpoch()
   try {
     const detail=await repository.getWorkflow(taskId)
     if(requestSequence!==detailRequestSequence||selectedId.value!==workflowId)return
-    return studio.mergeWorkflowDetail(detail,preserveMediaUrls)
+    return studio.mergeWorkflowDetail(detail,preserveMediaUrls,requestEpoch)
   } catch(error) {
     if(requestSequence!==detailRequestSequence||selectedId.value!==workflowId)return
     if(!quiet)studio.notify(`读取任务详情失败：${error instanceof Error?error.message:'服务端未返回任务详情'}`,'error')
@@ -606,9 +663,10 @@ const refreshOutputMedia=async(media:TaskOutputMedia,index:number)=>{
   if(!workflow)throw new Error('当前任务不存在')
   const workflowId=workflow.id
   const taskId=workflow.taskId||workflow.id
+  const requestEpoch=studio.captureSessionEpoch()
   const detail=await repository.getWorkflow(taskId)
   if(selectedId.value!==workflowId)throw new Error('当前已切换到其他任务')
-  const merged=studio.mergeWorkflowDetail(detail,false)
+  const merged=studio.mergeWorkflowDetail(detail,false,requestEpoch)
   const identity=outputMediaIdentity(media,index)
   return merged.outputMedia?.find((item,itemIndex)=>outputMediaIdentity(item,itemIndex)===identity)
     || merged.outputMedia?.[index]
@@ -647,10 +705,11 @@ const publishOutputMedia=async(media:TaskOutputMedia,index:number)=>{
   const workflow=selected.value
   if(!workflow)return
   const key=outputMediaRecoveryKey(media,index)
+  const requestEpoch=studio.captureSessionEpoch()
   publishingOutputKey.value=key
   try{
     const detail=await repository.publishTaskOutput(workflow.taskId||workflow.id,media.index??index)
-    studio.mergeWorkflowDetail(detail,false)
+    studio.mergeWorkflowDetail(detail,false,requestEpoch)
     studio.notify('公开发行副本已生成：母版未修改，下载文件含可见 AI 标识、元数据和签名来源清单','success')
   }catch(error){studio.notify(error instanceof Error?error.message:'公开发行副本生成失败','error')}
   finally{publishingOutputKey.value=''}
@@ -663,9 +722,14 @@ const setOutputPromotionCategory=(category:Ref2VAReferenceCategory)=>{
     outputPromotionProject.value?.bible.props[0]?.id
   )||''
 }
-const openOutputPromotion=(media:TaskOutputMedia,index:number)=>{
+const openOutputPromotion=async(media:TaskOutputMedia,index:number)=>{
   const workflow=selected.value
   if(!workflow||mediaKind(media)!=='image')return
+  let project=studio.projectById(workflow.projectId)
+  if(project&&!project.detailLoaded){
+    try{project=await studio.loadProject(workflow.projectId)}
+    catch(error){studio.notify(error instanceof Error?error.message:'项目详情加载失败，请稍后重试','error');return}
+  }
   outputPromotionSelection.value={
     taskId:workflow.taskId||workflow.id,
     workflowId:workflow.id,
@@ -675,7 +739,6 @@ const openOutputPromotion=(media:TaskOutputMedia,index:number)=>{
   }
   outputPromotionMode.value='frame'
   outputPromotionName.value=''
-  const project=studio.projectById(workflow.projectId)
   const firstCategory:Ref2VAReferenceCategory=project?.bible.characters.length?'character':project?.bible.scenes.length?'scene':'prop'
   outputPromotionCategory.value=firstCategory
   outputPromotionEntityId.value=(firstCategory==='character'?project?.bible.characters[0]?.id:firstCategory==='scene'?project?.bible.scenes[0]?.id:project?.bible.props[0]?.id)||''
@@ -696,6 +759,7 @@ const promoteOutputToAsset=async()=>{
     target={referenceCategory:outputPromotionCategory.value,entityId:outputPromotionEntityId.value}
   }
   const key=outputMediaRecoveryKey(selection.media,selection.index)
+  const requestEpoch=studio.captureSessionEpoch()
   promotingAssetKey.value=key
   try{
     const asset=await repository.promoteTaskOutputToAsset(
@@ -709,7 +773,7 @@ const promoteOutputToAsset=async()=>{
     catch(error){refreshWarning=error instanceof Error?error.message:'素材或 Bible 刷新失败'}
     try{
       const detail=await repository.getWorkflow(selection.taskId)
-      studio.mergeWorkflowDetail(detail,false)
+      studio.mergeWorkflowDetail(detail,false,requestEpoch)
     }catch(error){refreshWarning ||= error instanceof Error?error.message:'任务状态刷新失败'}
     outputPromotionOpen.value=false
     outputPromotionSelection.value=null
@@ -799,12 +863,65 @@ const refreshTaskStatus=async()=>{
   try{await studio.refreshWorkflows(true);pollError.value='';selectedId.value=studio.workflows.some((workflow)=>workflow.id===taskId)?taskId:selectedId.value;reconcileSelected();if(selectedId.value)await hydrateSelectedTask(selectedId.value);studio.notify('任务状态已刷新')}
   catch(error){const message=error instanceof Error?error.message:'服务端未返回最新任务状态';pollError.value=message;studio.notify(`刷新任务状态失败：${message}`,'error')}
 }
-const selectProject=(id:string)=>{selectedProjectId.value=id;episodeIds.value=[]}
-const toggleEpisode=(id:string)=>{const i=episodeIds.value.indexOf(id);if(i>=0)episodeIds.value.splice(i,1);else episodeIds.value.push(id)}
-const selectAll=()=>{episodeIds.value=episodeIds.value.length===selectedProject.value?.episodes.length?[]:selectedProject.value?.episodes.map(e=>e.id)||[]}
-const create=async()=>{if(!selectedProject.value){studio.notify('请选择一个连续剧项目','error');return}if(!selectedProductionHasVideo.value&&!selectedProductionHasImage.value){studio.notify('所选范围没有可生产的分镜','error');return}normalizeResolutionMultiple();createLoading.value=true;try{const item=await studio.createWorkflow(selectedProject.value,episodeIds.value,resolutionProfile.value,resolutionMultiple.value,imageResolutionProfile.value,imageResolutionMultiple.value,productionWorkflowSelections.value);taskFilter.value='active';selectedId.value=item.id;failureExpanded.value=false;createOpen.value=false;if(mockMode){item.status='running';item.currentStep='剧本拆解';item.nodes[0].status='running';item.nodes[0].progress=8}else await refresh();reconcileSelected()}catch(e){studio.notify(e instanceof Error?e.message:'创建失败','error')}finally{createLoading.value=false}}
+const selectProject=async(id:string)=>{
+  if(id===selectedProjectId.value)return
+  seriesProductionIdempotencyKey.value='';seriesProductionIdempotencyConflict.value='';restoringSeriesProductionRetryState=true;selectedProjectId.value=id;episodeIds.value=[];restoringSeriesProductionRetryState=false;extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false
+  const project=studio.projectById(id)
+  if(!project?.detailLoaded){
+    createLoading.value=true
+    try{await studio.loadProject(id)}
+    catch(error){studio.notify(error instanceof Error?error.message:'项目详情加载失败，请稍后重试','error')}
+    finally{createLoading.value=false}
+  }
+  restoreSeriesProductionRetryState(id)
+}
+const toggleEpisode=(id:string)=>{const i=episodeIds.value.indexOf(id);if(i>=0)episodeIds.value.splice(i,1);else episodeIds.value.push(id);extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false}
+const selectAll=()=>{episodeIds.value=episodeIds.value.length===selectedProject.value?.episodes.length?[]:selectedProject.value?.episodes.map(e=>e.id)||[];extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false}
+const closeCreateWizard=()=>{createOpen.value=false;extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false}
+const create=async()=>{
+  if(!selectedProject.value){studio.notify('请选择一个连续剧项目','error');return}
+  if(!selectedProductionHasVideo.value&&!selectedProductionHasImage.value){studio.notify('所选范围没有可生产的分镜','error');return}
+  if(seriesProductionIdempotencyConflict.value){studio.notify('旧整剧提交状态仍不确定；请先刷新任务核对，或明确放弃旧尝试后再创建新批次。','error');return}
+  if(productionConfirmationRequired.value&&!extendedProductionConfirmed.value){extendedProductionConfirmed.value=true;return}
+  normalizeResolutionMultiple();createLoading.value=true
+  try{
+    const storageKey=seriesProductionStorageKey(selectedProject.value.id)
+    const idempotencyKey=seriesProductionIdempotencyKey.value||`whole-series-${selectedProject.value.id}-${typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():Date.now()}`
+    seriesProductionIdempotencyKey.value=idempotencyKey;persistSeriesProductionRetryState(selectedProject.value.id,idempotencyKey)
+    const item=await studio.createWorkflow(selectedProject.value,episodeIds.value,resolutionProfile.value,resolutionMultiple.value,imageResolutionProfile.value,imageResolutionMultiple.value,productionWorkflowSelections.value,extendedProductionConfirmed.value,idempotencyKey)
+    sessionStorage.removeItem(storageKey);seriesProductionIdempotencyKey.value='';seriesProductionIdempotencyConflict.value='';taskFilter.value='active';selectedId.value=item.id;failureExpanded.value=false;createOpen.value=false;extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false
+    if(mockMode){item.status='running';item.currentStep='剧本拆解';item.nodes[0].status='running';item.nodes[0].progress=8}else await refresh();reconcileSelected()
+  }catch(e){
+    if(productionErrorCode(e)==='production_queue_confirmation_required'){
+      serverProductionConfirmationRequired.value=true;extendedProductionConfirmed.value=true
+      studio.notify('任务量超过当前配置的队列推荐值，请核对提示后再次确认。','info')
+      return
+    }
+    const message=e instanceof Error?e.message:'创建失败'
+    if(productionErrorCode(e)==='production_idempotency_conflict'||(/(?:idempotency_key|幂等)/i.test(message)&&/(?:不完整|不同|新的|冲突)/i.test(message))){
+      seriesProductionIdempotencyConflict.value='旧整剧提交可能已部分或完整创建，服务端拒绝把同一幂等键用于当前请求。'
+      studio.notify('旧整剧提交状态仍不确定，已保留幂等键并停止新建。请先刷新任务核对；只有明确放弃旧尝试后才能创建新批次。','error')
+      return
+    }
+    studio.notify(message,'error')
+  }finally{createLoading.value=false}
+}
 const loadProductionWorkflowTemplates=async()=>{productionWorkflowTemplatesLoading.value=true;productionWorkflowTemplatesError.value='';try{productionWorkflowTemplates.value=await repository.getProductionWorkflowTemplates()}catch(error){productionWorkflowTemplatesError.value=error instanceof Error?error.message:'服务端未返回工作流模板'}finally{productionWorkflowTemplatesLoading.value=false}}
-const openCreateWizard=()=>{ref2vaTemplateId.value='';ref2vaWorkflowParameters.value={};createOpen.value=true}
+const loadProductionCapability=async()=>{productionCapabilityError.value='';try{productionCapability.value=await repository.getProductionCapability()}catch(error){productionCapability.value=null;productionCapabilityError.value=error instanceof Error?error.message:'无法读取当前生产队列配置'}}
+const openCreateWizard=async()=>{
+  restoringSeriesProductionRetryState=true;ref2vaTemplateId.value='';ref2vaWorkflowParameters.value={};restoringSeriesProductionRetryState=false
+  extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false;productionCapabilityError.value=''
+  createLoading.value=true
+  try {
+    selectedProjectId.value=studio.projects.some((project)=>project.id===selectedProjectId.value)?selectedProjectId.value:studio.projects[0]?.id||''
+    const project=studio.projectById(selectedProjectId.value)
+    if(project&&!project.detailLoaded)await studio.loadProject(project.id)
+    await loadProductionCapability()
+    restoreSeriesProductionRetryState(selectedProjectId.value)
+    createOpen.value=true
+  } catch(error) { studio.notify(error instanceof Error?error.message:'项目详情加载失败，请稍后重试','error') }
+  finally { createLoading.value=false }
+}
 const toggleRun=(flow:Workflow)=>{if(!mockMode){studio.notify('真实任务由服务端队列管理，请使用取消或重试 API','info');return}if(flow.status==='running'){flow.status='paused';flow.currentStep='已手动暂停'}else if(flow.status==='paused'||flow.status==='queued'){flow.status='running';flow.currentStep=flow.nodes.find(n=>n.status!=='completed')?.label||'恢复运行'} }
 const simulate=()=>{if(!mockMode)return;studio.workflows.filter(f=>f.status==='running').forEach(flow=>{const node=flow.nodes.find(n=>n.status==='running')||flow.nodes.find(n=>n.status==='pending');if(!node)return;if(node.status==='pending')node.status='running';node.progress=Math.min(100,node.progress+1);flow.progress=Math.round(flow.nodes.reduce((s,n)=>s+n.progress,0)/flow.nodes.length);flow.progressSource='comfyui';flow.comfyProgress=node.progress;flow.progressTelemetryState='receiving';flow.remoteState='running';flow.currentStep=`${node.label} · 当前节点采样 ${node.progress}%`;if(node.progress>=100){node.status='completed';const next=flow.nodes.find(n=>n.status==='pending');if(next){next.status='running';flow.comfyProgress=next.progress;flow.currentStep=next.label}else{flow.status='completed';flow.progress=100;flow.progressSource='terminal';flow.comfyProgress=undefined;flow.remoteState='succeeded';flow.currentStep='已完成'}}});reconcileSelected()}
 const refresh=async(preserveMediaUrls=false)=>{try{await studio.refreshWorkflows(preserveMediaUrls);pollError.value='';reconcileSelected();if(selectedId.value)await hydrateSelectedTask(selectedId.value,true,preserveMediaUrls)}catch(error){pollError.value=error instanceof Error?error.message:'队列刷新失败'}}
@@ -838,7 +955,32 @@ const deleteTask=async()=>{
     studio.notify(`删除历史任务失败：${error instanceof Error ? error.message : '服务端拒绝了删除请求'}`, 'error')
   } finally { deleteLoading.value = false }
 }
-const retry=async()=>{if(!selected.value||selected.value.status!=='failed')return;retryLoading.value=true;try{const result=await repository.retryGenerationTask(selected.value.taskId||selected.value.id);taskFilter.value='active';await refresh();selectedId.value=String(result.id);failureExpanded.value=false;reconcileSelected();studio.notify('重试任务已创建并重新进入队列')}catch(error){studio.notify(error instanceof Error?error.message:'任务重试失败','error')}finally{retryLoading.value=false}}
+const retry=async()=>{
+  if(!selected.value||selected.value.status!=='failed')return
+  const taskId=selected.value.taskId||selected.value.id
+  retryLoading.value=true
+  try{
+    const result=await repository.retryGenerationTask(taskId,retryExtendedConfirmedTaskId.value===taskId)
+    retryExtendedConfirmedTaskId.value='';taskFilter.value='active';await refresh();selectedId.value=String(result.id);failureExpanded.value=false;reconcileSelected();studio.notify('重试任务已按原工作流和参数重新进入队列')
+  }catch(error){
+    if(productionErrorCode(error)==='production_queue_confirmation_required'){
+      retryExtendedConfirmedTaskId.value=taskId
+      studio.notify('当前队列超过建议值；请核对等待时间和资源占用提示后，再次点击确认重试。','info')
+      return
+    }
+    studio.notify(error instanceof Error?error.message:'任务重试失败','error')
+  }finally{retryLoading.value=false}
+}
+watch(selectedId,()=>{retryExtendedConfirmedTaskId.value=''})
+watch([episodeIds,resolutionProfile,resolutionMultiple,imageResolutionProfile,imageResolutionMultiple,ref2vaTemplateId,ref2vaWorkflowParameters],()=>{
+  if(restoringSeriesProductionRetryState)return
+  if(seriesProductionIdempotencyKey.value&&selectedProjectId.value){
+    studio.notify('上次整剧提交状态尚未确认，范围和参数已恢复为原请求。请先核对任务，或明确放弃旧尝试后再修改。','info')
+    restoreSeriesProductionRetryState(selectedProjectId.value)
+    return
+  }
+  extendedProductionConfirmed.value=false;serverProductionConfirmationRequired.value=false
+},{deep:true,flush:'sync'})
 const loadWorkflowExport=async(task:Workflow,format:'ui'|'api')=>{const requestSequence=++workflowInspectRequestSequence;workflowInspectLoading.value=true;workflowInspectError.value='';workflowExport.value=null;try{const result=await repository.getGeneratedWorkflowExport(task,format);if(requestSequence===workflowInspectRequestSequence)workflowExport.value=result}catch(error){if(requestSequence===workflowInspectRequestSequence)workflowInspectError.value=error instanceof Error?error.message:'读取工作流失败'}finally{if(requestSequence===workflowInspectRequestSequence)workflowInspectLoading.value=false}}
 const inspectWorkflow=async(task:Workflow)=>{inspectedTaskId.value=task.id;workflowInspectOpen.value=true;workflowExportFormat.value='ui';workflowSyncResult.value=null;await loadWorkflowExport(task,'ui')}
 const switchWorkflowFormat=async(format:'ui'|'api')=>{if(format===workflowExportFormat.value&&workflowExport.value)return;workflowExportFormat.value=format;workflowSyncResult.value=null;const task=inspectedTask.value;if(task)await loadWorkflowExport(task,format)}
@@ -847,14 +989,14 @@ const downloadWorkflow=()=>{if(!workflowExport.value||!exportedWorkflowJson.valu
 const syncWorkflowToComfy=async()=>{const task=inspectedTask.value;if(!task||!isCanvasWorkflow.value||workflowExport.value?.importReady!==true)return;workflowSyncing.value=true;try{const result=await repository.syncGeneratedWorkflowToComfyUI(task.taskId||task.id);workflowSyncResult.value=result;studio.notify(`工作流已同步到 ComfyUI：${result.workflowPath}`)}catch(error){studio.notify(error instanceof Error?error.message:'同步到 ComfyUI 失败','error')}finally{workflowSyncing.value=false}}
 const openInComfy=()=>{if(!safeComfyUrl.value){studio.notify(workflowExport.value?.openReason||'当前没有可安全打开的 ComfyUI 地址','error');return}const opened=window.open(safeComfyUrl.value,'_blank','noopener,noreferrer');if(opened)opened.opener=null}
 const checkHealth=async()=>{if(healthChecking.value)return;healthChecking.value=true;try{health.value=await repository.testComfy('')}catch(error){health.value={ok:false,message:error instanceof Error?error.message:'ComfyUI 不可达'}}finally{healthChecking.value=false}}
-onMounted(async()=>{document.addEventListener('pointerdown',onTaskMenuPointerDown);document.addEventListener('keydown',onTaskMenuKeydown);await Promise.all([studio.initialize(),loadProductionWorkflowTemplates()]);const requestedTask=String(Array.isArray(route.query.task)?route.query.task[0]||'':route.query.task||'');const requestedBatch=String(Array.isArray(route.query.batch)?route.query.batch[0]||'':route.query.batch||'');const target=studio.workflows.find((item)=>item.id===requestedTask||item.taskId===requestedTask)||studio.workflows.filter((item)=>requestedBatch&&item.batchId===requestedBatch).sort((left,right)=>(left.batchIndex||0)-(right.batchIndex||0))[0];if(target){taskFilter.value='all';selectedId.value=target.id}else reconcileSelected();selectedProjectId.value=studio.projects[0]?.id||'';if(selectedId.value)await hydrateSelectedTask(selectedId.value);await checkHealth();ticker=window.setInterval(mockMode?simulate:()=>refresh(true),mockMode?1600:5000);healthTicker=window.setInterval(()=>{void checkHealth()},15000);clockTicker=window.setInterval(()=>{nowMs.value=Date.now()},1000)})
+onMounted(async()=>{document.addEventListener('pointerdown',onTaskMenuPointerDown);document.addEventListener('keydown',onTaskMenuKeydown);await Promise.all([studio.initialize(),loadProductionWorkflowTemplates(),loadProductionCapability()]);const requestedTask=String(Array.isArray(route.query.task)?route.query.task[0]||'':route.query.task||'');const requestedBatch=String(Array.isArray(route.query.batch)?route.query.batch[0]||'':route.query.batch||'');const target=studio.workflows.find((item)=>item.id===requestedTask||item.taskId===requestedTask)||studio.workflows.filter((item)=>requestedBatch&&item.batchId===requestedBatch).sort((left,right)=>(left.batchIndex||0)-(right.batchIndex||0))[0];if(target){taskFilter.value='all';selectedId.value=target.id}else reconcileSelected();selectedProjectId.value=studio.projects[0]?.id||'';if(selectedId.value)await hydrateSelectedTask(selectedId.value);await checkHealth();ticker=window.setInterval(mockMode?simulate:()=>refresh(true),mockMode?1600:5000);healthTicker=window.setInterval(()=>{void checkHealth()},15000);clockTicker=window.setInterval(()=>{nowMs.value=Date.now()},1000)})
 onBeforeUnmount(()=>{promptRequestSequence+=1;detailRequestSequence+=1;workflowInspectRequestSequence+=1;document.removeEventListener('pointerdown',onTaskMenuPointerDown);document.removeEventListener('keydown',onTaskMenuKeydown);window.clearInterval(ticker);window.clearInterval(healthTicker);window.clearInterval(clockTicker)})
 </script>
 
 <template>
   <div class="workflow-page page-stack">
     <section class="page-heading split-heading"><div><span class="eyebrow">AUTONOMOUS PRODUCTION PIPELINE</span><h2>媒体生产工作流</h2><p>将视频分镜交给 MiniMax H3、图片定帧交给 SDXL，并统一进入本地 ComfyUI 队列；只有视频产物参与按集组装。</p></div><button class="button primary" @click="openCreateWizard"><Plus :size="16"/>创建生产任务</button></section>
-    <section class="pipeline-health panel"><div class="health-item"><span class="health-icon" :class="{online:healthLevel==='connected',degraded:healthLevel==='degraded'}"><Server :size="18"/></span><div><span>ComfyUI 服务 · 每 15 秒检测</span><strong>{{ health?.message || '正在探测服务端连接…' }}</strong></div><i :class="{neutral:healthLevel==='checking'||healthLevel==='unavailable',warning:healthLevel==='degraded'}">{{ healthBadge }}</i></div><div class="health-divider"></div><div class="health-item"><span class="health-icon"><Cpu :size="18"/></span><div><span>执行策略</span><strong>本地 CUDA · 单任务安全模式</strong></div><i class="neutral">LIMIT 1</i></div><div class="health-divider"></div><div class="health-item"><span class="health-icon"><Sparkles :size="18"/></span><div><span>生成模型</span><strong>MiniMax H3 · SDXL</strong></div><i class="neutral">VIDEO + IMAGE</i></div><RouterLink to="/settings" class="button ghost small">连接状态 <ArrowRight :size="14"/></RouterLink></section>
+    <section class="pipeline-health panel"><div class="health-item"><span class="health-icon" :class="{online:healthLevel==='connected',degraded:healthLevel==='degraded'}"><Server :size="18"/></span><div><span>ComfyUI 服务 · 每 15 秒检测</span><strong>{{ health?.message || '正在探测服务端连接…' }}</strong></div><i :class="{neutral:healthLevel==='checking'||healthLevel==='unavailable',warning:healthLevel==='degraded'}">{{ healthBadge }}</i></div><div class="health-divider"></div><div class="health-item"><span class="health-icon"><Cpu :size="18"/></span><div><span>执行策略</span><strong>{{ productionCapability?`按服务端配置执行 · 并发 ${productionCapability.maxConcurrent}`:productionCapabilityError?'生产策略读取失败':'正在读取生产策略…' }}</strong></div><i class="neutral">{{ productionCapability?`CONCURRENCY ${productionCapability.maxConcurrent}`:productionCapabilityError?'UNAVAILABLE':'LOADING' }}</i></div><div class="health-divider"></div><div class="health-item"><span class="health-icon"><Sparkles :size="18"/></span><div><span>生成模型</span><strong>MiniMax H3 · SDXL</strong></div><i class="neutral">VIDEO + IMAGE</i></div><RouterLink to="/settings" class="button ghost small">连接状态 <ArrowRight :size="14"/></RouterLink></section>
 
     <section class="workflow-layout">
       <aside class="panel workflow-list">
@@ -882,7 +1024,8 @@ onBeforeUnmount(()=>{promptRequestSequence+=1;detailRequestSequence+=1;workflowI
               <button class="button ghost" :disabled="!selected.generatedWorkflowId" title="只读查看，不会提交或中断任务" @click="inspectWorkflow(selected)"><Eye :size="15"/>在 ComfyUI 查看工作流</button>
               <RouterLink v-if="selected.projectId&&selected.episodeId&&selected.shotId" class="button ghost" :to="{path:`/projects/${selected.projectId}/episodes/${selected.episodeId}/storyboard`,query:{shot:selected.shotId}}"><Clapperboard :size="15"/>修改并重新生成此镜头</RouterLink>
               <button v-if="selectedCanCancel" class="button ghost task-cancel-button" :disabled="cancelLoading" @click="cancelTask"><Ban :size="15"/>{{ cancelLoading?'正在核对…':selected.backendStatus==='cancel_requested'?'重新确认取消':'取消任务' }}</button>
-              <button v-if="selected.status==='failed'" class="button primary" :disabled="retryLoading||(selected.retryAllowed===false&&!selected.retryRequiresReconciliation)" :title="selected.retryRequiresReconciliation?'将先确认旧 Prompt 已不在 ComfyUI 队列或历史中，再安全创建重试任务':selected.retryAllowed===false?selected.retryBlockReason||'服务端尚未确认远端任务已终止，暂不能安全重试':''" @click="retry"><RefreshCw :size="15"/>{{ retryLoading?'正在验证并创建重试…':selected.retryRequiresReconciliation?'验证远端并重试':'重试失败任务' }}</button>
+              <span v-if="selected.status==='failed'&&retryExtendedConfirmedTaskId===(selected.taskId||selected.id)" class="retry-queue-confirmation"><AlertTriangle :size="13"/>队列已超过当前建议值；再次点击会按原任务完整重试，只会增加等待时间和资源占用。</span>
+              <button v-if="selected.status==='failed'" class="button primary" :disabled="retryLoading||(selected.retryAllowed===false&&!selected.retryRequiresReconciliation)" :title="selected.retryRequiresReconciliation?'将先确认旧 Prompt 已不在 ComfyUI 队列或历史中，再按原工作流和参数创建重试任务':selected.retryAllowed===false?selected.retryBlockReason||'服务端尚未确认远端任务已终止，暂不能安全重试':'重试会复用原任务的实际工作流与参数；如需更换，请使用“修改并重新生成此镜头”'" @click="retry"><RefreshCw :size="15"/>{{ retryLoading?'正在验证并创建重试…':retryExtendedConfirmedTaskId===(selected.taskId||selected.id)?'确认并重试失败任务':selected.retryRequiresReconciliation?'验证远端并重试':'重试失败任务' }}</button>
               <button v-if="selectedCanDelete" class="button ghost task-delete-button" @click="openDeleteConfirm"><Trash2 :size="15"/>删除历史任务</button>
               <button v-if="mockMode&&selected.status!=='completed'" class="button ghost" @click="toggleRun(selected)"><component :is="selected.status==='running'?Pause:Play" :size="15"/>{{ selected.status==='running'?'暂停 Mock 任务':'继续 Mock 任务' }}</button>
               <div ref="taskMenuRoot" class="task-more-menu">
@@ -1000,7 +1143,7 @@ onBeforeUnmount(()=>{promptRequestSequence+=1;detailRequestSequence+=1;workflowI
           </div>
         </section>
       </main>
-      <main v-else class="panel empty-state"><WorkflowIcon :size="30"/><h3>{{ studio.workflows.length?'当前筛选没有任务':'创建第一个工作流' }}</h3><p>{{ studio.workflows.length?'当前状态下没有可展示的任务，请切换筛选条件。':'选择连续剧和需要制作的集数，系统会自动编排全部节点。' }}</p><button v-if="studio.workflows.length" class="button ghost" @click="setTaskFilter('all')">查看全部任务</button><button v-else class="button primary" @click="createOpen=true"><Plus :size="15"/>创建任务</button></main>
+      <main v-else class="panel empty-state"><WorkflowIcon :size="30"/><h3>{{ studio.workflows.length?'当前筛选没有任务':'创建第一个工作流' }}</h3><p>{{ studio.workflows.length?'当前状态下没有可展示的任务，请切换筛选条件。':'选择连续剧和需要制作的集数，系统会自动编排全部节点。' }}</p><button v-if="studio.workflows.length" class="button ghost" @click="setTaskFilter('all')">查看全部任务</button><button v-else class="button primary" :disabled="createLoading" @click="openCreateWizard"><Plus :size="15"/>{{ createLoading?'正在加载项目…':'创建任务' }}</button></main>
     </section>
 
     <BaseModal :open="outputPromotionOpen" title="保存生成图片到素材库" eyebrow="REUSABLE IMAGE ASSET" width="680px" @close="closeOutputPromotion">
@@ -1099,16 +1242,34 @@ onBeforeUnmount(()=>{promptRequestSequence+=1;detailRequestSequence+=1;workflowI
       <template #footer><button class="button ghost" :disabled="deleteLoading" @click="closeDeleteConfirm">保留记录</button><button class="button task-delete-confirm-button" :disabled="deleteLoading" @click="deleteTask"><Trash2 :size="15"/>{{ deleteLoading?'正在删除…':'确认删除' }}</button></template>
     </BaseModal>
 
-    <BaseModal :open="createOpen" title="创建媒体生产工作流" eyebrow="NEW PRODUCTION PIPELINE" width="720px" @close="createOpen=false">
+    <BaseModal :open="createOpen" title="创建媒体生产工作流" eyebrow="NEW PRODUCTION PIPELINE" width="720px" @close="closeCreateWizard">
       <div class="workflow-wizard">
         <div class="wizard-step"><span>01</span><div><h4>选择连续剧项目</h4><p>工作流会读取项目的一致性 Bible 和默认生产规格。</p><div class="project-select-grid"><button v-for="project in studio.projects" :key="project.id" :class="{active:selectedProjectId===project.id}" @click="selectProject(project.id)"><div :style="{background:studio.styles.find(s=>s.id===project.styleId)?.gradient}"><Clapperboard :size="20"/></div><span><strong>{{ project.title }}</strong><small>{{ project.episodes.length }} 集 · {{ studio.styles.find(s=>s.id===project.styleId)?.name }}</small></span><i><Check :size="12"/></i></button></div></div></div>
         <div class="wizard-step"><span>02</span><div><h4>选择生产范围</h4><p>不勾选时默认处理全剧；之后新增集数可再次追加任务。</p><button v-if="selectedProject" class="select-all" @click="selectAll"><span>{{ episodeIds.length===selectedProject.episodes.length?'取消全选':'全选所有剧集' }}</span><strong>{{ episodeIds.length }}/{{ selectedProject.episodes.length }}</strong></button><div class="episode-check-list"><button v-for="episode in selectedProject?.episodes" :key="episode.id" :class="{active:episodeIds.includes(episode.id)}" @click="toggleEpisode(episode.id)"><i><Check :size="11"/></i><span>EP {{ String(episode.number).padStart(2,'0') }}</span><strong>{{ episode.title }}</strong><small>{{ episode.shots.length }} 镜</small></button></div></div></div>
         <div v-if="selectedProductionHasRef2VA" class="wizard-step"><span>03</span><div><h4>Ref2VA 生成工作流</h4><p>可为所选范围内的 Ref2VA 视频指定工作流和对应参数；其他模式仍自动使用官方默认。</p><ProductionWorkflowPicker v-model:template-id="ref2vaTemplateId" v-model:parameters="ref2vaWorkflowParameters" :templates="productionWorkflowTemplates" :loading="productionWorkflowTemplatesLoading" :error="productionWorkflowTemplatesError" h3-mode="Ref2VA"/></div></div>
-        <div v-if="selectedProductionHasVideo" class="wizard-step"><span>{{ selectedProductionHasRef2VA?'04':'03' }}</span><div><h4>H3 视频分辨率 / 显存档位</h4><p>此档位只应用到视频任务；视频 FPS 固定为 24。图片使用下方独立的 SDXL 档位。</p><div class="resolution-profile-grid"><button v-for="profile in resolutionProfiles" :key="profile.value" :class="{active:resolutionProfile===profile.value,danger:profile.value==='project'}" @click="resolutionProfile=profile.value"><span><strong>{{ profile.label }}</strong><i>{{ profile.badge }}</i></span><b>{{ profileDimensions(profile.value) }}</b><small>{{ profile.hint }}</small><Check :size="13"/></button></div><label class="resolution-profile-select" :class="{active:advancedProfileSelected}"><span><strong>更多官方档位</strong><small>0.4–2.0 MP · 高档位显存与耗时显著增加</small></span><select :value="advancedProfileSelected?resolutionProfile:''" @change="selectAdvancedProfile"><option value="" disabled>选择更高分辨率档位</option><option v-for="profile in advancedResolutionProfiles" :key="profile.value" :value="profile.value">{{ profile.label }} · {{ profileDimensions(profile.value) }}</option></select></label><label class="resolution-multiple-field"><span><strong>尺寸取整倍数</strong><small>官方默认 32；允许 8–128，按 4 递增</small></span><input v-model.number="resolutionMultiple" type="number" min="8" max="128" step="4" @blur="normalizeResolutionMultiple"/><b>宽高将取 {{ resolutionMultiple }} 的整数倍</b></label><div class="resolution-profile-note" :class="{danger:isHighMemoryProfile(resolutionProfile)}"><AlertTriangle :size="14"/><span>本次视频将提交 {{ resolutionProfile==='project'?'项目默认':`${resolutionProfile} MP` }}（{{ profileDimensions(resolutionProfile) }}），不修改项目设定。{{ resolutionProfile==='0.1'?'这是最省显存的低分辨率验证档位。':resolutionProfile==='0.3'?'这是本机 8GB 显存的推荐起点。':resolutionProfile==='0.2'?'这是低显存、稳定的烟测档位。':isHighMemoryProfile(resolutionProfile)?'该档位需要高显存，1.0 MP 及以上在 8GB 机器上极易 OOM，请谨慎使用。':'该档位比 0.3 MP 占用更多显存。' }}</span></div></div></div>
+        <div v-if="selectedProductionHasVideo" class="wizard-step"><span>{{ selectedProductionHasRef2VA?'04':'03' }}</span><div><h4>H3 视频分辨率 / 显存档位</h4><p>此档位只应用到视频任务；视频 FPS 固定为 24。图片使用下方独立的 SDXL 档位。</p><div class="resolution-profile-grid"><button v-for="profile in resolutionProfiles" :key="profile.value" :class="{active:resolutionProfile===profile.value,danger:profile.value==='project'}" @click="resolutionProfile=profile.value"><span><strong>{{ profile.label }}</strong><i>{{ profile.badge }}</i></span><b>{{ profileDimensions(profile.value) }}</b><small>{{ profile.hint }}</small><Check :size="13"/></button></div><label class="resolution-profile-select" :class="{active:advancedProfileSelected}"><span><strong>更多官方档位</strong><small>0.4–2.0 MP · 高档位显存与耗时显著增加</small></span><select :value="advancedProfileSelected?resolutionProfile:''" @change="selectAdvancedProfile"><option value="" disabled>选择更高分辨率档位</option><option v-for="profile in advancedResolutionProfiles" :key="profile.value" :value="profile.value">{{ profile.label }} · {{ profileDimensions(profile.value) }}</option></select></label><label class="resolution-multiple-field"><span><strong>尺寸取整倍数</strong><small>官方默认 32；允许 8–128，按 4 递增</small></span><input v-model.number="resolutionMultiple" type="number" min="8" max="128" step="4" @blur="normalizeResolutionMultiple"/><b>宽高将取 {{ resolutionMultiple }} 的整数倍</b></label><div class="resolution-profile-note" :class="{danger:isHighMemoryProfile(resolutionProfile)}"><AlertTriangle :size="14"/><span>本次视频将提交 {{ resolutionProfile==='project'?'项目默认':`${resolutionProfile} MP` }}（{{ profileDimensions(resolutionProfile) }}），不修改项目设定。{{ resolutionProfile==='0.1'?'这是最省显存的低分辨率验证档位。':resolutionProfile==='0.3'?'这是低显存环境的常用起点，仍需在目标 GPU 烟测。':resolutionProfile==='0.2'?'这是低显存、稳定的烟测档位。':isHighMemoryProfile(resolutionProfile)?'该档位需要高显存；1.0 MP 及以上应先在目标 GPU 做低成本烟测。':'该档位比 0.3 MP 占用更多显存。' }}</span></div></div></div>
         <div v-if="selectedProductionHasImage" class="wizard-step"><span>{{ selectedProductionHasVideo?(selectedProductionHasRef2VA?'05':'04'):'03' }}</span><div><h4>SDXL 图片分辨率 / 显存档位</h4><p>图片独立使用本档位，不继承视频低显存档。推荐至少 0.8 MP，默认 0.98 MP；0.1–0.3 MP 仅用于连通性测试。</p><ResolutionProfilePicker v-model="imageResolutionProfile" v-model:multiple="imageResolutionMultiple" :multiple-step="8" label="SDXL 图片分辨率档位" compact/></div></div>
-        <div class="workflow-plan"><Sparkles :size="17"/><p>将按镜头类型创建任务：视频使用 MiniMax H3 与原生音频，图片使用 SDXL 标准文生图。选择的工作流只应用到匹配的 Ref2VA 镜头；其他模式使用官方默认。任务详情可预览和下载两类原始产物；只有视频按集组装。</p></div>
+        <div class="workflow-plan"><Sparkles :size="17"/><p>将为所选范围的 {{ selectedProductionTaskCount }} 个镜头逐镜创建独立任务：视频使用 MiniMax H3 与原生音频，图片使用 SDXL 标准文生图。整剧总集数与总镜数不作为业务上限；worker 按当前并发持续排队执行，失败镜头可独立重试。</p></div>
+        <div v-if="productionCapability" class="workflow-plan" :class="{danger:productionConfirmationRequired}">
+          <AlertTriangle v-if="productionConfirmationRequired" :size="17"/><Clock3 v-else :size="17"/>
+          <p>当前配置：队列建议值 {{ productionCapability.recommendedMaxPending }}，单用户建议值 {{ productionCapability.recommendedMaxActivePerUser }}，执行并发 {{ productionCapability.maxConcurrent }}。本次连同现有任务约分 {{ productionQueueWaveCount }} 个调度波次；超过建议值只会增加等待时间和资源占用，不会降低目标镜数。</p>
+        </div>
+        <div v-if="productionCapabilityError" class="workflow-plan danger"><AlertTriangle :size="17"/><p>暂时无法读取生产策略：{{ productionCapabilityError }}。仍可提交；若服务端要求长任务确认，页面会保留当前选择并提示再次确认。</p></div>
+        <div v-if="seriesProductionIdempotencyKey" class="workflow-plan"><RefreshCw :size="17"/><div><p>上次整剧提交的响应尚未确认；再次提交会复用同一幂等键，已创建的完整批次将直接返回，不会重复创建任务。为避免重复生产，范围和参数会保持原请求；如需更改，请先核对任务，再明确放弃旧尝试。</p><button type="button" class="button ghost small" @click="abandonSeriesProductionRetry">核对任务后放弃旧尝试</button></div></div>
+        <div v-if="seriesProductionIdempotencyConflict" class="workflow-plan danger"><AlertTriangle :size="17"/><div><p>{{ seriesProductionIdempotencyConflict }} 请先关闭弹窗并刷新“生产工作流”核对已有任务；不要直接换键重提。</p></div></div>
+        <div v-if="productionConfirmationRequired&&extendedProductionConfirmed" class="workflow-plan danger"><AlertTriangle :size="17"/><p>请再次确认：继续后会完整创建 {{ selectedProductionTaskCount }} 个逐镜任务，并按当前并发排队。关闭页面不会取消已经入队的任务。</p></div>
       </div>
-      <template #footer><button class="button ghost" @click="createOpen=false">取消</button><button class="button primary" :disabled="createLoading||(!selectedProductionHasVideo&&!selectedProductionHasImage)" @click="create"><WorkflowIcon :size="15"/>{{ createLoading?'正在编排…':'开始生产' }}</button></template>
+      <template #footer><button class="button ghost" @click="closeCreateWizard">取消</button><button class="button primary" :disabled="createLoading||Boolean(seriesProductionIdempotencyConflict)||(!selectedProductionHasVideo&&!selectedProductionHasImage)" @click="create"><WorkflowIcon :size="15"/>{{ createLoading?'正在编排…':productionConfirmationRequired&&!extendedProductionConfirmed?'查看长任务确认':productionConfirmationRequired?'确认并开始生产':`开始生产 ${selectedProductionTaskCount} 镜` }}</button></template>
     </BaseModal>
   </div>
 </template>
+
+<style scoped>
+.workflow-plan.danger {
+  border-color: rgba(230, 167, 90, .28);
+  background: rgba(230, 167, 90, .055);
+  color: var(--accent);
+}
+.workflow-plan.danger p { color: #b4946e; }
+.retry-queue-confirmation { display:inline-flex;align-items:center;gap:5px;color:#d2a15c;font-size:9px;line-height:1.45; }
+</style>

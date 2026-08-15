@@ -47,7 +47,7 @@ const newBibleItem = (id: string, name: string, description: string, assetId: st
 })
 
 const shot = (id: string, order: number, title: string, duration: number, action: string): Shot => ({
-  id, order, title, mediaType: 'video', duration, mode: order === 1 ? 'FL2VA' : 'Ref2VA', framing: order === 1 ? '大全景' : '中近景', camera: order === 1 ? '缓慢推轨，轻微手持呼吸' : '低机位横移后快速推近', action, prompt: '', negativePrompt: '人物身份漂移，面部变化，多余肢体，文字水印，镜头跳切，低清晰度', characterIds: order === 1 ? ['char-shen'] : ['char-shen', 'char-qing'], sceneId: 'scene-bamboo', propIds: order === 1 ? [] : ['prop-sword'], referenceAssetIds: [], referenceBindings: { characters: [], props: [], videos: [], audios: [] }, audioEnabled: true, audio: { dialogue: order === 1 ? '' : '青禾（压低声音）：他们追上来了。', soundscape: '细密雨声、竹叶摩擦、远处闷雷，剑鞘轻碰衣料', music: '低沉古琴单音，随后加入克制的弦乐脉冲' }, status: order === 1 ? 'ready' : 'draft'
+  id, order, title, mediaType: 'video', duration, mode: order === 1 ? 'FL2VA' : 'Ref2VA', framing: order === 1 ? '大全景' : '中近景', camera: order === 1 ? '缓慢推轨，轻微手持呼吸' : '低机位横移后快速推近', action, prompt: '', negativePrompt: '人物身份漂移，面部变化，多余肢体，文字水印，镜头跳切，低清晰度', characterIds: order === 1 ? ['char-shen'] : ['char-shen', 'char-qing'], sceneId: 'scene-bamboo', propIds: order === 1 ? [] : ['prop-sword'], referenceAssetIds: [], referenceBindings: { characters: [], props: [], videos: [], audios: [] }, requiresFirstFrameContinuity: order > 1, requiresLastFrameContinuity: true, audioEnabled: true, audio: { dialogue: order === 1 ? '' : '青禾（压低声音）：他们追上来了。', soundscape: '细密雨声、竹叶摩擦、远处闷雷，剑鞘轻碰衣料', music: '低沉古琴单音，随后加入克制的弦乐脉冲' }, status: order === 1 ? 'ready' : 'draft'
 })
 
 const episode = (id: string, number: number, title: string, synopsis: string): Episode => ({
@@ -58,7 +58,7 @@ const episode = (id: string, number: number, title: string, synopsis: string): E
 
 export const mockProjects: SeriesProject[] = [
   {
-    id: 'project-rain-sword', title: '听雨不归人', logline: '失忆剑客护送一封无法打开的密信，却发现沿途追杀者都来自他曾经建立的组织。', masterScript: '第1集：雨夜来信\n镜头1：雨夜竹林中，沈砚背对镜头独行。\n镜头2：青禾从竹影中现身示警。', styleId: 'wuxia', status: 'producing', aspectRatio: '9:16', resolution: '720p', defaultMode: 'Ref2VA',
+    id: 'project-rain-sword', title: '听雨不归人', logline: '失忆剑客护送一封无法打开的密信，却发现沿途追杀者都来自他曾经建立的组织。', masterScript: '第1集：雨夜来信\n镜头1：雨夜竹林中，沈砚背对镜头独行。\n镜头2：青禾从竹影中现身示警。', isFavorite: true, styleId: 'wuxia', status: 'producing', aspectRatio: '9:16', resolution: '720p', defaultMode: 'Ref2VA',
     bible: {
       characters: [newBibleItem('char-shen', '沈砚', '28岁清瘦剑客，黑发高束，左眉一道浅疤，墨色窄袖长衫，沉静克制', 'wuxia-character-01'), newBibleItem('char-qing', '青禾', '24岁药师，青灰斗篷，银簪，腰间药囊，眼神敏锐', 'wuxia-character-02')],
       scenes: [newBibleItem('scene-bamboo', '竹林雨夜', '深夜冷青色竹林，斜雨、薄雾、湿润石径，远方暖色灯笼为唯一暖光', 'wuxia-scene-01')],
@@ -68,7 +68,7 @@ export const mockProjects: SeriesProject[] = [
     episodes: [episode('episode-1', 1, '雨夜来信', '沈砚在竹林遭伏，青禾带来一封写着他名字的密信。'), episode('episode-2', 2, '无名客栈', '二人在客栈避雨，却发现所有住客都认识沈砚。'), episode('episode-3', 3, '剑冢旧梦', '密信指向雪山剑冢，沈砚第一次看见自己被抹去的过去。')], createdAt: '2026-08-01T08:00:00Z', updatedAt: now
   },
   {
-    id: 'project-neon-evidence', title: '零点证词', logline: '一名失去部分记忆的法医，在每晚零点收到来自未来受害者的证词。', masterScript: '第1集：来自明天的尸检\n镜头1：零点，尚未发生的凶案报告出现在解剖台上。', styleId: 'detective', status: 'writing', aspectRatio: '9:16', resolution: '720p', defaultMode: 'FL2VA',
+    id: 'project-neon-evidence', title: '零点证词', logline: '一名失去部分记忆的法医，在每晚零点收到来自未来受害者的证词。', masterScript: '第1集：来自明天的尸检\n镜头1：零点，尚未发生的凶案报告出现在解剖台上。', isFavorite: false, styleId: 'detective', status: 'writing', aspectRatio: '9:16', resolution: '720p', defaultMode: 'FL2VA',
     bible: { characters: [newBibleItem('char-forensic', '林默', '31岁法医，短发，深色风衣，右手戴黑色手套', 'detective-character-02')], scenes: [newBibleItem('scene-archive', '旧档案室', '冷白顶灯与窗外蓝紫霓虹交叠，潮湿墙面，密集铁柜', 'detective-scene-02')], props: [newBibleItem('prop-camera', '袖珍相机', '磨损黄铜机身，镜片边缘一道裂纹', 'detective-prop-02')], negativePrompt: '明快高调光，角色变化，现代品牌标识，水印', colorScript: '钴蓝、青绿与少量钠灯橙，真相揭示时逐步抽离彩色。' },
     episodes: [episode('episode-d1', 1, '来自明天的尸检', '零点，尚未发生的凶案报告出现在解剖台上。')], createdAt: '2026-08-05T10:00:00Z', updatedAt: now
   }
@@ -84,5 +84,5 @@ export const mockWorkflows: Workflow[] = [
 ]
 
 export const mockSettings: ComfySettings = {
-  host: 'http://127.0.0.1:8188', installPath: 'E:\\comfyUI\\ComfyUI_windows_portable_nvidia_cu126\\ComfyUI_windows_portable', outputPath: 'E:\\comfyUI\\ComfyUI_windows_portable_nvidia_cu126\\ComfyUI_windows_portable\\ComfyUI\\output', workflowPath: '', concurrency: 1, autoStart: false, apiKey: ''
+  host: 'http://127.0.0.1:8188', installPath: 'C:\\path\\to\\ComfyUI_windows_portable', outputPath: 'C:\\path\\to\\ComfyUI_windows_portable\\ComfyUI\\output', workflowPath: '', concurrency: 1, autoStart: false, apiKey: ''
 }

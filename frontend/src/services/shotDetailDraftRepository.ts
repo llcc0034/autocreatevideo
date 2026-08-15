@@ -2,6 +2,9 @@ import { api, unwrap } from './api'
 import {
   adaptShotDetailDraft,
   adaptShotDetailDraftApplyResult,
+  adaptShotDetailDraftBatch,
+  adaptShotDetailDraftBatchApplyResult,
+  adaptShotDetailDraftBatchDetail,
   shotDetailDraftDataPayload,
 } from './shotDetailDraft'
 import type {
@@ -11,16 +14,29 @@ import type {
   ShotDetailDraftLanguageMode,
   CreativeGenerationCapability,
   PromptProviderId,
+  ShotDetailDraftBatch,
+  ShotDetailDraftBatchDetail,
+  ShotDetailDraftBatchApplyResult,
+  ShotHighDetailPolicy,
 } from '@/types'
-import { adaptPromptProviders } from './providerCapabilities'
+import {
+  adaptPromptProviders,
+  mockCreativePromptProviderCapability,
+  promptProvider,
+} from './providerCapabilities'
 
 type Raw = Record<string, any>
 const useMock = import.meta.env.VITE_USE_MOCK === 'true'
-// A single-shot high-detail request is much smaller than a multi-shot draft,
-// but model loading and a repair pass can still take several minutes.
-const SHOT_DETAIL_DRAFT_TIMEOUT_MS = 720_000
+// Zero lets Axios wait for the server-owned provider timeout. Deployments can
+// set a finite browser ceiling without changing application code.
+const configuredShotDetailTimeout = Number(import.meta.env.VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS ?? 0)
+if (!Number.isFinite(configuredShotDetailTimeout) || configuredShotDetailTimeout < 0) {
+  throw new Error('VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS must be zero or a positive number')
+}
+const SHOT_DETAIL_DRAFT_TIMEOUT_MS = configuredShotDetailTimeout
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 const wait = () => new Promise((resolve) => setTimeout(resolve, 180))
+
 const mockDrafts = new Map<string, ShotDetailDraft>()
 
 const unwrapRows = (payload: unknown): Raw[] => {
@@ -30,6 +46,21 @@ const unwrapRows = (payload: unknown): Raw[] => {
   if (Array.isArray(body?.drafts)) return body.drafts
   return []
 }
+
+const positive = (value: unknown): number | undefined => {
+  const result = Number(value)
+  return Number.isFinite(result) && result > 0 ? result : undefined
+}
+
+const adaptHighDetailPolicy = (raw: Raw): ShotHighDetailPolicy => ({
+  provider: raw.provider === 'deepseek_api' ? 'deepseek_api' : 'local_qwen',
+  recommendedZhChars: positive(raw.recommended_zh_chars),
+  recommendedEnChars: positive(raw.recommended_en_chars),
+  transportZhMaxChars: positive(raw.transport_zh_max_chars),
+  transportEnMaxChars: positive(raw.transport_en_max_chars),
+  recommendedMaxShots: positive(raw.recommended_max_shots),
+  maxAttempts: positive(raw.max_attempts),
+})
 
 const mockFlags = (draft: ShotDetailDraft): ShotDetailDraft => ({
   ...draft,
@@ -50,30 +81,120 @@ export const shotDetailDraftRepository = {
     if (!useMock) {
       const raw = unwrap<Raw>((await api.get('/capabilities/creative-drafts/')).data)
       const providerCapability = adaptPromptProviders(raw)
+      const defaultCapability = promptProvider(providerCapability.providers, providerCapability.defaultProvider)
       return {
-        supported: raw.creative_generation_supported === true, configured: raw.configured === true,
-        provider: String(raw.provider || ''), model: String(raw.model || ''),
-        modelDownloaded: raw.model_downloaded === true, modelVerified: raw.model_verified === true,
-        device: String(raw.device || 'cpu'), minShots: Number(raw.min_shots || 1), maxShots: Number(raw.max_shots || 4),
-        maxSourceChars: Number(raw.max_source_chars || 0), baselineMaxNewTokens: Number(raw.baseline_max_new_tokens || 0),
-        maxNewTokens: Number(raw.max_new_tokens || 0), configuredMaxNewTokens: Number(raw.configured_max_new_tokens || 0),
-        contextSize: Number(raw.context_size || 0), loadedOnDemand: raw.loaded_on_demand === true,
-        unloadedAfterRequest: raw.unloaded_after_request === true, reviewRequired: raw.review_required !== false,
-        translationReviewReused: raw.translation_review_reused === true, notice: String(raw.notice || '') || undefined,
+        supported: raw.creative_generation_supported === true, configured: defaultCapability?.configured === true,
+        provider: defaultCapability?.id || '', model: defaultCapability?.model || '',
+        modelDownloaded: defaultCapability?.modelDownloaded === true, modelVerified: defaultCapability?.modelVerified === true,
+        device: defaultCapability?.device || '', minShots: defaultCapability?.minShots,
+        batchShots: defaultCapability?.batchShots, maxSourceChars: defaultCapability?.maxSourceChars,
+        minShotDurationMs: defaultCapability?.minShotDurationMs, maxShotDurationMs: defaultCapability?.maxShotDurationMs,
+        baselineMaxNewTokens: defaultCapability?.baselineMaxNewTokens,
+        maxNewTokens: defaultCapability?.maxNewTokens,
+        configuredMaxNewTokens: defaultCapability?.configuredMaxNewTokens,
+        contextSize: defaultCapability?.contextSize, loadedOnDemand: defaultCapability?.loadedOnDemand === true,
+        unloadedAfterRequest: defaultCapability?.unloadedAfterRequest === true,
+        reviewRequired: defaultCapability?.reviewRequired !== false,
+        translationReviewReused: defaultCapability?.translationReviewReused === true,
+        notice: defaultCapability?.notice,
+        shotHighDetailPolicies: Object.fromEntries(
+          Object.entries((raw.shot_high_detail_policies || {}) as Raw)
+            .map(([id, policy]) => [id, adaptHighDetailPolicy((policy || {}) as Raw)]),
+        ),
+        shotHighDetailSharedResourceBusy: raw.shot_high_detail_shared_resource_busy === true,
         ...providerCapability,
       }
     }
     await wait()
+    const mockProvider = mockCreativePromptProviderCapability()
     return {
-      supported: true, configured: true, provider: 'mock-qwen-local', model: 'Qwen/Qwen3-4B-GGUF',
-      modelDownloaded: true, modelVerified: true, device: 'cpu', minShots: 1, maxShots: 4,
-      maxSourceChars: 12000, baselineMaxNewTokens: 2304, maxNewTokens: 3072,
-      configuredMaxNewTokens: 3072, contextSize: 32768, loadedOnDemand: true,
-      unloadedAfterRequest: true, reviewRequired: true, translationReviewReused: true,
-      defaultProvider: 'local_qwen', providers: [{ id: 'local_qwen', label: '本地 Qwen', enabled: true,
-        configured: true, ready: true, model: 'Qwen/Qwen3-4B-GGUF', transport: 'local',
-        modelDownloaded: true, modelVerified: true, device: 'cpu' }],
+      supported: true, configured: true, provider: mockProvider.id, model: mockProvider.model,
+      modelDownloaded: mockProvider.modelDownloaded === true, modelVerified: mockProvider.modelVerified === true,
+      device: mockProvider.device || '', minShots: mockProvider.minShots,
+      batchShots: mockProvider.batchShots, maxSourceChars: mockProvider.maxSourceChars,
+      minShotDurationMs: mockProvider.minShotDurationMs, maxShotDurationMs: mockProvider.maxShotDurationMs,
+      baselineMaxNewTokens: mockProvider.baselineMaxNewTokens,
+      maxNewTokens: mockProvider.maxNewTokens ?? mockProvider.configuredMaxNewTokens,
+      configuredMaxNewTokens: mockProvider.configuredMaxNewTokens ?? mockProvider.maxNewTokens,
+      contextSize: mockProvider.contextSize, loadedOnDemand: mockProvider.loadedOnDemand === true,
+      unloadedAfterRequest: mockProvider.unloadedAfterRequest === true,
+      reviewRequired: mockProvider.reviewRequired !== false,
+      translationReviewReused: mockProvider.translationReviewReused === true,
+      defaultProvider: 'local_qwen', providers: [mockProvider],
+      shotHighDetailPolicies: {
+        local_qwen: {
+          provider: 'local_qwen',
+          recommendedZhChars: positive(import.meta.env.VITE_MOCK_SHOT_DETAIL_RECOMMENDED_ZH_CHARS),
+          recommendedEnChars: positive(import.meta.env.VITE_MOCK_SHOT_DETAIL_RECOMMENDED_EN_CHARS),
+          transportZhMaxChars: positive(import.meta.env.VITE_MOCK_SHOT_DETAIL_TRANSPORT_ZH_MAX_CHARS),
+          transportEnMaxChars: positive(import.meta.env.VITE_MOCK_SHOT_DETAIL_TRANSPORT_EN_MAX_CHARS),
+        },
+      },
     }
+  },
+
+  async listBatches(projectId: string, episodeId: string): Promise<ShotDetailDraftBatch[]> {
+    if (useMock) return []
+    const response = await api.get(`/projects/${projectId}/shot-detail-draft-batches/`, {
+      params: { episode: episodeId, page_size: 50 },
+    })
+    return unwrapRows(response.data).map(adaptShotDetailDraftBatch)
+  },
+
+  async createBatch(projectId: string, options: {
+    episodeId: string
+    requestId: string
+    provider: PromptProviderId
+    variationNote?: string
+    confirmationAcknowledged?: boolean
+  }): Promise<ShotDetailDraftBatch> {
+    if (useMock) throw new Error('Mock 模式暂不支持整集高细节扩写。')
+    const response = await api.post(`/projects/${projectId}/shot-detail-draft-batches/`, {
+      episode_id: options.episodeId,
+      request_id: options.requestId,
+      provider: options.provider,
+      variation_note: options.variationNote || '',
+      confirmation_acknowledged: options.confirmationAcknowledged === true,
+    })
+    return adaptShotDetailDraftBatch(unwrap<Raw>(response.data))
+  },
+
+  async batchDetail(batchId: string, page = 1, pageSize = 200): Promise<ShotDetailDraftBatchDetail> {
+    if (useMock) throw new Error('Mock 模式暂不支持整集高细节扩写。')
+    const response = await api.get(`/shot-detail-draft-batches/${batchId}/`, {
+      params: { page, page_size: pageSize },
+    })
+    return adaptShotDetailDraftBatchDetail(unwrap<Raw>(response.data))
+  },
+
+  async batchDetailAll(batchId: string): Promise<ShotDetailDraftBatchDetail> {
+    const first = await this.batchDetail(batchId, 1, 200)
+    const pages = Math.ceil(first.pagination.count / 200)
+    if (pages <= 1) return first
+    const rest = await Promise.all(
+      Array.from({ length: pages - 1 }, (_, index) => this.batchDetail(batchId, index + 2, 200)),
+    )
+    return { ...first, items: [first, ...rest].flatMap((result) => result.items) }
+  },
+
+  async applyBatch(batchId: string, options: {
+    expectedBatchRevision: number
+    items: Array<{ itemId: string; draftId: string; expectedRevision: number }>
+    languageMode: ShotDetailDraftLanguageMode
+    englishReviewAcknowledged?: boolean
+    reviewAcknowledged?: boolean
+  }): Promise<ShotDetailDraftBatchApplyResult> {
+    if (useMock) throw new Error('Mock 模式暂不支持整集高细节扩写。')
+    const response = await api.post(`/shot-detail-draft-batches/${batchId}/apply/`, {
+      expected_batch_revision: options.expectedBatchRevision,
+      items: options.items.map((item) => ({
+        item_id: item.itemId, draft_id: item.draftId, expected_revision: item.expectedRevision,
+      })),
+      language_mode: options.languageMode,
+      english_review_acknowledged: options.englishReviewAcknowledged === true,
+      review_acknowledged: options.reviewAcknowledged === true,
+    })
+    return adaptShotDetailDraftBatchApplyResult(unwrap<Raw>(response.data))
   },
 
   async list(projectId: string, shotId: string): Promise<ShotDetailDraft[]> {

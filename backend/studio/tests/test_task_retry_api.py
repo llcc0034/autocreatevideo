@@ -1,12 +1,15 @@
 import importlib
+from copy import deepcopy
 from unittest.mock import patch
 
 from django.apps import apps as django_apps
+from django.core.management import call_command
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
 from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
+from studio.services.workflow import build_workflow
 from studio.tests.factories import build_story
 
 
@@ -106,6 +109,157 @@ class GenerationTaskRetryAPITests(TestCase):
         duplicate = self.client.post(f"/api/v1/tasks/{self.task.id}/retry/", {}, format="json")
         self.assertEqual(duplicate.status_code, 400, duplicate.data)
         self.assertIn(str(retry.id), str(duplicate.data))
+
+    @override_settings(
+        TASK_RECOMMENDED_MAX_PENDING=1,
+        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=1,
+    )
+    def test_single_task_create_requires_queue_confirmation_then_preserves_request(self):
+        self.task.status = GenerationTask.Status.QUEUED
+        self.task.save(update_fields=("status", "updated_at"))
+        payload = {
+            "generated_workflow_id": str(self.task.generated_workflow_id),
+            "priority": 9,
+            "max_attempts": 4,
+        }
+
+        unconfirmed = self.client.post("/api/v1/tasks/", payload, format="json")
+
+        self.assertEqual(unconfirmed.status_code, 409, unconfirmed.data)
+        self.assertEqual(
+            unconfirmed.data["error"]["code"],
+            "production_queue_confirmation_required",
+        )
+        self.assertEqual(unconfirmed.data["error"]["details"]["requested_task_count"], 1)
+        self.assertEqual(GenerationTask.objects.count(), 1)
+
+        confirmed = self.client.post(
+            "/api/v1/tasks/",
+            {**payload, "extended_generation_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(confirmed.status_code, 201, confirmed.data)
+        created = GenerationTask.objects.get(pk=confirmed.data["id"])
+        self.assertEqual(created.priority, 9)
+        self.assertEqual(created.max_attempts, 4)
+        self.assertTrue(created.capability_snapshot["extended_generation_confirmed"])
+
+    @override_settings(
+        TASK_RECOMMENDED_MAX_PENDING=1,
+        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=1,
+    )
+    def test_retry_requires_queue_confirmation_then_reuses_source_parameters(self):
+        GenerationTask.objects.create(
+            owner=self.user,
+            project=self.task.project,
+            episode=self.task.episode,
+            generated_workflow=self.task.generated_workflow,
+            kind=GenerationTask.Kind.VIDEO,
+            status=GenerationTask.Status.QUEUED,
+        )
+
+        unconfirmed = self.client.post(
+            f"/api/v1/tasks/{self.task.id}/retry/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(unconfirmed.status_code, 409, unconfirmed.data)
+        self.assertEqual(
+            unconfirmed.data["error"]["code"],
+            "production_queue_confirmation_required",
+        )
+        self.assertEqual(GenerationTask.objects.count(), 2)
+
+        confirmed = self.client.post(
+            f"/api/v1/tasks/{self.task.id}/retry/",
+            {"extended_generation_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(confirmed.status_code, 201, confirmed.data)
+        retry = GenerationTask.objects.get(pk=confirmed.data["id"])
+        self.assertEqual(retry.generated_workflow_id, self.task.generated_workflow_id)
+        self.assertEqual(retry.priority, self.task.priority)
+        self.assertEqual(retry.max_attempts, self.task.max_attempts)
+        self.assertTrue(retry.capability_snapshot["extended_generation_confirmed"])
+
+    def test_retry_reuses_materialized_variant_parameters_and_snapshot(self):
+        call_command("seed_data", verbosity=0)
+        workflow = self.task.generated_workflow
+        prompt = workflow.prompt_artifact
+        shot = prompt.shot
+        shot.duration_ms = 5000
+        shot.h3_mode = "Ref2VA"
+        shot.reference_bindings = {}
+        shot.save(update_fields=("duration_ms", "h3_mode", "reference_bindings", "updated_at"))
+        result = build_h3_video_prompt(
+            workflow.project,
+            [shot],
+            H3PromptOptions(mode="Ref2VA", include_audio=True),
+        )
+        prompt.h3_mode = "Ref2VA"
+        prompt.prompt_text = result.text
+        prompt.structured_payload = result.payload
+        prompt.consistency_snapshot = result.consistency_snapshot
+        prompt.content_hash = result.content_hash
+        prompt.total_duration_ms = 5000
+        prompt.save(update_fields=(
+            "h3_mode", "prompt_text", "structured_payload", "consistency_snapshot",
+            "content_hash", "total_duration_ms", "updated_at",
+        ))
+        variant = WorkflowTemplate.objects.get(
+            owner=None, slug="minimax-h3-r2v-t8-dual-clock-4step",
+        )
+        graph, injected, content_hash = build_workflow(
+            variant,
+            prompt,
+            workflow.project,
+            {"STEPS": 7, "LORA_STRENGTH": 0.75},
+        )
+        workflow.template = variant
+        workflow.workflow_json = deepcopy(graph)
+        workflow.injected_values = injected
+        workflow.content_hash = content_hash
+        workflow.save(update_fields=(
+            "template", "workflow_json", "injected_values", "content_hash", "updated_at",
+        ))
+        self.task.generated_workflow = workflow
+        self.task.model_profile = "local_h3_ref2va_t8_dual_clock_4step"
+        self.task.workflow_version = variant.version
+        self.task.capability_snapshot = {
+            **self.task.capability_snapshot,
+            "template_slug": variant.slug,
+            "source_workflow": variant.input_schema["source_workflow"],
+            "workflow_parameters": {"STEPS": 7, "LORA_STRENGTH": 0.75},
+        }
+        self.task.save(update_fields=(
+            "generated_workflow", "model_profile", "workflow_version",
+            "capability_snapshot", "updated_at",
+        ))
+
+        response = self.client.post(f"/api/v1/tasks/{self.task.id}/retry/", {}, format="json")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        retry = GenerationTask.objects.select_related(
+            "generated_workflow__template",
+        ).get(pk=response.data["id"])
+        self.assertEqual(retry.generated_workflow_id, workflow.id)
+        self.assertEqual(retry.generated_workflow.template.slug, variant.slug)
+        self.assertEqual(retry.generated_workflow.injected_values["STEPS"], 7)
+        self.assertEqual(retry.generated_workflow.injected_values["LORA_STRENGTH"], 0.75)
+        self.assertEqual(retry.generated_workflow.workflow_json["7"]["inputs"]["steps"], 7)
+        self.assertEqual(retry.generated_workflow.workflow_json["2"]["inputs"]["strength_model"], 0.75)
+        self.assertEqual(
+            retry.capability_snapshot["workflow_parameters"],
+            {"STEPS": 7, "LORA_STRENGTH": 0.75},
+        )
+        self.assertEqual(retry.capability_snapshot["template_slug"], variant.slug)
+        self.assertEqual(
+            retry.capability_snapshot["source_workflow"],
+            "video_minimax_h3_r2v_t8_dual_clock_4step.json",
+        )
 
     def test_definitive_remote_failure_can_be_retried_with_new_token(self):
         self.task.submission_token = "old-terminal-token"

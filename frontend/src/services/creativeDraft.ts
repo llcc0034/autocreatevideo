@@ -10,14 +10,11 @@ import type {
   CreativeDraftShot,
   CreativeDraftValidation,
   H3Mode,
+  PromptProviderCapability,
+  PromptProviderId,
 } from '@/types'
 
 type Raw = Record<string, any>
-
-export const CREATIVE_DRAFT_ENGLISH_LIMITS = {
-  narrative: { generation: 1000, editor: 1000 },
-  action: { generation: 1000, editor: 1000 },
-} as const
 
 const objectValue = (value: unknown): Raw => (
   value && typeof value === 'object' ? value as Raw : {}
@@ -203,7 +200,7 @@ const adaptShot = (raw: Raw, position: number): CreativeDraftShot => ({
   soundscapeEn: text(raw.soundscape_en ?? raw.soundscapeEn),
   musicZh: text(raw.music_zh ?? raw.musicZh),
   musicEn: text(raw.music_en ?? raw.musicEn),
-  durationMs: Number(raw.duration_ms ?? raw.durationMs ?? 5000),
+  durationMs: Number(raw.duration_ms ?? raw.durationMs ?? 0),
   mediaType: 'video',
   h3Mode: h3Mode(raw.h3_mode ?? raw.h3Mode),
   includeAudio: raw.include_audio !== false && raw.includeAudio !== false,
@@ -367,9 +364,27 @@ export const creativeSafeFailureDiagnostic = (metadata: unknown): CreativeSafeFa
   return { code, path: safePathCharacters && safePathRoot ? rawPath : '' }
 }
 
+/** Extracts the stable runtime/request error independently from field diagnostics. */
+export const creativeSafeFailureCode = (metadata: unknown): string => {
+  const body = objectValue(metadata)
+  const rawCode = String(body.error_code ?? body.errorCode ?? '').trim().toLowerCase()
+  return /^[a-z][a-z0-9_]{0,79}$/.test(rawCode) ? rawCode : ''
+}
+
+export const creativeProviderLabel = (provider: PromptProviderId | string = 'local_qwen'): string => (
+  provider === 'deepseek_api' ? 'DeepSeek API' : '本地 Qwen'
+)
+
+export const creativeProviderFailureFallback = (
+  provider: PromptProviderId | string = 'local_qwen',
+): string => (
+  `${creativeProviderLabel(provider)} 未返回可审核的结构化镜头。请一键重试整稿；若持续失败，`
+  + '请减少本次镜数、缩短本次创作要求或按剧情边界拆分后重试。正式分镜未修改。'
+)
+
 const retryInstruction = (contextCurrent: boolean): string => (
   contextCurrent
-    ? '请一键重试整稿；若持续失败，改为 1–2 镜或缩短本次创作要求。'
+    ? '请一键重试整稿；若持续失败，请减少本次镜数、缩短本次创作要求或按剧情边界拆分后重试。'
     : '当前故事、Bible 或剧本已变化，请按当前内容生成新草稿。'
 )
 
@@ -381,10 +396,18 @@ const retryInstruction = (contextCurrent: boolean): string => (
 export const creativeFailureRecovery = (
   rawCode: unknown,
   contextCurrent = true,
+  provider: PromptProviderId | string = 'local_qwen',
 ): string | undefined => {
   const code = String(rawCode || '').trim()
   const retry = retryInstruction(contextCurrent)
   const unchanged = '正式分镜未修改。'
+  const providerLabel = creativeProviderLabel(provider)
+  if (code === 'creative_generation_confirmation_required') {
+    return `${providerLabel} 本次镜数或权威剧本超过当前单批建议参考值；请确认是否继续完整生成。${unchanged}`
+  }
+  if (code === 'creative_dialogue_capacity_exceeded') {
+    return `本段剧本中的权威对白超过所选通道当前配置的镜数承载量；请拆分本集片段后重新生成。${unchanged}`
+  }
   if (code === 'creative_resource_busy') {
     return `视频生产或其他本地 Qwen 请求正在占用资源；请等待当前任务结束后再重试。${unchanged}`
   }
@@ -402,21 +425,21 @@ export const creativeFailureRecovery = (
   }
   if (['creative_output_budget_exhausted', 'output_budget_exhausted'].includes(code)) {
     const action = contextCurrent
-      ? '请不要按原设置重复提交：把本段改为 1–2 镜，或按剧情与权威对白边界拆分后重新生成。'
+      ? '请不要按原设置重复提交：减少本次镜数，或按剧情与权威对白边界拆分后重新生成。'
       : retry
-    return `本地 Qwen 已用完本次动态输出容量，返回内容不完整且没有可采用草稿。${action}${unchanged}`
+    return `${providerLabel} 已用完本次动态输出容量，返回内容不完整且没有可采用草稿。${action}${unchanged}`
   }
   if (['creative_repair_not_started', 'repair_not_started'].includes(code)) {
     const action = contextCurrent
-      ? '请缩减为 1–2 镜、缩短本次创作要求，并按权威对白边界拆分后重新生成。'
+      ? '请减少本次镜数、缩短本次创作要求，并按权威对白边界拆分后重新生成。'
       : retry
     return `首轮输出未通过结构校验，剩余执行时间或上下文不足，修复阶段未能启动。${action}${unchanged}`
   }
   if (code === 'creative_output_invalid_json') {
-    return `本地 Qwen 返回的分镜草稿格式不完整，未生成可审核草稿。${retry}${unchanged}`
+    return `${providerLabel} 返回的分镜草稿格式不完整，未生成可审核草稿。${retry}${unchanged}`
   }
   if (['creative_timeout', 'creative_parent_timeout'].includes(code)) {
-    return `本地 Qwen 本次创作超过运行时限，模型进程已结束，未生成可审核草稿。${retry}${unchanged}`
+    return `${providerLabel} 本次创作超过运行时限，未生成可审核草稿。${retry}${unchanged}`
   }
   if (code === 'creative_invalid_runtime_json') {
     return `本地 Qwen 运行时返回的响应格式异常，未生成可审核草稿。请刷新页面并检查“模型与能力”状态后再试；若持续出现，请重启本地 Qwen 服务。${unchanged}`
@@ -425,10 +448,10 @@ export const creativeFailureRecovery = (
     return `本地 Qwen 进程异常退出，未生成可审核草稿。请检查“模型与能力”状态，确认没有视频生产或其他 Qwen 任务占用后再重试。${unchanged}`
   }
   if (code === 'creative_validation_failed') {
-    return `本地 Qwen 输出未通过结构校验，未生成可审核草稿。${retry}${unchanged}`
+    return `${providerLabel} 输出未通过结构校验，未生成可审核草稿。${retry}${unchanged}`
   }
   if (code === 'creative_runtime_failed') {
-    return `本地 Qwen 运行失败，未生成可审核草稿。${retry}${unchanged}`
+    return `${providerLabel} 运行失败，未生成可审核草稿。${retry}${unchanged}`
   }
   if (code === 'creative_storyboard_validation_failed') {
     return `DeepSeek 候选未通过结构或字段长度校验，已安全拒绝采用。请根据下方问题位置缩短对应字段后重试。${unchanged}`
@@ -442,7 +465,23 @@ export const creativeFailureRecovery = (
   if (code === 'creative_storyboard_empty_output') {
     return `DeepSeek 本次未返回可审核内容。请稍后重试；若持续出现，请检查服务端模型配置。${unchanged}`
   }
-  if (['deepseek_api_disabled', 'deepseek_api_misconfigured', 'deepseek_protocol_unavailable'].includes(code)) {
+  if (code === 'creative_storyboard_invalid_request') {
+    return `分镜创作请求未通过安全协议校验；请刷新页面后重试。${unchanged}`
+  }
+  if (code === 'creative_storyboard_repair_invalid_json') {
+    return `DeepSeek 修复后的分镜结构仍无法安全解析；请减少镜数或按剧情边界拆分后重试。${unchanged}`
+  }
+  if (code === 'creative_storyboard_repair_validation_failed') {
+    return `DeepSeek 修复后的候选仍未通过结构校验；请根据问题位置缩短对应字段后重试。${unchanged}`
+  }
+  if ([
+    'creative_storyboard_repair_output_budget_exhausted',
+    'creative_storyboard_repair_incomplete_response',
+    'creative_storyboard_repair_empty_output',
+  ].includes(code)) {
+    return `DeepSeek 未完整返回修复后的分镜结构。请减少镜数、缩短创作要求或按剧情边界拆分后重试。${unchanged}`
+  }
+  if (['deepseek_api_disabled', 'deepseek_api_misconfigured', 'deepseek_protocol_unavailable', 'deepseek_provider_unavailable'].includes(code)) {
     return `DeepSeek 通道尚未正确配置；请检查服务端启用状态、模型和凭据后重试。${unchanged}`
   }
   if (code === 'deepseek_api_authentication_failed') {
@@ -457,22 +496,145 @@ export const creativeFailureRecovery = (
   if (['deepseek_api_request_rejected', 'deepseek_api_invalid_response'].includes(code)) {
     return `DeepSeek API 拒绝了请求或返回格式异常；请检查服务端配置后重试。${unchanged}`
   }
+  if (code === 'deepseek_api_failed') {
+    return `DeepSeek API 本次请求失败；请稍后重试并检查服务端通道状态。${unchanged}`
+  }
   return undefined
 }
 
-/** Normalizes flat DRF errors, the unified error envelope and browser timeouts. */
-export const creativeDraftRequestError = (cause: unknown, fallback: string): string => {
+export interface CreativeGenerationConfirmationContext {
+  targetShotCount: number
+  recommendedMaxShots?: number
+  batchShots?: number
+  sourceCharCount?: number
+  maxSourceChars?: number
+  requiredDialogueCount?: number
+  dialogueCapacity?: number
+  maxDialoguePerShot?: number
+  effectiveMaxDialoguePerShot?: number
+}
+
+/** Reads only the public integer policy values needed to recover from config drift. */
+export const creativeGenerationConfirmationContext = (
+  cause: unknown,
+): CreativeGenerationConfirmationContext | undefined => {
   const candidate = objectValue(cause)
   const response = objectValue(candidate.response)
   const data = objectValue(response.data)
   const envelope = objectValue(data.error)
-  const code = String(envelope.code || data.code || candidate.code || '')
+  const details = objectValue(envelope.details)
+  const code = String(details.code || envelope.code || data.code || candidate.code || '')
+  if (code !== 'creative_generation_confirmation_required') return undefined
+  const safePositiveInteger = (value: unknown): number | undefined => {
+    const number = Number(value)
+    return Number.isSafeInteger(number) && number > 0 ? number : undefined
+  }
+  const targetShotCount = safePositiveInteger(details.target_shot_count ?? details.targetShotCount)
+  if (!targetShotCount) return undefined
+  const result: CreativeGenerationConfirmationContext = { targetShotCount }
+  const recommendedMaxShots = safePositiveInteger(details.recommended_max_shots ?? details.recommendedMaxShots)
+  const batchShots = safePositiveInteger(details.batch_shots ?? details.batchShots)
+  const sourceCharCount = safePositiveInteger(details.source_char_count ?? details.sourceCharCount)
+  const maxSourceChars = safePositiveInteger(details.max_source_chars ?? details.maxSourceChars)
+  const safeNonNegativeInteger = (value: unknown): number | undefined => {
+    const number = Number(value)
+    return Number.isSafeInteger(number) && number >= 0 ? number : undefined
+  }
+  const requiredDialogueCount = safeNonNegativeInteger(
+    details.required_dialogue_count ?? details.requiredDialogueCount,
+  )
+  const dialogueCapacity = safeNonNegativeInteger(
+    details.dialogue_capacity ?? details.dialogueCapacity,
+  )
+  const maxDialoguePerShot = safePositiveInteger(
+    details.max_dialogue_per_shot ?? details.maxDialoguePerShot,
+  )
+  const effectiveMaxDialoguePerShot = safePositiveInteger(
+    details.effective_max_dialogue_per_shot ?? details.effectiveMaxDialoguePerShot,
+  )
+  if (recommendedMaxShots) result.recommendedMaxShots = recommendedMaxShots
+  if (batchShots) result.batchShots = batchShots
+  if (sourceCharCount) result.sourceCharCount = sourceCharCount
+  if (maxSourceChars) result.maxSourceChars = maxSourceChars
+  if (requiredDialogueCount !== undefined) result.requiredDialogueCount = requiredDialogueCount
+  if (dialogueCapacity !== undefined) result.dialogueCapacity = dialogueCapacity
+  if (maxDialoguePerShot) result.maxDialoguePerShot = maxDialoguePerShot
+  if (effectiveMaxDialoguePerShot) result.effectiveMaxDialoguePerShot = effectiveMaxDialoguePerShot
+  return result
+}
+
+/** Normalizes flat DRF errors, the unified error envelope and browser timeouts. */
+export const creativeDraftRequestError = (
+  cause: unknown,
+  fallback: string,
+  provider: PromptProviderId | string = 'local_qwen',
+  timing?: Pick<PromptProviderCapability, 'runtimeTimeoutSeconds' | 'processTimeoutSeconds'>,
+): string => {
+  const candidate = objectValue(cause)
+  const response = objectValue(candidate.response)
+  const data = objectValue(response.data)
+  const envelope = objectValue(data.error)
+  const envelopeDetails = objectValue(envelope.details)
+  const code = String(envelopeDetails.code || envelope.code || data.code || candidate.code || '')
   const rawMessage = String(candidate.message || '')
-  const recovery = creativeFailureRecovery(code)
+  if (code === 'creative_generation_confirmation_required') {
+    const confirmation = creativeGenerationConfirmationContext(cause)
+    if (confirmation) {
+      const reasons = []
+      if (
+        confirmation.recommendedMaxShots
+        && confirmation.targetShotCount > confirmation.recommendedMaxShots
+      ) {
+        reasons.push(`${confirmation.targetShotCount} 镜超过当前建议单次 ${confirmation.recommendedMaxShots} 镜`)
+      }
+      if (
+        confirmation.sourceCharCount
+        && confirmation.maxSourceChars
+        && confirmation.sourceCharCount > confirmation.maxSourceChars
+      ) {
+        reasons.push(`权威剧本 ${confirmation.sourceCharCount} 字符超过单批 ${confirmation.maxSourceChars} 字符参考值`)
+      }
+      if (
+        confirmation.requiredDialogueCount !== undefined
+        && confirmation.dialogueCapacity !== undefined
+        && confirmation.requiredDialogueCount > confirmation.dialogueCapacity
+      ) {
+        reasons.push(
+          `${confirmation.requiredDialogueCount} 句权威对白超过当前 ${confirmation.dialogueCapacity} 句建议容量`,
+        )
+      }
+      if (reasons.length) {
+        const batchNote = confirmation.batchShots
+          ? `，当前单次批次能力参考为 ${confirmation.batchShots} 镜`
+          : ''
+        return `${creativeProviderLabel(provider)} 本次请求${reasons.join('，')}${batchNote}。系统不会截断镜数或剧本；请在页面确认后按原镜数和完整剧本继续，任务预计耗时更长。正式分镜未修改。`
+      }
+    }
+  }
+  if (code === 'creative_dialogue_capacity_exceeded') {
+    const required = Number(envelopeDetails.required_dialogue_count)
+    const shots = Number(envelopeDetails.target_shot_count)
+    const capacity = Number(envelopeDetails.dialogue_capacity)
+    if ([required, shots, capacity].every((value) => Number.isSafeInteger(value) && value >= 0)) {
+      return `本段剧本包含 ${required} 句必须保留的原文对白；所选通道对 ${shots} 个镜头的当前建议容量为 ${capacity} 句。这是可配置的创作提醒，不会裁剪模型已返回的草稿；请确认后继续，或按需调整配置。正式分镜未修改。`
+    }
+  }
+  const recovery = creativeFailureRecovery(code, true, provider)
   if (recovery) return recovery
   const timedOut = code === 'ECONNABORTED' || code === 'ETIMEDOUT' || /timeout|timed out/i.test(rawMessage)
   if (timedOut) {
-    return '浏览器等待本地 Qwen 超过 17 分钟仍未收到响应；服务端正常应在 16 分钟硬上限内结束。这不等于服务端已取消。系统已刷新版本记录：若出现“生成失败”版本，可点击“一键重试整稿”；若没有，请先检查服务连接、等待模型释放或刷新后再重试。正式分镜未修改。'
+    const safeSeconds = (value: unknown): number | undefined => {
+      const seconds = Number(value)
+      return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined
+    }
+    const runtimeSeconds = safeSeconds(timing?.runtimeTimeoutSeconds)
+    const processSeconds = safeSeconds(timing?.processTimeoutSeconds)
+    const configuredTiming = [
+      runtimeSeconds ? `模型运行时限 ${runtimeSeconds} 秒` : '',
+      processSeconds ? `服务进程时限 ${processSeconds} 秒` : '',
+    ].filter(Boolean).join('、')
+    const timingNote = configuredTiming ? `所选通道当前配置为${configuredTiming}。` : ''
+    return `浏览器等待 ${creativeProviderLabel(provider)} 时请求超时。${timingNote}这不等于服务端已取消。系统已刷新版本记录：若出现“生成失败”版本，可点击“一键重试整稿”；若没有，请先检查服务连接或刷新后再重试。正式分镜未修改。`
   }
   // Unknown backend details are intentionally not rendered: they may contain
   // transport, parser, or model internals. Callers provide a safe fallback.
@@ -480,18 +642,32 @@ export const creativeDraftRequestError = (cause: unknown, fallback: string): str
 }
 
 /** Local editor checks are advisory; the server remains the apply gate. */
-export const creativeDraftEditorWarnings = (data: CreativeDraftData): string[] => {
+export const creativeDraftEditorWarnings = (
+  data: CreativeDraftData,
+  policy?: Pick<
+    PromptProviderCapability,
+    'minShotDurationMs' | 'maxShotDurationMs'
+    | 'recommendedNarrativeEnChars' | 'recommendedActionEnChars'
+  >,
+): string[] => {
   const warnings: string[] = []
   if (!data.shots.length) warnings.push('草稿没有分镜。')
   for (const shot of data.shots) {
     const label = `镜头 ${shot.order}`
-    if (shot.durationMs < 5000 || shot.durationMs > 15000) warnings.push(`${label} 时长必须为 5–15 秒。`)
-    if (!shot.narrativeZh.trim() || !shot.narrativeEn.trim()) warnings.push(`${label} 缺少中英叙事结构。`)
-    if (shot.narrativeEn.length > CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor) {
-      warnings.push(`${label} 英文叙事结构超过 ${CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor} 字符，建议人工核对并按需精简；仍可保存为草稿。`)
+    const minimumDurationMs = policy?.minShotDurationMs
+    const maximumDurationMs = policy?.maxShotDurationMs
+    if (minimumDurationMs !== undefined && maximumDurationMs !== undefined
+      && (shot.durationMs < minimumDurationMs || shot.durationMs > maximumDurationMs)) {
+      warnings.push(`${label} 时长必须为 ${minimumDurationMs / 1000}–${maximumDurationMs / 1000} 秒。`)
     }
-    if (shot.actionEn.length > CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor) {
-      warnings.push(`${label} 英文主动作超过 ${CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor} 字符，建议人工核对并按需精简；仍可保存为草稿。`)
+    if (!shot.narrativeZh.trim() || !shot.narrativeEn.trim()) warnings.push(`${label} 缺少中英叙事结构。`)
+    if (policy?.recommendedNarrativeEnChars !== undefined
+      && shot.narrativeEn.length > policy.recommendedNarrativeEnChars) {
+      warnings.push(`${label} 英文叙事结构超过 ${policy.recommendedNarrativeEnChars} 字符，建议人工核对并按需精简；仍可保存为草稿。`)
+    }
+    if (policy?.recommendedActionEnChars !== undefined
+      && shot.actionEn.length > policy.recommendedActionEnChars) {
+      warnings.push(`${label} 英文主动作超过 ${policy.recommendedActionEnChars} 字符，建议人工核对并按需精简；仍可保存为草稿。`)
     }
     if (!shot.actionZh.trim() || !shot.actionEn.trim()) warnings.push(`${label} 缺少中英主动作。`)
     if (!shot.cameraZh.trim() || !shot.cameraEn.trim()) warnings.push(`${label} 缺少中英单一运镜。`)

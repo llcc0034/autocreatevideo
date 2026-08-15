@@ -30,6 +30,15 @@ test('every production step tells the operator input, buttons, success and next 
   }
 })
 
+test('project creation starts from the managed list and redo remains an isolated draft', () => {
+  const step = productionManual.steps.find((item) => item.id === 'create-project')
+  assert.ok(step)
+  const text = searchableManualText(step)
+  for (const term of ['项目列表', '新建连续剧', '基于此项目重做', '不复制 bible、剧集、任务或产物', '不会自动触发 gpu']) {
+    assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `project management guidance missing ${term}`)
+  }
+})
+
 test('H3 instructions cover text, optional first/last frames and sparse Ref2VA inputs', () => {
   const step = productionManual.steps.find((item) => item.id === 'choose-h3-mode')
   assert.ok(step)
@@ -42,8 +51,23 @@ test('production instructions cover selectable Ref2VA variants and scoped parame
   const step = productionManual.steps.find((item) => item.id === 'submit-production')
   assert.ok(step)
   const text = searchableManualText(step)
-  for (const term of ['t8 dual-clock 4-step', 'turbo lora', '固定 20 steps', 'steps 4', 'steps 10', '1–20', 'lora 1.0', '0–2.2', '实验', '只应用到 ref2va', '能力预检', '不代表 gpu 端到端生成通过', '尚无 gpu 端到端验收结果']) {
+  for (const term of ['t8 dual-clock 4-step', 'turbo lora', '固定 20 steps', 'steps 4', 'steps 10', '1–20', 'lora 1.0', '0–2.2', '实验', '只应用到 ref2va', '能力预检', '不代表 gpu 端到端生成通过', '目标环境', 'gpu 全链', '稳定性', '容量', '画质验收']) {
     assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `workflow selection missing ${term}`)
+  }
+  for (const term of ['production_queue_confirmation_required', 'extended_generation_confirmed=true', '取消时不会创建任何任务', '完整保留所有逐镜任务', '不是项目集数、单集镜数或任务总量上限', '不会提高 worker 并发']) {
+    assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `queue confirmation guidance missing ${term}`)
+  }
+  for (const term of ['只保存、校验和提交当前镜头', '不会因其他镜头的问题而失败', '先保存并校验整集全部镜头']) {
+    assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `production scope guidance missing ${term}`)
+  }
+})
+
+test('task retry keeps the materialized workflow while new generation exposes selection', () => {
+  const step = productionManual.steps.find((item) => item.id === 'monitor-tasks')
+  assert.ok(step)
+  const text = searchableManualText(step)
+  for (const term of ['重试复用原任务的实际工作流与参数', '修改并重新生成此镜头', 'steps', 'lora 强度', 'production_queue_confirmation_required', '确认只继续排队', '不会改变原参数']) {
+    assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `retry semantics missing ${term}`)
   }
 })
 
@@ -141,14 +165,15 @@ test('shot translation promotion and negative recovery are operationally explici
   }
 })
 
-test('single-shot high-detail expansion documents review, application, budgets and recovery', () => {
+test('single-shot and episode high-detail expansion document review, atomic application and recovery', () => {
   const editStep = productionManual.steps.find((item) => item.id === 'edit-shots')
   assert.ok(editStep)
   const text = searchableManualText(editStep)
   for (const term of [
     '逐镜高细节扩写', '生成高细节候选', '保存并校验', '确认候选',
     '采用已审中英', '采用中文，转上方翻译审核', 'shot.detailed_description',
-    '500', '750', 'Ref2VA', '350–500', '上下文已变化', '资源忙',
+    '整集扩写', '整集应用', '原子应用', 'capability policy', 'Ref2VA', '上下文已变化', '资源暂时占用',
+    '只保存并校验当前镜头', '其他镜头的问题不会阻断', '生成全部提示词', '保存并校验整集',
   ]) assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `high-detail manual missing ${term}`)
 
   for (const incidentId of [
@@ -158,12 +183,17 @@ test('single-shot high-detail expansion documents review, application, budgets a
 
   const storyboardSource = readFileSync(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8')
   const panelSource = readFileSync(new URL('../src/components/ShotDetailDraftPanel.vue', import.meta.url), 'utf8')
+  const modalSource = readFileSync(new URL('../src/components/EpisodeDetailDraftModal.vue', import.meta.url), 'utf8')
+  const comparisonSource = readFileSync(new URL('../src/components/ShotDetailDraftComparison.vue', import.meta.url), 'utf8')
   assert.ok(storyboardSource.includes('<ShotDetailDraftPanel'))
   assert.ok(storyboardSource.includes('@applied="applyShotDetailDraft"'))
   assert.ok(storyboardSource.includes('shot.detailed_description'))
   assert.ok(panelSource.includes('requestSequence === loadSequence'))
   assert.ok(panelSource.includes('采用已审中英'))
   assert.ok(panelSource.includes('采用中文，转上方翻译审核'))
+  assert.ok(comparisonSource.includes('扩写前'))
+  assert.ok(comparisonSource.includes('扩写后'))
+  assert.ok(modalSource.includes('原子应用整集'))
 })
 
 test('global visual rules use an isolated English candidate and fingerprinted apply', () => {
@@ -210,13 +240,13 @@ test('creative draft failure guidance treats zero shots as a retry record, never
   for (const term of ['生成失败 · 0 镜', '失败审计记录', '一键重试整稿', '超时不等于服务端已取消']) {
     assert.ok(stepText.includes(term.toLocaleLowerCase('zh-CN')), `creative step missing ${term}`)
   }
-  for (const term of ['1–4 镜', '900 秒', '960 秒', '1,020 秒', '17 分钟']) {
+  for (const term of ['能力接口', '推荐镜数', '单批规划值', '页面不应写死秒数', '初次整稿与整稿重生成会沿剧本连续原文边界自动分批', '只有选镜重生成保留携带完整旧草稿的单次协议']) {
     assert.ok(stepText.includes(term.toLocaleLowerCase('zh-CN')), `creative timeout/capability guidance missing ${term}`)
   }
-  for (const term of ['镜数 + 全剧母稿/本集剧本中的权威对白', '3,072', '目标设备做容量基准', '3–4 镜是容量较满', '1–2 镜更适合迭代']) {
+  for (const term of ['镜数 + 权威对白 + provider 输出余量', '取消不会发送请求', '不会静默压缩']) {
     assert.ok(stepText.includes(term.toLocaleLowerCase('zh-CN')), `creative capacity guidance missing ${term}`)
   }
-  for (const term of ['统一限制为 1000 字符', '生成、修复与人工编辑', '逐镜高细节扩写']) {
+  for (const term of ['读取能力接口中的环境配置建议', '超过建议只提示人工复核', '不截断编辑或丢弃草稿']) {
     assert.ok(stepText.includes(term.toLocaleLowerCase('zh-CN')), `creative field-limit guidance missing ${term}`)
   }
   for (const term of ['已生成 · 待人工修正', '跳到字段', '保存并重新检查', '已阅读并承担风险', '数据完整性问题', '正式应用前必须处理']) {
@@ -225,14 +255,21 @@ test('creative draft failure guidance treats zero shots as a retry record, never
   for (const term of ['不是可保存的空草稿', '一键重试整稿', '不显示保存、确认或应用空稿入口']) {
     assert.ok(incidentText.includes(term), `creative incident missing ${term}`)
   }
-  for (const term of ['900 秒', '960 秒', '1,020 秒', '17 分钟', '检查 Django 服务连接']) {
+  for (const term of ['能力接口', '环境配置', '页面当前显示的等待上限', '检查 Django 服务连接']) {
     assert.ok(incidentText.includes(term.toLocaleLowerCase('zh-CN')), `creative incident timeout guidance missing ${term}`)
+  }
+
+  const extendedIncident = productionManual.incidents.find((item) => item.id === 'creative-extended-generation-confirmation')
+  assert.ok(extendedIncident)
+  const extendedText = searchableIncidentText(extendedIncident)
+  for (const term of ['extended_generation_confirmed=true', 'creative_generation_confirmation_required', '不表示任务必然失败', '保留原目标镜数', 'batch_shots']) {
+    assert.ok(extendedText.includes(term.toLocaleLowerCase('zh-CN')), `extended generation guidance missing ${term}`)
   }
 
   const budgetIncident = productionManual.incidents.find((item) => item.id === 'creative-output-budget')
   assert.ok(budgetIncident)
   const budgetText = searchableIncidentText(budgetIncident)
-  for (const term of ['creative_output_budget_exhausted', 'creative_repair_not_started', '1–2 镜', '权威对白边界', '缩短“本次创作要求”', '不会写入正式分镜']) {
+  for (const term of ['creative_batch_planning_failed', 'creative_output_budget_exceeded', 'deepseek_output_budget_exceeded', 'creative_output_budget_exhausted', 'creative_repair_not_started', '初次/整稿重生成批次规划', '选镜重生成', '缩短“本次创作要求”', '不会写入正式分镜']) {
     assert.ok(budgetText.includes(term.toLocaleLowerCase('zh-CN')), `creative budget recovery missing ${term}`)
   }
 })
@@ -302,7 +339,11 @@ test('runtime limits are bound to authenticated capability endpoints', () => {
   assert.equal(productionManual.capabilityEndpoints.creative, '/capabilities/creative-drafts/')
   assert.equal(productionManual.capabilityEndpoints.translation, '/capabilities/prompt-translation/')
   const manualView = readFileSync(new URL('../src/views/ProductionManualView.vue', import.meta.url), 'utf8')
-  assert.ok(manualView.includes('baseline_max_new_tokens?: number'))
-  assert.ok(manualView.includes('configured_max_new_tokens?: number'))
-  assert.ok(manualView.includes('镜无对白约 ${baseline}'))
+  assert.ok(manualView.includes('adaptPromptProviders'))
+  assert.ok(manualView.includes('adapted.defaultProvider'))
+  assert.ok(manualView.includes('baselineMaxNewTokens'))
+  assert.ok(manualView.includes('configuredMaxNewTokens'))
+  assert.ok(manualView.includes('单批 ${batch} 镜'))
+  assert.ok(!manualView.includes('max_shots'))
+  assert.ok(!manualView.includes('|| 4'))
 })

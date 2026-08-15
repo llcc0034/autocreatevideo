@@ -155,6 +155,24 @@ def creative_request(**overrides):
         "feedback": "换成更克制的构图，不要改变对白。",
         "options": {
             "shot_count": 1,
+            "min_shots": 1,
+            "batch_shots": 4,
+            "max_dialogue_per_shot": 2,
+            "max_episode_title_chars": 80,
+            "max_dialogue_text_chars": 240,
+            "max_dialogue_delivery_chars": 100,
+            "max_dialogue_delivery_en_chars": 150,
+            "min_shot_duration_ms": 5000,
+            "max_shot_duration_ms": 15000,
+            "output_min_tokens": 1024,
+            "output_base_tokens": 768,
+            "output_tokens_per_shot": 384,
+            "output_tokens_per_dialogue": 128,
+            "output_dialogue_char_threshold": 32,
+            "max_source_chars": 16000,
+            "max_regeneration_context_chars": 16000,
+            "max_input_chars": 24000,
+            "output_headroom_per_shot": 0,
             "minimum_duration_ms": 5000,
             "maximum_duration_ms": 15000,
             "default_duration_ms": 6000,
@@ -164,7 +182,12 @@ def creative_request(**overrides):
         },
         "seed": 20260810,
         "max_new_tokens": 1280,
+        "timeout_seconds": 900,
+        "threads": 4,
         "context_size": 8192,
+        "min_context_size": 8192,
+        "max_context_size": 32768,
+        "reserved_input_tokens": 2048,
         "required_dialogue_manifest": [{
             "speaker_id": "S1",
             "text_zh": "别动。",
@@ -214,6 +237,331 @@ def creative_candidate():
             }],
         }],
     }
+
+
+SHOT_DETAIL_PROTOCOL_LIMITS = {
+    "project_title_max_chars": 200,
+    "project_logline_max_chars": 2_000,
+    "project_continuity_summary_max_chars": 3_000,
+    "project_color_script_max_chars": 2_000,
+    "project_aspect_ratio_max_chars": 16,
+    "style_max_chars": 8_000,
+    "glossary_max_terms": 200,
+    "glossary_source_max_chars": 160,
+    "glossary_target_max_chars": 240,
+    "reference_bindings_max_chars": 4_000,
+    "shot_title_max_chars": 200,
+    "shot_narrative_max_chars": 2_000,
+    "shot_detailed_description_max_chars": 3_500,
+    "shot_camera_max_chars": 1_000,
+    "shot_continuity_notes_max_chars": 1_000,
+    "target_action_max_chars": 2_000,
+    "target_sound_effects_max_chars": 1_000,
+    "target_music_max_chars": 1_000,
+    "target_h3_mode_max_chars": 16,
+    "dialogue_speaker_id_max_chars": 16,
+    "dialogue_text_max_chars": 240,
+    "dialogue_delivery_max_chars": 160,
+    "max_dialogue_per_shot": 2,
+    "bible_max_characters": 20,
+    "bible_max_scenes": 1,
+    "bible_max_props": 30,
+    "bible_speaker_id_max_chars": 16,
+    "bible_entity_field_max_chars": 2_000,
+    "feedback_max_chars": 2_000,
+}
+
+
+def shot_high_detail_policy(**overrides):
+    policy = {
+        "recommended_zh_chars": 500,
+        "recommended_en_chars": 750,
+        "transport_zh_max_chars": 3_000,
+        "transport_en_max_chars": 4_500,
+        "output_tokens": 2_304,
+        "context_max_chars": 18_000,
+        "minimum_duration_ms": 5_000,
+        "maximum_duration_ms": 15_000,
+        "maximum_generation_number": 1_000_000,
+        **SHOT_DETAIL_PROTOCOL_LIMITS,
+    }
+    policy.update(overrides)
+    return policy
+
+
+def shot_high_detail_request(**overrides):
+    payload = {
+        "operation": runtime.SHOT_DETAIL_OPERATION,
+        "request_id": "shot-high-detail-contract-test",
+        "source_fingerprint": "c" * 64,
+        "project": {
+            "title": "Rain Gate",
+            "logline": "A courier crosses a guarded gate.",
+            "continuity_summary": "Keep identity, wardrobe, and handedness stable.",
+            "color_script": "Cool cyan-gray with restrained amber light.",
+            "aspect_ratio": "9:16",
+        },
+        "style": "restrained cinematic wuxia realism",
+        "glossary": {"Lin Che": "Lin Che"},
+        "target_shot": {
+            "id": "55555555-5555-4555-8555-555555555555",
+            "number": 1,
+            "title": "At the gate",
+            "narrative": "Lin Che advances along the wall.",
+            "detailed_description": "Rain beads on the stone while Lin Che advances.",
+            "camera": "Medium shot, slow track right.",
+            "action": "Lin Che advances toward the gate.",
+            "dialogue": [{
+                "speaker_id": "S1",
+                "text": "Keep moving.",
+                "delivery": "quietly",
+                "voiceover": False,
+                "start_ms": 500,
+                "end_ms": 2_000,
+            }],
+            "sound_effects": "Rain and soft footsteps.",
+            "music": "Low restrained strings.",
+            "continuity_notes": "Keep the broken blade in the left hand.",
+            "duration_ms": 5_000,
+            "media_type": "video",
+            "h3_mode": "Ref2VA",
+            "include_audio": True,
+            "requires_first_frame_continuity": False,
+            "requires_last_frame_continuity": True,
+            "scene_id": SCENE_ID,
+            "character_ids": [CHARACTER_ID],
+            "prop_ids": [PROP_ID],
+            "reference_bindings": {"character": [CHARACTER_ID]},
+        },
+        "boundaries": {"previous": None, "next": None},
+        "bible": {
+            "characters": [{
+                "id": CHARACTER_ID,
+                "stable_speaker_id": "S1",
+                "name": "Lin Che",
+                "visual_identity": "Young sword courier in a gray robe.",
+            }],
+            "scenes": [{
+                "id": SCENE_ID,
+                "name": "Rain Gate",
+                "visual_identity": "Dark stone gate in rain.",
+            }],
+            "props": [{
+                "id": PROP_ID,
+                "name": "Broken Blade",
+                "visual_identity": "A chipped dark steel blade.",
+            }],
+        },
+        "feedback": "Increase rain detail without changing action.",
+        "attempt": 1,
+        "seed": 43,
+        "max_new_tokens": 2_304,
+        "shot_detail_policy": shot_high_detail_policy(),
+    }
+    payload.update(overrides)
+    return payload
+
+
+class ShotHighDetailProviderPolicyTests(unittest.TestCase):
+    def test_every_protocol_limit_is_required_from_request_policy(self):
+        for key in SHOT_DETAIL_PROTOCOL_LIMITS:
+            with self.subTest(key=key):
+                payload = shot_high_detail_request()
+                payload["shot_detail_policy"].pop(key)
+                with self.assertRaisesRegex(
+                    runtime.RuntimeInputError,
+                    "shot_detail_policy must contain the configured detail limits",
+                ):
+                    runtime._normalise_shot_high_detail_request(payload)
+
+    def test_provider_policy_can_raise_every_former_high_detail_envelope(self):
+        payload = shot_high_detail_request()
+        long_speaker = "S" + ("1" * 16)
+        characters = [{
+            "id": CHARACTER_ID,
+            "stable_speaker_id": long_speaker,
+            "name": "N" * 2_001,
+        }]
+        characters.extend({
+            "id": str(uuid.UUID(int=10_000 + index)),
+            "stable_speaker_id": f"S{index + 2}",
+            "name": f"Character {index + 2}",
+        } for index in range(20))
+        scenes = [{"id": SCENE_ID, "name": "Primary Scene"}, {
+            "id": str(uuid.UUID(int=20_001)), "name": "Second Scene",
+        }]
+        props = [{"id": PROP_ID, "name": "Primary Prop"}]
+        props.extend({
+            "id": str(uuid.UUID(int=30_000 + index)), "name": f"Prop {index + 2}",
+        } for index in range(30))
+        glossary = {
+            f"term-{index}-" + ("s" * 161): "T" * 241
+            for index in range(201)
+        }
+        reference_bindings = {"payload": "r" * 4_100}
+        boundary = {
+            "id": "66666666-6666-4666-8666-666666666666",
+            "number": 2,
+            "title": "T" * 201,
+            "narrative": "N" * 2_001,
+            "detailed_description": "D" * 3_501,
+            "camera": "C" * 1_001,
+            "continuity_notes": "K" * 1_001,
+            "requires_first_frame_continuity": True,
+            "requires_last_frame_continuity": True,
+            "scene_id": SCENE_ID,
+            "character_ids": [CHARACTER_ID],
+            "prop_ids": [PROP_ID],
+        }
+        payload.update({
+            "project": {
+                "title": "T" * 201,
+                "logline": "L" * 2_001,
+                "continuity_summary": "C" * 3_001,
+                "color_script": "P" * 2_001,
+                "aspect_ratio": "A" * 17,
+            },
+            "style": "S" * 8_001,
+            "glossary": glossary,
+            "boundaries": {"previous": boundary, "next": None},
+            "bible": {"characters": characters, "scenes": scenes, "props": props},
+            "feedback": "F" * 2_001,
+        })
+        payload["target_shot"].update({
+            "title": "T" * 201,
+            "narrative": "N" * 2_001,
+            "detailed_description": "D" * 3_501,
+            "camera": "C" * 1_001,
+            "action": "A" * 2_001,
+            "dialogue": [{
+                "speaker_id": long_speaker,
+                "text": "D" * 241,
+                "delivery": "V" * 161,
+                "voiceover": False,
+            }],
+            "sound_effects": "E" * 1_001,
+            "music": "M" * 1_001,
+            "continuity_notes": "K" * 1_001,
+            "reference_bindings": reference_bindings,
+        })
+        payload["shot_detail_policy"].update({
+            "context_max_chars": 2_000_000,
+            "project_title_max_chars": 201,
+            "project_logline_max_chars": 2_001,
+            "project_continuity_summary_max_chars": 3_001,
+            "project_color_script_max_chars": 2_001,
+            "project_aspect_ratio_max_chars": 17,
+            "style_max_chars": 8_001,
+            "glossary_max_terms": 201,
+            "glossary_source_max_chars": 220,
+            "glossary_target_max_chars": 241,
+            "reference_bindings_max_chars": 4_200,
+            "shot_title_max_chars": 201,
+            "shot_narrative_max_chars": 2_001,
+            "shot_detailed_description_max_chars": 3_501,
+            "shot_camera_max_chars": 1_001,
+            "shot_continuity_notes_max_chars": 1_001,
+            "target_action_max_chars": 2_001,
+            "target_sound_effects_max_chars": 1_001,
+            "target_music_max_chars": 1_001,
+            "dialogue_speaker_id_max_chars": len(long_speaker),
+            "dialogue_text_max_chars": 241,
+            "dialogue_delivery_max_chars": 161,
+            "bible_max_characters": 21,
+            "bible_max_scenes": 2,
+            "bible_max_props": 31,
+            "bible_speaker_id_max_chars": len(long_speaker),
+            "bible_entity_field_max_chars": 2_001,
+            "feedback_max_chars": 2_001,
+        })
+
+        request = runtime._normalise_shot_high_detail_request(payload)
+
+        self.assertEqual(len(request.glossary), 201)
+        self.assertEqual(len(request.bible["characters"]), 21)
+        self.assertEqual(len(request.bible["scenes"]), 2)
+        self.assertEqual(len(request.bible["props"]), 31)
+        self.assertEqual(len(request.feedback), 2_001)
+        self.assertEqual(len(request.target_shot["action"]), 2_001)
+        self.assertEqual(len(request.boundaries["previous"]["camera"]), 1_001)
+
+    def test_lower_provider_limits_are_enforced_without_legacy_fallbacks(self):
+        cases = (
+            ("project_title_max_chars", "project.title", lambda value: value["project"].update(title="AB")),
+            ("style_max_chars", "style", lambda value: value.update(style="AB")),
+            (
+                "reference_bindings_max_chars", "reference_bindings",
+                lambda value: value["target_shot"].update(reference_bindings={"x": "y"}),
+            ),
+            ("shot_title_max_chars", "target_shot.title", lambda value: value["target_shot"].update(title="AB")),
+            (
+                "dialogue_text_max_chars", "dialogue[0].text",
+                lambda value: value["target_shot"]["dialogue"][0].update(text="AB"),
+            ),
+            (
+                "target_h3_mode_max_chars", "target_shot.h3_mode",
+                lambda value: None,
+            ),
+            (
+                "max_dialogue_per_shot", "target_shot.dialogue",
+                lambda value: value["target_shot"].update(dialogue=[
+                    *value["target_shot"]["dialogue"],
+                    {
+                        "speaker_id": "S1", "text": "Again.", "delivery": "quietly",
+                        "voiceover": False,
+                    },
+                ]),
+            ),
+            (
+                "bible_entity_field_max_chars", "bible.characters[0].name",
+                lambda value: value["bible"]["characters"][0].update(name="AB"),
+            ),
+            ("feedback_max_chars", "feedback", lambda value: value.update(feedback="AB")),
+        )
+        for key, expected_path, mutate in cases:
+            with self.subTest(key=key):
+                payload = shot_high_detail_request()
+                payload["shot_detail_policy"][key] = 1
+                mutate(payload)
+                with self.assertRaisesRegex(runtime.RuntimeInputError, expected_path.replace("[", r"\[")):
+                    runtime._normalise_shot_high_detail_request(payload)
+
+    def test_provider_env_contract_is_declared_for_every_protocol_limit(self):
+        repo_root = Path(__file__).resolve().parents[1]
+        root_env = (repo_root / ".env.example").read_text(encoding="utf-8")
+        backend_env = (repo_root / "backend" / ".env.example").read_text(encoding="utf-8")
+        compose = (repo_root / "docker-compose.yml").read_text(encoding="utf-8")
+        settings_source = (
+            repo_root / "backend" / "autoprompt_backend" / "settings.py"
+        ).read_text(encoding="utf-8")
+        for key in SHOT_DETAIL_PROTOCOL_LIMITS:
+            suffix = key.upper()
+            self.assertIn(f'"{key}"', settings_source)
+            for prefix in ("QWEN", "DEEPSEEK"):
+                env_name = f"{prefix}_SHOT_DETAIL_{suffix}"
+                with self.subTest(env_name=env_name):
+                    self.assertIn(f"{env_name}=", root_env)
+                    self.assertIn(f"{env_name}=", backend_env)
+                    self.assertIn(f"{env_name}:", compose)
+        for env_name in (
+            "SHOT_DETAIL_REVIEW_MIN_ZH_CHARS",
+            "SHOT_DETAIL_REVIEW_MIN_EN_CHARS",
+            "SHOT_DETAIL_REVIEW_NEAR_ZH_MARGIN_CHARS",
+            "SHOT_DETAIL_REVIEW_NEAR_EN_MARGIN_CHARS",
+            "SHOT_DETAIL_LEASE_SAFETY_SECONDS",
+        ):
+            with self.subTest(env_name=env_name):
+                self.assertIn(f"{env_name}=", root_env)
+                self.assertIn(f"{env_name}=", backend_env)
+                self.assertIn(f"{env_name}:", compose)
+                self.assertIn(env_name, settings_source)
+        self.assertIn('LOCAL_QWEN_CREATIVE["timeout_seconds"]', settings_source)
+        self.assertIn(
+            'LOCAL_QWEN_CREATIVE["process_cleanup_grace_seconds"]', settings_source,
+        )
+        self.assertIn('DEEPSEEK_API["timeout_seconds"]', settings_source)
+        self.assertIn('DEEPSEEK_API["max_retries"]', settings_source)
+        self.assertIn('SHOT_DETAIL_POLICY["stale_minutes"] * 60', settings_source)
 
 
 class QwenTranslateOnceRuleTests(unittest.TestCase):
@@ -1096,11 +1444,97 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
             runtime._CREATIVE_DIRECTION_INSERTION_TEMPLATES,
         )
 
-    def test_verified_cpu_contract_rejects_more_than_four_shots(self):
+    def test_provider_batch_hint_does_not_clamp_or_reject_eleven_shots(self):
         payload = creative_request()
-        payload["options"] = {**payload["options"], "shot_count": 5}
-        with self.assertRaisesRegex(runtime.RuntimeInputError, "between 1 and 4"):
-            runtime._normalise_creative_request(payload)
+        dialogue = [f"第{index}句。" for index in range(1, 14)]
+        payload["episode"] = {
+            **payload["episode"],
+            "script": "\n".join(f"S1：{text}" for text in dialogue),
+        }
+        payload["options"] = {
+            **payload["options"],
+            "shot_count": 11,
+            # batch_shots is a provider batch-planning hint, not the episode's
+            # business shot-count ceiling.
+            "batch_shots": 4,
+            "max_regeneration_context_chars": 96000,
+            "max_input_chars": 120000,
+            "output_headroom_per_shot": 384,
+            "recommended_shot_durations_ms": [6000] * 11,
+        }
+        payload["required_dialogue_manifest"] = [
+            {
+                "speaker_id": "S1",
+                "text_zh": text,
+                "source_order": index,
+                "source_delivery_zh": "",
+            }
+            for index, text in enumerate(dialogue, start=1)
+        ]
+        payload["max_new_tokens"] = 6656
+
+        request = runtime._normalise_creative_request(payload)
+
+        self.assertEqual(request.shot_count, 11)
+        self.assertEqual(request.batch_shots, 4)
+        self.assertEqual(request.max_tokens, 6656)
+        self.assertEqual(len(request.required_dialogue_manifest), 13)
+        schema = runtime._creative_response_schema(request)
+        self.assertEqual(schema["properties"]["shots"]["minItems"], 11)
+        self.assertEqual(schema["properties"]["shots"]["maxItems"], 11)
+
+    def test_batch_context_requires_strict_ranges_and_previous_global_boundary(self):
+        payload = creative_request()
+        payload["options"] = {
+            **payload["options"],
+            "shot_count": 2,
+        }
+        payload["max_new_tokens"] = 1664
+        payload["batch_context"] = {
+            "batch_index": 2,
+            "batch_count": 2,
+            "global_shot_start": 3,
+            "global_shot_end": 4,
+            "global_shot_count": 4,
+            "source_mode": "contiguous_excerpt",
+            "previous_shot": {
+                "client_key": "shot-02",
+                "order": 2,
+                "scene_id": SCENE_ID,
+                "character_ids": [CHARACTER_ID],
+                "prop_ids": [],
+                "action_zh": "沈砚按住剑鞘。",
+                "action_en": "Shen Yan holds the scabbard.",
+                "continuity_zh": "灰色旧袍不变。",
+                "continuity_en": "Keep the worn gray robe unchanged.",
+            },
+        }
+
+        request = runtime._normalise_creative_request(payload)
+
+        self.assertEqual(request.batch_context["batch_index"], 2)
+        self.assertEqual(request.batch_context["global_shot_start"], 3)
+        self.assertEqual(request.batch_context["source_mode"], "contiguous_excerpt")
+        self.assertEqual(
+            request.batch_context["previous_shot"]["client_key"],
+            "shot-02",
+        )
+
+        extra = json.loads(json.dumps(payload, ensure_ascii=False))
+        extra["batch_context"]["unexpected"] = True
+        with self.assertRaisesRegex(
+            runtime.RuntimeInputError,
+            "batch_context must contain exactly",
+        ):
+            runtime._normalise_creative_request(extra)
+
+        discontinuous = json.loads(json.dumps(payload, ensure_ascii=False))
+        discontinuous["batch_context"]["previous_shot"]["order"] = 1
+        with self.assertRaisesRegex(
+            runtime.RuntimeInputError,
+            "must immediately precede",
+        ):
+            runtime._normalise_creative_request(discontinuous)
 
     def test_episode_title_preflight_matches_authoritative_eighty_character_limit(self):
         accepted = creative_request()
@@ -1349,7 +1783,15 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
     def test_post_repair_headroom_does_not_change_primary_output_budget_table(self):
         self.assertEqual(
             {
-                shot_count: runtime._creative_required_output_tokens(shot_count, [])
+                shot_count: runtime._creative_required_output_tokens(
+                    shot_count,
+                    [],
+                    output_min_tokens=1024,
+                    output_base_tokens=768,
+                    output_tokens_per_shot=384,
+                    output_tokens_per_dialogue=128,
+                    output_dialogue_char_threshold=32,
+                )
                 for shot_count in range(1, 5)
             },
             {1: 1152, 2: 1536, 3: 1920, 4: 2304},
@@ -5197,7 +5639,7 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
         )
         self.assertEqual(response["error_code"], "creative_repair_not_started")
 
-    def test_length_finish_reason_returns_specific_budget_error_before_decode_or_repair(self):
+    def test_length_finish_reason_parses_valid_candidate_and_returns_review_risk(self):
         calls = []
 
         class LengthLimitedFakeLlama:
@@ -5211,7 +5653,9 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
                 calls.append(kwargs)
                 return {
                     "choices": [{
-                        "message": {"content": '{"schema_version":1,"episode":'},
+                        "message": {
+                            "content": json.dumps(creative_candidate(), ensure_ascii=False),
+                        },
                         "finish_reason": "LENGTH",
                     }],
                 }
@@ -5227,21 +5671,28 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
             model_path.write_bytes(b"fake")
             with patch.dict(sys.modules, {"llama_cpp": fake_module}), patch.object(
                 runtime, "_resolve_model", return_value=model_path,
-            ), patch.object(runtime, "_validate_creative_storyboard") as validate:
+            ):
                 response, exit_code = runtime.run(creative_request())
 
-        self.assertEqual(exit_code, 2)
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error_code"], "creative_output_budget_exhausted")
-        self.assertEqual(response["metadata"]["phase"], "primary_output_budget")
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["metadata"]["phase"], "complete")
         self.assertEqual(response["metadata"]["primary_completion"]["finish_reason"], "LENGTH")
+        self.assertTrue(response["metadata"]["primary_completion"]["incomplete"])
+        self.assertTrue(response["metadata"]["incomplete"])
+        self.assertGreater(response["metadata"]["usage"]["total_tokens"], 0)
         self.assertFalse(response["metadata"]["repair_required"])
         self.assertFalse(response["metadata"]["repair_attempted"])
-        self.assertIsNone(response["result"])
-        validate.assert_not_called()
+        issue = next(
+            item for item in response["review_issues"]
+            if item["code"] == "model_output_incomplete_finish_reason"
+        )
+        self.assertEqual(issue["severity"], "risk")
+        self.assertEqual(issue["path"], "result")
+        self.assertNotIn("shots", json.dumps(issue, ensure_ascii=False))
         self.assertEqual(len(calls), 1)
 
-    def test_repair_length_finish_reason_returns_same_specific_budget_error(self):
+    def test_parseable_repair_length_finish_reason_returns_reviewable_candidate(self):
         invalid = creative_candidate()
         invalid["shots"][0]["camera_plan"]["speed"] = "static"
         calls = []
@@ -5264,7 +5715,9 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
                     }
                 return {
                     "choices": [{
-                        "message": {"content": '{"schema_version":1,"episode":'},
+                        "message": {
+                            "content": json.dumps(creative_candidate(), ensure_ascii=False),
+                        },
                         "finish_reason": "LeNgTh",
                     }],
                 }
@@ -5283,17 +5736,21 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
             ):
                 response, exit_code = runtime.run(creative_request())
 
-        self.assertEqual(exit_code, 2)
-        self.assertFalse(response["ok"])
-        self.assertEqual(response["error_code"], "creative_output_budget_exhausted")
-        self.assertEqual(response["metadata"]["phase"], "repair_output_budget")
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["metadata"]["phase"], "complete")
         self.assertTrue(response["metadata"]["repair_required"])
         self.assertTrue(response["metadata"]["repair_attempted"])
+        self.assertTrue(response["metadata"]["repair_succeeded"])
         self.assertEqual(
             response["metadata"]["repair_completion"]["finish_reason"], "LeNgTh",
         )
-        self.assertEqual(response["metadata"]["applied_normalizations"], [])
-        self.assertIsNone(response["result"])
+        self.assertTrue(response["metadata"]["repair_completion"]["incomplete"])
+        self.assertTrue(response["metadata"]["incomplete"])
+        self.assertIn(
+            "model_output_incomplete_finish_reason",
+            {item["code"] for item in response["review_issues"]},
+        )
         self.assertEqual(len(calls), 2)
 
 

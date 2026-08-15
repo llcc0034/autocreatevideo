@@ -189,7 +189,50 @@ class ShotDetailDraftApiTests(TestCase):
         )
         self.assertEqual(compiled.text.count(self.candidate()["detail_en"]), 1)
         self.assertNotIn(self.candidate()["detail_zh"], compiled.text)
-        self.assertNotIn(self.candidate()["detail_en"], build_negative_prompt(self.project, [self.shot]))
+        self.assertNotIn(
+            self.candidate()["detail_en"], build_negative_prompt(self.project, [self.shot]),
+        )
+
+    def test_real_service_runtime_request_normalises_continuity_and_dialogue_timing(self):
+        self.shot.dialogue = [{
+            "speaker_id": "S1",
+            "text": "这封信不是昨晚烧的。",
+            "delivery": "压低声音",
+            "voiceover": False,
+            "start_ms": 500,
+            "end_ms": 2600,
+        }]
+        self.shot.requires_first_frame_continuity = True
+        self.shot.requires_last_frame_continuity = False
+        self.shot.duration_ms = 5000
+        self.shot.save(update_fields=(
+            "dialogue", "requires_first_frame_continuity",
+            "requires_last_frame_continuity", "duration_ms", "updated_at",
+        ))
+
+        generated, captured = self._generate()
+        self.assertEqual(generated.status_code, 201, generated.data)
+        runtime_path = Path(__file__).resolve().parents[3] / "scripts" / "qwen_translate_once.py"
+        spec = importlib.util.spec_from_file_location(
+            "qwen_detail_real_request_for_test", runtime_path,
+        )
+        runtime = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        sys.modules[spec.name] = runtime
+        spec.loader.exec_module(runtime)
+
+        normalized = runtime._normalise_shot_high_detail_request(captured)
+        self.assertTrue(normalized.target_shot["requires_first_frame_continuity"])
+        self.assertFalse(normalized.target_shot["requires_last_frame_continuity"])
+        self.assertEqual(
+            normalized.target_shot["dialogue"][0]["start_ms"], 500,
+        )
+        self.assertEqual(
+            normalized.target_shot["dialogue"][0]["end_ms"], 2600,
+        )
+        self.assertEqual(
+            normalized.max_tokens, captured["shot_detail_policy"]["output_tokens"],
+        )
 
     def test_post_apply_boundary_and_bible_changes_make_draft_stale(self):
         generated, _ = self._generate()
@@ -444,6 +487,187 @@ class ShotDetailDraftApiTests(TestCase):
         self.assertEqual(run_runtime.call_count, 1)
         self.assertTrue(response.data["runtime_metadata"]["fallback_generated"])
 
+    def test_deepseek_protocol_failure_preserves_bilingual_candidate_for_review(self):
+        original_description = self.shot.detailed_description
+        candidate = {
+            **self.candidate(),
+            "schema_version": 2,
+            "unexpected_transport_field": "discard me",
+        }
+        runtime_error = CreativeDraftError(
+            "raw protocol details must not reach the API",
+            code="shot_high_detail_validation_failed",
+            runtime_metadata={
+                "provider": "deepseek_api",
+                "model": "deepseek-v4-flash",
+                "validation_path": "schema_version",
+            },
+            structured_candidate=candidate,
+        )
+
+        with patch(
+            "studio.services.shot_detail_drafts._run_provider_runtime",
+            side_effect=runtime_error,
+        ) as run_provider:
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/shot-detail-drafts/generate/",
+                {"shot_id": str(self.shot.id), "provider": "deepseek_api"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["status"], ShotDetailDraft.Status.DRAFT)
+        self.assertEqual(response.data["draft_data"], {
+            "schema_version": 1,
+            "detail_zh": candidate["detail_zh"],
+            "detail_en": candidate["detail_en"],
+        })
+        self.assertEqual(response.data["validation"]["status"], "needs_review")
+        protocol_issue = next(
+            issue for issue in response.data["validation"]["review_issues"]
+            if issue["code"] == "model_output_protocol_validation_failed"
+        )
+        self.assertEqual(protocol_issue["severity"], "requires_edit")
+        self.assertTrue(
+            response.data["runtime_metadata"]["salvaged_structured_candidate"],
+        )
+        self.assertFalse(response.data["runtime_metadata"]["fallback_generated"])
+        self.assertEqual(
+            response.data["runtime_metadata"]["error_code"],
+            "shot_detail_validation_failed",
+        )
+        self.assertNotIn("unexpected_transport_field", response.data["draft_data"])
+        self.assertNotIn("raw protocol details", response.content.decode("utf-8"))
+        self.assertEqual(run_provider.call_count, 1)
+        self.shot.refresh_from_db()
+        self.assertEqual(self.shot.detailed_description, original_description)
+
+    def test_deepseek_protocol_failure_preserves_one_sided_candidate_for_editing(self):
+        candidate = {
+            "schema_version": 2,
+            "detail_zh": self.candidate()["detail_zh"],
+        }
+        runtime_error = CreativeDraftError(
+            "strict bilingual protocol rejected one-sided output",
+            code="shot_high_detail_validation_failed",
+            runtime_metadata={"provider": "deepseek_api", "model": "deepseek-v4-flash"},
+            structured_candidate=candidate,
+        )
+
+        with patch(
+            "studio.services.shot_detail_drafts._run_provider_runtime",
+            side_effect=runtime_error,
+        ):
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/shot-detail-drafts/generate/",
+                {"shot_id": str(self.shot.id), "provider": "deepseek_api"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["validation"]["status"], "needs_review")
+        self.assertEqual(response.data["draft_data"]["detail_zh"], candidate["detail_zh"])
+        self.assertEqual(response.data["draft_data"]["detail_en"], "")
+        issues = {
+            issue["code"]: issue["severity"]
+            for issue in response.data["validation"]["review_issues"]
+        }
+        self.assertEqual(
+            issues["model_output_protocol_validation_failed"], "requires_edit",
+        )
+        self.assertEqual(issues["detail_en_missing"], "requires_edit")
+
+    def test_deepseek_protocol_failure_preserves_overlength_candidate_for_editing(self):
+        candidate = {
+            "schema_version": 1,
+            "detail_zh": "中" * 3001,
+            "detail_en": "a" * 4501,
+        }
+        runtime_error = CreativeDraftError(
+            "configured response envelope was exceeded",
+            code="shot_high_detail_validation_failed",
+            runtime_metadata={"provider": "deepseek_api", "model": "deepseek-v4-flash"},
+            structured_candidate=candidate,
+        )
+
+        with patch(
+            "studio.services.shot_detail_drafts._run_provider_runtime",
+            side_effect=runtime_error,
+        ):
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/shot-detail-drafts/generate/",
+                {"shot_id": str(self.shot.id), "provider": "deepseek_api"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["status"], ShotDetailDraft.Status.DRAFT)
+        self.assertEqual(response.data["draft_data"]["detail_zh"], candidate["detail_zh"])
+        self.assertEqual(response.data["draft_data"]["detail_en"], candidate["detail_en"])
+        transport_issues = [
+            issue for issue in response.data["validation"]["review_issues"]
+            if issue["code"] == "field_length_above_transport_envelope"
+        ]
+        self.assertEqual(len(transport_issues), 2)
+        self.assertTrue(all(
+            issue["severity"] == "requires_edit" for issue in transport_issues
+        ))
+
+    def test_deepseek_unparseable_or_empty_output_remains_failed(self):
+        original_description = self.shot.detailed_description
+        cases = (
+            (
+                "shot_high_detail_output_invalid_json",
+                {},
+                "shot_detail_output_invalid_json",
+            ),
+            (
+                "shot_high_detail_validation_failed",
+                {"schema_version": 1, "detail_zh": "", "detail_en": ""},
+                "shot_detail_validation_failed",
+            ),
+        )
+        for remote_code, candidate, expected_code in cases:
+            with self.subTest(remote_code=remote_code):
+                runtime_error = CreativeDraftError(
+                    "raw provider response must not reach the API",
+                    code=remote_code,
+                    runtime_metadata={
+                        "provider": "deepseek_api", "model": "deepseek-v4-flash",
+                    },
+                    structured_candidate=candidate,
+                )
+                with patch(
+                    "studio.services.shot_detail_drafts._run_provider_runtime",
+                    side_effect=runtime_error,
+                ):
+                    response = self.client.post(
+                        f"/api/v1/projects/{self.project.id}/shot-detail-drafts/generate/",
+                        {"shot_id": str(self.shot.id), "provider": "deepseek_api"},
+                        format="json",
+                    )
+
+                self.assertEqual(response.status_code, 502, response.data)
+                self.assertEqual(response.data["code"], expected_code)
+                failed = response.data["draft"]
+                self.assertEqual(failed["status"], ShotDetailDraft.Status.FAILED)
+                self.assertEqual(failed["draft_data"], {})
+                self.assertFalse(failed["runtime_metadata"]["fallback_generated"])
+                self.assertNotIn(
+                    "raw provider response", response.content.decode("utf-8"),
+                )
+
+        self.shot.refresh_from_db()
+        self.assertEqual(self.shot.detailed_description, original_description)
+
+
+RUNTIME_SHOT_DETAIL_POLICY = {
+    "recommended_zh_chars": 500,
+    "recommended_en_chars": 750,
+    "transport_zh_max_chars": 3000,
+    "transport_en_max_chars": 4500,
+}
+
 
 class ShotDetailRuntimeValidationTests(TestCase):
     def test_server_direction_semantics_excludes_ordinary_left_right_words(self):
@@ -467,7 +691,7 @@ class ShotDetailRuntimeValidationTests(TestCase):
         assert spec and spec.loader
         sys.modules[spec.name] = runtime
         spec.loader.exec_module(runtime)
-        request = SimpleNamespace(glossary={})
+        request = SimpleNamespace(glossary={}, policy=RUNTIME_SHOT_DETAIL_POLICY)
         for invalid_english in (
             "日本語 director prose", "한국어 director prose", "Русский prose",
             "Greek α director prose", "Arabic العربية prose",
@@ -497,7 +721,9 @@ class ShotDetailRuntimeValidationTests(TestCase):
         candidate = runtime._validate_shot_high_detail({
             "detail_zh": "镜头缓慢向右移动，人物停在门口。",
             "detail_en": "The camera slowly moves right as the subject stops at the doorway.",
-        }, SimpleNamespace(glossary={}), review_issues=[])
+        }, SimpleNamespace(
+            glossary={}, policy=RUNTIME_SHOT_DETAIL_POLICY,
+        ), review_issues=[])
         self.assertEqual(candidate["schema_version"], 1)
         self.assertIn("detail_en", candidate)
 
@@ -516,7 +742,9 @@ class ShotDetailRuntimeValidationTests(TestCase):
                 "english": "The camera slowly tracks right as the subject stops at the doorway.",
                 "explanation": "ignored operator note",
             },
-        }, SimpleNamespace(glossary={}), review_issues=issues)
+        }, SimpleNamespace(
+            glossary={}, policy=RUNTIME_SHOT_DETAIL_POLICY,
+        ), review_issues=issues)
         self.assertEqual(candidate["schema_version"], 1)
         self.assertEqual(candidate["detail_zh"], "镜头缓慢向右横移，人物停在门口。")
         self.assertTrue(any(
@@ -533,6 +761,8 @@ class ShotDetailRuntimeValidationTests(TestCase):
         issues = []
         candidate = runtime._validate_shot_high_detail({
             "detail_cn": "镜头缓慢向右横移，人物停在门口。",
-        }, SimpleNamespace(glossary={}), review_issues=issues)
+        }, SimpleNamespace(
+            glossary={}, policy=RUNTIME_SHOT_DETAIL_POLICY,
+        ), review_issues=issues)
         self.assertEqual(candidate["detail_en"], "")
         self.assertTrue(any(issue["code"] == "detail_en_missing" for issue in issues))

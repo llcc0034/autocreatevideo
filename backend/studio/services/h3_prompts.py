@@ -49,8 +49,8 @@ from studio.services.prompt_translation import (
 
 BASE_MODES = {Shot.H3Mode.T2VA, Shot.H3Mode.I2VA, Shot.H3Mode.FL2VA, Shot.H3Mode.L2VA}
 H3_PROMPT_CHARACTER_LIMIT = 7_000
-PROMPT_COMPILER_VERSION = 8
-PROMPT_INPUT_FINGERPRINT_VERSION = 4
+PROMPT_COMPILER_VERSION = 9
+PROMPT_INPUT_FINGERPRINT_VERSION = 5
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _PROTECTED_AUTHORED_TEXT_RE = re.compile(
     r"<(d|lyrics|screen_text)\b[^>]*>.*?</\1>",
@@ -388,13 +388,31 @@ def sync_consistency_locks(project: SeriesProject) -> list[ConsistencyLock]:
         "subject": subject_value,
     }))
 
+    active_keys = {
+        (scope, str(target_id) if target_id else None, key)
+        for scope, target_id, key, _value in specs
+    }
+    obsolete_lock_ids = [
+        lock.id
+        for lock in project.consistency_locks.filter(is_active=True)
+        if (
+            lock.scope,
+            str(lock.target_id) if lock.target_id else None,
+            lock.lock_key,
+        ) not in active_keys
+    ]
+    if obsolete_lock_ids:
+        ConsistencyLock.objects.filter(id__in=obsolete_lock_ids).update(
+            is_active=False,
+        )
+
     synced = []
     for scope, target_id, key, value in specs:
         lock, created = ConsistencyLock.objects.get_or_create(
             project=project, scope=scope, target_id=target_id, lock_key=key,
             defaults={"locked_value": value},
         )
-        if not created and lock.locked_value != value:
+        if not created and (lock.locked_value != value or not lock.is_active):
             lock.locked_value = value
             lock.version += 1
             lock.is_active = True
@@ -561,6 +579,8 @@ def prompt_input_fingerprint(
                     _asset_snapshot(asset) for asset in shot.reference_assets.all()
                 ],
                 "reference_bindings": shot.reference_bindings or {},
+                "requires_first_frame_continuity": shot.requires_first_frame_continuity,
+                "requires_last_frame_continuity": shot.requires_last_frame_continuity,
                 "continuity_notes": shot.continuity_notes,
                 "metadata": shot.metadata or {},
             }
@@ -622,6 +642,8 @@ def _dialogue_lines(
     shot: Shot,
     language: str,
     reference_labels: dict[tuple[str, str], str] | None = None,
+    *,
+    duration_ms: int,
 ) -> list[str]:
     reference_labels = reference_labels or {}
     lines = []
@@ -665,10 +687,17 @@ def _dialogue_lines(
             shot.episode.project_id, "shot", shot.id,
             f"shot.dialogue.{index}.delivery", delivery_source,
         ).strip()
+        start_ms = int(entry.get("start_ms", 0))
+        end_ms = int(entry.get("end_ms", duration_ms))
+        if not 0 <= start_ms < end_ms <= duration_ms:
+            raise PromptBuildError(
+                f"分镜 {shot.number} 的 dialogue[{index}] 时间范围超出当前镜头时长"
+            )
+        timing_clause = f"From {start_ms / 1000:.3f}s to {end_ms / 1000:.3f}s, "
         if entry.get("voiceover") is True:
             delivery_clause = f", {delivery}" if delivery else ""
             lines.append(
-                f"{prefix} ({speaker_id}) says in an off-screen voiceover{delivery_clause}: "
+                f"{timing_clause}{prefix} ({speaker_id}) says in an off-screen voiceover{delivery_clause}: "
                 f"<d>[{language}] {text}</d>"
             )
             visible_subject = subject_label or "the corresponding visible on-screen character"
@@ -679,7 +708,8 @@ def _dialogue_lines(
         else:
             delivery_clause = f" {delivery}" if delivery else ""
             lines.append(
-                f"{prefix} ({speaker_id}) says{delivery_clause}: <d>[{language}] {text}</d>"
+                f"{timing_clause}{prefix} ({speaker_id}) says{delivery_clause}: "
+                f"<d>[{language}] {text}</d>"
             )
     return lines
 
@@ -775,9 +805,22 @@ def _shot_description(
         parts.extend(_dedupe_text([narrative, action]))
         if shot.camera:
             parts.append(_compact(camera))
+    if shot.requires_first_frame_continuity:
+        parts.append(
+            "The opening frame must visibly continue the previous shot's final subject state, "
+            "screen direction, prop placement, lighting, and spatial relationships"
+        )
+    if shot.requires_last_frame_continuity:
+        parts.append(
+            "The final frame must hold a stable, matchable subject state, screen direction, "
+            "prop placement, lighting, and composition for the next shot"
+        )
     if options.include_audio and shot.sound_effects:
         parts.append(f"Synchronized diegetic sound: {_compact(sound_effects)}")
-    dialogue = _dialogue_lines(shot, options.language, reference_labels)
+    dialogue = _dialogue_lines(
+        shot, options.language, reference_labels,
+        duration_ms=_shot_duration(shot, options),
+    )
     if dialogue and options.include_audio:
         parts.extend(dialogue)
     continuity = _positive_continuity(shot)

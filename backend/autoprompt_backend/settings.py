@@ -185,6 +185,7 @@ SPECTACULAR_SETTINGS = {
         "AssemblyJobStatusEnum": "studio.models.AssemblyJob.Status",
         "ComfyUIWorkflowFormatEnum": ("comfyui_api", "comfyui_ui"),
         "PromptPolicyModeEnum": ("warn", "block"),
+        "ModelProviderEnum": ("local_qwen", "deepseek_api"),
         # Video and SDXL requests intentionally share the same official
         # megapixel profile set. Give that shared choice set one stable schema
         # component name so drf-spectacular does not invent competing names.
@@ -220,6 +221,81 @@ COMFYUI_EXTRA_ALLOWED_NODE_TYPES = tuple(
     item.strip() for item in os.getenv("COMFYUI_EXTRA_ALLOWED_NODE_TYPES", "").split(",") if item.strip()
 )
 MINIMAX_H3_MODEL = os.getenv("MINIMAX_H3_MODEL", "minimax-h3")
+VIDEO_SHOT_MIN_DURATION_MS = int(os.getenv("VIDEO_SHOT_MIN_DURATION_MS", "5000"))
+VIDEO_SHOT_MAX_DURATION_MS = int(os.getenv("VIDEO_SHOT_MAX_DURATION_MS", "15000"))
+H3_MIN_ALIGNED_FRAMES = int(os.getenv("H3_MIN_ALIGNED_FRAMES", "124"))
+H3_MAX_ALIGNED_FRAMES = int(os.getenv("H3_MAX_ALIGNED_FRAMES", "362"))
+if not 1 <= VIDEO_SHOT_MIN_DURATION_MS <= VIDEO_SHOT_MAX_DURATION_MS:
+    raise ImproperlyConfigured(
+        "VIDEO_SHOT_MIN_DURATION_MS and VIDEO_SHOT_MAX_DURATION_MS must define "
+        "a positive ordered range"
+    )
+if not 1 <= H3_MIN_ALIGNED_FRAMES <= H3_MAX_ALIGNED_FRAMES:
+    raise ImproperlyConfigured(
+        "H3_MIN_ALIGNED_FRAMES and H3_MAX_ALIGNED_FRAMES must define a positive "
+        "ordered range"
+    )
+
+
+def _configured_h3_aligned_frames(duration_ms: int) -> int:
+    requested = max(5, round(duration_ms * 24 / 1000))
+    return requested + (5 - requested % 17) % 17
+
+
+if (
+    _configured_h3_aligned_frames(VIDEO_SHOT_MIN_DURATION_MS) < H3_MIN_ALIGNED_FRAMES
+    or _configured_h3_aligned_frames(VIDEO_SHOT_MAX_DURATION_MS) > H3_MAX_ALIGNED_FRAMES
+):
+    raise ImproperlyConfigured(
+        "VIDEO_SHOT duration bounds must align inside H3_MIN_ALIGNED_FRAMES and "
+        "H3_MAX_ALIGNED_FRAMES"
+    )
+
+
+def _strict_environment_boolean(name: str, default: str) -> bool:
+    raw = os.getenv(name, default).strip().casefold()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise ImproperlyConfigured(
+        f"{name} must be one of true/false, 1/0, yes/no, or on/off"
+    )
+
+
+SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS = int(
+    os.getenv("SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS", "5000")
+)
+SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY = _strict_environment_boolean(
+    "SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY", "false",
+)
+SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY = _strict_environment_boolean(
+    "SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY", "false",
+)
+SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS = int(
+    os.getenv("SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS", "320")
+)
+SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS = int(
+    os.getenv("SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS", "220")
+)
+if not (
+    VIDEO_SHOT_MIN_DURATION_MS
+    <= SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS
+    <= VIDEO_SHOT_MAX_DURATION_MS
+):
+    raise ImproperlyConfigured(
+        "SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS must stay inside the configured "
+        "VIDEO_SHOT duration range"
+    )
+if not (
+    1
+    <= SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS
+    <= SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS
+):
+    raise ImproperlyConfigured(
+        "SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS and "
+        "SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS must define a positive ordered range"
+    )
 H3_PROMPT_OPTIMIZER = {
     # Privacy-first default: no prompt leaves this process until an operator
     # explicitly enables and configures an OpenAI-compatible endpoint.
@@ -248,14 +324,14 @@ DEEPSEEK_API = {
     "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
     "timeout_seconds": float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "180")),
     "max_retries": int(os.getenv("DEEPSEEK_MAX_RETRIES", "1")),
-    "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "4096")),
+    "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "16384")),
 }
 if DEEPSEEK_API["timeout_seconds"] <= 0:
     raise ImproperlyConfigured("DEEPSEEK_TIMEOUT_SECONDS must be greater than zero")
 if not 0 <= DEEPSEEK_API["max_retries"] <= 3:
     raise ImproperlyConfigured("DEEPSEEK_MAX_RETRIES must be between 0 and 3")
-if not 1 <= DEEPSEEK_API["max_tokens"] <= 32768:
-    raise ImproperlyConfigured("DEEPSEEK_MAX_TOKENS must be between 1 and 32768")
+if DEEPSEEK_API["max_tokens"] < 1:
+    raise ImproperlyConfigured("DEEPSEEK_MAX_TOKENS must be greater than zero")
 if not DEEPSEEK_API["base_url"]:
     raise ImproperlyConfigured("DEEPSEEK_BASE_URL must not be empty")
 if not DEEPSEEK_API["model"]:
@@ -264,6 +340,208 @@ if DEEPSEEK_API["enabled"] and not DEEPSEEK_API["api_key"]:
     raise ImproperlyConfigured(
         "DEEPSEEK_API_KEY must be set when DEEPSEEK_ENABLED is true"
     )
+
+
+# Human-review guidance is deliberately separate from model transport/schema
+# limits. Exceeding these values only creates an editable review issue; it must
+# never discard a provider response or prevent saving the proposal as a draft.
+CREATIVE_DRAFT_REVIEW = {
+    "recommended_title_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_TITLE_ZH_CHARS", "48")
+    ),
+    "recommended_title_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_TITLE_EN_CHARS", "72")
+    ),
+    "recommended_narrative_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_NARRATIVE_ZH_CHARS", "180")
+    ),
+    "recommended_narrative_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_NARRATIVE_EN_CHARS", "1000")
+    ),
+    "recommended_camera_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_CAMERA_ZH_CHARS", "220")
+    ),
+    "recommended_camera_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_CAMERA_EN_CHARS", "320")
+    ),
+    "recommended_action_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_ACTION_ZH_CHARS", "120")
+    ),
+    "recommended_action_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_ACTION_EN_CHARS", "1000")
+    ),
+    "recommended_continuity_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_CONTINUITY_ZH_CHARS", "160")
+    ),
+    "recommended_continuity_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_CONTINUITY_EN_CHARS", "240")
+    ),
+    "recommended_soundscape_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_SOUNDSCAPE_ZH_CHARS", "120")
+    ),
+    "recommended_soundscape_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_SOUNDSCAPE_EN_CHARS", "180")
+    ),
+    "recommended_music_zh_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_MUSIC_ZH_CHARS", "80")
+    ),
+    "recommended_music_en_chars": int(
+        os.getenv("CREATIVE_REVIEW_RECOMMENDED_MUSIC_EN_CHARS", "120")
+    ),
+    "max_camera_movements": int(
+        os.getenv("CREATIVE_REVIEW_MAX_CAMERA_MOVEMENTS", "1")
+    ),
+    "max_action_sequence_markers": int(
+        os.getenv("CREATIVE_REVIEW_MAX_ACTION_SEQUENCE_MARKERS", "4")
+    ),
+    "min_script_action_coverage_percent": int(
+        os.getenv("CREATIVE_REVIEW_MIN_SCRIPT_ACTION_COVERAGE_PERCENT", "80")
+    ),
+}
+def _validate_creative_review_policy(config: dict) -> None:
+    for key, value in config.items():
+        if int(value) <= 0:
+            raise ImproperlyConfigured(
+                f"CREATIVE_REVIEW_{key.upper()} must be greater than zero"
+            )
+    if int(config["min_script_action_coverage_percent"]) > 100:
+        raise ImproperlyConfigured(
+            "CREATIVE_REVIEW_MIN_SCRIPT_ACTION_COVERAGE_PERCENT must be between 1 and 100"
+        )
+
+
+_validate_creative_review_policy(CREATIVE_DRAFT_REVIEW)
+
+
+def _validate_creative_provider_policy(config: dict, prefix: str) -> None:
+    positive_keys = (
+        "min_shots",
+        "recommended_max_shots",
+        "batch_shots",
+        "max_dialogue_per_shot",
+        "max_episode_title_chars",
+        "max_dialogue_text_chars",
+        "max_dialogue_delivery_chars",
+        "max_dialogue_delivery_en_chars",
+        "min_shot_duration_ms",
+        "max_shot_duration_ms",
+        "output_min_tokens",
+        "output_base_tokens",
+        "output_tokens_per_shot",
+        "output_tokens_per_dialogue",
+        "max_source_chars",
+        "max_regeneration_context_chars",
+        "max_input_chars",
+    )
+    for key in positive_keys:
+        if int(config[key]) <= 0:
+            raise ImproperlyConfigured(f"{prefix}_{key.upper()} must be greater than zero")
+    if config["recommended_max_shots"] < config["min_shots"]:
+        raise ImproperlyConfigured(
+            f"{prefix}_RECOMMENDED_MAX_SHOTS must not be less than "
+            f"{prefix}_MIN_SHOTS"
+        )
+    if config["batch_shots"] < config["min_shots"]:
+        raise ImproperlyConfigured(
+            f"{prefix}_BATCH_SHOTS must not be less than {prefix}_MIN_SHOTS"
+        )
+    if config["max_source_chars"] > config["max_input_chars"]:
+        raise ImproperlyConfigured(
+            f"{prefix}_MAX_SOURCE_CHARS must not exceed {prefix}_MAX_INPUT_CHARS"
+        )
+    if config["max_regeneration_context_chars"] > config["max_input_chars"]:
+        raise ImproperlyConfigured(
+            f"{prefix}_MAX_REGENERATION_CONTEXT_CHARS must not exceed "
+            f"{prefix}_MAX_INPUT_CHARS"
+        )
+    if config["min_shot_duration_ms"] > config["max_shot_duration_ms"]:
+        raise ImproperlyConfigured(
+            f"{prefix}_MIN_SHOT_DURATION_MS must not exceed "
+            f"{prefix}_MAX_SHOT_DURATION_MS"
+        )
+    if config["min_shot_duration_ms"] < VIDEO_SHOT_MIN_DURATION_MS:
+        raise ImproperlyConfigured(
+            f"{prefix}_MIN_SHOT_DURATION_MS must not be less than "
+            "VIDEO_SHOT_MIN_DURATION_MS"
+        )
+    if config["max_shot_duration_ms"] > VIDEO_SHOT_MAX_DURATION_MS:
+        raise ImproperlyConfigured(
+            f"{prefix}_MAX_SHOT_DURATION_MS must not exceed "
+            "VIDEO_SHOT_MAX_DURATION_MS"
+        )
+    if int(config["output_dialogue_char_threshold"]) < 0:
+        raise ImproperlyConfigured(
+            f"{prefix}_OUTPUT_DIALOGUE_CHAR_THRESHOLD must be zero or greater"
+        )
+    if int(config["output_headroom_per_shot"]) < 0:
+        raise ImproperlyConfigured(
+            f"{prefix}_OUTPUT_HEADROOM_PER_SHOT must be zero or greater"
+        )
+
+
+DEEPSEEK_CREATIVE = {
+    **CREATIVE_DRAFT_REVIEW,
+    "min_shots": int(os.getenv("DEEPSEEK_CREATIVE_MIN_SHOTS", "1")),
+    "recommended_max_shots": int(
+        os.getenv("DEEPSEEK_CREATIVE_RECOMMENDED_MAX_SHOTS", "4")
+    ),
+    "batch_shots": int(os.getenv("DEEPSEEK_CREATIVE_BATCH_SHOTS", "1")),
+    "max_dialogue_per_shot": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_DIALOGUE_PER_SHOT", "2")
+    ),
+    "max_episode_title_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_EPISODE_TITLE_CHARS", "80")
+    ),
+    "max_dialogue_text_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_DIALOGUE_TEXT_CHARS", "240")
+    ),
+    "max_dialogue_delivery_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_DIALOGUE_DELIVERY_CHARS", "100")
+    ),
+    "max_dialogue_delivery_en_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_DIALOGUE_DELIVERY_EN_CHARS", "150")
+    ),
+    "min_shot_duration_ms": int(
+        os.getenv(
+            "DEEPSEEK_CREATIVE_MIN_SHOT_DURATION_MS",
+            str(VIDEO_SHOT_MIN_DURATION_MS),
+        )
+    ),
+    "max_shot_duration_ms": int(
+        os.getenv(
+            "DEEPSEEK_CREATIVE_MAX_SHOT_DURATION_MS",
+            str(VIDEO_SHOT_MAX_DURATION_MS),
+        )
+    ),
+    "output_min_tokens": int(
+        os.getenv("DEEPSEEK_CREATIVE_OUTPUT_MIN_TOKENS", "1024")
+    ),
+    "output_base_tokens": int(
+        os.getenv("DEEPSEEK_CREATIVE_OUTPUT_BASE_TOKENS", "768")
+    ),
+    "output_tokens_per_shot": int(
+        os.getenv("DEEPSEEK_CREATIVE_OUTPUT_TOKENS_PER_SHOT", "384")
+    ),
+    "output_tokens_per_dialogue": int(
+        os.getenv("DEEPSEEK_CREATIVE_OUTPUT_TOKENS_PER_DIALOGUE", "128")
+    ),
+    "output_dialogue_char_threshold": int(
+        os.getenv("DEEPSEEK_CREATIVE_OUTPUT_DIALOGUE_CHAR_THRESHOLD", "32")
+    ),
+    "max_source_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_SOURCE_CHARS", "24000")
+    ),
+    "max_regeneration_context_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_REGENERATION_CONTEXT_CHARS", "96000")
+    ),
+    "max_input_chars": int(
+        os.getenv("DEEPSEEK_CREATIVE_MAX_INPUT_CHARS", "120000")
+    ),
+    "output_headroom_per_shot": int(
+        os.getenv("DEEPSEEK_CREATIVE_OUTPUT_HEADROOM_PER_SHOT", "384")
+    ),
+}
+_validate_creative_provider_policy(DEEPSEEK_CREATIVE, "DEEPSEEK_CREATIVE")
 
 _PROMPT_PROVIDER_IDS = {"local_qwen", "deepseek_api"}
 
@@ -343,6 +621,7 @@ LOCAL_PROMPT_TRANSLATION = {
 # a separate context/output budget. Keeping this distinct from translation
 # prevents a 768-token translation limit from silently truncating storyboards.
 LOCAL_QWEN_CREATIVE = {
+    **CREATIVE_DRAFT_REVIEW,
     "enabled": os.getenv("QWEN_CREATIVE_ENABLED", "true").lower()
     in {"1", "true", "yes", "on"},
     "model_id": os.getenv(
@@ -361,31 +640,334 @@ LOCAL_QWEN_CREATIVE = {
         os.getenv("QWEN_CREATIVE_DEVICE", "cpu"), "QWEN_CREATIVE_DEVICE",
     ),
     "gpu_layers": QWEN_GPU_LAYERS,
-    # Child inference deadline.  The Django subprocess owner adds a fixed
-    # 60-second cleanup grace and therefore waits at most 960 seconds by
-    # default; browser clients must stay above that parent ceiling.
+    # Child inference deadline and parent cleanup grace are independently
+    # configurable so operators can size them for the selected runtime.
     "timeout_seconds": float(os.getenv("QWEN_CREATIVE_TIMEOUT_SECONDS", "900")),
+    "process_cleanup_grace_seconds": float(
+        os.getenv("QWEN_CREATIVE_PROCESS_CLEANUP_GRACE_SECONDS", "60")
+    ),
     "max_new_tokens": int(os.getenv("QWEN_CREATIVE_MAX_NEW_TOKENS", "3072")),
     "context_size": int(os.getenv("QWEN_CREATIVE_CONTEXT_SIZE", "8192")),
-    "min_shots": 1,
-    "max_shots": int(os.getenv("QWEN_CREATIVE_MAX_SHOTS", "4")),
+    "min_context_size": int(os.getenv("QWEN_CREATIVE_MIN_CONTEXT_SIZE", "8192")),
+    "max_context_size": int(os.getenv("QWEN_CREATIVE_MAX_CONTEXT_SIZE", "32768")),
+    "reserved_input_tokens": int(
+        os.getenv("QWEN_CREATIVE_RESERVED_INPUT_TOKENS", "2048")
+    ),
+    "min_shots": int(os.getenv("QWEN_CREATIVE_MIN_SHOTS", "1")),
+    "recommended_max_shots": int(
+        os.getenv("QWEN_CREATIVE_RECOMMENDED_MAX_SHOTS", "4")
+    ),
+    "batch_shots": int(os.getenv("QWEN_CREATIVE_BATCH_SHOTS", "4")),
+    "max_dialogue_per_shot": int(
+        os.getenv("QWEN_CREATIVE_MAX_DIALOGUE_PER_SHOT", "2")
+    ),
+    "max_episode_title_chars": int(
+        os.getenv("QWEN_CREATIVE_MAX_EPISODE_TITLE_CHARS", "80")
+    ),
+    "max_dialogue_text_chars": int(
+        os.getenv("QWEN_CREATIVE_MAX_DIALOGUE_TEXT_CHARS", "240")
+    ),
+    "max_dialogue_delivery_chars": int(
+        os.getenv("QWEN_CREATIVE_MAX_DIALOGUE_DELIVERY_CHARS", "100")
+    ),
+    "max_dialogue_delivery_en_chars": int(
+        os.getenv("QWEN_CREATIVE_MAX_DIALOGUE_DELIVERY_EN_CHARS", "150")
+    ),
+    "min_shot_duration_ms": int(
+        os.getenv(
+            "QWEN_CREATIVE_MIN_SHOT_DURATION_MS",
+            str(VIDEO_SHOT_MIN_DURATION_MS),
+        )
+    ),
+    "max_shot_duration_ms": int(
+        os.getenv(
+            "QWEN_CREATIVE_MAX_SHOT_DURATION_MS",
+            str(VIDEO_SHOT_MAX_DURATION_MS),
+        )
+    ),
+    "output_min_tokens": int(os.getenv("QWEN_CREATIVE_OUTPUT_MIN_TOKENS", "1024")),
+    "output_base_tokens": int(os.getenv("QWEN_CREATIVE_OUTPUT_BASE_TOKENS", "768")),
+    "output_tokens_per_shot": int(
+        os.getenv("QWEN_CREATIVE_OUTPUT_TOKENS_PER_SHOT", "384")
+    ),
+    "output_tokens_per_dialogue": int(
+        os.getenv("QWEN_CREATIVE_OUTPUT_TOKENS_PER_DIALOGUE", "128")
+    ),
+    "output_dialogue_char_threshold": int(
+        os.getenv("QWEN_CREATIVE_OUTPUT_DIALOGUE_CHAR_THRESHOLD", "32")
+    ),
     "max_source_chars": int(os.getenv("QWEN_CREATIVE_MAX_SOURCE_CHARS", "16000")),
+    "max_regeneration_context_chars": int(
+        os.getenv("QWEN_CREATIVE_MAX_REGENERATION_CONTEXT_CHARS", "16000")
+    ),
+    "max_input_chars": int(os.getenv("QWEN_CREATIVE_MAX_INPUT_CHARS", "24000")),
+    "output_headroom_per_shot": int(
+        os.getenv("QWEN_CREATIVE_OUTPUT_HEADROOM_PER_SHOT", "0")
+    ),
 }
-if not 1 <= LOCAL_QWEN_CREATIVE["max_shots"] <= 4:
-    raise ImproperlyConfigured("QWEN_CREATIVE_MAX_SHOTS must be between 1 and 4")
-if not 2048 <= LOCAL_QWEN_CREATIVE["max_new_tokens"] <= 3072:
-    raise ImproperlyConfigured("QWEN_CREATIVE_MAX_NEW_TOKENS must be between 2048 and 3072")
-if not 8192 <= LOCAL_QWEN_CREATIVE["context_size"] <= 32768:
-    raise ImproperlyConfigured("QWEN_CREATIVE_CONTEXT_SIZE must be between 8192 and 32768")
-if not 4000 <= LOCAL_QWEN_CREATIVE["max_source_chars"] <= 16000:
-    raise ImproperlyConfigured("QWEN_CREATIVE_MAX_SOURCE_CHARS must be between 4000 and 16000")
+_validate_creative_provider_policy(LOCAL_QWEN_CREATIVE, "QWEN_CREATIVE")
+if LOCAL_QWEN_CREATIVE["timeout_seconds"] <= 0:
+    raise ImproperlyConfigured("QWEN_CREATIVE_TIMEOUT_SECONDS must be greater than zero")
+if LOCAL_QWEN_CREATIVE["process_cleanup_grace_seconds"] < 0:
+    raise ImproperlyConfigured(
+        "QWEN_CREATIVE_PROCESS_CLEANUP_GRACE_SECONDS must be zero or greater"
+    )
+for _creative_key in (
+    "max_new_tokens", "context_size", "min_context_size",
+    "max_context_size", "reserved_input_tokens",
+):
+    if LOCAL_QWEN_CREATIVE[_creative_key] < 1:
+        raise ImproperlyConfigured(
+            f"QWEN_CREATIVE_{_creative_key.upper()} must be greater than zero"
+        )
+if not (
+    LOCAL_QWEN_CREATIVE["min_context_size"]
+    <= LOCAL_QWEN_CREATIVE["context_size"]
+    <= LOCAL_QWEN_CREATIVE["max_context_size"]
+):
+    raise ImproperlyConfigured(
+        "QWEN_CREATIVE_MIN_CONTEXT_SIZE, QWEN_CREATIVE_CONTEXT_SIZE and "
+        "QWEN_CREATIVE_MAX_CONTEXT_SIZE must be ordered from smallest to largest"
+    )
+if (
+    LOCAL_QWEN_CREATIVE["max_new_tokens"]
+    > LOCAL_QWEN_CREATIVE["context_size"]
+    - LOCAL_QWEN_CREATIVE["reserved_input_tokens"]
+):
+    raise ImproperlyConfigured(
+        "QWEN_CREATIVE_MAX_NEW_TOKENS must leave QWEN_CREATIVE_RESERVED_INPUT_TOKENS "
+        "context tokens for input"
+    )
+
+# Review-gated per-shot director-detail policy.  These values are shared by
+# the HTTP API, the durable episode batch worker, and the isolated Qwen
+# protocol request.  Recommended limits create review/confirmation messages;
+# only the wider transport envelope protects storage and process boundaries.
+_SHOT_DETAIL_PROTOCOL_LIMIT_DEFAULTS = {
+    "project_title_max_chars": 200,
+    "project_logline_max_chars": 2_000,
+    "project_continuity_summary_max_chars": 3_000,
+    "project_color_script_max_chars": 2_000,
+    "project_aspect_ratio_max_chars": 16,
+    "style_max_chars": 8_000,
+    "glossary_max_terms": 200,
+    "glossary_source_max_chars": 160,
+    "glossary_target_max_chars": 240,
+    "reference_bindings_max_chars": 4_000,
+    "shot_title_max_chars": 200,
+    "shot_narrative_max_chars": 2_000,
+    "shot_detailed_description_max_chars": 3_500,
+    "shot_camera_max_chars": 1_000,
+    "shot_continuity_notes_max_chars": 1_000,
+    "target_action_max_chars": 2_000,
+    "target_sound_effects_max_chars": 1_000,
+    "target_music_max_chars": 1_000,
+    "target_h3_mode_max_chars": 16,
+    "dialogue_speaker_id_max_chars": 16,
+    "dialogue_text_max_chars": 240,
+    "dialogue_delivery_max_chars": 160,
+    "max_dialogue_per_shot": 2,
+    "bible_max_characters": 20,
+    "bible_max_scenes": 1,
+    "bible_max_props": 30,
+    "bible_speaker_id_max_chars": 16,
+    "bible_entity_field_max_chars": 2_000,
+    "feedback_max_chars": 2_000,
+}
+_SHOT_DETAIL_PROTOCOL_ENV_SUFFIXES = {
+    key: key.upper() for key in _SHOT_DETAIL_PROTOCOL_LIMIT_DEFAULTS
+}
+
+
+def _shot_detail_protocol_limits(provider_prefix: str) -> dict[str, int]:
+    """Resolve one provider's complete high-detail request envelope."""
+    return {
+        key: int(os.getenv(
+            f"{provider_prefix}_SHOT_DETAIL_{_SHOT_DETAIL_PROTOCOL_ENV_SUFFIXES[key]}",
+            str(default_value),
+        ))
+        for key, default_value in _SHOT_DETAIL_PROTOCOL_LIMIT_DEFAULTS.items()
+    }
+
+
+SHOT_DETAIL_POLICY = {
+    "recommended_zh_chars": int(
+        os.getenv("SHOT_DETAIL_RECOMMENDED_ZH_CHARS", "500")
+    ),
+    "recommended_en_chars": int(
+        os.getenv("SHOT_DETAIL_RECOMMENDED_EN_CHARS", "750")
+    ),
+    "transport_zh_max_chars": int(
+        os.getenv("SHOT_DETAIL_TRANSPORT_ZH_MAX_CHARS", "3000")
+    ),
+    "transport_en_max_chars": int(
+        os.getenv("SHOT_DETAIL_TRANSPORT_EN_MAX_CHARS", "4500")
+    ),
+    "output_tokens": int(os.getenv("SHOT_DETAIL_OUTPUT_TOKENS", "2304")),
+    "context_max_chars": int(
+        os.getenv("SHOT_DETAIL_CONTEXT_MAX_CHARS", "18000")
+    ),
+    "review_min_zh_chars": int(
+        os.getenv("SHOT_DETAIL_REVIEW_MIN_ZH_CHARS", "100")
+    ),
+    "review_min_en_chars": int(
+        os.getenv("SHOT_DETAIL_REVIEW_MIN_EN_CHARS", "160")
+    ),
+    "review_near_zh_margin_chars": int(
+        os.getenv("SHOT_DETAIL_REVIEW_NEAR_ZH_MARGIN_CHARS", "20")
+    ),
+    "review_near_en_margin_chars": int(
+        os.getenv("SHOT_DETAIL_REVIEW_NEAR_EN_MARGIN_CHARS", "30")
+    ),
+    "maximum_generation_number": int(
+        os.getenv("SHOT_DETAIL_MAX_GENERATION_NUMBER", "1000000")
+    ),
+    "minimum_duration_ms": VIDEO_SHOT_MIN_DURATION_MS,
+    "maximum_duration_ms": VIDEO_SHOT_MAX_DURATION_MS,
+    "max_attempts": int(os.getenv("SHOT_DETAIL_MAX_ATTEMPTS", "3")),
+    "retry_seconds": float(os.getenv("SHOT_DETAIL_RETRY_SECONDS", "5")),
+    "stale_minutes": int(os.getenv("SHOT_DETAIL_STALE_MINUTES", "30")),
+    "lease_safety_seconds": float(
+        os.getenv("SHOT_DETAIL_LEASE_SAFETY_SECONDS", "60")
+    ),
+    **_SHOT_DETAIL_PROTOCOL_LIMIT_DEFAULTS,
+}
+SHOT_DETAIL_PROVIDER_POLICIES = {
+    "local_qwen": {
+        "recommended_max_shots": int(
+            os.getenv("QWEN_SHOT_DETAIL_RECOMMENDED_MAX_SHOTS", "4")
+        ),
+        "output_tokens": int(os.getenv(
+            "QWEN_SHOT_DETAIL_OUTPUT_TOKENS",
+            str(SHOT_DETAIL_POLICY["output_tokens"]),
+        )),
+        "context_max_chars": int(os.getenv(
+            "QWEN_SHOT_DETAIL_CONTEXT_MAX_CHARS",
+            str(SHOT_DETAIL_POLICY["context_max_chars"]),
+        )),
+        **_shot_detail_protocol_limits("QWEN"),
+    },
+    "deepseek_api": {
+        "recommended_max_shots": int(
+            os.getenv("DEEPSEEK_SHOT_DETAIL_RECOMMENDED_MAX_SHOTS", "16")
+        ),
+        "output_tokens": int(os.getenv(
+            "DEEPSEEK_SHOT_DETAIL_OUTPUT_TOKENS",
+            str(SHOT_DETAIL_POLICY["output_tokens"]),
+        )),
+        "context_max_chars": int(os.getenv(
+            "DEEPSEEK_SHOT_DETAIL_CONTEXT_MAX_CHARS",
+            str(SHOT_DETAIL_POLICY["context_max_chars"]),
+        )),
+        **_shot_detail_protocol_limits("DEEPSEEK"),
+    },
+}
+for _shot_detail_key in (
+    "recommended_zh_chars", "recommended_en_chars",
+    "transport_zh_max_chars", "transport_en_max_chars", "output_tokens",
+    "context_max_chars", "review_min_zh_chars", "review_min_en_chars",
+    "max_dialogue_per_shot", "maximum_generation_number",
+    "minimum_duration_ms", "maximum_duration_ms", "max_attempts", "stale_minutes",
+):
+    if int(SHOT_DETAIL_POLICY[_shot_detail_key]) < 1:
+        raise ImproperlyConfigured(
+            f"SHOT_DETAIL_{_shot_detail_key.upper()} must be greater than zero"
+        )
+if SHOT_DETAIL_POLICY["retry_seconds"] < 0:
+    raise ImproperlyConfigured("SHOT_DETAIL_RETRY_SECONDS must be zero or greater")
+if SHOT_DETAIL_POLICY["lease_safety_seconds"] < 0:
+    raise ImproperlyConfigured(
+        "SHOT_DETAIL_LEASE_SAFETY_SECONDS must be zero or greater"
+    )
+for _shot_detail_margin_key in (
+    "review_near_zh_margin_chars", "review_near_en_margin_chars",
+):
+    if int(SHOT_DETAIL_POLICY[_shot_detail_margin_key]) < 0:
+        raise ImproperlyConfigured(
+            f"SHOT_DETAIL_{_shot_detail_margin_key.upper()} must be zero or greater"
+        )
+if (
+    SHOT_DETAIL_POLICY["review_near_zh_margin_chars"]
+    > SHOT_DETAIL_POLICY["recommended_zh_chars"]
+    or SHOT_DETAIL_POLICY["review_near_en_margin_chars"]
+    > SHOT_DETAIL_POLICY["recommended_en_chars"]
+):
+    raise ImproperlyConfigured(
+        "SHOT_DETAIL review near-limit margins must not exceed their recommendations"
+    )
+if SHOT_DETAIL_POLICY["minimum_duration_ms"] > SHOT_DETAIL_POLICY["maximum_duration_ms"]:
+    raise ImproperlyConfigured("SHOT_DETAIL duration policy must be ordered")
+_SHOT_DETAIL_LONGEST_PROVIDER_RUNTIME_SECONDS = max(
+    LOCAL_QWEN_CREATIVE["timeout_seconds"]
+    + LOCAL_QWEN_CREATIVE["process_cleanup_grace_seconds"],
+    DEEPSEEK_API["timeout_seconds"] * (DEEPSEEK_API["max_retries"] + 1),
+)
+if (
+    SHOT_DETAIL_POLICY["stale_minutes"] * 60
+    <= _SHOT_DETAIL_LONGEST_PROVIDER_RUNTIME_SECONDS
+    + SHOT_DETAIL_POLICY["lease_safety_seconds"]
+):
+    raise ImproperlyConfigured(
+        "SHOT_DETAIL_STALE_MINUTES must outlast the longest configured provider run plus "
+        "SHOT_DETAIL_LEASE_SAFETY_SECONDS"
+    )
+if (
+    SHOT_DETAIL_POLICY["transport_zh_max_chars"]
+    < SHOT_DETAIL_POLICY["recommended_zh_chars"]
+    or SHOT_DETAIL_POLICY["transport_en_max_chars"]
+    < SHOT_DETAIL_POLICY["recommended_en_chars"]
+):
+    raise ImproperlyConfigured(
+        "SHOT_DETAIL transport limits must not be lower than review recommendations"
+    )
+for _provider_name, _provider_policy in SHOT_DETAIL_PROVIDER_POLICIES.items():
+    if any(int(_provider_policy[key]) < 1 for key in (
+        "recommended_max_shots", "output_tokens", "context_max_chars",
+        *_SHOT_DETAIL_PROTOCOL_LIMIT_DEFAULTS,
+    )):
+        raise ImproperlyConfigured(
+            f"{_provider_name.upper()} shot-detail provider policy values must be positive"
+        )
+if (
+    SHOT_DETAIL_PROVIDER_POLICIES["local_qwen"]["output_tokens"]
+    > LOCAL_QWEN_CREATIVE["max_new_tokens"]
+):
+    raise ImproperlyConfigured(
+        "QWEN_SHOT_DETAIL_OUTPUT_TOKENS must not exceed QWEN_CREATIVE_MAX_NEW_TOKENS"
+    )
+if (
+    SHOT_DETAIL_PROVIDER_POLICIES["deepseek_api"]["output_tokens"]
+    > DEEPSEEK_API["max_tokens"]
+):
+    raise ImproperlyConfigured(
+        "DEEPSEEK_SHOT_DETAIL_OUTPUT_TOKENS must not exceed DEEPSEEK_MAX_TOKENS"
+    )
 LOCAL_QWEN_LOCK_PATH = os.getenv(
     "LOCAL_QWEN_LOCK_PATH", str(BASE_DIR.parent / ".runtime" / "locks" / "local-qwen.lock"),
 ).strip()
 TASK_WORKER_POLL_SECONDS = float(os.getenv("TASK_WORKER_POLL_SECONDS", "2"))
 TASK_MAX_CONCURRENT = int(os.getenv("TASK_MAX_CONCURRENT", "1"))
-TASK_MAX_PENDING = int(os.getenv("TASK_MAX_PENDING", "20"))
-TASK_MAX_ACTIVE_PER_USER = int(os.getenv("TASK_MAX_ACTIVE_PER_USER", "5"))
+TASK_RECOMMENDED_MAX_PENDING = int(os.getenv("TASK_RECOMMENDED_MAX_PENDING", "20"))
+TASK_RECOMMENDED_MAX_ACTIVE_PER_USER = int(
+    os.getenv("TASK_RECOMMENDED_MAX_ACTIVE_PER_USER", "5")
+)
+for _task_limit_name, _task_limit in (
+    ("TASK_MAX_CONCURRENT", TASK_MAX_CONCURRENT),
+    ("TASK_RECOMMENDED_MAX_PENDING", TASK_RECOMMENDED_MAX_PENDING),
+    ("TASK_RECOMMENDED_MAX_ACTIVE_PER_USER", TASK_RECOMMENDED_MAX_ACTIVE_PER_USER),
+):
+    if _task_limit < 1:
+        raise ImproperlyConfigured(f"{_task_limit_name} must be greater than zero")
+if TASK_RECOMMENDED_MAX_ACTIVE_PER_USER > TASK_RECOMMENDED_MAX_PENDING:
+    raise ImproperlyConfigured(
+        "TASK_RECOMMENDED_MAX_ACTIVE_PER_USER must not exceed "
+        "TASK_RECOMMENDED_MAX_PENDING"
+    )
+SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS = int(
+    os.getenv("SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS", "1000000")
+)
+if SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS < 1:
+    raise ImproperlyConfigured("SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS must be greater than zero")
 TASK_GENERATION_TIMEOUT_SECONDS = float(os.getenv("TASK_GENERATION_TIMEOUT_SECONDS", "21600"))
 TASK_REMOTE_POLL_SECONDS = float(os.getenv("TASK_REMOTE_POLL_SECONDS", "1"))
 TASK_HEARTBEAT_SECONDS = float(os.getenv("TASK_HEARTBEAT_SECONDS", "5"))

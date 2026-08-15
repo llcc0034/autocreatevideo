@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { AlertTriangle, ArrowLeft, ArrowRight, BookOpen, Box, Check, ChevronRight, Clapperboard, Clock3, Copy, Download, Eye, FileJson, Film, Image, Languages, Layers3, Lock, MoreHorizontal, Plus, RefreshCw, Save, Search, Sparkles, Trash2, Unlock, UserRound, WandSparkles, Workflow, X } from 'lucide-vue-next'
+import { AlertTriangle, ArrowLeft, ArrowRight, BookOpen, Box, Check, ChevronRight, Clapperboard, Clock3, Copy, Download, Eye, FileJson, Film, Image, ImagePlus, Languages, Layers3, Lock, MoreHorizontal, Plus, RefreshCw, Save, Search, Sparkles, Trash2, Unlock, Upload, UserRound, WandSparkles, Workflow, X } from 'lucide-vue-next'
 import BaseModal from '@/components/BaseModal.vue'
 import StatusBadge from '@/components/StatusBadge.vue'
 import ToggleSwitch from '@/components/ToggleSwitch.vue'
 import AssetImage from '@/components/AssetImage.vue'
+import ProjectCoverImage from '@/components/ProjectCoverImage.vue'
 import ResolutionProfilePicker from '@/components/ResolutionProfilePicker.vue'
 import ProductionWorkflowPicker from '@/components/ProductionWorkflowPicker.vue'
 import PromptImpactBadge from '@/components/PromptImpactBadge.vue'
@@ -13,7 +14,8 @@ import PromptWritingGuide from '@/components/PromptWritingGuide.vue'
 import TranslationReviewPanel from '@/components/TranslationReviewPanel.vue'
 import CreativeDraftWorkbench from '@/components/CreativeDraftWorkbench.vue'
 import GlobalVisualRulesDraft from '@/components/GlobalVisualRulesDraft.vue'
-import { repository } from '@/services/repository'
+import { productionErrorCode, repository, type ProductionCapability } from '@/services/repository'
+import { PROJECT_COVER_ACCEPT, projectCoverFileError } from '@/services/projectManagement'
 import { bibleCanonicalTargetCollisionMessage, bibleCanonicalTargetCollisions, formatTranslationGlossary, missingBibleCanonicalNames as findMissingBibleCanonicalNames, parseTranslationGlossary } from '@/services/translationReview'
 import { DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, DEFAULT_PRODUCTION_RESOLUTION_PROFILE, isProductionResolutionProfile, normalizeImageProductionResolutionMultiple, normalizeProductionResolutionMultiple } from '@/constants/productionResolution'
 import { useStudioStore } from '@/stores/studio'
@@ -21,14 +23,23 @@ import { useAuthStore } from '@/stores/auth'
 import type { AssemblyResult, Asset, BibleAssetDraftResult, BibleDraftLanguage, BibleItem, Episode, H3Mode, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, PromptTranslationField, ReleaseBundle, ScriptBreakdownOptions, SeriesProject, VisualRulesDraftApplyResult } from '@/types'
 
 const studio = useStudioStore(); const auth = useAuthStore(); const route = useRoute(); const router = useRouter()
-const project = ref<SeriesProject | null>(null); const loading = ref(true); const saving = ref(false); const tab = ref<'overview'|'bible'|'episodes'|'release'>('overview'); const bibleSection = ref<'characters'|'scenes'|'props'>('characters')
+const project = ref<SeriesProject | null>(null); const loading = ref(true); const projectLoadError = ref(''); const saving = ref(false); const tab = ref<'overview'|'bible'|'episodes'|'release'>('overview'); const bibleSection = ref<'characters'|'scenes'|'props'>('characters')
 const addBibleOpen = ref(false); const addEpisodeOpen = ref(false); const createLoading = ref(false); const breakdownLoading = ref(false)
+const rebuildConfirmOpen = ref(false)
 const bibleAssetPickerId = ref('')
-const episodeAssemblies = ref<Record<string, AssemblyResult>>({}); const completedEpisodeAssemblies = ref<Record<string, AssemblyResult>>({}); const selectedEpisodeId = ref(''); const assemblyLoadingId = ref(''); const assemblyError = ref(''); const assemblyPreviewRefreshingId = ref(''); const assemblyPreviewErrors = ref<Record<string,string>>({}); const episodeGenerationLoadingId = ref(''); const episodeIdempotencyKeys = ref<Record<string,string>>({}); const wholeEpisodeOpen = ref(false); const wholeEpisodeId = ref(''); const wholeEpisodeProfile = ref<ProductionResolutionProfile>(DEFAULT_PRODUCTION_RESOLUTION_PROFILE); const wholeEpisodeMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const wholeEpisodeImageProfile = ref<ProductionResolutionProfile>('0.98'); const wholeEpisodeImageMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE)
+const episodeAssemblies = ref<Record<string, AssemblyResult>>({}); const completedEpisodeAssemblies = ref<Record<string, AssemblyResult>>({}); const selectedEpisodeId = ref(''); const assemblyLoadingId = ref(''); const assemblyError = ref(''); const assemblyPreviewRefreshingId = ref(''); const assemblyPreviewErrors = ref<Record<string,string>>({}); const episodeGenerationLoadingId = ref(''); const episodeIdempotencyKeys = ref<Record<string,string>>({}); const wholeEpisodeOpen = ref(false); const wholeEpisodeExtendedConfirmed = ref(false); const wholeEpisodeIdempotencyConflict = ref(''); const wholeEpisodeId = ref(''); const wholeEpisodeProfile = ref<ProductionResolutionProfile>(DEFAULT_PRODUCTION_RESOLUTION_PROFILE); const wholeEpisodeMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const wholeEpisodeImageProfile = ref<ProductionResolutionProfile>('0.98'); const wholeEpisodeImageMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE)
 const productionWorkflowTemplates = ref<ProductionWorkflowTemplate[]>([]); const productionWorkflowTemplatesLoading = ref(false); const productionWorkflowTemplatesError = ref(''); const wholeRef2vaTemplateId = ref(''); const wholeRef2vaParameters = ref<Record<string,number>>({})
+const productionCapability = ref<ProductionCapability | null>(null); const productionCapabilityError = ref('')
 const releaseBundles = ref<ReleaseBundle[]>([]); const releaseLoading = ref(false); const releaseError = ref(''); const releaseTitle = ref(''); const releaseNotes = ref('')
 const newProject = ref({ title: '', logline: '', masterScript: '', styleId: 'wuxia', aspectRatio: '9:16' as SeriesProject['aspectRatio'], resolution: '720p' as SeriesProject['resolution'], defaultMode: 'Ref2VA' as H3Mode })
-const breakdownOptions = ref<ScriptBreakdownOptions>({ episodeCountHint: 1, defaultShotDuration: 5, multiShot: true, includeAudio: true, replaceExisting: false })
+const coverInput = ref<HTMLInputElement | null>(null)
+const pendingCoverFile = ref<File | null>(null)
+const pendingCoverPreview = ref('')
+const coverSaving = ref(false)
+const coverError = ref('')
+const breakdownOptions = ref<ScriptBreakdownOptions>({ episodeCountHint: 1, defaultShotDuration: 0, multiShot: true, includeAudio: true, defaultFirstFrameContinuity: false, defaultLastFrameContinuity: false, replaceExisting: false, discardExistingProduction: false })
+const videoShotMinDurationSeconds = computed(() => productionCapability.value ? productionCapability.value.videoShotMinDurationMs / 1000 : undefined)
+const videoShotMaxDurationSeconds = computed(() => productionCapability.value ? productionCapability.value.videoShotMaxDurationMs / 1000 : undefined)
 const translationGlossaryText = ref('')
 const translationGlossaryValidation = computed(() => parseTranslationGlossary(translationGlossaryText.value))
 const canonicalBackfillLoading = ref(false)
@@ -253,6 +264,8 @@ const assembleEpisode = async (episode: Episode) => {
 }
 const openWholeEpisode = (episode: Episode) => {
   wholeEpisodeId.value = episode.id
+  wholeEpisodeExtendedConfirmed.value = false
+  wholeEpisodeIdempotencyConflict.value = ''
   const storageKey = `cineforge_whole_episode_idempotency_${episode.id}`
   const pendingKey = sessionStorage.getItem(storageKey) || ''
   if (pendingKey) episodeIdempotencyKeys.value = { ...episodeIdempotencyKeys.value, [episode.id]: pendingKey }
@@ -276,6 +289,21 @@ const openWholeEpisode = (episode: Episode) => {
   }
   wholeEpisodeOpen.value = true
 }
+const abandonWholeEpisodeRetryState = () => {
+  const episode = wholeEpisode.value
+  if (!episode) return
+  const storageKey = `cineforge_whole_episode_idempotency_${episode.id}`
+  const nextKeys = { ...episodeIdempotencyKeys.value }; delete nextKeys[episode.id]; episodeIdempotencyKeys.value = nextKeys
+  sessionStorage.removeItem(storageKey)
+  sessionStorage.removeItem(`${storageKey}_profile`)
+  sessionStorage.removeItem(`${storageKey}_multiple`)
+  sessionStorage.removeItem(`${storageKey}_image_profile`)
+  sessionStorage.removeItem(`${storageKey}_image_multiple`)
+  sessionStorage.removeItem(`${storageKey}_workflow_selections`)
+  wholeEpisodeIdempotencyConflict.value = ''
+  wholeEpisodeExtendedConfirmed.value = false
+  studio.notify('已放弃旧整集提交状态；再次生成时会创建新的幂等批次。', 'info')
+}
 const generateWholeEpisode = async () => {
   const episode = wholeEpisode.value
   if (!project.value) return
@@ -293,7 +321,7 @@ const generateWholeEpisode = async () => {
   sessionStorage.setItem(`${storageKey}_image_multiple`, String(wholeEpisodeImageMultiple.value))
   sessionStorage.setItem(`${storageKey}_workflow_selections`, JSON.stringify(wholeEpisodeWorkflowSelections.value))
   try {
-    const task = await studio.generateWholeEpisode(project.value, episode, idempotencyKey, wholeEpisodeProfile.value, wholeEpisodeMultiple.value, wholeEpisodeImageProfile.value, wholeEpisodeImageMultiple.value, wholeEpisodeWorkflowSelections.value)
+    const task = await studio.generateWholeEpisode(project.value, episode, idempotencyKey, wholeEpisodeProfile.value, wholeEpisodeMultiple.value, wholeEpisodeImageProfile.value, wholeEpisodeImageMultiple.value, wholeEpisodeWorkflowSelections.value, wholeEpisodeExtendedConfirmed.value)
     const nextKeys = { ...episodeIdempotencyKeys.value }; delete nextKeys[episode.id]; episodeIdempotencyKeys.value = nextKeys
     sessionStorage.removeItem(storageKey)
     sessionStorage.removeItem(`${storageKey}_profile`)
@@ -301,18 +329,20 @@ const generateWholeEpisode = async () => {
     sessionStorage.removeItem(`${storageKey}_image_profile`)
     sessionStorage.removeItem(`${storageKey}_image_multiple`)
     sessionStorage.removeItem(`${storageKey}_workflow_selections`)
+    wholeEpisodeExtendedConfirmed.value = false
     wholeEpisodeOpen.value = false
     router.push({ path: '/workflows', query: { task: task.id, batch: task.batchId || '' } })
   } catch (error) {
+    if (productionErrorCode(error) === 'production_queue_confirmation_required') {
+      wholeEpisodeExtendedConfirmed.value = true
+      studio.notify(`本集 ${episode.shots.length} 个镜头超过当前队列建议值；镜数会完整保留，请核对提示后再次确认。`, 'info')
+      return
+    }
     const message = error instanceof Error ? error.message : '整集生成任务创建失败'
-    if (/(idempotency_key|幂等)/i.test(message) && /(不完整|不同|新的|新 key|冲突)/i.test(message)) {
-      const nextKeys = { ...episodeIdempotencyKeys.value }; delete nextKeys[episode.id]; episodeIdempotencyKeys.value = nextKeys
-      sessionStorage.removeItem(storageKey)
-      sessionStorage.removeItem(`${storageKey}_profile`)
-      sessionStorage.removeItem(`${storageKey}_multiple`)
-      sessionStorage.removeItem(`${storageKey}_image_profile`)
-      sessionStorage.removeItem(`${storageKey}_image_multiple`)
-      sessionStorage.removeItem(`${storageKey}_workflow_selections`)
+    if (productionErrorCode(error) === 'production_idempotency_conflict' || (/(idempotency_key|幂等)/i.test(message) && /(不完整|不同|新的|新 key|冲突)/i.test(message))) {
+      wholeEpisodeIdempotencyConflict.value = '旧整集提交状态不完整或参数已发生冲突。幂等键已保留，系统不会自动换键重提。请先到生产工作流核对已有任务；只有确认放弃旧尝试后才能创建新批次。'
+      studio.notify(wholeEpisodeIdempotencyConflict.value, 'error')
+      return
     }
     studio.notify(message, 'error')
   } finally { episodeGenerationLoadingId.value = '' }
@@ -406,26 +436,27 @@ const verifyReleaseCandidate = async (bundle: ReleaseBundle) => {
 
 const loadProject = async () => {
   loading.value = true
+  projectLoadError.value = ''
   translationGlossaryText.value = ''
   try {
     await studio.initialize()
     if (!isNew.value) {
-      const found = studio.projectById(String(route.params.projectId)); if (found) {
+      const found = await studio.loadProject(String(route.params.projectId)); if (found) {
         project.value = clone(found)
         translationGlossaryText.value = formatTranslationGlossary(project.value.translationGlossary)
-        if(!['T2VA','FL2VA','Ref2VA'].includes(project.value.defaultMode)){project.value.defaultMode='FL2VA';studio.notify('历史默认模式已映射为“首尾帧生视频”；两个帧槽位均可为空','info')}
+        if(!['T2VA','FL2VA','Ref2VA'].includes(project.value.defaultMode)){project.value.defaultMode='FL2VA';studio.notify('检测到不受支持的默认模式，已使用“首尾帧生视频”；两个帧槽位均可为空','info')}
         await Promise.all([
           studio.refreshAssets(), loadEpisodeAssemblies(found.id), loadReleaseBundles(found.id),
         ])
-      } else router.replace('/')
+      } else router.replace('/projects')
     }
   } catch (error) {
-    studio.notify(error instanceof Error ? error.message : '项目加载失败', 'error')
+    projectLoadError.value = error instanceof Error ? error.message : '项目加载失败'
+    studio.notify(projectLoadError.value, 'error')
   } finally { loading.value = false }
 }
 const handleCreativeDraftApplied = async (episodeId: string) => {
-  await studio.refreshProjects()
-  const found = studio.projectById(String(route.params.projectId))
+  const found = await studio.loadProject(String(route.params.projectId), true)
   if (found) {
     project.value = clone(found)
     translationGlossaryText.value = formatTranslationGlossary(project.value.translationGlossary)
@@ -434,18 +465,81 @@ const handleCreativeDraftApplied = async (episodeId: string) => {
   studio.notify('创作草稿已应用到正式分镜；尚未创建提示词或生产任务。')
 }
 const loadProductionWorkflowTemplates=async()=>{productionWorkflowTemplatesLoading.value=true;productionWorkflowTemplatesError.value='';try{productionWorkflowTemplates.value=await repository.getProductionWorkflowTemplates()}catch(error){productionWorkflowTemplatesError.value=error instanceof Error?error.message:'服务端未返回工作流模板'}finally{productionWorkflowTemplatesLoading.value=false}}
+const loadProductionCapability=async()=>{productionCapabilityError.value='';try{productionCapability.value=await repository.getProductionCapability();const minimum=productionCapability.value.videoShotMinDurationMs/1000;const maximum=productionCapability.value.videoShotMaxDurationMs/1000;if(!Number.isFinite(breakdownOptions.value.defaultShotDuration)||breakdownOptions.value.defaultShotDuration<minimum||breakdownOptions.value.defaultShotDuration>maximum)breakdownOptions.value.defaultShotDuration=productionCapability.value.scriptBreakdownDefaultShotDurationMs/1000;breakdownOptions.value.defaultFirstFrameContinuity=productionCapability.value.scriptBreakdownDefaultFirstFrameContinuity;breakdownOptions.value.defaultLastFrameContinuity=productionCapability.value.scriptBreakdownDefaultLastFrameContinuity}catch(error){productionCapability.value=null;productionCapabilityError.value=error instanceof Error?error.message:'服务端未返回正式视频时长配置'}}
 onMounted(async () => {
-  await Promise.all([loadProject(),loadProductionWorkflowTemplates()])
+  await Promise.all([loadProject(),loadProductionWorkflowTemplates(),loadProductionCapability()])
   assemblyPollTimer = setInterval(pollActiveAssemblies, 2000)
   await pollActiveAssemblies()
 })
-onBeforeUnmount(() => { if (assemblyPollTimer) clearInterval(assemblyPollTimer) })
+const revokePendingCoverPreview = () => {
+  if (pendingCoverPreview.value.startsWith('blob:')) URL.revokeObjectURL(pendingCoverPreview.value)
+  pendingCoverPreview.value = ''
+}
+const chooseProjectCover = () => {
+  coverError.value = ''
+  coverInput.value?.click()
+}
+const selectProjectCover = async (event: Event) => {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0] || null
+  input.value = ''
+  if (!file) return
+  const validationError = projectCoverFileError(file)
+  if (validationError) { coverError.value = validationError; studio.notify(validationError, 'error'); return }
+  if (isNew.value) {
+    revokePendingCoverPreview()
+    pendingCoverFile.value = file
+    pendingCoverPreview.value = URL.createObjectURL(file)
+    coverError.value = ''
+    return
+  }
+  if (!project.value || coverSaving.value) return
+  coverSaving.value = true
+  coverError.value = ''
+  try { project.value = clone(await studio.setProjectCover(project.value, file)) }
+  catch (error) { coverError.value = error instanceof Error ? error.message : '封面上传失败，请稍后重试'; studio.notify(coverError.value, 'error') }
+  finally { coverSaving.value = false }
+}
+const removeProjectCover = async () => {
+  if (isNew.value) {
+    pendingCoverFile.value = null
+    revokePendingCoverPreview()
+    coverError.value = ''
+    return
+  }
+  if (!project.value || coverSaving.value || !project.value.coverAssetId) return
+  coverSaving.value = true
+  coverError.value = ''
+  try { project.value = clone(await studio.setProjectCover(project.value, null)) }
+  catch (error) { coverError.value = error instanceof Error ? error.message : '封面移除失败，请稍后重试'; studio.notify(coverError.value, 'error') }
+  finally { coverSaving.value = false }
+}
+const refreshCurrentProjectCover = async () => {
+  if (!project.value) return undefined
+  const refreshed = await studio.loadProject(project.value.id, true)
+  project.value.coverAssetId = refreshed.coverAssetId
+  project.value.coverUrl = refreshed.coverUrl
+  return refreshed.coverUrl
+}
+onBeforeUnmount(() => { if (assemblyPollTimer) clearInterval(assemblyPollTimer); revokePendingCoverPreview() })
 watch(() => route.params.projectId, async () => { await loadProject(); await pollActiveAssemblies() })
 
 const createProject = async () => {
+  if (createLoading.value) return
   if (!newProject.value.title.trim()) { studio.notify('请先填写项目名称', 'error'); return }
   createLoading.value = true
-  try { const created = await studio.createProject(newProject.value); router.replace(`/projects/${created.id}`) }
+  try {
+    let created = await studio.createProject(newProject.value)
+    if (pendingCoverFile.value) {
+      try { created = await studio.setProjectCover(created, pendingCoverFile.value) }
+      catch (error) {
+        studio.notify(`项目已创建，但封面上传失败，可进入项目稍后重试：${error instanceof Error ? error.message : '未知错误'}`, 'error')
+      }
+    }
+    pendingCoverFile.value = null
+    revokePendingCoverPreview()
+    await router.replace(`/projects/${created.id}`)
+  }
   catch (error) { studio.notify(error instanceof Error ? error.message : '创建项目失败', 'error') }
   finally { createLoading.value = false }
 }
@@ -479,8 +573,7 @@ const handleVisualRulesApplied = async (result: VisualRulesDraftApplyResult) => 
   project.value.updatedAt = result.updatedAt || project.value.updatedAt
   invalidateProjectPromptsFromTranslation()
   try {
-    await studio.refreshProjects()
-    const refreshed = studio.projectById(result.projectId)
+    const refreshed = await studio.loadProject(result.projectId, true)
     if (refreshed) {
       project.value = clone(refreshed)
       translationGlossaryText.value = formatTranslationGlossary(project.value.translationGlossary)
@@ -490,13 +583,60 @@ const handleVisualRulesApplied = async (result: VisualRulesDraftApplyResult) => 
     studio.notify('三项视觉规则已保存，但项目列表刷新失败；当前页面仍显示服务端已采用值。', 'error')
   }
 }
+const clearReplacedEpisodeRetryState = (episodeIds: string[]) => {
+  for (const episodeId of episodeIds) {
+    const storageKey = `cineforge_whole_episode_idempotency_${episodeId}`
+    sessionStorage.removeItem(storageKey)
+    sessionStorage.removeItem(`${storageKey}_profile`)
+    sessionStorage.removeItem(`${storageKey}_multiple`)
+    sessionStorage.removeItem(`${storageKey}_image_profile`)
+    sessionStorage.removeItem(`${storageKey}_image_multiple`)
+    sessionStorage.removeItem(`${storageKey}_workflow_selections`)
+  }
+}
+const runBreakdown = async (discardExistingProduction: boolean) => {
+  if (!project.value?.masterScript.trim()) { studio.notify('请先粘贴完整剧本', 'error'); return }
+  if (!productionCapability.value || videoShotMinDurationSeconds.value === undefined || videoShotMaxDurationSeconds.value === undefined) { studio.notify('尚未读取正式视频时长配置，请刷新后重试', 'error'); return }
+  const replacedEpisodeIds = project.value.episodes.map((episode) => episode.id)
+  breakdownOptions.value.discardExistingProduction = discardExistingProduction
+  breakdownLoading.value = true
+  try {
+    project.value = clone(await studio.breakdownScript(project.value, breakdownOptions.value))
+    clearReplacedEpisodeRetryState(replacedEpisodeIds)
+    selectedEpisodeId.value = project.value.episodes[0]?.id || ''
+    episodeAssemblies.value = {}; completedEpisodeAssemblies.value = {}; episodeIdempotencyKeys.value = {}
+    wholeEpisodeOpen.value = false; wholeEpisodeId.value = ''; wholeEpisodeExtendedConfirmed.value = false; wholeEpisodeIdempotencyConflict.value = ''
+    breakdownOptions.value.replaceExisting = false
+    breakdownOptions.value.discardExistingProduction = false
+    rebuildConfirmOpen.value = false
+    translationReviewRefreshKey.value += 1
+    tab.value = 'episodes'
+    try {
+      await Promise.all([
+        studio.refreshWorkflows(),
+        loadEpisodeAssemblies(project.value.id),
+        loadReleaseBundles(project.value.id),
+      ])
+    } catch {
+      studio.notify('剧集已成功重建，但部分生产历史面板刷新失败；重新进入页面即可恢复。', 'info')
+    }
+  }
+  catch (error) { studio.notify(error instanceof Error ? error.message : '剧本拆解失败', 'error') }
+  finally { breakdownLoading.value = false; breakdownOptions.value.discardExistingProduction = false }
+}
 const breakdown = async () => {
   if (!project.value?.masterScript.trim()) { studio.notify('请先粘贴完整剧本', 'error'); return }
-  if (project.value.episodes.length && !breakdownOptions.value.replaceExisting) { studio.notify('项目已有剧集；如需重建，请显式勾选替换现有剧集', 'error'); return }
-  breakdownLoading.value = true
-  try { project.value = clone(await studio.breakdownScript(project.value, breakdownOptions.value)); tab.value = 'episodes' }
-  catch (error) { studio.notify(error instanceof Error ? error.message : '剧本拆解失败', 'error') }
-  finally { breakdownLoading.value = false }
+  if (!productionCapability.value || videoShotMinDurationSeconds.value === undefined || videoShotMaxDurationSeconds.value === undefined) { studio.notify('尚未读取正式视频时长配置，请刷新后重试', 'error'); return }
+  if (project.value.episodes.length) {
+    if (!breakdownOptions.value.replaceExisting) { studio.notify('项目已有剧集；如需重建，请显式勾选替换现有剧集', 'error'); return }
+    rebuildConfirmOpen.value = true
+    return
+  }
+  await runBreakdown(false)
+}
+const confirmProjectRebuild = async () => {
+  rebuildConfirmOpen.value = false
+  await runBreakdown(true)
 }
 const applyCanonicalGlossaryResult = (result: Awaited<ReturnType<typeof studio.ensureCanonicalGlossary>>) => {
   if (!project.value) return
@@ -705,21 +845,24 @@ const generateBibleDraftFromAsset=async()=>{
 <template>
   <div v-if="loading" class="page-loading"><div class="loader-ring"></div><span>正在装载制作圣经…</span></div>
   <div v-else-if="isNew" class="new-project-page page-stack">
-    <button class="back-link" @click="router.push('/')"><ArrowLeft :size="15"/>返回制作总览</button>
+    <input ref="coverInput" type="file" :accept="PROJECT_COVER_ACCEPT" hidden @change="selectProjectCover">
+    <button class="back-link" @click="router.push('/projects')"><ArrowLeft :size="15"/>返回连续剧项目</button>
     <section class="new-project-heading"><span class="eyebrow">CREATE A SERIES UNIVERSE</span><h2>新建连续短剧</h2><p>先确定故事和视觉世界。角色、场景与道具可在下一步持续补充，并自动贯穿无限集数。</p></section>
     <section class="new-project-layout">
       <div class="panel new-project-form">
-        <div class="form-section"><div class="section-number">01</div><div class="section-content"><h3>故事基础</h3><p>为连续剧建立可识别的核心概念；下方徽标说明每个字段在当前真实生产链路中的作用。</p><label class="field"><span class="impact-label-row">项目名称 * <PromptImpactBadge kind="label" title="只用于项目、任务和页面识别，不进入 H3 提示词。"/></span><input v-model="newProject.title" placeholder="例如：听雨不归人" maxlength="60"><small>{{ newProject.title.length }}/60</small></label><label class="field"><span class="impact-label-row">一句话梗概 <PromptImpactBadge kind="indirect" title="用于项目说明；当前真实单镜提示词不会原样引用该字段。"/></span><textarea v-model="newProject.logline" rows="3" placeholder="主角是谁、想要什么、面临怎样的阻力？"></textarea></label><label class="field"><span class="impact-label-row">完整剧本（可稍后补充） <PromptImpactBadge kind="indirect" title="只作为剧集与分镜拆解源；拆解完成后不会自动复制到每个提示词。"/></span><textarea v-model="newProject.masterScript" rows="8" maxlength="1000000" placeholder="粘贴含“第N集”“镜头N”和角色对白的完整剧本，创建后可自动拆成无限剧集与分镜。"></textarea><small>剧本只提交到你的 Django 服务；前端不会直连第三方模型。</small></label><PromptWritingGuide scope="project"/></div></div>
+        <div class="form-section"><div class="section-number">01</div><div class="section-content"><h3>故事基础</h3><p>为连续剧建立可识别的核心概念；下方徽标说明每个字段在当前真实生产链路中的作用。</p><label class="field"><span class="impact-label-row">项目名称 * <PromptImpactBadge kind="label" title="只用于项目、任务和页面识别，不进入 H3 提示词。"/></span><input v-model="newProject.title" placeholder="例如：听雨不归人" maxlength="60"><small>{{ newProject.title.length }}/60</small></label><label class="field"><span class="impact-label-row">一句话梗概 <PromptImpactBadge kind="indirect" title="用于项目说明；当前真实单镜提示词不会原样引用该字段。"/></span><textarea v-model="newProject.logline" rows="3" placeholder="主角是谁、想要什么、面临怎样的阻力？"></textarea></label><label class="field"><span class="impact-label-row">完整剧本（可稍后补充） <PromptImpactBadge kind="indirect" title="只作为剧集与分镜拆解源；拆解完成后不会自动复制到每个提示词。"/></span><textarea v-model="newProject.masterScript" rows="8" placeholder="粘贴含“第N集”“镜头N”和角色对白的完整剧本，创建后可自动拆成无限剧集与分镜。"></textarea><small>剧本只提交到你的 Django 服务；拆解输入预算由后端配置决定，前端不会静默截断。</small></label><PromptWritingGuide scope="project"/></div></div>
         <div class="form-section"><div class="section-number">02</div><div class="section-content"><div class="impact-heading"><h3>选择视觉风格</h3><PromptImpactBadge kind="prompt" title="风格的 visual prompt 会进入每个镜头，风格负面规则也会合并到负面提示词。"/><PromptImpactBadge kind="continuity"/></div><p>风格决定默认镜头语言、色彩与提示词前缀。</p><div class="new-style-grid"><button v-for="style in studio.styles" :key="style.id" :class="{active:newProject.styleId===style.id}" :style="{background:style.gradient,'--accent':style.accent}" @click="newProject.styleId=style.id"><i class="check"><Check :size="12"/></i><span>{{ style.englishName }}</span><strong>{{ style.name }}</strong><small>{{ style.tags.join(' · ') }}</small></button></div></div></div>
         <div class="form-section"><div class="section-number">03</div><div class="section-content"><h3>生产规格</h3><p>本地 H3 工作流按 24 fps 和单任务安全策略提交；每个分镜仍可单独切换工作流。</p><div class="form-grid three"><label class="field"><span class="impact-label-row">画幅比例 <PromptImpactBadge kind="production" title="决定官方分辨率档位的宽高方向，并记录到连续性生产格式。"/><PromptImpactBadge kind="continuity"/></span><select v-model="newProject.aspectRatio"><option value="9:16">9:16 · 竖屏短剧</option><option value="16:9">16:9 · 横屏影视</option><option value="1:1">1:1 · 方形内容</option></select></label><label class="field"><span class="impact-label-row">项目默认分辨率 <PromptImpactBadge kind="production" title="仅在生产档位选择“项目默认”时生效；0.1–2.0 MP 档位会覆盖该尺寸。"/></span><select v-model="newProject.resolution"><option value="720p">768×1344 · 项目默认尺寸</option><option value="1080p" disabled>1080p · 仅作后期超分预留，不直接提交</option></select></label><label class="field"><span class="impact-label-row">新分镜默认 H3 工作流 <PromptImpactBadge kind="indirect" title="只初始化之后创建或拆解出的分镜，不会改写已有分镜。"/><PromptImpactBadge kind="production"/></span><select v-model="newProject.defaultMode"><option v-for="mode in h3Modes" :key="mode.value" :value="mode.value">{{ mode.label }} · {{ mode.desc }}</option></select></label></div></div></div>
+        <div class="form-section"><div class="section-number">04</div><div class="section-content"><h3>连续剧封面</h3><p>推荐 2:3 竖版图；支持 JPEG、PNG、WebP，最大 10 MB。封面只用于项目识别，不进入生成工作流。</p><div class="cover-picker"><button type="button" class="cover-picker-preview" :disabled="createLoading" :style="{background:currentStyle?.gradient}" :aria-label="pendingCoverPreview?'更换待上传的连续剧封面':'选择连续剧封面'" @click="chooseProjectCover"><img v-if="pendingCoverPreview" :src="pendingCoverPreview" alt="待上传的连续剧封面预览"><template v-else><ImagePlus :size="25"/><span>选择封面图片</span></template></button><div><strong>{{ pendingCoverFile?.name || '尚未选择封面' }}</strong><small>项目会先创建，再上传并绑定封面；封面失败不会造成重复项目。</small><div class="cover-picker-actions"><button type="button" class="button ghost small" :disabled="createLoading" @click="chooseProjectCover"><Upload :size="13"/>{{ pendingCoverPreview?'更换封面':'选择封面' }}</button><button v-if="pendingCoverPreview" type="button" class="button ghost small" :disabled="createLoading" @click="removeProjectCover"><Trash2 :size="13"/>移除</button></div></div></div><p v-if="coverError" class="cover-error" role="alert">{{ coverError }}</p></div></div>
         <div class="new-form-footer"><span><Lock :size="14"/>所有数据默认保存在你的本地制作环境</span><button class="button primary" :disabled="createLoading" @click="createProject">{{ createLoading?'正在创建…':'创建并进入工作室' }}<ArrowRight :size="17"/></button></div>
       </div>
-      <aside class="new-project-preview panel" :style="{background:currentStyle?.gradient}"><div class="preview-pattern"></div><span class="eyebrow">LIVE PROJECT PREVIEW</span><div class="preview-center"><div class="preview-clap"><i></i><Clapperboard :size="36"/></div><small>{{ currentStyle?.englishName }}</small><h3>{{ newProject.title || '未命名连续剧' }}</h3><p>{{ newProject.logline || '你的故事将从这里开始。' }}</p></div><div class="preview-spec"><span>{{ newProject.aspectRatio }}</span><span>{{ newProject.resolution }}</span><span>{{ workflowLabel(newProject.defaultMode) }}</span></div></aside>
+      <aside class="new-project-preview panel" :style="{background:currentStyle?.gradient}"><img v-if="pendingCoverPreview" class="new-cover-preview-image" :src="pendingCoverPreview" alt="待上传的连续剧封面实时预览"><template v-else><div class="preview-pattern"></div><span class="eyebrow">LIVE PROJECT PREVIEW</span><div class="preview-center"><div class="preview-clap"><i></i><Clapperboard :size="36"/></div><small>{{ currentStyle?.englishName }}</small><h3>{{ newProject.title || '未命名连续剧' }}</h3><p>{{ newProject.logline || '你的故事将从这里开始。' }}</p></div><div class="preview-spec"><span>{{ newProject.aspectRatio }}</span><span>{{ newProject.resolution }}</span><span>{{ workflowLabel(newProject.defaultMode) }}</span></div></template></aside>
     </section>
   </div>
 
   <div v-else-if="project" class="series-page page-stack">
-    <section class="series-header" :style="{background:currentStyle?.gradient}"><div class="series-pattern"></div><div class="series-header-main"><button class="back-link light" @click="router.push('/')"><ArrowLeft :size="14"/>项目</button><div class="series-title"><div class="series-poster"><Clapperboard :size="30"/><span>{{ currentStyle?.name }}</span></div><div><div class="series-status"><StatusBadge :status="project.status"/><span>{{ currentStyle?.englishName }}</span></div><h2>{{ project.title }}</h2><p>{{ project.logline }}</p><div class="series-facts"><span>{{ project.aspectRatio }}</span><i></i><span>{{ project.resolution }}</span><i></i><span>H3 视频 · SDXL 图片</span><i></i><span>{{ project.episodes.length }} 集</span></div></div></div></div><div class="series-header-actions"><button class="button glass" :disabled="saving||Boolean(canonicalGlossaryBlockedReason)" :title="canonicalGlossaryBlockedReason||''" @click="save"><Save :size="16"/>{{ saving?'保存中…':'保存设定' }}</button><RouterLink to="/workflows" class="button primary"><Workflow :size="16"/>生成整剧工作流</RouterLink></div></section>
+    <input ref="coverInput" type="file" :accept="PROJECT_COVER_ACCEPT" hidden @change="selectProjectCover">
+    <section class="series-header" :style="{background:currentStyle?.gradient}"><ProjectCoverImage v-if="project.coverUrl" class="series-cover-background" :src="project.coverUrl" :alt="`《${project.title}》连续剧封面`" :refresh="refreshCurrentProjectCover" eager/><div class="series-pattern"></div><div class="series-header-main"><button class="back-link light" @click="router.push('/projects')"><ArrowLeft :size="14"/>全部项目</button><div class="series-title"><div class="series-poster"><ProjectCoverImage v-if="project.coverUrl" :src="project.coverUrl" alt="" :refresh="refreshCurrentProjectCover" eager/><template v-else><Clapperboard :size="30"/><span>{{ currentStyle?.name }}</span></template></div><div><div class="series-status"><StatusBadge :status="project.status"/><span>{{ currentStyle?.englishName }}</span></div><h2>{{ project.title }}</h2><p>{{ project.logline }}</p><div class="series-facts"><span>{{ project.aspectRatio }}</span><i></i><span>{{ project.resolution }}</span><i></i><span>H3 视频 · SDXL 图片</span><i></i><span>{{ project.episodes.length }} 集</span></div></div></div></div><div class="series-header-actions"><button type="button" class="button glass" :disabled="coverSaving" @click="chooseProjectCover"><Upload :size="16"/>{{ coverSaving?'封面处理中…':project.coverAssetId?'更换封面':'上传封面' }}</button><button v-if="project.coverAssetId" type="button" class="button glass" :disabled="coverSaving" aria-label="移除连续剧封面" @click="removeProjectCover"><Trash2 :size="16"/>移除封面</button><button class="button glass" :disabled="saving||Boolean(canonicalGlossaryBlockedReason)" :title="canonicalGlossaryBlockedReason||''" @click="save"><Save :size="16"/>{{ saving?'保存中…':'保存设定' }}</button><RouterLink to="/workflows" class="button primary"><Workflow :size="16"/>生成整剧工作流</RouterLink><p v-if="coverError" class="cover-error header-cover-error" role="alert">{{ coverError }}</p></div></section>
     <nav class="studio-tabs"><button :class="{active:tab==='overview'}" @click="tab='overview'"><Layers3 :size="16"/>项目总览</button><button :class="{active:tab==='bible'}" @click="tab='bible'"><BookOpen :size="16"/>一致性 Bible <span>{{ project.bible.characters.length+project.bible.scenes.length+project.bible.props.length }}</span></button><button :class="{active:tab==='episodes'}" @click="tab='episodes'"><Film :size="16"/>剧集与分镜 <span>{{ project.episodes.length }}</span></button><button :class="{active:tab==='release'}" @click="tab='release'"><Lock :size="16"/>发行候选 <span>{{ releaseBundles.length }}</span></button></nav>
 
     <template v-if="tab==='overview'">
@@ -728,15 +871,17 @@ const generateBibleDraftFromAsset=async()=>{
       <section class="panel script-workbench">
         <header class="panel-header"><div><span class="eyebrow">MASTER SCRIPT BREAKDOWN</span><h3>完整剧本与自动拆解</h3><p>识别“第 N 集 / EPISODE N”“镜头 / SHOT”和角色对白，并绑定现有角色、场景与道具 Bible。</p></div><button class="button ghost small" :disabled="saving||Boolean(canonicalGlossaryBlockedReason)" :title="canonicalGlossaryBlockedReason||''" @click="save"><Save :size="14"/>保存剧本</button></header>
         <div class="script-workbench-body">
-          <div class="script-editor-stack"><label class="field script-editor"><span class="impact-label-row">全剧母稿 <PromptImpactBadge kind="indirect" title="作为确定性剧本拆解源；拆解后，生成只读取已保存的剧集、分镜和 Bible。"/><PromptImpactBadge kind="audit" title="原文会保留，便于核对拆解结果。"/></span><textarea v-model="project.masterScript" rows="14" maxlength="1000000" placeholder="第1集：标题&#10;镜头1：场景与动作&#10;角色名：对白&#10;&#10;第2集：……"></textarea><small>{{ project.masterScript.length.toLocaleString() }} 字符 · 最大 1,000,000 字符</small></label><PromptWritingGuide scope="project"/></div>
+          <div class="script-editor-stack"><label class="field script-editor"><span class="impact-label-row">全剧母稿 <PromptImpactBadge kind="indirect" title="作为确定性剧本拆解源；拆解后，生成只读取已保存的剧集、分镜和 Bible。"/><PromptImpactBadge kind="audit" title="原文会保留，便于核对拆解结果。"/></span><textarea v-model="project.masterScript" rows="14" placeholder="第1集：标题&#10;镜头1【时长=8秒】【首帧连续=否】【尾帧连续=是】：场景&#10;[0-3秒] 动作：人物推门进入&#10;[3-6秒] 角色名（in a low voice）：对白&#10;&#10;第2集：……"></textarea><small>{{ project.masterScript.length.toLocaleString() }} 字符 · 拆解输入预算由后端配置决定，前端不会静默截断</small></label><PromptWritingGuide scope="project"/></div>
           <aside class="script-breakdown-options">
             <div><span class="eyebrow">BREAKDOWN PROFILE</span><h4>拆解参数</h4></div>
-            <label class="field"><span class="impact-label-row">预计集数提示 <PromptImpactBadge kind="indirect" title="仅在母稿没有明确“第 N 集 / EPISODE N”标题时参与均匀切分。"/></span><input v-model.number="breakdownOptions.episodeCountHint" type="number" min="1" max="1000"></label>
-            <label class="field"><span class="impact-label-row">默认单镜时长 <PromptImpactBadge kind="production" title="只初始化本次新拆出的分镜时长，之后可逐镜修改。"/></span><select v-model.number="breakdownOptions.defaultShotDuration"><option :value="5">5 秒</option><option :value="6">6 秒</option><option :value="8">8 秒</option><option :value="10">10 秒</option><option :value="12">12 秒</option><option :value="15">15 秒</option></select></label>
+            <label class="field"><span class="impact-label-row">预计集数提示 <PromptImpactBadge kind="indirect" title="仅在母稿没有明确“第 N 集 / EPISODE N”标题时参与均匀切分；它是业务目标，不是模型单批次限制。"/></span><input v-model.number="breakdownOptions.episodeCountHint" type="number" min="1"></label>
+            <label class="field"><span class="impact-label-row">默认单镜时长 <PromptImpactBadge kind="production" title="只初始化本次新拆出的分镜时长；有效范围来自生产能力接口，之后可逐镜修改。"/></span><input v-model.number="breakdownOptions.defaultShotDuration" type="number" :min="videoShotMinDurationSeconds" :max="videoShotMaxDurationSeconds" step="0.5" :disabled="!productionCapability"><small v-if="productionCapability">当前正式视频范围 {{ videoShotMinDurationSeconds }}–{{ videoShotMaxDurationSeconds }} 秒</small><small v-else class="field-error">{{ productionCapabilityError || '正在读取正式视频时长配置…' }}</small></label>
+            <div class="setting-toggle"><div><span class="impact-label-row">默认承接上一镜尾帧 <PromptImpactBadge kind="continuity" title="母稿未写“首帧连续”时使用；只记录连续性要求，不会伪造首帧素材绑定。"/></span><small>明确写在镜头标题中的值优先</small></div><ToggleSwitch v-model="breakdownOptions.defaultFirstFrameContinuity"/></div>
+            <div class="setting-toggle"><div><span class="impact-label-row">默认保留下一镜衔接帧 <PromptImpactBadge kind="continuity" title="母稿未写“尾帧连续”时使用；会进入导演提示词，但不等同于已生成尾帧素材。"/></span><small>明确写在镜头标题中的值优先</small></div><ToggleSwitch v-model="breakdownOptions.defaultLastFrameContinuity"/></div>
             <div class="setting-toggle"><div><span class="impact-label-row">多分镜提示词 <PromptImpactBadge kind="indirect" title="保存为剧集拆解偏好；当前整集生产仍为逐镜独立任务。"/></span><small>记录拆解偏好；当前生产为逐镜单任务，便于失败重试</small></div><ToggleSwitch v-model="breakdownOptions.multiShot"/></div>
             <div class="setting-toggle"><div><span class="impact-label-row">MiniMax H3 原生音频 <PromptImpactBadge kind="production" title="初始化新分镜的音频开关；最终以每个分镜自己的开关为准。"/></span><small>为新分镜保留对白、环境声与配乐字段</small></div><ToggleSwitch v-model="breakdownOptions.includeAudio"/></div>
-            <label v-if="project.episodes.length" class="script-replace"><input v-model="breakdownOptions.replaceExisting" type="checkbox"><span><strong class="impact-label-row">替换现有 {{ project.episodes.length }} 集 <PromptImpactBadge kind="audit" title="破坏性拆解选项；已有生产或组装审计时后端会拒绝。"/></strong><small>已有生成或组装审计记录时，后端会拒绝删除。</small></span></label>
-            <button class="button primary full" :disabled="breakdownLoading||!project.masterScript.trim()" @click="breakdown"><WandSparkles :size="16"/>{{ breakdownLoading ? '正在拆解剧本…' : '自动生成剧集与分镜' }}</button>
+            <label v-if="project.episodes.length" class="script-replace"><input v-model="breakdownOptions.replaceExisting" type="checkbox"><span><strong class="impact-label-row">重建并替换现有 {{ project.episodes.length }} 集 <PromptImpactBadge kind="audit" title="破坏性重建；点击生成后还需在弹框中确认清理范围。"/></strong><small>确认后清理旧分镜及其提示词、草稿、终态任务和组装记录；当前 Bible、素材与全剧规则保留。</small></span></label>
+            <button class="button primary full" :disabled="breakdownLoading||!project.masterScript.trim()||!productionCapability" @click="breakdown"><WandSparkles :size="16"/>{{ breakdownLoading ? '正在拆解剧本…' : '自动生成剧集与分镜' }}</button>
           </aside>
         </div>
       </section>
@@ -826,10 +971,22 @@ const generateBibleDraftFromAsset=async()=>{
       </section>
     </template>
 
+    <BaseModal :open="rebuildConfirmOpen" title="确认重建剧集与分镜" eyebrow="DESTRUCTIVE SCRIPT REBUILD" width="620px" @close="!breakdownLoading&&(rebuildConfirmOpen=false)">
+      <div v-if="project" class="script-rebuild-confirm">
+        <div><AlertTriangle :size="22"/><span><strong>将以当前母稿和当前 Bible 重建</strong><small>现有 {{ project.episodes.length }} 集、{{ totalShots }} 个分镜会被替换。新分镜会重新绑定当前的林澈等 Bible 对象，不会继续引用已删除的 UUID。</small></span></div>
+        <ul>
+          <li>会清理：旧分镜、提示词、创作草稿、逐镜扩写、终态生成任务、组装记录、草稿发行候选和失效翻译。</li>
+          <li>会保留：项目、当前 Bible、素材库、封面、风格、全剧视觉规则、术语表及物理输出文件。</li>
+          <li>若仍有运行中/远端未终结任务，或已有封存/发行版本，服务端会停止重建且不修改任何数据。</li>
+        </ul>
+        <p>数据库中的旧制作记录删除后不可恢复。物理输出文件不会在本次请求中直接删除，可由后续存储清理流程回收。</p>
+      </div>
+      <template #footer><button class="button ghost" :disabled="breakdownLoading" @click="rebuildConfirmOpen=false">取消</button><button class="button primary" :disabled="breakdownLoading" @click="confirmProjectRebuild"><Trash2 :size="15"/>{{ breakdownLoading?'正在清理并重建…':'确认清理并重建' }}</button></template>
+    </BaseModal>
     <BaseModal :open="wholeEpisodeOpen" title="生成整集" eyebrow="WHOLE EPISODE BATCH" width="560px" @close="!episodeGenerationLoadingId&&(wholeEpisodeOpen=false)">
       <ProductionWorkflowPicker v-if="wholeEpisodeHasRef2VA" v-model:template-id="wholeRef2vaTemplateId" v-model:parameters="wholeRef2vaParameters" :templates="productionWorkflowTemplates" :loading="productionWorkflowTemplatesLoading" :error="productionWorkflowTemplatesError" :disabled="Boolean(wholeEpisode&&episodeIdempotencyKeys[wholeEpisode.id])" h3-mode="Ref2VA"/>
-      <div v-if="wholeEpisode" class="whole-episode-confirm"><div><Sparkles :size="22"/><span><strong>第 {{ wholeEpisode.number }} 集 · {{ wholeEpisode.title }}</strong><small>将逐镜创建 {{ wholeEpisode.shots.length }} 个独立任务：{{ episodeVideoCount(wholeEpisode) }} 个 H3 视频、{{ episodeImageCount(wholeEpisode) }} 个 SDXL 图片；失败分镜可单独重试。</small></span></div><ResolutionProfilePicker v-if="episodeVideoCount(wholeEpisode)" v-model="wholeEpisodeProfile" v-model:multiple="wholeEpisodeMultiple" label="H3 视频分辨率档位" :disabled="Boolean(episodeIdempotencyKeys[wholeEpisode.id])"/><details v-if="episodeImageCount(wholeEpisode)" class="whole-episode-image-resolution" open><summary>图片输出参数 · 推荐 0.98 MP</summary><ResolutionProfilePicker v-model="wholeEpisodeImageProfile" v-model:multiple="wholeEpisodeImageMultiple" :multiple-step="8" label="SDXL 图片分辨率档位" :disabled="Boolean(episodeIdempotencyKeys[wholeEpisode.id])"/><p>SDXL 推荐至少 0.8 MP，默认 0.98 MP；图片宽高按 8 的倍数取整；0.1–0.3 MP 仅用于连通性测试，不建议作为交付图片。</p></details><small v-if="episodeIdempotencyKeys[wholeEpisode.id]">上次响应未确认，重试将保持视频/图片各自档位、尺寸倍数与幂等键。</small><p>网络错误后重试会复用本集当前幂等键，成功返回后才会清除，避免重复创建任务。图片作为独立定帧产物，不参与本集视频组装。</p></div>
-      <template #footer><button class="button ghost" :disabled="Boolean(episodeGenerationLoadingId)" @click="wholeEpisodeOpen=false">取消</button><button class="button primary" :disabled="Boolean(episodeGenerationLoadingId)||!wholeEpisode||Boolean(canonicalGlossaryBlockedReason)" :title="canonicalGlossaryBlockedReason||''" @click="generateWholeEpisode"><Sparkles :size="15"/>{{ episodeGenerationLoadingId?'正在创建批次…':`生成 ${wholeEpisode?.shots.length||0} 个分镜任务` }}</button></template>
+      <div v-if="wholeEpisode" class="whole-episode-confirm"><div><Sparkles :size="22"/><span><strong>第 {{ wholeEpisode.number }} 集 · {{ wholeEpisode.title }}</strong><small>将逐镜创建 {{ wholeEpisode.shots.length }} 个独立任务：{{ episodeVideoCount(wholeEpisode) }} 个 H3 视频、{{ episodeImageCount(wholeEpisode) }} 个 SDXL 图片；失败分镜可单独重试。</small></span></div><div v-if="wholeEpisodeExtendedConfirmed"><AlertTriangle :size="18"/><span><strong>请再次确认长任务</strong><small>本集 {{ wholeEpisode.shots.length }} 镜会全部保留，并按分镜独立入队；超过队列建议值只会增加等待时间、模型执行时间与 API 用量，不会截断镜数。</small></span></div><div v-if="wholeEpisodeIdempotencyConflict" class="whole-episode-idempotency-conflict"><AlertTriangle :size="16"/><span><strong>已停止自动重提</strong><small>{{ wholeEpisodeIdempotencyConflict }}</small></span></div><ResolutionProfilePicker v-if="episodeVideoCount(wholeEpisode)" v-model="wholeEpisodeProfile" v-model:multiple="wholeEpisodeMultiple" label="H3 视频分辨率档位" :disabled="Boolean(episodeIdempotencyKeys[wholeEpisode.id])"/><details v-if="episodeImageCount(wholeEpisode)" class="whole-episode-image-resolution" open><summary>图片输出参数 · 推荐 0.98 MP</summary><ResolutionProfilePicker v-model="wholeEpisodeImageProfile" v-model:multiple="wholeEpisodeImageMultiple" :multiple-step="8" label="SDXL 图片分辨率档位" :disabled="Boolean(episodeIdempotencyKeys[wholeEpisode.id])"/><p>SDXL 推荐至少 0.8 MP，默认 0.98 MP；图片宽高按 8 的倍数取整；0.1–0.3 MP 仅用于连通性测试，不建议作为交付图片。</p></details><small v-if="episodeIdempotencyKeys[wholeEpisode.id]">上次响应未确认，重试将保持视频/图片各自档位、尺寸倍数与幂等键。</small><button v-if="episodeIdempotencyKeys[wholeEpisode.id]" type="button" class="button ghost small" @click="abandonWholeEpisodeRetryState">核对任务后放弃旧尝试</button><p>网络错误后重试会复用本集当前幂等键，成功返回后才会清除，避免重复创建任务。图片作为独立定帧产物，不参与本集视频组装。</p></div>
+      <template #footer><button class="button ghost" :disabled="Boolean(episodeGenerationLoadingId)" @click="wholeEpisodeOpen=false">取消</button><button class="button primary" :disabled="Boolean(episodeGenerationLoadingId)||Boolean(wholeEpisodeIdempotencyConflict)||!wholeEpisode||Boolean(canonicalGlossaryBlockedReason)" :title="wholeEpisodeIdempotencyConflict||canonicalGlossaryBlockedReason||''" @click="generateWholeEpisode"><Sparkles :size="15"/>{{ episodeGenerationLoadingId?'正在创建批次…':wholeEpisodeExtendedConfirmed?`确认并生成 ${wholeEpisode?.shots.length||0} 个分镜任务`:`生成 ${wholeEpisode?.shots.length||0} 个分镜任务` }}</button></template>
     </BaseModal>
     <BaseModal :open="addBibleOpen" :title="`新增${bibleSections.find(s=>s.value===bibleSection)?.singular}设定`" eyebrow="NEW CONTINUITY ANCHOR" width="1040px" @close="closeAddBibleModal">
       <div class="bible-draft-editor">
@@ -877,13 +1034,23 @@ const generateBibleDraftFromAsset=async()=>{
       <template #footer><button class="button ghost" @click="addEpisodeOpen=false">取消</button><button class="button primary" @click="addEpisode"><Plus :size="15"/>新增并编辑分镜</button></template>
     </BaseModal>
   </div>
+  <section v-else class="panel project-load-failure" role="alert">
+    <AlertTriangle :size="30" />
+    <h2>项目加载失败</h2>
+    <p>{{ projectLoadError || '没有找到这个连续剧项目。' }}</p>
+    <div><button type="button" class="button ghost" @click="router.push('/projects')"><ArrowLeft :size="15"/>返回项目列表</button><button type="button" class="button primary" @click="loadProject"><RefreshCw :size="15"/>重新加载</button></div>
+  </section>
 </template>
 
 <style scoped>
+.cover-picker{display:grid;grid-template-columns:112px minmax(0,1fr);align-items:center;gap:15px}.cover-picker-preview{width:112px;aspect-ratio:2/3;padding:0;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;border:1px dashed rgba(230,167,90,.38);border-radius:7px;color:#d7a45e;cursor:pointer}.cover-picker-preview img{width:100%;height:100%;object-fit:cover}.cover-picker-preview span{font-size:9px}.cover-picker>div{display:flex;min-width:0;flex-direction:column;gap:7px}.cover-picker strong{overflow:hidden;color:#c1c5ca;font-size:11px;text-overflow:ellipsis;white-space:nowrap}.cover-picker small{color:#697078;font-size:9px;line-height:1.55}.cover-picker-actions{display:flex;gap:7px}.cover-error{margin-top:9px;color:#e4868d;font-size:10px;line-height:1.5}.new-cover-preview-image{position:absolute!important;inset:0;z-index:0!important;width:100%;height:100%;object-fit:cover}.new-project-preview:has(.new-cover-preview-image):after{content:'';position:absolute;inset:0;z-index:1;background:linear-gradient(180deg,rgba(5,7,9,.15),rgba(5,7,9,.78))}.series-cover-background{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.42}.series-poster>img{width:100%;height:100%;border-radius:inherit;object-fit:cover}.series-header-actions{flex-wrap:wrap;justify-content:flex-end}.header-cover-error{width:100%;margin:0;text-align:right}
 .impact-label-row{display:flex!important;align-items:center;flex-wrap:wrap;gap:6px}.impact-heading{display:flex;align-items:center;flex-wrap:wrap;gap:7px}.impact-heading h3{margin-right:2px}.script-editor-stack{min-width:0;display:flex;flex-direction:column;gap:10px}.bible-impact-label{display:flex;align-items:center;flex-wrap:wrap;gap:5px;min-height:20px;font-size:10px!important;letter-spacing:.04em!important;color:#777d85!important}.bible-card-title span{font-size:9px!important;color:#8e7655!important}.management-only-note{max-width:118px;color:#6d737a;font-size:10px;line-height:1.35;text-align:right}.bible-card-actions .lock-button{height:auto;min-height:32px;padding:6px 9px;text-align:left}.global-rules header>div>p{max-width:760px;margin-top:5px;font-size:10px;line-height:1.55;color:#6f757d}.global-rules>.translation-review{margin-top:14px}.global-rules .field>small{position:static;font-size:10px;line-height:1.5}.global-rules .glossary-field{grid-column:1/-1}.global-rules .glossary-field textarea{font-family:Consolas,monospace;line-height:1.6}.global-rules .glossary-field>em{font-size:9px;font-style:normal}.global-rules .glossary-field>.glossary-ok{color:#70c9ae}.global-rules .glossary-field>.glossary-error{color:#e9867b}.form-stack>.prompt-writing-guide{margin-top:2px}
+.project-load-failure{max-width:620px;margin:42px auto;padding:42px;display:flex;align-items:center;flex-direction:column;gap:12px;text-align:center;color:#d99651}.project-load-failure h2{margin:0;color:#e4e8eb}.project-load-failure p{max-width:520px;margin:0;color:#7d878f;line-height:1.6}.project-load-failure>div{display:flex;gap:9px;margin-top:8px}
+.script-rebuild-confirm{display:flex;flex-direction:column;gap:14px}.script-rebuild-confirm>div{display:flex;align-items:flex-start;gap:10px;padding:12px;border:1px solid rgba(229,107,99,.3);border-radius:8px;background:rgba(229,107,99,.06);color:#df8178}.script-rebuild-confirm>div>span{display:flex;flex-direction:column;gap:4px}.script-rebuild-confirm strong{font-size:12px;color:#e6a099}.script-rebuild-confirm small,.script-rebuild-confirm li,.script-rebuild-confirm p{font-size:9px;line-height:1.6;color:#8f8585}.script-rebuild-confirm ul{margin:0;padding:0 0 0 20px;display:grid;gap:6px}.script-rebuild-confirm p{margin:0;padding:10px;border-radius:7px;background:#0b0f13;color:#777f86}
 .glossary-status-row{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:7px}.glossary-status-row em{font-size:10px;font-style:normal}.glossary-status-row .glossary-ok{color:#70c9ae}.glossary-status-row .glossary-error{color:#e9867b}.canonical-notice{padding:9px 11px;border:1px solid rgba(104,197,167,.25);border-radius:7px;background:rgba(104,197,167,.06);color:#8bd8be;font-size:10px;line-height:1.5}.canonical-notice.warning{border-color:rgba(218,154,70,.3);background:rgba(218,154,70,.07);color:#d7a65f}.bible-canonical-notice{display:flex;align-items:flex-start;gap:8px;margin:-2px 0 4px}.bible-canonical-notice>strong{flex:0 0 auto;color:inherit;font-size:9px;letter-spacing:.04em}.bible-canonical-notice>span{min-width:0}.visual-translation-notice{border-color:rgba(94,164,218,.25);background:rgba(94,164,218,.06);color:#8bc5e7}.visual-translation-notice.warning{border-color:rgba(218,154,70,.3);background:rgba(218,154,70,.07);color:#d7a65f}.bible-canonical-row{display:flex;align-items:center;gap:8px;min-height:25px;padding:5px 8px;border:1px solid rgba(104,197,167,.18);border-radius:6px;background:rgba(104,197,167,.035)}.bible-canonical-row>span{color:#59b99a;font-size:7px;letter-spacing:.14em}.bible-canonical-row>strong{overflow:hidden;color:#9acdbd;font-family:Consolas,monospace;font-size:9px;font-weight:500;text-overflow:ellipsis;white-space:nowrap}.bible-canonical-row.missing{border-color:rgba(218,154,70,.2);background:rgba(218,154,70,.035)}.bible-canonical-row.missing>span,.bible-canonical-row.missing>strong{color:#a98452}.canonical-create-hint,.canonical-create-progress{display:flex;gap:10px;align-items:flex-start;padding:11px 12px;border:1px solid rgba(104,197,167,.22);border-radius:7px;background:rgba(104,197,167,.05);color:#67c5a6}.canonical-create-hint>span,.canonical-create-progress>span{display:flex;min-width:0;flex-direction:column;gap:3px}.canonical-create-hint strong,.canonical-create-progress strong{font-size:11px;color:#a8dccb}.canonical-create-hint small,.canonical-create-progress small{font-size:9px;line-height:1.5;color:#72978a}.canonical-create-progress .loader-ring{width:16px;height:16px;flex:0 0 auto}.spinning{animation:spin 1s linear infinite}
 .bible-draft-editor{display:flex;flex-direction:column;gap:13px}.bible-draft-evidence{display:flex;align-items:flex-start;gap:10px;padding:12px;border:1px solid rgba(104,197,167,.25);border-radius:8px;background:rgba(104,197,167,.05);color:#64c5a5}.bible-draft-evidence>span{display:flex;min-width:0;flex:1;flex-direction:column;gap:4px}.bible-draft-evidence strong{font-size:11px;color:#a7daca}.bible-draft-evidence small{font-size:9px;line-height:1.55;color:#71958a}.bible-draft-evidence>b{padding:4px 7px;border:1px solid rgba(104,197,167,.25);border-radius:999px;font-size:7px;letter-spacing:.1em}.bible-asset-browser{overflow:hidden;border:1px solid #293038;border-radius:9px;background:#0d1115}.bible-asset-browser>header{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;padding:12px;border-bottom:1px solid #242a31}.bible-asset-browser>header>div:first-child{display:flex;flex-direction:column;gap:5px}.bible-asset-browser>header span{font-size:10px;color:#aeb5bb}.bible-asset-browser>header small{font-size:8px;line-height:1.45;color:#677078}.bible-asset-tools{display:flex;align-items:center;gap:7px}.bible-asset-tools label{width:240px;height:32px;padding:0 9px;display:flex;align-items:center;gap:7px;border:1px solid #2d343c;border-radius:6px;background:#090c10;color:#69727b}.bible-asset-tools input{min-width:0;flex:1;border:0;outline:0;background:transparent;color:#c4c9ce;font-size:9px}.bible-asset-tools select{height:32px;border:1px solid #2d343c;border-radius:6px;background:#090c10;color:#9fa6ac;font-size:9px}.bible-asset-catalog{max-height:330px;padding:10px;display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;overflow-y:auto}.bible-asset-catalog article{min-width:0;height:150px;position:relative;overflow:hidden;border:1px solid #2a3037;border-radius:7px;background:#11161b}.bible-asset-catalog article.active{border-color:#d99b48;box-shadow:0 0 0 1px rgba(217,155,72,.2)}.bible-asset-catalog article.incompatible{opacity:.48}.bible-asset-select{width:100%;height:100%;padding:0;position:relative;overflow:hidden;border:0;background:transparent;text-align:left;cursor:pointer}.bible-asset-select:disabled{cursor:not-allowed}.bible-asset-select img{width:100%;height:105px;object-fit:cover}.bible-asset-select>span{height:43px;padding:5px 7px;display:flex;min-width:0;flex-direction:column;gap:2px}.bible-asset-select strong{overflow:hidden;color:#c2c7cc;font-size:9px;text-overflow:ellipsis;white-space:nowrap}.bible-asset-select small{overflow:hidden;color:#687179;font-size:7px;text-overflow:ellipsis;white-space:nowrap}.bible-asset-select>i{width:18px;height:18px;position:absolute;right:6px;top:6px;display:none;align-items:center;justify-content:center;border-radius:50%;background:#d99b48;color:#16100a}.bible-asset-catalog article.active .bible-asset-select>i{display:flex}.bible-asset-preview{width:24px;height:24px;position:absolute;right:5px;top:76px;display:flex;align-items:center;justify-content:center;border:1px solid rgba(255,255,255,.18);border-radius:5px;background:rgba(7,9,12,.8);color:#ccd1d5;cursor:pointer}.bible-asset-browser>footer{display:flex;justify-content:space-between;gap:12px;padding:8px 11px;border-top:1px solid #242a31;color:#68717a;font-size:8px}.bible-asset-browser>footer a{display:flex;align-items:center;gap:5px;color:#c7914b}.bible-asset-loading,.bible-asset-empty{min-height:150px;display:flex;align-items:center;justify-content:center;gap:9px;color:#737d85;font-size:10px}.bible-asset-empty{flex-direction:column}.bible-asset-empty button{border:0;background:transparent;color:#c48d48;cursor:pointer}.bible-draft-assistant{padding:11px 12px;display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:13px;border:1px solid #2b3239;border-radius:8px;background:#0c1014}.bible-draft-assistant.ready{border-color:rgba(217,155,72,.28);background:rgba(217,155,72,.035)}.bible-draft-assistant-copy{display:flex;align-items:flex-start;gap:9px;color:#d39a50}.bible-draft-assistant-copy>span{display:flex;flex-direction:column;gap:3px}.bible-draft-assistant-copy strong{font-size:10px}.bible-draft-assistant-copy small{font-size:8px;color:#737b82}.bible-draft-language{height:32px;padding:3px;display:flex;align-items:center;gap:3px;border:1px solid #2c333a;border-radius:7px;background:#090c10}.bible-draft-language>span{padding:0 6px;color:#6e777f;font-size:8px}.bible-draft-language button{height:24px;padding:0 9px;border:0;border-radius:5px;background:transparent;color:#757e86;font-size:8px;cursor:pointer}.bible-draft-language button.active{background:rgba(217,155,72,.14);color:#e2a657}.bible-draft-error,.bible-draft-stale,.bible-draft-provenance,.bible-draft-warnings{display:flex;align-items:flex-start;gap:8px;padding:10px 11px;border:1px solid rgba(239,115,123,.27);border-radius:7px;background:rgba(239,115,123,.055);color:#df7f88}.bible-draft-error span{min-width:0;flex:1;font-size:9px;line-height:1.5}.bible-draft-error button,.bible-draft-stale button{display:flex;align-items:center;gap:4px;border:0;background:transparent;color:inherit;font-size:8px;cursor:pointer}.bible-draft-stale{border-color:rgba(217,155,72,.28);background:rgba(217,155,72,.055);color:#d49b50}.bible-draft-stale>span,.bible-draft-provenance>span,.bible-draft-warnings>span{display:flex;min-width:0;flex:1;flex-direction:column;gap:3px}.bible-draft-stale strong,.bible-draft-provenance strong,.bible-draft-warnings strong{font-size:9px}.bible-draft-stale small,.bible-draft-provenance small,.bible-draft-warnings small{font-size:8px;line-height:1.45}.bible-draft-provenance{border-color:rgba(104,197,167,.24);background:rgba(104,197,167,.05);color:#65c3a4}.bible-draft-provenance code{color:#7b9e93;font-size:8px}.bible-draft-warnings{border-color:rgba(217,155,72,.25);background:rgba(217,155,72,.045);color:#c7924c}.bible-draft-conflicts{overflow:hidden;border:1px solid rgba(91,164,218,.25);border-radius:8px;background:rgba(91,164,218,.035)}.bible-draft-conflicts>header{padding:9px 11px;display:flex;align-items:center;justify-content:space-between;gap:10px;border-bottom:1px solid rgba(91,164,218,.18)}.bible-draft-conflicts>header span{display:flex;flex-direction:column;gap:2px}.bible-draft-conflicts strong{color:#8ec1df;font-size:9px}.bible-draft-conflicts small{font-size:8px;line-height:1.45;color:#718996}.bible-draft-conflicts button{border:0;background:transparent;color:#84bad9;font-size:8px;cursor:pointer}.bible-draft-conflicts article{padding:8px 11px;display:flex;align-items:center;justify-content:space-between;gap:12px;border-top:1px solid rgba(91,164,218,.1)}.bible-draft-conflicts article span{display:flex;min-width:0;flex:1;flex-direction:column;gap:3px}.bible-draft-conflicts article b{font-size:8px;color:#8b9ba5}.bible-draft-conflicts article small{max-height:44px;overflow:auto;color:#9aa9b2}.bible-draft-fields{padding-top:2px}.bible-asset-full-preview{display:flex;flex-direction:column;gap:10px}.bible-asset-full-preview>img{width:100%;height:min(68vh,680px);object-fit:contain;border-radius:8px;background:#080b0e}.bible-asset-full-preview>footer{display:flex;align-items:center;justify-content:space-between;gap:14px}.bible-asset-full-preview>footer>span{display:flex;min-width:0;flex-direction:column;gap:4px}.bible-asset-full-preview strong{font-size:12px}.bible-asset-full-preview small{font-size:9px;color:#737c84}
 .whole-episode-image-resolution{padding:9px;border:1px solid rgba(104,197,167,.18);border-radius:7px;background:rgba(104,197,167,.025)}.whole-episode-image-resolution summary{color:#9bc5b7;font-size:10px;font-weight:650;cursor:pointer}.whole-episode-image-resolution>p{margin:7px 0 0!important;color:#74857f!important;font-size:8px!important;line-height:1.55!important}
+.whole-episode-idempotency-conflict{display:flex;align-items:flex-start;gap:8px;padding:10px;border:1px solid rgba(223,101,90,.28);border-radius:7px;background:rgba(223,101,90,.055);color:#df8177}.whole-episode-idempotency-conflict>span{display:grid;gap:5px}.whole-episode-idempotency-conflict small{color:#a68585;font-size:9px;line-height:1.55}.whole-episode-idempotency-conflict button{justify-self:start}
 .release-workspace{display:flex;flex-direction:column;gap:14px;padding:28px 30px 42px}.release-heading{margin-bottom:0}.release-principles{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:1px;padding:0;overflow:hidden;background:rgba(255,255,255,.045)}.release-principles>div{display:flex;gap:12px;align-items:flex-start;padding:17px;background:#101419}.release-principles svg{flex:0 0 auto;color:#d69a47}.release-principles span{display:flex;flex-direction:column;gap:5px}.release-principles strong{font-size:12px;color:#e8ecef}.release-principles small{font-size:10px;line-height:1.55;color:#747d86}.release-error{display:flex;justify-content:space-between;gap:12px;padding:11px 14px;border:1px solid rgba(238,93,106,.32);border-radius:8px;background:rgba(238,93,106,.07);color:#e58a94;font-size:11px}.release-error button{border:0;background:transparent;color:inherit;cursor:pointer}.release-draft,.release-create{padding:20px}.release-draft>header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.release-draft h4,.release-history h4{margin:6px 0 4px;font-size:17px}.release-draft header p,.release-create p{margin:0;color:#757e86;font-size:11px;line-height:1.55}.release-updated{font-size:9px;color:#626b73}.release-status,.verification-chip{display:inline-flex;align-items:center;height:22px;padding:0 8px;border:1px solid #39414a;border-radius:999px;color:#8e98a2;font-size:9px}.release-status.draft{border-color:rgba(215,154,70,.35);color:#d99d4a;background:rgba(215,154,70,.07)}.release-status.sealed{border-color:rgba(84,184,221,.35);color:#6fc4e5}.release-status.released{border-color:rgba(82,201,159,.4);color:#62d0aa;background:rgba(82,201,159,.06)}.release-status.superseded{color:#777f87}.verification-chip.verified{border-color:rgba(82,201,159,.28);color:#62cda7}.verification-chip.invalid{border-color:rgba(238,93,106,.35);color:#e97e89}.release-selection-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:18px 0}.release-selection-metrics>div{display:flex;flex-direction:column;gap:7px;padding:12px;border:1px solid #242a30;border-radius:7px;background:#0c1014}.release-selection-metrics span{font-size:9px;color:#69727b}.release-selection-metrics strong{font-size:13px;color:#d6dade}.release-selection-metrics strong.ok{color:#64cfa9}.release-form{display:grid;grid-template-columns:minmax(220px,.7fr) minmax(320px,1.3fr);gap:10px}.release-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:14px}.release-create>div:first-child{display:flex;align-items:flex-start;gap:14px;margin-bottom:15px}.release-create>div:first-child svg{color:#d89b48}.release-create>div:first-child span{display:flex;flex-direction:column;gap:4px}.release-create>button{margin-top:13px}.release-history{display:flex;flex-direction:column;gap:10px}.release-history>header{display:flex;justify-content:space-between;align-items:end}.release-history>header h4{margin:4px 0 0}.release-history>header small{color:#68717a;font-size:9px}.release-list{display:flex;flex-direction:column;gap:8px}.release-row{display:grid;grid-template-columns:52px minmax(0,1fr) auto;gap:14px;align-items:center;padding:15px}.release-version{display:flex;flex-direction:column;align-items:center;justify-content:center;height:52px;border:1px solid #2a3036;border-radius:7px;background:#0b0f13}.release-version span{font-size:8px;letter-spacing:.18em;color:#6d747b}.release-version strong{font-size:20px;color:#d89b48}.release-copy>div{display:flex;gap:6px}.release-copy h4{margin:6px 0 3px;font-size:13px}.release-copy p{margin:0 0 7px;color:#717a82;font-size:10px}.release-copy>small{color:#626b73;font-size:9px}.release-row-actions{display:flex;gap:7px}.release-empty{display:flex;min-height:160px;align-items:center;justify-content:center;flex-direction:column;gap:7px;color:#69717a}.release-empty strong{color:#bdc3c8}.release-empty p{margin:0;font-size:10px}
 @media (max-width:900px){.release-principles,.release-selection-metrics{grid-template-columns:1fr 1fr}.release-form{grid-template-columns:1fr}.release-row{grid-template-columns:44px 1fr}.release-row-actions{grid-column:2}.release-workspace{padding:20px 14px}.bible-asset-browser>header{align-items:stretch;flex-direction:column}.bible-asset-tools{align-items:stretch}.bible-asset-tools label{width:auto;flex:1}.bible-asset-catalog{grid-template-columns:repeat(3,minmax(0,1fr))}.bible-draft-assistant{grid-template-columns:1fr}.bible-draft-language{width:max-content}}
 </style>

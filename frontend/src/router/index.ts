@@ -10,6 +10,7 @@ const router = createRouter({
     { path: '/', component: AppShell, children: [
       { path: '', name: 'dashboard', component: () => import('@/views/DashboardView.vue'), meta: { title: '制作总览' } },
       { path: 'assets', name: 'assets', component: () => import('@/views/AssetLibraryView.vue'), meta: { title: '素材库' } },
+      { path: 'projects', name: 'projects', component: () => import('@/views/SeriesProjectsView.vue'), meta: { title: '连续剧项目' } },
       { path: 'projects/new', name: 'project-new', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '新建连续剧' } },
       { path: 'projects/:projectId', name: 'project-detail', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '连续剧工作室' } },
       { path: 'projects/:projectId/episodes/:episodeId/storyboard', name: 'storyboard', component: () => import('@/views/StoryboardView.vue'), meta: { title: '可视化分镜' } },

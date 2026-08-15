@@ -16,11 +16,11 @@
 | 官方 H3 Base | T2VA | 默认 | 分辨率档位；采样固定 20 steps | 目标环境低成本烟测 |
 | 官方 H3 First/Last Frame | T2VA、I2VA、L2VA、FL2VA | 默认 | 分辨率档位；采样固定 20 steps | 0/1/2 张图矩阵烟测 |
 | 官方 H3 Ref2VA | Ref2VA | 默认 | 分辨率档位；采样固定 20 steps | 图片、视频、配对音轨和独立音频矩阵烟测 |
-| T8 Dual-Clock 4-Step | Ref2VA | 实验、显式选择 | `STEPS` 1–20，默认 4；`LORA_STRENGTH` 0–2.2，默认 1.0 | 使用兼容 non-pruned Ref2VA 后验收 |
-| Turbo LoRA | Ref2VA | 实验、显式选择 | `STEPS` 1–20，默认 10；`LORA_STRENGTH` 0–2.2，默认 1.0 | 使用兼容 non-pruned Ref2VA 后验收 |
+| T8 Dual-Clock 4-Step | Ref2VA | 实验、显式选择 | `STEPS` 1–20，默认 4；`LORA_STRENGTH` 0–2.2，默认 1.0 | 目标环境 GPU 全链、稳定性、容量和画质验收 |
+| Turbo LoRA | Ref2VA | 实验、显式选择 | `STEPS` 1–20，默认 10；`LORA_STRENGTH` 0–2.2，默认 1.0 | 目标环境 GPU 全链、稳定性、容量和画质验收 |
 | SDXL Base 1.0 | 文生图 | 默认 | 独立图片分辨率档位 | checkpoint 与 PNG 烟测 |
 
-两个实验工作流的源配方连接 Turbo LoRA，而目标环境若使用 pruned Ref2VA INT8 基模，可能出现 AdaLN 适配器形状不匹配、LoRA 不完整应用或运行失败。节点和模型可见、静态图构建成功、参数契约通过均不等同于 GPU 端到端验收。
+两个实验工作流的源配方连接 Turbo LoRA，目标环境的基模、LoRA 和节点版本仍可影响 AdaLN 适配、LoRA 应用完整性和运行结果。节点和模型可见、静态图构建成功、参数契约通过均不等同于 GPU 端到端验收。
 
 ## 必需能力
 
@@ -40,6 +40,7 @@
 SDXL 图片路径固定使用 `CheckpointLoaderSimple`、两个 `CLIPTextEncode`、`EmptyLatentImage`、`KSampler`、`VAEDecode` 和 `SaveImage`，checkpoint 固定为 `sd_xl_base_1.0.safetensors`。
 
 配置示例列出模板期望的 H3 diffusion model、Qwen3-VL text encoder、video/audio VAE 和 LoRA 文件名。文件是否存在以目标 ComfyUI 的实时模型枚举为准，不以仓库文档或本地目录推断。
+配置示例是通用部署模板，其 `generation_smoke_test_enabled=false` 和实验 profile 的 `gpu_e2e_verified=false` 要求每个目标环境独立验收，不得因其他机器的结果把新部署默认为已验收。
 
 ## 入队前契约预检
 
@@ -64,7 +65,7 @@ SDXL 图片路径固定使用 `CheckpointLoaderSimple`、两个 `CLIPTextEncode`
 
 ## 输入与输出约束
 
-- H3 视频为 24 FPS，时长 5–15 秒，帧数对齐 `17k+5`。
+- H3 视频为 24 FPS，时长范围由 `VIDEO_SHOT_MIN_DURATION_MS` / `VIDEO_SHOT_MAX_DURATION_MS` 配置并通过生产能力接口公开；对应帧数必须落在可配置的 H3 对齐范围内并满足 `17k+5`。
 - Ref2VA 支持 0–9 张图片、0–3 个视频、每个视频可选一条配对音轨，以及 0–3 条独立音频。
 - 参考视频进入任务目录后统一转为精确 24/1 CFR H.264，并核验帧数；音频按最终帧时长补齐或裁剪。
 - 上传与暂存文件按租户、MIME、扩展名、大小、媒体流和解析后路径重新验证。
@@ -72,6 +73,8 @@ SDXL 图片路径固定使用 `CheckpointLoaderSimple`、两个 `CLIPTextEncode`
 - 仓库素材库是 Bible 文本连续性和溯源锚点。只有用户显式绑定到 H3 输入槽位的媒体才会作为像素或音频参考暂存到 ComfyUI。
 
 ## GPU 烟测
+
+### 目标环境验收方法
 
 在没有运行中任务且目标模型已加载条件满足时，按以下顺序执行：
 
@@ -82,7 +85,7 @@ SDXL 图片路径固定使用 `CheckpointLoaderSimple`、两个 `CLIPTextEncode`
 5. 记录目标设备、ComfyUI 与插件版本、模型文件哈希、耗时、峰值显存/内存和输出 SHA-256。
 6. 再验证取消、worker 中断恢复、明确失败后的审计式重试，以及缺节点/缺模型时未调用 `/prompt`。
 
-实验工作流只有在兼容 non-pruned Ref2VA 模型上完成上述步骤后，才能在对应环境标记为已验收。正式分辨率和批量吞吐需要独立压力与画质抽检，不能由低分辨率单次烟测推断。
+每个实验工作流都必须在对应目标环境完成上述步骤，才能记录该环境的 GPU 端到端验收。正式分辨率、批量吞吐、长期稳定性和画质需要独立压力与人工抽检，不能由低分辨率单次烟测推断。
 
 ## 安全要求
 

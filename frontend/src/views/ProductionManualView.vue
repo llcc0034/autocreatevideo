@@ -7,6 +7,8 @@ import {
   ShieldCheck, Sparkles, X,
 } from 'lucide-vue-next'
 import { api } from '@/services/api'
+import { adaptPromptProviders } from '@/services/providerCapabilities'
+import type { PromptProviderCapability } from '@/types'
 import {
   productionManual, searchableIncidentText, searchableManualText,
   type ManualIncident, type ManualStep,
@@ -22,11 +24,6 @@ type CapabilityState = {
   gpu_ready?: boolean
   gpu_context_smoke_passed?: boolean
   runtime_probe_error_code?: string
-  min_shots?: number
-  max_shots?: number
-  baseline_max_new_tokens?: number
-  max_new_tokens?: number
-  configured_max_new_tokens?: number
   loaded_on_demand?: boolean
   unloaded_after_request?: boolean
 }
@@ -36,7 +33,7 @@ const router = useRouter()
 const query = ref('')
 const capabilityLoading = ref(false)
 const capabilityError = ref('')
-const creativeCapability = ref<CapabilityState | null>(null)
+const creativeCapability = ref<PromptProviderCapability | null>(null)
 const translationCapability = ref<CapabilityState | null>(null)
 const openSteps = ref(new Set<string>(productionManual.steps.map((step) => step.id)))
 
@@ -49,30 +46,40 @@ const visibleIncidents = computed(() => normalizedQuery.value
   : productionManual.incidents)
 const resultCount = computed(() => visibleSteps.value.length + visibleIncidents.value.length)
 
-const isReady = (capability: CapabilityState | null) => Boolean(capability?.configured && capability?.enabled !== false)
-const creativeShotRange = computed(() => creativeCapability.value?.min_shots && creativeCapability.value?.max_shots
-  ? `${creativeCapability.value.min_shots}–${creativeCapability.value.max_shots} 镜`
-  : '以当前能力接口为准')
+const isReady = (capability: Pick<CapabilityState, 'configured' | 'enabled'> | null) => (
+  Boolean(capability?.configured && capability?.enabled !== false)
+)
+const creativeShotRange = computed(() => {
+  const capability = creativeCapability.value
+  const parts = [
+    capability?.minShots ? `最低 ${capability.minShots} 镜` : '',
+    capability?.recommendedMaxShots ? `推荐不超过 ${capability.recommendedMaxShots} 镜` : '',
+    capability?.batchShots ? `单批规划 ${capability.batchShots} 镜` : '',
+  ].filter(Boolean)
+  return parts.length ? parts.join(' · ') : '以当前能力接口为准'
+})
 const creativeBudgetLabel = computed(() => {
-  const baseline = Number(creativeCapability.value?.baseline_max_new_tokens || 0)
+  const baseline = Number(creativeCapability.value?.baselineMaxNewTokens || 0)
   const limit = Number(
-    creativeCapability.value?.configured_max_new_tokens || creativeCapability.value?.max_new_tokens || 0,
+    creativeCapability.value?.configuredMaxNewTokens || creativeCapability.value?.maxNewTokens || 0,
   )
   if (!baseline || !limit) return '容量按镜数与对白动态计算'
-  return `${creativeCapability.value?.max_shots || 4} 镜无对白约 ${baseline} · 上限 ${limit}`
+  const batch = creativeCapability.value?.batchShots
+  return `${batch ? `单批 ${batch} 镜` : '当前单批'}无对白约 ${baseline} · token 上限 ${limit}`
 })
 const modelLabel = computed(() => creativeCapability.value?.model || translationCapability.value?.model || '读取中')
-const deviceLabel = computed(() => String(creativeCapability.value?.device || translationCapability.value?.device || '—').toUpperCase())
+const deviceLabel = computed(() => creativeCapability.value?.transport === 'remote'
+  ? 'REMOTE'
+  : String(creativeCapability.value?.device || translationCapability.value?.device || '—').toUpperCase())
 const deviceRuntimeLabel = computed(() => {
-  const capability = creativeCapability.value?.cuda_requested
-    ? creativeCapability.value
-    : translationCapability.value
-  if (!capability?.cuda_requested) return 'CPU · 按需加载'
-  if (capability.gpu_ready) {
-    const layers = Number(capability.gpu_layers)
+  const capability: PromptProviderCapability | null = creativeCapability.value
+  if (capability?.transport === 'remote') return '远程 API · 不占本地模型锁'
+  if (!capability?.cudaRequested) return 'CPU · 按需加载'
+  if (capability.gpuReady) {
+    const layers = Number(capability.gpuLayers)
     return `CUDA 已验证 · ${layers === -1 ? '全部层卸载' : `${layers} 层卸载`}`
   }
-  return `CUDA 未就绪 · ${capability.runtime_probe_error_code || '等待运行时烟测'}`
+  return `CUDA 未就绪 · ${capability.runtimeProbeErrorCode || '等待运行时烟测'}`
 })
 
 const fetchCapabilities = async () => {
@@ -82,7 +89,15 @@ const fetchCapabilities = async () => {
     api.get(productionManual.capabilityEndpoints.creative),
     api.get(productionManual.capabilityEndpoints.translation),
   ])
-  creativeCapability.value = creative.status === 'fulfilled' ? creative.value.data?.data || creative.value.data : null
+  if (creative.status === 'fulfilled') {
+    const raw = creative.value.data?.data || creative.value.data
+    const adapted = adaptPromptProviders(raw as Record<string, unknown>)
+    creativeCapability.value = adapted.providers.find(
+      (provider) => provider.id === adapted.defaultProvider,
+    ) || adapted.providers[0] || null
+  } else {
+    creativeCapability.value = null
+  }
   translationCapability.value = translation.status === 'fulfilled' ? translation.value.data?.data || translation.value.data : null
   if (creative.status === 'rejected' || translation.status === 'rejected') {
     capabilityError.value = '部分运行能力暂时无法读取；操作步骤仍可使用，提交前请到系统设置刷新状态。'
@@ -140,7 +155,7 @@ onMounted(() => { void fetchCapabilities(); void syncHash() })
 
     <section class="manual-runtime-grid">
       <article class="panel" :class="{ ready: isReady(creativeCapability) }">
-        <Sparkles :size="18"/><span><small>本地创作能力</small><strong>{{ capabilityLoading ? '读取中…' : isReady(creativeCapability) ? '已就绪' : '未就绪' }}</strong></span><i>{{ creativeShotRange }} · {{ creativeBudgetLabel }}</i>
+        <Sparkles :size="18"/><span><small>{{ creativeCapability?.label || '默认创作通道' }}</small><strong>{{ capabilityLoading ? '读取中…' : isReady(creativeCapability) ? '已就绪' : '未就绪' }}</strong></span><i>{{ creativeShotRange }} · {{ creativeBudgetLabel }}</i>
       </article>
       <article class="panel" :class="{ ready: isReady(translationCapability) }">
         <ShieldCheck :size="18"/><span><small>本地翻译审核</small><strong>{{ capabilityLoading ? '读取中…' : isReady(translationCapability) ? '已就绪' : '未就绪' }}</strong></span><i>必须人工确认</i>

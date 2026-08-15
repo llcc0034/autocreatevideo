@@ -7,6 +7,8 @@ import math
 import os
 import re
 
+from django.conf import settings
+
 from studio.models import PromptArtifact, SeriesProject, WorkflowTemplate
 from studio.services.resolution import (
     H3_RESOLUTION_MULTIPLE_DEFAULT,
@@ -18,10 +20,10 @@ from studio.services.resolution import (
 
 
 PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+)\}")
-H3_MIN_REQUEST_DURATION_MS = 5_000
-H3_MAX_REQUEST_DURATION_MS = 15_000
-H3_MIN_ALIGNED_FRAMES = 124
-H3_MAX_ALIGNED_FRAMES = 362
+H3_MIN_REQUEST_DURATION_MS = settings.VIDEO_SHOT_MIN_DURATION_MS
+H3_MAX_REQUEST_DURATION_MS = settings.VIDEO_SHOT_MAX_DURATION_MS
+H3_MIN_ALIGNED_FRAMES = settings.H3_MIN_ALIGNED_FRAMES
+H3_MAX_ALIGNED_FRAMES = settings.H3_MAX_ALIGNED_FRAMES
 
 # The API prompt is data, but a Comfy workflow is executable configuration.
 # Keep the approved surface deliberately small and review additions here before
@@ -475,8 +477,8 @@ def build_workflow(
     is_h3_video = is_h3 and prompt.prompt_type == "video"
     if is_h3_video and not H3_MIN_REQUEST_DURATION_MS <= duration_ms <= H3_MAX_REQUEST_DURATION_MS:
         raise WorkflowBuildError(
-            "MiniMax H3 单次工作流请求时长必须在 5000–15000ms；"
-            "17k+5 帧对齐后的有效范围约为 5167–15083ms。"
+            "MiniMax H3 单次工作流请求时长必须在 "
+            f"{H3_MIN_REQUEST_DURATION_MS}–{H3_MAX_REQUEST_DURATION_MS}ms。"
         )
     resolution_profile = str(overrides.get("RESOLUTION_PROFILE", "project"))
     if resolution_profile not in H3_RESOLUTION_PROFILES:
@@ -517,7 +519,10 @@ def build_workflow(
     )
     effective_duration_ms = round(frames * 1000 / fps) if prompt.prompt_type == "video" else 0
     if is_h3_video and not H3_MIN_ALIGNED_FRAMES <= frames <= H3_MAX_ALIGNED_FRAMES:
-        raise WorkflowBuildError("MiniMax H3 帧数对齐结果超出 124–362 帧安全范围")
+        raise WorkflowBuildError(
+            "MiniMax H3 帧数对齐结果超出 "
+            f"{H3_MIN_ALIGNED_FRAMES}–{H3_MAX_ALIGNED_FRAMES} 帧安全范围"
+        )
     required_dimension_multiple = schema.get("required_dimension_multiple")
     if required_dimension_multiple is not None:
         try:
@@ -559,7 +564,10 @@ def build_workflow(
         "OUTPUT_PREFIX": _safe_output_prefix(
             str(overrides.get("OUTPUT_PREFIX", f"autoprompt/{project.id}/{prompt.id}"))
         ),
-        "H3_SAFE_DURATION": not is_h3 or 5_000 <= duration_ms <= 15_000,
+        "H3_SAFE_DURATION": (
+            not is_h3
+            or H3_MIN_REQUEST_DURATION_MS <= duration_ms <= H3_MAX_REQUEST_DURATION_MS
+        ),
         # Backward-compatible fallback for older reviewed H3 definitions. New
         # system templates declare and validate this through user_parameters.
         "STEPS": 20,

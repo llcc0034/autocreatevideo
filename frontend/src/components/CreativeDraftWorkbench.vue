@@ -4,17 +4,25 @@ import {
   AlertTriangle, Box, Check, Clock3, Languages, LoaderCircle, Lock,
   MapPin, RotateCcw, Save, ShieldCheck, Sparkles, UserRound, WandSparkles,
 } from 'lucide-vue-next'
+import BaseModal from '@/components/BaseModal.vue'
 import { creativeDraftRepository } from '@/services/creativeDraftRepository'
-import { promptProvider, REMOTE_PROMPT_EGRESS_NOTICE } from '@/services/providerCapabilities'
 import {
-  CREATIVE_DRAFT_ENGLISH_LIMITS,
+  creativeShotCountDecision,
+  promptProvider,
+  promptProviderId,
+  REMOTE_PROMPT_EGRESS_NOTICE,
+} from '@/services/providerCapabilities'
+import {
   creativeDraftEditorWarnings,
   creativeFailureRecovery,
+  creativeGenerationConfirmationContext,
   creativeDraftIsEditable,
   creativeDraftIsEmptyFailure,
   creativeDraftRequestError,
   creativeDraftReviewIssueAction,
   creativeDraftReviewIssueTitle,
+  creativeProviderFailureFallback,
+  creativeSafeFailureCode,
   creativeSafeFailureDiagnostic,
 } from '@/services/creativeDraft'
 import type {
@@ -34,10 +42,12 @@ const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value))
 const selectedEpisodeId = ref(props.initialEpisodeId || props.project.episodes[0]?.id || '')
 const capability = ref<CreativeGenerationCapability | null>(null)
 const selectedProvider = ref<PromptProviderId>('local_qwen')
+const selectedProviderWasEdited = ref(false)
 const drafts = ref<CreativeDraft[]>([])
 const selectedDraftId = ref('')
 const workingData = ref<CreativeDraftData | null>(null)
-const targetShotCount = ref(4)
+const targetShotCount = ref<number | null>(null)
+const targetShotCountWasEdited = ref(false)
 const creativity = ref<CreativeDraftCreativity>('balanced')
 const variationNote = ref('')
 const placement = ref<CreativeDraftPlacement>('replace')
@@ -55,23 +65,59 @@ type PendingRiskAction =
 const pendingRiskAction = ref<PendingRiskAction | null>(null)
 const riskDialogOpen = ref(false)
 const riskAcknowledged = ref(false)
+type PendingExtendedGenerationAction =
+  | {
+    kind: 'generate'
+    provider: PromptProviderId
+    targetShotCount: number
+    recommendedMaxShots?: number
+    batchShots?: number
+    sourceCharCount?: number
+    maxSourceChars?: number
+    requiredDialogueCount?: number
+    dialogueCapacity?: number
+    maxDialoguePerShot?: number
+    effectiveMaxDialoguePerShot?: number
+  }
+  | {
+    kind: 'regenerate'
+    provider: PromptProviderId
+    targetShotCount: number
+    recommendedMaxShots?: number
+    batchShots?: number
+    sourceCharCount?: number
+    maxSourceChars?: number
+    requiredDialogueCount?: number
+    dialogueCapacity?: number
+    maxDialoguePerShot?: number
+    effectiveMaxDialoguePerShot?: number
+    shotKeys: string[]
+  }
+const pendingExtendedGeneration = ref<PendingExtendedGenerationAction | null>(null)
 
 const activeEpisode = computed(() => props.project.episodes.find((item) => item.id === selectedEpisodeId.value))
 const activeDraft = computed(() => drafts.value.find((item) => item.id === selectedDraftId.value) || null)
 const editable = computed(() => creativeDraftIsEditable(activeDraft.value))
 const emptyFailedDraft = computed(() => creativeDraftIsEmptyFailure(activeDraft.value))
 const failedDraftDiagnostic = computed(() => creativeSafeFailureDiagnostic(activeDraft.value?.runtimeMetadata))
-const failedDraftErrorCode = computed(() => failedDraftDiagnostic.value.code)
+const failedDraftErrorCode = computed(() => creativeSafeFailureCode(activeDraft.value?.runtimeMetadata))
+const failedDraftProvider = computed(() => activeDraft.value?.provider || selectedProvider.value)
 const failedDraftReason = computed(() => (
-  creativeFailureRecovery(failedDraftErrorCode.value, activeDraft.value?.contextCurrent !== false)
+  creativeFailureRecovery(
+    failedDraftErrorCode.value,
+    activeDraft.value?.contextCurrent !== false,
+    failedDraftProvider.value,
+  )
   || error.value
-  || '本地 Qwen 未返回可审核的结构化镜头。请一键重试整稿；若持续失败，改为 1–2 镜或缩短本次创作要求。正式分镜未修改。'
+  || creativeProviderFailureFallback(failedDraftProvider.value)
 ))
 const dirty = computed(() => Boolean(
   activeDraft.value && workingData.value
   && JSON.stringify(activeDraft.value.draftData) !== JSON.stringify(workingData.value),
 ))
-const localWarnings = computed(() => workingData.value ? creativeDraftEditorWarnings(workingData.value) : [])
+const localWarnings = computed(() => workingData.value
+  ? creativeDraftEditorWarnings(workingData.value, selectedProviderCapability.value)
+  : [])
 const reviewIssues = computed(() => activeDraft.value?.reviewIssues || [])
 const actionCoverageIssues = computed(() => reviewIssues.value.filter((item) => (
   /script_action_coverage_low|action_coverage_low|script.*action.*coverage/i.test(item.code)
@@ -89,26 +135,80 @@ const requiresEditCount = computed(() => activeDraft.value?.reviewSummary.requir
   || reviewIssues.value.filter((item) => item.severity === 'requires_edit').length)
 const displayedValidationStatus = computed(() => dirty.value ? 'pending' : (activeDraft.value?.validation.status || 'pending'))
 const selectedProviderCapability = computed(() => promptProvider(capability.value?.providers, selectedProvider.value))
-const generationReady = computed(() => Boolean(selectedProviderCapability.value?.ready ?? (
-  selectedProvider.value === 'local_qwen' && capability.value?.supported && capability.value.configured
-  && capability.value.modelDownloaded && capability.value.modelVerified
-)))
+const pendingExtendedProviderCapability = computed(() => pendingExtendedGeneration.value
+  ? promptProvider(capability.value?.providers, pendingExtendedGeneration.value.provider)
+  : undefined)
+const pendingExtendedRecommendedMaxShots = computed(() => (
+  pendingExtendedGeneration.value?.recommendedMaxShots
+  ?? pendingExtendedProviderCapability.value?.recommendedMaxShots
+))
+const pendingExtendedBatchShots = computed(() => (
+  pendingExtendedGeneration.value?.batchShots
+  ?? pendingExtendedProviderCapability.value?.batchShots
+))
+const pendingExtendedSourceCharCount = computed(() => pendingExtendedGeneration.value?.sourceCharCount)
+const pendingExtendedMaxSourceChars = computed(() => (
+  pendingExtendedGeneration.value?.maxSourceChars
+  ?? pendingExtendedProviderCapability.value?.maxSourceChars
+))
+const pendingExtendedIsBatchable = computed(() => Boolean(
+  pendingExtendedGeneration.value
+  && (
+    pendingExtendedGeneration.value.kind === 'generate'
+    || pendingExtendedGeneration.value.shotKeys.length === 0
+  )
+))
+const generationReady = computed(() => selectedProviderCapability.value?.ready === true)
 const providerEgressNotice = computed(() => selectedProvider.value === 'deepseek_api'
   ? selectedProviderCapability.value?.dataEgressNotice || REMOTE_PROMPT_EGRESS_NOTICE
   : '')
-const minShots = computed(() => capability.value?.minShots || 1)
-const maxShots = computed(() => capability.value?.maxShots || 4)
-const baselineOutputBudget = computed(() => capability.value?.baselineMaxNewTokens || 0)
+const minShots = computed(() => selectedProviderCapability.value?.minShots)
+const recommendedMaxShots = computed(() => selectedProviderCapability.value?.recommendedMaxShots)
+const defaultShots = computed(() => selectedProviderCapability.value?.defaultShots ?? recommendedMaxShots.value ?? minShots.value ?? null)
+const batchShots = computed(() => selectedProviderCapability.value?.batchShots)
+const maxDialoguePerShot = computed(() => selectedProviderCapability.value?.maxDialoguePerShot)
+const maxSourceChars = computed(() => selectedProviderCapability.value?.maxSourceChars)
+const minShotDurationMs = computed(() => selectedProviderCapability.value?.minShotDurationMs)
+const maxShotDurationMs = computed(() => selectedProviderCapability.value?.maxShotDurationMs)
+const minShotDurationSeconds = computed(() => minShotDurationMs.value === undefined ? undefined : minShotDurationMs.value / 1000)
+const maxShotDurationSeconds = computed(() => maxShotDurationMs.value === undefined ? undefined : maxShotDurationMs.value / 1000)
+const shotDurationGuide = computed(() => (
+  minShotDurationSeconds.value !== undefined && maxShotDurationSeconds.value !== undefined
+    ? `${minShotDurationSeconds.value}–${maxShotDurationSeconds.value} 秒`
+    : '所选通道配置的时长范围'
+))
+const baselineOutputBudget = computed(() => selectedProviderCapability.value?.baselineMaxNewTokens)
 const configuredOutputBudget = computed(() => (
-  capability.value?.configuredMaxNewTokens || capability.value?.maxNewTokens || 0
+  selectedProviderCapability.value?.configuredMaxNewTokens ?? selectedProviderCapability.value?.maxNewTokens
 ))
-const normalizedTargetShotCount = computed(() => (
-  Math.min(maxShots.value, Math.max(minShots.value, Number(targetShotCount.value) || minShots.value))
+const providerTimingGuide = computed(() => [
+  selectedProviderCapability.value?.runtimeTimeoutSeconds
+    ? `模型运行时限 ${selectedProviderCapability.value.runtimeTimeoutSeconds} 秒`
+    : '',
+  selectedProviderCapability.value?.processTimeoutSeconds
+    ? `服务进程时限 ${selectedProviderCapability.value.processTimeoutSeconds} 秒`
+    : '',
+].filter(Boolean).join('，'))
+const requestedTargetShotCount = computed(() => Number(targetShotCount.value))
+const targetShotCountDecision = computed(() => creativeShotCountDecision(
+  requestedTargetShotCount.value,
+  selectedProviderCapability.value,
 ))
-const targetDurationRange = computed(() => ({
-  min: normalizedTargetShotCount.value * 5,
-  max: normalizedTargetShotCount.value * 15,
-}))
+const targetShotCountError = computed(() => {
+  if (!selectedProviderCapability.value || targetShotCountDecision.value.valid) return ''
+  return targetShotCountDecision.value.reason || '生成镜数不符合所选通道的当前配置。'
+})
+const targetShotCountNeedsConfirmation = computed(() => (
+  targetShotCountDecision.value.valid && targetShotCountDecision.value.confirmationRequired
+))
+const targetDurationRange = computed(() => {
+  if (!Number.isFinite(requestedTargetShotCount.value)
+    || minShotDurationSeconds.value === undefined || maxShotDurationSeconds.value === undefined) return undefined
+  return {
+    min: requestedTargetShotCount.value * minShotDurationSeconds.value,
+    max: requestedTargetShotCount.value * maxShotDurationSeconds.value,
+  }
+})
 const selectedCount = computed(() => selectedShotKeys.value.length)
 const totalDuration = computed(() => (workingData.value?.shots || []).reduce((sum, shot) => sum + shot.durationMs, 0) / 1000)
 const canConfirm = computed(() => Boolean(
@@ -118,11 +218,21 @@ const canApply = computed(() => Boolean(
   activeDraft.value?.canApply && activeDraft.value.status === 'confirmed' && !dirty.value
   && activeDraft.value.contextCurrent && !requiresEditCount.value,
 ))
-const contextEstimate = computed(() => (
-  props.project.logline.length + props.project.masterScript.length + (activeEpisode.value?.synopsis.length || 0) + (activeEpisode.value?.script?.length || 0)
+const authoritativeVisibleSourceChars = computed(() => {
+  const episode = activeEpisode.value
+  const candidates = [
+    episode?.script || '',
+    props.project.masterScript || '',
+    episode?.synopsis || '',
+    props.project.logline || '',
+  ]
+  return (candidates.find((value) => value.trim()) || '').length
+})
+const visibleSourceExceedsBatchReference = computed(() => Boolean(
+  maxSourceChars.value && authoritativeVisibleSourceChars.value > maxSourceChars.value,
 ))
-const visibleSourceTooLong = computed(() => Boolean(
-  capability.value?.maxSourceChars && contextEstimate.value > capability.value.maxSourceChars,
+const generationNeedsConfirmation = computed(() => (
+  targetShotCountNeedsConfirmation.value || visibleSourceExceedsBatchReference.value
 ))
 const statusLabels: Record<CreativeDraft['status'], string> = {
   draft: '创作草稿', confirmed: '已确认审核', applied: '已应用', superseded: '历史版本', failed: '生成失败',
@@ -184,11 +294,49 @@ const jumpToReviewIssue = async (issue: CreativeDraftReviewIssue) => {
   control?.focus({ preventScroll: true })
 }
 
-const errorMessage = (cause: unknown, fallback: string) => creativeDraftRequestError(cause, fallback)
+const errorMessage = (
+  cause: unknown,
+  fallback: string,
+  provider: PromptProviderId | string = selectedProvider.value,
+) => creativeDraftRequestError(
+  cause,
+  fallback,
+  provider,
+  promptProvider(capability.value?.providers, promptProviderId(provider)),
+)
 const persistedDraftIdFromError = (cause: unknown): string => {
   if (!cause || typeof cause !== 'object') return ''
   const data = (cause as { response?: { data?: { draft?: { id?: unknown } } } }).response?.data
   return String(data?.draft?.id || '')
+}
+const providerShotCountDecision = (count: number, provider: PromptProviderId = selectedProvider.value) => (
+  creativeShotCountDecision(count, promptProvider(capability.value?.providers, provider))
+)
+const applySelectedProviderDefaultShotCount = () => {
+  if (targetShotCountWasEdited.value) return
+  targetShotCount.value = defaultShots.value
+}
+const closeExtendedGenerationDialog = () => { pendingExtendedGeneration.value = null }
+const recoverExtendedGenerationConfirmation = (
+  cause: unknown,
+  pending: PendingExtendedGenerationAction,
+): boolean => {
+  const confirmation = creativeGenerationConfirmationContext(cause)
+  if (!confirmation || confirmation.targetShotCount !== pending.targetShotCount) return false
+  pendingExtendedGeneration.value = {
+    ...pending,
+    recommendedMaxShots: confirmation.recommendedMaxShots,
+    batchShots: confirmation.batchShots,
+    sourceCharCount: confirmation.sourceCharCount,
+    maxSourceChars: confirmation.maxSourceChars,
+    requiredDialogueCount: confirmation.requiredDialogueCount,
+    dialogueCapacity: confirmation.dialogueCapacity,
+    maxDialoguePerShot: confirmation.maxDialoguePerShot,
+    effectiveMaxDialoguePerShot: confirmation.effectiveMaxDialoguePerShot,
+  }
+  error.value = ''
+  notice.value = ''
+  return true
 }
 
 const selectDraft = (draft: CreativeDraft) => {
@@ -199,6 +347,7 @@ const selectDraft = (draft: CreativeDraft) => {
   riskDialogOpen.value = false
   riskAcknowledged.value = false
   pendingRiskAction.value = null
+  pendingExtendedGeneration.value = null
   error.value = ''; notice.value = ''
 }
 
@@ -212,7 +361,7 @@ const loadDrafts = async (preferredId = '') => {
       || drafts.value[0]
     if (selected) selectDraft(selected)
     else { selectedDraftId.value = ''; workingData.value = null }
-  } catch (cause) { error.value = errorMessage(cause, '无法读取本集的本地 Qwen 创作草稿。') }
+  } catch (cause) { error.value = errorMessage(cause, '无法读取本集的创作草稿。') }
   finally { loading.value = false }
 }
 
@@ -220,34 +369,73 @@ const loadCapability = async () => {
   capabilityLoading.value = true
   try {
     capability.value = await creativeDraftRepository.capability()
-    if (!capability.value.providers?.some((provider) => provider.id === selectedProvider.value)) {
+    if (
+      !selectedProviderWasEdited.value
+      && capability.value.providers?.some((provider) => provider.id === capability.value?.defaultProvider)
+    ) {
+      selectedProvider.value = capability.value.defaultProvider || 'local_qwen'
+    } else if (!capability.value.providers?.some((provider) => provider.id === selectedProvider.value)) {
       selectedProvider.value = capability.value.defaultProvider || 'local_qwen'
     }
-    targetShotCount.value = Math.min(maxShots.value, Math.max(minShots.value, targetShotCount.value))
-  } catch (cause) { error.value = errorMessage(cause, '无法读取本地 Qwen 创作能力。') }
+    applySelectedProviderDefaultShotCount()
+  } catch (cause) { error.value = errorMessage(cause, '无法读取创作通道能力。') }
   finally { capabilityLoading.value = false }
 }
 
-const generate = async () => {
-  if (!activeEpisode.value || !generationReady.value) return
+const generate = async (
+  extendedGenerationConfirmed: boolean,
+  requestedCount: number,
+  provider: PromptProviderId,
+) => {
+  const providerCapability = promptProvider(capability.value?.providers, provider)
+  if (!activeEpisode.value || providerCapability?.ready !== true) return
+  const decision = providerShotCountDecision(requestedCount, provider)
+  if (!decision.valid) { error.value = decision.reason || '生成镜数不符合所选通道的当前配置。'; return }
   action.value = 'generate'; error.value = ''; notice.value = ''
   try {
     const draft = await creativeDraftRepository.generate(props.project.id, {
       episodeId: activeEpisode.value.id,
-      targetShotCount: Math.min(maxShots.value, Math.max(minShots.value, Number(targetShotCount.value))),
+      targetShotCount: requestedCount,
       creativity: creativity.value,
       variationNote: variationNote.value.trim(),
-      provider: selectedProvider.value,
+      provider,
+      extendedGenerationConfirmed,
     })
     await loadDrafts(draft.id)
   } catch (cause) {
-    const message = errorMessage(cause, '本地 Qwen 创作草稿生成失败，正式分镜未被修改。')
+    if (!extendedGenerationConfirmed && recoverExtendedGenerationConfirmation(cause, {
+      kind: 'generate', provider, targetShotCount: requestedCount,
+    })) return
+    const message = errorMessage(
+      cause,
+      `${providerCapability.label || '所选创作通道'}生成草稿失败，正式分镜未被修改。`,
+      provider,
+    )
     // The server deliberately persists a failed candidate for repair/retry
     // before returning 502. Reconcile so it never becomes invisible to users.
     await loadDrafts(persistedDraftIdFromError(cause))
     error.value = message
   }
   finally { action.value = '' }
+}
+
+const requestGenerate = () => {
+  if (!activeEpisode.value || !generationReady.value) return
+  const requestedCount = requestedTargetShotCount.value
+  const decision = providerShotCountDecision(requestedCount)
+  if (!decision.valid) { error.value = decision.reason || '生成镜数不符合所选通道的当前配置。'; return }
+  if (decision.confirmationRequired || visibleSourceExceedsBatchReference.value) {
+    error.value = ''; notice.value = ''
+    pendingExtendedGeneration.value = {
+      kind: 'generate', provider: selectedProvider.value, targetShotCount: requestedCount,
+      recommendedMaxShots: decision.recommendedMaximum,
+      batchShots: decision.batchReference,
+      sourceCharCount: authoritativeVisibleSourceChars.value,
+      maxSourceChars: maxSourceChars.value,
+    }
+    return
+  }
+  void generate(false, requestedCount, selectedProvider.value)
 }
 
 const replaceDraft = (draft: CreativeDraft) => {
@@ -273,28 +461,71 @@ const save = async () => {
   finally { action.value = '' }
 }
 
-const regenerate = async (shotKeys: string[] = []) => {
+const regenerate = async (
+  shotKeys: string[],
+  extendedGenerationConfirmed: boolean,
+  requestedCount: number,
+  provider: PromptProviderId,
+) => {
   const current = activeDraft.value
   if (!current) return
+  const decision = providerShotCountDecision(requestedCount, provider)
+  if (!decision.valid) { error.value = decision.reason || '生成镜数不符合所选通道的当前配置。'; return }
   action.value = 'regenerate'; actionShotKey.value = shotKeys[0] || ''; error.value = ''; notice.value = ''
   try {
     const saved = await saveCurrent() || current
     if (!saved.canRegenerate) throw new Error('当前草稿已不能重新生成，请刷新版本记录。')
     const next = await creativeDraftRepository.regenerate(saved.id, {
       expectedRevision: saved.revision,
-      targetShotCount: shotKeys.length ? undefined : targetShotCount.value,
+      targetShotCount: shotKeys.length ? undefined : requestedCount,
       creativity: creativity.value,
       variationNote: variationNote.value.trim(),
       shotKeys,
-      provider: selectedProvider.value,
+      provider,
+      extendedGenerationConfirmed,
     })
     await loadDrafts(next.id)
   } catch (cause) {
+    if (!extendedGenerationConfirmed && recoverExtendedGenerationConfirmation(cause, {
+      kind: 'regenerate', provider, targetShotCount: requestedCount, shotKeys: [...shotKeys],
+    })) return
     const message = errorMessage(cause, '重新生成失败；原草稿和正式分镜均保持不变。')
     await loadDrafts(persistedDraftIdFromError(cause) || current.id)
     error.value = message
   }
   finally { action.value = ''; actionShotKey.value = '' }
+}
+
+const requestRegenerate = (shotKeys: string[] = []) => {
+  if (!activeDraft.value) return
+  const requestedCount = shotKeys.length
+    ? (workingData.value?.shots.length || activeDraft.value.draftData.shots.length)
+    : requestedTargetShotCount.value
+  const decision = providerShotCountDecision(requestedCount)
+  if (!decision.valid) { error.value = decision.reason || '生成镜数不符合所选通道的当前配置。'; return }
+  if (decision.confirmationRequired || (!shotKeys.length && visibleSourceExceedsBatchReference.value)) {
+    error.value = ''; notice.value = ''
+    pendingExtendedGeneration.value = {
+      kind: 'regenerate', provider: selectedProvider.value, targetShotCount: requestedCount, shotKeys: [...shotKeys],
+      recommendedMaxShots: decision.recommendedMaximum,
+      batchShots: decision.batchReference,
+      sourceCharCount: authoritativeVisibleSourceChars.value,
+      maxSourceChars: maxSourceChars.value,
+    }
+    return
+  }
+  void regenerate(shotKeys, false, requestedCount, selectedProvider.value)
+}
+
+const continueExtendedGeneration = async () => {
+  const pending = pendingExtendedGeneration.value
+  if (!pending) return
+  closeExtendedGenerationDialog()
+  if (pending.kind === 'generate') {
+    await generate(true, pending.targetShotCount, pending.provider)
+    return
+  }
+  await regenerate(pending.shotKeys, true, pending.targetShotCount, pending.provider)
 }
 
 const confirmReview = async (reviewAcknowledged = false) => {
@@ -374,7 +605,8 @@ const entityName = (kind: 'character'|'scene'|'prop', id: string) => {
 }
 const setDuration = (shotIndex: number, value: unknown) => {
   if (!workingData.value) return
-  const seconds = Math.min(15, Math.max(5, Number(value || 5)))
+  const seconds = Number(value)
+  if (!Number.isFinite(seconds) || seconds <= 0) return
   workingData.value.shots[shotIndex].durationMs = Math.round(seconds * 1000)
 }
 const setIncludeAudio = (shotIndex: number, enabled: boolean) => {
@@ -403,7 +635,18 @@ watch(() => props.project.episodes.map((item) => item.id).join('|'), () => {
     selectedEpisodeId.value = props.initialEpisodeId || props.project.episodes[0]?.id || ''
   }
 })
-watch(selectedEpisodeId, () => loadDrafts())
+watch(selectedEpisodeId, () => {
+  closeExtendedGenerationDialog()
+  void loadDrafts()
+})
+watch(selectedProvider, () => {
+  closeExtendedGenerationDialog()
+  applySelectedProviderDefaultShotCount()
+})
+watch(targetShotCount, () => {
+  const pending = pendingExtendedGeneration.value
+  if (pending && Number(targetShotCount.value) !== pending.targetShotCount) closeExtendedGenerationDialog()
+})
 watch(() => JSON.stringify(workingData.value), () => {
   if (dirty.value) {
     englishReviewAcknowledged.value = false
@@ -418,42 +661,42 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
     <header class="creative-header">
       <div class="creative-title">
         <div><WandSparkles :size="21"/></div>
-        <span><small>LOCAL QWEN STORY AUTHORING</small><strong>结构化双语分镜草稿</strong><p>根据全剧说明、剧本、本集梗概、风格、Bible 与术语表补全；生成结果先进入草稿沙箱，不会直接生产。</p></span>
+        <span><small>STRUCTURED AI STORY AUTHORING</small><strong>结构化双语分镜草稿</strong><p>根据全剧说明、剧本、本集梗概、风格、Bible 与术语表补全；生成结果先进入草稿沙箱，不会直接生产。</p></span>
       </div>
       <span v-if="capability" :class="['capability-pill',{ready:generationReady}]">
-        {{ generationReady ? `${selectedProviderCapability?.label || '所选通道'}已就绪` : '创作通道未就绪' }}<template v-if="selectedProvider==='local_qwen'"> · {{ capability.device.toUpperCase() }} 按需加载</template>
+        {{ generationReady ? `${selectedProviderCapability?.label || '所选通道'}已就绪` : '创作通道未就绪' }}<template v-if="selectedProvider==='local_qwen'"> · {{ selectedProviderCapability?.device ? selectedProviderCapability.device.toUpperCase() : '设备未报告' }}<template v-if="selectedProviderCapability?.loadedOnDemand"> 按需加载</template></template>
       </span>
     </header>
 
     <div v-if="!project.episodes.length" class="creative-empty">
-      <Sparkles :size="22"/><strong>请先新增一个剧集</strong><p>剧集标题和梗概是本地 Qwen 定位本集剧情的必要上下文。</p>
+      <Sparkles :size="22"/><strong>请先新增一个剧集</strong><p>剧集标题和梗概是创作通道定位本集剧情的必要上下文。</p>
     </div>
     <template v-else>
       <div class="source-snapshot">
         <div><span>创作对象</span><select v-model="selectedEpisodeId"><option v-for="episode in project.episodes" :key="episode.id" :value="episode.id">第 {{ episode.number }} 集 · {{ episode.title }}</option></select></div>
-        <div><span>权威输入 · 服务端只读</span><p><b>全剧：</b>{{ project.logline || '未填写一句话说明' }}</p><p><b>本集：</b>{{ activeEpisode?.synopsis || '未填写本集梗概' }}</p><small>全剧母稿 {{ project.masterScript.length }} 字 · 本集剧本 {{ activeEpisode?.script?.length || 0 }} 字 · 本页可见源约 {{ contextEstimate }} 字；服务端还会加入风格、Bible 和 canonical 术语。</small></div>
+        <div><span>权威输入 · 服务端只读</span><p><b>全剧：</b>{{ project.logline || '未填写一句话说明' }}</p><p><b>本集：</b>{{ activeEpisode?.synopsis || '未填写本集梗概' }}</p><small>全剧母稿 {{ project.masterScript.length }} 字 · 本集剧本 {{ activeEpisode?.script?.length || 0 }} 字 · 本次优先权威源 {{ authoritativeVisibleSourceChars }} 字；服务端还会加入风格、Bible 和 canonical 术语。</small></div>
       </div>
 
       <div class="generation-controls">
-        <label><span>处理通道</span><select v-model="selectedProvider" :disabled="Boolean(action)"><option v-for="provider in capability?.providers || []" :key="provider.id" :value="provider.id" :disabled="!provider.ready">{{ provider.label }}{{ provider.ready ? '' : '（未就绪）' }}</option></select><small>{{ selectedProvider==='deepseek_api' ? '外部 API，通常响应更快。' : '默认本地处理，不发送项目上下文。' }}</small></label>
-        <label><span>生成镜数</span><input v-model.number="targetShotCount" type="number" :min="minShots" :max="maxShots"><small>{{ normalizedTargetShotCount }} 镜总时长约 {{ targetDurationRange.min }}–{{ targetDurationRange.max }} 秒（每镜 5–15 秒）；多个快速动作可组成一条连续动作链。</small></label>
+        <label><span>处理通道</span><select v-model="selectedProvider" :disabled="Boolean(action)" @change="selectedProviderWasEdited=true"><option v-for="provider in capability?.providers || []" :key="provider.id" :value="provider.id" :disabled="!provider.ready">{{ provider.label }}{{ provider.ready ? '' : '（未就绪）' }}</option></select><small>{{ selectedProvider==='deepseek_api' ? '外部 API，通常响应更快。' : '默认本地处理，不发送项目上下文。' }}</small></label>
+        <label><span>生成镜数</span><input v-model.number="targetShotCount" type="number" :min="minShots" :aria-invalid="Boolean(targetShotCountError)" @input="targetShotCountWasEdited=true"><small v-if="targetShotCountError" class="field-error">{{ targetShotCountError }}</small><small v-else-if="targetShotCountNeedsConfirmation" class="field-warning">{{ requestedTargetShotCount }} 镜超过当前单次建议值；点击生成后确认，系统会按原镜数提交。</small><small v-else-if="targetDurationRange">{{ requestedTargetShotCount }} 镜总时长约 {{ targetDurationRange.min }}–{{ targetDurationRange.max }} 秒（每镜 {{ shotDurationGuide }}）；多个快速动作可组成一条连续动作链。</small><small v-else>镜头时长由所选通道的服务端配置决定；多个快速动作可组成一条连续动作链。</small></label>
         <label><span>创意幅度</span><select v-model="creativity"><option value="conservative">保守补全 · 忠于原剧本</option><option value="balanced">均衡创作 · 推荐</option><option value="bold">大胆变化 · 仍锁定事实</option></select><small>不会改写人物身份、对白正文或事件顺序。</small></label>
         <label class="variation"><span>本次创作要求（可选）</span><input v-model="variationNote" placeholder="例如：加强雨夜压迫感，运镜更克制；不要新增角色"><small>只影响构图、运镜、节奏和声景，不替代剧本事实。</small></label>
-        <button class="creative-primary" :disabled="Boolean(action)||capabilityLoading||!generationReady||!activeEpisode||visibleSourceTooLong" title="4 镜实测约 12 分钟；CPU 子进程最长运行 15 分钟，服务端最迟 16 分钟结束，页面等待至 17 分钟" @click="generate">
-          <LoaderCircle v-if="action==='generate'" class="spin" :size="14"/><Sparkles v-else :size="14"/>{{ action==='generate'?'本地生成中，请勿重复提交…':'生成新草稿' }}
+        <button class="creative-primary" :disabled="Boolean(action)||capabilityLoading||!generationReady||!activeEpisode||Boolean(targetShotCountError)" :title="generationNeedsConfirmation?'当前镜数或权威剧本超过单批建议参考值；点击后确认是否继续。':'按当前镜数生成一份可审核草稿。'" @click="requestGenerate">
+          <LoaderCircle v-if="action==='generate'" class="spin" :size="14"/><Sparkles v-else :size="14"/>{{ action==='generate'?(selectedProvider==='deepseek_api'?'DeepSeek 生成中，请勿重复提交…':'本地生成中，请勿重复提交…'):'生成新草稿' }}
         </button>
       </div>
       <div v-if="providerEgressNotice" class="creative-alert egress"><AlertTriangle :size="14"/><span><strong>外部 API 数据发送提示：</strong>{{ providerEgressNotice }}</span></div>
       <div v-if="capability" class="creative-budget-guide">
         <Clock3 :size="15"/>
         <span>
-          <strong>1–2 镜更适合反复迭代；4 镜实测约 12 分钟</strong>
-          <small>输出容量由镜数 + 剧本中的权威对白共同决定。<template v-if="baselineOutputBudget&&configuredOutputBudget">{{ maxShots }} 镜无权威对白时基础量约 {{ baselineOutputBudget }}，本机单次上限 {{ configuredOutputBudget }}；</template>预计超过上限会在加载模型前要求拆段。若运行后仍提示容量用尽或未进入修复，请改为 1–2 镜并按对白边界拆分。</small>
+          <strong>{{ recommendedMaxShots ? `所选通道建议单次不超过 ${recommendedMaxShots} 镜；更多镜头会先请你确认` : '镜数越多，生成整份草稿所需时间越长' }}</strong>
+          <small>输出容量由镜数 + 剧本中的权威对白共同决定。<template v-if="maxDialoguePerShot">每镜建议承载不超过 {{ maxDialoguePerShot }} 句权威对白；</template><template v-if="baselineOutputBudget&&configuredOutputBudget">建议镜数无权威对白时基础量约 {{ baselineOutputBudget }}，当前配置单次输出参考 {{ configuredOutputBudget }}；</template><template v-if="providerTimingGuide">{{ providerTimingGuide }}；</template>超过建议镜数不会被自动改小或直接阻止，确认后会按原镜数提交。<template v-if="batchShots">所选通道当前单次批次能力参考为 {{ batchShots }} 镜。</template></small>
         </span>
       </div>
-      <div class="action-timing-guide"><Clock3 :size="15"/><span><strong>动作密集时可提高每镜时长，或压缩单个动作节奏</strong><small>镜数不会把每镜锁死为 5 秒：例如 2 镜最多可承载 30 秒。系统会在 5–15 秒内分配每镜时长；同一连贯动作弧可包含多个快速动作。最终仍请人工核对动作可读性与剧本覆盖。</small></span></div>
+      <div class="action-timing-guide"><Clock3 :size="15"/><span><strong>动作密集时可提高每镜时长，或压缩单个动作节奏</strong><small>系统会按所选通道当前配置的 {{ shotDurationGuide }} 分配每镜时长；同一连贯动作弧可包含多个快速动作。最终仍请人工核对动作可读性与剧本覆盖。</small></span></div>
       <div v-if="capability&&!generationReady" class="creative-alert"><AlertTriangle :size="14"/><span>{{ selectedProviderCapability?.notice || capability.notice || '所选创作通道尚未配置。' }}</span></div>
-      <div v-if="visibleSourceTooLong" class="creative-alert error"><AlertTriangle :size="14"/><span>当前可见剧本源已超过本地模型 {{ capability?.maxSourceChars }} 字上限；请拆分本集剧本或缩短全剧母稿后再生成。</span></div>
+      <div v-if="visibleSourceExceedsBatchReference" class="creative-alert"><AlertTriangle :size="14"/><span>当前权威剧本源超过所选通道单批 {{ maxSourceChars }} 字参考值。点击生成后需先确认；服务端会按连续片段自动拆批并保留完整剧本与原镜数，批次数、等待时间和 API 用量可能增加。</span></div>
       <div v-if="notice" class="creative-alert success"><Check :size="14"/><span>{{ notice }}</span></div>
       <div v-if="error&&!emptyFailedDraft" class="creative-alert error"><AlertTriangle :size="14"/><span>{{ error }}</span></div>
 
@@ -470,8 +713,8 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
         <div v-if="emptyFailedDraft" class="creative-failed-empty">
           <div class="failed-empty-icon"><AlertTriangle :size="21"/></div>
           <div><small>FAILED AUDIT RECORD · 0 USABLE SHOTS</small><strong>本次生成未产出可编辑镜头</strong><div v-if="failedDraftDiagnostic.code" class="failed-safe-diagnostic"><code>{{ failedDraftDiagnostic.code }}</code><span v-if="failedDraftDiagnostic.path">问题位置：<code>{{ failedDraftDiagnostic.path }}</code></span></div><p>{{ failedDraftReason }}</p><p>“0 镜”只是保留用于追踪的失败记录，不是可保存的空草稿；正式分镜、提示词和生产任务均未修改。</p></div>
-          <button v-if="activeDraft.contextCurrent&&activeDraft.canRegenerate" type="button" :disabled="Boolean(action)" @click="regenerate()"><LoaderCircle v-if="action==='regenerate'" class="spin" :size="14"/><RotateCcw v-else :size="14"/>{{ action==='regenerate'?'正在重试整稿…':'一键重试整稿' }}</button>
-          <button v-else type="button" :disabled="Boolean(action)||!generationReady||visibleSourceTooLong" @click="generate"><LoaderCircle v-if="action==='generate'" class="spin" :size="14"/><Sparkles v-else :size="14"/>按当前故事生成新草稿</button>
+          <button v-if="activeDraft.contextCurrent&&activeDraft.canRegenerate" type="button" :disabled="Boolean(action)||Boolean(targetShotCountError)" @click="requestRegenerate()"><LoaderCircle v-if="action==='regenerate'" class="spin" :size="14"/><RotateCcw v-else :size="14"/>{{ action==='regenerate'?'正在重试整稿…':'一键重试整稿' }}</button>
+          <button v-else type="button" :disabled="Boolean(action)||!generationReady||Boolean(targetShotCountError)" @click="requestGenerate"><LoaderCircle v-if="action==='generate'" class="spin" :size="14"/><Sparkles v-else :size="14"/>按当前故事生成新草稿</button>
         </div>
         <template v-else>
           <div v-if="!activeDraft.contextCurrent" class="creative-alert error"><AlertTriangle :size="14"/><span>项目说明、剧本、Bible 或术语表已变化。本版本失效且不能应用，请重新生成。</span></div>
@@ -479,7 +722,7 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
         <div class="validation-strip" :class="[displayedValidationStatus,{review:reviewIssueCount}]">
           <ShieldCheck v-if="!dirty&&!reviewIssueCount&&['passed','ready'].includes(displayedValidationStatus)" :size="15"/><AlertTriangle v-else :size="15"/>
           <span>
-            <strong>{{ dirty?'当前修改待重新检查':reviewIssueCount?`已生成 · 待人工修正（${reviewIssueCount} 项）`:displayedValidationStatus==='failed'?'历史结构校验未通过':'已生成 · 可确认' }}</strong>
+            <strong>{{ dirty?'当前修改待重新检查':reviewIssueCount?`已生成 · 待人工修正（${reviewIssueCount} 项）`:displayedValidationStatus==='failed'?'该版本结构校验未通过':'已生成 · 可确认' }}</strong>
             <small>{{ dirty?'保存后会重新计算问题清单；保存草稿本身不受内容风险限制。':reviewIssueCount?'这些是小模型可能产生的偏差，可直接修改、逐镜重生，或在明确知情后继续。':'当前没有发现需要特别提醒的内容问题，仍建议人工浏览后确认。' }}</small>
           </span>
           <b>{{ workingData.shots.length }} 镜 · {{ totalDuration.toFixed(1) }} 秒</b>
@@ -506,7 +749,7 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
         <div class="shot-selection-bar">
           <button class="plain" @click="toggleAll"><Check :size="12"/>{{ selectedCount===workingData.shots.length?'取消全选':'全选' }}</button>
           <span>已选 {{ selectedCount }}/{{ workingData.shots.length }} 镜；可单镜重新生成或只应用所选镜头。</span>
-          <button :disabled="Boolean(action)||!activeDraft.canRegenerate||!selectedCount" @click="regenerate(selectedShotKeys)"><RotateCcw :size="12"/>重生成已选</button>
+          <button :disabled="Boolean(action)||!activeDraft.canRegenerate||!selectedCount" @click="requestRegenerate(selectedShotKeys)"><RotateCcw :size="12"/>重生成已选</button>
         </div>
 
         <div class="creative-shots">
@@ -518,16 +761,16 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
               <span class="shot-metrics"><Clock3 :size="12"/>{{ (shot.durationMs/1000).toFixed(1) }}s · {{ shot.h3Mode }} · {{ shot.includeAudio?'含音频':'静音' }}</span>
             </summary>
             <div class="shot-body">
-              <div class="shot-rules"><ShieldCheck :size="14"/><span>质量合同：5–15 秒、一个连贯动作弧、一个有动机的运镜；动作弧可包含多个节奏清楚的快速连续动作，叙事写清 setup → action chain → end state，连续性写清 in/out。人物、场景、道具和原对白被锁定。</span><button :disabled="Boolean(action)||!activeDraft.canRegenerate" @click="regenerate([shot.clientKey])"><LoaderCircle v-if="action==='regenerate'&&actionShotKey===shot.clientKey" class="spin" :size="12"/><RotateCcw v-else :size="12"/>仅重新生成此镜</button></div>
-              <div class="shot-settings"><label :id="fieldDomId(index,'durationMs')"><span>时长（秒）</span><input type="number" min="5" max="15" step="0.5" :value="shot.durationMs/1000" :disabled="!editable" @change="setDuration(index,($event.target as HTMLInputElement).value)"></label><label :id="fieldDomId(index,'h3Mode')"><span>H3 模式意图</span><select v-model="shot.h3Mode" :disabled="!editable"><option value="T2VA">T2VA 文生视频</option><option value="I2VA">I2VA 首帧</option><option value="L2VA">L2VA 尾帧</option><option value="FL2VA">FL2VA 首尾帧</option><option value="Ref2VA">Ref2VA 参考生视频</option></select><small>没有合规参考槽位时，应用会安全降为 T2VA；之后可在分镜编辑器绑定首尾帧。</small></label><label :id="fieldDomId(index,'includeAudio')" class="audio-toggle"><input :checked="shot.includeAudio" type="checkbox" :disabled="!editable" @change="setIncludeAudio(index,($event.target as HTMLInputElement).checked)"><span>原生音频</span></label></div>
+              <div class="shot-rules"><ShieldCheck :size="14"/><span>质量合同：{{ shotDurationGuide }}、一个连贯动作弧、一个有动机的运镜；动作弧可包含多个节奏清楚的快速连续动作，叙事写清 setup → action chain → end state，连续性写清 in/out。人物、场景、道具和原对白被锁定。</span><button :disabled="Boolean(action)||!activeDraft.canRegenerate" @click="requestRegenerate([shot.clientKey])"><LoaderCircle v-if="action==='regenerate'&&actionShotKey===shot.clientKey" class="spin" :size="12"/><RotateCcw v-else :size="12"/>仅重新生成此镜</button></div>
+              <div class="shot-settings"><label :id="fieldDomId(index,'durationMs')"><span>时长（秒）</span><input type="number" :min="minShotDurationSeconds" :max="maxShotDurationSeconds" step="0.5" :value="shot.durationMs/1000" :disabled="!editable" @change="setDuration(index,($event.target as HTMLInputElement).value)"></label><label :id="fieldDomId(index,'h3Mode')"><span>H3 模式意图</span><select v-model="shot.h3Mode" :disabled="!editable"><option value="T2VA">T2VA 文生视频</option><option value="I2VA">I2VA 首帧</option><option value="L2VA">L2VA 尾帧</option><option value="FL2VA">FL2VA 首尾帧</option><option value="Ref2VA">Ref2VA 参考生视频</option></select><small>没有合规参考槽位时，应用会安全降为 T2VA；之后可在分镜编辑器绑定首尾帧。</small></label><label :id="fieldDomId(index,'includeAudio')" class="audio-toggle"><input :checked="shot.includeAudio" type="checkbox" :disabled="!editable" @change="setIncludeAudio(index,($event.target as HTMLInputElement).checked)"><span>原生音频</span></label></div>
               <div class="bible-locks"><span><Lock :size="12"/>Bible 白名单 · 只读</span><i v-for="id in shot.characterIds" :key="`c-${id}`"><UserRound :size="11"/>{{ entityName('character',id) }}</i><i v-if="shot.sceneId"><MapPin :size="11"/>{{ entityName('scene',shot.sceneId) }}</i><i v-for="id in shot.propIds" :key="`p-${id}`"><Box :size="11"/>{{ entityName('prop',id) }}</i><small v-if="!shot.characterIds.length&&!shot.sceneId&&!shot.propIds.length">本镜未绑定 Bible 实体；如不符合剧本，请仅重新生成此镜。</small><div v-for="field in relationReviewFields" :id="fieldDomId(index,field)" :key="field" class="relation-review-anchor"><small v-for="issue in issuesForField(index,field)" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></div></div>
               <div class="bilingual-grid">
                 <label :id="fieldDomId(index,'titleZh')"><span>中文镜头标题</span><input v-model="shot.titleZh" :disabled="!editable"><small v-for="issue in issuesForField(index,'titleZh')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
                 <label :id="fieldDomId(index,'titleEn')" class="english"><span>English shot title</span><input v-model="shot.titleEn" :disabled="!editable"><small v-for="issue in issuesForField(index,'titleEn')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
                 <label :id="fieldDomId(index,'narrativeZh')"><span>中文叙事结构 · setup → 主动作 → end state</span><textarea v-model="shot.narrativeZh" rows="4" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'narrativeZh')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
-                <label :id="fieldDomId(index,'narrativeEn')" class="english"><span class="bounded-field-title"><b>English narrative structure</b><small :class="{ warning: shot.narrativeEn.length >= CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor, overflow: shot.narrativeEn.length > CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor }">生成≤{{ CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.generation }} · 编辑 {{ shot.narrativeEn.length }}/{{ CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor }}</small></span><textarea v-model="shot.narrativeEn" rows="4" :maxlength="CREATIVE_DRAFT_ENGLISH_LIMITS.narrative.editor" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'narrativeEn')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
+                <label :id="fieldDomId(index,'narrativeEn')" class="english"><span class="bounded-field-title"><b>English narrative structure</b><small :class="{ warning: selectedProviderCapability?.recommendedNarrativeEnChars !== undefined && shot.narrativeEn.length > selectedProviderCapability.recommendedNarrativeEnChars }">建议≤{{ selectedProviderCapability?.recommendedNarrativeEnChars ?? '—' }} · 当前 {{ shot.narrativeEn.length }}</small></span><textarea v-model="shot.narrativeEn" rows="4" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'narrativeEn')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
                 <label :id="fieldDomId(index,'actionZh')"><span>本镜连续动作链 / 主动作摘要</span><textarea v-model="shot.actionZh" rows="3" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'actionZh')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
-                <label :id="fieldDomId(index,'actionEn')" class="english"><span class="bounded-field-title"><b>English action chain / primary-action summary</b><small :class="{ warning: shot.actionEn.length >= CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor, overflow: shot.actionEn.length > CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor }">生成≤{{ CREATIVE_DRAFT_ENGLISH_LIMITS.action.generation }} · 编辑 {{ shot.actionEn.length }}/{{ CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor }}</small></span><textarea v-model="shot.actionEn" rows="3" :maxlength="CREATIVE_DRAFT_ENGLISH_LIMITS.action.editor" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'actionEn')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
+                <label :id="fieldDomId(index,'actionEn')" class="english"><span class="bounded-field-title"><b>English action chain / primary-action summary</b><small :class="{ warning: selectedProviderCapability?.recommendedActionEnChars !== undefined && shot.actionEn.length > selectedProviderCapability.recommendedActionEnChars }">建议≤{{ selectedProviderCapability?.recommendedActionEnChars ?? '—' }} · 当前 {{ shot.actionEn.length }}</small></span><textarea v-model="shot.actionEn" rows="3" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'actionEn')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
                 <label :id="fieldDomId(index,'cameraZh')"><span>中文单一运镜 + 动机</span><textarea v-model="shot.cameraZh" rows="3" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'cameraZh')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
                 <label :id="fieldDomId(index,'cameraEn')" class="english"><span>English single camera move + motivation</span><textarea v-model="shot.cameraEn" rows="3" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'cameraEn')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
                 <label :id="fieldDomId(index,'continuityZh')"><span>中文 continuity in / out</span><textarea v-model="shot.continuityZh" rows="3" :disabled="!editable"></textarea><small v-for="issue in issuesForField(index,'continuityZh')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
@@ -545,12 +788,26 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
         </div>
 
         <footer class="draft-actions">
-          <div><span v-if="dirty" class="dirty-dot">有未保存修改 · 保存后问题清单会重新计算</span><span v-else>修订 {{ activeDraft.revision }} · {{ activeDraft.updatedAt ? new Date(activeDraft.updatedAt).toLocaleString('zh-CN') : '刚刚更新' }}</span><button :disabled="Boolean(action)||!dirty||!editable" title="保存始终允许；服务端会重新计算人工检查项" @click="save"><LoaderCircle v-if="action==='save'" class="spin" :size="12"/><Save v-else :size="12"/>保存并重新检查</button><button :disabled="Boolean(action)||!activeDraft.canRegenerate" @click="regenerate()"><RotateCcw :size="12"/>整稿重新生成</button><button class="confirm" :disabled="Boolean(action)||!canConfirm" @click="requestConfirm"><Check :size="12"/>{{ reviewIssueCount?'查看风险并确认':'确认整份草稿' }}</button></div>
+          <div><span v-if="dirty" class="dirty-dot">有未保存修改 · 保存后问题清单会重新计算</span><span v-else>修订 {{ activeDraft.revision }} · {{ activeDraft.updatedAt ? new Date(activeDraft.updatedAt).toLocaleString('zh-CN') : '刚刚更新' }}</span><button :disabled="Boolean(action)||!dirty||!editable" title="保存始终允许；服务端会重新计算人工检查项" @click="save"><LoaderCircle v-if="action==='save'" class="spin" :size="12"/><Save v-else :size="12"/>保存并重新检查</button><button :disabled="Boolean(action)||!activeDraft.canRegenerate||Boolean(targetShotCountError)" @click="requestRegenerate()"><RotateCcw :size="12"/>整稿重新生成</button><button class="confirm" :disabled="Boolean(action)||!canConfirm" @click="requestConfirm"><Check :size="12"/>{{ reviewIssueCount?'查看风险并确认':'确认整份草稿' }}</button></div>
           <div class="apply-zone"><header><span><strong>应用到正式分镜</strong><small>这是唯一会改变正式剧集的步骤；内容风险不会锁死按钮，但会要求再次明确确认。</small></span><select v-model="placement" :disabled="!canApply"><option value="replace">替换本集现有分镜</option><option value="append">追加到本集末尾</option></select></header><div v-if="requiresEditCount" class="requires-edit-note"><AlertTriangle :size="13"/>还有 {{ requiresEditCount }} 项未知素材、说话人或数据引用。它们不是内容审核，但为避免写入无效 ID，正式应用前必须替换、删除或重新生成对应镜头。</div><label class="review-ack"><input v-model="englishReviewAcknowledged" type="checkbox" :disabled="!canApply"><span>我已逐项核对英文中的人物、方位、动作、运镜、数字、道具部位和连续性；允许写入已确认翻译。</span></label><div><button :disabled="Boolean(action)||!canApply||!selectedCount" @click="requestApply('chinese_only',selectedShotKeys.length===workingData.shots.length?[]:selectedShotKeys)"><Languages :size="13"/>{{ selectedCount===workingData.shots.length?'整批仅采用中文':`仅采用中文 · ${selectedCount} 镜` }}</button><button class="bilingual-apply" :disabled="Boolean(action)||!canApply||!selectedCount||!englishReviewAcknowledged" @click="requestApply('bilingual_confirmed',selectedShotKeys.length===workingData.shots.length?[]:selectedShotKeys)"><ShieldCheck :size="13"/>{{ selectedCount===workingData.shots.length?'采用已审中英整集':`采用已审中英 · ${selectedCount} 镜` }}</button></div></div>
         </footer>
         </template>
       </template>
     </template>
+    <BaseModal
+      :open="Boolean(pendingExtendedGeneration)"
+      title="确认继续生成较长草稿"
+      eyebrow="EXTENDED GENERATION"
+      width="560px"
+      @close="closeExtendedGenerationDialog"
+    >
+      <div v-if="pendingExtendedGeneration" class="extended-generation-confirm">
+        <div><Clock3 :size="20"/><span><strong>{{ pendingExtendedProviderCapability?.label || '所选创作通道' }} · {{ pendingExtendedGeneration.targetShotCount }} 镜</strong><small><template v-if="pendingExtendedRecommendedMaxShots&&pendingExtendedGeneration.targetShotCount>pendingExtendedRecommendedMaxShots">当前镜数超过建议单次 {{ pendingExtendedRecommendedMaxShots }} 镜；</template><template v-if="pendingExtendedSourceCharCount&&pendingExtendedMaxSourceChars&&pendingExtendedSourceCharCount>pendingExtendedMaxSourceChars">权威剧本 {{ pendingExtendedSourceCharCount }} 字符超过单批 {{ pendingExtendedMaxSourceChars }} 字符参考值；</template><template v-if="pendingExtendedGeneration.requiredDialogueCount!==undefined&&pendingExtendedGeneration.dialogueCapacity!==undefined&&pendingExtendedGeneration.requiredDialogueCount>pendingExtendedGeneration.dialogueCapacity">权威对白 {{ pendingExtendedGeneration.requiredDialogueCount }} 句超过当前建议容量 {{ pendingExtendedGeneration.dialogueCapacity }} 句（配置 {{ pendingExtendedGeneration.maxDialoguePerShot ?? '—' }} 句/镜，本次有效值 {{ pendingExtendedGeneration.effectiveMaxDialoguePerShot ?? '—' }} 句/镜）；</template><template v-if="pendingExtendedBatchShots">镜头批次能力参考为 {{ pendingExtendedBatchShots }} 镜；</template>这些数值用于长任务提醒，不限制整剧或单集总镜数。</small></span></div>
+        <p v-if="pendingExtendedIsBatchable">继续后系统会按 {{ pendingExtendedGeneration.targetShotCount }} 镜和完整权威剧本原样提交，不会截断内容；服务端会按所选通道配置自动拆分连续批次。平台后续按分集、批次和逐镜执行生产；模型通道差异只会影响等待时间<template v-if="pendingExtendedGeneration.provider==='deepseek_api'">与外部 API 用量</template>。草稿完成后仍需人工审核，且不会在此步骤创建视频任务或修改正式分镜。</p>
+        <p v-else>继续后会按原镜数重生成所选镜头，并保留其他镜头。选镜重生成需携带完整旧草稿，仍使用所选通道的单次协议；若超出当前可配置的 source、regeneration context 或 token 预算，服务端会在调用模型前明确提示调整配置，不会截断上下文或改写正式分镜。</p>
+      </div>
+      <template #footer><button type="button" class="button ghost" @click="closeExtendedGenerationDialog">取消</button><button type="button" class="button primary" @click="continueExtendedGeneration"><Sparkles :size="14"/>仍然生成 {{ pendingExtendedGeneration?.targetShotCount }} 镜</button></template>
+    </BaseModal>
     <div v-if="riskDialogOpen&&pendingRiskAction" class="review-risk-backdrop" @click.self="closeRiskDialog">
       <section class="review-risk-dialog" role="dialog" aria-modal="true" aria-labelledby="review-risk-title">
         <header><AlertTriangle :size="18"/><span><strong id="review-risk-title">草稿仍有 {{ reviewIssueCount }} 项待人工判断</strong><small>{{ pendingRiskAction.kind==='confirm'?'确认后仍可在应用前复核。':'继续后会把当前选择写入正式分镜。' }}</small></span></header>
@@ -582,4 +839,6 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
 .field-review-issue{display:flex!important;align-items:flex-start;gap:4px;padding:5px 6px;border:1px solid rgba(218,158,73,.2);border-radius:5px;background:rgba(218,158,73,.05);color:#c9a064!important;font-size:8px!important;line-height:1.45}.field-review-issue svg{flex:0 0 auto;margin-top:1px}.field-review-issue em{display:block;color:#849099;font-style:normal}.dialogue-review-anchor:empty,.relation-review-anchor:empty{display:none}.dialogue-review-anchor,.relation-review-anchor{display:grid;gap:4px;width:100%}
 .review-risk-backdrop{position:fixed;inset:0;z-index:1200;display:grid;place-items:center;padding:20px;background:rgba(2,5,8,.76);backdrop-filter:blur(4px)}.review-risk-dialog{width:min(560px,100%);display:grid;gap:12px;padding:17px;border:1px solid rgba(218,158,73,.3);border-radius:11px;background:#0d1217;box-shadow:0 24px 80px rgba(0,0,0,.55)}.review-risk-dialog>header{display:flex;align-items:flex-start;gap:9px;color:#d8a65f}.review-risk-dialog>header>span{display:grid;gap:2px}.review-risk-dialog>header small,.review-risk-dialog>p,.more-review-issues{color:#7f8991;font-size:9px;line-height:1.5}.review-risk-dialog>p{margin:0}.review-risk-dialog>ul{display:grid;gap:5px;max-height:210px;overflow:auto;margin:0;padding:0;list-style:none}.review-risk-dialog>ul li{display:grid;grid-template-columns:115px 1fr;gap:8px;padding:7px;border-radius:5px;background:#090d11;font-size:9px}.review-risk-dialog>ul b{color:#87929b}.review-risk-dialog>ul span{color:#c5a06a}.requires-edit-note{display:flex;align-items:flex-start;gap:6px;padding:7px;border:1px solid rgba(223,101,90,.22);border-radius:5px;background:rgba(223,101,90,.05);color:#d78278;font-size:9px;line-height:1.45}.risk-ack{display:flex;align-items:flex-start;gap:7px;color:#a8b1b7;font-size:9px;line-height:1.5}.risk-ack input{margin-top:2px}.review-risk-dialog>footer{display:flex;justify-content:flex-end;gap:7px}.review-risk-dialog>footer button{min-height:31px;padding:7px 10px;border:1px solid #303941;border-radius:6px;background:#151b21;color:#aeb7bd;font-size:9px;cursor:pointer}.review-risk-dialog>footer button.continue{display:inline-flex;align-items:center;gap:5px;border-color:rgba(218,158,73,.35);background:#725226;color:#fff}.review-risk-dialog>footer button:disabled{opacity:.4;cursor:not-allowed}
 @media(max-width:900px){.review-issues li{align-items:flex-start;flex-direction:column}.review-risk-dialog>ul li{grid-template-columns:1fr}.review-risk-dialog>footer{flex-direction:column-reverse}.review-risk-dialog>footer button{width:100%}}
+.generation-controls small.field-error{color:#df8177}.generation-controls small.field-warning{color:#d2a15c}
+.extended-generation-confirm{display:grid;gap:14px}.extended-generation-confirm>div{display:flex;align-items:flex-start;gap:10px;padding:12px;border:1px solid rgba(218,158,73,.24);border-radius:8px;background:rgba(218,158,73,.055);color:#d2a15c}.extended-generation-confirm>div>span{display:grid;gap:4px}.extended-generation-confirm strong{font-size:11px;color:#d8b276}.extended-generation-confirm small,.extended-generation-confirm p{color:#858d94;font-size:9px;line-height:1.6}.extended-generation-confirm p{margin:0}
 </style>

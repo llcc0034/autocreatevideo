@@ -8,6 +8,7 @@ import {
   reconcileTranslationDrafts,
   translationEntryIdentity,
   translationFieldIdentity,
+  translationReviewRequestError,
   translationReviewStatus,
 } from '@/services/translationReview'
 import type {
@@ -238,7 +239,7 @@ const translateOne = async (field: PromptTranslationField) => {
       ? await repository.retranslateProjectField(current.id, field.sourceText, selectedProvider.value)
       : (await repository.translateProjectFields(props.projectId, [field], selectedProvider.value))[0]
     if (row && requestContext === `${props.projectId}:${props.episodeId}:${props.shotId}`) upsertEntries([row])
-  } catch (cause) { error.value = cause instanceof Error ? cause.message : `${field.label}翻译失败，中文原文未被修改` }
+  } catch (cause) { error.value = translationReviewRequestError(cause, `${field.label}翻译失败，中文原文未被修改。`) }
   finally { const next = { ...busy.value }; delete next[key]; busy.value = next }
 }
 
@@ -262,7 +263,7 @@ const confirm = async (field: PromptTranslationField) => {
       if (promotedFields.length) emit('promoted', { shotId: row.scopeId || requestShotId, promotedFields, entries: [row], shotPatch: {} })
     } else upsertEntries([row])
   }
-  catch (cause) { error.value = cause instanceof Error ? cause.message : `${field.label}确认失败` }
+  catch (cause) { error.value = translationReviewRequestError(cause, `${field.label}确认失败，请刷新后重试。`) }
   finally {
     const next = { ...busy.value }; delete next[key]; busy.value = next
     if (promotesFormalShotField) setPromotionOperation(false)
@@ -334,8 +335,8 @@ onMounted(load)
     </header>
     <div v-if="providerEgressNotice" class="translation-egress"><AlertTriangle :size="14"/><span><strong>外部 API 数据发送提示：</strong>{{ providerEgressNotice }}</span></div>
     <div v-if="blockedReason" class="translation-error"><AlertTriangle :size="14"/><span><strong>canonical 术语碰撞 · 翻译确认与正式字段同步已暂停：</strong> {{ blockedReason }} 请先回到“项目总览 → 全剧视觉规则”修正并保存；系统不会自动猜译名。</span></div>
-    <div v-if="repairLegacyNegativePrompt" class="translation-recovery"><AlertTriangle :size="14"/><span><strong>旧创作草稿负面约束待审计：</strong>保存和生成已暂停。点击上方按钮后，服务端只会在 applied CreativeDraft 来源和值逐字匹配时清除；若这是您手工填写的真实缺陷词，请直接改写为英文负面约束后保存。</span></div>
-    <div class="translation-safety"><ShieldCheck :size="14"/><span><strong>本地 4B 候选不可直接生产：</strong>必须逐项核对专名、人物性别、左/右手、道具部位、数值与比例、景别与运镜、动作先后和镜头终态，确认无误后再点“确认译文”。对白、歌词和真实屏显文字保留原文，只翻译对白括号中的 delivery 与导演字段。新建 Bible 时会自动补写英文 canonical glossary；历史缺失项可在“项目总览 → 全剧视觉规则”一键补全，译法不满意时再人工修改（如“玄纹剑 = Xuanwen Sword”）。未配置时人物、场景和道具名会使用 S1、scene:slug、prop:slug 等稳定技术标识，而不会自由翻译。默认本机模型是 ModelScope <code>Qwen/Qwen3-4B-GGUF</code>，并非 DashScope Qwen-MT API。</span></div>
+    <div v-if="repairLegacyNegativePrompt" class="translation-recovery"><AlertTriangle :size="14"/><span><strong>来源匹配的创作草稿负面约束待审计：</strong>保存和生成已暂停。点击上方按钮后，服务端只会在 applied CreativeDraft 来源和值逐字匹配时清除；若这是您手工填写的真实缺陷词，请直接改写为英文负面约束后保存。</span></div>
+    <div class="translation-safety"><ShieldCheck :size="14"/><span><strong>本地 4B 候选不可直接生产：</strong>必须逐项核对专名、人物性别、左/右手、道具部位、数值与比例、景别与运镜、动作先后和镜头终态，确认无误后再点“确认译文”。对白、歌词和真实屏显文字保留原文，只翻译对白括号中的 delivery 与导演字段。新建 Bible 时会自动补写英文 canonical glossary；缺失项可在“项目总览 → 全剧视觉规则”一键补全，译法不满意时再人工修改（如“玄纹剑 = Xuanwen Sword”）。未配置时人物、场景和道具名会使用 S1、scene:slug、prop:slug 等稳定技术标识，而不会自由翻译。默认本地模型是 ModelScope <code>Qwen/Qwen3-4B-GGUF</code>，并非 DashScope Qwen-MT API。</span></div>
     <div v-if="capability&&!capabilityReady" class="translation-error"><AlertTriangle :size="14"/>{{ selectedProviderCapability?.notice || capability.message || '所选处理通道尚未配置，当前只能查看原文和审核历史。' }}</div>
     <div v-if="error" class="translation-error"><AlertTriangle :size="14"/>{{ error }}</div>
     <div v-if="loading" class="translation-loading"><LoaderCircle class="spin" :size="16"/>读取翻译审核状态…</div>

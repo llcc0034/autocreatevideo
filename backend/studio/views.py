@@ -13,7 +13,7 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.files import File
 from django.db import transaction
-from django.db.models import Count, Max, Q, Sum
+from django.db.models import Count, IntegerField, Max, OuterRef, Q, Subquery, Sum
 from django.db.models.functions import Coalesce
 from django.http import FileResponse, HttpResponse, JsonResponse, StreamingHttpResponse
 from django.urls import reverse
@@ -21,7 +21,7 @@ from django.utils.http import content_disposition_header
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import OpenApiParameter, extend_schema
+from drf_spectacular.utils import OpenApiParameter, PolymorphicProxySerializer, extend_schema
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
@@ -67,8 +67,10 @@ from studio.serializers import (
     GeneratedWorkflowSerializer,
     GenerationTaskCreateSerializer,
     GenerationTaskInputPromptSerializer,
+    GenerationTaskRetrySerializer,
     GenerationTaskSerializer,
     PromptFieldTranslationSerializer,
+    PromptTranslationConflictErrorResponseSerializer,
     PromptTranslationBatchRequestSerializer,
     PromptTranslationConfirmSerializer,
     PromptTranslationPromoteShotResponseSerializer,
@@ -77,8 +79,12 @@ from studio.serializers import (
     TaskOutputPromoteSerializer,
     NextEpisodeSerializer,
     ProductionBuildSerializer,
+    ProductionBuildResponseSerializer,
+    ProductionIdempotencyConflictErrorResponseSerializer,
+    ProductionQueueConfirmationErrorResponseSerializer,
     ProductionWorkflowTemplateSerializer,
     ProjectBibleSyncSerializer,
+    ProjectDeleteErrorResponseSerializer,
     PromptArtifactSerializer,
     PromptGenerateSerializer,
     PropBibleSerializer,
@@ -88,6 +94,8 @@ from studio.serializers import (
     ReleaseBundleSerializer,
     SceneBibleSerializer,
     ScriptBreakdownSerializer,
+    ScriptBreakdownResponseSerializer,
+    ScriptRebuildConflictResponseSerializer,
     SeriesProjectSerializer,
     ShotSerializer,
     StyleSerializer,
@@ -129,6 +137,7 @@ from studio.services.prompt_translation import (
     LOCAL_QWEN_PROVIDER,
     build_translation_context,
     ensure_no_canonical_target_collisions,
+    missing_relevant_canonical_identity_mappings,
     resolve_current_source,
     source_text_hash,
     translation_entry_context_current,
@@ -142,7 +151,11 @@ from studio.services.canonical_glossary import (
     ensure_canonical_glossary as ensure_project_canonical_glossary,
 )
 from studio.services.workflow import WorkflowBuildError, build_workflow
-from studio.services.script_breakdown import breakdown_script
+from studio.services.script_breakdown import (
+    ScriptRebuildConflict,
+    breakdown_script,
+    discard_rebuildable_production,
+)
 from studio.services.resolution import (
     H3_RESOLUTION_MULTIPLE_DEFAULT,
     ResolutionProfileError,
@@ -281,6 +294,122 @@ def _owned_projects(queryset, user):
     return queryset if user.is_staff else queryset.filter(owner=user)
 
 
+def _is_dedicated_project_cover(asset: Asset) -> bool:
+    metadata = asset.metadata if isinstance(asset.metadata, dict) else {}
+    return (
+        asset.owner_id is not None
+        and asset.kind == Asset.Kind.REFERENCE
+        and metadata.get("usage") == "project_cover"
+        and bool(asset.file)
+    )
+
+
+def _delete_file_after_commit(asset: Asset) -> None:
+    if not asset.file:
+        return
+    storage = asset.file.storage
+    name = asset.file.name
+    if name:
+        transaction.on_commit(
+            lambda storage=storage, name=name: storage.delete(name),
+            robust=True,
+        )
+
+
+def _asset_structured_reference_labels(asset: Asset) -> list[str]:
+    labels: list[str] = []
+    if asset.cover_projects.exists():
+        labels.append("连续剧封面")
+    bible_models = (
+        (CharacterBible, "人物 Bible"),
+        (SceneBible, "场景 Bible"),
+        (PropBible, "道具 Bible"),
+    )
+    for model, label in bible_models:
+        if model.objects.filter(
+            Q(anchor_asset_id=asset.id) | Q(reference_assets=asset),
+        ).exists():
+            labels.append(label)
+    if Shot.objects.filter(reference_assets=asset).exists():
+        labels.append("分镜参考")
+    return labels
+
+
+def _json_contains_asset_id(value, asset_id: str) -> bool:
+    if isinstance(value, dict):
+        return any(
+            (key in {"asset_id", "audio_asset_id", "paired_video_asset_id", "id"} and str(item) == asset_id)
+            or _json_contains_asset_id(item, asset_id)
+            for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return any(_json_contains_asset_id(item, asset_id) for item in value)
+    return False
+
+
+def _asset_has_active_task_reference(asset: Asset) -> bool:
+    active_statuses = (
+        GenerationTask.Status.QUEUED,
+        GenerationTask.Status.RUNNING,
+        GenerationTask.Status.CANCEL_REQUESTED,
+    )
+    asset_id = str(asset.id)
+    tasks = GenerationTask.objects.filter(
+        owner_id=asset.owner_id,
+        status__in=active_statuses,
+    ).select_related("generated_workflow__prompt_artifact")
+    for task in tasks:
+        prompt = task.generated_workflow.prompt_artifact
+        if any(
+            _json_contains_asset_id(value, asset_id)
+            for value in (
+                task.staged_inputs,
+                task.capability_snapshot,
+                prompt.structured_payload,
+                prompt.consistency_snapshot,
+                prompt.request_options,
+            )
+        ):
+            return True
+    return False
+
+
+def _asset_reference_conflict_message(asset: Asset) -> str:
+    if asset_is_release_evidence(asset):
+        return "该素材已进入封存或历史发行清单，不能修改类别或删除；可停用但必须保留审计证据。"
+    labels = _asset_structured_reference_labels(asset)
+    if labels:
+        return f"该素材已用于{'、'.join(labels)}，请先解除引用后再修改类别或删除。"
+    if _asset_has_active_task_reference(asset):
+        return "该素材正被排队、运行或取消中的生成任务使用，请等待任务终结后再修改类别或删除。"
+    return ""
+
+
+def _delete_unused_project_cover(asset_id) -> None:
+    if not asset_id:
+        return
+    asset = Asset.objects.select_for_update().filter(pk=asset_id).first()
+    if not asset or not _is_dedicated_project_cover(asset):
+        return
+    if (
+        asset.cover_projects.exists()
+        or CharacterBible.objects.filter(
+            Q(anchor_asset_id=asset.id) | Q(reference_assets=asset),
+        ).exists()
+        or SceneBible.objects.filter(
+            Q(anchor_asset_id=asset.id) | Q(reference_assets=asset),
+        ).exists()
+        or PropBible.objects.filter(
+            Q(anchor_asset_id=asset.id) | Q(reference_assets=asset),
+        ).exists()
+        or Shot.objects.filter(reference_assets=asset).exists()
+        or asset_is_release_evidence(asset)
+    ):
+        return
+    _delete_file_after_commit(asset)
+    asset.delete()
+
+
 def _can_execute_template(template: WorkflowTemplate, user) -> bool:
     """Only curated global system templates may be run by non-staff users.
 
@@ -304,7 +433,38 @@ def _executable_templates(queryset, user):
     return queryset.filter(owner__isnull=True, is_system=True)
 
 
-def _assert_queue_capacity(user, additional: int = 1):
+class ProductionQueueConfirmationRequired(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "production_queue_confirmation_required"
+    default_detail = "本次生产任务超过当前队列推荐阈值，需要确认后继续。"
+
+    def __init__(self, *, snapshot: dict[str, int]):
+        super().__init__({
+            "detail": self.default_detail,
+            **snapshot,
+        })
+        # APIException coerces every nested value to ErrorDetail text. Keep the
+        # allowlisted queue counters numeric so the documented schema remains
+        # truthful and clients can compare values without parsing strings.
+        self.detail = {
+            "detail": self.default_detail,
+            **snapshot,
+        }
+
+
+class ProductionIdempotencyConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "production_idempotency_conflict"
+    default_detail = "该 idempotency_key 已用于不同的生产请求。"
+
+
+def _assert_queue_capacity(
+    user,
+    additional: int = 1,
+    *,
+    extended_generation_confirmed: bool = False,
+):
+    """Require acknowledgement above configured queue guidance, never cap business volume."""
     WorkerLease.objects.get_or_create(key="generation-capacity")
     WorkerLease.objects.select_for_update().get(key="generation-capacity")
     active_statuses = (
@@ -313,15 +473,23 @@ def _assert_queue_capacity(user, additional: int = 1):
         GenerationTask.Status.CANCEL_REQUESTED,
     )
     active = GenerationTask.objects.filter(status__in=active_statuses).count()
-    if active + additional > settings.TASK_MAX_PENDING:
-        raise ValidationError(
-            f"本地 H3 安全队列最多保留 {settings.TASK_MAX_PENDING} 个活动任务；请等待完成或先只生成工作流"
-        )
     user_active = GenerationTask.objects.filter(owner=user, status__in=active_statuses).count()
-    if user_active + additional > settings.TASK_MAX_ACTIVE_PER_USER:
-        raise ValidationError(
-            f"每个用户最多保留 {settings.TASK_MAX_ACTIVE_PER_USER} 个活动生成任务；请等待现有任务完成"
-        )
+    requested = max(1, int(additional))
+    snapshot = {
+        "requested_task_count": requested,
+        "active_task_count": active,
+        "user_active_task_count": user_active,
+        "recommended_max_pending": settings.TASK_RECOMMENDED_MAX_PENDING,
+        "recommended_max_active_per_user": settings.TASK_RECOMMENDED_MAX_ACTIVE_PER_USER,
+        "max_concurrent": settings.TASK_MAX_CONCURRENT,
+    }
+    exceeds_recommendation = (
+        active + requested > settings.TASK_RECOMMENDED_MAX_PENDING
+        or user_active + requested > settings.TASK_RECOMMENDED_MAX_ACTIVE_PER_USER
+    )
+    if exceeds_recommendation and not extended_generation_confirmed:
+        raise ProductionQueueConfirmationRequired(snapshot=snapshot)
+    return snapshot
 
 
 def _create_generation_task(
@@ -427,7 +595,11 @@ def _create_generation_task(
     )
 
 
-def _clone_generation_task_for_retry(task: GenerationTask) -> GenerationTask:
+def _clone_generation_task_for_retry(
+    task: GenerationTask,
+    *,
+    extended_generation_confirmed: bool = False,
+) -> GenerationTask:
     """Create an auditable retry without mutating the terminal source task."""
     injected = task.generated_workflow.injected_values or {}
     capability_snapshot = {
@@ -438,6 +610,7 @@ def _clone_generation_task_for_retry(task: GenerationTask) -> GenerationTask:
         ),
         "retry_of": str(task.id),
         "batch_role": "retry",
+        "extended_generation_confirmed": bool(extended_generation_confirmed),
     }
     is_image = task.kind == GenerationTask.Kind.IMAGE
     if is_image:
@@ -461,15 +634,56 @@ def _clone_generation_task_for_retry(task: GenerationTask) -> GenerationTask:
     )
 
 
+def _production_workflow_selection_snapshot(
+    data: dict, *, canonical: bool = True,
+) -> list[dict]:
+    selections = [
+        {
+            **selection,
+            "template_id": str(selection["template_id"]),
+        }
+        for selection in data.get("workflow_selections", [])
+    ]
+    if canonical:
+        selections.sort(key=lambda selection: (
+            str(selection.get("output_kind") or ""),
+            str(selection.get("h3_mode") or ""),
+            str(selection.get("template_id") or ""),
+        ))
+    return selections
+
+
+def _canonical_fingerprint_value(value):
+    """Sort unordered snapshot collections into one deterministic JSON value."""
+    if isinstance(value, dict):
+        return {
+            key: _canonical_fingerprint_value(item)
+            for key, item in sorted(value.items())
+        }
+    if isinstance(value, list):
+        normalized = [_canonical_fingerprint_value(item) for item in value]
+        return sorted(
+            normalized,
+            key=lambda item: json.dumps(
+                item, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"), default=str,
+            ),
+        )
+    return value
+
+
 def _episode_batch_fingerprint(
     *, project: SeriesProject, episode: Episode, shots: list[Shot], data: dict,
-    consistency_snapshot: dict,
+    consistency_snapshot: dict, canonical: bool = True,
+    canonical_consistency: bool | None = None,
 ) -> str:
     """Fingerprint the requested batch and the ordered source-shot snapshot.
 
     The project row is locked before this is called, so the fingerprint and
     any tasks created from it describe one consistent editor snapshot.
     """
+    if canonical_consistency is None:
+        canonical_consistency = canonical
     payload = {
         "version": 1,
         "project_id": str(project.id),
@@ -483,7 +697,10 @@ def _episode_batch_fingerprint(
             "continuity_to_next": episode.continuity_to_next,
             "prompt_settings": episode.prompt_settings,
         },
-        "consistency_snapshot": consistency_snapshot,
+        "consistency_snapshot": (
+            _canonical_fingerprint_value(consistency_snapshot)
+            if canonical_consistency else consistency_snapshot
+        ),
         "whole_episode": True,
         "template_id": str(data["template_id"]) if data.get("template_id") else None,
         "priority": data["priority"],
@@ -493,13 +710,9 @@ def _episode_batch_fingerprint(
         "image_resolution_profile": data["image_resolution_profile"],
         "image_resolution_multiple": data["image_resolution_multiple"],
         "workflow_overrides": data["workflow_overrides"],
-        "workflow_selections": [
-            {
-                **selection,
-                "template_id": str(selection["template_id"]),
-            }
-            for selection in data.get("workflow_selections", [])
-        ],
+        "workflow_selections": _production_workflow_selection_snapshot(
+            data, canonical=canonical,
+        ),
         "shots": [
             {
                 "id": str(shot.id),
@@ -517,10 +730,21 @@ def _episode_batch_fingerprint(
                 "h3_mode": shot.h3_mode,
                 "include_audio": shot.include_audio,
                 "scene_id": str(shot.scene_id) if shot.scene_id else None,
-                "character_ids": [str(item.id) for item in shot.characters.all()],
-                "prop_ids": [str(item.id) for item in shot.props.all()],
-                "reference_asset_ids": [str(item.id) for item in shot.reference_assets.all()],
+                "character_ids": (
+                    sorted(str(item.id) for item in shot.characters.all())
+                    if canonical else [str(item.id) for item in shot.characters.all()]
+                ),
+                "prop_ids": (
+                    sorted(str(item.id) for item in shot.props.all())
+                    if canonical else [str(item.id) for item in shot.props.all()]
+                ),
+                "reference_asset_ids": (
+                    sorted(str(item.id) for item in shot.reference_assets.all())
+                    if canonical else [str(item.id) for item in shot.reference_assets.all()]
+                ),
                 "reference_bindings": shot.reference_bindings or {},
+                "requires_first_frame_continuity": shot.requires_first_frame_continuity,
+                "requires_last_frame_continuity": shot.requires_last_frame_continuity,
                 "continuity_notes": shot.continuity_notes,
                 "metadata": shot.metadata,
             }
@@ -533,7 +757,109 @@ def _episode_batch_fingerprint(
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _episode_batch_tasks(*, user, project: SeriesProject, idempotency_key: str) -> list[GenerationTask]:
+def _series_batch_fingerprint(
+    *, project: SeriesProject, episodes: list[Episode],
+    production_groups_by_episode: dict[uuid.UUID, tuple[list[Shot], list[list[Shot]]]],
+    planned_units: list[dict], data: dict, consistency_snapshot: dict,
+) -> str:
+    """Fingerprint one resolved multi-episode/selection production plan.
+
+    ``planned_units`` contains the exact template and effective workflow
+    parameters selected for every child. Together with the ordered editor
+    snapshot below, this prevents an idempotency replay from silently adopting
+    a later template/default or a changed episode/shot fact.
+    """
+    workflow_selections = _production_workflow_selection_snapshot(data)
+    payload = {
+        "version": 1,
+        "scope": "series",
+        "project": {
+            "id": str(project.id),
+            "title": project.title,
+            "logline": project.logline,
+            "master_script": project.master_script,
+            "language": project.language,
+            "target_model": project.target_model,
+            "aspect_ratio": project.aspect_ratio,
+            "width": project.width,
+            "height": project.height,
+            "fps": project.fps,
+            "default_shot_duration_ms": project.default_shot_duration_ms,
+            "continuity_seed": project.continuity_seed,
+            "continuity_summary": project.continuity_summary,
+            "production_settings": project.production_settings,
+        },
+        "consistency_snapshot": _canonical_fingerprint_value(consistency_snapshot),
+        "request": {
+            "whole_episode": False,
+            "multi_shot": data["multi_shot"],
+            "template_id": str(data["template_id"]) if data.get("template_id") else None,
+            "priority": data["priority"],
+            "max_attempts": data["max_attempts"],
+            "resolution_profile": data["resolution_profile"],
+            "resolution_multiple": data["resolution_multiple"],
+            "image_resolution_profile": data["image_resolution_profile"],
+            "image_resolution_multiple": data["image_resolution_multiple"],
+            "workflow_overrides": data["workflow_overrides"],
+            "workflow_selections": workflow_selections,
+        },
+        "episodes": [],
+        "production_units": planned_units,
+    }
+    for episode in episodes:
+        shots, groups = production_groups_by_episode.get(episode.id, ([], []))
+        payload["episodes"].append({
+            "id": str(episode.id),
+            "number": episode.number,
+            "title": episode.title,
+            "synopsis": episode.synopsis,
+            "script": episode.script,
+            "continuity_from_previous": episode.continuity_from_previous,
+            "continuity_to_next": episode.continuity_to_next,
+            "prompt_settings": episode.prompt_settings,
+            "groups": [[str(shot.id) for shot in group] for group in groups],
+            "shots": [
+                {
+                    "id": str(shot.id),
+                    "number": shot.number,
+                    "title": shot.title,
+                    "narrative": shot.narrative,
+                    "detailed_description": shot.detailed_description,
+                    "camera": shot.camera,
+                    "action": shot.action,
+                    "dialogue": shot.dialogue,
+                    "sound_effects": shot.sound_effects,
+                    "music": shot.music,
+                    "duration_ms": shot.duration_ms,
+                    "media_type": shot.media_type,
+                    "h3_mode": shot.h3_mode,
+                    "include_audio": shot.include_audio,
+                    "scene_id": str(shot.scene_id) if shot.scene_id else None,
+                    "character_ids": sorted(
+                        str(item.id) for item in shot.characters.all()
+                    ),
+                    "prop_ids": sorted(str(item.id) for item in shot.props.all()),
+                    "reference_asset_ids": sorted(
+                        str(item.id) for item in shot.reference_assets.all()
+                    ),
+                    "reference_bindings": shot.reference_bindings or {},
+                    "requires_first_frame_continuity": shot.requires_first_frame_continuity,
+                    "requires_last_frame_continuity": shot.requires_last_frame_continuity,
+                    "continuity_notes": shot.continuity_notes,
+                    "metadata": shot.metadata,
+                }
+                for shot in shots
+            ],
+        })
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _production_batch_tasks(
+    *, user, project: SeriesProject, idempotency_key: str,
+) -> list[GenerationTask]:
     queryset = GenerationTask.objects.filter(
         owner=user,
         project=project,
@@ -615,14 +941,18 @@ def _episode_batch_response(
     idempotent_replay: bool,
 ) -> dict:
     if not tasks:
-        raise ValidationError("整集生成批次没有可复用的子任务")
+        raise ProductionIdempotencyConflict({
+            "detail": "整集生成批次没有可复用的子任务，请使用新的 idempotency_key。",
+            "idempotency_key": idempotency_key,
+        })
     first = tasks[0].capability_snapshot or {}
     batch_size = int(first.get("batch_size", 0))
     if batch_size != len(tasks) or [
         int((task.capability_snapshot or {}).get("batch_index", 0)) for task in tasks
     ] != list(range(1, batch_size + 1)):
-        raise ValidationError({
-            "idempotency_key": "检测到不完整的整集生成批次；请使用新的 idempotency_key 重新提交",
+        raise ProductionIdempotencyConflict({
+            "detail": "检测到不完整的整集生成批次，请使用新的 idempotency_key 重新提交。",
+            "idempotency_key": idempotency_key,
         })
     units = [_production_unit_from_task(task) for task in tasks]
     return {
@@ -630,6 +960,10 @@ def _episode_batch_response(
         "whole_episode": True,
         "batch_id": first.get("batch_id"),
         "batch_kind": "episode",
+        "batch_size": batch_size,
+        "extended_generation_confirmed": bool(
+            first.get("extended_generation_confirmed", False)
+        ),
         "idempotency_key": idempotency_key,
         "idempotent_replay": idempotent_replay,
         "episode_ids": [first.get("episode_id")],
@@ -641,6 +975,78 @@ def _episode_batch_response(
         "counts": {"prompts": len(tasks), "workflows": len(tasks), "tasks": len(tasks)},
         "production_units": units,
         "tasks": GenerationTaskSerializer(tasks, many=True).data,
+    }
+
+
+def _series_batch_response(
+    *, project: SeriesProject, tasks: list[GenerationTask], idempotency_key: str,
+    idempotent_replay: bool,
+) -> dict:
+    if not tasks:
+        raise ProductionIdempotencyConflict({
+            "detail": "幂等生产批次没有可复用的子任务，请使用新的 idempotency_key。",
+            "idempotency_key": idempotency_key,
+        })
+    first = tasks[0].capability_snapshot or {}
+    batch_size = int(first.get("batch_size", 0))
+    batch_id = first.get("batch_id")
+    batch_kind = first.get("batch_kind")
+    fingerprint = first.get("request_fingerprint")
+    indices = [
+        int((task.capability_snapshot or {}).get("batch_index", 0)) for task in tasks
+    ]
+    complete = (
+        batch_kind in {"selection", "series"}
+        and batch_id
+        and fingerprint
+        and batch_size == len(tasks)
+        and indices == list(range(1, batch_size + 1))
+        and all(
+            (task.capability_snapshot or {}).get("batch_id") == batch_id
+            and (task.capability_snapshot or {}).get("batch_kind") == batch_kind
+            and (task.capability_snapshot or {}).get("idempotency_key") == idempotency_key
+            and (task.capability_snapshot or {}).get("request_fingerprint") == fingerprint
+            for task in tasks
+        )
+    )
+    if not complete:
+        raise ProductionIdempotencyConflict({
+            "detail": "检测到不完整或混合的幂等生产批次，请使用新的 idempotency_key。",
+            "idempotency_key": idempotency_key,
+        })
+    units = [_production_unit_from_task(task) for task in tasks]
+    episode_ids = list(dict.fromkeys(
+        str(unit["episode_id"]) for unit in units if unit.get("episode_id")
+    ))
+    prompt_language_gate_reports = []
+    for task, unit in zip(tasks, units, strict=True):
+        report = _prompt_language_gate_payload(
+            task.generated_workflow.prompt_artifact,
+            episode_id=unit.get("episode_id"),
+            episode_number=unit.get("episode_number"),
+            shot_ids=unit.get("shot_ids", []),
+        )
+        if report:
+            prompt_language_gate_reports.append(report)
+    return {
+        "project_id": str(project.id),
+        "whole_episode": False,
+        "batch_id": batch_id,
+        "batch_kind": batch_kind,
+        "batch_size": batch_size,
+        "extended_generation_confirmed": bool(
+            first.get("extended_generation_confirmed", False)
+        ),
+        "idempotency_key": idempotency_key,
+        "idempotent_replay": idempotent_replay,
+        "episode_ids": episode_ids,
+        "prompt_artifact_ids": [unit["prompt_artifact_id"] for unit in units],
+        "workflow_ids": [unit["workflow_id"] for unit in units],
+        "task_ids": [unit["task_id"] for unit in units],
+        "counts": {"prompts": len(tasks), "workflows": len(tasks), "tasks": len(tasks)},
+        "production_units": units,
+        "tasks": GenerationTaskSerializer(tasks, many=True).data,
+        "prompt_language_gate": prompt_language_gate_reports,
     }
 
 
@@ -685,6 +1091,8 @@ _BIBLE_SCALAR_FIELDS = {
 
 
 def _validate_asset_access(user, assets) -> None:
+    if any(_is_dedicated_project_cover(asset) for asset in assets):
+        raise ValidationError("连续剧封面是项目展示专用素材，不能用于设定集、分镜或生成输入。")
     if user.is_staff:
         return
     if any(asset.owner_id not in (None, user.id) for asset in assets):
@@ -814,6 +1222,102 @@ def _temporary_speaker_ids(existing, desired: set[str]) -> dict:
     return result
 
 
+def _without_deleted_binding_entities(
+    bindings: object,
+    *,
+    field: str,
+    deleted_ids: set[str],
+) -> tuple[object, bool]:
+    if not isinstance(bindings, dict):
+        return bindings, False
+    result = dict(bindings)
+    if field == "scene":
+        scene = result.get("scene")
+        if isinstance(scene, dict) and str(scene.get("entity_id") or "") in deleted_ids:
+            result.pop("scene", None)
+            return result, True
+        return bindings, False
+    rows = result.get(field)
+    if not isinstance(rows, list):
+        return bindings, False
+    kept = [
+        row for row in rows
+        if not (
+            isinstance(row, dict)
+            and str(row.get("entity_id") or "") in deleted_ids
+        )
+    ]
+    if len(kept) == len(rows):
+        return bindings, False
+    if kept:
+        result[field] = kept
+    else:
+        result.pop(field, None)
+    return result, True
+
+
+def _prune_deleted_bible_dependencies(
+    *,
+    project: SeriesProject,
+    key: str,
+    delete_ids: set,
+) -> None:
+    if not delete_ids:
+        return
+    deleted_id_strings = {str(value) for value in delete_ids}
+    binding_field = {
+        "characters": "characters", "scenes": "scene", "props": "props",
+    }[key]
+    translation_scope = {
+        "characters": PromptFieldTranslation.ScopeType.CHARACTER,
+        "scenes": PromptFieldTranslation.ScopeType.SCENE,
+        "props": PromptFieldTranslation.ScopeType.PROP,
+    }[key]
+    lock_scope = {
+        "characters": ConsistencyLock.Scope.CHARACTER,
+        "scenes": ConsistencyLock.Scope.SCENE,
+        "props": ConsistencyLock.Scope.PROP,
+    }[key]
+
+    for shot in Shot.objects.select_for_update().filter(episode__project=project):
+        changed_fields = []
+        cleaned, changed = _without_deleted_binding_entities(
+            shot.reference_bindings,
+            field=binding_field,
+            deleted_ids=deleted_id_strings,
+        )
+        if changed:
+            shot.reference_bindings = cleaned
+            changed_fields.append("reference_bindings")
+        metadata = dict(shot.metadata or {})
+        cleaned_metadata_bindings, metadata_changed = _without_deleted_binding_entities(
+            metadata.get("reference_bindings"),
+            field=binding_field,
+            deleted_ids=deleted_id_strings,
+        )
+        if metadata_changed:
+            if cleaned_metadata_bindings:
+                metadata["reference_bindings"] = cleaned_metadata_bindings
+            else:
+                metadata.pop("reference_bindings", None)
+            shot.metadata = metadata
+            changed_fields.append("metadata")
+        if changed_fields:
+            shot.save(update_fields=(*changed_fields, "updated_at"))
+
+    PromptFieldTranslation.objects.filter(
+        project=project,
+        scope_type=translation_scope,
+        scope_id__in=delete_ids,
+    ).delete()
+    ConsistencyLock.objects.filter(
+        project=project,
+        scope=lock_scope,
+        target_id__in=delete_ids,
+        is_active=True,
+    ).update(is_active=False)
+
+
 def _sync_bible_collection(*, project, user, key: str, items: list[dict]):
     model = {"characters": CharacterBible, "scenes": SceneBible, "props": PropBible}[key]
     existing = list(model.objects.select_for_update().filter(project=project).prefetch_related("reference_assets"))
@@ -826,6 +1330,11 @@ def _sync_bible_collection(*, project, user, key: str, items: list[dict]):
     delete_ids = set(existing_by_id) - requested_ids
     deleted_count = len(delete_ids)
     if delete_ids:
+        _prune_deleted_bible_dependencies(
+            project=project,
+            key=key,
+            delete_ids=delete_ids,
+        )
         model.objects.filter(pk__in=delete_ids).delete()
     retained = [item for item in existing if item.pk in requested_ids]
 
@@ -1255,6 +1764,16 @@ class AssetViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         with transaction.atomic():
+            metadata = serializer.validated_data.get("metadata") or {}
+            if isinstance(metadata, dict) and metadata.get("usage") == "project_cover":
+                try:
+                    SeriesProject.objects.select_for_update().get(
+                        pk=metadata.get("project_id"), owner=self.request.user,
+                    )
+                except (SeriesProject.DoesNotExist, ValueError) as exc:
+                    raise ValidationError({
+                        "metadata": "连续剧项目已不存在，请返回项目列表刷新后重试。",
+                    }) from exc
             User.objects.select_for_update().get(pk=self.request.user.pk)
             serializer.enforce_tenant_quota()
             serializer.save(owner=self.request.user)
@@ -1265,6 +1784,27 @@ class AssetViewSet(viewsets.ModelViewSet):
                 "全局内置素材为只读；请通过受审计的素材 manifest/import 流程维护。"
             )
         with transaction.atomic():
+            try:
+                asset = self.get_queryset().select_for_update().get(pk=serializer.instance.pk)
+            except Asset.DoesNotExist as exc:
+                raise NotFound("素材不存在") from exc
+            self.check_object_permissions(self.request, asset)
+            serializer.instance = asset
+            requested_kind = serializer.validated_data.get("kind", asset.kind)
+            if requested_kind != asset.kind:
+                conflict = _asset_reference_conflict_message(asset)
+                if conflict:
+                    raise ValidationError({"kind": conflict})
+            if _is_dedicated_project_cover(asset):
+                metadata = asset.metadata or {}
+                try:
+                    SeriesProject.objects.select_for_update().get(
+                        pk=metadata.get("project_id"), owner=asset.owner,
+                    )
+                except (SeriesProject.DoesNotExist, ValueError) as exc:
+                    raise ValidationError({
+                        "metadata": "封面所属连续剧项目已不存在，不能继续修改该素材。",
+                    }) from exc
             User.objects.select_for_update().get(pk=self.request.user.pk)
             serializer.enforce_tenant_quota()
             serializer.save()
@@ -1272,6 +1812,17 @@ class AssetViewSet(viewsets.ModelViewSet):
     def destroy(self, request, *args, **kwargs):
         with transaction.atomic():
             try:
+                cover_project_ids = list(
+                    SeriesProject.objects.filter(cover_asset_id=kwargs["pk"])
+                    .order_by("pk")
+                    .values_list("pk", flat=True)
+                )
+                if cover_project_ids:
+                    list(
+                        SeriesProject.objects.select_for_update()
+                        .filter(pk__in=cover_project_ids)
+                        .order_by("pk")
+                    )
                 asset = self.get_queryset().select_for_update().get(pk=kwargs["pk"])
             except Asset.DoesNotExist as exc:
                 raise NotFound("素材不存在") from exc
@@ -1280,8 +1831,11 @@ class AssetViewSet(viewsets.ModelViewSet):
                 raise ValidationError(
                     "全局内置素材为只读；请通过受审计的素材 manifest/import 流程维护。"
                 )
-            if asset_is_release_evidence(asset):
-                raise ValidationError("该素材已进入封存或历史发行清单，不能删除；可停用但必须保留审计证据。")
+            if not _is_dedicated_project_cover(asset):
+                conflict = _asset_reference_conflict_message(asset)
+                if conflict:
+                    raise ValidationError(conflict)
+            _delete_file_after_commit(asset)
             asset.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -1442,6 +1996,40 @@ def _ensure_translation_resources_available() -> None:
         raise TranslationResourceBusy()
 
 
+class ProjectDeleteConflict(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "project_has_active_work"
+
+    def __init__(self, detail=None, code=None):
+        super().__init__(detail=detail, code=code)
+        if isinstance(detail, dict):
+            for field in (
+                "active_generation_tasks",
+                "unresolved_remote_tasks",
+                "active_assembly_jobs",
+            ):
+                if field in detail:
+                    self.detail[field] = int(detail[field])
+
+
+class ScriptRebuildConfirmationRequired(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "script_rebuild_confirmation_required"
+
+    def __init__(self, detail):
+        super().__init__(detail=detail)
+        self.detail = detail
+
+
+class ScriptRebuildBlocked(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_code = "script_rebuild_blocked"
+
+    def __init__(self, detail):
+        super().__init__(detail=detail)
+        self.detail = detail
+
+
 class SeriesProjectViewSet(viewsets.ModelViewSet):
     serializer_class = SeriesProjectSerializer
     permission_classes = [IsOwnerOrStaff]
@@ -1450,8 +2038,23 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
     ordering_fields = ("title", "created_at", "updated_at")
 
     def get_queryset(self):
-        queryset = SeriesProject.objects.select_related("style", "owner").annotate(
+        project_duration = (
+            Shot.objects.filter(episode__project_id=OuterRef("pk"))
+            .values("episode__project_id")
+            .annotate(total=Sum("duration_ms"))
+            .values("total")[:1]
+        )
+        queryset = SeriesProject.objects.select_related("style", "owner", "cover_asset").annotate(
             episode_count=Count("episodes", distinct=True),
+            completed_episode_count=Count(
+                "episodes",
+                filter=Q(episodes__status=Episode.Status.COMPLETED),
+                distinct=True,
+            ),
+            total_duration_ms=Coalesce(
+                Subquery(project_duration, output_field=IntegerField()),
+                0,
+            ),
             character_count=Count("characters", distinct=True),
             scene_count=Count("scenes", distinct=True),
             prop_count=Count("props", distinct=True),
@@ -1460,6 +2063,119 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(owner=self.request.user)
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            project = SeriesProject.objects.select_for_update().get(
+                pk=serializer.instance.pk,
+            )
+            self.check_object_permissions(self.request, project)
+            serializer.instance = project
+            old_cover_id = project.cover_asset_id
+            new_cover = serializer.validated_data.get("cover_asset")
+            if new_cover is not None:
+                try:
+                    locked_cover = Asset.objects.select_for_update().get(
+                        pk=new_cover.pk,
+                    )
+                except Asset.DoesNotExist as exc:
+                    raise ValidationError({"cover_asset": "封面素材已被删除，请重新上传。"}) from exc
+                serializer.validated_data["cover_asset"] = serializer.validate_cover_asset(
+                    locked_cover,
+                )
+            project = serializer.save()
+            if old_cover_id and old_cover_id != project.cover_asset_id:
+                _delete_unused_project_cover(old_cover_id)
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        self.perform_create(serializer)
+        project = self.get_queryset().get(pk=serializer.instance.pk)
+        response_serializer = self.get_serializer(project)
+        headers = self.get_success_headers(response_serializer.data)
+        return Response(
+            response_serializer.data,
+            status=status.HTTP_201_CREATED,
+            headers=headers,
+        )
+
+    @extend_schema(
+        responses={
+            204: None,
+            404: ProjectDeleteErrorResponseSerializer,
+            409: ProjectDeleteErrorResponseSerializer,
+        },
+    )
+    def destroy(self, request, *args, **kwargs):
+        with transaction.atomic():
+            try:
+                project = _owned_projects(
+                    SeriesProject.objects.all(), request.user,
+                ).select_for_update().get(pk=kwargs["pk"])
+            except SeriesProject.DoesNotExist as exc:
+                raise NotFound("连续剧项目不存在") from exc
+            self.check_object_permissions(request, project)
+            cover_asset_id = project.cover_asset_id
+            # Lock child work records before evaluating the delete guard. This
+            # prevents a recovery worker from changing a failed unresolved
+            # task back to queued between the safety check and the cascade.
+            generation_tasks = list(
+                project.generation_tasks.select_for_update().only(
+                    "status", "submission_token", "submission_state", "remote_state",
+                )
+            )
+            assembly_jobs = list(
+                project.assembly_jobs.select_for_update().only("status")
+            )
+            active_generation_statuses = {
+                GenerationTask.Status.QUEUED,
+                GenerationTask.Status.RUNNING,
+                GenerationTask.Status.CANCEL_REQUESTED,
+            }
+            terminal_submission_states = {
+                GenerationTask.SubmissionState.TERMINAL_FAILED,
+                GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+            }
+            active_generation_tasks = sum(
+                task.status in active_generation_statuses
+                for task in generation_tasks
+            )
+            unresolved_remote_tasks = sum(
+                bool(task.submission_token)
+                and task.status != GenerationTask.Status.SUCCEEDED
+                and task.submission_state not in terminal_submission_states
+                and task.remote_state != GenerationTask.RemoteState.SUCCEEDED
+                for task in generation_tasks
+            )
+            active_assembly_statuses = {
+                AssemblyJob.Status.QUEUED,
+                AssemblyJob.Status.RUNNING,
+            }
+            active_assembly_jobs = sum(
+                job.status in active_assembly_statuses
+                for job in assembly_jobs
+            )
+            if active_generation_tasks or unresolved_remote_tasks or active_assembly_jobs:
+                raise ProjectDeleteConflict({
+                    "detail": (
+                        "项目仍有排队、运行、取消中或远端状态未终结的生产任务，不能删除；"
+                        "请等待任务及远端提交均进入终态后重试。"
+                    ),
+                    "active_generation_tasks": active_generation_tasks,
+                    "unresolved_remote_tasks": unresolved_remote_tasks,
+                    "active_assembly_jobs": active_assembly_jobs,
+                })
+            # GenerationTask intentionally protects its materialized workflow.
+            # All tasks are safe terminal rows at this point, so delete those
+            # project-owned rows first and let the project cascade collect the
+            # workflows. Any later PROTECT failure rolls this transaction back.
+            GenerationTask.objects.filter(
+                pk__in=[task.pk for task in generation_tasks],
+            ).delete()
+            project.delete()
+            _delete_unused_project_cover(cover_asset_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @extend_schema(
         request=CanonicalGlossaryEnsureSerializer,
@@ -1614,7 +2330,13 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
         episode = Episode.objects.create(project=project, number=next_number, **serializer.validated_data)
         return Response(EpisodeSerializer(episode, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
-    @extend_schema(request=ScriptBreakdownSerializer, responses=dict)
+    @extend_schema(
+        request=ScriptBreakdownSerializer,
+        responses={
+            201: ScriptBreakdownResponseSerializer,
+            409: ScriptRebuildConflictResponseSerializer,
+        },
+    )
     @action(detail=True, methods=["post"], url_path="breakdown-script")
     def breakdown_script(self, request, pk=None):
         project = self.get_object()
@@ -1626,21 +2348,34 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
             raise ValidationError({"script": "请求 script 与项目 master_script 均为空"})
         if project.episodes.exists() and not data["replace_existing"]:
             raise ValidationError({"replace_existing": "项目已有剧集；若要按完整剧本重建，请显式设为 true"})
-        if data["replace_existing"] and (
-            project.generation_tasks.exists() or project.assembly_jobs.exists()
-        ):
-            raise ValidationError("项目已有生成或组装记录，为保护审计链不能自动删除；请新建项目或手工追加剧集")
         try:
             with transaction.atomic():
                 project = SeriesProject.objects.select_for_update().get(pk=project.pk)
                 if project.episodes.exists() and not data["replace_existing"]:
                     raise ValidationError({"replace_existing": "并发请求期间项目已创建剧集；请刷新后重试"})
-                if data["replace_existing"] and (
-                    project.generation_tasks.exists() or project.assembly_jobs.exists()
-                ):
-                    raise ValidationError("并发请求期间项目新增了生成或组装记录，已停止覆盖")
                 if data["replace_existing"]:
-                    project.episodes.all().delete()
+                    cleared = discard_rebuildable_production(
+                        project,
+                        discard_existing_production=data[
+                            "discard_existing_production"
+                        ],
+                    )
+                else:
+                    cleared = {
+                        "episodes": 0,
+                        "shots": 0,
+                        "generation_tasks": 0,
+                        "assembly_jobs": 0,
+                        "prompt_artifacts": 0,
+                        "generated_workflows": 0,
+                        "creative_drafts": 0,
+                        "shot_detail_drafts": 0,
+                        "shot_detail_batches": 0,
+                        "shot_detail_batch_items": 0,
+                        "prompt_field_translations": 0,
+                        "draft_release_bundles": 0,
+                        "physical_outputs_retained": True,
+                    }
                 if data["script"] and data["script"] != project.master_script:
                     project.master_script = data["script"]
                     project.save(update_fields=("master_script", "updated_at"))
@@ -1648,9 +2383,16 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                     project, script,
                     episode_count_hint=data["episode_count_hint"],
                     default_shot_duration_ms=data["default_shot_duration_ms"],
+                    default_first_frame_continuity=data["default_first_frame_continuity"],
+                    default_last_frame_continuity=data["default_last_frame_continuity"],
                     multi_shot=data["multi_shot"],
                     include_audio=data["include_audio"],
                 )
+                sync_consistency_locks(project)
+        except ScriptRebuildConflict as exc:
+            if exc.code == "script_rebuild_confirmation_required":
+                raise ScriptRebuildConfirmationRequired(exc.details) from exc
+            raise ScriptRebuildBlocked(exc.details) from exc
         except ValueError as exc:
             raise ValidationError(str(exc)) from exc
         episodes = []
@@ -1669,6 +2411,7 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                 "episodes": len(episodes),
                 "shots": sum(len(item["shots"]) for item in episodes),
             },
+            "cleared": cleared,
         }, status=status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["post"], url_path="complete")
@@ -1683,7 +2426,21 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
         project.save(update_fields=("status", "completed_at", "updated_at"))
         return Response(self.get_serializer(project).data)
 
-    @extend_schema(request=ProductionBuildSerializer)
+    @extend_schema(
+        request=ProductionBuildSerializer,
+        responses={
+            200: ProductionBuildResponseSerializer,
+            201: ProductionBuildResponseSerializer,
+            409: PolymorphicProxySerializer(
+                component_name="ProductionBuildConflictErrorResponse",
+                serializers=[
+                    ProductionQueueConfirmationErrorResponseSerializer,
+                    ProductionIdempotencyConflictErrorResponseSerializer,
+                ],
+                resource_type_field_name=None,
+            ),
+        },
+    )
     @action(detail=True, methods=["post"], url_path="build-production")
     def build_production(self, request, pk=None):
         project = self.get_object()
@@ -1830,7 +2587,10 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
             batch_id = None
             batch_fingerprint = None
             batch_size = 0
+            batch_kind = ""
             batch_consistency_snapshot = None
+            production_groups_by_episode: dict[uuid.UUID, tuple[list[Shot], list[list[Shot]]]] = {}
+            resolved_idempotent_groups: dict[tuple[str, ...], dict] = {}
             if whole_episode:
                 # The serializer guarantees exactly one requested id; this
                 # second check provides an ownership-aware error after lookup.
@@ -1850,7 +2610,7 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                     data=data,
                     consistency_snapshot=batch_consistency_snapshot,
                 )
-                existing_tasks = _episode_batch_tasks(
+                existing_tasks = _production_batch_tasks(
                     user=request.user, project=project,
                     idempotency_key=data["idempotency_key"],
                 )
@@ -1859,12 +2619,38 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                         (task.capability_snapshot or {}).get("request_fingerprint")
                         for task in existing_tasks
                     }
-                    if fingerprints != {batch_fingerprint}:
-                        raise ValidationError({
-                            "idempotency_key": (
+                    accepted_fingerprints = {batch_fingerprint}
+                    # Accept batches created during either earlier fingerprint
+                    # generation: relation/workflow canonicalization landed
+                    # before consistency-list canonicalization. New children
+                    # always store the fully deterministic fingerprint above.
+                    accepted_fingerprints.add(_episode_batch_fingerprint(
+                        project=project,
+                        episode=batch_episode,
+                        shots=whole_episode_shots,
+                        data=data,
+                        consistency_snapshot=batch_consistency_snapshot,
+                        canonical=True,
+                        canonical_consistency=False,
+                    ))
+                    accepted_fingerprints.add(_episode_batch_fingerprint(
+                        project=project,
+                        episode=batch_episode,
+                        shots=whole_episode_shots,
+                        data=data,
+                        consistency_snapshot=batch_consistency_snapshot,
+                        canonical=False,
+                    ))
+                    if (
+                        len(fingerprints) != 1
+                        or not fingerprints <= accepted_fingerprints
+                    ):
+                        raise ProductionIdempotencyConflict({
+                            "detail": (
                                 "该 idempotency_key 已用于不同的整集生成请求；"
                                 "修改分镜或参数后必须使用新的键"
                             ),
+                            "idempotency_key": data["idempotency_key"],
                         })
                     return Response(
                         _episode_batch_response(
@@ -1876,43 +2662,209 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                         status=status.HTTP_200_OK,
                     )
                 batch_id = str(uuid.uuid4())
+                batch_kind = "episode"
                 batch_size = len(whole_episode_shots)
                 # Reserve the complete batch under the queue-capacity mutex.
                 # No prompt/workflow/task is persisted if this preflight fails.
-                _assert_queue_capacity(request.user, additional=batch_size)
-            batch_index = 0
-            for episode in episodes:
-                if whole_episode:
-                    shots = whole_episode_shots or []
-                else:
+                _assert_queue_capacity(
+                    request.user,
+                    additional=batch_size,
+                    extended_generation_confirmed=data["extended_generation_confirmed"],
+                )
+            else:
+                for episode in episodes:
                     episode_shots = episode.shots.order_by("number")
                     if requested_shot_ids:
                         episode_shots = episode_shots.filter(pk__in=requested_shot_ids)
                     shots = load_shots([str(item.id) for item in episode_shots])
+                    if not shots:
+                        production_groups_by_episode[episode.id] = ([], [])
+                        continue
+                    try:
+                        groups = _production_groups(
+                            episode,
+                            shots,
+                            data["multi_shot"],
+                            force_single_shot=False,
+                        )
+                    except PromptBuildError as exc:
+                        raise ValidationError(str(exc)) from exc
+                    production_groups_by_episode[episode.id] = (shots, groups)
+                batch_size = sum(
+                    len(groups) for _, groups in production_groups_by_episode.values()
+                )
+                idempotency_key = data["idempotency_key"]
+                if data["enqueue"] and batch_size > 1 and not idempotency_key:
+                    raise ValidationError({
+                        "idempotency_key": (
+                            "一次创建多个生产任务时必须提供非空 idempotency_key，"
+                            "用于安全重放并避免重复排队"
+                        ),
+                    })
+                if idempotency_key and not batch_size:
+                    raise ValidationError({
+                        "idempotency_key": "所选生产范围没有可创建的任务，不能建立幂等批次",
+                    })
+                if data["enqueue"] and batch_size:
+                    if idempotency_key:
+                        # A keyed selection is always represented as a complete
+                        # auditable batch, including the one-child case.
+                        batch_id = str(uuid.uuid4())
+                        batch_kind = "series" if len(episodes) > 1 else "selection"
+                        batch_consistency_snapshot = capture_consistency_snapshot(project)
+                        planned_units = []
+                        planned_workflow_selections = set()
+                        for episode in episodes:
+                            _, groups = production_groups_by_episode.get(
+                                episode.id, ([], []),
+                            )
+                            for group in groups:
+                                first_shot = group[0]
+                                output_kind = first_shot.media_type
+                                selection_key = (output_kind, first_shot.h3_mode)
+                                matched_selection = selected_workflows.get(selection_key)
+                                if matched_selection:
+                                    planned_workflow_selections.add(selection_key)
+                                template = _select_production_template(
+                                    templates=available_templates,
+                                    preferred=preferred_template,
+                                    selected=(matched_selection or {}).get("template"),
+                                    output_kind=output_kind,
+                                    h3_mode=first_shot.h3_mode,
+                                )
+                                effective_overrides = dict(
+                                    image_workflow_overrides
+                                    if output_kind == PromptArtifact.PromptType.IMAGE
+                                    else video_workflow_overrides
+                                )
+                                if matched_selection:
+                                    effective_overrides.update(
+                                        matched_selection["parameters"]
+                                    )
+                                group_key = tuple(str(item.id) for item in group)
+                                resolved_idempotent_groups[group_key] = {
+                                    "template": template,
+                                    "workflow_overrides": effective_overrides,
+                                    "selection_key": (
+                                        selection_key if matched_selection else None
+                                    ),
+                                }
+                                planned_units.append({
+                                    "episode_id": str(episode.id),
+                                    "shot_ids": list(group_key),
+                                    "output_kind": output_kind,
+                                    "h3_mode": first_shot.h3_mode,
+                                    "include_audio": (
+                                        first_shot.include_audio
+                                        if output_kind == PromptArtifact.PromptType.VIDEO
+                                        else False
+                                    ),
+                                    "template": {
+                                        "id": str(template.id),
+                                        "slug": template.slug,
+                                        "version": template.version,
+                                        "provider": template.provider,
+                                        "model": template.model,
+                                        "definition": template.definition,
+                                        "input_schema": template.input_schema,
+                                    },
+                                    "workflow_overrides": effective_overrides,
+                                })
+                        unused_selections = (
+                            set(selected_workflows) - planned_workflow_selections
+                        )
+                        if unused_selections:
+                            formatted = ", ".join(
+                                f"{kind}/{mode}"
+                                for kind, mode in sorted(unused_selections)
+                            )
+                            raise ValidationError({
+                                "workflow_selections": (
+                                    "所选生产范围没有可应用的镜头: " + formatted
+                                ),
+                            })
+                        batch_fingerprint = _series_batch_fingerprint(
+                            project=project,
+                            episodes=episodes,
+                            production_groups_by_episode=production_groups_by_episode,
+                            planned_units=planned_units,
+                            data=data,
+                            consistency_snapshot=batch_consistency_snapshot,
+                        )
+                        existing_tasks = _production_batch_tasks(
+                            user=request.user,
+                            project=project,
+                            idempotency_key=idempotency_key,
+                        )
+                        if existing_tasks:
+                            fingerprints = {
+                                (task.capability_snapshot or {}).get(
+                                    "request_fingerprint"
+                                )
+                                for task in existing_tasks
+                            }
+                            if fingerprints != {batch_fingerprint}:
+                                raise ProductionIdempotencyConflict({
+                                    "detail": (
+                                        "该 idempotency_key 已用于不同的生产请求；"
+                                        "修改剧集、分镜或工作流参数后必须使用新的键"
+                                    ),
+                                    "idempotency_key": idempotency_key,
+                                })
+                            return Response(
+                                _series_batch_response(
+                                    project=project,
+                                    tasks=existing_tasks,
+                                    idempotency_key=idempotency_key,
+                                    idempotent_replay=True,
+                                ),
+                                status=status.HTTP_200_OK,
+                            )
+                    _assert_queue_capacity(
+                        request.user,
+                        additional=batch_size,
+                        extended_generation_confirmed=data[
+                            "extended_generation_confirmed"
+                        ],
+                    )
+            batch_index = 0
+            for episode in episodes:
+                if whole_episode:
+                    shots = whole_episode_shots or []
+                    try:
+                        groups = _production_groups(
+                            episode,
+                            shots,
+                            data["multi_shot"],
+                            force_single_shot=True,
+                        )
+                    except PromptBuildError as exc:
+                        raise ValidationError(str(exc)) from exc
+                else:
+                    shots, groups = production_groups_by_episode.get(episode.id, ([], []))
                 if not shots:
                     continue
-                try:
-                    groups = _production_groups(
-                        episode,
-                        shots,
-                        data["multi_shot"],
-                        force_single_shot=whole_episode,
-                    )
-                except PromptBuildError as exc:
-                    raise ValidationError(str(exc)) from exc
                 for group in groups:
                     first_shot = group[0]
                     output_kind = first_shot.media_type
-                    matched_selection = selected_workflows.get(
-                        (output_kind, first_shot.h3_mode),
-                    )
-                    if matched_selection:
-                        used_workflow_selections.add((output_kind, first_shot.h3_mode))
-                    template = _select_production_template(
-                        templates=available_templates, preferred=preferred_template,
-                        selected=(matched_selection or {}).get("template"),
-                        output_kind=output_kind, h3_mode=first_shot.h3_mode,
-                    )
+                    group_key = tuple(str(item.id) for item in group)
+                    resolved_idempotent_group = resolved_idempotent_groups.get(group_key)
+                    if resolved_idempotent_group:
+                        template = resolved_idempotent_group["template"]
+                        selection_key = resolved_idempotent_group["selection_key"]
+                        if selection_key:
+                            used_workflow_selections.add(selection_key)
+                        matched_selection = selected_workflows.get(selection_key)
+                    else:
+                        selection_key = (output_kind, first_shot.h3_mode)
+                        matched_selection = selected_workflows.get(selection_key)
+                        if matched_selection:
+                            used_workflow_selections.add(selection_key)
+                        template = _select_production_template(
+                            templates=available_templates, preferred=preferred_template,
+                            selected=(matched_selection or {}).get("template"),
+                            output_kind=output_kind, h3_mode=first_shot.h3_mode,
+                        )
                     try:
                         prompts = _create_prompt_artifacts(
                             request.user, project, episode, group,
@@ -1923,9 +2875,7 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                                 if output_kind == PromptArtifact.PromptType.VIDEO else False
                             ),
                             duration_overrides={},
-                            consistency_snapshot=(
-                                batch_consistency_snapshot if whole_episode else None
-                            ),
+                            consistency_snapshot=batch_consistency_snapshot,
                             reuse_latest_unchanged=True,
                         )
                         prompt = prompts[0]
@@ -1942,13 +2892,18 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                         if output_kind == PromptArtifact.PromptType.IMAGE and template.model:
                             prompt.model = template.model
                             prompt.save(update_fields=("model", "updated_at"))
-                        selected_overrides = dict(
-                            image_workflow_overrides
-                            if output_kind == PromptArtifact.PromptType.IMAGE
-                            else video_workflow_overrides
-                        )
-                        if matched_selection:
-                            selected_overrides.update(matched_selection["parameters"])
+                        if resolved_idempotent_group:
+                            selected_overrides = dict(
+                                resolved_idempotent_group["workflow_overrides"]
+                            )
+                        else:
+                            selected_overrides = dict(
+                                image_workflow_overrides
+                                if output_kind == PromptArtifact.PromptType.IMAGE
+                                else video_workflow_overrides
+                            )
+                            if matched_selection:
+                                selected_overrides.update(matched_selection["parameters"])
                         workflow_json, injected, content_hash = build_workflow(
                             template,
                             prompt,
@@ -1966,39 +2921,43 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                     workflows.append(workflow)
                     task = None
                     if data["enqueue"]:
-                        capability_overrides = None
-                        if whole_episode:
+                        capability_overrides = {
+                            "extended_generation_confirmed": bool(
+                                data["extended_generation_confirmed"]
+                            ),
+                        }
+                        if batch_id:
                             batch_index += 1
-                            if len(group) != 1:
+                            if whole_episode and len(group) != 1:
                                 raise ValidationError(
                                     "整集生成内部契约错误：每个子任务必须只包含一个分镜"
                                 )
-                            child_shot = group[0]
-                            capability_overrides = {
+                            child_shot = group[0] if len(group) == 1 else None
+                            capability_overrides.update({
                                 "batch_id": batch_id,
-                                "batch_kind": "episode",
+                                "batch_kind": batch_kind,
                                 "batch_role": "child",
                                 "batch_index": batch_index,
                                 "batch_size": batch_size,
-                                "idempotency_key": data["idempotency_key"],
-                                "request_fingerprint": batch_fingerprint,
                                 "episode_id": str(episode.id),
                                 "episode_number": episode.number,
                                 "episode_title": episode.title,
-                                "shot_ids": [str(child_shot.id)],
-                                "shot_id": str(child_shot.id),
-                                "shot_number": child_shot.number,
-                                "shot_title": child_shot.title,
+                                "shot_ids": [str(item.id) for item in group],
+                                "shot_id": str(child_shot.id) if child_shot else None,
+                                "shot_number": child_shot.number if child_shot else None,
+                                "shot_title": child_shot.title if child_shot else "",
                                 "prompt_artifact_reused": bool(
                                     getattr(prompt, "_production_prompt_reused", False)
                                 ),
                                 **({
                                     "include_audio": child_shot.include_audio,
                                     "requested_duration_ms": child_shot.duration_ms,
-                                } if output_kind == Shot.MediaType.VIDEO else {}),
-                            }
-                        else:
-                            _assert_queue_capacity(request.user)
+                                } if child_shot and output_kind == Shot.MediaType.VIDEO else {}),
+                                **({
+                                    "idempotency_key": data["idempotency_key"],
+                                    "request_fingerprint": batch_fingerprint,
+                                } if data["idempotency_key"] else {}),
+                            })
                         task = _create_generation_task(
                             user=request.user, workflow=workflow,
                             priority=data["priority"], max_attempts=data["max_attempts"],
@@ -2051,6 +3010,10 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                             ),
                             "workflow_id": str(workflow.id),
                             "task_id": str(task.id) if task else None,
+                            "batch_id": batch_id,
+                            "batch_kind": batch_kind or None,
+                            "batch_index": batch_index if batch_id else None,
+                            "batch_size": batch_size if batch_id else None,
                         })
                 target_status = (
                     Episode.Status.GENERATING if data["enqueue"] else Episode.Status.READY
@@ -2079,12 +3042,26 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
             )
             response_payload["prompt_language_gate"] = prompt_language_gate_reports
             return Response(response_payload, status=status.HTTP_201_CREATED)
+        if data["idempotency_key"]:
+            return Response(
+                _series_batch_response(
+                    project=project,
+                    tasks=tasks,
+                    idempotency_key=data["idempotency_key"],
+                    idempotent_replay=False,
+                ),
+                status=status.HTTP_201_CREATED,
+            )
         return Response({
             "project_id": str(project.id),
             "episode_ids": [str(item.id) for item in episodes],
             "prompt_artifact_ids": [str(item.id) for item in generated_prompts],
             "workflow_ids": [str(item.id) for item in workflows],
             "task_ids": [str(item.id) for item in tasks],
+            "batch_id": batch_id,
+            "batch_kind": batch_kind or None,
+            "batch_size": batch_size,
+            "extended_generation_confirmed": data["extended_generation_confirmed"],
             "counts": {"prompts": len(generated_prompts), "workflows": len(workflows), "tasks": len(tasks)},
             "production_units": production_units,
             "prompt_language_gate": prompt_language_gate_reports,
@@ -2142,6 +3119,7 @@ class ConsistencyLockViewSet(ProjectChildViewSet):
 _SHOT_SCALAR_FIELDS = (
     "title", "narrative", "detailed_description", "camera", "action", "dialogue", "sound_effects", "music",
     "duration_ms", "media_type", "h3_mode", "include_audio", "scene", "reference_bindings",
+    "requires_first_frame_continuity", "requires_last_frame_continuity",
     "continuity_notes", "metadata",
 )
 
@@ -2215,7 +3193,10 @@ def _sync_episode_shots(*, episode: Episode, user, items: list[dict]):
             and not VIDEO_SHOT_MIN_DURATION_MS <= instance.duration_ms <= VIDEO_SHOT_MAX_DURATION_MS
         ):
             raise ValidationError({
-                "shots": f"分镜 {instance.number} 的视频时长必须在 5000–15000ms",
+                "shots": (
+                    f"分镜 {instance.number} 的视频时长必须在 "
+                    f"{VIDEO_SHOT_MIN_DURATION_MS}–{VIDEO_SHOT_MAX_DURATION_MS}ms"
+                ),
             })
         if instance.media_type == Shot.MediaType.IMAGE:
             instance.include_audio = False
@@ -2340,6 +3321,13 @@ _PROMOTABLE_DIALOGUE_DELIVERY_RE = re.compile(
 class TranslationPromotionConflict(APIException):
     status_code = status.HTTP_409_CONFLICT
     default_code = "translation_promotion_conflict"
+
+    def __init__(self, detail=None, code=None):
+        super().__init__(detail, code)
+        # Keep the allow-listed conflict payload typed. APIException otherwise
+        # coerces booleans and revision counters to ErrorDetail strings.
+        if detail is not None:
+            self.detail = detail
 
 
 def _promotion_target(field_key: str) -> tuple[str, int | None] | None:
@@ -2485,6 +3473,26 @@ def _confirm_and_promote_translation(
         candidate = validate_manual_translation(current_source, candidate)
     except TranslationValidationError as exc:
         raise ValidationError({"translation": str(exc)}) from exc
+    current_context = build_translation_context(
+        entry.project,
+        scope_type=entry.scope_type,
+        scope_id=entry.scope_id,
+        field_key=entry.field_key,
+        source_text=current_source,
+    )
+    stored_context_hash = str(
+        (entry.runtime_metadata or {}).get("translation_context_hash") or ""
+    )
+    if stored_context_hash == translation_context_hash(current_context):
+        missing_mappings = missing_relevant_canonical_identity_mappings(
+            entry.project, current_source, candidate,
+        )
+        if missing_mappings:
+            raise TranslationPromotionConflict({
+                "code": "canonical_target_missing",
+                "detail": "修改后的英文译文缺少当前视觉与术语规则要求保留的 canonical 名称。",
+                "missing_mappings": missing_mappings,
+            })
     if not translation_entry_context_current(
         entry, project=entry.project, current_source=current_source,
         translated_text=candidate,
@@ -2505,7 +3513,9 @@ def _confirm_and_promote_translation(
         return entry, _promotion_field_payload(entry, candidate), shot
 
     _append_translation_history(
-        entry, event="translation_promoted", actor=user,
+        entry,
+        event="translation_promoted" if target and shot is not None else "translation_confirmed",
+        actor=user,
     )
     entry.revision += 1
     now = timezone.now()
@@ -2649,7 +3659,13 @@ class PromptFieldTranslationViewSet(viewsets.ReadOnlyModelViewSet):
         )
         return Response(PromptFieldTranslationSerializer(saved).data)
 
-    @extend_schema(request=PromptTranslationConfirmSerializer, responses=PromptFieldTranslationSerializer)
+    @extend_schema(
+        request=PromptTranslationConfirmSerializer,
+        responses={
+            200: PromptFieldTranslationSerializer,
+            409: PromptTranslationConflictErrorResponseSerializer,
+        },
+    )
     @action(detail=True, methods=["post"], url_path="confirm")
     def confirm(self, request, pk=None):
         serializer = PromptTranslationConfirmSerializer(data=request.data)
@@ -2965,7 +3981,7 @@ def _create_prompt_artifacts(
 
 
 def _partition_h3_shots(shots: list[Shot]) -> list[list[Shot]]:
-    """Partition one ordered, homogeneous video run into safe 5–15s jobs."""
+    """Partition one ordered video run into configured production-duration jobs."""
     if not shots:
         return []
     size = len(shots)
@@ -2977,9 +3993,9 @@ def _partition_h3_shots(shots: list[Shot]) -> list[list[Shot]]:
         duration = 0
         for end in range(start, size):
             duration += shots[end].duration_ms
-            if duration > 15_000:
+            if duration > VIDEO_SHOT_MAX_DURATION_MS:
                 break
-            if duration < 5_000:
+            if duration < VIDEO_SHOT_MIN_DURATION_MS:
                 continue
             candidate = [*best[start], (start, end + 1)]
             current = best[end + 1]
@@ -2988,7 +4004,8 @@ def _partition_h3_shots(shots: list[Shot]) -> list[list[Shot]]:
     if best[size] is None:
         numbers = ", ".join(str(item.number) for item in shots)
         raise PromptBuildError(
-            f"视频分镜 [{numbers}] 无法按连续顺序划分为 5000–15000ms 的 H3 任务；"
+            f"视频分镜 [{numbers}] 无法按连续顺序划分为 "
+            f"{VIDEO_SHOT_MIN_DURATION_MS}–{VIDEO_SHOT_MAX_DURATION_MS}ms 的 H3 任务；"
             "请调整分镜时长或模式/音频分组"
         )
     return [shots[start:end] for start, end in best[size]]
@@ -3384,6 +4401,13 @@ class GenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):
     def retrieve(self, request, *args, **kwargs):
         return super().retrieve(request, *args, **kwargs)
 
+    @extend_schema(
+        request=GenerationTaskCreateSerializer,
+        responses={
+            201: GenerationTaskSerializer,
+            409: ProductionQueueConfirmationErrorResponseSerializer,
+        },
+    )
     def create(self, request, *args, **kwargs):
         serializer = GenerationTaskCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -3404,10 +4428,24 @@ class GenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):
             shot_ids=list((workflow.prompt_artifact.request_options or {}).get("shot_ids") or []),
         )
         with transaction.atomic():
-            _assert_queue_capacity(request.user)
+            try:
+                SeriesProject.objects.select_for_update().get(pk=workflow.project_id)
+            except SeriesProject.DoesNotExist as exc:
+                raise NotFound("连续剧项目不存在") from exc
+            _assert_queue_capacity(
+                request.user,
+                extended_generation_confirmed=data[
+                    "extended_generation_confirmed"
+                ],
+            )
             task = _create_generation_task(
                 user=request.user, workflow=workflow,
                 priority=data["priority"], max_attempts=data["max_attempts"],
+                capability_snapshot_overrides={
+                    "extended_generation_confirmed": bool(
+                        data["extended_generation_confirmed"]
+                    ),
+                },
             )
         return Response(self.get_serializer(task).data, status=status.HTTP_201_CREATED)
 
@@ -4011,11 +5049,24 @@ class GenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):
         ))
         return Response(self.get_serializer(task).data)
 
-    @extend_schema(request=None, responses={201: GenerationTaskSerializer})
+    @extend_schema(
+        request=GenerationTaskRetrySerializer,
+        responses={
+            201: GenerationTaskSerializer,
+            409: ProductionQueueConfirmationErrorResponseSerializer,
+        },
+    )
     @action(detail=True, methods=["post"])
     def retry(self, request, pk=None):
+        request_serializer = GenerationTaskRetrySerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        retry_options = request_serializer.validated_data
         source = self.get_object()
         with transaction.atomic():
+            try:
+                SeriesProject.objects.select_for_update().get(pk=source.project_id)
+            except SeriesProject.DoesNotExist as exc:
+                raise NotFound("连续剧项目不存在") from exc
             task = self.get_queryset().select_for_update().get(pk=source.pk)
             if not _can_execute_template(task.generated_workflow.template, request.user):
                 raise ValidationError("The workflow template is not executable by this user.")
@@ -4092,8 +5143,18 @@ class GenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):
                 task.save(update_fields=(
                     "submission_state", "heartbeat_at", "remote_state", "remote_error", "updated_at",
                 ))
-            _assert_queue_capacity(request.user)
-            retry_task = _clone_generation_task_for_retry(task)
+            _assert_queue_capacity(
+                request.user,
+                extended_generation_confirmed=retry_options[
+                    "extended_generation_confirmed"
+                ],
+            )
+            retry_task = _clone_generation_task_for_retry(
+                task,
+                extended_generation_confirmed=retry_options[
+                    "extended_generation_confirmed"
+                ],
+            )
         return Response(self.get_serializer(retry_task).data, status=status.HTTP_201_CREATED)
 
 

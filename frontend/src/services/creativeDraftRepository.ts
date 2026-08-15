@@ -16,16 +16,17 @@ import type {
   Episode,
   SeriesProject,
   Shot,
+  PromptProviderCapability,
   PromptProviderId,
 } from '@/types'
-import { adaptPromptProviders } from './providerCapabilities'
+import {
+  adaptPromptProviders,
+  mockCreativePromptProviderCapability,
+  promptProvider,
+} from './providerCapabilities'
 
 type Raw = Record<string, any>
 const useMock = import.meta.env.VITE_USE_MOCK === 'true'
-// The child Qwen process may run for 900 seconds and its parent enforces a
-// 960-second hard ceiling. Keep the browser at 17 minutes so the server has a
-// full minute of network/serialization margin to return the terminal result.
-const CREATIVE_GENERATION_TIMEOUT_MS = 1_020_000
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
 const wait = () => new Promise((resolve) => setTimeout(resolve, 180))
 const mockDrafts = new Map<string, CreativeDraft>()
@@ -44,12 +45,10 @@ const localProjects = (): SeriesProject[] => {
 const saveProjects = (projects: SeriesProject[]) => localStorage.setItem('cineforge_projects', JSON.stringify(projects))
 
 const mockEnglish = (source: string, fallback: string) => source.trim() ? `[Mock draft] ${source.trim()}` : fallback
-const mockData = (project: SeriesProject, episode: Episode, targetShotCount: number): CreativeDraftData => {
-  const sourceShots = episode.shots.length
-    ? episode.shots.slice(0, targetShotCount)
-    : Array.from({ length: targetShotCount }, (_, index): Shot => ({
+const mockData = (project: SeriesProject, episode: Episode, targetShotCount: number, capability: PromptProviderCapability): CreativeDraftData => {
+  const sourceShots = Array.from({ length: targetShotCount }, (_, index): Shot => episode.shots[index] || ({
       id: `mock-source-${index + 1}`, order: index + 1, title: `镜头 ${index + 1}`,
-      mediaType: 'video', duration: 5, mode: project.defaultMode, framing: '中景',
+      mediaType: 'video', duration: (capability.minShotDurationMs ?? 0) / 1000, mode: project.defaultMode, framing: '中景',
       camera: '稳定缓慢推进', action: episode.synopsis || project.logline || '人物进入场景，事件开始。',
       continuityDirection: '承接上一镜位置与视线，动作结束后保持可衔接姿态。', prompt: '',
       negativePrompt: project.bible.negativePrompt, characterIds: [], sceneId: project.bible.scenes[0]?.id,
@@ -74,7 +73,10 @@ const mockData = (project: SeriesProject, episode: Episode, targetShotCount: num
       continuityEn: mockEnglish(shot.continuityDirection || '', 'continue from the prior state and end in a stable matching pose'),
       soundscapeZh: shot.audio.soundscape || '连续环境声', soundscapeEn: mockEnglish(shot.audio.soundscape, 'continuous diegetic ambience'),
       musicZh: shot.audio.music || '克制的叙事配乐', musicEn: mockEnglish(shot.audio.music, 'restrained non-diegetic score'),
-      durationMs: Math.min(15000, Math.max(5000, Math.round((shot.duration || 5) * 1000))),
+      durationMs: Math.min(
+        capability.maxShotDurationMs ?? Number.POSITIVE_INFINITY,
+        Math.max(capability.minShotDurationMs ?? 0, Math.round(Number(shot.duration || 0) * 1000)),
+      ),
       mediaType: 'video' as const, h3Mode: shot.mode, includeAudio: shot.audioEnabled,
       sceneId: shot.sceneId, characterIds: [...shot.characterIds], propIds: [...shot.propIds], dialogue: [],
     })),
@@ -104,32 +106,45 @@ export const creativeDraftRepository = {
     if (!useMock) {
       const raw = unwrap<Raw>((await api.get('/capabilities/creative-drafts/')).data)
       const providerCapability = adaptPromptProviders(raw)
+      const defaultCapability = promptProvider(providerCapability.providers, providerCapability.defaultProvider)
       return {
         supported: raw.creative_generation_supported === true,
-        configured: raw.configured === true,
-        provider: String(raw.provider || ''), model: String(raw.model || ''),
-        modelDownloaded: raw.model_downloaded === true, modelVerified: raw.model_verified === true,
-        device: String(raw.device || 'cpu'), minShots: Number(raw.min_shots || 1), maxShots: Number(raw.max_shots || 4),
-        maxSourceChars: Number(raw.max_source_chars || 0),
-        baselineMaxNewTokens: Number(raw.baseline_max_new_tokens || 0),
-        maxNewTokens: Number(raw.max_new_tokens || raw.configured_max_new_tokens || 0),
-        configuredMaxNewTokens: Number(raw.configured_max_new_tokens || raw.max_new_tokens || 0),
-        contextSize: Number(raw.context_size || 0), loadedOnDemand: raw.loaded_on_demand === true,
-        unloadedAfterRequest: raw.unloaded_after_request === true, reviewRequired: raw.review_required !== false,
-        translationReviewReused: raw.translation_review_reused === true,
-        notice: String(raw.notice || '') || undefined,
+        configured: defaultCapability?.configured === true,
+        provider: defaultCapability?.id || '', model: defaultCapability?.model || '',
+        modelDownloaded: defaultCapability?.modelDownloaded === true,
+        modelVerified: defaultCapability?.modelVerified === true,
+        device: defaultCapability?.device || '', minShots: defaultCapability?.minShots,
+        batchShots: defaultCapability?.batchShots,
+        maxSourceChars: defaultCapability?.maxSourceChars,
+        minShotDurationMs: defaultCapability?.minShotDurationMs,
+        maxShotDurationMs: defaultCapability?.maxShotDurationMs,
+        baselineMaxNewTokens: defaultCapability?.baselineMaxNewTokens,
+        maxNewTokens: defaultCapability?.maxNewTokens ?? defaultCapability?.configuredMaxNewTokens,
+        configuredMaxNewTokens: defaultCapability?.configuredMaxNewTokens ?? defaultCapability?.maxNewTokens,
+        contextSize: defaultCapability?.contextSize, loadedOnDemand: defaultCapability?.loadedOnDemand === true,
+        unloadedAfterRequest: defaultCapability?.unloadedAfterRequest === true,
+        reviewRequired: defaultCapability?.reviewRequired !== false,
+        translationReviewReused: defaultCapability?.translationReviewReused === true,
+        notice: defaultCapability?.notice,
         ...providerCapability,
       }
     }
     await wait()
-    return { supported: true, configured: true, provider: 'mock-qwen-local', model: 'Qwen/Qwen3-4B-GGUF',
-      modelDownloaded: true, modelVerified: true, device: 'cpu', minShots: 1, maxShots: 4,
-      maxSourceChars: 12000, baselineMaxNewTokens: 2304, maxNewTokens: 3072,
-      configuredMaxNewTokens: 3072, contextSize: 32768, loadedOnDemand: true,
-      unloadedAfterRequest: true, reviewRequired: true, translationReviewReused: true,
+    const mockProvider = mockCreativePromptProviderCapability()
+    return { supported: true, configured: true, provider: mockProvider.id, model: mockProvider.model,
+      modelDownloaded: mockProvider.modelDownloaded === true, modelVerified: mockProvider.modelVerified === true,
+      device: mockProvider.device || '', minShots: mockProvider.minShots,
+      batchShots: mockProvider.batchShots, maxSourceChars: mockProvider.maxSourceChars,
+      minShotDurationMs: mockProvider.minShotDurationMs, maxShotDurationMs: mockProvider.maxShotDurationMs,
+      baselineMaxNewTokens: mockProvider.baselineMaxNewTokens,
+      maxNewTokens: mockProvider.maxNewTokens ?? mockProvider.configuredMaxNewTokens,
+      configuredMaxNewTokens: mockProvider.configuredMaxNewTokens ?? mockProvider.maxNewTokens,
+      contextSize: mockProvider.contextSize, loadedOnDemand: mockProvider.loadedOnDemand === true,
+      unloadedAfterRequest: mockProvider.unloadedAfterRequest === true,
+      reviewRequired: mockProvider.reviewRequired !== false,
+      translationReviewReused: mockProvider.translationReviewReused === true,
       notice: 'Mock 模式仅用于前端交互验证。', defaultProvider: 'local_qwen',
-      providers: [{ id: 'local_qwen', label: '本地 Qwen', enabled: true, configured: true, ready: true,
-        model: 'Qwen/Qwen3-4B-GGUF', transport: 'local', modelDownloaded: true, modelVerified: true, device: 'cpu' }] }
+      providers: [mockProvider] }
   },
 
   async list(projectId: string, episodeId: string): Promise<CreativeDraft[]> {
@@ -147,7 +162,8 @@ export const creativeDraftRepository = {
     targetShotCount: number
     creativity: CreativeDraftCreativity
     variationNote?: string
-    provider?: PromptProviderId
+    provider: PromptProviderId
+    extendedGenerationConfirmed?: boolean
   }): Promise<CreativeDraft> {
     if (!useMock) {
       const response = await api.post(`/projects/${projectId}/creative-drafts/generate/`, {
@@ -155,19 +171,21 @@ export const creativeDraftRepository = {
         target_shot_count: options.targetShotCount,
         creativity: options.creativity,
         variation_note: options.variationNote || '',
-        provider: options.provider || 'local_qwen',
-      }, { timeout: CREATIVE_GENERATION_TIMEOUT_MS })
+        provider: options.provider,
+        extended_generation_confirmed: options.extendedGenerationConfirmed === true,
+      }, { timeout: 0 })
       return adaptCreativeDraft(unwrap<Raw>(response.data))
     }
     await wait()
     const { project, episode } = mockProjectEpisode(projectId, options.episodeId)
+    const mockProvider = mockCreativePromptProviderCapability()
     const generationNo = [...mockDrafts.values()].filter((item) => item.episodeId === episode.id).length + 1
     const now = new Date().toISOString()
     const draft = mockFlags({
       id: `creative-draft-${Date.now()}`, projectId, episodeId: episode.id, status: 'draft', revision: 1,
       generationNo, contextHash: `mock-${project.updatedAt}`, contextCurrent: true,
       creativity: options.creativity, variationNote: options.variationNote || '',
-      draftData: mockData(project, episode, options.targetShotCount),
+      draftData: mockData(project, episode, options.targetShotCount, mockProvider),
       validation: { status: 'ready', errors: [], warnings: [] },
       reviewIssues: [],
       reviewSummary: { issueCount: 0, riskCount: 0, requiresEditCount: 0, status: 'ready' },
@@ -199,7 +217,8 @@ export const creativeDraftRepository = {
     creativity?: CreativeDraftCreativity
     variationNote?: string
     shotKeys?: string[]
-    provider?: PromptProviderId
+    provider: PromptProviderId
+    extendedGenerationConfirmed?: boolean
   }): Promise<CreativeDraft> {
     if (!useMock) {
       const response = await api.post(`/creative-drafts/${id}/regenerate/`, {
@@ -207,10 +226,11 @@ export const creativeDraftRepository = {
         target_shot_count: options.targetShotCount,
         creativity: options.creativity,
         variation_note: options.variationNote || '',
-        provider: options.provider || 'local_qwen',
+        provider: options.provider,
+        extended_generation_confirmed: options.extendedGenerationConfirmed === true,
         ...(options.shotKeys?.length ? { shot_keys: options.shotKeys } : {}),
         preserve_locked_content: true,
-      }, { timeout: CREATIVE_GENERATION_TIMEOUT_MS })
+      }, { timeout: 0 })
       return adaptCreativeDraft(unwrap<Raw>(response.data))
     }
     await wait()
@@ -218,9 +238,14 @@ export const creativeDraftRepository = {
     if (!current || current.revision !== options.expectedRevision) throw new Error('草稿版本已变化，请刷新后重试。')
     mockDrafts.set(id, mockFlags({ ...current, status: 'superseded', canEdit: false, canApply: false }))
     const now = new Date().toISOString()
+    const { project, episode } = mockProjectEpisode(current.projectId, current.episodeId)
+    const regeneratedData = options.shotKeys?.length
+      ? current.draftData
+      : mockData(project, episode, options.targetShotCount ?? current.draftData.shots.length, mockCreativePromptProviderCapability())
     const next = mockFlags({ ...clone(current), id: `creative-draft-${Date.now()}`, parentDraftId: current.id,
       status: 'draft', revision: 1, generationNo: current.generationNo + 1,
       creativity: options.creativity || current.creativity, variationNote: options.variationNote || '',
+      draftData: regeneratedData,
       createdAt: now, updatedAt: now, confirmedAt: undefined, appliedAt: undefined,
     })
     mockDrafts.set(next.id, next); return clone(next)
@@ -278,7 +303,9 @@ export const creativeDraftRepository = {
       duration: shot.durationMs / 1000, mode: shot.h3Mode, framing: shot.narrativeZh,
       camera: shot.cameraZh, action: shot.actionZh || shot.narrativeZh, continuityDirection: shot.continuityZh,
       prompt: '', negativePrompt: project.bible.negativePrompt, characterIds: shot.characterIds,
-      sceneId: shot.sceneId, propIds: shot.propIds, referenceAssetIds: [], audioEnabled: shot.includeAudio,
+      sceneId: shot.sceneId, propIds: shot.propIds, referenceAssetIds: [],
+      requiresFirstFrameContinuity: false, requiresLastFrameContinuity: false,
+      audioEnabled: shot.includeAudio,
       audio: { dialogue: shot.dialogue.map((line) => `${line.speakerId}：${line.textZh}`).join('\n'), soundscape: shot.soundscapeZh, music: shot.musicZh }, status: 'draft',
     }))
     if (options.placement === 'replace' && !options.shotKeys?.length) episode.shots = mapped

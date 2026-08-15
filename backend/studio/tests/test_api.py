@@ -426,6 +426,7 @@ class APIFlowTests(TestCase):
         response = self.client.post(f"/api/v1/projects/{self.project.id}/build-production/", {
             "multi_shot": False,
             "enqueue": True,
+            "idempotency_key": "controlled-official-resolution-profile",
             "resolution_profile": "0.3",
         }, format="json")
         self.assertEqual(response.status_code, 201, response.data)
@@ -573,7 +574,8 @@ class APIFlowTests(TestCase):
     def test_breakdown_master_script_binds_bible_and_creates_shots(self):
         self.episode.delete()
         self.project.master_script = (
-            "第1集：烧焦的信\n镜头1：旧档案室里，林默展开证物。\n林默：这不是昨晚烧的。\n"
+            "第1集：烧焦的信\n镜头1【时长=8秒】【首帧连续=否】【尾帧连续=是】：旧档案室里。\n"
+            "[0-3秒] 动作：林默展开证物。\n[3-6秒] 林默：这不是昨晚烧的。\n"
             "镜头2：闪电照亮门后人影。\n\n第2集：追踪\n镜头1：林默冲进旧档案室。"
         )
         self.project.save(update_fields=("master_script", "updated_at"))
@@ -585,7 +587,12 @@ class APIFlowTests(TestCase):
         self.assertEqual(response.data["counts"], {"episodes": 2, "shots": 3})
         first_shot = self.project.episodes.get(number=1).shots.get(number=1)
         self.assertEqual(first_shot.dialogue[0]["speaker_id"], "S1")
-        self.assertEqual(first_shot.duration_ms, 5000)
+        self.assertEqual(first_shot.dialogue[0]["start_ms"], 3000)
+        self.assertEqual(first_shot.dialogue[0]["end_ms"], 6000)
+        self.assertEqual(first_shot.duration_ms, 8000)
+        self.assertFalse(first_shot.requires_first_frame_continuity)
+        self.assertTrue(first_shot.requires_last_frame_continuity)
+        self.assertIn("[0s–3s] 林默展开证物。", first_shot.narrative)
         self.assertEqual(list(first_shot.characters.values_list("stable_speaker_id", flat=True)), ["S1"])
 
     def test_page_size_query_returns_full_90_asset_library_slice(self):
@@ -623,9 +630,13 @@ class APIFlowTests(TestCase):
                 },
                 {
                     "id": str(self.shot1.id), "number": 2, "narrative": self.shot1.narrative,
-                    "dialogue": self.shot1.dialogue, "characters": [str(self.character.id)],
+                    "dialogue": [{
+                        **self.shot1.dialogue[0], "start_ms": 500, "end_ms": 2500,
+                    }], "characters": [str(self.character.id)],
                     "reference_assets": [str(reference.id)], "duration_ms": 5000,
                     "media_type": "video", "h3_mode": "T2VA", "include_audio": True,
+                    "requires_first_frame_continuity": True,
+                    "requires_last_frame_continuity": True,
                     "metadata": {"framing": "特写", "lens": "50mm"},
                 },
                 {
@@ -642,6 +653,10 @@ class APIFlowTests(TestCase):
         self.shot2.refresh_from_db()
         self.assertEqual((self.shot2.number, self.shot1.number), (1, 2))
         self.assertEqual(self.shot1.dialogue[0]["speaker_id"], "S1")
+        self.assertEqual(self.shot1.dialogue[0]["start_ms"], 500)
+        self.assertEqual(self.shot1.dialogue[0]["end_ms"], 2500)
+        self.assertTrue(self.shot1.requires_first_frame_continuity)
+        self.assertTrue(self.shot1.requires_last_frame_continuity)
         self.assertEqual(self.shot1.metadata["framing"], "特写")
         self.assertEqual(list(self.shot1.reference_assets.values_list("id", flat=True)), [reference.id])
         created = self.episode.shots.get(number=3)

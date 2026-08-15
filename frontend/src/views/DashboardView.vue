@@ -1,18 +1,34 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 import { ArrowRight, Clapperboard, Clock3, Film, FolderOpen, Images, MoreHorizontal, Play, Plus, Sparkles, WandSparkles, Workflow } from 'lucide-vue-next'
 import { useStudioStore } from '@/stores/studio'
 import StatusBadge from '@/components/StatusBadge.vue'
+import ProjectCoverImage from '@/components/ProjectCoverImage.vue'
 import { workflowProgressPresentation } from '@/services/taskProgress'
+import { projectEpisodeSummary } from '@/services/projectManagement'
 
 const studio = useStudioStore()
-const episodeCount = computed(() => studio.projects.reduce((sum, project) => sum + project.episodes.length, 0))
+const episodeSummary = (project: (typeof studio.projects)[number]) => project.detailLoaded ? projectEpisodeSummary(project) : project
+const completedEpisodeCountFor = (project: (typeof studio.projects)[number]) => episodeSummary(project).completedEpisodeCount ?? 0
+const episodeCountFor = (project: (typeof studio.projects)[number]) => episodeSummary(project).episodeCount ?? 0
+const episodeCount = computed(() => studio.projects.reduce((sum, project) => sum + (episodeSummary(project).episodeCount ?? 0), 0))
 const runningCount = computed(() => studio.workflows.filter((item) => item.status === 'running' || item.status === 'queued').length)
-const estimatedMinutes = computed(() => studio.projects.reduce((sum, project) => sum + project.episodes.reduce((episodeSum, ep) => episodeSum + ep.shots.reduce((s, shot) => s + shot.duration, 0), 0), 0) / 60)
+const estimatedMinutes = computed(() => studio.projects.reduce((sum, project) => sum + (episodeSummary(project).totalDurationSeconds ?? 0), 0) / 60)
 const greeting = computed(() => new Date().getHours() < 12 ? '早上好' : new Date().getHours() < 18 ? '下午好' : '晚上好')
 const styleFor = (id: string) => studio.styles.find((style) => style.id === id)
 const formatDate = (value: string) => new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric' }).format(new Date(value))
 const taskProgress = workflowProgressPresentation
+const unavailableCoverIds = ref(new Set<string>())
+const hasVisibleCover = (project: (typeof studio.projects)[number]) => Boolean(
+  project.coverUrl && !unavailableCoverIds.value.has(project.id),
+)
+const markCoverUnavailable = (projectId: string) => {
+  unavailableCoverIds.value.add(projectId)
+}
+const refreshProjectCover = async (projectId: string) => {
+  await studio.refreshProjects()
+  return studio.projects.find((project) => project.id === projectId)?.coverUrl
+}
 </script>
 
 <template>
@@ -37,16 +53,19 @@ const taskProgress = workflowProgressPresentation
 
     <section class="content-grid wide-left">
       <div class="panel project-panel">
-        <header class="panel-header"><div><span class="eyebrow">SERIES IN PRODUCTION</span><h3>最近连续剧</h3></div><RouterLink to="/projects/new" class="text-link">新建项目 <ArrowRight :size="14"/></RouterLink></header>
+        <header class="panel-header"><div><span class="eyebrow">SERIES IN PRODUCTION</span><h3>最近连续剧</h3></div><RouterLink to="/projects" class="text-link">查看全部 <ArrowRight :size="14"/></RouterLink></header>
         <div v-if="studio.loading" class="skeleton-list"><i v-for="n in 3" :key="n"></i></div>
         <div v-else class="project-list">
           <RouterLink v-for="project in studio.projects.slice(0,4)" :key="project.id" :to="`/projects/${project.id}`" class="project-row">
-            <div class="project-cover" :style="{background:styleFor(project.styleId)?.gradient}"><div class="cover-lines"></div><span>{{ styleFor(project.styleId)?.name }}</span></div>
-            <div class="project-main"><div><h4>{{ project.title }}</h4><StatusBadge :status="project.status"/></div><p>{{ project.logline }}</p><div class="project-meta"><span><Film :size="13"/> {{ project.episodes.length }} 集</span><span>{{ project.aspectRatio }} · {{ project.resolution }}</span><span>更新于 {{ formatDate(project.updatedAt) }}</span></div></div>
-            <div class="project-progress"><span>{{ project.episodes.filter(e=>e.status==='completed').length }} / {{ project.episodes.length || 1 }}</span><div><i :style="{width:`${Math.max(8,project.episodes.filter(e=>e.status==='completed').length/(project.episodes.length||1)*100)}%`}"></i></div><small>剧集完成度</small></div>
+            <div class="project-cover" :style="{background:styleFor(project.styleId)?.gradient}">
+              <template v-if="!hasVisibleCover(project)"><div class="cover-lines"></div><span>{{ styleFor(project.styleId)?.name }}</span></template>
+              <ProjectCoverImage v-else class="project-cover-image" :src="project.coverUrl" :alt="`《${project.title}》连续剧封面`" :refresh="() => refreshProjectCover(project.id)" @unavailable="markCoverUnavailable(project.id)" />
+            </div>
+            <div class="project-main"><div><h4>{{ project.title }}</h4><StatusBadge :status="project.status"/></div><p>{{ project.logline || '暂无简介' }}</p><div class="project-meta"><span><Film :size="13"/> {{ episodeCountFor(project) }} 集</span><span>{{ project.aspectRatio }} · {{ project.resolution }}</span><span>更新于 {{ formatDate(project.updatedAt) }}</span></div></div>
+            <div class="project-progress"><span>{{ completedEpisodeCountFor(project) }} / {{ episodeCountFor(project) }}</span><div><i :style="{width:`${Math.max(8,completedEpisodeCountFor(project)/Math.max(1,episodeCountFor(project))*100)}%`}"></i></div><small>剧集完成度</small></div>
             <button class="icon-btn" @click.prevent><MoreHorizontal :size="18"/></button>
           </RouterLink>
-          <RouterLink v-if="!studio.projects.length" to="/projects/new" class="empty-inline"><Plus :size="25"/><span>创建你的第一部连续剧</span></RouterLink>
+          <RouterLink v-if="!studio.projects.length" to="/projects" class="empty-inline"><FolderOpen :size="25"/><span>查看连续剧项目</span></RouterLink>
         </div>
       </div>
       <div class="panel workflow-mini-panel">
@@ -69,3 +88,7 @@ const taskProgress = workflowProgressPresentation
     </section>
   </div>
 </template>
+
+<style scoped>
+.project-cover-image{position:absolute;inset:0;z-index:1;width:100%;height:100%;object-fit:cover}
+</style>

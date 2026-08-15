@@ -13,6 +13,9 @@
     "test:shot-detail": "node --test tests/shotDetailDraft.test.ts",
     "test:visual-rules": "node --test tests/visualRulesDraft.test.ts",
     "test:manual": "node --test tests/productionManual.test.ts",
+    "test:workflow-selection": "node --test tests/productionWorkflowSelection.test.ts",
+    "test:projects": "node --test tests/projectManagement.test.ts",
+    "test:assets": "node --test tests/assetManagement.test.ts",
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "vue-tsc -b"
   },

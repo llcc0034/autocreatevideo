@@ -15,7 +15,9 @@ DIALOGUE_MAX_ENTRIES = 64
 DIALOGUE_SPEAKER_ID_MAX_LENGTH = 16
 DIALOGUE_TEXT_MAX_LENGTH = 2_000
 DIALOGUE_DELIVERY_MAX_LENGTH = 500
-DIALOGUE_ALLOWED_KEYS = frozenset({"speaker_id", "text", "delivery", "voiceover"})
+DIALOGUE_ALLOWED_KEYS = frozenset({
+    "speaker_id", "text", "delivery", "voiceover", "start_ms", "end_ms",
+})
 _SPEAKER_ID_RE = re.compile(r"^S[1-9][0-9]*$")
 _VOICEOVER_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])voiceover(?![A-Za-z0-9_])", re.IGNORECASE)
 
@@ -77,6 +79,24 @@ def normalize_dialogue_entry(value: Any, *, index: int | None = None) -> dict:
         if type(voiceover) is not bool:  # bool is deliberate; reject 0/1.
             raise DialogueContractError(f"{label}.voiceover 必须是布尔值")
         result["voiceover"] = voiceover
+    timing_keys = {"start_ms", "end_ms"} & set(value)
+    if timing_keys and timing_keys != {"start_ms", "end_ms"}:
+        raise DialogueContractError(
+            f"{label}.start_ms 与 {label}.end_ms 必须同时提供"
+        )
+    if timing_keys:
+        start_ms = value["start_ms"]
+        end_ms = value["end_ms"]
+        if type(start_ms) is not int or type(end_ms) is not int:
+            raise DialogueContractError(
+                f"{label}.start_ms 与 {label}.end_ms 必须是整数毫秒"
+            )
+        if start_ms < 0 or end_ms <= start_ms:
+            raise DialogueContractError(
+                f"{label} 时间范围必须满足 0 <= start_ms < end_ms"
+            )
+        result["start_ms"] = start_ms
+        result["end_ms"] = end_ms
     return result
 
 
@@ -86,3 +106,16 @@ def normalize_dialogue(value: Any) -> list[dict]:
     if len(value) > DIALOGUE_MAX_ENTRIES:
         raise DialogueContractError(f"dialogue 最多包含 {DIALOGUE_MAX_ENTRIES} 行")
     return [normalize_dialogue_entry(item, index=index) for index, item in enumerate(value)]
+
+
+def validate_dialogue_timing(value: Any, *, duration_ms: int) -> list[dict]:
+    """Normalize dialogue and ensure explicit ranges fit the effective shot."""
+    normalized = normalize_dialogue(value)
+    for index, item in enumerate(normalized):
+        if "start_ms" not in item:
+            continue
+        if item["end_ms"] > duration_ms:
+            raise DialogueContractError(
+                f"dialogue[{index}].end_ms 不能超过镜头时长 {duration_ms}ms"
+            )
+    return normalized

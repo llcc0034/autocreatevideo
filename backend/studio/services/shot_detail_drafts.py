@@ -12,8 +12,10 @@ import hashlib
 import json
 import re
 import unicodedata
+from dataclasses import dataclass
 from typing import Any
 
+from django.conf import settings
 from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
@@ -27,6 +29,7 @@ from studio.models import (
     SeriesProject,
     Shot,
     ShotDetailDraft,
+    ShotDetailDraftBatchItem,
 )
 from studio.services.creative_drafts import (
     CreativeContextConflict,
@@ -38,10 +41,7 @@ from studio.services.creative_drafts import (
     _require_runtime,
     _run_runtime,
     _run_provider_runtime,
-    _require_runtime,
-    _run_runtime,
     creative_config,
-    ensure_creative_resources_available,
     ensure_creative_resources_available,
     normalise_creative_provider,
     LOCAL_QWEN_PROVIDER,
@@ -59,14 +59,6 @@ from studio.services.direction_semantics import direction_semantic_mismatches
 
 SHOT_DETAIL_SCHEMA_VERSION = 1
 SHOT_DETAIL_OPERATION = "shot_high_detail"
-# These are prompt-quality recommendations, not storage or review gates.  A
-# human may deliberately keep a longer editable draft while reviewing it.
-SHOT_DETAIL_ZH_MAX_CHARS = 500
-SHOT_DETAIL_EN_MAX_CHARS = 750
-SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS = 3_000
-SHOT_DETAIL_EN_TRANSPORT_MAX_CHARS = 4_500
-SHOT_DETAIL_OUTPUT_TOKENS = 2_304
-SHOT_DETAIL_CONTEXT_CHAR_LIMIT = 18_000
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 ENGLISH_DIRECTOR_FORBIDDEN_RE = re.compile(
     r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u0400-\u052f"
@@ -88,6 +80,61 @@ class ShotDetailRevisionConflict(CreativeRevisionConflict):
 
 class ShotDetailValidationError(CreativeValidationError):
     pass
+
+
+@dataclass
+class PreparedShotDetailApplication:
+    draft: ShotDetailDraft
+    project: SeriesProject
+    episode: Episode
+    shot: Shot
+    user: Any
+    language_mode: str
+    data: dict[str, str]
+    validation: dict[str, Any]
+    translated: bool
+    next_value: str
+    generation_context_hash: str
+    generation_context_snapshot: dict[str, Any]
+    policy: dict[str, Any]
+
+
+def shot_detail_policy(provider: str | None = None) -> dict[str, Any]:
+    """Return the only runtime policy for one high-detail operation."""
+    selected = normalise_creative_provider(
+        provider,
+        default=getattr(settings, "PROMPT_CREATIVE_DEFAULT_PROVIDER", LOCAL_QWEN_PROVIDER),
+    )
+    common = dict(getattr(settings, "SHOT_DETAIL_POLICY", {}) or {})
+    provider_values = dict(
+        (getattr(settings, "SHOT_DETAIL_PROVIDER_POLICIES", {}) or {}).get(selected, {})
+    )
+    return {"provider": selected, **common, **provider_values}
+
+
+def resolve_shot_detail_policy(
+    provider: str | None = None, override: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Merge a historic frozen policy over today's complete policy contract."""
+    selected = normalise_creative_provider(provider)
+    policy = shot_detail_policy(selected)
+    if isinstance(override, dict):
+        policy.update(override)
+    policy["provider"] = selected
+    return policy
+
+
+def shot_detail_provider_label(provider: str | None) -> str:
+    return "DeepSeek API" if normalise_creative_provider(provider) == "deepseek_api" else "本地 Qwen"
+
+
+def shot_detail_draft_policy(draft: ShotDetailDraft) -> dict[str, Any]:
+    """Resolve a draft with its server-owned generation-time policy snapshot."""
+    provider = normalise_creative_provider(draft.provider)
+    stored = (draft.input_settings or {}).get("policy")
+    return resolve_shot_detail_policy(
+        provider, stored if isinstance(stored, dict) else None,
+    )
 
 
 def _has_forbidden_english_director_text(value: str) -> bool:
@@ -119,19 +166,57 @@ def shot_detail_capability() -> dict[str, Any]:
     from studio.services.creative_drafts import get_creative_capability
 
     capability = dict(get_creative_capability())
+    policies = {
+        provider["id"]: shot_detail_policy(provider["id"])
+        for provider in capability.get("providers", [])
+    }
+    from studio.models import GenerationTask
+
+    shared_resource_busy = GenerationTask.objects.filter(status__in=(
+        GenerationTask.Status.QUEUED,
+        GenerationTask.Status.RUNNING,
+        GenerationTask.Status.CANCEL_REQUESTED,
+    )).exists()
+    providers = capability.get("providers", [])
+    for provider in providers:
+        if not isinstance(provider, dict):
+            continue
+        runtime_error = str(provider.get("runtime_probe_error_code") or "")
+        local_install_ready = bool(
+            provider.get("id") == LOCAL_QWEN_PROVIDER
+            and provider.get("enabled")
+            and provider.get("model_downloaded")
+            and provider.get("model_verified")
+            and runtime_error in {"", "shared_resource_busy"}
+            and (
+                provider.get("configured")
+                or provider.get("runtime_ready")
+                or runtime_error == "shared_resource_busy"
+            )
+        )
+        provider["temporarily_busy"] = bool(
+            local_install_ready
+            and (
+                shared_resource_busy
+                or runtime_error == "shared_resource_busy"
+            )
+        )
     capability.update({
         "shot_high_detail_supported": True,
         "shot_high_detail_schema_version": SHOT_DETAIL_SCHEMA_VERSION,
-        "shot_high_detail_output_tokens": SHOT_DETAIL_OUTPUT_TOKENS,
-        "shot_high_detail_context_char_limit": SHOT_DETAIL_CONTEXT_CHAR_LIMIT,
-        "shot_high_detail_zh_max_chars": SHOT_DETAIL_ZH_MAX_CHARS,
-        "shot_high_detail_en_max_chars": SHOT_DETAIL_EN_MAX_CHARS,
+        "shot_high_detail_policies": policies,
+        # Busy is transient scheduling state and never changes whether a
+        # provider is installed/configured.
+        "shot_high_detail_shared_resource_busy": shared_resource_busy,
         "shot_high_detail_review_required": True,
     })
     return capability
 
 
-def _dialogue_snapshot(shot: Shot) -> list[dict[str, Any]]:
+def _dialogue_snapshot(
+    shot: Shot, *, policy: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    policy = policy or shot_detail_policy()
     if not isinstance(shot.dialogue, list):
         raise ShotDetailValidationError("正式镜头的对白必须是列表，修复后再扩写")
     entries: list[dict[str, Any]] = []
@@ -147,13 +232,22 @@ def _dialogue_snapshot(shot: Shot) -> list[dict[str, Any]]:
             "text": text,
             "delivery": str(item.get("delivery") or ""),
             "voiceover": bool(item.get("voiceover")),
+            **({
+                "start_ms": item["start_ms"],
+                "end_ms": item["end_ms"],
+            } if "start_ms" in item and "end_ms" in item else {}),
         })
-    if len(entries) > 2:
-        raise ShotDetailValidationError("单镜高细节扩写最多接受两条当前镜头对白")
+    if len(entries) > policy["max_dialogue_per_shot"]:
+        raise ShotDetailValidationError(
+            "单镜高细节扩写当前对白数量超过配置的审阅范围"
+        )
     return entries
 
 
-def _shot_snapshot(shot: Shot, *, boundary: bool = False) -> dict[str, Any]:
+def _shot_snapshot(
+    shot: Shot, *, boundary: bool = False,
+    policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Return the formal source snapshot for one detail-review candidate.
 
     ``expansion_focus`` is deliberately narrow: the model expands camera motion
@@ -168,6 +262,8 @@ def _shot_snapshot(shot: Shot, *, boundary: bool = False) -> dict[str, Any]:
         "detailed_description": str(shot.detailed_description or ""),
         "camera": str(shot.camera or ""),
         "continuity_notes": str(shot.continuity_notes or ""),
+        "requires_first_frame_continuity": bool(shot.requires_first_frame_continuity),
+        "requires_last_frame_continuity": bool(shot.requires_last_frame_continuity),
         "scene_id": str(shot.scene_id) if shot.scene_id else None,
         "character_ids": [str(item.id) for item in shot.characters.all()],
         "prop_ids": [str(item.id) for item in shot.props.all()],
@@ -177,7 +273,7 @@ def _shot_snapshot(shot: Shot, *, boundary: bool = False) -> dict[str, Any]:
     value.update({
         "media_type": shot.media_type,
         "action": str(shot.action or ""),
-        "dialogue": _dialogue_snapshot(shot),
+        "dialogue": _dialogue_snapshot(shot, policy=policy),
         "sound_effects": str(shot.sound_effects or ""),
         "music": str(shot.music or ""),
         "duration_ms": shot.duration_ms,
@@ -244,17 +340,19 @@ def _adjacent_shots(shot: Shot) -> tuple[Shot | None, Shot | None]:
 
 def shot_detail_context_snapshot(
     project: SeriesProject, episode: Episode, shot: Shot,
+    *, policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the exact narrow source contract captured with each proposal."""
     if episode.project_id != project.id or shot.episode_id != episode.id:
         raise ShotDetailValidationError("镜头、剧集和项目必须属于同一项目")
     if shot.media_type != Shot.MediaType.VIDEO:
         raise ShotDetailValidationError("逐镜高细节扩写只支持视频镜头")
+    policy = policy or shot_detail_policy()
     previous, following = _adjacent_shots(shot)
     character_values = list(shot.characters.all())
     prop_values = list(shot.props.all())
     scene_value = shot.scene
-    target = _shot_snapshot(shot)
+    target = _shot_snapshot(shot, policy=policy)
     # Canonical terms are collected from the two expansion sources and the
     # visual context only.  Dialogue, title, audio and continuity remain
     # constraints; pulling their names into the expansion glossary can make a
@@ -288,8 +386,8 @@ def shot_detail_context_snapshot(
         },
         "target_shot": target,
         "boundaries": {
-            "previous": _shot_snapshot(previous, boundary=True) if previous else None,
-            "next": _shot_snapshot(following, boundary=True) if following else None,
+            "previous": _shot_snapshot(previous, boundary=True, policy=policy) if previous else None,
+            "next": _shot_snapshot(following, boundary=True, policy=policy) if following else None,
         },
         "bible": {
             "characters": [_character_snapshot(item) for item in character_values],
@@ -306,24 +404,33 @@ def _snapshot_hash(snapshot: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def shot_detail_context_hash(project: SeriesProject, episode: Episode, shot: Shot) -> str:
-    return _snapshot_hash(shot_detail_context_snapshot(project, episode, shot))
+def shot_detail_context_hash(
+    project: SeriesProject, episode: Episode, shot: Shot,
+    *, policy: dict[str, Any] | None = None,
+) -> str:
+    return _snapshot_hash(shot_detail_context_snapshot(
+        project, episode, shot, policy=policy,
+    ))
 
 
-def _live_context_hash(project_id, episode_id, shot_id) -> str:
+def _live_context_hash(
+    project_id, episode_id, shot_id, *, policy: dict[str, Any] | None = None,
+) -> str:
     project = SeriesProject.objects.select_related("style").get(pk=project_id)
     episode = Episode.objects.get(pk=episode_id, project=project)
     shot = Shot.objects.select_related("episode", "scene").prefetch_related("characters", "props").get(
         pk=shot_id, episode=episode,
     )
-    return shot_detail_context_hash(project, episode, shot)
+    return shot_detail_context_hash(project, episode, shot, policy=policy)
 
 
 def _runtime_request(
     *, snapshot: dict[str, Any], context_hash: str, variation_note: str, attempt: int,
-    project: SeriesProject,
+    project: SeriesProject, provider: str, request_id: str | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = creative_config()
+    policy = policy or shot_detail_policy(provider)
     source = {
         "project": {
             "title": snapshot["project"]["title"],
@@ -353,14 +460,14 @@ def _runtime_request(
         "bible": snapshot["bible"],
     }
     context_size = len(json.dumps(source, ensure_ascii=False, separators=(",", ":")))
-    if context_size > SHOT_DETAIL_CONTEXT_CHAR_LIMIT:
+    if context_size > policy["context_max_chars"]:
         raise ShotDetailValidationError(
             f"当前镜头、相邻连续性和绑定 Bible 共 {context_size} 字符，超过单镜高细节 "
-            f"{SHOT_DETAIL_CONTEXT_CHAR_LIMIT} 字符上限；请先精简正式字段或解绑无关素材",
+            f"{policy['context_max_chars']} 字符上限；请先精简正式字段或解绑无关素材",
         )
     return {
         "operation": SHOT_DETAIL_OPERATION,
-        "request_id": context_hash[:24],
+        "request_id": str(request_id or context_hash[:24])[:160],
         "source_fingerprint": context_hash,
         "project": source["project"],
         "style": source["style"],
@@ -379,8 +486,14 @@ def _runtime_request(
         "model_id": config["model_id"],
         "device": config["device"],
         "gpu_layers": config["gpu_layers"],
-        "max_new_tokens": SHOT_DETAIL_OUTPUT_TOKENS,
+        "max_new_tokens": policy["output_tokens"],
+        "shot_detail_policy": {
+            key: value for key, value in policy.items() if key != "provider"
+        },
         "context_size": config["context_size"],
+        "min_context_size": config["min_context_size"],
+        "max_context_size": config["max_context_size"],
+        "reserved_input_tokens": config["reserved_input_tokens"],
         "timeout_seconds": config["timeout_seconds"],
     }
 
@@ -410,7 +523,23 @@ _DETAIL_REVIEW_SUGGESTIONS = {
     "direction_semantics_mismatch": "请核对左右、手脚、站位和运动方向。",
     "canonical_glossary_missing": "请核对人物、场景和道具的 canonical English 名称。",
     "field_length_above_recommendation": "内容超过推荐长度；可人工精简，也可知情保留。",
+    "field_length_above_transport_envelope": (
+        "模型正文超过当前通道配置的传输建议范围；候选已完整保留，"
+        "请人工精简并保存校验后再应用。"
+    ),
     "canonical_target_collision": "多个 Bible 实体共用了同一英文 canonical 名称，请人工核对。",
+    "model_output_protocol_validation_failed": (
+        "模型返回了可编辑正文，但没有通过共享结构协议；请修改并重新保存后再应用。"
+    ),
+}
+
+_SHOT_DETAIL_PROVIDER_ERROR_CODES = {
+    "shot_high_detail_empty_output": "shot_detail_output_invalid_json",
+    "shot_high_detail_output_invalid_json": "shot_detail_output_invalid_json",
+    "shot_high_detail_incomplete_response": "shot_detail_output_invalid_json",
+    "shot_high_detail_validation_failed": "shot_detail_validation_failed",
+    "shot_high_detail_repair_validation_failed": "shot_detail_validation_failed",
+    "shot_high_detail_output_budget_exhausted": "shot_detail_output_budget_exhausted",
 }
 
 
@@ -488,7 +617,9 @@ def _detail_bilingual_review_issues(
 def _validate_detail_data(
     candidate: Any, *, project: SeriesProject | None = None,
     runtime_review_issues: list[dict[str, str]] | None = None,
+    policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
+    policy = policy or shot_detail_policy()
     if not isinstance(candidate, dict):
         return dict(candidate or {}), {
             "status": "failed", "errors": ["高细节草稿必须只包含 schema_version、detail_zh、detail_en"],
@@ -516,10 +647,6 @@ def _validate_detail_data(
         errors.append("高细节草稿 schema_version 不受支持")
     if not isinstance(detail_zh, str) or not isinstance(detail_en, str):
         errors.append("detail_zh 和 detail_en 必须是文本")
-    if isinstance(detail_zh, str) and len(detail_zh) > SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS:
-        errors.append(f"detail_zh 超过可编辑草稿上限 {SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS} 字符")
-    if isinstance(detail_en, str) and len(detail_en) > SHOT_DETAIL_EN_TRANSPORT_MAX_CHARS:
-        errors.append(f"detail_en 超过可编辑草稿上限 {SHOT_DETAIL_EN_TRANSPORT_MAX_CHARS} 字符")
     if isinstance(detail_zh, str) and _has_unsafe_text_controls(detail_zh):
         errors.append("detail_zh 包含不可安全存储的控制字符")
     if isinstance(detail_en, str) and _has_unsafe_text_controls(detail_en):
@@ -538,6 +665,16 @@ def _validate_detail_data(
         }
 
     issues = _normalise_detail_review_issues(runtime_review_issues)
+    if len(normalized["detail_zh"]) > policy["transport_zh_max_chars"]:
+        issues.append(_detail_review_issue(
+            "field_length_above_transport_envelope", "detail_zh",
+            severity="requires_edit",
+        ))
+    if len(normalized["detail_en"]) > policy["transport_en_max_chars"]:
+        issues.append(_detail_review_issue(
+            "field_length_above_transport_envelope", "detail_en",
+            severity="requires_edit",
+        ))
     if not normalized["detail_zh"].strip():
         issues.append(_detail_review_issue("detail_zh_missing", "detail_zh", severity="requires_edit"))
     elif not CJK_RE.search(normalized["detail_zh"]):
@@ -548,19 +685,28 @@ def _validate_detail_data(
         issues.append(_detail_review_issue("english_contains_cjk", "detail_en", severity="requires_edit"))
     elif _has_forbidden_english_director_text(normalized["detail_en"]):
         issues.append(_detail_review_issue("english_prompt_charset_invalid", "detail_en", severity="requires_edit"))
-    if len(normalized["detail_zh"]) > SHOT_DETAIL_ZH_MAX_CHARS:
+    if len(normalized["detail_zh"]) > policy["recommended_zh_chars"]:
         issues.append(_detail_review_issue("field_length_above_recommendation", "detail_zh"))
-    if len(normalized["detail_en"]) > SHOT_DETAIL_EN_MAX_CHARS:
+    if len(normalized["detail_en"]) > policy["recommended_en_chars"]:
         issues.append(_detail_review_issue("field_length_above_recommendation", "detail_en"))
     if project is not None and normalized["detail_zh"].strip() and normalized["detail_en"].strip():
         issues.extend(_detail_bilingual_review_issues(
             project=project, detail_zh=normalized["detail_zh"], detail_en=normalized["detail_en"],
         ))
-    if len(normalized["detail_zh"]) < 100 or len(normalized["detail_en"]) < 160:
-            warnings.append("高细节草稿较短；可补充构图、空间关系、动作过程、收束状态和光线材质")
-    if len(normalized["detail_zh"]) >= SHOT_DETAIL_ZH_MAX_CHARS - 20:
+    if (
+        len(normalized["detail_zh"]) < policy["review_min_zh_chars"]
+        or len(normalized["detail_en"]) < policy["review_min_en_chars"]
+    ):
+        warnings.append("高细节草稿较短；可补充构图、空间关系、动作过程、收束状态和光线材质")
+    if len(normalized["detail_zh"]) >= max(
+        1,
+        policy["recommended_zh_chars"] - policy["review_near_zh_margin_chars"],
+    ):
         warnings.append("中文细节已接近推荐长度；避免继续叠加新的事件")
-    if len(normalized["detail_en"]) >= SHOT_DETAIL_EN_MAX_CHARS - 30:
+    if len(normalized["detail_en"]) >= max(
+        1,
+        policy["recommended_en_chars"] - policy["review_near_en_margin_chars"],
+    ):
         warnings.append("英文细节已接近推荐长度；避免继续叠加新的事件")
     issues = _dedupe_detail_review_issues(issues)
     summary = _detail_review_summary(issues)
@@ -573,7 +719,9 @@ def _validate_detail_data(
     }
 
 
-def _safe_source_starter(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+def _safe_source_starter(
+    snapshot: dict[str, Any], *, policy: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Build an editable Chinese starter from authoritative expansion fields.
 
     This is a no-model recovery path for malformed local-model output.  It
@@ -607,7 +755,7 @@ def _safe_source_starter(snapshot: dict[str, Any]) -> dict[str, Any] | None:
         labelled.append(("动作与画面描述：", narrative))
 
     parts: list[str] = []
-    remaining = SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS
+    remaining = (policy or shot_detail_policy())["transport_zh_max_chars"]
     for label, value in labelled:
         separator = "\n" if parts else ""
         available = remaining - len(separator) - len(label)
@@ -628,17 +776,58 @@ def _safe_source_starter(snapshot: dict[str, Any]) -> dict[str, Any] | None:
 
 def _source_fallback_candidate(
     snapshot: dict[str, Any], *, project: SeriesProject,
+    policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]] | None:
-    starter = _safe_source_starter(snapshot)
+    starter = _safe_source_starter(snapshot, policy=policy)
     if starter is None:
         return None
     data, validation = _validate_detail_data(
         starter,
         project=project,
+        policy=policy,
         runtime_review_issues=[_detail_review_issue(
             "model_output_unusable_fallback", "detail_zh", severity="requires_edit",
         )],
     )
+    return data, validation
+
+
+def _salvage_deepseek_detail_candidate(
+    error: CreativeDraftError, *, project: SeriesProject,
+    policy: dict[str, Any],
+) -> tuple[dict[str, str], dict[str, Any]] | None:
+    """Keep only a bounded, editable bilingual candidate from protocol failure.
+
+    The raw model response never crosses this boundary.  At least one known
+    prose field must contain text; a missing peer becomes the existing
+    requires-edit issue.  The normal server validator still rejects unsafe
+    controls and transport-limit violations.  The protocol failure also
+    remains a requires-edit issue, so salvaging never makes the model output
+    directly applicable.
+    """
+    raw = getattr(error, "structured_candidate", None)
+    if not isinstance(raw, dict):
+        return None
+    detail_zh = raw.get("detail_zh") if isinstance(raw.get("detail_zh"), str) else ""
+    detail_en = raw.get("detail_en") if isinstance(raw.get("detail_en"), str) else ""
+    if not detail_zh.strip() and not detail_en.strip():
+        return None
+    data, validation = _validate_detail_data(
+        {
+            "schema_version": SHOT_DETAIL_SCHEMA_VERSION,
+            "detail_zh": detail_zh,
+            "detail_en": detail_en,
+        },
+        project=project,
+        policy=policy,
+        runtime_review_issues=[_detail_review_issue(
+            "model_output_protocol_validation_failed",
+            "result",
+            severity="requires_edit",
+        )],
+    )
+    if validation.get("status") == "failed":
+        return None
     return data, validation
 
 
@@ -663,15 +852,22 @@ def _next_generation_no(shot: Shot) -> int:
 
 def generate_shot_detail_candidate(
     *, project: SeriesProject, episode: Episode, shot: Shot, variation_note: str, attempt: int,
-    provider: str | None = None,
+    provider: str | None = None, expected_context_hash: str | None = None,
+    request_id: str | None = None, policy_override: dict[str, Any] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any], dict[str, Any], list[str], str, dict[str, Any]]:
     provider = normalise_creative_provider(provider)
+    policy = resolve_shot_detail_policy(provider, policy_override)
     config = creative_config()
-    snapshot = shot_detail_context_snapshot(project, episode, shot)
+    snapshot = shot_detail_context_snapshot(project, episode, shot, policy=policy)
     context_hash = _snapshot_hash(snapshot)
+    if expected_context_hash and context_hash != expected_context_hash:
+        raise ShotDetailContextConflict(
+            "当前镜头、相邻连续性或绑定 Bible 已变化，本次批量扩写未调用模型"
+        )
     request = _runtime_request(
         snapshot=snapshot, context_hash=context_hash, variation_note=variation_note,
-        attempt=attempt, project=project,
+        attempt=attempt, project=project, provider=provider, request_id=request_id,
+        policy=policy,
     )
     try:
         if provider == LOCAL_QWEN_PROVIDER:
@@ -687,17 +883,55 @@ def generate_shot_detail_candidate(
     except CreativeDraftError as exc:
         exc.attempt_context_snapshot = snapshot
         exc.attempt_context_hash = context_hash
+        exc.code = _SHOT_DETAIL_PROVIDER_ERROR_CODES.get(exc.code, exc.code)
         try:
             exc.source_drift_during_attempt = (
-                _live_context_hash(project.id, episode.id, shot.id) != context_hash
+                _live_context_hash(
+                    project.id, episode.id, shot.id, policy=policy,
+                ) != context_hash
             )
         except Exception:
             exc.source_drift_during_attempt = True
         exc.runtime_metadata.update({
+            "error_code": exc.code,
             "attempt_context_hash": context_hash,
             "source_drift_during_attempt": exc.source_drift_during_attempt,
             "operation": SHOT_DETAIL_OPERATION,
         })
+        salvaged = None
+        if (
+            provider == "deepseek_api"
+            and exc.code == "shot_detail_validation_failed"
+            and not exc.source_drift_during_attempt
+        ):
+            salvaged = _salvage_deepseek_detail_candidate(
+                exc, project=project, policy=policy,
+            )
+        if salvaged is not None:
+            if _live_context_hash(
+                project.id, episode.id, shot.id, policy=policy,
+            ) != context_hash:
+                raise ShotDetailContextConflict(
+                    "生成期间镜头、相邻连续性或绑定 Bible 已变更，请重新生成"
+                ) from exc
+            data, validation = salvaged
+            runtime = _runtime_metadata({
+                "provider": provider,
+                "model": exc.runtime_metadata.get("model", ""),
+                "metadata": exc.runtime_metadata,
+            })
+            runtime.update({
+                "error_code": exc.code,
+                "review_required": True,
+                "review_issue_count": len(validation.get("review_issues", [])),
+                "fallback_generated": False,
+                "salvaged_structured_candidate": True,
+                "salvage_reason_code": exc.code,
+            })
+            return (
+                data, validation, runtime, validation["warnings"],
+                context_hash, snapshot,
+            )
         raise
     result = payload.get("result")
     echoed_fingerprint = str(
@@ -712,14 +946,19 @@ def generate_shot_detail_candidate(
     )
     data, validation = _validate_detail_data(
         result, project=project, runtime_review_issues=runtime_issues,
+        policy=policy,
     )
     fallback_used = False
-    if validation.get("status") == "failed":
-        fallback = _source_fallback_candidate(snapshot, project=project)
+    if validation.get("status") == "failed" and provider == LOCAL_QWEN_PROVIDER:
+        fallback = _source_fallback_candidate(
+            snapshot, project=project, policy=policy,
+        )
         if fallback is not None:
             data, validation = fallback
             fallback_used = True
-    if _live_context_hash(project.id, episode.id, shot.id) != context_hash:
+    if _live_context_hash(
+        project.id, episode.id, shot.id, policy=policy,
+    ) != context_hash:
         raise ShotDetailContextConflict("生成期间镜头、相邻连续性或绑定 Bible 已变更，请重新生成")
     runtime = _runtime_metadata(payload)
     runtime.update({
@@ -747,12 +986,17 @@ def create_shot_detail_draft(
     *, project: SeriesProject, episode: Episode, shot: Shot, user, variation_note: str,
     parent: ShotDetailDraft | None = None, expected_parent_revision: int | None = None,
     provider: str = LOCAL_QWEN_PROVIDER,
+    expected_context_hash: str | None = None, request_id: str | None = None,
+    batch_item: ShotDetailDraftBatchItem | None = None,
+    policy_override: dict[str, Any] | None = None,
 ) -> ShotDetailDraft:
     provider = normalise_creative_provider(provider)
+    policy = resolve_shot_detail_policy(provider, policy_override)
     attempt = max(_next_generation_no(shot), (parent.generation_no + 1) if parent else 1)
     data, validation, runtime, warnings, context_hash, snapshot = generate_shot_detail_candidate(
         project=project, episode=episode, shot=shot, variation_note=variation_note, attempt=attempt,
-        provider=provider,
+        provider=provider, expected_context_hash=expected_context_hash, request_id=request_id,
+        policy_override=policy,
     )
     with transaction.atomic():
         locked_project = SeriesProject.objects.select_for_update().select_related("style").get(pk=project.pk)
@@ -760,13 +1004,20 @@ def create_shot_detail_draft(
         locked_shot = Shot.objects.select_for_update().select_related("scene").prefetch_related(
             "characters", "props",
         ).get(pk=shot.pk, episode=locked_episode)
-        if shot_detail_context_hash(locked_project, locked_episode, locked_shot) != context_hash:
+        if shot_detail_context_hash(
+            locked_project, locked_episode, locked_shot, policy=policy,
+        ) != context_hash:
             raise ShotDetailContextConflict("保存高细节草稿前上下文已变更，请重新生成")
         locked_parent = None
         if parent:
             locked_parent = ShotDetailDraft.objects.select_for_update().get(pk=parent.pk, shot=locked_shot)
             if expected_parent_revision is not None and locked_parent.revision != expected_parent_revision:
                 raise ShotDetailRevisionConflict("原高细节草稿版本已变化，请刷新后重新生成")
+        locked_batch_item = None
+        if batch_item:
+            locked_batch_item = ShotDetailDraftBatchItem.objects.select_for_update().get(
+                pk=batch_item.pk, shot=locked_shot,
+            )
         draft = ShotDetailDraft.objects.create(
             project=locked_project, episode=locked_episode, shot=locked_shot, created_by=user,
             parent_draft=locked_parent, generation_no=_next_generation_no(locked_shot),
@@ -774,9 +1025,7 @@ def create_shot_detail_draft(
             input_settings={
                 "provider": provider,
                 "actual_output_token_budget": runtime.get("actual_output_token_budget"),
-                "context_char_limit": SHOT_DETAIL_CONTEXT_CHAR_LIMIT,
-                "detail_zh_max_chars": SHOT_DETAIL_ZH_MAX_CHARS,
-                "detail_en_max_chars": SHOT_DETAIL_EN_MAX_CHARS,
+                "policy": {key: value for key, value in policy.items() if key != "provider"},
                 "attempt": attempt,
             },
             variation_note=variation_note, draft_data=data, validation=validation, warnings=warnings,
@@ -794,6 +1043,9 @@ def create_shot_detail_draft(
             locked_parent.status = ShotDetailDraft.Status.SUPERSEDED
             locked_parent.revision += 1
             locked_parent.save(update_fields=("status", "revision", "updated_at"))
+        if locked_batch_item:
+            locked_batch_item.draft = draft
+            locked_batch_item.save(update_fields=("draft", "updated_at"))
     return draft
 
 
@@ -804,14 +1056,22 @@ def create_failed_shot_detail_draft(
     source_drift_during_attempt: bool = False, parent: ShotDetailDraft | None = None,
     expected_parent_revision: int | None = None,
     provider: str = LOCAL_QWEN_PROVIDER,
+    batch_item: ShotDetailDraftBatchItem | None = None,
+    policy_override: dict[str, Any] | None = None,
 ) -> ShotDetailDraft:
+    provider = normalise_creative_provider(provider)
+    policy = resolve_shot_detail_policy(provider, policy_override)
+    provider_label = shot_detail_provider_label(provider)
     safe_messages = {
-        "shot_detail_output_invalid_json": "本地 Qwen 返回的高细节格式不完整，未生成可审核候选。",
-        "shot_detail_output_budget_exhausted": "本地 Qwen 在完成高细节候选前达到输出容量上限。",
-        "shot_detail_timeout": "本地 Qwen 生成高细节候选超时。",
+        "shot_detail_output_invalid_json": f"{provider_label} 返回的高细节格式不完整，未生成可审核候选。",
+        "shot_high_detail_output_invalid_json": f"{provider_label} 返回的高细节格式不完整，未生成可审核候选。",
+        "shot_detail_validation_failed": f"{provider_label} 返回了高细节正文，但结构仍需人工修订。",
+        "shot_high_detail_validation_failed": f"{provider_label} 返回了高细节正文，但结构仍需人工修订。",
+        "shot_detail_output_budget_exhausted": f"{provider_label} 在完成高细节候选前达到输出容量上限。",
+        "shot_detail_timeout": f"{provider_label} 生成高细节候选超时。",
     }
     safe_error = safe_messages.get(
-        error_code, "本地 Qwen 未返回可审核的高细节候选；正式镜头未修改。",
+        error_code, f"{provider_label} 未返回可审核的高细节候选；正式镜头未修改。",
     )
     with transaction.atomic():
         locked_project = SeriesProject.objects.select_for_update().select_related("style").get(pk=project.pk)
@@ -824,16 +1084,27 @@ def create_failed_shot_detail_draft(
             locked_parent = ShotDetailDraft.objects.select_for_update().get(pk=parent.pk, shot=locked_shot)
             if expected_parent_revision is not None and locked_parent.revision != expected_parent_revision:
                 raise ShotDetailRevisionConflict("原高细节草稿版本已变化，未记录过期失败尝试")
+        locked_batch_item = None
+        if batch_item:
+            locked_batch_item = ShotDetailDraftBatchItem.objects.select_for_update().get(
+                pk=batch_item.pk, shot=locked_shot,
+            )
         snapshot = attempt_context_snapshot or shot_detail_context_snapshot(
-            locked_project, locked_episode, locked_shot,
+            locked_project, locked_episode, locked_shot, policy=policy,
         )
         context_hash = attempt_context_hash or _snapshot_hash(snapshot)
         fallback = None
         if (
-            not source_drift_during_attempt
-            and error_code in {"shot_detail_output_invalid_json", "shot_detail_validation_failed"}
+            provider == LOCAL_QWEN_PROVIDER
+            and not source_drift_during_attempt
+            and error_code in {
+                "shot_detail_output_invalid_json", "shot_detail_validation_failed",
+                "shot_high_detail_output_invalid_json", "shot_high_detail_validation_failed",
+            }
         ):
-            fallback = _source_fallback_candidate(snapshot, project=locked_project)
+            fallback = _source_fallback_candidate(
+                snapshot, project=locked_project, policy=policy,
+            )
         fallback_data, fallback_validation = fallback or ({}, None)
         draft = ShotDetailDraft.objects.create(
             project=locked_project, episode=locked_episode, shot=locked_shot, created_by=user,
@@ -843,7 +1114,7 @@ def create_failed_shot_detail_draft(
                 "provider": provider,
                 "runtime_error_code": error_code,
                 "source_drift_during_attempt": bool(source_drift_during_attempt),
-                "context_char_limit": SHOT_DETAIL_CONTEXT_CHAR_LIMIT,
+                "policy": {key: value for key, value in policy.items() if key != "provider"},
             },
             variation_note=variation_note,
             draft_data=fallback_data,
@@ -878,6 +1149,9 @@ def create_failed_shot_detail_draft(
             locked_parent.status = ShotDetailDraft.Status.SUPERSEDED
             locked_parent.revision += 1
             locked_parent.save(update_fields=("status", "revision", "updated_at"))
+        if locked_batch_item:
+            locked_batch_item.draft = draft
+            locked_batch_item.save(update_fields=("draft", "updated_at"))
         return draft
 
 
@@ -917,18 +1191,28 @@ def append_shot_detail_review_acknowledgement(
 def confirm_shot_detail_draft(
     *, draft: ShotDetailDraft, user, expected_revision: int, review_acknowledged: bool = False,
 ) -> ShotDetailDraft:
+    identity = ShotDetailDraft.objects.only(
+        "project_id", "episode_id", "shot_id",
+    ).get(pk=draft.pk)
     with transaction.atomic():
-        locked = ShotDetailDraft.objects.select_for_update().select_related("project", "episode", "shot").get(pk=draft.pk)
-        project = SeriesProject.objects.select_for_update().select_related("style").get(pk=locked.project_id)
-        episode = Episode.objects.select_for_update().get(pk=locked.episode_id, project=project)
+        project = SeriesProject.objects.select_for_update().select_related("style").get(pk=identity.project_id)
+        episode = Episode.objects.select_for_update().get(pk=identity.episode_id, project=project)
         shot = Shot.objects.select_for_update().select_related("scene").prefetch_related("characters", "props").get(
-            pk=locked.shot_id, episode=episode,
+            pk=identity.shot_id, episode=episode,
+        )
+        locked = ShotDetailDraft.objects.select_for_update().select_related(
+            "project", "episode", "shot",
+        ).get(
+            pk=draft.pk, project=project, episode=episode, shot=shot,
         )
         if locked.revision != expected_revision:
             raise ShotDetailRevisionConflict("高细节草稿版本已变化，请刷新后再确认")
         if locked.status != ShotDetailDraft.Status.DRAFT:
             raise ShotDetailValidationError("只有待审核的高细节草稿可以确认")
-        if shot_detail_context_hash(project, episode, shot) != locked.context_hash:
+        policy = shot_detail_draft_policy(locked)
+        if shot_detail_context_hash(
+            project, episode, shot, policy=policy,
+        ) != locked.context_hash:
             raise ShotDetailContextConflict("当前镜头、相邻连续性或绑定 Bible 已变化，请重新生成")
         # Preserve runtime-only advisory signals across the human-review flow.
         # Editing may clear issues that no longer apply, but confirming a draft
@@ -938,6 +1222,7 @@ def confirm_shot_detail_draft(
             locked.draft_data,
             project=project,
             runtime_review_issues=shot_detail_review_issues(locked.validation),
+            policy=policy,
         )
         if validation["status"] not in {"passed", "ready", "needs_review"}:
             raise ShotDetailValidationError("高细节草稿未通过校验", errors=validation["errors"])
@@ -964,20 +1249,32 @@ def confirm_shot_detail_draft(
 def patch_shot_detail_draft(
     *, draft: ShotDetailDraft, expected_revision: int, draft_data: dict[str, Any],
 ) -> ShotDetailDraft:
+    identity = ShotDetailDraft.objects.only(
+        "project_id", "episode_id", "shot_id",
+    ).get(pk=draft.pk)
     with transaction.atomic():
-        locked = ShotDetailDraft.objects.select_for_update().select_related("project", "episode", "shot").get(pk=draft.pk)
-        project = SeriesProject.objects.select_for_update().select_related("style").get(pk=locked.project_id)
-        episode = Episode.objects.select_for_update().get(pk=locked.episode_id, project=project)
+        project = SeriesProject.objects.select_for_update().select_related("style").get(pk=identity.project_id)
+        episode = Episode.objects.select_for_update().get(pk=identity.episode_id, project=project)
         shot = Shot.objects.select_for_update().select_related("scene").prefetch_related("characters", "props").get(
-            pk=locked.shot_id, episode=episode,
+            pk=identity.shot_id, episode=episode,
+        )
+        locked = ShotDetailDraft.objects.select_for_update().select_related(
+            "project", "episode", "shot",
+        ).get(
+            pk=draft.pk, project=project, episode=episode, shot=shot,
         )
         if locked.revision != expected_revision:
             raise ShotDetailRevisionConflict("高细节草稿版本已变化，请刷新后再编辑")
         if locked.status not in {ShotDetailDraft.Status.DRAFT, ShotDetailDraft.Status.FAILED}:
             raise ShotDetailValidationError("只有待审核或校验失败的高细节草稿可以编辑")
-        if shot_detail_context_hash(project, episode, shot) != locked.context_hash:
+        policy = shot_detail_draft_policy(locked)
+        if shot_detail_context_hash(
+            project, episode, shot, policy=policy,
+        ) != locked.context_hash:
             raise ShotDetailContextConflict("当前镜头、相邻连续性或绑定 Bible 已变化，请重新生成")
-        data, validation = _validate_detail_data(draft_data, project=project)
+        data, validation = _validate_detail_data(
+            draft_data, project=project, policy=policy,
+        )
         append_revision_history(locked)
         locked.revision += 1
         locked.draft_data = data
@@ -1056,98 +1353,186 @@ def _write_confirmed_translation(
     entry.save()
 
 
+def prepare_locked_shot_detail_application(
+    *, draft: ShotDetailDraft, project: SeriesProject, episode: Episode, shot: Shot,
+    user, language_mode: str, expected_revision: int,
+    review_acknowledged: bool = False, allow_draft: bool = False,
+) -> PreparedShotDetailApplication:
+    """Preflight one already-locked draft without writing formal data."""
+    if draft.revision != expected_revision:
+        raise ShotDetailRevisionConflict("高细节草稿版本已变化，请刷新后再应用")
+    allowed_statuses = {ShotDetailDraft.Status.CONFIRMED}
+    if allow_draft:
+        allowed_statuses.add(ShotDetailDraft.Status.DRAFT)
+    if draft.status not in allowed_statuses:
+        raise ShotDetailValidationError(
+            "只有待审核或已确认的高细节草稿可以应用"
+            if allow_draft else "只有已确认的高细节草稿可以应用",
+        )
+    policy = shot_detail_draft_policy(draft)
+    if shot_detail_context_hash(
+        project, episode, shot, policy=policy,
+    ) != draft.context_hash:
+        raise ShotDetailContextConflict(
+            "当前镜头、相邻连续性或绑定 Bible 已变化，请重新生成并确认",
+        )
+    data, validation = _validate_detail_data(
+        draft.draft_data,
+        project=project,
+        runtime_review_issues=shot_detail_review_issues(draft.validation),
+        policy=policy,
+    )
+    if validation["status"] not in {"passed", "ready", "needs_review"}:
+        raise ShotDetailValidationError(
+            "高细节草稿复验失败，不能应用", errors=validation["errors"],
+        )
+    if shot_detail_requires_edit_issues(validation):
+        raise ShotDetailValidationError(
+            "高细节草稿仍有必须人工修复的内容，修正后再应用",
+            code="shot_detail_requires_edit",
+        )
+    if shot_detail_review_issues(validation) and not review_acknowledged:
+        raise ShotDetailValidationError(
+            "请先阅读高细节草稿的人工核验项并明确确认风险",
+            code="shot_detail_review_acknowledgement_required",
+        )
+    translated = language_mode == "bilingual_confirmed"
+    if translated:
+        next_value = data["detail_en"]
+    elif language_mode == "chinese_only":
+        next_value = data["detail_zh"]
+    else:
+        raise ShotDetailValidationError(
+            "language_mode 必须为 chinese_only 或 bilingual_confirmed",
+        )
+    return PreparedShotDetailApplication(
+        draft=draft, project=project, episode=episode, shot=shot, user=user,
+        language_mode=language_mode, data=data, validation=validation,
+        translated=translated, next_value=next_value,
+        generation_context_hash=draft.context_hash,
+        generation_context_snapshot=draft.context_snapshot,
+        policy=policy,
+    )
+
+
+def commit_prepared_shot_detail_application(
+    prepared: PreparedShotDetailApplication,
+) -> None:
+    """Write a preflighted plan; caller owns the surrounding transaction."""
+    draft = prepared.draft
+    shot = prepared.shot
+    now = timezone.now()
+    if draft.status == ShotDetailDraft.Status.DRAFT:
+        append_revision_history(draft)
+        draft.revision += 1
+        draft.status = ShotDetailDraft.Status.CONFIRMED
+        draft.confirmed_by = prepared.user
+        draft.confirmed_at = now
+        draft.draft_data = prepared.data
+        draft.validation = prepared.validation
+        draft.warnings = prepared.validation["warnings"]
+        draft.error_message = ""
+        if shot_detail_review_issues(prepared.validation):
+            append_shot_detail_review_acknowledgement(
+                draft, user=prepared.user, action="confirm",
+            )
+        draft.save()
+
+    metadata = dict(shot.metadata or {})
+    metadata["shot_detail_provenance"] = {
+        "shot_detail_draft_id": str(draft.id),
+        "generation_context_hash": prepared.generation_context_hash,
+        "applied_language_mode": prepared.language_mode,
+        "applied_at": now.isoformat(),
+    }
+    shot.detailed_description = prepared.next_value
+    shot.metadata = metadata
+    shot.save(update_fields=("detailed_description", "metadata", "updated_at"))
+    if prepared.translated:
+        _write_confirmed_translation(
+            project=prepared.project, shot=shot,
+            source=prepared.data["detail_zh"],
+            translated=prepared.data["detail_en"],
+            user=prepared.user, draft=draft,
+        )
+
+    append_revision_history(draft)
+    draft.revision += 1
+    draft.project = prepared.project
+    draft.episode = prepared.episode
+    draft.shot = shot
+    draft.draft_data = prepared.data
+    draft.validation = prepared.validation
+    draft.warnings = prepared.validation["warnings"]
+    draft.status = ShotDetailDraft.Status.APPLIED
+    draft.applied_by = prepared.user
+    draft.applied_at = now
+    if shot_detail_review_issues(prepared.validation):
+        append_shot_detail_review_acknowledgement(
+            draft, user=prepared.user, action="apply",
+        )
+    draft.save()
+
+
+def finalize_prepared_shot_detail_application(
+    prepared: PreparedShotDetailApplication,
+) -> None:
+    """Rebase context after every selected batch shot has been written."""
+    draft = prepared.draft
+    shot = prepared.shot
+    applied_snapshot = shot_detail_context_snapshot(
+        prepared.project, prepared.episode, shot, policy=prepared.policy,
+    )
+    applied_context_hash = _snapshot_hash(applied_snapshot)
+    metadata = dict(shot.metadata or {})
+    provenance = dict(metadata.get("shot_detail_provenance") or {})
+    provenance["applied_context_hash"] = applied_context_hash
+    metadata["shot_detail_provenance"] = provenance
+    shot.metadata = metadata
+    shot.save(update_fields=("metadata", "updated_at"))
+    input_settings = dict(draft.input_settings or {})
+    input_settings["generation_context_hash"] = prepared.generation_context_hash
+    input_settings["generation_context_snapshot"] = prepared.generation_context_snapshot
+    input_settings["applied_context_hash"] = applied_context_hash
+    draft.context_hash = applied_context_hash
+    draft.context_snapshot = applied_snapshot
+    draft.input_settings = input_settings
+    draft.project = prepared.project
+    draft.episode = prepared.episode
+    draft.shot = shot
+    draft.save(update_fields=(
+        "context_hash", "context_snapshot", "input_settings", "updated_at",
+    ))
+
+
 def apply_shot_detail_draft(
     *, draft: ShotDetailDraft, user, language_mode: str, expected_revision: int,
     review_acknowledged: bool = False,
 ) -> tuple[ShotDetailDraft, Shot, bool]:
+    identity = ShotDetailDraft.objects.only(
+        "project_id", "episode_id", "shot_id",
+    ).get(pk=draft.pk)
     with transaction.atomic():
-        locked = ShotDetailDraft.objects.select_for_update().select_related("project", "episode", "shot").get(pk=draft.pk)
-        project = SeriesProject.objects.select_for_update().select_related("style").get(pk=locked.project_id)
-        episode = Episode.objects.select_for_update().get(pk=locked.episode_id, project=project)
-        shot = Shot.objects.select_for_update().select_related("scene").prefetch_related("characters", "props").get(
-            pk=locked.shot_id, episode=episode,
+        project = SeriesProject.objects.select_for_update().select_related("style").get(
+            pk=identity.project_id,
         )
-        if locked.revision != expected_revision:
-            raise ShotDetailRevisionConflict("高细节草稿版本已变化，请刷新后再应用")
-        if locked.status != ShotDetailDraft.Status.CONFIRMED:
-            raise ShotDetailValidationError("只有已确认的高细节草稿可以应用")
-        if shot_detail_context_hash(project, episode, shot) != locked.context_hash:
-            raise ShotDetailContextConflict("当前镜头、相邻连续性或绑定 Bible 已变化，请重新生成并确认")
-        # Keep the same review record that was acknowledged at confirmation;
-        # formal application must not downgrade a runtime advisory into an
-        # invisible clean state.
-        data, validation = _validate_detail_data(
-            locked.draft_data,
-            project=project,
-            runtime_review_issues=shot_detail_review_issues(locked.validation),
+        episode = Episode.objects.select_for_update().get(
+            pk=identity.episode_id, project=project,
         )
-        if validation["status"] not in {"passed", "ready", "needs_review"}:
-            raise ShotDetailValidationError("持久化高细节草稿复验失败，不能应用", errors=validation["errors"])
-        if shot_detail_requires_edit_issues(validation):
-            raise ShotDetailValidationError(
-                "高细节草稿仍有必须人工修复的内容，修正后再应用",
-                code="shot_detail_requires_edit",
-            )
-        if shot_detail_review_issues(validation) and not review_acknowledged:
-            raise ShotDetailValidationError(
-                "请先阅读高细节草稿的人工核验项并明确确认风险",
-                code="shot_detail_review_acknowledgement_required",
-            )
-        translated = language_mode == "bilingual_confirmed"
-        if translated:
-            next_value = data["detail_en"]
-        elif language_mode == "chinese_only":
-            next_value = data["detail_zh"]
-        else:
-            raise ShotDetailValidationError("language_mode 必须为 chinese_only 或 bilingual_confirmed")
-        metadata = dict(shot.metadata or {})
-        generation_context_hash = locked.context_hash
-        generation_context_snapshot = locked.context_snapshot
-        metadata["shot_detail_provenance"] = {
-            "shot_detail_draft_id": str(locked.id),
-            "generation_context_hash": generation_context_hash,
-            "applied_language_mode": language_mode,
-            "applied_at": timezone.now().isoformat(),
-        }
-        shot.detailed_description = next_value
-        shot.metadata = metadata
-        shot.save(update_fields=("detailed_description", "metadata", "updated_at"))
-        if translated:
-            _write_confirmed_translation(
-                project=project, shot=shot, source=data["detail_zh"], translated=data["detail_en"],
-                user=user, draft=locked,
-            )
-        # `detailed_description` is part of the narrow source contract.  Keep the
-        # original generation input in history, then reset the live baseline to
-        # the just-applied formal value so this applied draft is current now and
-        # becomes stale only after a later shot/Bible/boundary edit.
-        applied_snapshot = shot_detail_context_snapshot(project, episode, shot)
-        applied_context_hash = _snapshot_hash(applied_snapshot)
-        metadata["shot_detail_provenance"]["applied_context_hash"] = applied_context_hash
-        shot.metadata = metadata
-        shot.save(update_fields=("metadata", "updated_at"))
-        append_revision_history(locked)
-        input_settings = dict(locked.input_settings or {})
-        input_settings["generation_context_hash"] = generation_context_hash
-        input_settings["generation_context_snapshot"] = generation_context_snapshot
-        input_settings["applied_context_hash"] = applied_context_hash
-        locked.revision += 1
-        locked.context_hash = applied_context_hash
-        locked.context_snapshot = applied_snapshot
-        locked.input_settings = input_settings
-        # The draft was select_related before the formal Shot write.  Refresh
-        # its in-memory relation for the immediate API serializer so it compares
-        # against the post-apply field rather than the stale pre-apply object.
-        locked.project = project
-        locked.episode = episode
-        locked.shot = shot
-        locked.draft_data = data
-        locked.validation = validation
-        locked.warnings = validation["warnings"]
-        locked.status = ShotDetailDraft.Status.APPLIED
-        locked.applied_by = user
-        locked.applied_at = timezone.now()
-        if shot_detail_review_issues(validation):
-            append_shot_detail_review_acknowledgement(locked, user=user, action="apply")
-        locked.save()
-    return locked, shot, translated
+        shot = Shot.objects.select_for_update().select_related("scene").prefetch_related(
+            "characters", "props",
+        ).get(pk=identity.shot_id, episode=episode)
+        locked = ShotDetailDraft.objects.select_for_update().select_related(
+            "project", "episode", "shot",
+        ).get(
+            pk=draft.pk, project=project, episode=episode, shot=shot,
+        )
+        prepared = prepare_locked_shot_detail_application(
+            draft=locked, project=project, episode=episode, shot=shot,
+            user=user, language_mode=language_mode,
+            expected_revision=expected_revision,
+            review_acknowledged=review_acknowledged, allow_draft=False,
+        )
+        commit_prepared_shot_detail_application(prepared)
+        finalize_prepared_shot_detail_application(prepared)
+    return locked, shot, prepared.translated

@@ -10,21 +10,25 @@ import PromptImpactBadge from '@/components/PromptImpactBadge.vue'
 import PromptWritingGuide from '@/components/PromptWritingGuide.vue'
 import TranslationReviewPanel from '@/components/TranslationReviewPanel.vue'
 import ShotDetailDraftPanel from '@/components/ShotDetailDraftPanel.vue'
+import EpisodeDetailDraftModal from '@/components/EpisodeDetailDraftModal.vue'
 import ResolutionProfilePicker from '@/components/ResolutionProfilePicker.vue'
 import ProductionWorkflowPicker from '@/components/ProductionWorkflowPicker.vue'
 import { DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, DEFAULT_PRODUCTION_RESOLUTION_PROFILE, isProductionResolutionProfile, normalizeImageProductionResolutionMultiple, normalizeProductionResolutionMultiple } from '@/constants/productionResolution'
-import { repository } from '@/services/repository'
+import { productionErrorCode, repository, type ProductionCapability } from '@/services/repository'
 import { promptArtifactNeedsRegeneration } from '@/services/promptArtifactFreshness'
 import { applyPromotedFieldsToShot, applyShotTranslationPatch, bibleCanonicalTargetCollisionMessage, bibleCanonicalTargetCollisions, dialogueDeliveryTranslationFields } from '@/services/translationReview'
 import { useStudioStore } from '@/stores/studio'
-import type { Asset, AssetType, BibleItem, Episode, H3Mode, H3PromptPayload, H3ReferenceAudioPurpose, H3ReferenceBindings, H3ReferenceVideoPurpose, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, PromptTranslationField, SeriesProject, Shot, ShotDetailDraftApplyResult, ShotTranslationPromotionResult, TaskOutputMedia, Workflow } from '@/types'
+import type { Asset, AssetType, BibleItem, Episode, H3Mode, H3PromptPayload, H3ReferenceAudioPurpose, H3ReferenceBindings, H3ReferenceVideoPurpose, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, PromptTranslationField, SeriesProject, Shot, ShotDetailDraftApplyResult, ShotDetailDraftBatchApplyResult, ShotDetailDraftLanguageMode, ShotTranslationPromotionResult, TaskOutputMedia, Workflow } from '@/types'
 
 const route = useRoute(); const router = useRouter(); const studio = useStudioStore()
-const project = ref<SeriesProject | null>(null); const episode = ref<Episode | null>(null); const selectedShotId = ref(''); const loading = ref(true); const generating = ref(false); const saving = ref(false); const regeneratingShot = ref(false); const generatingWholeEpisode = ref(false); const wholeEpisodeOpen = ref(false); const wholeEpisodeProfile = ref<ProductionResolutionProfile>(DEFAULT_PRODUCTION_RESOLUTION_PROFILE); const wholeEpisodeMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const wholeEpisodeImageProfile = ref<ProductionResolutionProfile>('0.98'); const wholeEpisodeImageMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const wholeEpisodeIdempotencyKey = ref(''); const uploadingReference = ref<'video'|'audio'|''>(''); const videoUploadInput = ref<HTMLInputElement|null>(null); const audioUploadInput = ref<HTMLInputElement|null>(null); const externalAudioPickerVideoId=ref(''); const uploadAudioForVideoId=ref(''); const videoShotResolutionProfile = ref<ProductionResolutionProfile>(DEFAULT_PRODUCTION_RESOLUTION_PROFILE); const imageShotResolutionProfile = ref<ProductionResolutionProfile>('0.98'); const videoShotResolutionMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const imageShotResolutionMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const previewVideo = ref<HTMLVideoElement|null>(null); const previewPlaying = ref(false); const previewCurrentTime = ref(0); const previewDuration = ref(0); const previewLoading = ref(false); const previewRecovering = ref(false); const previewError = ref(''); const generatedPrompt = ref<H3PromptPayload | null>(null); const generatedPromptsByShot = ref<Record<string, H3PromptPayload>>({}); const inspectorTab = ref<'visual'|'continuity'|'audio'>('visual'); const lastSubmittedTask = ref<{ shotId: string; taskId: string } | null>(null)
+const project = ref<SeriesProject | null>(null); const episode = ref<Episode | null>(null); const selectedShotId = ref(''); const loading = ref(true); const generating = ref(false); const saving = ref(false); const regeneratingShot = ref(false); const generatingWholeEpisode = ref(false); const wholeEpisodeOpen = ref(false); const wholeEpisodeExtendedConfirmed = ref(false); const wholeEpisodeIdempotencyConflict = ref(''); const wholeEpisodeProfile = ref<ProductionResolutionProfile>(DEFAULT_PRODUCTION_RESOLUTION_PROFILE); const wholeEpisodeMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const wholeEpisodeImageProfile = ref<ProductionResolutionProfile>('0.98'); const wholeEpisodeImageMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const wholeEpisodeIdempotencyKey = ref(''); const uploadingReference = ref<'video'|'audio'|''>(''); const videoUploadInput = ref<HTMLInputElement|null>(null); const audioUploadInput = ref<HTMLInputElement|null>(null); const externalAudioPickerVideoId=ref(''); const uploadAudioForVideoId=ref(''); const videoShotResolutionProfile = ref<ProductionResolutionProfile>(DEFAULT_PRODUCTION_RESOLUTION_PROFILE); const imageShotResolutionProfile = ref<ProductionResolutionProfile>('0.98'); const videoShotResolutionMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const imageShotResolutionMultiple = ref(DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE); const previewVideo = ref<HTMLVideoElement|null>(null); const previewPlaying = ref(false); const previewCurrentTime = ref(0); const previewDuration = ref(0); const previewLoading = ref(false); const previewRecovering = ref(false); const previewError = ref(''); const generatedPrompt = ref<H3PromptPayload | null>(null); const generatedPromptsByShot = ref<Record<string, H3PromptPayload>>({}); const inspectorTab = ref<'visual'|'continuity'|'audio'>('visual'); const lastSubmittedTask = ref<{ shotId: string; taskId: string } | null>(null); const pendingShotRegenerationConfirmation = ref<{ shotId:string; shotOrder:number; shotTitle:string; mediaType:'video'|'image' }|null>(null)
 const productionWorkflowTemplates = ref<ProductionWorkflowTemplate[]>([]); const productionWorkflowTemplatesLoading = ref(false); const productionWorkflowTemplatesError = ref(''); const shotRef2vaTemplateId = ref(''); const shotRef2vaParameters = ref<Record<string,number>>({}); const wholeRef2vaTemplateId = ref(''); const wholeRef2vaParameters = ref<Record<string,number>>({})
+const productionCapability = ref<ProductionCapability | null>(null); const productionCapabilityError = ref('')
 type ShotOutputPreview = { taskId:string; kind:'video'|'image'; url:string; filename:string; downloadUrl:string; completedAt:string }
 const shotOutputPreviews = ref<Record<string, ShotOutputPreview>>({})
 const translationPromotionBusy = ref(false)
+const episodeDetailDraftOpen = ref(false)
+const episodeDetailDraftMode = ref<'expand'|'apply'>('expand')
 const shotWorkflowTasks = ref<Record<string, Workflow[]>>({})
 const hydratedPreviewTasks = new Set<string>()
 const previewRecoveryTasks = new Set<string>()
@@ -64,6 +68,22 @@ const videoPurposeOptionDisabled=(shot:Shot,currentAssetId:string,candidate:H3Re
   return bindingsFor(shot).videos.some((item)=>item.assetId!==currentAssetId&&item.purpose===conflicting)
 }
 const selectedShot = computed(() => episode.value?.shots.find((item) => item.id === selectedShotId.value) || null)
+const videoShotMinDurationSeconds = computed(() => productionCapability.value ? productionCapability.value.videoShotMinDurationMs / 1000 : undefined)
+const videoShotMaxDurationSeconds = computed(() => productionCapability.value ? productionCapability.value.videoShotMaxDurationMs / 1000 : undefined)
+const selectedShotDurationOutOfRange = computed(() => {
+  const duration = selectedShot.value?.duration
+  const minimum = videoShotMinDurationSeconds.value
+  const maximum = videoShotMaxDurationSeconds.value
+  return selectedShot.value?.mediaType === 'video'
+    && duration !== undefined
+    && minimum !== undefined
+    && maximum !== undefined
+    && (!Number.isFinite(duration) || duration < minimum || duration > maximum)
+})
+const adjustSelectedShotDuration = (delta: number) => {
+  if (!selectedShot.value || videoShotMinDurationSeconds.value === undefined || videoShotMaxDurationSeconds.value === undefined) return
+  selectedShot.value.duration = Math.min(videoShotMaxDurationSeconds.value, Math.max(videoShotMinDurationSeconds.value, selectedShot.value.duration + delta))
+}
 const shotResolutionProfile = computed<ProductionResolutionProfile>({
   get: () => selectedShot.value?.mediaType === 'image' ? imageShotResolutionProfile.value : videoShotResolutionProfile.value,
   set: (value) => { if(selectedShot.value?.mediaType === 'image')imageShotResolutionProfile.value=value;else videoShotResolutionProfile.value=value }
@@ -133,6 +153,7 @@ const makeRef2vaSelection = (templateId:string,parameters:Record<string,number>)
 const shotWorkflowSelections = computed(() => selectedShot.value?.mediaType === 'video' && selectedShot.value.mode === 'Ref2VA' ? makeRef2vaSelection(shotRef2vaTemplateId.value,shotRef2vaParameters.value) : [])
 const wholeEpisodeWorkflowSelections = computed(() => episodeHasRef2VA.value ? makeRef2vaSelection(wholeRef2vaTemplateId.value,wholeRef2vaParameters.value) : [])
 const loadProductionWorkflowTemplates=async()=>{productionWorkflowTemplatesLoading.value=true;productionWorkflowTemplatesError.value='';try{productionWorkflowTemplates.value=await repository.getProductionWorkflowTemplates()}catch(error){productionWorkflowTemplatesError.value=error instanceof Error?error.message:'服务端未返回工作流模板'}finally{productionWorkflowTemplatesLoading.value=false}}
+const loadProductionCapability=async()=>{productionCapabilityError.value='';try{productionCapability.value=await repository.getProductionCapability()}catch(error){productionCapability.value=null;productionCapabilityError.value=error instanceof Error?error.message:'服务端未返回正式视频时长配置'}}
 const promptJson = computed(() => generatedPrompt.value ? JSON.stringify(generatedPrompt.value, null, 2) : '')
 const actualPromptText = computed(() => generatedPrompt.value?.prompt_text || generatedPrompt.value?.integrated_multimodal_description || '')
 const promptQuality = computed(() => generatedPrompt.value?.quality)
@@ -161,9 +182,15 @@ const canonicalTargetCollisionError = computed(() => {
   const names = [...project.value.bible.characters, ...project.value.bible.scenes, ...project.value.bible.props].map((item) => item.name)
   return bibleCanonicalTargetCollisionMessage(bibleCanonicalTargetCollisions(names, project.value.translationGlossary))
 })
+const currentShotPersistenceBlockedReason = computed(() => {
+  if (translationPromotionBusy.value) return '译文正在原子同步到正式分镜字段，请等待完成。'
+  if (selectedShot.value?.legacyNegativePromptRepairEligible) return '当前镜头的来源匹配负面约束待服务端审计恢复。'
+  return canonicalTargetCollisionError.value
+})
+const currentShotPersistenceBlocked = computed(() => Boolean(currentShotPersistenceBlockedReason.value))
 const editorPersistenceBlockedReason = computed(() => {
   if (translationPromotionBusy.value) return '译文正在原子同步到正式分镜字段，请等待完成。'
-  if (legacyNegativeRepairShots.value.length) return `本集有 ${legacyNegativeRepairShots.value.length} 个镜头的旧负面约束待服务端审计恢复。`
+  if (legacyNegativeRepairShots.value.length) return `本集有 ${legacyNegativeRepairShots.value.length} 个镜头的来源匹配负面约束待服务端审计恢复。`
   return canonicalTargetCollisionError.value
 })
 const editorPersistenceBlocked = computed(() => Boolean(editorPersistenceBlockedReason.value))
@@ -181,10 +208,10 @@ const selectedTranslationFields = computed<PromptTranslationField[]>(() => {
   if (shot.sceneId) { const item=project.value.bible.scenes.find((row)=>row.id===shot.sceneId); if(item){ const base={scopeType:'scene' as const,scopeId:item.id,impact:'continuity' as const};add({...base,fieldKey:'scene.visual_identity',label:`场景 · ${item.name} · 视觉锚点`,sourceText:item.visualPrompt});add({...base,fieldKey:'scene.location',label:`场景 · ${item.name} · 地点结构`,sourceText:item.location||''});add({...base,fieldKey:'scene.time_of_day',label:`场景 · ${item.name} · 时间`,sourceText:item.timeOfDay||''});add({...base,fieldKey:'scene.lighting',label:`场景 · ${item.name} · 光线`,sourceText:item.lighting||''});add({...base,fieldKey:'scene.color_palette',label:`场景 · ${item.name} · 色板`,sourceText:item.colorPalette||''});add({...base,fieldKey:'scene.ambient_sound',label:`场景 · ${item.name} · 环境声`,sourceText:item.ambientSound||'',impact:'prompt'}) } }
   for (const id of shot.propIds) { const item=project.value.bible.props.find((row)=>row.id===id); if(item){ const base={scopeType:'prop' as const,scopeId:item.id,impact:'continuity' as const};add({...base,fieldKey:'prop.visual_identity',label:`道具 · ${item.name} · 视觉锚点`,sourceText:item.visualPrompt});add({...base,fieldKey:'prop.material',label:`道具 · ${item.name} · 材质`,sourceText:item.material||''});add({...base,fieldKey:'prop.distinctive_marks',label:`道具 · ${item.name} · 固定标记`,sourceText:item.distinctiveMarks||''});add({...base,fieldKey:'prop.continuity_state',label:`道具 · ${item.name} · 连续性状态`,sourceText:item.continuityState||''}) } }
   add({ fieldKey:'shot.camera', label:'镜头运动', sourceText:shot.camera, scopeType:'shot', scopeId:shot.id, impact:'prompt' })
-  // The formal Shot stores the compact action/visible-picture source in
-  // `action`; keeping the translation field key aligned prevents a promotion
-  // from being written to the unrelated narrative field.
-  add({ fieldKey:'shot.action', label:'动作与画面描述', sourceText:shot.action, scopeType:'shot', scopeId:shot.id, impact:'prompt' })
+  // The browser editor exposes the formal Shot.narrative field as `shot.action`.
+  // Keep the translation identity aligned with the persisted backend field so
+  // retranslation resolves the same authoritative source shown in the editor.
+  add({ fieldKey:'shot.narrative', label:'动作与画面描述', sourceText:shot.action, scopeType:'shot', scopeId:shot.id, impact:'prompt' })
   // A Chinese-only high-detail apply deliberately keeps the Chinese source in
   // the formal Shot until this existing review panel has a human-confirmed
   // English candidate. Do not re-list an already-applied English detail.
@@ -253,7 +280,7 @@ const applyShotTranslationPromotion = (result: ShotTranslationPromotionResult) =
     if (applied.length || patched) invalidatePrompt(target, 'translations_changed')
   }
   if (promotedCount || recoveredNegative) {
-    const parts = [promotedCount ? `已同步 ${promotedCount} 个正式英文导演字段` : '', recoveredNegative ? '已审计并恢复旧负面约束' : ''].filter(Boolean)
+    const parts = [promotedCount ? `已同步 ${promotedCount} 个正式英文导演字段` : '', recoveredNegative ? '已审计并恢复来源匹配负面约束' : ''].filter(Boolean)
     studio.notify(`${parts.join('；')}；镜头标题与对白正文保持中文，请一键重新生成提示词。`)
   }
 }
@@ -281,6 +308,33 @@ const applyShotDetailDraft = (result: ShotDetailDraftApplyResult) => {
     ? '已应用已审英文高细节说明；当前提示词已失效，请重新生成并复检。'
     : '已应用中文高细节说明；请在上方翻译审核确认英文后，再重新生成并复检提示词。')
 }
+const openEpisodeDetailDraft = (mode:'expand'|'apply') => {
+  episodeDetailDraftMode.value = mode
+  episodeDetailDraftOpen.value = true
+}
+const applyEpisodeDetailDraft = (
+  result: ShotDetailDraftBatchApplyResult,
+  _languageMode: ShotDetailDraftLanguageMode,
+) => {
+  if (!episode.value || !project.value) return
+  let applied = 0
+  for (const appliedShot of result.appliedShots) {
+    const localShot = episode.value.shots.find((shot) => shot.id === appliedShot.id)
+    const storedShot = studio.projects.find((entry) => entry.id === project.value!.id)
+      ?.episodes.find((entry) => entry.id === episode.value!.id)
+      ?.shots.find((shot) => shot.id === appliedShot.id)
+    const targets = [localShot, storedShot].filter((shot, index, rows): shot is Shot => Boolean(shot) && rows.indexOf(shot) === index)
+    for (const target of targets) {
+      target.detailedDescription = appliedShot.detailedDescription
+      if (appliedShot.metadata) target.metadata = { ...target.metadata, ...appliedShot.metadata }
+      invalidatePrompt(target, 'inputs_changed')
+    }
+    if (localShot) applied += 1
+  }
+  studio.notify(result.translationWritten
+    ? `已原子应用 ${applied} 个视频镜头的已审英文扩写；相关提示词已失效。`
+    : `已原子应用 ${applied} 个视频镜头的中文扩写；相关提示词已失效，请继续翻译审核。`)
+}
 const episodeAudioEnabled = computed<boolean>({
   get: () => episode.value?.audioEnabled ?? true,
   set: (enabled) => {
@@ -307,6 +361,8 @@ const selectedPromptInputs = computed(() => {
       action: shot.action,
       detailedDescription: shot.detailedDescription || '',
       continuityDirection: shot.continuityDirection || '',
+      requiresFirstFrameContinuity: shot.requiresFirstFrameContinuity,
+      requiresLastFrameContinuity: shot.requiresLastFrameContinuity,
       negativePrompt: shot.negativePrompt,
       characterIds: shot.characterIds,
       sceneId: shot.sceneId || '',
@@ -560,9 +616,9 @@ const downloadSelectedOutput = async () => {
   }catch(error){studio.notify(`下载${preview.kind==='image'?'图片':'视频'}失败：${error instanceof Error?error.message:'请稍后重试'}`,'error')}
 }
 
-const newShot = (order:number):Shot => ({ id:`shot-${Date.now()}-${order}`, order, title:`镜头 ${String(order).padStart(2,'0')}`, mediaType:'video', duration:5, mode:['T2VA','FL2VA','Ref2VA'].includes(project.value?.defaultMode||'')?project.value!.defaultMode:'FL2VA', framing:'中景', camera:'', action:'', continuityDirection:'', prompt:'', negativePrompt:'', characterIds:[], sceneId:project.value?.bible.scenes[0]?.id, propIds:[], referenceAssetIds:[], referenceBindings:emptyBindings(), audioEnabled:episode.value?.audioEnabled ?? true, audio:{ dialogue:'', soundscape:'', music:'' }, status:'draft' })
+const newShot = (order:number):Shot => ({ id:`shot-${Date.now()}-${order}`, order, title:`镜头 ${String(order).padStart(2,'0')}`, mediaType:'video', duration:(productionCapability.value?.scriptBreakdownDefaultShotDurationMs??0)/1000, mode:['T2VA','FL2VA','Ref2VA'].includes(project.value?.defaultMode||'')?project.value!.defaultMode:'FL2VA', framing:'中景', camera:'', action:'', continuityDirection:'', prompt:'', negativePrompt:'', characterIds:[], sceneId:project.value?.bible.scenes[0]?.id, propIds:[], referenceAssetIds:[], referenceBindings:emptyBindings(), requiresFirstFrameContinuity:productionCapability.value?.scriptBreakdownDefaultFirstFrameContinuity===true, requiresLastFrameContinuity:productionCapability.value?.scriptBreakdownDefaultLastFrameContinuity===true, audioEnabled:episode.value?.audioEnabled ?? true, audio:{ dialogue:'', soundscape:'', music:'' }, status:'draft' })
 const load = async () => {
-  loading.value=true; await studio.initialize(); const found=studio.projectById(String(route.params.projectId)); if(!found){router.replace('/');return}
+  loading.value=true; await studio.initialize(); const found=await studio.loadProject(String(route.params.projectId)); if(!found){router.replace('/projects');return}
   project.value=clone(found); const foundEpisode=project.value.episodes.find(item=>item.id===String(route.params.episodeId)); if(!foundEpisode){router.replace(`/projects/${project.value.id}`);return}
   episode.value=foundEpisode; if(!episode.value.shots.length) episode.value.shots.push(newShot(1));
   const requestedShotId=String(Array.isArray(route.query.shot)?route.query.shot[0]||'':route.query.shot||'')
@@ -586,10 +642,10 @@ const load = async () => {
     studio.notify(error instanceof Error?`未能核对提示词与译文版本：${error.message}`:'未能核对提示词与译文版本','error')
   }
   hydrateGeneratedPromptCache();loading.value=false
-  if(mappedLegacyMode)studio.notify('历史 I2VA/L2VA 已安全映射为“首尾帧生视频”，请确认首帧/尾帧槽位（均可为空）','info')
-  else if(legacyReferenceNeedsReview)studio.notify('历史参考生视频未包含显式分类绑定；可保持零参考，或点击“按一致性 Bible 自动绑定”后检查 Picture 顺序','info')
+  if(mappedLegacyMode)studio.notify('检测到 I2VA/L2VA 模式，已使用“首尾帧生视频”；请确认首帧/尾帧槽位（均可为空）','info')
+  else if(legacyReferenceNeedsReview)studio.notify('当前参考生视频未包含显式分类绑定；可保持零参考，或点击“按一致性 Bible 自动绑定”后检查 Picture 顺序','info')
 }
-onMounted(async()=>{await Promise.all([load(),loadProductionWorkflowTemplates()])})
+onMounted(async()=>{await Promise.all([loadProductionWorkflowTemplates(),loadProductionCapability()]);await load()})
 watch(selectedShotId,(id)=>{
   shotRef2vaTemplateId.value='';shotRef2vaParameters.value={}
   previewRequestEpoch += 1
@@ -624,7 +680,7 @@ const persistEpisodeKeepingSelection = async (): Promise<Shot | null> => {
   if (!project.value || !episode.value) return null
   if (translationPromotionBusy.value) throw new Error('译文正在原子同步到正式分镜字段，请等待完成后再保存或生成。')
   if (legacyNegativeRepairShots.value.length) {
-    throw new Error(`本集有 ${legacyNegativeRepairShots.value.length} 个镜头的旧负面约束待服务端审计恢复；请进入对应镜头点击“审计并恢复负面约束”后再保存或生成。`)
+    throw new Error(`本集有 ${legacyNegativeRepairShots.value.length} 个镜头的来源匹配负面约束待服务端审计恢复；请进入对应镜头点击“审计并恢复负面约束”后再保存或生成。`)
   }
   if (canonicalTargetCollisionError.value) throw new Error(`${canonicalTargetCollisionError.value} 请回到“连续剧工作室 → 项目总览 → 全剧视觉规则”修正术语表后再保存或生成。`)
   const previous = selectedShot.value ? clone(selectedShot.value) : null
@@ -644,12 +700,37 @@ const persistEpisodeKeepingSelection = async (): Promise<Shot | null> => {
   hydrateGeneratedPromptCache()
   return restored
 }
+const persistCurrentShotKeepingSelection = async (): Promise<Shot | null> => {
+  if (!project.value || !episode.value || !selectedShot.value) return null
+  if (translationPromotionBusy.value) throw new Error('译文正在原子同步到正式分镜字段，请等待完成后再保存或生成。')
+  if (selectedShot.value.legacyNegativePromptRepairEligible) {
+    throw new Error('当前镜头的负面约束与创作草稿连续性字段来源匹配；请先点击“审计并恢复负面约束”，或人工改为真实的英文缺陷排除词后再保存或生成。')
+  }
+  if (canonicalTargetCollisionError.value) throw new Error(`${canonicalTargetCollisionError.value} 请回到“连续剧工作室 → 项目总览 → 全剧视觉规则”修正术语表后再保存或生成。`)
+  const previousId = selectedShot.value.id
+  const saved = clone(await studio.saveShot(project.value, episode.value, selectedShot.value))
+  const selectionStillTargetsSavedShot = selectedShotId.value === previousId || selectedShotId.value === saved.id
+  const index = episode.value.shots.findIndex((item) => item.id === saved.id || item.id === previousId)
+  if (index >= 0) episode.value.shots[index] = saved; else episode.value.shots.push(saved)
+  if (previousId !== saved.id) {
+    const prompts = { ...generatedPromptsByShot.value }
+    const previousPrompt = prompts[previousId]
+    delete prompts[previousId]
+    const promptToKeep = saved.generatedPrompt || previousPrompt
+    if (promptToKeep && promptToKeep.compiler_current !== false) prompts[saved.id] = clone(promptToKeep)
+    generatedPromptsByShot.value = prompts
+  }
+  if (selectionStillTargetsSavedShot) selectedShotId.value = saved.id
+  hydrateGeneratedPromptCache()
+  return saved
+}
 const save = async()=>{if(!project.value||!episode.value)return;saving.value=true;try{await persistEpisodeKeepingSelection()}catch(e){studio.notify(e instanceof Error?e.message:'保存分镜失败','error')}finally{saving.value=false}}
-const generate=async()=>{if(!project.value||!episode.value||!selectedShot.value)return;generating.value=true;try{const initialErrors=referenceErrorsFor(selectedShot.value);if(initialErrors.length)throw new Error(initialErrors.join('；'));const shot=await persistEpisodeKeepingSelection();if(!shot)throw new Error('保存后未找到当前分镜');const errors=referenceErrorsFor(shot);if(errors.length)throw new Error(errors.join('；'));const payload=await studio.generatePrompt(project.value,episode.value,shot);generatedPromptsByShot.value={...generatedPromptsByShot.value,[shot.id]:payload};if(selectedShotId.value===shot.id)generatedPrompt.value=payload;shot.prompt=payload.integrated_multimodal_description;shot.generatedPrompt=payload;shot.promptRefreshReason=undefined;shot.status='ready';studio.notify(shot.mediaType==='image'?'一致性图片提示词已生成':`${selectedModeProfile.value.name}提示词已生成`)}catch(e){studio.notify(e instanceof Error?e.message:'提示词生成失败','error')}finally{generating.value=false}}
+const generate=async()=>{if(!project.value||!episode.value||!selectedShot.value)return;generating.value=true;try{const initialErrors=referenceErrorsFor(selectedShot.value);if(initialErrors.length)throw new Error(initialErrors.join('；'));const shot=await persistCurrentShotKeepingSelection();if(!shot)throw new Error('保存后未找到当前分镜');const errors=referenceErrorsFor(shot);if(errors.length)throw new Error(errors.join('；'));const payload=await studio.generatePrompt(project.value,episode.value,shot);generatedPromptsByShot.value={...generatedPromptsByShot.value,[shot.id]:payload};if(selectedShotId.value===shot.id)generatedPrompt.value=payload;shot.prompt=payload.integrated_multimodal_description;shot.generatedPrompt=payload;shot.promptRefreshReason=undefined;shot.status='ready';studio.notify(shot.mediaType==='image'?'一致性图片提示词已生成':`${selectedModeProfile.value.name}提示词已生成`)}catch(e){studio.notify(e instanceof Error?e.message:'提示词生成失败','error')}finally{generating.value=false}}
 const generateAll=async()=>{if(!project.value||!episode.value||!episode.value.shots.length)return;generating.value=true;try{for(const shot of episode.value.shots){const errors=referenceErrorsFor(shot);if(errors.length)throw new Error(`${shot.title}：${errors.join('；')}`)}await persistEpisodeKeepingSelection();const shots=[...(episode.value?.shots||[])];for(const item of shots){const payload=await studio.generatePrompt(project.value!,episode.value!,item);generatedPromptsByShot.value={...generatedPromptsByShot.value,[item.id]:payload};if(selectedShotId.value===item.id)generatedPrompt.value=payload;item.prompt=payload.integrated_multimodal_description;item.generatedPrompt=payload;item.promptRefreshReason=undefined;item.status='ready'}studio.notify(`已按各自工作流模板生成 ${shots.length} 个提示词`)}catch(e){studio.notify(e instanceof Error?e.message:'批量生成提示词失败','error')}finally{generating.value=false}}
 const restoreWorkflowSelection=(serialized:string|null)=>{wholeRef2vaTemplateId.value='';wholeRef2vaParameters.value={};if(!serialized)return;try{const rows=JSON.parse(serialized) as Array<{templateId?:unknown;parameters?:unknown}>;const row=Array.isArray(rows)?rows[0]:undefined;if(typeof row?.templateId==='string'){wholeRef2vaTemplateId.value=row.templateId;wholeRef2vaParameters.value=row.parameters&&typeof row.parameters==='object'?row.parameters as Record<string,number>: {}}}catch{/* Invalid local retry state falls back to the official default. */}}
-const clearWholeEpisodeRetryState=(storageKey:string)=>{wholeEpisodeIdempotencyKey.value='';sessionStorage.removeItem(storageKey);sessionStorage.removeItem(`${storageKey}_profile`);sessionStorage.removeItem(`${storageKey}_multiple`);sessionStorage.removeItem(`${storageKey}_image_profile`);sessionStorage.removeItem(`${storageKey}_image_multiple`);sessionStorage.removeItem(`${storageKey}_workflow_selections`)}
-const openWholeEpisodeDialog=()=>{if(!episode.value)return;const storageKey=`cineforge_whole_episode_idempotency_${episode.value.id}`;wholeEpisodeIdempotencyKey.value=sessionStorage.getItem(storageKey)||'';const pendingProfile=sessionStorage.getItem(`${storageKey}_profile`);const pendingImageProfile=sessionStorage.getItem(`${storageKey}_image_profile`);wholeEpisodeProfile.value=isProductionResolutionProfile(pendingProfile)?pendingProfile:DEFAULT_PRODUCTION_RESOLUTION_PROFILE;wholeEpisodeImageProfile.value=isProductionResolutionProfile(pendingImageProfile)?pendingImageProfile:'0.98';wholeEpisodeMultiple.value=wholeEpisodeIdempotencyKey.value?normalizeProductionResolutionMultiple(sessionStorage.getItem(`${storageKey}_multiple`)):DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE;wholeEpisodeImageMultiple.value=wholeEpisodeIdempotencyKey.value?normalizeImageProductionResolutionMultiple(sessionStorage.getItem(`${storageKey}_image_multiple`)):DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE;restoreWorkflowSelection(wholeEpisodeIdempotencyKey.value?sessionStorage.getItem(`${storageKey}_workflow_selections`):null);wholeEpisodeOpen.value=true}
+const clearWholeEpisodeRetryState=(storageKey:string)=>{wholeEpisodeIdempotencyKey.value='';wholeEpisodeIdempotencyConflict.value='';sessionStorage.removeItem(storageKey);sessionStorage.removeItem(`${storageKey}_profile`);sessionStorage.removeItem(`${storageKey}_multiple`);sessionStorage.removeItem(`${storageKey}_image_profile`);sessionStorage.removeItem(`${storageKey}_image_multiple`);sessionStorage.removeItem(`${storageKey}_workflow_selections`)}
+const abandonWholeEpisodeRetryState=()=>{if(!episode.value)return;clearWholeEpisodeRetryState(`cineforge_whole_episode_idempotency_${episode.value.id}`);wholeEpisodeExtendedConfirmed.value=false;studio.notify('已放弃旧整集提交状态；再次生成时会创建新的幂等批次。','info')}
+const openWholeEpisodeDialog=()=>{if(!episode.value)return;wholeEpisodeExtendedConfirmed.value=false;wholeEpisodeIdempotencyConflict.value='';const storageKey=`cineforge_whole_episode_idempotency_${episode.value.id}`;wholeEpisodeIdempotencyKey.value=sessionStorage.getItem(storageKey)||'';const pendingProfile=sessionStorage.getItem(`${storageKey}_profile`);const pendingImageProfile=sessionStorage.getItem(`${storageKey}_image_profile`);wholeEpisodeProfile.value=isProductionResolutionProfile(pendingProfile)?pendingProfile:DEFAULT_PRODUCTION_RESOLUTION_PROFILE;wholeEpisodeImageProfile.value=isProductionResolutionProfile(pendingImageProfile)?pendingImageProfile:'0.98';wholeEpisodeMultiple.value=wholeEpisodeIdempotencyKey.value?normalizeProductionResolutionMultiple(sessionStorage.getItem(`${storageKey}_multiple`)):DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE;wholeEpisodeImageMultiple.value=wholeEpisodeIdempotencyKey.value?normalizeImageProductionResolutionMultiple(sessionStorage.getItem(`${storageKey}_image_multiple`)):DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE;restoreWorkflowSelection(wholeEpisodeIdempotencyKey.value?sessionStorage.getItem(`${storageKey}_workflow_selections`):null);wholeEpisodeOpen.value=true}
 const submitWholeEpisode=async()=>{
   if(!project.value||!episode.value||!episode.value.shots.length)return
   generatingWholeEpisode.value=true
@@ -660,38 +741,68 @@ const submitWholeEpisode=async()=>{
     const storageKey=`cineforge_whole_episode_idempotency_${episode.value.id}`
     const idempotencyKey=wholeEpisodeIdempotencyKey.value||sessionStorage.getItem(storageKey)||`whole-episode-${episode.value.id}-${typeof crypto!=='undefined'&&crypto.randomUUID?crypto.randomUUID():Date.now()}`
     wholeEpisodeIdempotencyKey.value=idempotencyKey;sessionStorage.setItem(storageKey,idempotencyKey);sessionStorage.setItem(`${storageKey}_profile`,wholeEpisodeProfile.value);sessionStorage.setItem(`${storageKey}_multiple`,String(wholeEpisodeMultiple.value));sessionStorage.setItem(`${storageKey}_image_profile`,wholeEpisodeImageProfile.value);sessionStorage.setItem(`${storageKey}_image_multiple`,String(wholeEpisodeImageMultiple.value));sessionStorage.setItem(`${storageKey}_workflow_selections`,JSON.stringify(wholeEpisodeWorkflowSelections.value))
-    const task=await studio.generateWholeEpisode(project.value,episode.value,idempotencyKey,wholeEpisodeProfile.value,wholeEpisodeMultiple.value,wholeEpisodeImageProfile.value,wholeEpisodeImageMultiple.value,wholeEpisodeWorkflowSelections.value)
-    clearWholeEpisodeRetryState(storageKey);wholeEpisodeOpen.value=false
+    const task=await studio.generateWholeEpisode(project.value,episode.value,idempotencyKey,wholeEpisodeProfile.value,wholeEpisodeMultiple.value,wholeEpisodeImageProfile.value,wholeEpisodeImageMultiple.value,wholeEpisodeWorkflowSelections.value,wholeEpisodeExtendedConfirmed.value)
+    clearWholeEpisodeRetryState(storageKey);wholeEpisodeExtendedConfirmed.value=false;wholeEpisodeOpen.value=false
     router.push({path:'/workflows',query:{task:task.id,batch:task.batchId||''}})
   }catch(error){
+    if(productionErrorCode(error)==='production_queue_confirmation_required'){
+      wholeEpisodeExtendedConfirmed.value=true
+      studio.notify(`本集 ${episode.value?.shots.length||0} 个镜头超过当前队列建议值；镜数会完整保留，请核对提示后再次确认。`,'info')
+      return
+    }
     const message=error instanceof Error?error.message:'整集生成任务创建失败'
-    if(episode.value&&/(idempotency_key|幂等)/i.test(message)&&/(不完整|不同|新的|新 key|冲突)/i.test(message)){
-      const storageKey=`cineforge_whole_episode_idempotency_${episode.value.id}`
-      clearWholeEpisodeRetryState(storageKey)
+    if(productionErrorCode(error)==='production_idempotency_conflict'||(/(idempotency_key|幂等)/i.test(message)&&/(不完整|不同|新的|新 key|冲突)/i.test(message))){
+      wholeEpisodeIdempotencyConflict.value='旧整集提交状态不完整或参数已发生冲突。幂等键已保留，系统不会自动换键重提。请先到生产工作流核对已有任务；只有确认放弃旧尝试后才能创建新批次。'
+      studio.notify(wholeEpisodeIdempotencyConflict.value,'error')
+      return
     }
     studio.notify(message,'error')
   }
   finally{generatingWholeEpisode.value=false}
 }
-const saveAndRegenerateShot = async () => {
+const saveAndRegenerateShot = async (extendedGenerationConfirmed = false) => {
   if (!project.value || !episode.value || !selectedShot.value) return
   const requestedKind = selectedShot.value.mediaType
+  let requestedShotId = selectedShot.value.id
   regeneratingShot.value = true
   try {
-    const persistedShot = await persistEpisodeKeepingSelection()
+    const persistedShot = await persistCurrentShotKeepingSelection()
     if (!persistedShot || persistedShot.mediaType !== requestedKind) throw new Error(`保存后未找到可生成的${requestedKind === 'image' ? '图片' : '视频'}镜头`)
+    requestedShotId = persistedShot.id
     const errors = referenceErrorsFor(persistedShot)
     if (errors.length) throw new Error(errors.join('；'))
-    const result = await studio.regenerateShot(project.value, episode.value, persistedShot, shotResolutionProfile.value, shotResolutionMultiple.value, shotWorkflowSelections.value)
+    const result = await studio.regenerateShot(project.value, episode.value, persistedShot, shotResolutionProfile.value, shotResolutionMultiple.value, shotWorkflowSelections.value, extendedGenerationConfirmed)
     persistedShot.status = 'rendering'
+    pendingShotRegenerationConfirmation.value = null
     lastSubmittedTask.value = { shotId: persistedShot.id, taskId: result.taskId }
     studio.notify(`镜头 ${String(persistedShot.order).padStart(2, '0')} ${requestedKind === 'image' ? '图片' : '视频'}已按 ${shotResolutionProfile.value} 档 / ${shotResolutionMultiple.value} 倍数提交 · 任务 ${result.taskId.slice(0, 8)}`)
     await loadShotOutputPreview(true)
   } catch (e) {
+    if (!extendedGenerationConfirmed && productionErrorCode(e) === 'production_queue_confirmation_required') {
+      const shot = episode.value?.shots.find((item) => item.id === requestedShotId) || selectedShot.value
+      if (shot) pendingShotRegenerationConfirmation.value = {
+        shotId: shot.id, shotOrder: shot.order, shotTitle: shot.title, mediaType: shot.mediaType,
+      }
+      studio.notify('当前生产队列超过建议值；请核对提示后明确确认是否继续生成此镜头。', 'info')
+      return
+    }
     studio.notify(e instanceof Error ? e.message : `镜头${requestedKind === 'image' ? '图片' : '视频'}生成提交失败`, 'error')
   } finally {
     regeneratingShot.value = false
   }
+}
+const closeShotRegenerationConfirmation = () => {
+  if (!regeneratingShot.value) pendingShotRegenerationConfirmation.value = null
+}
+const confirmShotRegeneration = async () => {
+  const pending = pendingShotRegenerationConfirmation.value
+  if (!pending) return
+  if (selectedShot.value?.id !== pending.shotId) {
+    pendingShotRegenerationConfirmation.value = null
+    studio.notify('当前选中的镜头已变化，请重新发起生成。', 'error')
+    return
+  }
+  await saveAndRegenerateShot(true)
 }
 const copyPrompt=async()=>{if(!actualPromptText.value)return;await navigator.clipboard.writeText(actualPromptText.value);studio.notify(generatedPrompt.value?.mediaType==='image'?'实际图片提示词已复制':'实际提交给 H3 的提示词已复制')}
 const copyPromptJson=async()=>{if(!promptJson.value)return;await navigator.clipboard.writeText(promptJson.value);studio.notify('提示词结构 JSON 已复制')}
@@ -704,7 +815,15 @@ const thumbFor=(assetIds:string[])=>studio.assets.find(a=>assetIds.includes(a.id
     <header class="storyboard-header">
       <div class="storyboard-title"><button class="icon-btn" @click="router.push(`/projects/${project.id}`)"><ArrowLeft :size="17"/></button><div><span>{{ project.title }} / EP {{ String(episode.number).padStart(2,'0') }}</span><h2>{{ episode.title }}</h2></div><StatusBadge :status="episode.status"/></div>
       <div class="storyboard-global"><label><span title="普通生产可按连续镜头合并提示词；“生成整集”始终逐镜创建独立、可重试任务">普通工作流多分镜</span><ToggleSwitch v-model="episode.multiShot"/></label><label><span title="同步开启或关闭本集现有全部视频镜头的 MiniMax H3 原生音频">原生音频（全部视频镜头）</span><ToggleSwitch v-model="episodeAudioEnabled"/></label><i></i><span>{{ videoShotCount }} 视频 · {{ imageShotCount }} 图片 · {{ totalDuration }} 秒视频</span></div>
-      <div class="storyboard-actions"><button class="button ghost small" :disabled="saving||editorPersistenceBlocked" :title="editorPersistenceBlockedReason" @click="save"><Save :size="15"/>{{ saving?'保存中':'保存' }}</button><button class="button ghost small" :disabled="generating||editorPersistenceBlocked" :title="editorPersistenceBlockedReason" @click="generateAll"><WandSparkles :size="15"/>{{ generating?'生成中…':'生成全部提示词' }}</button><button class="button primary small" :disabled="generatingWholeEpisode||!episode.shots.length||blockedEpisodePromptShots.length>0||editorPersistenceBlocked" :title="editorPersistenceBlocked?editorPersistenceBlockedReason:blockedEpisodePromptShots.length?`${blockedEpisodePromptShots.length} 个已复检的图片/视频提示词仍需英文改写，生产门禁会阻断提交`:'保存分镜后逐镜创建整集批次'" @click="openWholeEpisodeDialog"><Sparkles :size="15"/>生成整集</button></div>
+      <div class="storyboard-actions">
+        <button class="button ghost small" :disabled="saving||editorPersistenceBlocked" :title="editorPersistenceBlockedReason" @click="save"><Save :size="15"/>{{ saving?'保存中':'保存' }}</button>
+        <div class="episode-tool-group" aria-label="整集工具">
+          <button class="button ghost small" :disabled="!episode.shots.length" @click="openEpisodeDetailDraft('expand')"><WandSparkles :size="15"/>整集扩写</button>
+          <button class="button ghost small" :disabled="!episode.shots.length" @click="openEpisodeDetailDraft('apply')"><Check :size="15"/>整集应用</button>
+          <button class="button ghost small" :disabled="generating||editorPersistenceBlocked" :title="editorPersistenceBlockedReason" @click="generateAll"><WandSparkles :size="15"/>{{ generating?'生成中…':'生成全部提示词' }}</button>
+          <button class="button primary small" :disabled="generatingWholeEpisode||!episode.shots.length||blockedEpisodePromptShots.length>0||editorPersistenceBlocked" :title="editorPersistenceBlocked?editorPersistenceBlockedReason:blockedEpisodePromptShots.length?`${blockedEpisodePromptShots.length} 个已复检的图片/视频提示词仍需英文改写，生产门禁会阻断提交`:'保存分镜后逐镜创建整集批次'" @click="openWholeEpisodeDialog"><Sparkles :size="15"/>生成整集</button>
+        </div>
+      </div>
     </header>
 
     <div v-if="canonicalTargetCollisionError" class="canonical-collision-banner"><AlertTriangle :size="15"/><span><strong>canonical 术语碰撞 · 保存、翻译同步和生成已暂停</strong><small>{{ canonicalTargetCollisionError }} 请回到“连续剧工作室 → 项目总览 → 全剧视觉规则”人工修正并保存。</small></span></div>
@@ -749,24 +868,25 @@ const thumbFor=(assetIds:string[])=>studio.assets.find(a=>assetIds.includes(a.id
             </div>
             <PromptWritingGuide scope="shot"/>
             <TranslationReviewPanel :project-id="project.id" :episode-id="episode.id" :shot-id="selectedShot.id" :fields="selectedTranslationFields" :repair-legacy-negative-prompt="selectedShot.legacyNegativePromptRepairEligible===true" :blocked-reason="canonicalTargetCollisionError" compact title="当前分镜 · 本地 Qwen 译文人工审核" @promoted="applyShotTranslationPromotion" @promotion-busy="translationPromotionBusy=$event" @changed="invalidatePrompt(selectedShot,'translations_changed')"/>
-            <ShotDetailDraftPanel v-if="selectedShot.mediaType==='video'" :project-id="project.id" :shot="selectedShot" :blocked-reason="editorPersistenceBlockedReason" @applied="applyShotDetailDraft"/>
+            <ShotDetailDraftPanel v-if="selectedShot.mediaType==='video'" :project-id="project.id" :shot="selectedShot" :blocked-reason="currentShotPersistenceBlockedReason" @applied="applyShotDetailDraft"/>
             <div class="form-grid four">
               <label class="field"><span class="field-label">镜头标题 <PromptImpactBadge kind="label" title="只用于镜头列表、任务识别和检索，不写入 H3 导演描述。"/></span><input v-model="selectedShot.title" placeholder="例如：雨夜入栈"></label>
               <label class="field"><span class="field-label">生成类型 <PromptImpactBadge kind="production" title="决定生成图片或视频，并切换对应工作流字段。"/></span><select v-model="selectedShot.mediaType"><option value="video">视频 · MiniMax H3</option><option value="image">图片 · 一致性参考帧</option></select></label>
               <label class="field"><span class="field-label">景别 / 构图 <PromptImpactBadge kind="prompt" title="作为 shot size 与 framing 写入导演描述。"/></span><select v-model="selectedShot.framing"><option v-for="item in framings" :key="item">{{ item }}</option></select></label>
-              <label v-if="selectedShot.mediaType==='video'" class="field"><span class="field-label">镜头时长 <PromptImpactBadge kind="production" title="控制 H3 duration 与动作密度；视频支持 5–15 秒。"/></span><div class="number-control"><button @click="selectedShot.duration=Math.max(5,selectedShot.duration-1)">−</button><input v-model.number="selectedShot.duration" type="number" min="5" max="15"><em>秒</em><button @click="selectedShot.duration=Math.min(15,selectedShot.duration+1)">+</button></div></label>
+              <label v-if="selectedShot.mediaType==='video'" class="field"><span class="field-label">镜头时长 <PromptImpactBadge kind="production" title="控制 H3 duration 与动作密度；有效范围来自生产能力配置。"/></span><div class="number-control"><button :disabled="!productionCapability" @click="adjustSelectedShotDuration(-1)">−</button><input v-model.number="selectedShot.duration" type="number" :min="videoShotMinDurationSeconds" :max="videoShotMaxDurationSeconds" step="0.5" :disabled="!productionCapability"><em>秒</em><button :disabled="!productionCapability" @click="adjustSelectedShotDuration(1)">+</button></div><small v-if="productionCapability" :class="{'field-error':selectedShotDurationOutOfRange}">当前正式视频范围 {{ videoShotMinDurationSeconds }}–{{ videoShotMaxDurationSeconds }} 秒<span v-if="selectedShotDurationOutOfRange">；请先调整到范围内</span></small><small v-else class="field-error">{{ productionCapabilityError || '正在读取正式视频时长配置…' }}</small></label>
             </div>
             <div class="form-grid two">
               <div class="field"><span class="field-label">镜头运动 <PromptImpactBadge kind="prompt" title="进入 Camera 段；建议使用简洁英文并只保留一个主要运镜。"/></span><textarea v-model="selectedShot.camera" rows="3" placeholder="Describe shot size, angle, lens behavior, one camera move, speed, and final framing in English."></textarea><div class="prompt-example-list"><button v-for="(example,index) in cameraExamples" :key="example" type="button" :title="example" @click="selectedShot.camera=example">英文示例 {{ index+1 }}</button></div></div>
-              <div class="field"><span class="field-label">动作与画面描述 <PromptImpactBadge kind="prompt" title="作为一条去重后的可观察动作链进入当前镜头；使用英文现在时，并写清结束状态。"/></span><textarea v-model="selectedShot.action" rows="3" placeholder="Use present-tense English: one visible action, one environment response, and a clear end state."></textarea><div class="prompt-example-list"><button type="button" title="插入后请替换方括号内容" @click="selectedShot.action=actionTemplate">插入英文动作模板</button><small>5 秒镜头建议只保留一个主要动作。</small></div></div>
+              <div class="field"><span class="field-label">动作与画面描述 <PromptImpactBadge kind="prompt" title="作为可观察动作链进入当前镜头；可在每行动作前保留母稿解析出的相对时间范围。"/></span><textarea v-model="selectedShot.action" rows="4" placeholder="[0s–2.5s] The subject opens the door.&#10;[2.5s–5s] The subject stops in a stable final pose."></textarea><div class="prompt-example-list"><button type="button" title="插入后请替换方括号内容" @click="selectedShot.action=actionTemplate">插入英文动作模板</button><small>时间范围相对本镜头起点；未写时母稿拆解会使用 0 至整镜时长。</small></div></div>
             </div>
             <div class="form-grid two">
               <label class="field"><span class="field-label">正向连续性指令 <PromptImpactBadge kind="continuity" title="写入正向 Continuity；仅描述必须保持的身份、服装、空间和状态。"/></span><textarea v-model="selectedShot.continuityDirection" rows="2" placeholder="Preserve the same face, hairstyle, wardrobe, prop hand, screen direction, and end-state continuity."></textarea><small>只写要保持的正向事实，不要在这里填写“不要、避免、漂移”等缺陷词。</small></label>
-              <label class="field"><span class="field-label">负面约束 / 质量审计 <PromptImpactBadge kind="audit" title="与正向导演描述分离并保存在提示词产物中；当前本地 H3 原生节点没有独立 negative 输入。"/></span><textarea v-model="selectedShot.negativePrompt" rows="2" :readonly="selectedShot.legacyNegativePromptRepairEligible" placeholder="identity drift, wardrobe change, extra limbs, text, watermark, low resolution"></textarea><small v-if="selectedShot.legacyNegativePromptRepairEligible" class="legacy-negative-warning">该值已由服务端确认与旧 CreativeDraft 连续性来源匹配，不能继续保存为负面词；请在上方点击“审计并恢复负面约束”。</small><small v-else>当前用于审计，不会错误塞入正向提示词；不要复制正向连续性描述。</small></label>
+              <label class="field"><span class="field-label">负面约束 / 质量审计 <PromptImpactBadge kind="audit" title="与正向导演描述分离并保存在提示词产物中；当前本地 H3 原生节点没有独立 negative 输入。"/></span><textarea v-model="selectedShot.negativePrompt" rows="2" :readonly="selectedShot.legacyNegativePromptRepairEligible" placeholder="identity drift, wardrobe change, extra limbs, text, watermark, low resolution"></textarea><small v-if="selectedShot.legacyNegativePromptRepairEligible" class="legacy-negative-warning">该值已由服务端确认与创作草稿连续性字段来源匹配，不能继续保存为负面词；请在上方点击“审计并恢复负面约束”。</small><small v-else>当前用于审计，不会错误塞入正向提示词；不要复制正向连续性描述。</small></label>
             </div>
             <div class="mode-guide"><Sparkles :size="16"/><div><strong>{{ selectedShot.mediaType==='image' ? 'SDXL 一致性定帧提示词' : `${selectedModeProfile.name} · 自动提示词模板` }}</strong><p v-if="selectedShot.mediaType==='video'">{{ selectedModeProfile.desc }}</p><p v-else>当前为 SDXL 标准文生图：使用风格及已选人物、场景、道具的 Bible 英文视觉锚点生成静态构图；素材库参考图仅用于人工连续性核对，不会作为像素输入连接。</p><div v-if="selectedShot.mediaType==='video'" class="template-fields"><code v-for="field in selectedModeProfile.fields" :key="field">{{ field }}</code></div></div></div>
           </div>
           <div v-else-if="inspectorTab==='continuity'" class="inspector-content continuity-selector">
+            <div class="selector-group"><header><div><Link2 :size="16"/><span>首尾帧连续要求</span><PromptImpactBadge kind="continuity" title="这是导演与生产意图，不代表素材槽位已经绑定。"/></div><small>母稿默认值可在项目总览的拆解参数中调整</small></header><div class="form-grid two"><div class="setting-toggle"><div><strong>首帧承接上一镜</strong><small>开始状态需匹配上一镜结束状态</small></div><ToggleSwitch v-model="selectedShot.requiresFirstFrameContinuity"/></div><div class="setting-toggle"><div><strong>尾帧衔接下一镜</strong><small>结束时保留稳定、可匹配的状态与构图</small></div><ToggleSwitch v-model="selectedShot.requiresLastFrameContinuity"/></div></div></div>
             <div class="selector-group"><header><div><UserRound :size="16"/><span>本镜头人物</span><PromptImpactBadge kind="continuity" title="人物 Bible 定义参与身份与服装一致性；Ref2VA 可进一步绑定人物图片。"/></div><small>可多选 · 人物素材只绑定人物</small></header><div class="continuity-options"><button v-for="item in project.bible.characters" :key="item.id" :class="{active:selectedShot.characterIds.includes(item.id)}" @click="toggleEntity('character',item.id)"><div><AssetImage v-if="thumbFor(item.referenceAssetIds)" :src="thumbFor(item.referenceAssetIds)" :label="item.name" :accent="style?.accent"/><UserRound v-else :size="20"/></div><span><strong>{{ item.name }}</strong><small>一致性视觉锚点</small></span><i><Check :size="12"/></i></button></div></div>
             <div class="selector-group"><header><div><Image :size="16"/><span>场景锚点</span><PromptImpactBadge kind="continuity" title="场景 Bible 定义参与固定空间结构、光线与色彩连续性。"/></div><small>单选 · 场景素材只绑定场景</small></header><div class="continuity-options"><button v-for="item in project.bible.scenes" :key="item.id" :class="{active:selectedShot.sceneId===item.id}" @click="selectScene(item.id)"><div><AssetImage v-if="thumbFor(item.referenceAssetIds)" :src="thumbFor(item.referenceAssetIds)" :label="item.name" :accent="style?.accent"/><Image v-else :size="20"/></div><span><strong>{{ item.name }}</strong><small>已锁定空间结构</small></span><i><Check :size="12"/></i></button></div></div>
             <div class="selector-group"><header><div><Box :size="16"/><span>关键道具</span><PromptImpactBadge kind="continuity" title="道具 Bible 定义参与形状、材质、比例与持久标记的一致性。"/></div><small>可多选 · 道具素材只绑定道具</small></header><div class="continuity-options"><button v-for="item in project.bible.props" :key="item.id" :class="{active:selectedShot.propIds.includes(item.id)}" @click="toggleEntity('prop',item.id)"><div><AssetImage v-if="thumbFor(item.referenceAssetIds)" :src="thumbFor(item.referenceAssetIds)" :label="item.name" :accent="style?.accent"/><Box v-else :size="20"/></div><span><strong>{{ item.name }}</strong><small>一致性视觉锚点</small></span><i><Check :size="12"/></i></button></div></div>
@@ -817,7 +937,7 @@ const thumbFor=(assetIds:string[])=>studio.assets.find(a=>assetIds.includes(a.id
           <div v-else-if="selectedShot.mediaType==='video'" class="inspector-content audio-editor">
             <div class="audio-master"><div><AudioLines :size="20"/><span><strong>MiniMax H3 原生音频</strong><small>画面与声音在同一次生成中保持时间同步</small></span></div><ToggleSwitch v-model="selectedShot.audioEnabled"/></div>
             <div :class="{disabled:!selectedShot.audioEnabled}" class="audio-fields">
-              <label class="field"><span><Mic2 :size="14"/>对白 / 画内语音 / 旁白 <PromptImpactBadge kind="prompt" title="对白原文逐字进入 &lt;d&gt;；括号中的英文演绎方式进入导演描述，voiceover token 会切换为画外旁白并锁定画面人物嘴唇。"/></span><textarea v-model="selectedShot.audio.dialogue" rows="4" placeholder="沈砚（in a low, restrained voice）：谁在等我？&#10;S1（voiceover; softly, with controlled breath）：我又回到了这里。"></textarea><small>每行严格格式：<b>角色名或 S1（in a low, restrained voice）：中文对白</b>。括号内容会影响生成，请用英文；需要旁白时加入独立 token <code>voiceover</code>，例如 <code>（voiceover; softly）</code>。旁白会自动要求画面人物闭唇。不要填写 scenetrans / cutoff。</small><code>director delivery + &lt;d&gt;[Chinese]对白原文&lt;/d&gt;</code></label>
+              <label class="field"><span><Mic2 :size="14"/>对白 / 画内语音 / 旁白 <PromptImpactBadge kind="prompt" title="对白原文逐字进入 &lt;d&gt;；可选时间范围控制该句在镜内的发生区间。"/></span><textarea v-model="selectedShot.audio.dialogue" rows="4" placeholder="[1–3.5秒] 沈砚（in a low, restrained voice）：谁在等我？&#10;[3.5–5秒] S1（voiceover; softly）：我又回到了这里。"></textarea><small>每行格式：<b>[可选起止秒] 角色名或 S1（英文演绎）：中文对白</b>。时间相对本镜头起点；未写时间的旧对白按整镜范围处理。需要旁白时加入独立 token <code>voiceover</code>。不要填写 scenetrans / cutoff。</small><code>timing + director delivery + &lt;d&gt;[Chinese]对白原文&lt;/d&gt;</code></label>
               <label class="field"><span><Waves :size="14"/>整体声景 <PromptImpactBadge kind="prompt" title="进入 overall_soundscape，描述环境声、动作拟音、空间与时间同步。"/></span><textarea v-model="selectedShot.audio.soundscape" rows="3" placeholder="Rain strikes the tiled roof; wet footsteps approach from screen right; the sword guard gives one short metallic click."></textarea><small>优先英文描述可听事实与出现时机，不要写配乐。</small><code>overall_soundscape</code></label>
               <label class="field"><span><Music2 :size="14"/>非叙事音乐 <PromptImpactBadge kind="prompt" title="进入 non_diegetic_music；仅描述画外配乐，不与环境声混写。"/></span><textarea v-model="selectedShot.audio.music" rows="3" placeholder="Sparse guqin harmonics at 72 BPM; a slow two-note pulse enters after 2 seconds, swells once, then fades before the cut."></textarea><small>写配器、速度、节奏、动态与进入/退出时机；无配乐请留空，系统会输出 N/A。</small><code>non_diegetic_music</code></label>
             </div>
@@ -834,7 +954,7 @@ const thumbFor=(assetIds:string[])=>studio.assets.find(a=>assetIds.includes(a.id
       <aside v-if="selectedShot" class="prompt-panel">
         <header><div><span class="eyebrow">{{ selectedShot.mediaType==='image'?'CONSISTENCY IMAGE PROMPT':'MINIMAX H3 VIDEO PROMPT' }}</span><h3>提示词预览</h3></div><button v-if="generatedPrompt" class="icon-btn" @click="copyPrompt"><Copy :size="15"/></button></header>
         <div class="h3-mode-card"><div><component :is="selectedShot.mediaType==='image'?Image:Sparkles" :size="17"/><span><strong>{{ selectedShot.mediaType==='image'?'SDXL 一致性定帧':selectedModeProfile.name }}</strong><small>{{ selectedShot.mediaType==='image'?'Standard text-to-image workflow':selectedModeProfile.workflow }}</small></span></div><span>{{ selectedShot.mediaType==='image'?'IMAGE':effectiveSelectedMode }}</span></div>
-        <div v-if="!generatedPrompt" class="prompt-empty"><div><WandSparkles :size="27"/></div><h4>{{ selectedPromptRefreshReason?'重新生成并复检':'生成' }}{{ selectedShot.mediaType==='image'?'图片':selectedModeProfile.name }}专用提示词</h4><p>{{ selectedShot.mediaType==='image'?'整合风格、静态构图，以及已选人物、场景和道具的 Bible 英文视觉锚点；当前 SDXL 标准文生图不会连接参考图像素。':`${selectedModeProfile.desc} 模板字段：${selectedModeProfile.fields.join('、')}。` }}</p><div v-if="selectedPromptRefreshMessage" class="prompt-blocked-note"><RotateCcw :size="13"/>{{ selectedPromptRefreshMessage }}</div><div v-if="referenceValidationErrors.length" class="prompt-blocked-note"><AlertTriangle :size="13"/>请先在“一致性引用”中修正 {{ referenceValidationErrors.length }} 项素材绑定</div><button class="button primary full" :disabled="generating||referenceValidationErrors.length>0||editorPersistenceBlocked" @click="generate">{{ generating?'正在编排…':selectedPromptRefreshReason?`一键重新生成当前${selectedShot.mediaType==='image'?'图片':selectedModeProfile.name}提示词`:`生成当前${selectedShot.mediaType==='image'?'图片':selectedModeProfile.name}提示词` }}</button></div>
+        <div v-if="!generatedPrompt" class="prompt-empty"><div><WandSparkles :size="27"/></div><h4>{{ selectedPromptRefreshReason?'重新生成并复检':'生成' }}{{ selectedShot.mediaType==='image'?'图片':selectedModeProfile.name }}专用提示词</h4><p>{{ selectedShot.mediaType==='image'?'整合风格、静态构图，以及已选人物、场景和道具的 Bible 英文视觉锚点；当前 SDXL 标准文生图不会连接参考图像素。':`${selectedModeProfile.desc} 模板字段：${selectedModeProfile.fields.join('、')}。` }}</p><div v-if="selectedPromptRefreshMessage" class="prompt-blocked-note"><RotateCcw :size="13"/>{{ selectedPromptRefreshMessage }}</div><div v-if="referenceValidationErrors.length" class="prompt-blocked-note"><AlertTriangle :size="13"/>请先在“一致性引用”中修正 {{ referenceValidationErrors.length }} 项素材绑定</div><button class="button primary full" :disabled="generating||referenceValidationErrors.length>0||currentShotPersistenceBlocked" :title="currentShotPersistenceBlockedReason" @click="generate">{{ generating?'正在编排…':selectedPromptRefreshReason?`一键重新生成当前${selectedShot.mediaType==='image'?'图片':selectedModeProfile.name}提示词`:`生成当前${selectedShot.mediaType==='image'?'图片':selectedModeProfile.name}提示词` }}</button></div>
         <template v-else>
           <div class="prompt-summary"><span>TYPE <strong>{{ generatedPrompt.mediaType.toUpperCase() }}</strong></span><span>MODEL <strong>{{ generatedPrompt.model }}</strong></span><span v-if="generatedPrompt.mode">WORKFLOW <strong>{{ generatedPrompt.mode }}</strong></span><span v-if="generatedPrompt.effective_conditioning_mode">CONDITION <strong>{{ generatedPrompt.effective_conditioning_mode }}</strong></span><span v-if="generatedPrompt.prompt_template_key">TEMPLATE <strong>{{ generatedPrompt.prompt_template_key }}</strong></span><span v-if="generatedPrompt.duration">DURATION <strong>{{ generatedPrompt.duration }}s</strong></span></div>
           <section v-if="promptQuality" class="prompt-quality-panel" :class="{attention:promptQuality.status==='needs_attention'}">
@@ -850,7 +970,7 @@ const thumbFor=(assetIds:string[])=>studio.assets.find(a=>assetIds.includes(a.id
           </section>
           <div class="json-preview actual-prompt"><strong>实际提交给 {{ generatedPrompt.mediaType==='image'?'图片工作流':'MiniMax H3' }} 的 prompt_text</strong><pre>{{ actualPromptText }}</pre></div>
           <details class="json-preview structured-preview"><summary>查看结构化字段 JSON</summary><pre>{{ promptJson }}</pre></details>
-          <div class="prompt-actions"><button class="button ghost full" @click="copyPrompt"><Clipboard :size="15"/>复制实际提示词</button><button class="button ghost full" @click="copyPromptJson"><Clipboard :size="15"/>复制结构 JSON</button><button class="button primary full" :disabled="editorPersistenceBlocked" @click="generate"><RotateCcw :size="15"/>重新生成并复检</button></div>
+          <div class="prompt-actions"><button class="button ghost full" @click="copyPrompt"><Clipboard :size="15"/>复制实际提示词</button><button class="button ghost full" @click="copyPromptJson"><Clipboard :size="15"/>复制结构 JSON</button><button class="button primary full" :disabled="generating||currentShotPersistenceBlocked" :title="currentShotPersistenceBlockedReason" @click="generate"><RotateCcw :size="15"/>重新生成并复检</button></div>
         </template>
         <div class="shot-render-action">
           <div><strong>生成此镜头的新{{ selectedShot.mediaType==='image'?'图片':'视频' }}</strong><p>{{ selectedShot.mediaType==='video'?'先保存当前编辑，再只为这个分镜创建新的 ComfyUI 视频任务；成功后可回到连续剧工作室重新组装本集。':'先保存当前编辑，再创建独立 SDXL 图片任务；完成后会在上方舞台和任务详情中预览、下载。当前只使用 Bible 英文视觉锚点，不连接参考图像素。' }}</p></div>
@@ -859,25 +979,45 @@ const thumbFor=(assetIds:string[])=>studio.assets.find(a=>assetIds.includes(a.id
           <ProductionWorkflowPicker v-if="selectedShot.mediaType==='video'&&selectedShot.mode==='Ref2VA'" v-model:template-id="shotRef2vaTemplateId" v-model:parameters="shotRef2vaParameters" :templates="productionWorkflowTemplates" :loading="productionWorkflowTemplatesLoading" :error="productionWorkflowTemplatesError" h3-mode="Ref2VA"/>
           <div v-if="selectedShot.mediaType==='image'" class="image-resolution-guidance"><Image :size="13"/><span><strong>SDXL 推荐约 1 MP</strong>默认使用 0.98 MP；0.1 / 0.2 MP 仅适合验证工作流连通性，成片细节和人物质量通常不足。</span></div>
           <div v-if="selectedPromptProductionBlocked" class="prompt-blocked-note"><AlertTriangle :size="13"/>该提示词的导演字段仍含待改写中文；生产门禁会拒绝排队。完成英文改写后请先“重新生成并复检”。</div>
-          <button class="button primary full" :disabled="regeneratingShot||saving||editorPersistenceBlocked||referenceValidationErrors.length>0||selectedPromptProductionBlocked" :title="editorPersistenceBlocked?editorPersistenceBlockedReason:''" @click="saveAndRegenerateShot"><component :is="selectedShot.mediaType==='image'?Image:Film" :size="15"/>{{ regeneratingShot?'保存并提交中…':`保存并重新生成${selectedShot.mediaType==='image'?'图片':'视频'}` }}</button>
+          <button class="button primary full" :disabled="regeneratingShot||saving||generating||currentShotPersistenceBlocked||referenceValidationErrors.length>0||selectedPromptProductionBlocked" :title="currentShotPersistenceBlockedReason" @click="saveAndRegenerateShot(false)"><component :is="selectedShot.mediaType==='image'?Image:Film" :size="15"/>{{ regeneratingShot?'保存并提交中…':`保存并重新生成${selectedShot.mediaType==='image'?'图片':'视频'}` }}</button>
           <div v-if="lastSubmittedTask?.shotId===selectedShot.id" class="shot-task-link"><span>任务 {{ lastSubmittedTask.taskId.slice(0,8) }} 已进入生产队列</span><RouterLink to="/workflows">查看进度 <ChevronRight :size="12"/></RouterLink></div>
         </div>
         <div class="continuity-health"><header><span><Lock :size="14"/>连续性检查</span><strong :class="{invalid:referenceValidationErrors.length}">{{ referenceValidationErrors.length ? '素材待修正' : '通过' }}</strong></header><div><span>工作流素材绑定</span><i :class="{ok:!referenceValidationErrors.length}"></i></div><div><span>场景锚点</span><i :class="{ok:selectedShot.sceneId}"></i></div><div><span>全局色彩脚本</span><i :class="{ok:project.bible.colorScript}"></i></div><div><span>负面提示词</span><i :class="{ok:selectedShot.negativePrompt}"></i></div></div>
         <button class="delete-shot" @click="deleteShot(selectedShot.id)"><Trash2 :size="14"/>删除当前镜头</button>
       </aside>
     </div>
+    <EpisodeDetailDraftModal
+      :open="episodeDetailDraftOpen"
+      :project-id="project.id"
+      :episode="episode"
+      :shots="episode.shots"
+      :initial-mode="episodeDetailDraftMode"
+      :blocked-reason="editorPersistenceBlocked ? editorPersistenceBlockedReason : ''"
+      :persist-episode="persistEpisodeKeepingSelection"
+      @close="episodeDetailDraftOpen=false"
+      @applied="applyEpisodeDetailDraft"
+    />
+    <BaseModal :open="Boolean(pendingShotRegenerationConfirmation)" title="确认生成此镜头" eyebrow="QUEUE GUIDANCE" width="540px" @close="closeShotRegenerationConfirmation">
+      <div v-if="pendingShotRegenerationConfirmation" class="shot-regeneration-confirm">
+        <AlertTriangle :size="22"/><span><strong>镜头 {{ String(pendingShotRegenerationConfirmation.shotOrder).padStart(2,'0') }} · {{ pendingShotRegenerationConfirmation.shotTitle }}</strong><small>当前生产队列已超过服务端配置的建议值。继续会按原工作流完整创建 1 个{{ pendingShotRegenerationConfirmation.mediaType==='image'?'图片':'视频' }}任务，只会增加等待时间和资源占用，不会改变镜头内容。</small><p>当前编辑已保存；选择取消不会创建新的生产任务。稍后仍可重新点击生成。</p></span>
+      </div>
+      <template #footer><button class="button ghost" :disabled="regeneratingShot" @click="closeShotRegenerationConfirmation">取消，不提交</button><button class="button primary" :disabled="regeneratingShot" @click="confirmShotRegeneration"><component :is="pendingShotRegenerationConfirmation?.mediaType==='image'?Image:Film" :size="15"/>{{ regeneratingShot?'正在确认并提交…':'确认并生成此镜头' }}</button></template>
+    </BaseModal>
     <BaseModal :open="wholeEpisodeOpen" title="生成整集" eyebrow="WHOLE EPISODE BATCH" width="560px" @close="!generatingWholeEpisode&&(wholeEpisodeOpen=false)">
       <ProductionWorkflowPicker v-if="episodeHasRef2VA" v-model:template-id="wholeRef2vaTemplateId" v-model:parameters="wholeRef2vaParameters" :templates="productionWorkflowTemplates" :loading="productionWorkflowTemplatesLoading" :error="productionWorkflowTemplatesError" :disabled="Boolean(wholeEpisodeIdempotencyKey)" h3-mode="Ref2VA"/>
-      <div class="whole-episode-confirm"><div><Sparkles :size="22"/><span><strong>第 {{ episode.number }} 集 · {{ episode.title }}</strong><small>将逐镜创建 {{ episode.shots.length }} 个独立任务：{{ videoShotCount }} 个 H3 视频、{{ imageShotCount }} 个 SDXL 图片；失败分镜可单独重试。</small></span></div><div v-if="blockedEpisodePromptShots.length" class="prompt-blocked-note"><AlertTriangle :size="13"/>{{ blockedEpisodePromptShots.length }} 个已复检的图片/视频提示词仍需英文改写，后端生产门禁会拒绝整集排队。请返回对应镜头修正并重新复检；中文对白、歌词和真实屏显文字可保留原语言。</div><div v-if="videoShotCount" class="resolution-impact-header"><span>视频输出尺寸与倍数</span><PromptImpactBadge kind="production" title="该档位和尺寸倍数只应用到本集视频分镜。"/></div><ResolutionProfilePicker v-if="videoShotCount" v-model="wholeEpisodeProfile" v-model:multiple="wholeEpisodeMultiple" :disabled="Boolean(wholeEpisodeIdempotencyKey)"/><details v-if="imageShotCount" class="whole-episode-image-resolution" open><summary>图片输出参数 · 推荐 0.98 MP</summary><ResolutionProfilePicker v-model="wholeEpisodeImageProfile" v-model:multiple="wholeEpisodeImageMultiple" :multiple-step="8" label="SDXL 图片分辨率档位" :disabled="Boolean(wholeEpisodeIdempotencyKey)"/><p>SDXL 推荐至少 0.8 MP，默认 0.98 MP；图片宽高按 8 的倍数取整；0.1–0.3 MP 仅用于连通性测试，不建议作为交付图片。</p></details><small v-if="wholeEpisodeIdempotencyKey">上次响应未确认，重试将保持视频/图片各自档位、尺寸倍数与幂等键。</small><p>网络错误后再次点击会复用同一个幂等键，避免重复创建整集任务；成功返回后才会生成新的提交键。图片产物不会进入本集视频组装。</p></div>
-      <template #footer><button class="button ghost" :disabled="generatingWholeEpisode" @click="wholeEpisodeOpen=false">取消</button><button class="button primary" :disabled="generatingWholeEpisode||editorPersistenceBlocked||blockedEpisodePromptShots.length>0" :title="editorPersistenceBlocked?editorPersistenceBlockedReason:''" @click="submitWholeEpisode"><Sparkles :size="15"/>{{ generatingWholeEpisode?'正在创建批次…':`生成 ${episode.shots.length} 个分镜任务` }}</button></template>
+      <div class="whole-episode-confirm"><div><Sparkles :size="22"/><span><strong>第 {{ episode.number }} 集 · {{ episode.title }}</strong><small>将逐镜创建 {{ episode.shots.length }} 个独立任务：{{ videoShotCount }} 个 H3 视频、{{ imageShotCount }} 个 SDXL 图片；失败分镜可单独重试。</small></span></div><div v-if="wholeEpisodeExtendedConfirmed"><AlertTriangle :size="18"/><span><strong>请再次确认长任务</strong><small>本集 {{ episode.shots.length }} 镜会全部保留，并按分镜独立入队；超过队列建议值只会增加等待时间、模型执行时间与 API 用量，不会截断镜数。</small></span></div><div v-if="wholeEpisodeIdempotencyConflict" class="whole-episode-idempotency-conflict"><AlertTriangle :size="16"/><span><strong>已停止自动重提</strong><small>{{ wholeEpisodeIdempotencyConflict }}</small></span></div><div v-if="blockedEpisodePromptShots.length" class="prompt-blocked-note"><AlertTriangle :size="13"/>{{ blockedEpisodePromptShots.length }} 个已复检的图片/视频提示词仍需英文改写，后端生产门禁会拒绝整集排队。请返回对应镜头修正并重新复检；中文对白、歌词和真实屏显文字可保留原语言。</div><div v-if="videoShotCount" class="resolution-impact-header"><span>视频输出尺寸与倍数</span><PromptImpactBadge kind="production" title="该档位和尺寸倍数只应用到本集视频分镜。"/></div><ResolutionProfilePicker v-if="videoShotCount" v-model="wholeEpisodeProfile" v-model:multiple="wholeEpisodeMultiple" :disabled="Boolean(wholeEpisodeIdempotencyKey)"/><details v-if="imageShotCount" class="whole-episode-image-resolution" open><summary>图片输出参数 · 推荐 0.98 MP</summary><ResolutionProfilePicker v-model="wholeEpisodeImageProfile" v-model:multiple="wholeEpisodeImageMultiple" :multiple-step="8" label="SDXL 图片分辨率档位" :disabled="Boolean(wholeEpisodeIdempotencyKey)"/><p>SDXL 推荐至少 0.8 MP，默认 0.98 MP；图片宽高按 8 的倍数取整；0.1–0.3 MP 仅用于连通性测试，不建议作为交付图片。</p></details><small v-if="wholeEpisodeIdempotencyKey">上次响应未确认，重试将保持视频/图片各自档位、尺寸倍数与幂等键。</small><button v-if="wholeEpisodeIdempotencyKey" type="button" class="button ghost small" @click="abandonWholeEpisodeRetryState">核对任务后放弃旧尝试</button><p>网络错误后再次点击会复用同一个幂等键，避免重复创建整集任务；成功返回后才会生成新的提交键。图片产物不会进入本集视频组装。</p></div>
+      <template #footer><button class="button ghost" :disabled="generatingWholeEpisode" @click="wholeEpisodeOpen=false">取消</button><button class="button primary" :disabled="generatingWholeEpisode||Boolean(wholeEpisodeIdempotencyConflict)||editorPersistenceBlocked||blockedEpisodePromptShots.length>0" :title="wholeEpisodeIdempotencyConflict||editorPersistenceBlockedReason" @click="submitWholeEpisode"><Sparkles :size="15"/>{{ generatingWholeEpisode?'正在创建批次…':wholeEpisodeExtendedConfirmed?`确认并生成 ${episode.shots.length} 个分镜任务`:`生成 ${episode.shots.length} 个分镜任务` }}</button></template>
     </BaseModal>
   </div>
 </template>
 
 <style scoped>
+.storyboard-actions{align-items:center}.episode-tool-group{display:flex;align-items:center;gap:7px;padding-left:7px;border-left:1px solid var(--border)}.episode-tool-group .button{white-space:nowrap}@media(max-width:720px){.storyboard-actions{width:100%;overflow-x:auto;padding-bottom:3px;justify-self:stretch;flex-wrap:nowrap}.storyboard-actions>.button{flex:none}.episode-tool-group{min-width:max-content;flex-wrap:nowrap}}
 .canonical-collision-banner{margin:10px 14px 0;padding:10px 12px;display:flex;align-items:flex-start;gap:8px;border:1px solid rgba(229,113,117,.3);border-radius:7px;background:rgba(229,113,117,.065);color:#e18b91}.canonical-collision-banner>span{display:flex;min-width:0;flex-direction:column;gap:3px}.canonical-collision-banner strong{font-size:11px}.canonical-collision-banner small{font-size:10px;line-height:1.55}
 .field-label{display:flex;align-items:center;justify-content:space-between;gap:7px;flex-wrap:wrap}.field>small{font-size:11px;line-height:1.55;color:#6f757d}.field>small.legacy-negative-warning{color:#d9a45f}.prompt-example-list{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.prompt-example-list button{min-height:30px;padding:5px 9px;border:1px solid rgba(230,167,90,.18);border-radius:4px;background:rgba(230,167,90,.035);color:#aa8358;font-size:10px;cursor:pointer}.prompt-example-list button:hover{border-color:rgba(230,167,90,.4);color:var(--accent)}.prompt-example-list small{font-size:10px;color:#676d75}.workflow-mode-section strong,.reference-binding-panel>header strong,.frame-binding-grid article>header>span{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.selector-group>header>div{flex-wrap:wrap}.audio-fields .field>span{flex-wrap:wrap}.resolution-impact-header{display:flex;align-items:center;justify-content:space-between;gap:8px}.resolution-impact-header>span{font-size:11px;font-weight:600;color:#a9adb3}.prompt-quality-panel{padding:12px;display:flex;flex-direction:column;gap:10px;border:1px solid rgba(104,197,167,.2);border-radius:7px;background:rgba(104,197,167,.035)}.prompt-quality-panel.attention{border-color:rgba(229,113,117,.28);background:rgba(229,113,117,.035)}.prompt-quality-panel>header{display:flex;align-items:center;justify-content:space-between;gap:8px}.prompt-quality-panel>header>div{min-width:0;display:flex;align-items:center;gap:8px;color:var(--green)}.prompt-quality-panel.attention>header>div{color:#e57175}.prompt-quality-panel>header span{min-width:0;display:flex;flex-direction:column;gap:3px}.prompt-quality-panel>header small{font:10px Consolas,monospace;letter-spacing:.1em;color:#767e7d}.prompt-quality-panel>header strong{font-size:12px;color:#c8cdce}.quality-audit-note{margin:0;color:#777f86;font-size:10px;line-height:1.55}.prompt-quality-metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:7px}.prompt-quality-metrics>span{min-width:0;padding:8px;border:1px solid rgba(255,255,255,.055);border-radius:4px;background:#0a0d11;color:#7b8289;font-size:10px;line-height:1.5}.prompt-quality-metrics strong{display:block;margin-top:3px;color:#bbc0c5;font-size:11px;word-break:break-word}.quality-detail{display:flex;flex-direction:column;gap:7px}.quality-detail>strong{font-size:11px;color:#aeb4ba}.quality-detail>div{display:flex;gap:5px;flex-wrap:wrap}.quality-detail code{padding:5px 7px;border:1px solid rgba(230,167,90,.18);border-radius:4px;background:#0a0d11;color:#cf995b;font-size:10px;word-break:break-word}.quality-detail ul{max-height:160px;margin:0;padding:9px 9px 9px 24px;overflow:auto;border-radius:4px;background:#0a0d11}.quality-detail li{margin:0 0 6px;color:#bf888b;font-size:11px;line-height:1.55}.quality-detail li:last-child{margin-bottom:0}
 .image-resolution-guidance{padding:8px;display:flex;align-items:flex-start;gap:7px;border:1px solid rgba(104,197,167,.18);border-radius:6px;background:rgba(104,197,167,.035);color:var(--green)}.image-resolution-guidance span{font-size:8px;line-height:1.55;color:#788c85}.image-resolution-guidance strong{display:block;color:#9bc5b7;font-size:9px}
+.shot-regeneration-confirm{display:flex;align-items:flex-start;gap:11px;padding:13px;border:1px solid rgba(218,158,73,.25);border-radius:8px;background:rgba(218,158,73,.055);color:#d2a15c}.shot-regeneration-confirm>span{display:grid;gap:5px}.shot-regeneration-confirm strong{font-size:11px;color:#d8b276}.shot-regeneration-confirm small,.shot-regeneration-confirm p{margin:0;color:#858d94;font-size:9px;line-height:1.6}
+.whole-episode-idempotency-conflict{display:flex;align-items:flex-start;gap:8px;padding:10px;border:1px solid rgba(223,101,90,.28);border-radius:7px;background:rgba(223,101,90,.055);color:#df8177}.whole-episode-idempotency-conflict>span{display:grid;gap:5px}.whole-episode-idempotency-conflict small{color:#a68585;font-size:9px;line-height:1.55}.whole-episode-idempotency-conflict button{justify-self:start}
 .whole-episode-image-resolution{padding:9px;border:1px solid rgba(104,197,167,.18);border-radius:7px;background:rgba(104,197,167,.025)}.whole-episode-image-resolution summary{color:#9bc5b7;font-size:10px;font-weight:650;cursor:pointer}.whole-episode-image-resolution>.resolution-picker{margin-top:9px}.whole-episode-image-resolution>p{margin:7px 0 0!important;color:#74857f!important;font-size:8px!important;line-height:1.55!important}
 .reference-purpose-field{margin-top:8px;padding:8px;display:grid;grid-template-columns:minmax(120px,.7fr) minmax(170px,1fr);align-items:center;gap:6px 10px;border:1px solid rgba(230,167,90,.14);border-radius:5px;background:rgba(230,167,90,.025)}.reference-purpose-field>span{display:flex;align-items:center;gap:5px;color:#b8bdc3;font-size:10px;font-weight:650}.reference-purpose-field select{width:100%;height:32px;padding:0 28px 0 9px;border:1px solid rgba(230,167,90,.23);border-radius:4px;background:#0a0d11;color:#d2b083;font-size:10px}.reference-purpose-field small{grid-column:1/-1;color:#777f87;font-size:9px;line-height:1.55}.reference-purpose-field.audio-purpose{border-color:rgba(104,197,167,.14);background:rgba(104,197,167,.02)}.reference-purpose-field.audio-purpose select{border-color:rgba(104,197,167,.22);color:#88bca9}.selected-audio-bindings{display:flex;flex-direction:column;gap:7px}.selected-audio-bindings>article{padding:9px;border:1px solid rgba(104,197,167,.14);border-radius:6px;background:rgba(104,197,167,.02)}.selected-audio-bindings>article>header{display:flex;align-items:center;justify-content:space-between;gap:8px}.selected-audio-bindings>article>header span{min-width:0;display:flex;align-items:center;gap:7px}.selected-audio-bindings>article>header b{font:8px Consolas,monospace;color:var(--green)}.selected-audio-bindings>article>header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:10px;color:#aeb3b9}.selected-audio-bindings>article>header button{display:flex;align-items:center;gap:4px;background:transparent;color:#766568;font-size:9px;cursor:pointer}@media(max-width:720px){.reference-purpose-field{grid-template-columns:1fr}.reference-purpose-field small{grid-column:1}}
 </style>

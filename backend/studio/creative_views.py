@@ -36,7 +36,9 @@ from studio.services.creative_drafts import (
     create_creative_draft,
     create_failed_creative_draft,
     creative_context_hash,
+    creative_provider_config,
     creative_review_issues,
+    preserve_generation_review_issues,
     validate_creative_draft_data,
 )
 
@@ -51,6 +53,11 @@ class CreativeBusy(APIException):
     default_code = "creative_resource_busy"
 
 
+class CreativeInvalid(APIException):
+    status_code = status.HTTP_400_BAD_REQUEST
+    default_code = "invalid"
+
+
 CreativeDraftApplyResponse = inline_serializer(
     name="CreativeDraftApplyResponse",
     fields={
@@ -59,6 +66,48 @@ CreativeDraftApplyResponse = inline_serializer(
         "shots": ShotSerializer(many=True),
         "applied_shot_ids": serializers.ListField(child=serializers.UUIDField()),
         "translations_written": serializers.IntegerField(min_value=0),
+    },
+)
+
+CreativeDraftValidationErrorDetails = inline_serializer(
+    name="CreativeDraftValidationErrorDetails",
+    fields={
+        "code": serializers.CharField(),
+        "detail": serializers.CharField(),
+        "errors": serializers.ListField(child=serializers.CharField()),
+        "required_dialogue_count": serializers.IntegerField(min_value=0, required=False),
+        "target_shot_count": serializers.IntegerField(min_value=1, required=False),
+        "dialogue_capacity": serializers.IntegerField(min_value=0, required=False),
+        "recommended_max_shots": serializers.IntegerField(min_value=1, required=False),
+        "batch_shots": serializers.IntegerField(min_value=1, required=False),
+        "source_char_count": serializers.IntegerField(min_value=0, required=False),
+        "max_source_chars": serializers.IntegerField(min_value=1, required=False),
+        "max_dialogue_per_shot": serializers.IntegerField(min_value=1, required=False),
+        "effective_max_dialogue_per_shot": serializers.IntegerField(
+            min_value=1, required=False,
+        ),
+        "episode_title_chars": serializers.IntegerField(min_value=0, required=False),
+        "max_episode_title_chars": serializers.IntegerField(min_value=1, required=False),
+        "dialogue_text_chars": serializers.IntegerField(min_value=0, required=False),
+        "max_dialogue_text_chars": serializers.IntegerField(min_value=1, required=False),
+        "dialogue_delivery_chars": serializers.IntegerField(min_value=0, required=False),
+        "max_dialogue_delivery_chars": serializers.IntegerField(min_value=1, required=False),
+        "required_output_tokens": serializers.IntegerField(min_value=1, required=False),
+        "configured_max_output_tokens": serializers.IntegerField(min_value=1, required=False),
+    },
+)
+
+CreativeDraftValidationErrorResponse = inline_serializer(
+    name="CreativeDraftValidationErrorResponse",
+    fields={
+        "error": inline_serializer(
+            name="CreativeDraftValidationErrorEnvelope",
+            fields={
+                "status_code": serializers.IntegerField(),
+                "code": serializers.CharField(),
+                "details": CreativeDraftValidationErrorDetails,
+            },
+        ),
     },
 )
 
@@ -88,9 +137,16 @@ def _raise_creative_error(exc: CreativeDraftError):
         error.default_code = "creative_runtime_unavailable"
         raise error from exc
     if isinstance(exc, CreativeValidationError):
-        raise ValidationError({
+        payload = {
             "code": exc.code, "detail": str(exc), "errors": exc.errors,
-        }) from exc
+        }
+        payload.update(exc.public_context)
+        # APIException normally coerces every leaf to ErrorDetail strings. Keep
+        # the allowlisted public counters as integers so the documented API
+        # schema and the browser's safe numeric rendering stay truthful.
+        error = CreativeInvalid()
+        error.detail = payload
+        raise error from exc
     error = APIException(str(exc))
     error.status_code = status.HTTP_502_BAD_GATEWAY
     error.default_code = "creative_runtime_failed"
@@ -119,7 +175,11 @@ class ProjectCreativeDraftGenerateView(APIView):
 
     @extend_schema(
         request=CreativeDraftGenerateSerializer,
-        responses={201: EpisodeCreativeDraftSerializer, 502: dict},
+        responses={
+            201: EpisodeCreativeDraftSerializer,
+            400: CreativeDraftValidationErrorResponse,
+            502: dict,
+        },
     )
     def post(self, request, project_id):
         project = _owned_project(request.user, project_id)
@@ -134,6 +194,7 @@ class ProjectCreativeDraftGenerateView(APIView):
                 target_shot_count=data["target_shot_count"],
                 creativity=data["creativity"], variation_note=data["variation_note"],
                 provider=provider,
+                extended_generation_confirmed=data["extended_generation_confirmed"],
             )
         except (CreativeResourceBusy, CreativeContextConflict, CreativeValidationError,
                 CreativeRuntimeUnavailable) as exc:
@@ -151,6 +212,8 @@ class ProjectCreativeDraftGenerateView(APIView):
                 attempt_context_hash=exc.attempt_context_hash,
                 source_drift_during_attempt=exc.source_drift_during_attempt,
                 provider=provider,
+                extended_generation_confirmed=data["extended_generation_confirmed"],
+                provider_policy_snapshot=exc.provider_policy_snapshot,
             )
             return Response({
                 "detail": str(exc),
@@ -190,11 +253,25 @@ class EpisodeCreativeDraftViewSet(
         input_serializer = CreativeDraftPatchSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         data = input_serializer.validated_data
+        try:
+            identity = self.get_queryset().values("project_id", "episode_id").get(
+                pk=kwargs["pk"],
+            )
+        except EpisodeCreativeDraft.DoesNotExist as exc:
+            raise NotFound("创作草稿不存在") from exc
         with transaction.atomic():
-            try:
-                draft = self.get_queryset().select_for_update().get(pk=kwargs["pk"])
-            except EpisodeCreativeDraft.DoesNotExist as exc:
-                raise NotFound("创作草稿不存在") from exc
+            project = SeriesProject.objects.select_for_update().select_related("style").get(
+                pk=identity["project_id"],
+            )
+            episode = Episode.objects.select_for_update().get(
+                pk=identity["episode_id"],
+                project=project,
+            )
+            draft = self.get_queryset().select_for_update().get(
+                pk=kwargs["pk"],
+                project=project,
+                episode=episode,
+            )
             if draft.revision != data["expected_revision"]:
                 raise CreativeConflict("草稿版本已变化，请刷新后再编辑")
             if draft.status not in {
@@ -202,15 +279,21 @@ class EpisodeCreativeDraftViewSet(
                 EpisodeCreativeDraft.Status.FAILED,
             }:
                 raise ValidationError("只有待审核或校验失败草稿可以人工编辑")
-            project = SeriesProject.objects.select_for_update().select_related("style").get(
-                pk=draft.project_id,
-            )
-            episode = Episode.objects.select_for_update().get(pk=draft.episode_id)
             if creative_context_hash(project, episode) != draft.context_hash:
                 raise CreativeConflict("创作上下文已变化，请重新生成")
             normalized, validation = validate_creative_draft_data(
                 project, episode, data["draft_data"],
                 target_shot_count=len(data["draft_data"]["shots"]),
+                max_dialogue_per_shot=(draft.input_settings or {}).get(
+                    "max_dialogue_per_shot"
+                ),
+                min_shot_duration_ms=(draft.input_settings or {}).get(
+                    "min_shot_duration_ms"
+                ),
+                max_shot_duration_ms=(draft.input_settings or {}).get(
+                    "max_shot_duration_ms"
+                ),
+                review_policy=draft.input_settings or None,
             )
             append_revision_history(draft)
             draft.revision += 1
@@ -251,7 +334,12 @@ class EpisodeCreativeDraftViewSet(
         }:
             raise ValidationError("已应用或已被替代的草稿不能重新生成")
         current_count = len((current.draft_data or {}).get("shots", []))
-        target_count = data.get("target_shot_count", current_count or current.input_settings.get("target_shot_count", 4))
+        target_count = data.get(
+            "target_shot_count",
+            current_count
+            or current.input_settings.get("target_shot_count")
+            or creative_provider_config(provider)["recommended_max_shots"],
+        )
         shot_keys = data.get("shot_keys")
         if shot_keys:
             available = {
@@ -276,6 +364,7 @@ class EpisodeCreativeDraftViewSet(
                 parent=current, merge_from=current if shot_keys else None,
                 shot_keys=shot_keys, expected_parent_revision=data["expected_revision"],
                 provider=provider,
+                extended_generation_confirmed=data["extended_generation_confirmed"],
             )
         except (
             CreativeResourceBusy, CreativeContextConflict, CreativeRevisionConflict,
@@ -296,6 +385,8 @@ class EpisodeCreativeDraftViewSet(
                     source_drift_during_attempt=exc.source_drift_during_attempt,
                     expected_parent_revision=data["expected_revision"],
                     provider=provider,
+                    extended_generation_confirmed=data["extended_generation_confirmed"],
+                    provider_policy_snapshot=exc.provider_policy_snapshot,
                 )
             except CreativeDraftError as save_exc:
                 _raise_creative_error(save_exc)
@@ -316,25 +407,45 @@ class EpisodeCreativeDraftViewSet(
     def confirm(self, request, pk=None):
         serializer = CreativeDraftConfirmSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        try:
+            identity = self.get_queryset().values("project_id", "episode_id").get(pk=pk)
+        except EpisodeCreativeDraft.DoesNotExist as exc:
+            raise NotFound("创作草稿不存在") from exc
         with transaction.atomic():
-            try:
-                draft = self.get_queryset().select_for_update().get(pk=pk)
-            except EpisodeCreativeDraft.DoesNotExist as exc:
-                raise NotFound("创作草稿不存在") from exc
+            project = SeriesProject.objects.select_for_update().select_related("style").get(
+                pk=identity["project_id"],
+            )
+            episode = Episode.objects.select_for_update().get(
+                pk=identity["episode_id"],
+                project=project,
+            )
+            draft = self.get_queryset().select_for_update().get(
+                pk=pk,
+                project=project,
+                episode=episode,
+            )
             if draft.revision != serializer.validated_data["expected_revision"]:
                 raise CreativeConflict("草稿版本已变化，请刷新后再确认")
             if draft.status != EpisodeCreativeDraft.Status.DRAFT:
                 raise ValidationError("只有待审核草稿可以确认")
-            project = SeriesProject.objects.select_for_update().select_related("style").get(
-                pk=draft.project_id,
-            )
-            episode = Episode.objects.select_for_update().get(pk=draft.episode_id)
             if creative_context_hash(project, episode) != draft.context_hash:
                 raise CreativeConflict("项目、Bible、剧集或正式镜头已变化，请重新生成")
             normalized, validation = validate_creative_draft_data(
                 project, episode, draft.draft_data,
                 target_shot_count=len((draft.draft_data or {}).get("shots", [])),
+                max_dialogue_per_shot=(draft.input_settings or {}).get(
+                    "effective_max_dialogue_per_shot",
+                    (draft.input_settings or {}).get("max_dialogue_per_shot"),
+                ),
+                min_shot_duration_ms=(draft.input_settings or {}).get(
+                    "min_shot_duration_ms"
+                ),
+                max_shot_duration_ms=(draft.input_settings or {}).get(
+                    "max_shot_duration_ms"
+                ),
+                review_policy=draft.input_settings or None,
             )
+            validation = preserve_generation_review_issues(validation, draft.validation)
             if validation["status"] not in {"passed", "ready", "needs_review"}:
                 raise ValidationError({"validation": validation})
             if creative_review_issues(validation) and not serializer.validated_data[

@@ -24,6 +24,7 @@ $LocalTranslationRuntime = Join-Path $ProjectRoot '.runtime\qwen-python\Scripts\
 $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $ServiceRecords = [System.Collections.Generic.List[object]]::new()
 $KnownProjectProcessIds = [System.Collections.Generic.HashSet[int]]::new()
+. (Join-Path $PSScriptRoot 'restart_config.ps1')
 
 if ($SkipComfyUI -and $RestartComfyUI) {
     throw '-SkipComfyUI and -RestartComfyUI cannot be used together.'
@@ -98,9 +99,24 @@ public static class AutoPromptProcessInfo
 '@
 }
 
+if (-not $SkipComfyUI) {
+    $resolvedComfyUI = Resolve-AutoPromptComfyUIRoot `
+        -ExplicitRoot $ComfyUIRoot `
+        -ProcessOutputDirectory $env:COMFYUI_OUTPUT_DIR `
+        -BackendEnvPath (Join-Path $BackendRoot '.env') `
+        -ProcessOutputHostDirectory $env:COMFYUI_OUTPUT_HOST_DIR `
+        -RootEnvPath (Join-Path $ProjectRoot '.env')
+    if ($null -ne $resolvedComfyUI) {
+        $ComfyUIRoot = $resolvedComfyUI.Root
+        if ($resolvedComfyUI.Source -ne 'explicit') {
+            Write-Host "ComfyUI root resolved from $($resolvedComfyUI.Source): $ComfyUIRoot" -ForegroundColor DarkGray
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($ComfyUIRoot)) {
     if (-not $SkipComfyUI) {
-        throw 'ComfyUI root is not configured. Set AUTOPROMPT_COMFYUI_ROOT, pass -ComfyUIRoot, or use -SkipComfyUI.'
+        throw 'ComfyUI root is not configured. Set AUTOPROMPT_COMFYUI_ROOT, pass -ComfyUIRoot, configure backend\.env COMFYUI_OUTPUT_DIR as <portable-root>\ComfyUI\output, or use -SkipComfyUI.'
     }
     # Join-Path below still needs a non-empty base even though ComfyUI checks
     # and launch are disabled for this run.
@@ -161,7 +177,16 @@ function Stop-ProcessTree([int]$ProcessId, [string]$Reason) {
         Stop-Process -Id $descendants[$index] -Force -ErrorAction SilentlyContinue
     }
     if ($target) {
-        Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        try {
+            Stop-Process -Id $ProcessId -Force -ErrorAction Stop
+        } catch {
+            # The process can exit after Get-Process succeeds. Treat that race
+            # as already stopped, but preserve access-denied and other errors
+            # while the same PID is still alive.
+            if (Get-Process -Id $ProcessId -ErrorAction SilentlyContinue) {
+                throw
+            }
+        }
     }
     Start-Sleep -Milliseconds 250
 }
@@ -200,7 +225,13 @@ function Stop-RecordedServices {
     if (-not (Test-Path -LiteralPath $StatePath)) { return }
     try {
         $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 | ConvertFrom-Json
-        foreach ($service in @($state.services)) {
+    } catch {
+        Write-Warning "Could not read previous runtime state: $($_.Exception.Message)"
+        return
+    }
+    $stopErrors = [System.Collections.Generic.List[string]]::new()
+    foreach ($service in @($state.services)) {
+        try {
             if ($service.name -eq 'ComfyUI' -and -not $RestartComfyUI) {
                 Write-Host 'Keeping the previously started ComfyUI process.' -ForegroundColor Green
                 continue
@@ -217,9 +248,16 @@ function Stop-RecordedServices {
                 $KnownProjectProcessIds.Add([int]$childId) | Out-Null
             }
             Stop-ProcessTree ([int]$service.pid) "recorded $($service.name)"
+        } catch {
+            $message = "Could not stop recorded $($service.name) (PID $($service.pid)): $($_.Exception.Message)"
+            Write-Warning $message
+            if (Get-Process -Id ([int]$service.pid) -ErrorAction SilentlyContinue) {
+                $stopErrors.Add($message) | Out-Null
+            }
         }
-    } catch {
-        Write-Warning "Could not read previous runtime state: $($_.Exception.Message)"
+    }
+    if ($stopErrors.Count -gt 0) {
+        throw "Recorded service cleanup is incomplete; refusing to start duplicate services. $($stopErrors -join ' | ')"
     }
 }
 
@@ -371,7 +409,7 @@ $env:PYTHONUNBUFFERED = '1'
 $ComfyPython = Join-Path $ComfyUIRoot 'python_embeded\python.exe'
 $ComfyMain = Join-Path $ComfyUIRoot 'ComfyUI\main.py'
 if (-not $SkipComfyUI -and (-not (Test-Path -LiteralPath $ComfyPython) -or -not (Test-Path -LiteralPath $ComfyMain))) {
-    throw "ComfyUI portable installation was not found at $ComfyUIRoot. Set AUTOPROMPT_COMFYUI_ROOT or use -SkipComfyUI."
+    throw "ComfyUI portable installation was not found at $ComfyUIRoot. Set AUTOPROMPT_COMFYUI_ROOT, pass -ComfyUIRoot, configure backend\.env COMFYUI_OUTPUT_DIR as <portable-root>\ComfyUI\output, or use -SkipComfyUI."
 }
 
 # Refuse an explicit GPU-process restart before stopping any application

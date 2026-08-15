@@ -25,6 +25,23 @@ test('voiceover must be an independent token and formatting is reversible', () =
   assert.deepEqual(parseDialogueText(formatDialogueLines(voiceover), characters), voiceover)
 })
 
+test('timed dialogue round-trips in milliseconds without changing the text', () => {
+  const parsed = parseDialogueText(
+    '[1–3.5秒] 沈砚（softly）：原文。\n[00:03.500-5000ms] S1：第二句。',
+    characters,
+  )
+  assert.deepEqual(parsed, [
+    { speaker_id: 'S1', text: '原文。', delivery: 'softly', start_ms: 1000, end_ms: 3500 },
+    { speaker_id: 'S1', text: '第二句。', start_ms: 3500, end_ms: 5000 },
+  ])
+  assert.equal(
+    formatDialogueLines(parsed),
+    '[1–3.5秒] S1（softly）：原文。\n[3.5–5秒] S1：第二句。',
+  )
+  assert.deepEqual(parseDialogueText(formatDialogueLines(parsed), characters), parsed)
+  assert.equal(parseDialogueText('[4-2秒] S1：倒序。', characters), undefined)
+})
+
 test('rejects unknown speakers and overlong dialogue text', () => {
   assert.equal(parseDialogueText('陌生人：台词', characters), undefined)
   assert.equal(parseDialogueText(`S1：${'字'.repeat(2001)}`, characters), undefined)

@@ -1,7 +1,7 @@
 export type AssetType = 'character' | 'scene' | 'prop' | 'image' | 'video' | 'audio'
 export type Ref2VAReferenceCategory = 'character' | 'scene' | 'prop'
 export type H3Mode = 'T2VA' | 'I2VA' | 'FL2VA' | 'L2VA' | 'Ref2VA'
-export type ProjectStatus = 'draft' | 'writing' | 'producing' | 'completed'
+export type ProjectStatus = 'draft' | 'writing' | 'producing' | 'paused' | 'completed' | 'archived'
 export type WorkflowStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed'
 export type ProductionResolutionProfile = 'project' | '0.1' | '0.2' | '0.3' | '0.4' | '0.5' | '0.6' | '0.7' | '0.8' | '0.9' | '0.98' | '1.0' | '1.2' | '1.5' | '1.8' | '2.0'
 
@@ -299,6 +299,9 @@ export interface Shot {
   propIds: string[]
   referenceAssetIds: string[]
   referenceBindings?: H3ReferenceBindings
+  /** Continuity intent only; concrete frame assets remain in referenceBindings. */
+  requiresFirstFrameContinuity: boolean
+  requiresLastFrameContinuity: boolean
   metadata?: Record<string, unknown>
   audioEnabled: boolean
   audio: ShotAudio
@@ -324,6 +327,11 @@ export interface SeriesProject {
   title: string
   logline: string
   masterScript: string
+  isFavorite: boolean
+  /** Dedicated, owner-scoped reference Asset used as the series cover. */
+  coverAssetId?: string
+  /** Short-lived server-signed preview URL; refresh project data after it expires. */
+  coverUrl?: string
   continuitySummary?: string
   translationGlossary?: Record<string, string>
   styleId: string
@@ -335,6 +343,12 @@ export interface SeriesProject {
   defaultMode: H3Mode
   bible: ContinuityBible
   episodes: Episode[]
+  /** List endpoints provide aggregate counts without loading every episode and shot. */
+  episodeCount?: number
+  completedEpisodeCount?: number
+  totalDurationSeconds?: number
+  /** False only for list summaries whose Bible and episodes have not been hydrated. */
+  detailLoaded?: boolean
   createdAt: string
   updatedAt: string
 }
@@ -452,6 +466,8 @@ export interface PromptProviderCapability {
   enabled: boolean
   configured: boolean
   ready: boolean
+  /** Transient queue state; unlike `ready: false`, this does not disable submission. */
+  temporarilyBusy?: boolean
   model: string
   transport: 'local' | 'remote'
   dataEgressNotice?: string
@@ -459,6 +475,45 @@ export interface PromptProviderCapability {
   modelDownloaded?: boolean
   modelVerified?: boolean
   device?: string
+  cudaRequested?: boolean
+  gpuReady?: boolean
+  gpuLayers?: number
+  runtimeProbeErrorCode?: string
+  loadedOnDemand?: boolean
+  unloadedAfterRequest?: boolean
+  reviewRequired?: boolean
+  translationReviewReused?: boolean
+  minShots?: number
+  defaultShots?: number
+  recommendedMaxShots?: number
+  batchShots?: number
+  maxDialoguePerShot?: number
+  maxSourceChars?: number
+  recommendedTitleZhChars?: number
+  recommendedTitleEnChars?: number
+  recommendedNarrativeZhChars?: number
+  recommendedNarrativeEnChars?: number
+  recommendedCameraZhChars?: number
+  recommendedCameraEnChars?: number
+  recommendedActionZhChars?: number
+  recommendedActionEnChars?: number
+  recommendedContinuityZhChars?: number
+  recommendedContinuityEnChars?: number
+  recommendedSoundscapeZhChars?: number
+  recommendedSoundscapeEnChars?: number
+  recommendedMusicZhChars?: number
+  recommendedMusicEnChars?: number
+  maxCameraMovements?: number
+  maxActionSequenceMarkers?: number
+  minScriptActionCoveragePercent?: number
+  minShotDurationMs?: number
+  maxShotDurationMs?: number
+  baselineMaxNewTokens?: number
+  maxNewTokens?: number
+  configuredMaxNewTokens?: number
+  contextSize?: number
+  runtimeTimeoutSeconds?: number
+  processTimeoutSeconds?: number
 }
 
 export interface TranslationCapability {
@@ -557,13 +612,15 @@ export interface CreativeGenerationCapability {
   modelDownloaded: boolean
   modelVerified: boolean
   device: string
-  minShots: number
-  maxShots: number
-  maxSourceChars: number
-  baselineMaxNewTokens: number
-  maxNewTokens: number
-  configuredMaxNewTokens: number
-  contextSize: number
+  minShots?: number
+  batchShots?: number
+  maxSourceChars?: number
+  minShotDurationMs?: number
+  maxShotDurationMs?: number
+  baselineMaxNewTokens?: number
+  maxNewTokens?: number
+  configuredMaxNewTokens?: number
+  contextSize?: number
   loadedOnDemand: boolean
   unloadedAfterRequest: boolean
   reviewRequired: boolean
@@ -571,6 +628,19 @@ export interface CreativeGenerationCapability {
   notice?: string
   defaultProvider?: PromptProviderId
   providers?: PromptProviderCapability[]
+  shotHighDetailPolicies?: Partial<Record<PromptProviderId, ShotHighDetailPolicy>>
+  shotHighDetailSharedResourceBusy?: boolean
+}
+
+export interface ShotHighDetailPolicy {
+  provider?: PromptProviderId
+  recommendedZhChars?: number
+  recommendedEnChars?: number
+  transportZhMaxChars?: number
+  transportEnMaxChars?: number
+  recommendedMaxShots?: number
+  maxAttempts?: number
+  [key: string]: unknown
 }
 
 export interface CreativeDraftEpisodeCopy {
@@ -786,6 +856,70 @@ export interface ShotDetailDraftApplyResult {
   translationWritten: boolean
 }
 
+export type ShotDetailDraftBatchGenerationStatus =
+  | 'queued' | 'running' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled'
+export type ShotDetailDraftBatchApplyStatus = 'not_started' | 'complete'
+export type ShotDetailDraftBatchItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'stale' | 'skipped'
+
+export interface ShotDetailDraftBatch {
+  id: string
+  projectId: string
+  episodeId: string
+  requestId: string
+  provider: PromptProviderId
+  variationNote: string
+  generationStatus: ShotDetailDraftBatchGenerationStatus
+  applyStatus: ShotDetailDraftBatchApplyStatus
+  revision: number
+  totalCount: number
+  pendingCount: number
+  succeededCount: number
+  failedCount: number
+  staleCount: number
+  skippedCount: number
+  appliedCount: number
+  policySnapshot: Record<string, unknown>
+  createdAt?: string
+  updatedAt?: string
+  startedAt?: string
+  finishedAt?: string
+}
+
+export interface ShotDetailDraftBatchBeforeSnapshot {
+  targetShot: Record<string, unknown>
+}
+
+export interface ShotDetailDraftBatchItem {
+  id: string
+  batchId: string
+  shotId: string
+  ordinal: number
+  beforeSnapshot: ShotDetailDraftBatchBeforeSnapshot
+  draft?: ShotDetailDraft
+  status: ShotDetailDraftBatchItemStatus
+  attempts: number
+  maxAttempts: number
+  errorCode?: string
+  errorMessage?: string
+  createdAt?: string
+  updatedAt?: string
+}
+
+export interface ShotDetailDraftBatchDetail {
+  batch: ShotDetailDraftBatch
+  items: ShotDetailDraftBatchItem[]
+  appliedShots: ShotDetailDraftAppliedShot[]
+  translationWritten: boolean
+  pagination: { count: number; next?: string; previous?: string }
+}
+
+export interface ShotDetailDraftBatchApplyResult {
+  batch: ShotDetailDraftBatch
+  items: ShotDetailDraftBatchItem[]
+  appliedShots: ShotDetailDraftAppliedShot[]
+  translationWritten: boolean
+}
+
 export interface WorkflowNode {
   id: string
   label: string
@@ -988,7 +1122,10 @@ export interface ScriptBreakdownOptions {
   defaultShotDuration: number
   multiShot: boolean
   includeAudio: boolean
+  defaultFirstFrameContinuity: boolean
+  defaultLastFrameContinuity: boolean
   replaceExisting: boolean
+  discardExistingProduction: boolean
 }
 
 export interface AssemblyResult {

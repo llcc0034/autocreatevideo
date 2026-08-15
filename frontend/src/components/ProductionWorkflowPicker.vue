@@ -2,6 +2,7 @@
 import { computed, watch } from 'vue'
 import { AlertTriangle, CheckCircle2, Gauge, Workflow } from 'lucide-vue-next'
 import type { H3Mode, ProductionWorkflowTemplate } from '@/types'
+import { normalizeWorkflowParameterValue } from '@/services/workflowParameters'
 
 const props = withDefaults(defineProps<{
   templates: ProductionWorkflowTemplate[]
@@ -30,12 +31,10 @@ watch(matchingTemplates, (templates) => {
 const normalizeParameter = (key: string) => {
   const definition = selectedTemplate.value?.userParameters[key]
   if (!definition) return
-  let value = Number(parameters.value[key])
-  if (!Number.isFinite(value)) value = definition.default
-  if (definition.type === 'integer') value = Math.round(value)
-  if (definition.min !== undefined) value = Math.max(definition.min, value)
-  if (definition.max !== undefined) value = Math.min(definition.max, value)
-  parameters.value = { ...parameters.value, [key]: value }
+  parameters.value = {
+    ...parameters.value,
+    [key]: normalizeWorkflowParameterValue(parameters.value[key], definition),
+  }
 }
 </script>
 

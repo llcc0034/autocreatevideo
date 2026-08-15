@@ -1,5 +1,7 @@
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
+from uuid import UUID
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
@@ -8,12 +10,15 @@ from rest_framework.test import APIClient
 
 from studio.models import (
     Asset,
+    Episode,
     GeneratedWorkflow,
     GenerationTask,
     PromptArtifact,
     Shot,
+    WorkflowTemplate,
 )
 from studio.tests.factories import build_story
+from studio.views import _episode_batch_fingerprint
 
 
 class WholeEpisodeGenerationTests(TestCase):
@@ -85,6 +90,7 @@ class WholeEpisodeGenerationTests(TestCase):
         self.assertEqual(response.data["counts"], {"prompts": 2, "workflows": 2, "tasks": 2})
         self.assertFalse(response.data["idempotent_replay"])
         self.assertEqual(response.data["batch_kind"], "episode")
+        self.assertEqual(response.data["batch_size"], 2)
         self.assertEqual(response.data["episode_number"], self.episode.number)
         self.assertEqual(response.data["episode_title"], self.episode.title)
 
@@ -305,16 +311,212 @@ class WholeEpisodeGenerationTests(TestCase):
         self.assertEqual(GeneratedWorkflow.objects.count(), 2)
 
         conflict = self.client.post(url, self.payload(priority=7), format="json")
-        self.assertEqual(conflict.status_code, 400, conflict.data)
+        self.assertEqual(conflict.status_code, 409, conflict.data)
+        self.assertEqual(
+            conflict.data["error"]["code"], "production_idempotency_conflict",
+        )
         self.assertIn("idempotency_key", str(conflict.data))
         self.assertEqual(GenerationTask.objects.count(), 2)
 
         self.shot1.continuity_notes = "新的连续性约束会改变提示词"
         self.shot1.save(update_fields=("continuity_notes", "updated_at"))
         stale_source = self.client.post(url, self.payload(), format="json")
-        self.assertEqual(stale_source.status_code, 400, stale_source.data)
+        self.assertEqual(stale_source.status_code, 409, stale_source.data)
+        self.assertEqual(
+            stale_source.data["error"]["code"], "production_idempotency_conflict",
+        )
         self.assertIn("idempotency_key", str(stale_source.data))
         self.assertEqual(GenerationTask.objects.count(), 2)
+
+    def test_incomplete_whole_episode_batch_is_idempotency_conflict(self):
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        payload = self.payload("incomplete-whole-episode")
+        created = self.client.post(url, payload, format="json")
+        self.assertEqual(created.status_code, 201, created.data)
+        GenerationTask.objects.filter(pk=created.data["task_ids"][-1]).delete()
+
+        replay = self.client.post(url, payload, format="json")
+
+        self.assertEqual(replay.status_code, 409, replay.data)
+        self.assertEqual(
+            replay.data["error"]["code"], "production_idempotency_conflict",
+        )
+        self.assertEqual(
+            replay.data["error"]["details"]["idempotency_key"],
+            payload["idempotency_key"],
+        )
+        self.assertEqual(GenerationTask.objects.count(), 1)
+
+    def test_idempotency_fingerprint_includes_workflow_selection_and_parameters(self):
+        for shot in (self.shot1, self.shot2):
+            shot.h3_mode = Shot.H3Mode.REF2VA
+            shot.reference_bindings = {}
+            shot.save(update_fields=("h3_mode", "reference_bindings", "updated_at"))
+            shot.reference_assets.clear()
+        variant = WorkflowTemplate.objects.get(
+            owner=None, slug="minimax-h3-r2v-t8-dual-clock-4step",
+        )
+        selection = {
+            "output_kind": Shot.MediaType.VIDEO,
+            "h3_mode": Shot.H3Mode.REF2VA,
+            "template_id": str(variant.id),
+            "parameters": {"STEPS": 4, "LORA_STRENGTH": 1.0},
+        }
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+
+        first = self.client.post(
+            url,
+            self.payload("workflow-selection-fingerprint", workflow_selections=[selection]),
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        replay = self.client.post(
+            url,
+            self.payload("workflow-selection-fingerprint", workflow_selections=[selection]),
+            format="json",
+        )
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertTrue(replay.data["idempotent_replay"])
+
+        changed = self.client.post(
+            url,
+            self.payload(
+                "workflow-selection-fingerprint",
+                workflow_selections=[{
+                    **selection,
+                    "parameters": {"STEPS": 5, "LORA_STRENGTH": 1.0},
+                }],
+            ),
+            format="json",
+        )
+        self.assertEqual(changed.status_code, 409, changed.data)
+        self.assertEqual(
+            changed.data["error"]["code"], "production_idempotency_conflict",
+        )
+        self.assertIn("idempotency_key", str(changed.data))
+        self.assertEqual(GenerationTask.objects.count(), 2)
+        self.assertEqual(PromptArtifact.objects.count(), 2)
+        self.assertEqual(GeneratedWorkflow.objects.count(), 2)
+
+    def test_whole_episode_fingerprint_canonicalizes_workflow_selection_order(self):
+        selections = [
+            {
+                "output_kind": Shot.MediaType.VIDEO,
+                "h3_mode": mode,
+                "template_id": str(WorkflowTemplate.objects.get(
+                    owner=None, slug=slug,
+                ).id),
+                "parameters": {},
+            }
+            for mode, slug in (
+                (Shot.H3Mode.T2VA, "minimax-h3-base-video"),
+                (Shot.H3Mode.FL2VA, "minimax-h3-first-last-video"),
+            )
+        ]
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        first = self.client.post(
+            url,
+            self.payload("canonical-workflow-order", workflow_selections=selections),
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+
+        replay = self.client.post(
+            url,
+            self.payload(
+                "canonical-workflow-order",
+                workflow_selections=list(reversed(selections)),
+            ),
+            format="json",
+        )
+
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertTrue(replay.data["idempotent_replay"])
+        self.assertEqual(replay.data["task_ids"], first.data["task_ids"])
+        self.assertEqual(GenerationTask.objects.count(), 2)
+
+    def test_whole_episode_fingerprint_canonicalizes_related_ids_and_consistency(self):
+        class RelatedValues:
+            def __init__(self, values):
+                self.values = values
+
+            def all(self):
+                return list(self.values)
+
+        first_id = UUID(int=1)
+        second_id = UUID(int=2)
+        related = [SimpleNamespace(id=second_id), SimpleNamespace(id=first_id)]
+        characters = RelatedValues(list(related))
+        props = RelatedValues(list(related))
+        references = RelatedValues(list(related))
+        shot = SimpleNamespace(
+            id=UUID(int=3),
+            number=1,
+            title="稳定指纹",
+            narrative="稳定指纹",
+            detailed_description="",
+            camera="固定镜头",
+            action="",
+            dialogue=[],
+            sound_effects="",
+            music="",
+            duration_ms=5000,
+            media_type=Shot.MediaType.VIDEO,
+            h3_mode=Shot.H3Mode.T2VA,
+            include_audio=True,
+            scene_id=None,
+            characters=characters,
+            props=props,
+            reference_assets=references,
+            reference_bindings={},
+            requires_first_frame_continuity=False,
+            requires_last_frame_continuity=False,
+            continuity_notes="",
+            metadata={},
+        )
+        data = {
+            "template_id": None,
+            "priority": 0,
+            "max_attempts": 3,
+            "resolution_profile": "project",
+            "resolution_multiple": 32,
+            "image_resolution_profile": "0.98",
+            "image_resolution_multiple": 32,
+            "workflow_overrides": {},
+            "workflow_selections": [],
+        }
+        first_consistency = {
+            "characters": [
+                {"id": str(second_id), "name": "同名角色"},
+                {"id": str(first_id), "name": "同名角色"},
+            ],
+            "locks": [
+                {"scope_id": str(second_id), "scope_type": "character"},
+                {"scope_id": str(first_id), "scope_type": "character"},
+            ],
+        }
+        first = _episode_batch_fingerprint(
+            project=self.project,
+            episode=self.episode,
+            shots=[shot],
+            data=data,
+            consistency_snapshot=first_consistency,
+        )
+        characters.values.reverse()
+        props.values.reverse()
+        references.values.reverse()
+        second = _episode_batch_fingerprint(
+            project=self.project,
+            episode=self.episode,
+            shots=[shot],
+            data=data,
+            consistency_snapshot={
+                "locks": list(reversed(first_consistency["locks"])),
+                "characters": list(reversed(first_consistency["characters"])),
+            },
+        )
+
+        self.assertEqual(first, second)
 
     def test_retry_preserves_episode_shot_batch_identity_without_breaking_replay(self):
         url = f"/api/v1/projects/{self.project.id}/build-production/"
@@ -368,17 +570,309 @@ class WholeEpisodeGenerationTests(TestCase):
         filtered_results = filtered.data.get("results", filtered.data)
         self.assertIn(str(legacy.id), [item["id"] for item in filtered_results])
 
-    @override_settings(TASK_MAX_PENDING=1, TASK_MAX_ACTIVE_PER_USER=1)
-    def test_capacity_preflight_is_all_or_none_for_episode_batch(self):
+    @override_settings(
+        TASK_RECOMMENDED_MAX_PENDING=37,
+        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=19,
+        TASK_MAX_CONCURRENT=3,
+        TASK_GENERATION_TIMEOUT_SECONDS=4321,
+        VIDEO_SHOT_MIN_DURATION_MS=6000,
+        VIDEO_SHOT_MAX_DURATION_MS=12000,
+        SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS=7000,
+        SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY=True,
+        SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY=False,
+        SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS=500,
+        SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS=240,
+    )
+    def test_production_capability_exposes_configured_guidance_not_business_caps(self):
+        response = self.client.get("/api/v1/capabilities/production/")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["recommended_max_pending"], 37)
+        self.assertEqual(response.data["recommended_max_active_per_user"], 19)
+        self.assertEqual(response.data["max_concurrent"], 3)
+        self.assertEqual(response.data["task_timeout_seconds"], 4321)
+        self.assertEqual(response.data["video_shot_min_duration_ms"], 6000)
+        self.assertEqual(response.data["video_shot_max_duration_ms"], 12000)
+        self.assertEqual(response.data["script_breakdown_default_shot_duration_ms"], 7000)
+        self.assertTrue(response.data["script_breakdown_default_first_frame_continuity"])
+        self.assertFalse(response.data["script_breakdown_default_last_frame_continuity"])
+        self.assertEqual(response.data["script_breakdown_auto_split_trigger_chars"], 500)
+        self.assertEqual(response.data["script_breakdown_auto_split_target_chars"], 240)
+        self.assertTrue(response.data["confirmation_required"])
+        self.assertFalse(response.data["business_volume_limited"])
+
+    @override_settings(
+        TASK_RECOMMENDED_MAX_PENDING=1,
+        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=1,
+    )
+    def test_confirmed_full_series_build_creates_one_traceable_task_per_shot(self):
+        second_episode = Episode.objects.create(
+            project=self.project,
+            number=2,
+            title="第二集",
+            synopsis="第二集测试",
+            script="第二集测试镜头",
+        )
+        second_shot = Shot.objects.create(
+            episode=second_episode,
+            number=1,
+            title="第二集镜头",
+            narrative="第二集动作",
+            camera="稳定推进",
+            duration_ms=5000,
+            h3_mode=Shot.H3Mode.T2VA,
+            scene=self.scene,
+        )
+
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            {
+                "multi_shot": False,
+                "enqueue": True,
+                "extended_generation_confirmed": True,
+                "idempotency_key": "confirmed-full-series",
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.data["counts"]["tasks"], 3)
+        self.assertEqual(response.data["batch_kind"], "series")
+        self.assertEqual(response.data["batch_size"], 3)
+        batch_id = response.data["batch_id"]
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual(
+            [task.capability_snapshot["batch_index"] for task in tasks],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            {task.capability_snapshot["batch_id"] for task in tasks},
+            {batch_id},
+        )
+        self.assertEqual(
+            tasks[-1].capability_snapshot["shot_id"],
+            str(second_shot.id),
+        )
+
+    def test_keyed_series_selection_replays_without_writes_and_conflicts_on_changes(self):
+        second_episode = Episode.objects.create(
+            project=self.project,
+            number=2,
+            title="第二集",
+            synopsis="第二集测试",
+            script="第二集测试镜头",
+        )
+        second_shot = Shot.objects.create(
+            episode=second_episode,
+            number=1,
+            title="第二集镜头",
+            narrative="第二集动作",
+            camera="稳定推进",
+            duration_ms=5000,
+            h3_mode=Shot.H3Mode.T2VA,
+            scene=self.scene,
+        )
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        payload = {
+            "episode_ids": [str(self.episode.id), str(second_episode.id)],
+            "whole_episode": False,
+            "multi_shot": False,
+            "enqueue": True,
+            "idempotency_key": "keyed-series-selection",
+        }
+
+        first = self.client.post(url, payload, format="json")
+
+        self.assertEqual(first.status_code, 201, first.data)
+        self.assertFalse(first.data["whole_episode"])
+        self.assertFalse(first.data["idempotent_replay"])
+        self.assertEqual(first.data["batch_kind"], "series")
+        self.assertEqual(first.data["batch_size"], 3)
+        self.assertEqual(len(first.data["tasks"]), 3)
+        first_ids = first.data["task_ids"]
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        self.assertEqual(len(tasks), 3)
+        self.assertEqual(
+            {task.capability_snapshot["idempotency_key"] for task in tasks},
+            {payload["idempotency_key"]},
+        )
+        fingerprints = {
+            task.capability_snapshot["request_fingerprint"] for task in tasks
+        }
+        self.assertEqual(len(fingerprints), 1)
+        self.assertTrue(next(iter(fingerprints)))
+        counts = (
+            PromptArtifact.objects.count(),
+            GeneratedWorkflow.objects.count(),
+            GenerationTask.objects.count(),
+        )
+
+        replay = self.client.post(url, payload, format="json")
+
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertTrue(replay.data["idempotent_replay"])
+        self.assertEqual(replay.data["task_ids"], first_ids)
+        self.assertEqual(
+            (
+                PromptArtifact.objects.count(),
+                GeneratedWorkflow.objects.count(),
+                GenerationTask.objects.count(),
+            ),
+            counts,
+        )
+
+        for changed in (
+            {
+                **payload,
+                "shot_ids": [str(self.shot1.id), str(second_shot.id)],
+            },
+            {
+                **payload,
+                "workflow_overrides": {"SEED": 314159},
+            },
+        ):
+            with self.subTest(changed=changed):
+                conflict = self.client.post(url, changed, format="json")
+                self.assertEqual(conflict.status_code, 409, conflict.data)
+                self.assertEqual(
+                    conflict.data["error"]["code"],
+                    "production_idempotency_conflict",
+                )
+                self.assertEqual(
+                    conflict.data["error"]["details"]["idempotency_key"],
+                    payload["idempotency_key"],
+                )
+                self.assertEqual(
+                    (
+                        PromptArtifact.objects.count(),
+                        GeneratedWorkflow.objects.count(),
+                        GenerationTask.objects.count(),
+                    ),
+                    counts,
+                )
+
+    @override_settings(
+        TASK_RECOMMENDED_MAX_PENDING=1,
+        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=1,
+    )
+    def test_confirmed_one_hundred_episode_series_keeps_every_shot_task(self):
+        episodes = [
+            Episode(
+                project=self.project,
+                number=number,
+                title=f"第 {number} 集",
+                synopsis=f"第 {number} 集概要",
+                script=f"第 {number} 集单镜剧情。",
+            )
+            for number in range(2, 101)
+        ]
+        Episode.objects.bulk_create(episodes)
+        Shot.objects.bulk_create(
+            [
+                Shot(
+                    episode=self.episode,
+                    number=shot_number,
+                    title=f"第 1 集镜头 {shot_number}",
+                    narrative=f"第 1 集第 {shot_number} 镜动作。",
+                    camera="稳定推进",
+                    duration_ms=5000,
+                    h3_mode=Shot.H3Mode.T2VA,
+                    scene=self.scene,
+                )
+                for shot_number in range(3, 12)
+            ]
+            + [
+                Shot(
+                    episode=episode,
+                    number=shot_number,
+                    title=f"第 {episode.number} 集镜头 {shot_number}",
+                    narrative=f"第 {episode.number} 集第 {shot_number} 镜动作。",
+                    camera="稳定推进",
+                    duration_ms=5000,
+                    h3_mode=Shot.H3Mode.T2VA,
+                    scene=self.scene,
+                )
+                for episode in episodes
+                for shot_number in range(1, 12)
+            ]
+        )
+
+        payload = {
+            "multi_shot": False,
+            "enqueue": True,
+            "idempotency_key": "one-hundred-episode-series",
+        }
+        unconfirmed = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(unconfirmed.status_code, 409, unconfirmed.data)
+        self.assertEqual(
+            unconfirmed.data["error"]["code"],
+            "production_queue_confirmation_required",
+        )
+        self.assertEqual(
+            unconfirmed.data["error"]["details"]["requested_task_count"],
+            1100,
+        )
+        self.assertEqual(GenerationTask.objects.count(), 0)
+
+        confirmed = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            {**payload, "extended_generation_confirmed": True},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 201, confirmed.data)
+        self.assertEqual(confirmed.data["counts"]["tasks"], 1100)
+        self.assertEqual(confirmed.data["batch_kind"], "series")
+        self.assertEqual(confirmed.data["batch_size"], 1100)
+        self.assertEqual(len(confirmed.data["task_ids"]), 1100)
+        self.assertEqual(len(confirmed.data["production_units"]), 1100)
+        self.assertEqual(GenerationTask.objects.count(), 1100)
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        self.assertEqual(
+            [task.capability_snapshot["batch_index"] for task in tasks],
+            list(range(1, 1101)),
+        )
+        self.assertEqual(
+            {task.capability_snapshot["batch_size"] for task in tasks},
+            {1100},
+        )
+
+    @override_settings(
+        TASK_RECOMMENDED_MAX_PENDING=1,
+        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=1,
+    )
+    def test_queue_guidance_requires_confirmation_then_keeps_complete_episode_batch(self):
         response = self.client.post(
             f"/api/v1/projects/{self.project.id}/build-production/",
             self.payload("capacity-key"),
             format="json",
         )
-        self.assertEqual(response.status_code, 400, response.data)
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(
+            response.data["error"]["code"],
+            "production_queue_confirmation_required",
+        )
         self.assertEqual(GenerationTask.objects.count(), 0)
         self.assertEqual(GeneratedWorkflow.objects.count(), 0)
         self.assertEqual(PromptArtifact.objects.count(), 0)
+
+        confirmed = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload(
+                "capacity-key",
+                extended_generation_confirmed=True,
+            ),
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 201, confirmed.data)
+        self.assertEqual(GenerationTask.objects.count(), 2)
+        self.assertEqual(confirmed.data["counts"]["tasks"], 2)
+        self.assertEqual(confirmed.data["batch_kind"], "episode")
+        self.assertEqual(confirmed.data["batch_size"], 2)
+        self.assertEqual(confirmed.data["extended_generation_confirmed"], True)
 
     def test_creation_error_rolls_back_all_preceding_children(self):
         # Bypass API validation to simulate an invalid legacy row appearing
@@ -409,6 +903,29 @@ class WholeEpisodeGenerationTests(TestCase):
         ), format="json")
         self.assertEqual(selected_shot.status_code, 400, selected_shot.data)
         self.assertIn("shot_ids", str(selected_shot.data))
+
+    def test_nonwhole_multi_task_enqueue_requires_key_but_single_task_remains_compatible(self):
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        multi = self.client.post(url, {
+            "episode_ids": [str(self.episode.id)],
+            "whole_episode": False,
+            "multi_shot": False,
+            "enqueue": True,
+        }, format="json")
+        self.assertEqual(multi.status_code, 400, multi.data)
+        self.assertIn("idempotency_key", str(multi.data))
+        self.assertEqual(GenerationTask.objects.count(), 0)
+
+        single = self.client.post(url, {
+            "episode_ids": [str(self.episode.id)],
+            "shot_ids": [str(self.shot1.id)],
+            "whole_episode": False,
+            "multi_shot": False,
+            "enqueue": True,
+        }, format="json")
+        self.assertEqual(single.status_code, 201, single.data)
+        self.assertEqual(single.data["batch_size"], 1)
+        self.assertEqual(single.data["counts"]["tasks"], 1)
 
     def test_workflow_generate_rejects_non_object_overrides_without_server_error(self):
         created = self.client.post(

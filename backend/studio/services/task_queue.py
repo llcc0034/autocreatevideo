@@ -57,12 +57,29 @@ def claim_next_task() -> GenerationTask | None:
             return None
         if GenerationTask.objects.filter(status=GenerationTask.Status.RUNNING).count() >= settings.TASK_MAX_CONCURRENT:
             return None
+        # A queued task with a non-terminal token is a reattachment to an
+        # already submitted remote prompt, not a fresh generation attempt. It
+        # must be claimed ahead of every unsubmitted task regardless of normal
+        # priority or max_attempts; otherwise another /prompt could be posted
+        # while the recovered GPU job is still running.
         candidate = (
             GenerationTask.objects.select_for_update()
-            .filter(status=GenerationTask.Status.QUEUED, attempts__lt=models_f_max_attempts())
-            .order_by("-priority", "queued_at")
+            .filter(status=GenerationTask.Status.QUEUED)
+            .exclude(submission_token="")
+            .exclude(submission_state__in=(
+                GenerationTask.SubmissionState.TERMINAL_FAILED,
+                GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+            ))
+            .order_by("queued_at")
             .first()
         )
+        if candidate is None:
+            candidate = (
+                GenerationTask.objects.select_for_update()
+                .filter(status=GenerationTask.Status.QUEUED, attempts__lt=models_f_max_attempts())
+                .order_by("-priority", "queued_at")
+                .first()
+            )
         if not candidate:
             return None
         changed = GenerationTask.objects.filter(
@@ -252,6 +269,7 @@ def _wait_for_task_completion(
     next_heartbeat = 0.0
     next_health_check = 0.0
     consecutive_health_failures = 0
+    transient_poll_error = ""
     missing_since: float | None = None
     cancel_since: float | None = None
     cancel_sent = False
@@ -399,15 +417,36 @@ def _wait_for_task_completion(
                     },
                 )
 
-        history = history_method(prompt_id)
+        poll_error = ""
+        try:
+            history = history_method(prompt_id)
+        except ComfyUIError as exc:
+            history = None
+            poll_error = str(exc)
         if history is not None:
             heartbeat(GenerationTask.RemoteState.SUCCEEDED, error="", force=True)
             return history
 
-        is_queued = bool(queued_method(prompt_id))
-        if is_queued:
+        try:
+            is_queued = bool(queued_method(prompt_id))
+        except ComfyUIError as exc:
+            is_queued = None
+            queue_error = str(exc)
+            poll_error = f"{poll_error}; {queue_error}" if poll_error else queue_error
+
+        if poll_error:
+            transient_poll_error = poll_error
+            if is_queued:
+                missing_since = None
+            heartbeat(
+                GenerationTask.RemoteState.DEGRADED,
+                error=transient_poll_error,
+                force=True,
+            )
+        elif is_queued:
             missing_since = None
             heartbeat(GenerationTask.RemoteState.RUNNING, error="")
+            transient_poll_error = ""
         else:
             missing_since = missing_since or current
             heartbeat(GenerationTask.RemoteState.MISSING, error="Remote prompt is absent from queue and history")
@@ -810,8 +849,18 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
         prompt_id = task.submission_token or task.comfy_prompt_id
         had_persisted_submission = bool(prompt_id)
         if prompt_id:
-            history = client.history(prompt_id)
-            if history is None and client.is_queued(prompt_id):
+            lookup_error = ""
+            is_queued = False
+            try:
+                history = client.history(prompt_id)
+            except ComfyUIError as exc:
+                lookup_error = str(exc)
+            if history is None and not lookup_error:
+                try:
+                    is_queued = client.is_queued(prompt_id)
+                except ComfyUIError as exc:
+                    lookup_error = str(exc)
+            if history is None and (is_queued or lookup_error):
                 task.submission_state = GenerationTask.SubmissionState.RECOVERED
                 task.submission_submitted_at = task.submission_submitted_at or timezone.now()
                 task.progress = max(task.progress, 10)
@@ -822,7 +871,14 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
                     "submission_state", "submission_submitted_at", "progress",
                     "progress_source", "progress_updated_at", "updated_at",
                 ))
-                _record_runtime_state(task, GenerationTask.RemoteState.RECOVERED, remote_error="")
+                _record_runtime_state(
+                    task,
+                    (
+                        GenerationTask.RemoteState.RECOVERED
+                        if is_queued else GenerationTask.RemoteState.DEGRADED
+                    ),
+                    remote_error=lookup_error,
+                )
                 progress_socket = _open_task_progress_socket(task, client)
                 try:
                     history = _wait_for_task_completion(
@@ -1079,11 +1135,25 @@ def recover_stale_tasks(
         seconds=max(0.0, float(getattr(settings, "TASK_CANCEL_GRACE_SECONDS", 30))),
     )
     client = client or ComfyUIClient()
+    reconcilable_submission_states = (
+        GenerationTask.SubmissionState.PREPARED,
+        GenerationTask.SubmissionState.SUBMITTED,
+        GenerationTask.SubmissionState.RECOVERED,
+    )
     running_candidates = list(
         GenerationTask.objects.filter(status=GenerationTask.Status.RUNNING).filter(
             Q(heartbeat_at__lt=threshold)
             | Q(heartbeat_at__isnull=True, updated_at__lt=threshold)
         ).order_by("started_at")
+    )
+    # A submitted prompt may outlive a worker-side polling failure.  Reconcile
+    # these circuit-breaker records on every recovery pass so the same remote
+    # prompt can be reattached without creating a retry or a second POST.
+    unresolved_failed_candidates = list(
+        GenerationTask.objects.filter(
+            status=GenerationTask.Status.FAILED,
+            submission_state__in=reconcilable_submission_states,
+        ).exclude(submission_token="").order_by("finished_at")
     )
     # Cancellation has its own short reconciliation clock.  It must not wait
     # for the much longer abandoned-worker threshold, otherwise the global
@@ -1094,7 +1164,7 @@ def recover_stale_tasks(
             updated_at__lte=cancel_threshold,
         ).order_by("updated_at")
     )
-    candidates = running_candidates + cancel_candidates
+    candidates = running_candidates + cancel_candidates + unresolved_failed_candidates
     recovered = 0
     for task in candidates:
         now = timezone.now()
@@ -1166,12 +1236,18 @@ def recover_stale_tasks(
             history = client.history(prompt_id)
             remote_present = history is not None or client.is_queued(prompt_id)
         except ComfyUIError as exc:
-            GenerationTask.objects.filter(
-                pk=task.pk, status=GenerationTask.Status.RUNNING,
+            changed = GenerationTask.objects.filter(
+                pk=task.pk,
+            ).filter(
+                Q(status=GenerationTask.Status.RUNNING)
+                | Q(
+                    status=GenerationTask.Status.FAILED,
+                    submission_state__in=reconcilable_submission_states,
+                )
             ).update(
                 status=GenerationTask.Status.FAILED,
                 progress=0,
-                finished_at=now,
+                finished_at=task.finished_at or now,
                 heartbeat_at=now,
                 stalled_at=task.stalled_at or now,
                 remote_state=GenerationTask.RemoteState.DEGRADED,
@@ -1182,21 +1258,54 @@ def recover_stale_tasks(
                 ),
                 updated_at=now,
             )
-            recovered += 1
+            recovered += changed
             continue
 
         if remote_present:
             changed = GenerationTask.objects.filter(
-                pk=task.pk, status=GenerationTask.Status.RUNNING,
+                pk=task.pk,
+            ).filter(
+                Q(status=GenerationTask.Status.RUNNING)
+                | Q(
+                    status=GenerationTask.Status.FAILED,
+                    submission_state__in=reconcilable_submission_states,
+                )
             ).update(
                 status=GenerationTask.Status.QUEUED,
                 progress=max(task.progress, 10),
+                # claim_next_task increments attempts. Rewinding the abandoned
+                # local claim keeps a same-token reattachment attempt-neutral.
                 attempts=max(0, task.attempts - 1),
                 finished_at=None,
                 heartbeat_at=now,
                 remote_state=GenerationTask.RemoteState.RECOVERED,
                 remote_error="",
                 error_message="Recovered stale worker and reattached to persisted ComfyUI prompt",
+                updated_at=now,
+            )
+            recovered += changed
+        elif task.status == GenerationTask.Status.FAILED:
+            # A healthy ComfyUI response that reports the token in neither
+            # queue nor history resolves the uncertainty.  Terminalizing the
+            # missing token clears the global circuit breaker without ever
+            # posting the same task again; a user may then create an explicit
+            # retry using the already materialized workflow.
+            changed = GenerationTask.objects.filter(
+                pk=task.pk,
+                status=GenerationTask.Status.FAILED,
+                submission_state__in=reconcilable_submission_states,
+            ).update(
+                progress=0,
+                finished_at=task.finished_at or now,
+                heartbeat_at=now,
+                stalled_at=task.stalled_at or now,
+                submission_state=GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+                remote_state=GenerationTask.RemoteState.MISSING,
+                remote_error="Persisted prompt is absent from ComfyUI queue and history",
+                error_message=(
+                    "Persisted ComfyUI submission is absent after successful recovery "
+                    "reconciliation; the task can be retried safely"
+                ),
                 updated_at=now,
             )
             recovered += changed

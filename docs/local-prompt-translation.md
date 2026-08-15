@@ -38,7 +38,26 @@ DEEPSEEK_API_KEY=replace-with-a-new-rotated-secret
 DEEPSEEK_MODEL=deepseek-v4-flash
 DEEPSEEK_TIMEOUT_SECONDS=180
 DEEPSEEK_MAX_RETRIES=1
-DEEPSEEK_MAX_TOKENS=4096
+DEEPSEEK_MAX_TOKENS=16384
+DEEPSEEK_CREATIVE_MIN_SHOTS=1
+DEEPSEEK_CREATIVE_RECOMMENDED_MAX_SHOTS=4
+DEEPSEEK_CREATIVE_BATCH_SHOTS=1
+DEEPSEEK_CREATIVE_MAX_DIALOGUE_PER_SHOT=2
+DEEPSEEK_CREATIVE_MAX_EPISODE_TITLE_CHARS=80
+DEEPSEEK_CREATIVE_MAX_DIALOGUE_TEXT_CHARS=240
+DEEPSEEK_CREATIVE_MAX_DIALOGUE_DELIVERY_CHARS=100
+DEEPSEEK_CREATIVE_MAX_DIALOGUE_DELIVERY_EN_CHARS=150
+DEEPSEEK_CREATIVE_MIN_SHOT_DURATION_MS=5000
+DEEPSEEK_CREATIVE_MAX_SHOT_DURATION_MS=15000
+DEEPSEEK_CREATIVE_OUTPUT_MIN_TOKENS=1024
+DEEPSEEK_CREATIVE_OUTPUT_BASE_TOKENS=768
+DEEPSEEK_CREATIVE_OUTPUT_TOKENS_PER_SHOT=384
+DEEPSEEK_CREATIVE_OUTPUT_TOKENS_PER_DIALOGUE=128
+DEEPSEEK_CREATIVE_OUTPUT_DIALOGUE_CHAR_THRESHOLD=32
+DEEPSEEK_CREATIVE_MAX_SOURCE_CHARS=24000
+DEEPSEEK_CREATIVE_MAX_REGENERATION_CONTEXT_CHARS=96000
+DEEPSEEK_CREATIVE_MAX_INPUT_CHARS=120000
+DEEPSEEK_CREATIVE_OUTPUT_HEADROOM_PER_SHOT=384
 
 # 默认仍保持本地；界面可对每次操作单独选择 DeepSeek。
 PROMPT_TRANSLATION_DEFAULT_PROVIDER=local_qwen
@@ -79,7 +98,7 @@ worker 必须先取得同一把锁才会领取队列任务，并持有到 ComfyU
 检查后再并发占用内存”的窗口。视频任务排队时，Qwen 的数据库前置门禁仍会提前返回 409。
 
 CPU、字段长度、批量大小和上下文都会影响延迟与峰值内存。目标环境应在允许真实项目使用前
-分别基准测试单字段、批量、1–4 镜创作和逐镜扩写，并据此设置容量与超时告警。
+分别基准测试单字段、批量、推荐镜数内创作、超过推荐镜数的确认任务和逐镜扩写，并据此设置容量与超时告警。
 
 ## 审核状态和生产规则
 
@@ -152,7 +171,7 @@ H3 英文门禁会重新阻止生产，直到新源文对应的译文被确认�
 结构化中英双语分镜草稿。它不会直接生成 H3 最终提示词、工作流或参考素材绑定，也不会在生成时
 改写正式 `Episode`/`Shot`：
 
-1. 在现有剧集中选择 1–4 个目标镜头，选择保守/均衡/大胆创意强度，并可填写变化要求；
+1. 在现有剧集中填写业务目标镜数，选择保守/均衡/大胆创意强度，并可填写变化要求；超过 provider 推荐镜数时阅读耗时/API 用量提示并确认是否继续；
 2. 模型输出中英文画面、动作、运镜、连续性、声景、配乐和对白表演说明；对白正文只允许来自剧本的
    精确中文子串；
 3. 服务端再次严格校验 JSON schema、项目 Bible ID、时长、单一运镜、动作节拍、数字、左右、否定、
@@ -163,12 +182,15 @@ H3 英文门禁会重新阻止生产，直到新源文对应的译文被确认�
 7. 可整稿重新生成，也可按 `client_key` 只重新生成一个镜头；未选择镜头保持不变，每次生成形成独立不可变版本；
 8. 项目、剧集、Bible、术语表或正式镜头变化后，不匹配的草稿 context hash 立即失效，不能确认或应用。
 
-本地 4B CPU 模型的安全上限为一次 1–4 镜、源上下文 16000 字符、至少 8192 context；
-output tokens 按镜头数与必须保留的原文对白动态计算，单次上限 3072。每镜最多承载 2 句原文对白，
-超出容量时会在加载模型前要求拆分片段。
-超过上限会明确要求缩短本集剧本或分段创作，不会静默截断。创作进程仍只使用 CPU、按需加载并在
+创作镜数分为“推荐阈值”和“单次调用镜数”。默认本地 4B CPU 为推荐 4 镜、每次调用 4 镜，DeepSeek 为推荐 4 镜、每次调用 1 镜；推荐阈值只控制用户确认，`QWEN_CREATIVE_BATCH_SHOTS` / `DEEPSEEK_CREATIVE_BATCH_SHOTS` 用于初次整稿与整稿重生成的内部模型调用规划，二者相互独立且都只需不低于最小镜数。它们都不是单集或整剧总镜数上限。确认后的 11 镜请求仍保留 11 镜，不会被压缩为 4 镜。初次整稿与不带 `shot_keys` 的整稿重生成先保留显式“镜头 N”或空行段落边界，再按配置逐次调用；DeepSeek 默认每个镜头独立请求，并只携带该镜权威对白 manifest，后一镜只接收前一镜末尾的已校验连续性事实。每次返回先在本次调用范围内确定性对齐对白，再合并全稿；少返回镜头、镜号异常或后续调用失败时保留已获得的可解析镜头供人工确认。带 `shot_keys` 的选镜重生成仍走携带完整旧草稿的单次协议。
+
+output tokens 按镜头数、必须保留的原文对白和 provider 余量动态计算。默认本地 Qwen 输出上限 3072，DeepSeek 传输上限 16384；每镜对白默认 2 句是可配置的审核建议。实际所需密度更高时先由用户确认，再按本次有效密度继续并标记审核，不会删除原文对白。初次整稿和整稿重生成会缩小内部批次以满足真实预算；只有调用模型前无法形成批次或完全没有可物化返回时才明确失败。选镜重生成预算不足会在调用模型前返回所需量和配置量，不会把 DeepSeek 请求静默截到较小 token 值；应调整 provider 配置或选用具备足够能力的通道，而不是降低业务总镜数。11 镜加 13 条常规短对白在默认 DeepSeek 配置范围内，但仍应以当前剧本预检结果为准。
+
+源剧本、重生成草稿和总体输入分别使用 provider 的显式字符预算。权威剧本超过单批 `*_MAX_SOURCE_CHARS` 参考值时先要求用户确认，确认后的初次整稿与整稿重生成再按连续源片段自动分批，并逐批校验真实输入；不会截断权威剧本。仅选镜重生成按完整 `previous_draft` 上下文校验，超出其单次协议预算时会明确要求调整配置或选用具备足够能力的通道。字符预算不构成单集/整剧镜数上限。本地 Qwen 创作进程仍默认只使用 CPU、按需加载并在
 请求完成后退出。若草稿要求 I2VA/FL2VA/L2VA 却没有正式首尾帧绑定，应用时会安全降级为 T2VA；
 Ref2VA 只有在能从所选 Bible 找到无冲突的分类锚点素材时才会自动绑定，否则同样降级为 T2VA。
+
+本地 Qwen 上下文边界由 `QWEN_CREATIVE_MIN_CONTEXT_SIZE`、`QWEN_CREATIVE_CONTEXT_SIZE`、`QWEN_CREATIVE_MAX_CONTEXT_SIZE` 与 `QWEN_CREATIVE_RESERVED_INPUT_TOKENS` 共同约束；子进程结束后的父进程清理余量由 `QWEN_CREATIVE_PROCESS_CLEANUP_GRACE_SECONDS` 控制。默认分别为 8192、8192、32768、2048 与 60 秒，均可通过环境配置调整，运行时和页面不保留第二套固定常量。
 
 ## 逐镜高细节扩写
 

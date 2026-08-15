@@ -1,12 +1,13 @@
-"""Review-gated local-Qwen structured storyboard drafts.
+"""Review-gated structured storyboard drafts for local and remote providers.
 
-The local model is a proposal engine, never an author of record.  Its output is
-validated as a small storyboard IR, persisted outside formal Episode/Shot rows,
-and can enter production only after a current-context confirmation plus an
-explicit apply request.
+The selected model is a proposal engine, never an author of record. Its output
+is validated as a small storyboard IR, persisted outside formal Episode/Shot
+rows, and can enter production only after a current-context confirmation plus
+an explicit apply request.
 """
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -91,6 +92,17 @@ CREATIVE_OPERATION = "creative_storyboard"
 LOCAL_QWEN_PROVIDER = "local_qwen"
 DEEPSEEK_API_PROVIDER = "deepseek_api"
 CREATIVE_PROVIDERS = {LOCAL_QWEN_PROVIDER, DEEPSEEK_API_PROVIDER}
+CREATIVE_REVIEW_FIELD_NAMES = (
+    "title_zh", "title_en", "narrative_zh", "narrative_en",
+    "camera_zh", "camera_en", "action_zh", "action_en",
+    "continuity_zh", "continuity_en", "soundscape_zh", "soundscape_en",
+    "music_zh", "music_en",
+)
+CREATIVE_REVIEW_POLICY_KEYS = (
+    *(f"recommended_{field_name}_chars" for field_name in CREATIVE_REVIEW_FIELD_NAMES),
+    "max_camera_movements", "max_action_sequence_markers",
+    "min_script_action_coverage_percent",
+)
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 _ASCII_NUMBER_RE = re.compile(r"(?<![A-Za-z])\d+(?:\.\d+)?")
 _NEGATIVE_ZH_RE = re.compile(r"(?:不|没有|无|勿|禁止|未)")
@@ -132,6 +144,7 @@ class CreativeDraftError(RuntimeError):
         *,
         code: str = "creative_runtime_failed",
         runtime_metadata: dict[str, Any] | None = None,
+        structured_candidate: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.code = code
@@ -139,6 +152,8 @@ class CreativeDraftError(RuntimeError):
         self.attempt_context_snapshot: dict[str, Any] | None = None
         self.attempt_context_hash = ""
         self.source_drift_during_attempt = False
+        self.provider_policy_snapshot: dict[str, int | float] = {}
+        self.structured_candidate = dict(structured_candidate or {})
 
 
 class CreativeRuntimeUnavailable(CreativeDraftError):
@@ -158,30 +173,59 @@ class CreativeRevisionConflict(CreativeDraftError):
 
 
 class CreativeValidationError(CreativeDraftError):
+    _PUBLIC_CONTEXT_KEYS = {
+        "required_dialogue_count",
+        "target_shot_count",
+        "dialogue_capacity",
+        "recommended_max_shots",
+        "batch_shots",
+        "source_char_count",
+        "max_source_chars",
+        "max_dialogue_per_shot",
+        "effective_max_dialogue_per_shot",
+        "required_output_tokens",
+        "configured_max_output_tokens",
+    }
+
     def __init__(
         self, message: str, *, errors: list[str] | None = None,
         code: str = "creative_validation_failed",
+        public_context: dict[str, int] | None = None,
     ):
         super().__init__(message, code=code)
         self.errors = errors or [message]
+        self.public_context = {
+            key: int(value)
+            for key, value in (public_context or {}).items()
+            if key in self._PUBLIC_CONTEXT_KEYS
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= 0
+        }
 
 
 def creative_required_output_token_budget(
     shot_count: int,
     dialogue_manifest: list[dict[str, Any]] | None = None,
+    *,
+    policy: dict[str, Any],
 ) -> int:
-    """Return the exact CPU output budget for shots plus authored dialogue."""
-    count = max(1, min(4, int(shot_count)))
+    """Return the provider-policy output budget for shots plus authored dialogue."""
+    count = max(1, int(shot_count))
     dialogue_cost = sum(
-        128 + max(
+        int(policy["output_tokens_per_dialogue"]) + max(
             0,
             len(str(item.get("text_zh") or ""))
             + len(str(item.get("source_delivery_zh") or ""))
-            - 32,
+            - int(policy["output_dialogue_char_threshold"]),
         )
         for item in (dialogue_manifest or [])
     )
-    return max(1_024, 768 + (384 * count)) + dialogue_cost
+    return max(
+        int(policy["output_min_tokens"]),
+        int(policy["output_base_tokens"])
+        + (int(policy["output_tokens_per_shot"]) * count),
+    ) + dialogue_cost
 
 
 def required_dialogue_manifest(
@@ -224,6 +268,17 @@ def required_dialogue_manifest(
     return manifest
 
 
+def _creative_review_policy(configured: dict[str, Any] | None = None) -> dict[str, int]:
+    """Resolve non-blocking review guidance without inventing local defaults."""
+
+    overrides = configured or {}
+    defaults = getattr(settings, "CREATIVE_DRAFT_REVIEW", {}) or {}
+    return {
+        key: int(overrides.get(key, defaults[key]))
+        for key in CREATIVE_REVIEW_POLICY_KEYS
+    }
+
+
 def creative_config() -> dict[str, Any]:
     configured = getattr(settings, "LOCAL_QWEN_CREATIVE", {}) or {}
 
@@ -232,6 +287,7 @@ def creative_config() -> dict[str, Any]:
         return value if value.is_absolute() else (Path(settings.BASE_DIR) / value).resolve()
 
     return {
+        **_creative_review_policy(configured),
         "enabled": bool(configured.get("enabled", True)),
         "model_id": str(configured.get("model_id") or "Qwen/Qwen3-4B-GGUF"),
         "model_dir": resolve_path(configured.get("model_dir")),
@@ -240,12 +296,133 @@ def creative_config() -> dict[str, Any]:
         "device": str(configured.get("device") or "cpu").casefold(),
         "gpu_layers": int(configured.get("gpu_layers", -1)),
         "timeout_seconds": float(configured.get("timeout_seconds", 900)),
+        "process_cleanup_grace_seconds": float(
+            configured.get("process_cleanup_grace_seconds", 60)
+        ),
         "max_new_tokens": int(configured.get("max_new_tokens", 3072)),
         "context_size": int(configured.get("context_size", 8192)),
+        "min_context_size": int(configured.get("min_context_size", 8192)),
+        "max_context_size": int(configured.get("max_context_size", 32768)),
+        "reserved_input_tokens": int(configured.get("reserved_input_tokens", 2048)),
         "min_shots": int(configured.get("min_shots", 1)),
-        "max_shots": int(configured.get("max_shots", 4)),
+        "recommended_max_shots": int(configured.get("recommended_max_shots", 4)),
+        "batch_shots": int(configured.get("batch_shots", 4)),
+        "max_dialogue_per_shot": int(configured.get("max_dialogue_per_shot", 2)),
+        "max_episode_title_chars": int(configured.get("max_episode_title_chars", 80)),
+        "max_dialogue_text_chars": int(configured.get("max_dialogue_text_chars", 240)),
+        "max_dialogue_delivery_chars": int(
+            configured.get("max_dialogue_delivery_chars", 100)
+        ),
+        "max_dialogue_delivery_en_chars": int(
+            configured.get("max_dialogue_delivery_en_chars", 150)
+        ),
+        "min_shot_duration_ms": int(configured.get(
+            "min_shot_duration_ms", settings.VIDEO_SHOT_MIN_DURATION_MS,
+        )),
+        "max_shot_duration_ms": int(configured.get(
+            "max_shot_duration_ms", settings.VIDEO_SHOT_MAX_DURATION_MS,
+        )),
+        "output_min_tokens": int(configured.get("output_min_tokens", 1024)),
+        "output_base_tokens": int(configured.get("output_base_tokens", 768)),
+        "output_tokens_per_shot": int(configured.get("output_tokens_per_shot", 384)),
+        "output_tokens_per_dialogue": int(
+            configured.get("output_tokens_per_dialogue", 128)
+        ),
+        "output_dialogue_char_threshold": int(
+            configured.get("output_dialogue_char_threshold", 32)
+        ),
         "max_source_chars": int(configured.get("max_source_chars", 16000)),
+        "max_regeneration_context_chars": int(
+            configured.get("max_regeneration_context_chars", 16000)
+        ),
+        "max_input_chars": int(configured.get("max_input_chars", 24000)),
+        "output_headroom_per_shot": int(configured.get("output_headroom_per_shot", 0)),
+        "max_output_tokens": int(configured.get("max_new_tokens", 3072)),
     }
+
+
+def creative_provider_config(provider: str) -> dict[str, Any]:
+    """Return the selected provider's authoritative creative policy."""
+    if provider == LOCAL_QWEN_PROVIDER:
+        return creative_config()
+    if provider != DEEPSEEK_API_PROVIDER:
+        raise CreativeValidationError(
+            "不支持的模型通道",
+            code="unsupported_model_provider",
+        )
+    configured = getattr(settings, "DEEPSEEK_CREATIVE", {}) or {}
+    api_config = getattr(settings, "DEEPSEEK_API", {}) or {}
+    return {
+        **_creative_review_policy(configured),
+        "enabled": bool(api_config.get("enabled", False)),
+        "model_id": str(api_config.get("model") or ""),
+        "timeout_seconds": float(api_config.get("timeout_seconds", 180)),
+        "min_shots": int(configured.get("min_shots", 1)),
+        "recommended_max_shots": int(configured.get("recommended_max_shots", 4)),
+        "batch_shots": int(configured.get("batch_shots", 1)),
+        "max_dialogue_per_shot": int(configured.get("max_dialogue_per_shot", 2)),
+        "max_episode_title_chars": int(configured.get("max_episode_title_chars", 80)),
+        "max_dialogue_text_chars": int(configured.get("max_dialogue_text_chars", 240)),
+        "max_dialogue_delivery_chars": int(
+            configured.get("max_dialogue_delivery_chars", 100)
+        ),
+        "max_dialogue_delivery_en_chars": int(
+            configured.get("max_dialogue_delivery_en_chars", 150)
+        ),
+        "min_shot_duration_ms": int(configured.get(
+            "min_shot_duration_ms", settings.VIDEO_SHOT_MIN_DURATION_MS,
+        )),
+        "max_shot_duration_ms": int(configured.get(
+            "max_shot_duration_ms", settings.VIDEO_SHOT_MAX_DURATION_MS,
+        )),
+        "output_min_tokens": int(configured.get("output_min_tokens", 1024)),
+        "output_base_tokens": int(configured.get("output_base_tokens", 768)),
+        "output_tokens_per_shot": int(configured.get("output_tokens_per_shot", 384)),
+        "output_tokens_per_dialogue": int(
+            configured.get("output_tokens_per_dialogue", 128)
+        ),
+        "output_dialogue_char_threshold": int(
+            configured.get("output_dialogue_char_threshold", 32)
+        ),
+        "max_source_chars": int(configured.get("max_source_chars", 24000)),
+        "max_regeneration_context_chars": int(
+            configured.get("max_regeneration_context_chars", 96000)
+        ),
+        "max_input_chars": int(configured.get("max_input_chars", 120000)),
+        "output_headroom_per_shot": int(
+            configured.get("output_headroom_per_shot", 384)
+        ),
+        "max_output_tokens": int(api_config.get("max_tokens", 16384)),
+    }
+
+
+def _creative_policy_audit(
+    config: dict[str, Any], *, include_runtime: bool = True,
+) -> dict[str, int | float]:
+    keys = (
+        "min_shots", "recommended_max_shots", "batch_shots",
+        "max_dialogue_per_shot",
+        "max_episode_title_chars", "max_dialogue_text_chars",
+        "max_dialogue_delivery_chars", "max_dialogue_delivery_en_chars",
+        "min_shot_duration_ms", "max_shot_duration_ms", "output_min_tokens",
+        "output_base_tokens", "output_tokens_per_shot", "output_tokens_per_dialogue",
+        "output_dialogue_char_threshold", "max_source_chars",
+        "max_regeneration_context_chars", "max_input_chars",
+        "output_headroom_per_shot", "max_output_tokens",
+        *CREATIVE_REVIEW_POLICY_KEYS,
+    )
+    snapshot: dict[str, int | float] = {key: int(config[key]) for key in keys}
+    if include_runtime:
+        for key in (
+            "max_new_tokens", "context_size", "min_context_size",
+            "max_context_size", "reserved_input_tokens",
+        ):
+            if key in config:
+                snapshot[key] = int(config[key])
+        for key in ("timeout_seconds", "process_cleanup_grace_seconds"):
+            if key in config:
+                snapshot[key] = float(config[key])
+    return snapshot
 
 
 def _model_state(config: dict[str, Any]) -> dict[str, Any]:
@@ -265,6 +442,7 @@ def _model_state(config: dict[str, Any]) -> dict[str, Any]:
 
 def get_creative_capability() -> dict[str, Any]:
     config = creative_config()
+    deepseek_config = creative_provider_config(DEEPSEEK_API_PROVIDER)
     state = _model_state(config)
     runtime_state = qwen_runtime_device_state(config)
     configured = bool(
@@ -285,14 +463,24 @@ def get_creative_capability() -> dict[str, Any]:
         "gpu_layers": config["gpu_layers"],
         **runtime_state,
         "min_shots": config["min_shots"],
-        "max_shots": config["max_shots"],
+        **_creative_policy_audit(config, include_runtime=False),
         "max_source_chars": config["max_source_chars"],
-        "baseline_max_new_tokens": creative_required_output_token_budget(config["max_shots"]),
+        "max_regeneration_context_chars": config["max_regeneration_context_chars"],
+        "max_input_chars": config["max_input_chars"],
+        "baseline_max_new_tokens": creative_required_output_token_budget(
+            config["batch_shots"], policy=config,
+        ),
         "max_new_tokens": config["max_new_tokens"],
+        "max_output_tokens": config["max_output_tokens"],
         "configured_max_new_tokens": config["max_new_tokens"],
         "context_size": config["context_size"],
+        "min_context_size": config["min_context_size"],
+        "max_context_size": config["max_context_size"],
+        "reserved_input_tokens": config["reserved_input_tokens"],
         "runtime_timeout_seconds": config["timeout_seconds"],
-        "process_timeout_seconds": config["timeout_seconds"] + 60,
+        "process_timeout_seconds": (
+            config["timeout_seconds"] + config["process_cleanup_grace_seconds"]
+        ),
         "loaded_on_demand": True,
         "unloaded_after_request": True,
         "review_required": True,
@@ -311,9 +499,21 @@ def get_creative_capability() -> dict[str, Any]:
         "provider": DEEPSEEK_API_PROVIDER,
         "label": "DeepSeek API",
         "creative_generation_supported": True,
-        "min_shots": config["min_shots"],
-        "max_shots": config["max_shots"],
-        "max_source_chars": config["max_source_chars"],
+        "min_shots": deepseek_config["min_shots"],
+        **_creative_policy_audit(deepseek_config, include_runtime=False),
+        "max_source_chars": deepseek_config["max_source_chars"],
+        "max_regeneration_context_chars": deepseek_config["max_regeneration_context_chars"],
+        "max_input_chars": deepseek_config["max_input_chars"],
+        "baseline_max_new_tokens": (
+            creative_required_output_token_budget(
+                deepseek_config["batch_shots"], policy=deepseek_config,
+            )
+            + deepseek_config["output_headroom_per_shot"] * deepseek_config["batch_shots"]
+        ),
+        "max_new_tokens": deepseek_config["max_output_tokens"],
+        "max_output_tokens": deepseek_config["max_output_tokens"],
+        "configured_max_new_tokens": deepseek_config["max_output_tokens"],
+        "runtime_timeout_seconds": deepseek_config["timeout_seconds"],
         "review_required": True,
         "translation_review_reused": True,
         "ready": bool(
@@ -332,7 +532,8 @@ def get_creative_capability() -> dict[str, Any]:
     if default_provider not in CREATIVE_PROVIDERS:
         default_provider = LOCAL_QWEN_PROVIDER
     return {
-        **local_capability,
+        "creative_generation_supported": True,
+        "review_required": True,
         "default_provider": default_provider,
         "providers": [local_capability, deepseek_capability],
     }
@@ -362,6 +563,9 @@ def _run_provider_runtime(
             str(exc),
             code=str(getattr(exc, "code", "deepseek_api_failed")),
             runtime_metadata=dict(getattr(exc, "runtime_metadata", {}) or {}),
+            structured_candidate=dict(
+                getattr(exc, "structured_candidate", {}) or {},
+            ),
         ) from exc
 
 
@@ -444,6 +648,8 @@ def creative_context_snapshot(project: SeriesProject, episode: Episode) -> dict[
             "character_ids": sorted(str(value.id) for value in item.characters.all()),
             "prop_ids": sorted(str(value.id) for value in item.props.all()),
             "reference_bindings": item.reference_bindings,
+            "requires_first_frame_continuity": item.requires_first_frame_continuity,
+            "requires_last_frame_continuity": item.requires_last_frame_continuity,
             "continuity_notes": item.continuity_notes,
         } for item in episode.shots.order_by("number").prefetch_related("characters", "props")],
     }
@@ -484,13 +690,14 @@ def _runtime_source(snapshot: dict[str, Any], *, max_chars: int) -> dict[str, An
     ):
         project["master_script"] = ""
         warnings.append(
-            "本集已有独立剧本；为满足本地上下文预算，本次创作未重复发送整剧 master_script，"
+            "本集已有独立剧本；为满足当前通道上下文预算，本次创作未重复发送整剧 master_script，"
             "但整剧原文仍纳入 context hash。"
         )
         size = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
     if size > max_chars:
         raise CreativeValidationError(
-            f"创作上下文共 {size} 字符，超过本地模型单次 {max_chars} 字符上限；请缩短本集剧本或分段创作。"
+            f"创作上下文共 {size} 字符，超过当前通道单次 {max_chars} 字符上限；"
+            "请调整通道配置、缩短本集剧本或分段创作。"
         )
     payload["_input_warnings"] = warnings
     return payload
@@ -513,7 +720,10 @@ def _require_runtime(config: dict[str, Any]) -> None:
 
 def _run_runtime(request: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     started = time.monotonic()
-    process_timeout = float(config["timeout_seconds"]) + 60
+    process_timeout = (
+        float(config["timeout_seconds"])
+        + float(config["process_cleanup_grace_seconds"])
+    )
     diagnostic = {
         # Other local-Qwen proposal services deliberately reuse this exact
         # resource lock/process transport.  Preserve their operation name in
@@ -604,42 +814,72 @@ def _runtime_request(
     context_hash: str, target_shot_count: int, creativity: str,
     variation_note: str, attempt: int,
     regeneration_context: dict[str, Any] | None = None,
+    provider_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    config = creative_config()
+    config = provider_config or creative_config()
     source = _runtime_source(snapshot, max_chars=config["max_source_chars"])
     input_warnings = source.pop("_input_warnings", [])
     default_mode = snapshot["project"].get("default_h3_mode")
     if default_mode not in set(Shot.H3Mode.values):
         default_mode = Shot.H3Mode.T2VA
-    if len(str(snapshot["episode"].get("title") or "")) > 80:
-        raise CreativeValidationError("剧集标题超过 80 字符；请先缩短标题再生成创作草稿。")
+    if len(str(snapshot["episode"].get("title") or "")) > config["max_episode_title_chars"]:
+        raise CreativeValidationError(
+            f"剧集标题超过当前通道配置的 {config['max_episode_title_chars']} 字符；"
+            "请先缩短标题或调整通道配置。"
+        )
     include_audio = bool((episode.prompt_settings or {}).get("include_audio", True))
     recommended_durations = _recommended_shot_durations_ms(
         str(snapshot["episode"].get("script") or ""),
         target_shot_count,
         project.default_shot_duration_ms,
+        minimum_ms=config["min_shot_duration_ms"],
+        maximum_ms=config["max_shot_duration_ms"],
     )
     dialogue_manifest = required_dialogue_manifest(snapshot, include_audio=include_audio)
-    if len(dialogue_manifest) > target_shot_count * 2:
+    max_dialogue_per_shot = config["max_dialogue_per_shot"]
+    if len(dialogue_manifest) > target_shot_count * max_dialogue_per_shot:
+        dialogue_capacity = target_shot_count * max_dialogue_per_shot
         raise CreativeValidationError(
             f"本段剧本包含 {len(dialogue_manifest)} 句必须保留的原文对白，但 "
-            f"{target_shot_count} 个镜头按每镜最多 2 句只能容纳 {target_shot_count * 2} 句；"
-            "请增加镜头数或拆分本集片段后再生成。"
+            f"{target_shot_count} 个镜头按每镜最多 {max_dialogue_per_shot} 句"
+            f"只能容纳 {dialogue_capacity} 句；"
+            "请拆分本集片段后再生成。",
+            code="creative_dialogue_capacity_exceeded",
+            public_context={
+                "required_dialogue_count": len(dialogue_manifest),
+                "target_shot_count": target_shot_count,
+                "dialogue_capacity": dialogue_capacity,
+                "max_dialogue_per_shot": max_dialogue_per_shot,
+            },
         )
     for item in dialogue_manifest:
-        if len(item["text_zh"]) > 240 or len(item["source_delivery_zh"]) > 100:
+        if (
+            len(item["text_zh"]) > config["max_dialogue_text_chars"]
+            or len(item["source_delivery_zh"]) > config["max_dialogue_delivery_chars"]
+        ):
             raise CreativeValidationError(
-                f"第 {item['source_order']} 句原文对白或表演标注过长，无法放入 5–15 秒单镜；"
-                "请先拆分剧本对白。"
+                f"第 {item['source_order']} 句原文对白或表演标注超过当前通道配置；"
+                "请拆分剧本对白或调整通道配置。"
             )
     output_token_budget = creative_required_output_token_budget(
-        target_shot_count, dialogue_manifest,
+        target_shot_count, dialogue_manifest, policy=config,
     )
-    if output_token_budget > config["max_new_tokens"]:
+    provider_output_token_budget = (
+        output_token_budget
+        + config["output_headroom_per_shot"] * target_shot_count
+    )
+    if provider_output_token_budget > config["max_output_tokens"]:
         raise CreativeValidationError(
             f"当前 {target_shot_count} 镜和 {len(dialogue_manifest)} 句原文对白需要约 "
-            f"{output_token_budget} 个输出 token，超过本地 CPU 单次 {config['max_new_tokens']} 上限；"
-            "请拆分本集片段后再生成。"
+            f"{provider_output_token_budget} 个输出 token，超过当前通道配置的 "
+            f"{config['max_output_tokens']} token 上限；请调整提供方配置或拆分本集片段。",
+            code="creative_output_budget_exceeded",
+            public_context={
+                "target_shot_count": target_shot_count,
+                "required_dialogue_count": len(dialogue_manifest),
+                "required_output_tokens": provider_output_token_budget,
+                "configured_max_output_tokens": config["max_output_tokens"],
+            },
         )
     request = {
         "operation": CREATIVE_OPERATION,
@@ -656,13 +896,29 @@ def _runtime_request(
         "options": {
             "shot_count": target_shot_count,
             "min_shots": config["min_shots"],
-            "max_shots": config["max_shots"],
-            "minimum_duration_ms": 5000,
-            "maximum_duration_ms": 15000,
+            "batch_shots": config["batch_shots"],
+            "max_dialogue_per_shot": max_dialogue_per_shot,
+            "max_episode_title_chars": config["max_episode_title_chars"],
+            "max_dialogue_text_chars": config["max_dialogue_text_chars"],
+            "max_dialogue_delivery_chars": config["max_dialogue_delivery_chars"],
+            "max_dialogue_delivery_en_chars": config["max_dialogue_delivery_en_chars"],
+            "output_min_tokens": config["output_min_tokens"],
+            "output_base_tokens": config["output_base_tokens"],
+            "output_tokens_per_shot": config["output_tokens_per_shot"],
+            "output_tokens_per_dialogue": config["output_tokens_per_dialogue"],
+            "output_dialogue_char_threshold": config["output_dialogue_char_threshold"],
+            "max_source_chars": config["max_source_chars"],
+            "max_regeneration_context_chars": config["max_regeneration_context_chars"],
+            "max_input_chars": config["max_input_chars"],
+            "output_headroom_per_shot": config["output_headroom_per_shot"],
+            "minimum_duration_ms": config["min_shot_duration_ms"],
+            "maximum_duration_ms": config["max_shot_duration_ms"],
             "default_duration_ms": _action_density_duration_ms(
                 str(snapshot["episode"].get("script") or ""),
                 target_shot_count,
                 project.default_shot_duration_ms,
+                minimum_ms=config["min_shot_duration_ms"],
+                maximum_ms=config["max_shot_duration_ms"],
             ),
             "recommended_shot_durations_ms": recommended_durations,
             "h3_mode": default_mode,
@@ -670,27 +926,45 @@ def _runtime_request(
             "creativity": creativity,
         },
         "seed": int(project.continuity_seed) + max(1, int(attempt)),
-        "model_dir": str(config["model_dir"]),
         "model_id": config["model_id"],
-        "device": config["device"],
-        "gpu_layers": config["gpu_layers"],
         "max_new_tokens": output_token_budget,
-        "context_size": config["context_size"],
         "timeout_seconds": config["timeout_seconds"],
         "input_warnings": input_warnings,
         "required_dialogue_manifest": dialogue_manifest,
     }
+    if "model_dir" in config:
+        request.update({
+            "model_dir": str(config["model_dir"]),
+            "device": config["device"],
+            "gpu_layers": config["gpu_layers"],
+            "context_size": config["context_size"],
+            "min_context_size": config["min_context_size"],
+            "max_context_size": config["max_context_size"],
+            "reserved_input_tokens": config["reserved_input_tokens"],
+        })
     if regeneration_context:
+        previous_draft_chars = len(json.dumps(
+            regeneration_context.get("previous_draft") or {},
+            ensure_ascii=False, separators=(",", ":"),
+        ))
+        if previous_draft_chars > config["max_regeneration_context_chars"]:
+            raise CreativeValidationError(
+                f"逐镜重生成草稿共 {previous_draft_chars} 字符，超过当前通道配置的 "
+                f"{config['max_regeneration_context_chars']} 字符上限；"
+                "请调整提供方配置或改用整稿重新生成。"
+            )
         combined_chars = len(json.dumps(
             {"source": source, "regeneration_context": regeneration_context},
             ensure_ascii=False, separators=(",", ":"),
         ))
-        if combined_chars > config["max_source_chars"]:
+        if combined_chars > config["max_input_chars"]:
             raise CreativeValidationError(
-                f"逐镜重生成上下文共 {combined_chars} 字符，超过 {config['max_source_chars']} 字符上限；"
-                "请缩短本集剧本/分镜描述，或改用整稿重新生成。"
+                f"逐镜重生成上下文共 {combined_chars} 字符，超过当前通道配置的 "
+                f"{config['max_input_chars']} 字符上限；请调整提供方配置、缩短本集内容，"
+                "或改用整稿重新生成。"
             )
         request["regeneration_context"] = regeneration_context
+    request["provider_output_token_budget"] = provider_output_token_budget
     return request
 
 
@@ -772,6 +1046,15 @@ _CREATIVE_REVIEW_SUGGESTIONS = {
     "required_content_missing": "该字段内容为空，请补写、重新生成或知情保留。",
     "shot_count_mismatch": "实际镜头数与本次请求不同，请确认是否符合创作意图。",
     "shot_order_irregular": "镜头顺序或草稿标识不连续，建议人工整理。",
+    "batch_shot_count_mismatch": (
+        "模型某一批次返回的镜头数与计划不同；系统已保留全部可解析镜头，请人工核对。"
+    ),
+    "batch_shot_order_repaired": (
+        "模型某一批次返回的镜号不连续；系统已按实际返回顺序重新编号，请人工核对。"
+    ),
+    "generation_incomplete": (
+        "模型只完成了部分批次；系统已保留可解析镜头，请确认是继续编辑、重新生成还是知情采用。"
+    ),
     "duplicate_binding": "同一素材绑定重复出现，建议删除重复项。",
     "unknown_scene_reference": "场景不属于当前项目；正式应用前需替换或删除。",
     "unknown_character_reference": "人物不属于当前项目；正式应用前需替换或删除。",
@@ -780,16 +1063,26 @@ _CREATIVE_REVIEW_SUGGESTIONS = {
     "dialogue_binding_missing": "说话人尚未绑定到该镜头，请人工核对。",
     "dialogue_not_authored": "对白正文可能不是剧本原文，请人工核对。",
     "dialogue_delivery_differs_from_script": "对白语气与剧本中的表演标注不同，请在对应对白的中文语气字段中核对。",
+    "dialogue_manifest_repaired": (
+        "模型返回的对白存在缺失、多余或乱序；系统已按剧本原文重新对齐，"
+        "请核对对白所在镜头及英文表演提示。"
+    ),
+    "dialogue_manifest_mismatch": (
+        "当前草稿对白仍未与剧本原文逐句对齐，请人工核对后再继续。"
+    ),
+    "dialogue_delivery_translation_missing": (
+        "剧本中的中文表演标注缺少可保留的英文提示，请人工补译或知情确认。"
+    ),
     "audio_disabled_content_present": "镜头标记为静音，但仍包含对白、声景或配乐。",
     "dialogue_density_high": "短镜头中的对白较多，请确认节奏是否可执行。",
     "camera_movement_dense": "同一镜头可能包含多种运镜，请人工取舍。",
     "action_arc_dense": "动作节拍较多，请确认时长内是否可完成。",
-    "action_duration_may_be_short": "当前时长可能难以完整展示这组连续动作，可在 5–15 秒内延长或人工加快动作节奏。",
+    "action_duration_may_be_short": "当前时长可能难以完整展示这组连续动作，可在当前通道配置允许的时长范围内延长，或人工加快动作节奏。",
     "script_action_coverage_low": (
         "剧本中似乎还有可见动作未在分镜画面叙事中体现；该结果仅为启发式提醒，"
         "请人工对照剧本补全或调整镜头时长。"
     ),
-    "duration_outside_recommendation": "时长超出 MiniMax H3 常用的 5–15 秒范围。",
+    "duration_outside_recommendation": "时长超出当前创作通道配置允许的范围。",
     "missing_scene_binding": "本镜尚未绑定场景 Bible。",
     "missing_character_binding": "本镜尚未绑定人物 Bible。",
     "canonical_target_collision": "多个 Bible 实体共用了同一英文 canonical 名称，请人工核对。",
@@ -880,6 +1173,128 @@ def _creative_review_summary(issues: list[dict[str, str]]) -> dict[str, Any]:
     }
 
 
+def _flatten_creative_dialogue(
+    shots: list[dict[str, Any]],
+) -> list[tuple[int, int, dict[str, Any]]]:
+    """Return dialogue in the exact order presented to the reviewer."""
+    return [
+        (shot_index, line_index, line)
+        for shot_index, shot in enumerate(shots)
+        for line_index, line in enumerate(shot.get("dialogue", []))
+    ]
+
+
+def _dialogue_identity(value: dict[str, Any]) -> tuple[str, str]:
+    return (
+        str(value.get("speaker_id") or ""),
+        str(value.get("text_zh") or ""),
+    )
+
+
+def _reconcile_authoritative_dialogue_manifest(
+    shots: list[dict[str, Any]],
+    expected: list[dict[str, Any]],
+    *,
+    max_dialogue_per_shot: int | None,
+) -> bool:
+    """Repair a parseable model dialogue proposal from the authored manifest.
+
+    Authored speaker/text identity and any explicit Chinese performance note
+    remain authoritative. Matching model rows retain their English performance
+    text, voice-over flag and original shot whenever source order and configured
+    per-shot capacity make that placement possible. Missing rows are filled with
+    empty optional model-owned fields; extra rows are discarded.
+
+    ``False`` means either no repair was needed or the configured capacity could
+    not hold the complete manifest. The latter remains a review issue in the
+    global validator and never turns a parseable candidate into a failed draft.
+    """
+    actual = _flatten_creative_dialogue(shots)
+    actual_identity = [_dialogue_identity(line) for _, _, line in actual]
+    expected_identity = [_dialogue_identity(line) for line in expected]
+    if actual_identity == expected_identity:
+        return False
+    if not shots:
+        return False
+
+    if max_dialogue_per_shot is None:
+        # No provider policy is available only for direct/internal validation.
+        # Derive a lossless envelope from the candidate instead of inventing a
+        # second hidden policy value.
+        capacity = max(
+            1,
+            len(expected),
+            *(len(shot.get("dialogue", [])) for shot in shots),
+        )
+    else:
+        capacity = int(max_dialogue_per_shot)
+    if capacity < 1 or len(expected) > len(shots) * capacity:
+        return False
+
+    available: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+    for shot_index, _line_index, line in actual:
+        available.setdefault(_dialogue_identity(line), []).append((shot_index, line))
+    matched: list[tuple[int, dict[str, Any]] | None] = []
+    for source in expected:
+        rows = available.get(_dialogue_identity(source), [])
+        matched.append(rows.pop(0) if rows else None)
+
+    used = [0] * len(shots)
+    assigned_shots: list[int] = []
+
+    def feasible(shot_index: int, *, remaining_after: int) -> bool:
+        if shot_index < (assigned_shots[-1] if assigned_shots else 0):
+            return False
+        if used[shot_index] >= capacity:
+            return False
+        remaining_capacity = capacity - used[shot_index] - 1
+        remaining_capacity += sum(
+            capacity - used[index]
+            for index in range(shot_index + 1, len(shots))
+        )
+        return remaining_after <= remaining_capacity
+
+    for index, match in enumerate(matched):
+        remaining_after = len(expected) - index - 1
+        minimum = assigned_shots[-1] if assigned_shots else 0
+        preferred = match[0] if match else None
+        selected = None
+        if preferred is not None and preferred >= minimum and feasible(
+            preferred, remaining_after=remaining_after,
+        ):
+            selected = preferred
+        else:
+            for shot_index in range(minimum, len(shots)):
+                if feasible(shot_index, remaining_after=remaining_after):
+                    selected = shot_index
+                    break
+        if selected is None:
+            return False
+        assigned_shots.append(selected)
+        used[selected] += 1
+
+    rebuilt: list[list[dict[str, Any]]] = [[] for _shot in shots]
+    for source, match, shot_index in zip(
+        expected, matched, assigned_shots, strict=True,
+    ):
+        model_line = match[1] if match else {}
+        source_delivery = str(source.get("source_delivery_zh") or "")
+        rebuilt[shot_index].append({
+            "speaker_id": str(source.get("speaker_id") or ""),
+            "text_zh": str(source.get("text_zh") or ""),
+            "delivery_zh": (
+                source_delivery
+                if source_delivery
+                else str(model_line.get("delivery_zh") or "")
+            ),
+            "delivery_en": str(model_line.get("delivery_en") or ""),
+            "voiceover": bool(model_line.get("voiceover", False)),
+        })
+    for shot, dialogue in zip(shots, rebuilt, strict=True):
+        shot["dialogue"] = dialogue
+    return True
+
+
 def _pair_review_issues(
     zh: str,
     en: str,
@@ -925,29 +1340,31 @@ def _script_action_clauses(value: str) -> list[str]:
     return clauses
 
 
-def _action_density_duration_ms(script: str, shot_count: int, default_ms: int) -> int:
+def _action_density_duration_ms(
+    script: str, shot_count: int, default_ms: int, *, minimum_ms: int, maximum_ms: int,
+) -> int:
     """Suggest one bounded per-shot duration from a conservative density cue."""
 
     count = len(_script_action_clauses(script))
     if count <= 0:
-        return max(5_000, min(15_000, int(default_ms)))
+        return max(minimum_ms, min(maximum_ms, int(default_ms)))
     # Opening/end readability plus compact chained actions.  Round upward to
     # half seconds so the recommendation is stable and editor-friendly.
     per_shot = count / max(1, int(shot_count))
     estimate = 1_600 + (per_shot * 1_050)
     rounded = int(((estimate + 499) // 500) * 500)
-    return max(5_000, min(15_000, rounded))
+    return max(minimum_ms, min(maximum_ms, rounded))
 
 
 def _recommended_shot_durations_ms(
-    script: str, shot_count: int, default_ms: int,
+    script: str, shot_count: int, default_ms: int, *, minimum_ms: int, maximum_ms: int,
 ) -> list[int]:
-    """Partition coarse source action weight into ordered 5-15s suggestions."""
+    """Partition coarse source action weight into configured duration suggestions."""
 
     count = max(1, int(shot_count))
     clauses = _script_action_clauses(script)
     if not clauses:
-        value = max(5_000, min(15_000, int(default_ms)))
+        value = max(minimum_ms, min(maximum_ms, int(default_ms)))
         return [value] * count
     # Clause-level weights avoid treating a tightly phrased compound such as
     # "翻腕斤撩" as several full-duration events.  Long clauses receive only
@@ -981,20 +1398,24 @@ def _recommended_shot_durations_ms(
     values: list[int] = []
     for group in groups:
         if not group:
-            estimate = max(5_000, min(15_000, int(default_ms)))
+            estimate = max(minimum_ms, min(maximum_ms, int(default_ms)))
         else:
             # Fast readable micro-actions may share a second; the fixed 1.6s
             # allowance preserves an entry and exit state for the whole chain.
             estimate = 1_600 + (sum(group) * 1_000) + (max(0, len(group) - 1) * 150)
-        values.append(max(5_000, min(15_000, int(((estimate + 499) // 500) * 500))))
+        values.append(max(minimum_ms, min(maximum_ms, int(((estimate + 499) // 500) * 500))))
     return values
 
 
 def _script_action_coverage_issue(
-    script: str, shots: list[dict[str, Any]],
+    script: str, shots: list[dict[str, Any]], *, minimum_coverage_percent: int | None = None,
 ) -> dict[str, str] | None:
     """Return one non-blocking advisory when coarse lexical coverage is low."""
 
+    if minimum_coverage_percent is None:
+        minimum_coverage_percent = _creative_review_policy()[
+            "min_script_action_coverage_percent"
+        ]
     clauses = _script_action_clauses(script)
     if len(clauses) < 3:
         return None
@@ -1007,7 +1428,7 @@ def _script_action_coverage_issue(
         verbs = {match.group(0) for match in _SCRIPT_ACTION_VERB_RE.finditer(clause)}
         if verbs and any(verb in storyboard for verb in verbs):
             represented += 1
-    if represented * 5 < len(clauses) * 4:
+    if represented * 100 < len(clauses) * int(minimum_coverage_percent):
         return _creative_review_issue("script_action_coverage_low", "shots")
     return None
 
@@ -1017,6 +1438,10 @@ def validate_creative_draft_data(
     *,
     target_shot_count: int | None = None,
     runtime_review_issues: list[dict[str, str]] | None = None,
+    max_dialogue_per_shot: int | None = None,
+    min_shot_duration_ms: int | None = None,
+    max_shot_duration_ms: int | None = None,
+    review_policy: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Return an editable draft plus human-review issues.
 
@@ -1058,6 +1483,13 @@ def validate_creative_draft_data(
             "stable_speaker_id": item.stable_speaker_id,
         } for item in characters.values()]},
     }, include_audio=any(bool(item.get("include_audio")) for item in data["shots"]))
+    if _reconcile_authoritative_dialogue_manifest(
+        data["shots"], authored_dialogue,
+        max_dialogue_per_shot=max_dialogue_per_shot,
+    ):
+        issues.append(_creative_review_issue(
+            "dialogue_manifest_repaired", "shots[].dialogue",
+        ))
     materialized_dialogue: list[tuple[str, dict[str, Any]]] = []
     glossary_raw = (project.production_settings or {}).get("translation_glossary", {})
     glossary = {
@@ -1082,14 +1514,10 @@ def validate_creative_draft_data(
             "shot_order_irregular", "shots", severity="requires_edit",
         ))
 
+    resolved_review_policy = _creative_review_policy(review_policy)
     recommended_limits = {
-        "title_zh": 48, "title_en": 72,
-        "narrative_zh": 180, "narrative_en": 1000,
-        "camera_zh": 220, "camera_en": 320,
-        "action_zh": 120, "action_en": 1000,
-        "continuity_zh": 160, "continuity_en": 240,
-        "soundscape_zh": 120, "soundscape_en": 180,
-        "music_zh": 80, "music_en": 120,
+        field_name: resolved_review_policy[f"recommended_{field_name}_chars"]
+        for field_name in CREATIVE_REVIEW_FIELD_NAMES
     }
     required_fields = {
         "title_zh", "title_en", "narrative_zh", "narrative_en",
@@ -1171,7 +1599,13 @@ def validate_creative_draft_data(
                 issues.append(_creative_review_issue(
                     "field_length_above_recommendation", f"{base_path}.{field_name}",
                 ))
-        if not 5_000 <= int(shot.get("duration_ms") or 0) <= 15_000:
+        if (
+            min_shot_duration_ms is not None
+            and max_shot_duration_ms is not None
+            and not min_shot_duration_ms
+            <= int(shot.get("duration_ms") or 0)
+            <= max_shot_duration_ms
+        ):
             issues.append(_creative_review_issue(
                 "duration_outside_recommendation", f"{base_path}.duration_ms",
             ))
@@ -1182,7 +1616,10 @@ def validate_creative_draft_data(
             issues.append(_creative_review_issue(
                 "audio_disabled_content_present", f"{base_path}.include_audio",
             ))
-        if len(shot.get("dialogue", [])) > 2:
+        if (
+            max_dialogue_per_shot is not None
+            and len(shot.get("dialogue", [])) > max_dialogue_per_shot
+        ):
             issues.append(_creative_review_issue(
                 "dialogue_density_high", f"{base_path}.dialogue",
             ))
@@ -1190,11 +1627,13 @@ def validate_creative_draft_data(
         active_movements = [
             key for key, pattern in _CAMERA_MOVEMENTS.items() if pattern.search(camera_text)
         ]
-        if len(active_movements) > 1:
+        if len(active_movements) > resolved_review_policy["max_camera_movements"]:
             issues.append(_creative_review_issue(
                 "camera_movement_dense", f"{base_path}.camera_en",
             ))
-        if len(_SEQUENCE_RE.findall(f"{shot['action_zh']} {shot['action_en']}")) > 4:
+        if len(_SEQUENCE_RE.findall(
+            f"{shot['action_zh']} {shot['action_en']}"
+        )) > resolved_review_policy["max_action_sequence_markers"]:
             issues.append(_creative_review_issue(
                 "action_arc_dense", f"{base_path}.action_en",
             ))
@@ -1207,9 +1646,24 @@ def validate_creative_draft_data(
                 "missing_character_binding", f"{base_path}.character_ids", severity="warning",
             ))
 
-    coverage_issue = _script_action_coverage_issue(episode.script, data["shots"])
+    coverage_issue = _script_action_coverage_issue(
+        episode.script,
+        data["shots"],
+        minimum_coverage_percent=resolved_review_policy[
+            "min_script_action_coverage_percent"
+        ],
+    )
     if coverage_issue:
         issues.append(coverage_issue)
+
+    flattened_identity = [
+        _dialogue_identity(line) for _path, line in materialized_dialogue
+    ]
+    authoritative_identity = [_dialogue_identity(line) for line in authored_dialogue]
+    if flattened_identity != authoritative_identity:
+        issues.append(_creative_review_issue(
+            "dialogue_manifest_mismatch", "shots[].dialogue",
+        ))
 
     # Runtime normalization can resolve dialogue placement and identity after
     # its first validation pass. Recheck the exact persisted rows here and
@@ -1228,6 +1682,16 @@ def validate_creative_draft_data(
             issues.append(_creative_review_issue(
                 "dialogue_delivery_differs_from_script",
                 f"{dialogue_path}.delivery_zh",
+            ))
+        if (
+            line.get("speaker_id") == authored.get("speaker_id")
+            and line.get("text_zh") == authored.get("text_zh")
+            and authored.get("source_delivery_zh")
+            and not str(line.get("delivery_en") or "").strip()
+        ):
+            issues.append(_creative_review_issue(
+                "dialogue_delivery_translation_missing",
+                f"{dialogue_path}.delivery_en",
             ))
 
     try:
@@ -1268,6 +1732,7 @@ def _attach_attempt_audit(
     exc: CreativeDraftError,
     *, snapshot: dict[str, Any], context_hash: str,
     project: SeriesProject, episode: Episode,
+    provider_config: dict[str, Any],
 ) -> None:
     exc.attempt_context_snapshot = snapshot
     exc.attempt_context_hash = context_hash
@@ -1283,6 +1748,558 @@ def _attach_attempt_audit(
         "attempt_context_hash": context_hash,
         "source_drift_during_attempt": exc.source_drift_during_attempt,
     })
+    exc.provider_policy_snapshot = _creative_policy_audit(provider_config)
+
+
+def _creative_batch_source(snapshot: dict[str, Any]) -> tuple[str, str]:
+    """Return the one authoritative narrative field used for batch partitioning."""
+    candidates = (
+        ("episode.script", snapshot["episode"].get("script")),
+        ("project.master_script", snapshot["project"].get("master_script")),
+        ("episode.synopsis", snapshot["episode"].get("synopsis")),
+        ("project.logline", snapshot["project"].get("logline")),
+    )
+    for field, value in candidates:
+        if str(value or "").strip():
+            return field, str(value)
+    raise CreativeValidationError(
+        "剧集梗概、剧本、项目梗概和全剧剧本不能全部为空。",
+        code="creative_source_missing",
+    )
+
+
+def _creative_source_units(
+    snapshot: dict[str, Any], source_text: str,
+) -> list[dict[str, Any]]:
+    """Split source at authored shot boundaries without splitting dialogue.
+
+    A saved episode script normally keeps one authored shot per blank-line
+    paragraph, while an unsplit master script may retain explicit ``镜头 N`` /
+    ``分镜 N`` / ``SHOT N`` labels.  Those boundaries are authoritative: flattening them
+    into sentence fragments lets a provider compress four authored beats into
+    three returned shots and shifts every following dialogue line.  Only fall
+    back to the older line/sentence units when the source contains no authored
+    shot boundary at all.
+    """
+    units: list[dict[str, Any]] = []
+    normalised = source_text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not normalised:
+        return units
+
+    labelled_starts = list(re.finditer(
+        r"(?im)^\s*(?:镜头|分镜|shot)\s*\d+\s*[:：]?",
+        normalised,
+    ))
+    authored_blocks: list[str] = []
+    if labelled_starts:
+        prefix = normalised[:labelled_starts[0].start()].strip()
+        for index, match in enumerate(labelled_starts):
+            end = (
+                labelled_starts[index + 1].start()
+                if index + 1 < len(labelled_starts)
+                else len(normalised)
+            )
+            block = normalised[match.start():end].strip()
+            if index == 0 and prefix:
+                block = f"{prefix}\n{block}"
+            if block:
+                authored_blocks.append(block)
+    else:
+        authored_blocks = [
+            block.strip()
+            for block in re.split(r"\n[ \t]*\n+", normalised)
+            if block.strip()
+        ]
+        if len(authored_blocks) < 2:
+            authored_blocks = []
+
+    if authored_blocks:
+        for block in authored_blocks:
+            probe = {
+                "episode": {"script": block},
+                "project": {"master_script": ""},
+                "bible": snapshot["bible"],
+            }
+            units.append({
+                "text": block,
+                "dialogue_count": len(required_dialogue_manifest(
+                    probe, include_audio=True,
+                )),
+                "weight": max(1, len(block)),
+            })
+        return units
+
+    for raw_line in normalised.split("\n"):
+        if not raw_line.strip():
+            continue
+        probe = {
+            "episode": {"script": raw_line},
+            "project": {"master_script": ""},
+            "bible": snapshot["bible"],
+        }
+        dialogue_count = len(required_dialogue_manifest(probe, include_audio=True))
+        if dialogue_count:
+            # Dialogue lines are atomic. Inserting a boundary inside one would
+            # violate the byte-for-byte authored-dialogue contract.
+            parts = [raw_line]
+        else:
+            parts = [
+                part for part in re.split(r"(?<=[。！？!?；;，,])", raw_line)
+                if part.strip()
+            ] or [raw_line]
+        for part in parts:
+            units.append({
+                "text": part,
+                "dialogue_count": dialogue_count if len(parts) == 1 else 0,
+                "weight": max(1, len(part)),
+            })
+    return units
+
+
+def _partition_creative_source(
+    units: list[dict[str, Any]], shot_counts: list[int],
+    *, max_dialogue_per_shot: int,
+) -> list[str] | None:
+    """Partition contiguous source units proportionally while preserving dialogue order."""
+    batch_count = len(shot_counts)
+    if not units or len(units) < batch_count:
+        return None
+    prefix_weight = [0]
+    prefix_dialogue = [0]
+    for unit in units:
+        prefix_weight.append(prefix_weight[-1] + int(unit["weight"]))
+        prefix_dialogue.append(
+            prefix_dialogue[-1] + int(unit["dialogue_count"])
+        )
+    total_weight = prefix_weight[-1]
+    total_shots = sum(shot_counts)
+    boundaries = [0]
+    start = 0
+    cumulative_shots = 0
+    for batch_index, shot_count in enumerate(shot_counts[:-1]):
+        cumulative_shots += shot_count
+        remaining_batches = batch_count - batch_index - 1
+        max_end = len(units) - remaining_batches
+        desired_weight = total_weight * cumulative_shots / total_shots
+        capacity = shot_count * max_dialogue_per_shot
+        remaining_capacity = (
+            sum(shot_counts[batch_index + 1:]) * max_dialogue_per_shot
+        )
+        candidates: list[int] = []
+        for end in range(start + 1, max_end + 1):
+            segment_dialogue = prefix_dialogue[end] - prefix_dialogue[start]
+            dialogue_after = prefix_dialogue[-1] - prefix_dialogue[end]
+            if segment_dialogue > capacity or dialogue_after > remaining_capacity:
+                continue
+            candidates.append(end)
+        if not candidates:
+            return None
+        end = min(
+            candidates,
+            key=lambda value: (abs(prefix_weight[value] - desired_weight), value),
+        )
+        boundaries.append(end)
+        start = end
+    boundaries.append(len(units))
+    segments: list[str] = []
+    for index, shot_count in enumerate(shot_counts):
+        start, end = boundaries[index], boundaries[index + 1]
+        dialogue_count = prefix_dialogue[end] - prefix_dialogue[start]
+        if dialogue_count > shot_count * max_dialogue_per_shot:
+            return None
+        segments.append("\n".join(str(unit["text"]) for unit in units[start:end]))
+    return segments
+
+
+def _partition_sparse_creative_source(
+    units: list[dict[str, Any]], shot_counts: list[int],
+    *, max_dialogue_per_shot: int,
+) -> list[tuple[str, str]] | None:
+    """Assign scarce source units once and fill later batches with safe premise.
+
+    This fallback is only needed when there are fewer authored units than
+    provider batches. Dialogue-bearing units are never copied: each belongs to
+    exactly one contiguous batch. Batches without an owned unit receive only a
+    dialogue-free read-only premise (or an empty excerpt) and rely on the
+    validated previous-shot boundary to continue the global range.
+    """
+    if not units or len(units) >= len(shot_counts):
+        return None
+    assigned: list[list[dict[str, Any]]] = [[] for _ in shot_counts]
+    dialogue_counts = [0 for _ in shot_counts]
+    batch_index = 0
+    for unit_index, unit in enumerate(units):
+        dialogue_count = int(unit["dialogue_count"])
+        while (
+            batch_index < len(shot_counts)
+            and dialogue_counts[batch_index] + dialogue_count
+            > shot_counts[batch_index] * max_dialogue_per_shot
+        ):
+            batch_index += 1
+        if batch_index >= len(shot_counts):
+            return None
+        assigned[batch_index].append(unit)
+        dialogue_counts[batch_index] += dialogue_count
+        remaining_units = len(units) - unit_index - 1
+        remaining_batches = len(shot_counts) - batch_index - 1
+        if remaining_units and remaining_units <= remaining_batches:
+            batch_index += 1
+
+    shared_premise = "\n".join(
+        str(unit["text"]) for unit in units if not int(unit["dialogue_count"])
+    )
+    planned: list[tuple[str, str]] = []
+    for owned_units in assigned:
+        if owned_units:
+            planned.append((
+                "\n".join(str(unit["text"]) for unit in owned_units),
+                "contiguous_excerpt",
+            ))
+        else:
+            planned.append((shared_premise, "shared_read_only"))
+    return planned
+
+
+def _balanced_batch_shot_counts(
+    total_shots: int, *, maximum: int, minimum: int,
+) -> list[int] | None:
+    batch_count = (total_shots + maximum - 1) // maximum
+    if total_shots < batch_count * minimum:
+        return None
+    base, remainder = divmod(total_shots, batch_count)
+    counts = [base + (1 if index < remainder else 0) for index in range(batch_count)]
+    if min(counts) < minimum or max(counts) > maximum:
+        return None
+    return counts
+
+
+def _snapshot_for_creative_batch(
+    snapshot: dict[str, Any], *, source_field: str, source_segment: str,
+) -> dict[str, Any]:
+    batched = copy.deepcopy(snapshot)
+    owner, field = source_field.split(".", 1)
+    batched[owner][field] = source_segment
+    if source_field == "episode.script":
+        # The episode script is authoritative. Do not let a full-series master
+        # script make a batch repeat events outside its assigned excerpt.
+        batched["project"]["master_script"] = ""
+    return batched
+
+
+def _plan_initial_creative_batches(
+    *, project: SeriesProject, episode: Episode, snapshot: dict[str, Any],
+    context_hash: str, target_shot_count: int, creativity: str,
+    variation_note: str, attempt: int, config: dict[str, Any],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    """Build the largest safe provider-policy batches without invoking a model."""
+    source_field, source_text = _creative_batch_source(snapshot)
+    units = _creative_source_units(snapshot, source_text)
+    include_audio = bool((episode.prompt_settings or {}).get("include_audio", True))
+    full_dialogue = required_dialogue_manifest(snapshot, include_audio=include_audio)
+    authored_dialogue = required_dialogue_manifest(snapshot, include_audio=True)
+    planning_dialogue_per_shot = max(
+        config["max_dialogue_per_shot"],
+        len(full_dialogue),
+    )
+    full_capacity = target_shot_count * config["max_dialogue_per_shot"]
+    if len(full_dialogue) > full_capacity:
+        raise CreativeValidationError(
+            f"本集剧本包含 {len(full_dialogue)} 句必须保留的原文对白，但 "
+            f"{target_shot_count} 个镜头只能容纳 {full_capacity} 句。",
+            code="creative_dialogue_capacity_exceeded",
+            public_context={
+                "required_dialogue_count": len(full_dialogue),
+                "target_shot_count": target_shot_count,
+                "dialogue_capacity": full_capacity,
+                "max_dialogue_per_shot": config["max_dialogue_per_shot"],
+            },
+        )
+    attempted_counts: set[tuple[int, ...]] = set()
+    last_error: CreativeDraftError | None = None
+    # ``batch_shots`` controls the maximum number of storyboard shots sent to
+    # one model call; it never limits the episode's business shot count.  Do
+    # not bypass a configured one-shot DeepSeek policy merely because the full
+    # request happens to fit its token budget.
+    if target_shot_count <= config["batch_shots"]:
+        try:
+            complete_request = _runtime_request(
+                project=project, episode=episode, snapshot=snapshot,
+                context_hash=context_hash, target_shot_count=target_shot_count,
+                creativity=creativity, variation_note=variation_note,
+                attempt=attempt, provider_config=config,
+            )
+            complete_request["_batch_source_mode"] = "complete_source"
+            return [(snapshot, complete_request)]
+        except CreativeDraftError as exc:
+            last_error = exc
+    for maximum in range(min(config["batch_shots"], target_shot_count), 0, -1):
+        counts = _balanced_batch_shot_counts(
+            target_shot_count, maximum=maximum, minimum=config["min_shots"],
+        )
+        if not counts or tuple(counts) in attempted_counts:
+            continue
+        attempted_counts.add(tuple(counts))
+        segments = (
+            _partition_creative_source(
+                units, counts,
+                max_dialogue_per_shot=planning_dialogue_per_shot,
+            )
+        )
+        segment_plans: list[tuple[str, str]] | None = (
+            [(segment, "contiguous_excerpt") for segment in segments]
+            if segments else None
+        )
+        if not segment_plans and not authored_dialogue:
+            # A short non-dialogue premise may contain fewer semantic units
+            # than the required provider calls. Reuse it only as immutable
+            # shared context; batch_context assigns distinct global ranges.
+            segment_plans = [
+                (source_text, "shared_read_only") for _ in counts
+            ]
+        if not segment_plans:
+            segment_plans = _partition_sparse_creative_source(
+                units,
+                counts,
+                max_dialogue_per_shot=planning_dialogue_per_shot,
+            )
+        if not segment_plans:
+            continue
+        planned: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        try:
+            for (segment, source_mode), shot_count in zip(
+                segment_plans, counts, strict=True,
+            ):
+                batch_snapshot = _snapshot_for_creative_batch(
+                    snapshot, source_field=source_field, source_segment=segment,
+                )
+                batch_dialogue_count = len(required_dialogue_manifest(
+                    batch_snapshot, include_audio=include_audio,
+                ))
+                batch_config = dict(config)
+                batch_config["max_dialogue_per_shot"] = max(
+                    config["max_dialogue_per_shot"],
+                    (batch_dialogue_count + shot_count - 1) // shot_count,
+                )
+                request = _runtime_request(
+                    project=project, episode=episode, snapshot=batch_snapshot,
+                    context_hash=context_hash, target_shot_count=shot_count,
+                    creativity=creativity, variation_note=variation_note,
+                    attempt=attempt, provider_config=batch_config,
+                )
+                request["_batch_source_mode"] = source_mode
+                planned.append((batch_snapshot, request))
+        except CreativeDraftError as exc:
+            last_error = exc
+            continue
+        return planned
+    cause = str(last_error) if last_error else (
+        "剧本缺少足够的连续段落，无法在不拆开原文对白的前提下规划批次。"
+    )
+    raise CreativeValidationError(
+        f"无法按当前通道配置安全拆分本次创作：{cause}",
+        code="creative_batch_planning_failed",
+        public_context={
+            "target_shot_count": target_shot_count,
+            "batch_shots": config["batch_shots"],
+            "required_dialogue_count": len(full_dialogue),
+        },
+    )
+
+
+def _creative_batch_boundary(shot: dict[str, Any]) -> dict[str, Any]:
+    """Return only validated continuity facts needed by the next batch."""
+    return {
+        "client_key": str(shot.get("client_key") or ""),
+        "order": int(shot.get("order") or 0),
+        "scene_id": str(shot.get("scene_id")) if shot.get("scene_id") else None,
+        "character_ids": [str(value) for value in shot.get("character_ids", [])],
+        "prop_ids": [str(value) for value in shot.get("prop_ids", [])],
+        "action_zh": str(shot.get("action_zh") or ""),
+        "action_en": str(shot.get("action_en") or ""),
+        "continuity_zh": str(shot.get("continuity_zh") or ""),
+        "continuity_en": str(shot.get("continuity_en") or ""),
+    }
+
+
+def _offset_batch_review_issues(
+    issues: list[dict[str, str]], *, shot_offset: int,
+) -> list[dict[str, str]]:
+    shifted: list[dict[str, str]] = []
+    for issue in issues:
+        item = dict(issue)
+        path = str(item.get("path") or "")
+        item["path"] = re.sub(
+            r"^shots\[(\d+)\]",
+            lambda match: f"shots[{int(match.group(1)) + shot_offset}]",
+            path,
+        )
+        shifted.append(item)
+    return shifted
+
+
+def _run_initial_creative_batches(
+    *, project: SeriesProject, episode: Episode, snapshot: dict[str, Any],
+    context_hash: str, target_shot_count: int, creativity: str,
+    variation_note: str, attempt: int, config: dict[str, Any], provider: str,
+) -> tuple[dict[str, Any], list[dict[str, str]], list[str], dict[str, Any]]:
+    planned = _plan_initial_creative_batches(
+        project=project, episode=episode, snapshot=snapshot,
+        context_hash=context_hash, target_shot_count=target_shot_count,
+        creativity=creativity, variation_note=variation_note,
+        attempt=attempt, config=config,
+    )
+    batch_count = len(planned)
+    merged_candidate: dict[str, Any] | None = None
+    merged_shots: list[dict[str, Any]] = []
+    merged_review_issues: list[dict[str, str]] = []
+    warnings: list[str] = []
+    runtime_rows: list[dict[str, Any]] = []
+    output_token_budget = 0
+    previous_boundary: dict[str, Any] | None = None
+    shot_offset = 0
+    planned_shot_offset = 0
+    partial_failure: dict[str, Any] | None = None
+    for batch_index, (_batch_snapshot, request) in enumerate(planned, start=1):
+        batch_shot_count = int(request["options"]["shot_count"])
+        source_mode = str(request.pop("_batch_source_mode", "contiguous_excerpt"))
+        request["request_id"] = f"{context_hash[:16]}-b{batch_index:03d}"
+        request["seed"] = int(request["seed"]) + batch_index - 1
+        if batch_index > 1:
+            request["episode"]["continuity_from_previous"] = ""
+        if batch_index < batch_count:
+            request["episode"]["continuity_to_next"] = ""
+        request["batch_context"] = {
+            "batch_index": batch_index,
+            "batch_count": batch_count,
+            "global_shot_start": planned_shot_offset + 1,
+            "global_shot_end": planned_shot_offset + batch_shot_count,
+            "global_shot_count": target_shot_count,
+            "source_mode": source_mode,
+            "previous_shot": previous_boundary,
+        }
+        try:
+            payload = _run_provider_runtime(request, config, provider)
+            result_payload = (
+                payload.get("result")
+                if isinstance(payload.get("result"), dict)
+                else {}
+            )
+            batch_review_issues = _normalise_runtime_review_issues(
+                payload.get("review_issues", result_payload.get("review_issues")),
+            )
+            candidate = _normalise_runtime_result(payload, context_hash=context_hash)
+            local_shots = candidate.get("shots")
+            if not isinstance(local_shots, list) or not local_shots:
+                raise CreativeValidationError(
+                    "模型批次没有返回可保留的镜头。",
+                    code="creative_batch_empty",
+                    public_context={"target_shot_count": batch_shot_count},
+                )
+            if _reconcile_authoritative_dialogue_manifest(
+                local_shots,
+                list(request.get("required_dialogue_manifest") or []),
+                max_dialogue_per_shot=int(
+                    request["options"]["max_dialogue_per_shot"]
+                ),
+            ):
+                batch_review_issues.append(_creative_review_issue(
+                    "dialogue_manifest_repaired", "shots[].dialogue",
+                ))
+            if len(local_shots) != batch_shot_count:
+                merged_review_issues.append(_creative_review_issue(
+                    "batch_shot_count_mismatch", f"shots[{shot_offset}]",
+                ))
+            numbered: list[dict[str, Any]] = []
+            order_repaired = False
+            for local_index, raw_shot in enumerate(local_shots, start=1):
+                raw_order = raw_shot.get("order") if isinstance(raw_shot, dict) else None
+                if (
+                    isinstance(raw_order, bool)
+                    or not isinstance(raw_order, int)
+                    or raw_order != local_index
+                ):
+                    order_repaired = True
+                global_order = shot_offset + local_index
+                shot = dict(raw_shot)
+                shot["order"] = global_order
+                shot["client_key"] = f"shot-{global_order:02d}"
+                numbered.append(shot)
+            if order_repaired:
+                merged_review_issues.append(_creative_review_issue(
+                    "batch_shot_order_repaired", f"shots[{shot_offset}]",
+                ))
+            if merged_candidate is None:
+                merged_candidate = dict(candidate)
+                merged_candidate["shots"] = merged_shots
+            merged_shots.extend(numbered)
+            merged_review_issues.extend(_offset_batch_review_issues(
+                batch_review_issues, shot_offset=shot_offset,
+            ))
+            warnings.extend(request.get("input_warnings", []))
+            runtime_rows.append(_runtime_metadata(payload))
+            output_token_budget += int(request["provider_output_token_budget"])
+            previous_boundary = _creative_batch_boundary(numbered[-1])
+            shot_offset += len(numbered)
+            planned_shot_offset += batch_shot_count
+        except CreativeDraftError as exc:
+            exc.runtime_metadata.update({
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+                "global_shot_start": planned_shot_offset + 1,
+                "global_shot_end": planned_shot_offset + batch_shot_count,
+            })
+            if merged_candidate is None or not merged_shots:
+                raise
+            partial_failure = {
+                "error_code": exc.code,
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+            }
+            merged_review_issues.append(_creative_review_issue(
+                "generation_incomplete", "shots",
+            ))
+            warnings.append(
+                f"第 {batch_index} 批未完成；已保留前 {shot_offset} 个可解析镜头供人工确认。"
+            )
+            break
+    if merged_candidate is None or not merged_shots:
+        raise CreativeValidationError(
+            "模型未返回可保留的镜头数据。",
+            code="creative_batch_empty",
+            public_context={"target_shot_count": target_shot_count},
+        )
+    if shot_offset != target_shot_count:
+        merged_review_issues.append(_creative_review_issue(
+            "shot_count_mismatch", "shots",
+        ))
+    include_audio = bool((episode.prompt_settings or {}).get("include_audio", True))
+    runtime = dict(runtime_rows[-1])
+    elapsed_rows = [
+        int(row.get("elapsed_ms") or 0) for row in runtime_rows
+        if isinstance(row.get("elapsed_ms"), (int, float))
+    ]
+    runtime.update({
+        "batch_count": batch_count,
+        "batch_shot_counts": [
+            int(request["options"]["shot_count"]) for _snapshot, request in planned
+        ],
+        "batch_elapsed_ms": elapsed_rows,
+        "elapsed_ms": sum(elapsed_rows),
+        "actual_output_token_budget": output_token_budget,
+        "required_dialogue_count": len(required_dialogue_manifest(
+            snapshot, include_audio=include_audio,
+        )),
+        "generated_shot_count": shot_offset,
+        "generation_incomplete": bool(partial_failure),
+    })
+    if partial_failure:
+        runtime["partial_failure"] = partial_failure
+    return (
+        merged_candidate,
+        _dedupe_review_issues(merged_review_issues),
+        list(dict.fromkeys(warnings)),
+        runtime,
+    )
 
 
 def generate_creative_candidate(
@@ -1291,56 +2308,249 @@ def generate_creative_candidate(
     attempt: int = 1,
     regeneration_context: dict[str, Any] | None = None,
     provider: str | None = None,
+    extended_generation_confirmed: bool = False,
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], list[str], str]:
     provider = normalise_creative_provider(
         provider,
         default=getattr(settings, "PROMPT_CREATIVE_DEFAULT_PROVIDER", LOCAL_QWEN_PROVIDER),
     )
-    config = creative_config()
-    if not config["min_shots"] <= target_shot_count <= config["max_shots"]:
+    config = creative_provider_config(provider)
+    if target_shot_count < 1:
         raise CreativeValidationError(
-            f"一次仅支持 {config['min_shots']}–{config['max_shots']} 个镜头；更多镜头请分段生成。"
+            "生成镜数必须是正整数。",
+            code="creative_shot_count_invalid",
+            public_context={
+                "target_shot_count": target_shot_count,
+            },
         )
     snapshot = creative_context_snapshot(project, episode)
+    _source_field, authoritative_source = _creative_batch_source(snapshot)
+    source_char_count = len(authoritative_source)
+    include_audio = bool((episode.prompt_settings or {}).get("include_audio", True))
+    authored_dialogue = required_dialogue_manifest(snapshot, include_audio=include_audio)
+    configured_dialogue_per_shot = int(config["max_dialogue_per_shot"])
+    effective_dialogue_per_shot = max(
+        configured_dialogue_per_shot,
+        (len(authored_dialogue) + target_shot_count - 1) // target_shot_count,
+    )
+    below_shot_recommendation = target_shot_count < config["min_shots"]
+    exceeds_shot_recommendation = target_shot_count > config["recommended_max_shots"]
+    exceeds_dialogue_recommendation = (
+        effective_dialogue_per_shot > configured_dialogue_per_shot
+    )
+    episode_title_chars = len(str(snapshot["episode"].get("title") or ""))
+    dialogue_text_chars = max(
+        (len(str(item.get("text_zh") or "")) for item in authored_dialogue),
+        default=0,
+    )
+    dialogue_delivery_chars = max(
+        (len(str(item.get("source_delivery_zh") or "")) for item in authored_dialogue),
+        default=0,
+    )
+    exceeds_title_recommendation = episode_title_chars > config["max_episode_title_chars"]
+    exceeds_dialogue_text_recommendation = (
+        dialogue_text_chars > config["max_dialogue_text_chars"]
+    )
+    exceeds_dialogue_delivery_recommendation = (
+        dialogue_delivery_chars > config["max_dialogue_delivery_chars"]
+    )
+    # Only initial/whole-draft generation has the all-or-nothing batch planner.
+    # Selected-shot regeneration carries the full previous draft in one request;
+    # its configurable source/regeneration budgets remain a real single-call
+    # preflight rather than presenting a confirmation that cannot be fulfilled.
+    exceeds_source_batch = (
+        regeneration_context is None
+        and source_char_count > config["max_source_chars"]
+    )
+    if (
+        (
+            below_shot_recommendation
+            or exceeds_shot_recommendation
+            or exceeds_source_batch
+            or exceeds_dialogue_recommendation
+            or exceeds_title_recommendation
+            or exceeds_dialogue_text_recommendation
+            or exceeds_dialogue_delivery_recommendation
+        )
+        and not extended_generation_confirmed
+    ):
+        reasons = []
+        if below_shot_recommendation:
+            reasons.append(
+                f"{target_shot_count} 个镜头低于建议的 "
+                f"{config['min_shots']} 个"
+            )
+        if exceeds_shot_recommendation:
+            reasons.append(
+                f"{target_shot_count} 个镜头超过建议的 "
+                f"{config['recommended_max_shots']} 个"
+            )
+        if exceeds_source_batch:
+            reasons.append(
+                f"权威剧本 {source_char_count} 字符超过单批建议的 "
+                f"{config['max_source_chars']} 字符"
+            )
+        if exceeds_dialogue_recommendation:
+            reasons.append(
+                f"{len(authored_dialogue)} 句原文对白平均需要每镜最多 "
+                f"{effective_dialogue_per_shot} 句，超过建议的 "
+                f"{configured_dialogue_per_shot} 句"
+            )
+        if exceeds_title_recommendation:
+            reasons.append(
+                f"剧集标题 {episode_title_chars} 字符超过建议的 "
+                f"{config['max_episode_title_chars']} 字符"
+            )
+        if exceeds_dialogue_text_recommendation:
+            reasons.append(
+                f"最长原文对白 {dialogue_text_chars} 字符超过建议的 "
+                f"{config['max_dialogue_text_chars']} 字符"
+            )
+        if exceeds_dialogue_delivery_recommendation:
+            reasons.append(
+                f"最长对白表演标注 {dialogue_delivery_chars} 字符超过建议的 "
+                f"{config['max_dialogue_delivery_chars']} 字符"
+            )
+        raise CreativeValidationError(
+            f"本次创作{'，'.join(reasons)}，系统将自动分批，预计等待时间和资源消耗会增加；"
+            "请确认后继续。",
+            code="creative_generation_confirmation_required",
+            public_context={
+                "target_shot_count": target_shot_count,
+                "recommended_max_shots": config["recommended_max_shots"],
+                "batch_shots": config["batch_shots"],
+                "source_char_count": source_char_count,
+                "max_source_chars": config["max_source_chars"],
+                "required_dialogue_count": len(authored_dialogue),
+                "dialogue_capacity": target_shot_count * configured_dialogue_per_shot,
+                "max_dialogue_per_shot": configured_dialogue_per_shot,
+                "effective_max_dialogue_per_shot": effective_dialogue_per_shot,
+                "episode_title_chars": episode_title_chars,
+                "max_episode_title_chars": config["max_episode_title_chars"],
+                "dialogue_text_chars": dialogue_text_chars,
+                "max_dialogue_text_chars": config["max_dialogue_text_chars"],
+                "dialogue_delivery_chars": dialogue_delivery_chars,
+                "max_dialogue_delivery_chars": config["max_dialogue_delivery_chars"],
+            },
+        )
+    runtime_config = dict(config)
+    runtime_config["min_shots"] = min(config["min_shots"], target_shot_count)
+    runtime_config["max_dialogue_per_shot"] = effective_dialogue_per_shot
+    runtime_config["max_episode_title_chars"] = max(
+        config["max_episode_title_chars"], episode_title_chars,
+    )
+    runtime_config["max_dialogue_text_chars"] = max(
+        config["max_dialogue_text_chars"], dialogue_text_chars,
+    )
+    runtime_config["max_dialogue_delivery_chars"] = max(
+        config["max_dialogue_delivery_chars"], dialogue_delivery_chars,
+    )
     context_hash = hashlib.sha256(json.dumps(
         snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
     ).encode("utf-8")).hexdigest()
-    request = _runtime_request(
-        project=project, episode=episode, snapshot=snapshot, context_hash=context_hash,
-        target_shot_count=target_shot_count, creativity=creativity,
-        variation_note=variation_note, attempt=attempt,
-        regeneration_context=regeneration_context,
-    )
     try:
-        payload = _run_provider_runtime(request, config, provider)
-    except CreativeDraftError as exc:
-        _attach_attempt_audit(
-            exc, snapshot=snapshot, context_hash=context_hash,
-            project=project, episode=episode,
-        )
-        raise
-    result_payload = payload.get("result") if isinstance(payload.get("result"), dict) else {}
-    runtime_review_issues = _normalise_runtime_review_issues(
-        payload.get("review_issues", result_payload.get("review_issues")),
-    )
-    try:
-        candidate = _normalise_runtime_result(payload, context_hash=context_hash)
+        if regeneration_context is None:
+            candidate, runtime_review_issues, input_warnings, runtime = (
+                _run_initial_creative_batches(
+                    project=project, episode=episode, snapshot=snapshot,
+                    context_hash=context_hash,
+                    target_shot_count=target_shot_count,
+                    creativity=creativity, variation_note=variation_note,
+                    attempt=attempt, config=runtime_config, provider=provider,
+                )
+            )
+        else:
+            request = _runtime_request(
+                project=project, episode=episode, snapshot=snapshot,
+                context_hash=context_hash,
+                target_shot_count=target_shot_count, creativity=creativity,
+                variation_note=variation_note, attempt=attempt,
+                regeneration_context=regeneration_context,
+                provider_config=runtime_config,
+            )
+            payload = _run_provider_runtime(request, runtime_config, provider)
+            result_payload = (
+                payload.get("result")
+                if isinstance(payload.get("result"), dict)
+                else {}
+            )
+            runtime_review_issues = _normalise_runtime_review_issues(
+                payload.get("review_issues", result_payload.get("review_issues")),
+            )
+            candidate = _normalise_runtime_result(payload, context_hash=context_hash)
+            input_warnings = list(request.get("input_warnings", []))
+            runtime = _runtime_metadata(payload)
+            runtime.update({
+                "actual_output_token_budget": int(
+                    request["provider_output_token_budget"]
+                ),
+                "required_dialogue_count": len(
+                    request["required_dialogue_manifest"]
+                ),
+            })
         data, validation = validate_creative_draft_data(
             project, episode, candidate, target_shot_count=target_shot_count,
             runtime_review_issues=runtime_review_issues,
+            max_dialogue_per_shot=runtime_config["max_dialogue_per_shot"],
+            min_shot_duration_ms=runtime_config["min_shot_duration_ms"],
+            max_shot_duration_ms=runtime_config["max_shot_duration_ms"],
+            review_policy=runtime_config,
         )
     except CreativeDraftError as exc:
         _attach_attempt_audit(
             exc, snapshot=snapshot, context_hash=context_hash,
             project=project, episode=episode,
+            provider_config=runtime_config,
         )
         raise
+    if exceeds_dialogue_recommendation:
+        validation_issues = validation.setdefault("review_issues", [])
+        validation_issues[:] = _dedupe_review_issues([
+            *validation_issues,
+            _creative_review_issue("dialogue_density_high", "shots[].dialogue"),
+        ])
+        validation["summary"] = _creative_review_summary(validation_issues)
+        validation["status"] = validation["summary"]["status"]
+        input_warnings.append(
+            f"本次 {len(authored_dialogue)} 句原文对白按实际需要提高到每镜最多 "
+            f"{effective_dialogue_per_shot} 句；已保留为人工审核提醒。"
+        )
+    field_recommendation_issues = []
+    if exceeds_title_recommendation:
+        field_recommendation_issues.append(_creative_review_issue(
+            "field_length_above_recommendation", "episode.title_zh",
+        ))
+    if exceeds_dialogue_text_recommendation:
+        field_recommendation_issues.append(_creative_review_issue(
+            "field_length_above_recommendation", "shots[].dialogue.text_zh",
+        ))
+    if exceeds_dialogue_delivery_recommendation:
+        field_recommendation_issues.append(_creative_review_issue(
+            "field_length_above_recommendation", "shots[].dialogue.delivery_zh",
+        ))
+    if field_recommendation_issues:
+        validation_issues = validation.setdefault("review_issues", [])
+        validation_issues[:] = _dedupe_review_issues([
+            *validation_issues, *field_recommendation_issues,
+        ])
+        validation["summary"] = _creative_review_summary(validation_issues)
+        validation["status"] = validation["summary"]["status"]
+        input_warnings.append(
+            "剧集标题或原文对白超过所选通道的建议长度；已按实际内容继续并标记人工审核。"
+        )
+    runtime["configured_max_dialogue_per_shot"] = configured_dialogue_per_shot
+    runtime["effective_max_dialogue_per_shot"] = effective_dialogue_per_shot
+    runtime["effective_max_episode_title_chars"] = runtime_config["max_episode_title_chars"]
+    runtime["effective_max_dialogue_text_chars"] = runtime_config["max_dialogue_text_chars"]
+    runtime["effective_max_dialogue_delivery_chars"] = runtime_config[
+        "max_dialogue_delivery_chars"
+    ]
     validation["warnings"] = list(dict.fromkeys([
-        *request.get("input_warnings", []), *validation.get("warnings", []),
+        *input_warnings, *validation.get("warnings", []),
     ]))
     if _live_creative_context_hash(project.id, episode.id) != context_hash:
         raise CreativeContextConflict("创作期间项目或剧集上下文发生变化，请重新生成")
-    return data, validation, _runtime_metadata(payload), validation["warnings"], context_hash
+    return data, validation, runtime, validation["warnings"], context_hash
 
 
 def next_generation_no(episode: Episode) -> int:
@@ -1355,11 +2565,13 @@ def create_creative_draft(
     merge_from: EpisodeCreativeDraft | None = None, shot_keys: list[str] | None = None,
     expected_parent_revision: int | None = None,
     provider: str | None = None,
+    extended_generation_confirmed: bool = False,
 ) -> EpisodeCreativeDraft:
     provider = normalise_creative_provider(
         provider,
         default=getattr(settings, "PROMPT_CREATIVE_DEFAULT_PROVIDER", LOCAL_QWEN_PROVIDER),
     )
+    provider_policy = creative_provider_config(provider)
     attempt = max(next_generation_no(episode), (parent.generation_no + 1) if parent else 1)
     regeneration_context = None
     if merge_from and shot_keys:
@@ -1376,6 +2588,7 @@ def create_creative_draft(
         creativity=creativity, variation_note=variation_note, attempt=attempt,
         regeneration_context=regeneration_context,
         provider=provider,
+        extended_generation_confirmed=extended_generation_confirmed,
     )
     if merge_from and shot_keys:
         previous_by_key = {
@@ -1395,6 +2608,10 @@ def create_creative_draft(
         data, validation = validate_creative_draft_data(
             project, episode, data, target_shot_count=len(merged),
             runtime_review_issues=validation.get("review_issues", []),
+            max_dialogue_per_shot=provider_policy["max_dialogue_per_shot"],
+            min_shot_duration_ms=provider_policy["min_shot_duration_ms"],
+            max_shot_duration_ms=provider_policy["max_shot_duration_ms"],
+            review_policy=provider_policy,
         )
         warnings = validation["warnings"]
 
@@ -1423,8 +2640,26 @@ def create_creative_draft(
                 "provider": provider,
                 "target_shot_count": target_shot_count,
                 "attempt": attempt,
+                "extended_generation_confirmed": bool(extended_generation_confirmed),
+                **_creative_policy_audit(provider_policy),
                 "actual_output_token_budget": runtime.get("actual_output_token_budget"),
                 "required_dialogue_count": runtime.get("required_dialogue_count"),
+                "effective_max_dialogue_per_shot": runtime.get(
+                    "effective_max_dialogue_per_shot",
+                    provider_policy["max_dialogue_per_shot"],
+                ),
+                "effective_max_episode_title_chars": runtime.get(
+                    "effective_max_episode_title_chars",
+                    provider_policy["max_episode_title_chars"],
+                ),
+                "effective_max_dialogue_text_chars": runtime.get(
+                    "effective_max_dialogue_text_chars",
+                    provider_policy["max_dialogue_text_chars"],
+                ),
+                "effective_max_dialogue_delivery_chars": runtime.get(
+                    "effective_max_dialogue_delivery_chars",
+                    provider_policy["max_dialogue_delivery_chars"],
+                ),
             },
             creativity=creativity, variation_note=variation_note,
             draft_data=data, validation=validation, warnings=warnings,
@@ -1432,9 +2667,7 @@ def create_creative_draft(
                     if validation["status"] in {"passed", "ready", "needs_review"}
                     else EpisodeCreativeDraft.Status.FAILED),
             provider=provider,
-            model=str(runtime.get("model") or (
-                creative_config()["model_id"] if provider == LOCAL_QWEN_PROVIDER else ""
-            )),
+            model=str(runtime.get("model") or provider_policy["model_id"]),
             runtime_metadata=runtime,
             error_message=("" if validation["status"] in {"passed", "ready", "needs_review"}
                            else "；".join(validation["errors"])[:10000]),
@@ -1461,8 +2694,14 @@ def create_failed_creative_draft(
     parent: EpisodeCreativeDraft | None = None,
     expected_parent_revision: int | None = None,
     provider: str = LOCAL_QWEN_PROVIDER,
+    extended_generation_confirmed: bool = False,
+    provider_policy_snapshot: dict[str, int | float] | None = None,
 ) -> EpisodeCreativeDraft:
     """Persist an auditable runtime failure without touching formal shots."""
+    provider = normalise_creative_provider(provider, default=LOCAL_QWEN_PROVIDER)
+    provider_policy = _creative_policy_audit(
+        provider_policy_snapshot or creative_provider_config(provider)
+    )
     with transaction.atomic():
         locked_project = SeriesProject.objects.select_for_update().select_related("style").get(
             pk=project.pk,
@@ -1491,6 +2730,8 @@ def create_failed_creative_draft(
                 "target_shot_count": target_shot_count,
                 "runtime_error_code": error_code,
                 "source_drift_during_attempt": bool(source_drift_during_attempt),
+                "extended_generation_confirmed": bool(extended_generation_confirmed),
+                **provider_policy,
             },
             creativity=creativity, variation_note=variation_note,
             status=EpisodeCreativeDraft.Status.FAILED,
@@ -1521,6 +2762,38 @@ def append_revision_history(draft: EpisodeCreativeDraft) -> None:
 def creative_review_issues(validation: dict[str, Any] | None) -> list[dict[str, Any]]:
     raw = (validation or {}).get("review_issues", [])
     return [item for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
+
+
+_PERSISTENT_GENERATION_REVIEW_CODES = {
+    "batch_shot_count_mismatch",
+    "batch_shot_order_repaired",
+    "dialogue_density_high",
+    "dialogue_manifest_repaired",
+    "generation_incomplete",
+    "model_output_incomplete_finish_reason",
+    "shot_count_mismatch",
+}
+
+
+def preserve_generation_review_issues(
+    validation: dict[str, Any],
+    previous_validation: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Keep model-generation provenance visible until a human acknowledges it."""
+    persistent = [
+        item for item in creative_review_issues(previous_validation)
+        if str(item.get("code") or "") in _PERSISTENT_GENERATION_REVIEW_CODES
+    ]
+    if not persistent:
+        return validation
+    issues = _dedupe_review_issues([
+        *creative_review_issues(validation),
+        *persistent,
+    ])
+    validation["review_issues"] = issues
+    validation["summary"] = _creative_review_summary(issues)
+    validation["status"] = validation["summary"]["status"]
+    return validation
 
 
 def creative_requires_edit_issues(
@@ -1814,14 +3087,20 @@ def apply_creative_draft(
     review_acknowledged: bool = False,
 ) -> tuple[Episode, list[Shot], int]:
     """Apply a confirmed draft atomically; this is the sole formal write path."""
+    identity = EpisodeCreativeDraft.objects.only(
+        "project_id", "episode_id",
+    ).get(pk=draft.pk)
     with transaction.atomic():
+        project = SeriesProject.objects.select_for_update().select_related("style").get(
+            pk=identity.project_id,
+        )
+        episode = Episode.objects.select_for_update().get(
+            pk=identity.episode_id,
+            project=project,
+        )
         locked = EpisodeCreativeDraft.objects.select_for_update().select_related(
             "project", "episode",
-        ).get(pk=draft.pk)
-        project = SeriesProject.objects.select_for_update().select_related("style").get(
-            pk=locked.project_id,
-        )
-        episode = Episode.objects.select_for_update().get(pk=locked.episode_id)
+        ).get(pk=draft.pk, project=project, episode=episode)
         if locked.revision != expected_revision:
             raise CreativeRevisionConflict("草稿版本已变化，请刷新后再应用")
         if locked.status != EpisodeCreativeDraft.Status.CONFIRMED:
@@ -1835,6 +3114,20 @@ def apply_creative_draft(
         checked_data, checked_validation = validate_creative_draft_data(
             project, episode, locked.draft_data,
             target_shot_count=len((locked.draft_data or {}).get("shots", [])),
+            max_dialogue_per_shot=(locked.input_settings or {}).get(
+                "effective_max_dialogue_per_shot",
+                (locked.input_settings or {}).get("max_dialogue_per_shot"),
+            ),
+            min_shot_duration_ms=(locked.input_settings or {}).get(
+                "min_shot_duration_ms"
+            ),
+            max_shot_duration_ms=(locked.input_settings or {}).get(
+                "max_shot_duration_ms"
+            ),
+            review_policy=locked.input_settings or None,
+        )
+        checked_validation = preserve_generation_review_issues(
+            checked_validation, locked.validation,
         )
         if checked_validation["status"] not in {"passed", "ready", "needs_review"}:
             raise CreativeValidationError(

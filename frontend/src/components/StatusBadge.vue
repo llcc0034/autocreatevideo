@@ -1,6 +1,6 @@
 <script setup lang="ts">
 defineProps<{ status: string; label?: string }>()
-const labels: Record<string, string> = { draft: '草稿', writing: '编剧中', producing: '制作中', ready: '待生成', rendering: '生成中', completed: '已完成', queued: '排队中', running: '运行中', paused: '已暂停', failed: '失败', pending: '等待中', done: '完成' }
+const labels: Record<string, string> = { draft: '草稿', writing: '编剧中', producing: '制作中', ready: '待生成', rendering: '生成中', completed: '已完成', archived: '已归档', queued: '排队中', running: '运行中', paused: '已暂停', failed: '失败', pending: '等待中', done: '完成' }
 </script>
 <template><span class="status-badge" :class="`is-${status}`"><i></i>{{ label || labels[status] || status }}</span></template>
 <style scoped>

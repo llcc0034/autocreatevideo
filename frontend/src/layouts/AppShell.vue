@@ -11,16 +11,16 @@ const collapsed = ref(localStorage.getItem('cineforge_nav_collapsed') === 'true'
 const mobileOpen = ref(false)
 const nav = [
   { label: '制作总览', to: '/', icon: LayoutDashboard, match: (path: string) => path === '/' },
-  { label: '连续剧项目', to: '/projects/new', icon: Clapperboard, match: (path: string) => path.startsWith('/projects') },
+  { label: '连续剧项目', to: '/projects', icon: Clapperboard, match: (path: string) => path.startsWith('/projects') },
   { label: '风格素材库', to: '/assets', icon: Images, match: (path: string) => path.startsWith('/assets') },
   { label: '生产工作流', to: '/workflows', icon: Workflow, match: (path: string) => path.startsWith('/workflows') },
   { label: '操作手册', to: '/manual', icon: BookOpenCheck, match: (path: string) => path.startsWith('/manual') }
 ]
-const pageTitle = computed(() => String(route.meta.title || 'CineForge'))
+const pageTitle = computed(() => String(route.meta.title || 'AutoPrompt Studio'))
 const toggleCollapse = () => { collapsed.value = !collapsed.value; localStorage.setItem('cineforge_nav_collapsed', String(collapsed.value)) }
 const logout = () => { studio.resetSessionState(); auth.logout(); router.replace('/login') }
 const unauthorized = () => logout()
-onMounted(() => { void auth.refreshUser().catch(() => undefined); studio.initialize(); window.addEventListener('cineforge:unauthorized', unauthorized) })
+onMounted(() => { void auth.refreshUser().catch(() => undefined); void studio.initialize().catch(() => undefined); window.addEventListener('cineforge:unauthorized', unauthorized) })
 onBeforeUnmount(() => window.removeEventListener('cineforge:unauthorized', unauthorized))
 </script>
 
@@ -48,7 +48,7 @@ onBeforeUnmount(() => window.removeEventListener('cineforge:unauthorized', unaut
         <div class="top-actions">
           <button class="search-button"><Search :size="15"/><span>搜索项目、素材</span><kbd>⌘ K</kbd></button>
           <button class="icon-btn notification"><Bell :size="17"/><i></i></button>
-          <RouterLink to="/projects/new" class="button primary small"><Plus :size="16"/>新建连续剧</RouterLink>
+          <RouterLink v-if="!['projects','dashboard','project-new'].includes(String(route.name))" to="/projects/new" class="button primary small"><Plus :size="16"/>新建连续剧</RouterLink>
           <div class="user-avatar" :title="auth.user?.email">{{ (auth.user?.name || '创').slice(0,1).toUpperCase() }}</div>
         </div>
       </header>

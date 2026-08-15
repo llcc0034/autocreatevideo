@@ -4,6 +4,8 @@ WORKDIR /app
 COPY frontend/package.json frontend/package-lock.json ./
 RUN npm ci
 COPY frontend ./
+ARG VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS=720000
+ENV VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS=${VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS}
 RUN npm run build
 
 FROM nginx:1.27-alpine

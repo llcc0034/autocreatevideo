@@ -7,6 +7,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ImproperlyConfigured
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
@@ -33,7 +34,9 @@ from studio.services.creative_drafts import (
     creative_context_hash,
     creative_context_snapshot,
     creative_config,
+    creative_provider_config,
     ensure_creative_resources_available,
+    validate_creative_draft_data,
 )
 from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
 from studio.services.local_qwen_lock import local_qwen_runtime_lock
@@ -51,11 +54,61 @@ User = get_user_model()
         "runtime_python": "../.runtime/qwen-python/Scripts/python.exe",
         "device": "cpu",
         "timeout_seconds": 900,
+        "process_cleanup_grace_seconds": 60,
         "max_new_tokens": 3072,
         "context_size": 8192,
+        "min_context_size": 8192,
+        "max_context_size": 32768,
+        "reserved_input_tokens": 2048,
         "min_shots": 1,
-        "max_shots": 4,
+        "recommended_max_shots": 4,
+        "batch_shots": 4,
+        "max_dialogue_per_shot": 2,
+        "max_episode_title_chars": 80,
+        "max_dialogue_text_chars": 240,
+        "max_dialogue_delivery_chars": 100,
+        "max_dialogue_delivery_en_chars": 150,
+        "min_shot_duration_ms": 5000,
+        "max_shot_duration_ms": 15000,
+        "output_min_tokens": 1024,
+        "output_base_tokens": 768,
+        "output_tokens_per_shot": 384,
+        "output_tokens_per_dialogue": 128,
+        "output_dialogue_char_threshold": 32,
         "max_source_chars": 16000,
+        "max_regeneration_context_chars": 16000,
+        "max_input_chars": 24000,
+        "output_headroom_per_shot": 0,
+    },
+    DEEPSEEK_API={
+        "enabled": True,
+        "base_url": "https://api.deepseek.com",
+        "api_key": "test-secret-key",
+        "model": "deepseek-v4-flash",
+        "timeout_seconds": 180,
+        "max_retries": 0,
+        "max_tokens": 16384,
+    },
+    DEEPSEEK_CREATIVE={
+        "min_shots": 1,
+        "recommended_max_shots": 4,
+        "batch_shots": 16,
+        "max_dialogue_per_shot": 2,
+        "max_episode_title_chars": 80,
+        "max_dialogue_text_chars": 240,
+        "max_dialogue_delivery_chars": 100,
+        "max_dialogue_delivery_en_chars": 150,
+        "min_shot_duration_ms": 5000,
+        "max_shot_duration_ms": 15000,
+        "output_min_tokens": 1024,
+        "output_base_tokens": 768,
+        "output_tokens_per_shot": 384,
+        "output_tokens_per_dialogue": 128,
+        "output_dialogue_char_threshold": 32,
+        "max_source_chars": 24000,
+        "max_regeneration_context_chars": 96000,
+        "max_input_chars": 120000,
+        "output_headroom_per_shot": 384,
     },
 )
 class CreativeDraftAPITests(TestCase):
@@ -541,7 +594,9 @@ class CreativeDraftAPITests(TestCase):
             "凌霜侧身闪避，右腕翻转，斜撩荡刀，左脚踢膝。"
             "凌霜后撤半步，剑尖点地，纵身跃入黑暗，消失。"
         )
-        durations = _recommended_shot_durations_ms(script, 2, 5_000)
+        durations = _recommended_shot_durations_ms(
+            script, 2, 5_000, minimum_ms=5_000, maximum_ms=15_000,
+        )
         self.assertEqual(len(durations), 2)
         self.assertTrue(all(5_000 <= value <= 15_000 for value in durations))
         self.assertGreater(sum(durations), 10_000)
@@ -551,6 +606,14 @@ class CreativeDraftAPITests(TestCase):
         }])
         self.assertEqual(issue["code"], "script_action_coverage_low")
         self.assertNotIn("/", issue["suggestion_zh"])
+        self.assertIsNone(_script_action_coverage_issue(
+            script,
+            [{
+                "narrative_zh": "凌霜拔剑出鞘，跃入雨幕。",
+                "action_zh": "杀手扑出挥刀直劈。",
+            }],
+            minimum_coverage_percent=1,
+        ))
 
     @override_settings(H3_PROMPT_LANGUAGE_GATE="warn")
     def test_bilingual_apply_feeds_confirmed_english_into_h3_compiler(self):
@@ -1049,13 +1112,171 @@ class CreativeDraftAPITests(TestCase):
         response = self.client.get("/api/v1/capabilities/creative-drafts/")
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data["creative_generation_supported"])
-        self.assertEqual(response.data["min_shots"], 1)
-        self.assertEqual(response.data["max_shots"], 4)
-        self.assertEqual(response.data["baseline_max_new_tokens"], 2304)
-        self.assertEqual(response.data["max_new_tokens"], 3072)
-        self.assertEqual(response.data["runtime_timeout_seconds"], 900)
-        self.assertEqual(response.data["process_timeout_seconds"], 960)
         self.assertTrue(response.data["review_required"])
+        self.assertNotIn("min_shots", response.data)
+        providers = {item["id"]: item for item in response.data["providers"]}
+
+        local = providers["local_qwen"]
+        self.assertEqual(local["min_shots"], 1)
+        self.assertEqual(local["recommended_max_shots"], 4)
+        self.assertEqual(local["batch_shots"], 4)
+        self.assertEqual(local["max_episode_title_chars"], 80)
+        self.assertEqual(local["max_dialogue_text_chars"], 240)
+        self.assertEqual(local["min_shot_duration_ms"], 5000)
+        self.assertEqual(local["max_shot_duration_ms"], 15000)
+        self.assertEqual(local["output_tokens_per_shot"], 384)
+        self.assertEqual(local["output_tokens_per_dialogue"], 128)
+        self.assertEqual(local["output_dialogue_char_threshold"], 32)
+        self.assertEqual(local["output_headroom_per_shot"], 0)
+        self.assertEqual(local["baseline_max_new_tokens"], 2304)
+        self.assertEqual(local["max_new_tokens"], 3072)
+        self.assertEqual(local["runtime_timeout_seconds"], 900)
+        self.assertEqual(local["process_timeout_seconds"], 960)
+        self.assertEqual(local["min_context_size"], 8192)
+        self.assertEqual(local["max_context_size"], 32768)
+        self.assertEqual(local["reserved_input_tokens"], 2048)
+        self.assertEqual(local["recommended_narrative_en_chars"], 1000)
+        self.assertEqual(local["recommended_action_en_chars"], 1000)
+        self.assertEqual(local["max_camera_movements"], 1)
+        self.assertEqual(local["max_action_sequence_markers"], 4)
+        self.assertEqual(local["min_script_action_coverage_percent"], 80)
+
+        deepseek = providers["deepseek_api"]
+        self.assertEqual(deepseek["min_shots"], 1)
+        self.assertEqual(deepseek["recommended_max_shots"], 4)
+        self.assertEqual(deepseek["batch_shots"], 16)
+        self.assertEqual(deepseek["max_dialogue_per_shot"], 2)
+        self.assertEqual(deepseek["max_output_tokens"], 16384)
+
+    def test_capability_maps_custom_deepseek_policy_without_root_level_duplicates(self):
+        policy = {
+            "min_shots": 2,
+            "recommended_max_shots": 6,
+            "batch_shots": 12,
+            "max_dialogue_per_shot": 3,
+            "max_episode_title_chars": 96,
+            "max_dialogue_text_chars": 300,
+            "max_dialogue_delivery_chars": 120,
+            "max_dialogue_delivery_en_chars": 180,
+            "min_shot_duration_ms": 6000,
+            "max_shot_duration_ms": 14000,
+            "output_min_tokens": 1200,
+            "output_base_tokens": 900,
+            "output_tokens_per_shot": 420,
+            "output_tokens_per_dialogue": 140,
+            "output_dialogue_char_threshold": 40,
+            "max_source_chars": 26000,
+            "max_regeneration_context_chars": 88000,
+            "max_input_chars": 130000,
+            "output_headroom_per_shot": 512,
+        }
+        with override_settings(DEEPSEEK_CREATIVE=policy):
+            response = self.client.get("/api/v1/capabilities/creative-drafts/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertNotIn("recommended_max_shots", response.data)
+        deepseek = next(
+            item for item in response.data["providers"] if item["id"] == "deepseek_api"
+        )
+        for key, value in policy.items():
+            self.assertEqual(deepseek[key], value)
+
+    def test_deepseek_policy_fallback_uses_one_shot_per_model_call(self):
+        with override_settings(DEEPSEEK_CREATIVE={}):
+            config = creative_provider_config("deepseek_api")
+
+        self.assertEqual(config["batch_shots"], 1)
+
+    def test_creative_provider_policy_rejects_invalid_environment_relationships(self):
+        from autoprompt_backend.settings import (
+            CREATIVE_DRAFT_REVIEW,
+            _validate_creative_provider_policy,
+            _validate_creative_review_policy,
+        )
+
+        valid = {
+            "min_shots": 1,
+            "recommended_max_shots": 4,
+            "batch_shots": 16,
+            "max_dialogue_per_shot": 2,
+            "max_episode_title_chars": 80,
+            "max_dialogue_text_chars": 240,
+            "max_dialogue_delivery_chars": 100,
+            "max_dialogue_delivery_en_chars": 150,
+            "min_shot_duration_ms": 5000,
+            "max_shot_duration_ms": 15000,
+            "output_min_tokens": 1024,
+            "output_base_tokens": 768,
+            "output_tokens_per_shot": 384,
+            "output_tokens_per_dialogue": 128,
+            "output_dialogue_char_threshold": 32,
+            "max_source_chars": 24000,
+            "max_regeneration_context_chars": 96000,
+            "max_input_chars": 120000,
+            "output_headroom_per_shot": 384,
+        }
+        _validate_creative_provider_policy(
+            {**valid, "recommended_max_shots": 11, "batch_shots": 4},
+            "DEEPSEEK_CREATIVE",
+        )
+        invalid_cases = (
+            ({**valid, "min_shots": 2, "recommended_max_shots": 1}, "MIN_SHOTS"),
+            ({**valid, "min_shots": 2, "batch_shots": 1}, "MIN_SHOTS"),
+            ({**valid, "max_source_chars": 120001}, "MAX_SOURCE_CHARS"),
+            ({**valid, "max_regeneration_context_chars": 120001}, "MAX_REGENERATION"),
+            ({**valid, "max_dialogue_text_chars": 0}, "MAX_DIALOGUE_TEXT_CHARS"),
+            ({**valid, "min_shot_duration_ms": 15001}, "MIN_SHOT_DURATION_MS"),
+            ({**valid, "max_shot_duration_ms": 18000}, "MAX_SHOT_DURATION_MS"),
+            ({**valid, "output_dialogue_char_threshold": -1}, "OUTPUT_DIALOGUE_CHAR_THRESHOLD"),
+            ({**valid, "output_headroom_per_shot": -1}, "OUTPUT_HEADROOM"),
+        )
+        for policy, message in invalid_cases:
+            with self.subTest(message=message), self.assertRaisesRegex(
+                ImproperlyConfigured, message,
+            ):
+                _validate_creative_provider_policy(policy, "DEEPSEEK_CREATIVE")
+
+        with self.assertRaisesRegex(ImproperlyConfigured, "NARRATIVE_EN"):
+            _validate_creative_review_policy({
+                **CREATIVE_DRAFT_REVIEW,
+                "recommended_narrative_en_chars": 0,
+            })
+        with self.assertRaisesRegex(ImproperlyConfigured, "between 1 and 100"):
+            _validate_creative_review_policy({
+                **CREATIVE_DRAFT_REVIEW,
+                "min_script_action_coverage_percent": 101,
+            })
+
+    def test_review_recommendations_are_configurable_advisories(self):
+        from django.conf import settings
+
+        candidate = self.candidate(count=1)
+        candidate["shots"][0]["camera_en"] = "Push in, then pan right."
+        candidate["shots"][0]["action_en"] = "Step forward, then turn, then stop."
+        review_policy = {
+            **settings.CREATIVE_DRAFT_REVIEW,
+            "recommended_narrative_en_chars": 10,
+            "max_camera_movements": 1,
+            "max_action_sequence_markers": 1,
+        }
+        _data, validation = validate_creative_draft_data(
+            self.project,
+            self.episode,
+            candidate,
+            target_shot_count=1,
+            review_policy=review_policy,
+        )
+        issue_codes = {
+            (item["code"], item["path"])
+            for item in validation["review_issues"]
+        }
+        self.assertIn(
+            ("field_length_above_recommendation", "shots[0].narrative_en"),
+            issue_codes,
+        )
+        self.assertIn(("camera_movement_dense", "shots[0].camera_en"), issue_codes)
+        self.assertIn(("action_arc_dense", "shots[0].action_en"), issue_codes)
+        self.assertEqual(validation["status"], "needs_review")
 
     def test_busy_guard_queries_active_generation_before_runtime(self):
         mocked = type("Exists", (), {"exists": lambda self: True})()
@@ -1063,19 +1284,118 @@ class CreativeDraftAPITests(TestCase):
             with self.assertRaises(CreativeResourceBusy):
                 ensure_creative_resources_available()
 
-    def test_source_budget_fails_explicitly_without_truncation(self):
-        snapshot = creative_context_snapshot(self.project, self.episode)
-        tiny = {**creative_config(), "max_source_chars": 20}
-        with patch("studio.services.creative_drafts.creative_config", return_value=tiny):
-            response = self.client.post(
-                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+    def test_source_batch_recommendation_requires_confirmation_then_batches(self):
+        source_lines = [
+            f"凌霜穿过第{index}段长廊" + ("雨" * 1000) + "。"
+            for index in range(1, 5)
+        ]
+        self.episode.script = "\n".join(source_lines)
+        self.episode.save(update_fields=("script", "updated_at"))
+        tiny = {**creative_config(), "max_source_chars": 2500}
+        url = f"/api/v1/projects/{self.project.id}/creative-drafts/generate/"
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=tiny,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+        ) as runtime:
+            unconfirmed = self.client.post(
+                url,
                 {
-                    "episode_id": str(self.episode.id), "target_shot_count": 1,
+                    "episode_id": str(self.episode.id), "target_shot_count": 4,
                     "creativity": "balanced",
                 }, format="json",
             )
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("超过本地模型单次", str(response.data))
+        self.assertEqual(unconfirmed.status_code, 400, unconfirmed.data)
+        details = unconfirmed.data["error"]["details"]
+        self.assertEqual(details["code"], "creative_generation_confirmation_required")
+        self.assertEqual(details["source_char_count"], len(self.episode.script))
+        self.assertEqual(details["max_source_chars"], 2500)
+        runtime.assert_not_called()
+
+        captured = []
+
+        def complete_batch(request, _config, _provider):
+            captured.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            manifest = request["required_dialogue_manifest"]
+            if manifest:
+                source = manifest[0]
+                candidate["shots"][0]["dialogue"] = [{
+                    "speaker_id": source["speaker_id"],
+                    "text_zh": source["text_zh"],
+                    "delivery_zh": source.get("source_delivery_zh", ""),
+                    "delivery_en": "",
+                    "voiceover": bool(source.get("voiceover", False)),
+                }]
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=tiny,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ) as runtime:
+            confirmed = self.client.post(
+                url,
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                    "extended_generation_confirmed": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(confirmed.status_code, 201, confirmed.data)
+        self.assertEqual(runtime.call_count, 4)
+        self.assertEqual(
+            [request["batch_context"]["source_mode"] for request in captured],
+            ["contiguous_excerpt"] * 4,
+        )
+        self.assertEqual(
+            [request["episode"]["script"] for request in captured],
+            self.episode.script.splitlines(),
+        )
+        self.assertEqual(len(confirmed.data["draft_data"]["shots"]), 4)
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=tiny,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+        ) as runtime:
+            selected = self.client.post(
+                f"/api/v1/creative-drafts/{confirmed.data['id']}/regenerate/",
+                {
+                    "expected_revision": confirmed.data["revision"],
+                    "target_shot_count": 4,
+                    "shot_keys": [
+                        confirmed.data["draft_data"]["shots"][0]["client_key"]
+                    ],
+                    "preserve_locked_content": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(selected.status_code, 400, selected.data)
+        selected_details = selected.data["error"]["details"]
+        self.assertNotEqual(
+            selected_details["code"],
+            "creative_generation_confirmation_required",
+        )
+        self.assertNotIn("source_char_count", selected_details)
+        runtime.assert_not_called()
 
     def test_runtime_request_keeps_hash_and_attempt_authoritative(self):
         snapshot = creative_context_snapshot(self.project, self.episode)
@@ -1137,8 +1457,15 @@ class CreativeDraftAPITests(TestCase):
 
         with self.assertRaisesRegex(CreativeValidationError, "只能容纳 2 句"):
             request_for(3, shot_count=1)
-        with self.assertRaisesRegex(CreativeValidationError, "只能容纳 8 句"):
+        with self.assertRaisesRegex(CreativeValidationError, "只能容纳 8 句") as caught:
             request_for(9, shot_count=4)
+        self.assertEqual(caught.exception.code, "creative_dialogue_capacity_exceeded")
+        self.assertEqual(caught.exception.public_context, {
+            "required_dialogue_count": 9,
+            "target_shot_count": 4,
+            "dialogue_capacity": 8,
+            "max_dialogue_per_shot": 2,
+        })
 
         audio_disabled = request_for(9, shot_count=1, include_audio=False)
         self.assertEqual(audio_disabled["required_dialogue_manifest"], [])
@@ -1176,18 +1503,1111 @@ class CreativeDraftAPITests(TestCase):
         self.assertFalse(response.data["draft"]["context_current"])
         self.assertTrue(failed.runtime_metadata["source_drift_during_attempt"])
         self.assertEqual(failed.runtime_metadata["attempt_context_hash"], failed.context_hash)
+        self.assertEqual(failed.input_settings["min_shots"], 1)
+        self.assertEqual(failed.input_settings["max_source_chars"], 16000)
+        self.assertEqual(failed.input_settings["max_input_chars"], 24000)
+        self.assertEqual(failed.input_settings["max_output_tokens"], 3072)
+        self.assertEqual(failed.input_settings["context_size"], 8192)
+        self.assertEqual(failed.input_settings["timeout_seconds"], 900)
 
-    def test_generation_rejects_unverified_five_shot_cpu_request(self):
-        response = self.client.post(
-            f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+    def test_deepseek_eleven_shots_requires_confirmation_then_preserves_count_on_regenerate(self):
+        dialogue_texts = [f"第{index}句。" for index in range(1, 14)]
+        self.episode.script = "\n".join(
+            ["凌霜在雨夜客栈拔剑。"]
+            + [f"凌霜：{text}" for text in dialogue_texts]
+        )
+        self.episode.save(update_fields=("script", "updated_at"))
+        candidate = self.candidate(count=11)
+        for shot in candidate["shots"]:
+            shot["dialogue"] = []
+        for index, text in enumerate(dialogue_texts):
+            candidate["shots"][index // 2]["dialogue"].append({
+                "speaker_id": "S1",
+                "text_zh": text,
+                "delivery_zh": "",
+                "delivery_en": "",
+                "voiceover": False,
+            })
+
+        generate_url = f"/api/v1/projects/{self.project.id}/creative-drafts/generate/"
+        base_request = {
+            "episode_id": str(self.episode.id),
+            "provider": "deepseek_api",
+            "target_shot_count": 11,
+            "creativity": "balanced",
+        }
+        with patch("studio.services.creative_drafts._run_provider_runtime") as runtime:
+            unconfirmed = self.client.post(generate_url, base_request, format="json")
+
+        self.assertEqual(unconfirmed.status_code, 400, unconfirmed.data)
+        details = unconfirmed.data["error"]["details"]
+        self.assertEqual(details["code"], "creative_generation_confirmation_required")
+        self.assertEqual(details["target_shot_count"], 11)
+        self.assertEqual(details["recommended_max_shots"], 4)
+        self.assertEqual(details["batch_shots"], 16)
+        runtime.assert_not_called()
+        self.assertFalse(EpisodeCreativeDraft.objects.exists())
+
+        captured = {}
+
+        def complete(request, _config, provider):
+            captured.update(deepcopy(request))
+            self.assertEqual(provider, "deepseek_api")
+            return {
+                "ok": True,
+                "result": {
+                    **deepcopy(candidate),
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "deepseek-v4-flash", "phase": "complete"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete,
+        ):
+            generated = self.client.post(
+                generate_url,
+                {**base_request, "extended_generation_confirmed": True},
+                format="json",
+            )
+
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(len(generated.data["draft_data"]["shots"]), 11)
+        self.assertEqual(captured["options"]["shot_count"], 11)
+        self.assertEqual(captured["options"]["batch_shots"], 16)
+        self.assertEqual(captured["max_new_tokens"], 6656)
+        self.assertEqual(captured["provider_output_token_budget"], 10880)
+        self.assertEqual(len(captured["required_dialogue_manifest"]), 13)
+        self.assertEqual(generated.data["input_settings"]["target_shot_count"], 11)
+        self.assertTrue(generated.data["input_settings"]["extended_generation_confirmed"])
+        self.assertEqual(generated.data["input_settings"]["recommended_max_shots"], 4)
+        self.assertEqual(generated.data["input_settings"]["batch_shots"], 16)
+        self.assertEqual(generated.data["input_settings"]["max_dialogue_per_shot"], 2)
+        self.assertEqual(generated.data["input_settings"]["min_shots"], 1)
+        self.assertEqual(generated.data["input_settings"]["max_source_chars"], 24000)
+        self.assertEqual(generated.data["input_settings"]["max_input_chars"], 120000)
+        self.assertEqual(generated.data["input_settings"]["max_output_tokens"], 16384)
+        self.assertFalse(Shot.objects.exists())
+
+        regenerated_capture = {}
+
+        def regenerate(request, _config, provider):
+            regenerated_capture.update(deepcopy(request))
+            self.assertEqual(provider, "deepseek_api")
+            return {
+                "ok": True,
+                "result": {
+                    **deepcopy(candidate),
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "deepseek-v4-flash", "phase": "complete"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=regenerate,
+        ):
+            regenerated = self.client.post(
+                f"/api/v1/creative-drafts/{generated.data['id']}/regenerate/",
+                {
+                    "expected_revision": generated.data["revision"],
+                    "provider": "deepseek_api",
+                    "target_shot_count": 11,
+                    "extended_generation_confirmed": True,
+                    "shot_keys": [generated.data["draft_data"]["shots"][0]["client_key"]],
+                    "preserve_locked_content": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(regenerated.status_code, 201, regenerated.data)
+        self.assertEqual(len(regenerated.data["draft_data"]["shots"]), 11)
+        self.assertEqual(regenerated_capture["options"]["shot_count"], 11)
+        self.assertEqual(
+            len(regenerated_capture["regeneration_context"]["previous_draft"]["shots"]),
+            11,
+        )
+        self.assertTrue(regenerated.data["input_settings"]["extended_generation_confirmed"])
+
+    def test_initial_generate_batches_contiguous_source_and_carries_global_boundary(self):
+        source_lines = [
+            "片段一动作。",
+            "片段二动作。",
+            "片段三动作。",
+            "片段四动作。",
+        ]
+        self.episode.script = "\n".join(source_lines)
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 2,
+            "max_new_tokens": 2000,
+            "max_output_tokens": 2000,
+        }
+        captured_requests = []
+
+        def complete_batch(request, _config, provider):
+            self.assertEqual(provider, "local_qwen")
+            captured_requests.append(deepcopy(request))
+            candidate = self.candidate(count=2)
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {
+                    "model": "Qwen/Qwen3-4B-GGUF",
+                    "elapsed_ms": 100,
+                },
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ) as runtime:
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(runtime.call_count, 2)
+        self.assertEqual(
+            [request["episode"]["script"] for request in captured_requests],
+            ["\n".join(source_lines[:2]), "\n".join(source_lines[2:])],
+        )
+        self.assertEqual(
+            [request["batch_context"]["global_shot_start"] for request in captured_requests],
+            [1, 3],
+        )
+        self.assertIsNone(captured_requests[0]["batch_context"]["previous_shot"])
+        previous = captured_requests[1]["batch_context"]["previous_shot"]
+        self.assertEqual(previous["client_key"], "shot-02")
+        self.assertEqual(previous["order"], 2)
+        self.assertEqual(previous["scene_id"], str(self.scene.id))
+        self.assertEqual(
+            [shot["client_key"] for shot in response.data["draft_data"]["shots"]],
+            ["shot-01", "shot-02", "shot-03", "shot-04"],
+        )
+        self.assertEqual(
+            [shot["order"] for shot in response.data["draft_data"]["shots"]],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(response.data["runtime_metadata"]["batch_count"], 2)
+        self.assertEqual(response.data["runtime_metadata"]["batch_shot_counts"], [2, 2])
+        self.assertEqual(
+            [request["batch_context"]["source_mode"] for request in captured_requests],
+            ["contiguous_excerpt", "contiguous_excerpt"],
+        )
+
+    def test_batch_count_and_order_variance_is_preserved_for_review(self):
+        self.episode.script = "\n".join(f"片段{index}动作。" for index in range(1, 5))
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 2,
+            "max_new_tokens": 2000,
+            "max_output_tokens": 2000,
+        }
+        call_count = 0
+
+        def complete_batch(request, _config, _provider):
+            nonlocal call_count
+            call_count += 1
+            returned_count = request["options"]["shot_count"] if call_count == 1 else 1
+            candidate = self.candidate(count=returned_count)
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            if call_count == 2:
+                candidate["shots"][0]["order"] = 99
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ):
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(len(response.data["draft_data"]["shots"]), 3)
+        self.assertEqual(
+            [shot["order"] for shot in response.data["draft_data"]["shots"]],
+            [1, 2, 3],
+        )
+        codes = {issue["code"] for issue in response.data["validation"]["review_issues"]}
+        self.assertTrue({
+            "batch_shot_count_mismatch",
+            "batch_shot_order_repaired",
+            "shot_count_mismatch",
+        } <= codes)
+        self.assertEqual(response.data["status"], EpisodeCreativeDraft.Status.DRAFT)
+
+    def test_later_batch_failure_preserves_completed_model_data(self):
+        self.episode.script = "\n".join(f"片段{index}动作。" for index in range(1, 5))
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 2,
+            "max_new_tokens": 2000,
+            "max_output_tokens": 2000,
+        }
+        call_count = 0
+
+        def complete_then_fail(request, _config, _provider):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 2:
+                raise CreativeDraftError(
+                    "remote request failed",
+                    code="deepseek_api_network_error",
+                    runtime_metadata={"transport": "remote"},
+                )
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "deepseek-v4-flash", "transport": "remote"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_then_fail,
+        ):
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(len(response.data["draft_data"]["shots"]), 2)
+        codes = {issue["code"] for issue in response.data["validation"]["review_issues"]}
+        self.assertTrue({"generation_incomplete", "shot_count_mismatch"} <= codes)
+        self.assertTrue(response.data["runtime_metadata"]["generation_incomplete"])
+        self.assertEqual(
+            response.data["runtime_metadata"]["partial_failure"]["error_code"],
+            "deepseek_api_network_error",
+        )
+        self.assertEqual(response.data["status"], EpisodeCreativeDraft.Status.DRAFT)
+
+    def test_initial_and_whole_regenerate_respect_configured_batch_size(self):
+        source_lines = [f"片段{index}动作。" for index in range(1, 5)]
+        self.episode.script = "\n".join(source_lines)
+        self.episode.save(update_fields=("script", "updated_at"))
+        full_fit_config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 2,
+        }
+
+        captured_initial = []
+
+        def complete_for_request(request, _config, _provider):
+            captured_initial.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=full_fit_config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_for_request,
+        ) as runtime:
+            initial = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                },
+                format="json",
+            )
+
+        self.assertEqual(initial.status_code, 201, initial.data)
+        self.assertEqual(runtime.call_count, 2)
+        self.assertEqual(
+            [request["options"]["shot_count"] for request in captured_initial],
+            [2, 2],
+        )
+        self.assertEqual(
+            [request["batch_context"]["source_mode"] for request in captured_initial],
+            ["contiguous_excerpt", "contiguous_excerpt"],
+        )
+
+        batched_config = {
+            **full_fit_config,
+            "max_new_tokens": 2000,
+            "max_output_tokens": 2000,
+        }
+        captured_whole = []
+
+        def complete_whole(request, _config, _provider):
+            captured_whole.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=batched_config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_whole,
+        ) as runtime:
+            whole = self.client.post(
+                f"/api/v1/creative-drafts/{initial.data['id']}/regenerate/",
+                {
+                    "expected_revision": initial.data["revision"],
+                    "target_shot_count": 4,
+                    "preserve_locked_content": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(whole.status_code, 201, whole.data)
+        self.assertEqual(runtime.call_count, 2)
+        self.assertEqual(whole.data["runtime_metadata"]["batch_count"], 2)
+        self.assertTrue(all(
+            "regeneration_context" not in request for request in captured_whole
+        ))
+
+        captured_selected = []
+
+        def complete_selected(request, _config, _provider):
+            captured_selected.append(deepcopy(request))
+            candidate = self.candidate(count=4)
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=full_fit_config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_selected,
+        ) as runtime:
+            selected = self.client.post(
+                f"/api/v1/creative-drafts/{whole.data['id']}/regenerate/",
+                {
+                    "expected_revision": whole.data["revision"],
+                    "target_shot_count": 4,
+                    "shot_keys": [whole.data["draft_data"]["shots"][0]["client_key"]],
+                    "preserve_locked_content": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(selected.status_code, 201, selected.data)
+        self.assertEqual(runtime.call_count, 1)
+        selected_context = captured_selected[0]["regeneration_context"]
+        self.assertEqual(selected_context["selected_shot_keys"], ["shot-01"])
+        self.assertEqual(len(selected_context["previous_draft"]["shots"]), 4)
+
+    def test_short_non_dialogue_source_uses_shared_read_only_batches(self):
+        self.episode.script = "凌霜在雨夜客栈拔剑。"
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 4,
+        }
+        captured_requests = []
+
+        def complete_batch(request, _config, _provider):
+            captured_requests.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ) as runtime:
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 11,
+                    "creativity": "balanced",
+                    "extended_generation_confirmed": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(runtime.call_count, 3)
+        self.assertEqual(
+            [request["options"]["shot_count"] for request in captured_requests],
+            [4, 4, 3],
+        )
+        self.assertEqual(
+            [request["batch_context"]["source_mode"] for request in captured_requests],
+            ["shared_read_only", "shared_read_only", "shared_read_only"],
+        )
+        self.assertEqual(
+            [request["episode"]["script"] for request in captured_requests],
+            [self.episode.script, self.episode.script, self.episode.script],
+        )
+        self.assertEqual(len(response.data["draft_data"]["shots"]), 11)
+        self.assertEqual(response.data["runtime_metadata"]["batch_count"], 3)
+
+    def test_sparse_dialogue_source_assigns_dialogue_once_and_shares_no_manifest(self):
+        self.episode.script = "凌霜：别回头。"
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 4,
+        }
+        captured_requests = []
+
+        def complete_batch(request, _config, _provider):
+            captured_requests.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            manifest = request["required_dialogue_manifest"]
+            if manifest:
+                source = manifest[0]
+                candidate["shots"][0]["dialogue"] = [{
+                    "speaker_id": source["speaker_id"],
+                    "text_zh": source["text_zh"],
+                    "delivery_zh": source.get("source_delivery_zh", ""),
+                    "delivery_en": "",
+                    "voiceover": bool(source.get("voiceover", False)),
+                }]
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ) as runtime:
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 11,
+                    "creativity": "balanced",
+                    "extended_generation_confirmed": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(runtime.call_count, 3)
+        self.assertEqual(
+            [request["options"]["shot_count"] for request in captured_requests],
+            [4, 4, 3],
+        )
+        self.assertEqual(
+            [request["batch_context"]["source_mode"] for request in captured_requests],
+            ["contiguous_excerpt", "shared_read_only", "shared_read_only"],
+        )
+        manifests = [
+            request["required_dialogue_manifest"] for request in captured_requests
+        ]
+        self.assertEqual([len(manifest) for manifest in manifests], [1, 0, 0])
+        self.assertEqual(manifests[0][0]["text_zh"], "别回头。")
+        materialized = [
+            line["text_zh"]
+            for shot in response.data["draft_data"]["shots"]
+            for line in shot["dialogue"]
+        ]
+        self.assertEqual(materialized, ["别回头。"])
+        self.assertEqual(response.data["runtime_metadata"]["batch_count"], 3)
+
+    def test_source_over_single_batch_budget_requires_confirmation_then_batches(self):
+        source_lines = [
+            f"动作{index}" + ("风" * 500) + "。"
+            for index in range(1, 21)
+        ]
+        self.episode.script = "\n".join(source_lines)
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "max_source_chars": 6500,
+            "recommended_max_shots": 4,
+            "batch_shots": 4,
+        }
+        url = f"/api/v1/projects/{self.project.id}/creative-drafts/generate/"
+        base_request = {
+            "episode_id": str(self.episode.id),
+            "target_shot_count": 4,
+            "creativity": "balanced",
+        }
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+        ) as runtime:
+            unconfirmed = self.client.post(url, base_request, format="json")
+
+        self.assertEqual(unconfirmed.status_code, 400, unconfirmed.data)
+        details = unconfirmed.data["error"]["details"]
+        self.assertEqual(details["code"], "creative_generation_confirmation_required")
+        self.assertIn("source_char_count", details, details)
+        self.assertEqual(details["source_char_count"], len(self.episode.script))
+        self.assertEqual(details["max_source_chars"], 6500)
+        runtime.assert_not_called()
+
+        captured_requests = []
+
+        def complete_batch(request, _config, _provider):
+            captured_requests.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ):
+            confirmed = self.client.post(
+                url,
+                {**base_request, "extended_generation_confirmed": True},
+                format="json",
+            )
+
+        self.assertEqual(confirmed.status_code, 201, confirmed.data)
+        self.assertGreater(len(captured_requests), 1)
+        self.assertEqual(
+            "\n".join(request["episode"]["script"] for request in captured_requests),
+            self.episode.script,
+        )
+        self.assertTrue(confirmed.data["input_settings"]["extended_generation_confirmed"])
+        self.assertEqual(
+            confirmed.data["runtime_metadata"]["batch_count"],
+            len(captured_requests),
+        )
+
+    def test_initial_batch_repairs_second_batch_dialogue_tampering(self):
+        self.episode.script = "\n".join((
+            "片段一动作。",
+            "凌霜：台词一。",
+            "片段三动作。",
+            "凌霜：台词二。",
+        ))
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_config(),
+            "recommended_max_shots": 4,
+            "batch_shots": 2,
+            "max_new_tokens": 2000,
+            "max_output_tokens": 2000,
+        }
+        call_index = 0
+
+        def complete_batch(request, _config, _provider):
+            nonlocal call_index
+            call_index += 1
+            candidate = self.candidate(count=2)
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            candidate["shots"][0]["dialogue"] = [{
+                "speaker_id": "S1",
+                "text_zh": "台词一。" if call_index == 1 else "被篡改的台词。",
+                "delivery_zh": "",
+                "delivery_en": "",
+                "voiceover": False,
+            }]
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "Qwen/Qwen3-4B-GGUF"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ) as runtime:
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                },
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(runtime.call_count, 2)
+        self.assertEqual(response.data["status"], EpisodeCreativeDraft.Status.DRAFT)
+        self.assertEqual(response.data["validation"]["status"], "needs_review")
+        self.assertTrue(any(
+            issue["code"] == "dialogue_manifest_repaired"
+            and issue["severity"] == "risk"
+            for issue in response.data["validation"]["review_issues"]
+        ))
+        self.assertEqual([
+            line["text_zh"]
+            for shot in response.data["draft_data"]["shots"]
+            for line in shot["dialogue"]
+        ], ["台词一。", "台词二。"])
+        self.assertEqual(EpisodeCreativeDraft.objects.count(), 1)
+
+    def test_deepseek_single_shot_calls_preserve_authored_dialogue_ownership(self):
+        sword_spirit = CharacterBible.objects.create(
+            project=self.project,
+            slug="sword-spirit",
+            name="剑灵",
+            stable_speaker_id="S2",
+            visual_identity="剑中灵体",
+        )
+        elder = CharacterBible.objects.create(
+            project=self.project,
+            slug="elder-mo",
+            name="墨渊",
+            stable_speaker_id="S3",
+            visual_identity="宗门长老",
+        )
+        mask = CharacterBible.objects.create(
+            project=self.project,
+            slug="bone-mask",
+            name="白骨面具",
+            stable_speaker_id="S4",
+            visual_identity="白骨面具人",
+        )
+        source_dialogue = [
+            [("S1", "第一句。")],
+            [("S1", "第二句。")],
+            [("S2", "第三句。")],
+            [("S3", "第四句。")],
+            [("S1", "第五句。")],
+            [("S2", "第六句。")],
+            [("S4", "第七句。")],
+            [("S1", "第八句。")],
+            [("S2", "第九句。")],
+            [("S2", "第十句甲。"), ("S1", "第十句乙。")],
+            [("S2", "第十一句甲。"), ("S1", "第十一句乙。")],
+        ]
+        speaker_names = {
+            "S1": self.character.name,
+            "S2": sword_spirit.name,
+            "S3": elder.name,
+            "S4": mask.name,
+        }
+        blocks = []
+        for shot_index, lines in enumerate(source_dialogue, start=1):
+            block_lines = [f"第{shot_index}镜动作。"]
+            block_lines.extend(
+                f"{speaker_names[speaker_id]}：{text}"
+                for speaker_id, text in lines
+            )
+            blocks.append("\n".join(block_lines))
+        self.episode.script = "\n\n".join(blocks)
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_provider_config("deepseek_api"),
+            "recommended_max_shots": 4,
+            "batch_shots": 1,
+        }
+        captured_requests = []
+
+        def complete_single_shot(request, _config, provider):
+            self.assertEqual(provider, "deepseek_api")
+            captured_requests.append(deepcopy(request))
+            candidate = self.candidate(count=1)
+            candidate["shots"][0]["dialogue"] = []
+            candidate["shots"][0]["character_ids"] = [
+                str(self.character.id),
+                str(sword_spirit.id),
+                str(elder.id),
+                str(mask.id),
+            ]
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {
+                    "model": "deepseek-v4-flash",
+                    "transport": "remote",
+                    "elapsed_ms": 10,
+                },
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_single_shot,
+        ) as runtime:
+            generated = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "provider": "deepseek_api",
+                    "target_shot_count": 11,
+                    "creativity": "balanced",
+                    "extended_generation_confirmed": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(runtime.call_count, 11)
+        self.assertEqual(
+            [request["options"]["shot_count"] for request in captured_requests],
+            [1] * 11,
+        )
+        self.assertEqual(
+            [request["episode"]["script"] for request in captured_requests],
+            blocks,
+        )
+        self.assertEqual(
+            [
+                [
+                    (line["speaker_id"], line["text_zh"])
+                    for line in request["required_dialogue_manifest"]
+                ]
+                for request in captured_requests
+            ],
+            source_dialogue,
+        )
+        self.assertEqual(
+            [
+                [
+                    (line["speaker_id"], line["text_zh"])
+                    for line in shot["dialogue"]
+                ]
+                for shot in generated.data["draft_data"]["shots"]
+            ],
+            source_dialogue,
+        )
+        self.assertEqual(
+            generated.data["runtime_metadata"]["batch_shot_counts"],
+            [1] * 11,
+        )
+
+    def test_deepseek_multi_batch_repairs_thirteen_dialogues_and_requires_review(self):
+        self.episode.script = "\n".join(
+            f"凌霜（低声{index}）：第{index}句。" for index in range(1, 14)
+        )
+        self.episode.save(update_fields=("script", "updated_at"))
+        config = {
+            **creative_provider_config("deepseek_api"),
+            "recommended_max_shots": 4,
+            "batch_shots": 4,
+            # The complete request does not fit, while each planned provider
+            # batch does. This exercises the real multi-batch merge path.
+            "max_output_tokens": 5000,
+        }
+        captured_requests = []
+
+        def complete_batch(request, _config, provider):
+            self.assertEqual(provider, "deepseek_api")
+            captured_requests.append(deepcopy(request))
+            candidate = self.candidate(count=request["options"]["shot_count"])
+            for shot in candidate["shots"]:
+                shot["dialogue"] = []
+            manifest = request["required_dialogue_manifest"]
+            if manifest:
+                source = manifest[-1]
+                candidate["shots"][-1]["dialogue"] = [{
+                    "speaker_id": source["speaker_id"],
+                    "text_zh": source["text_zh"],
+                    "delivery_zh": source["source_delivery_zh"],
+                    "delivery_en": f"preserved {source['text_zh']}",
+                    "voiceover": False,
+                }, {
+                    "speaker_id": "S1",
+                    "text_zh": "模型多写的对白。",
+                    "delivery_zh": "",
+                    "delivery_en": "invented line",
+                    "voiceover": False,
+                }]
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "deepseek-v4-flash"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts.creative_provider_config",
+            return_value=config,
+        ), patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete_batch,
+        ) as runtime:
+            generated = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "provider": "deepseek_api",
+                    "target_shot_count": 11,
+                    "creativity": "balanced",
+                    "extended_generation_confirmed": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(runtime.call_count, 3)
+        self.assertEqual(
+            [request["options"]["shot_count"] for request in captured_requests],
+            [4, 4, 3],
+        )
+        self.assertEqual(generated.data["status"], EpisodeCreativeDraft.Status.DRAFT)
+        self.assertEqual(generated.data["validation"]["status"], "needs_review")
+        self.assertTrue(any(
+            issue["code"] == "dialogue_manifest_repaired"
+            and issue["severity"] == "risk"
+            for issue in generated.data["validation"]["review_issues"]
+        ))
+        shots = generated.data["draft_data"]["shots"]
+        self.assertTrue(all(len(shot["dialogue"]) <= 2 for shot in shots))
+        flattened = [line for shot in shots for line in shot["dialogue"]]
+        self.assertEqual(len(flattened), 13)
+        self.assertEqual(
+            [(line["speaker_id"], line["text_zh"], line["delivery_zh"])
+             for line in flattened],
+            [("S1", f"第{index}句。", f"低声{index}") for index in range(1, 14)],
+        )
+        self.assertEqual(
+            [line["delivery_en"] for line in flattened if line["delivery_en"]],
+            [
+                f"preserved {request['required_dialogue_manifest'][-1]['text_zh']}"
+                for request in captured_requests
+            ],
+        )
+
+        denied = self.client.post(
+            f"/api/v1/creative-drafts/{generated.data['id']}/confirm/",
+            {"expected_revision": generated.data["revision"]},
+            format="json",
+        )
+        self.assertEqual(denied.status_code, 400, denied.data)
+        confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{generated.data['id']}/confirm/",
             {
-                "episode_id": str(self.episode.id),
-                "target_shot_count": 5,
-                "creativity": "balanced",
+                "expected_revision": generated.data["revision"],
+                "review_acknowledged": True,
             },
             format="json",
         )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        self.assertEqual(confirmed.data["status"], EpisodeCreativeDraft.Status.CONFIRMED)
+        denied_apply = self.client.post(
+            f"/api/v1/creative-drafts/{generated.data['id']}/apply/",
+            {
+                "expected_revision": confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "replace",
+            },
+            format="json",
+        )
+        self.assertEqual(denied_apply.status_code, 400, denied_apply.data)
+        applied = self.client.post(
+            f"/api/v1/creative-drafts/{generated.data['id']}/apply/",
+            {
+                "expected_revision": confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "replace",
+                "review_acknowledged": True,
+            },
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200, applied.data)
+        self.assertEqual(len(applied.data["applied_shot_ids"]), 11)
+
+    def test_dialogue_density_above_recommendation_requires_confirmation_then_continues(self):
+        self.episode.script = "\n".join(
+            ["凌霜在雨夜客栈拔剑。"]
+            + [f"凌霜：第{i}句。" for i in range(1, 10)]
+        )
+        self.episode.save(update_fields=("script", "updated_at"))
+
+        with patch("studio.services.creative_drafts._run_provider_runtime") as runtime:
+            response = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "provider": "deepseek_api",
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                },
+                format="json",
+            )
+
         self.assertEqual(response.status_code, 400, response.data)
+        details = response.data["error"]["details"]
+        self.assertEqual(details["code"], "creative_generation_confirmation_required")
+        self.assertEqual(details["required_dialogue_count"], 9)
+        self.assertEqual(details["target_shot_count"], 4)
+        self.assertEqual(details["dialogue_capacity"], 8)
+        self.assertEqual(details["effective_max_dialogue_per_shot"], 3)
+        runtime.assert_not_called()
+        self.assertFalse(EpisodeCreativeDraft.objects.exists())
+        self.assertFalse(Shot.objects.exists())
+
+        captured = {}
+
+        def complete(request, _config, _provider):
+            captured.update(deepcopy(request))
+            candidate = self.candidate(count=4)
+            manifest = list(request["required_dialogue_manifest"])
+            for index, shot in enumerate(candidate["shots"]):
+                shot["dialogue"] = [{
+                    "speaker_id": item["speaker_id"],
+                    "text_zh": item["text_zh"],
+                    "delivery_zh": item["source_delivery_zh"],
+                    "delivery_en": "spoken as scripted",
+                    "voiceover": False,
+                } for item in manifest[index * 3:(index + 1) * 3]]
+            return {
+                "ok": True,
+                "result": {
+                    **candidate,
+                    "source_fingerprint": request["context_hash"],
+                },
+                "runtime": {"model": "deepseek-v4-flash"},
+            }
+
+        with patch(
+            "studio.services.creative_drafts._run_provider_runtime",
+            side_effect=complete,
+        ):
+            generated = self.client.post(
+                f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
+                {
+                    "episode_id": str(self.episode.id),
+                    "provider": "deepseek_api",
+                    "target_shot_count": 4,
+                    "creativity": "balanced",
+                    "extended_generation_confirmed": True,
+                },
+                format="json",
+            )
+
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(captured["options"]["max_dialogue_per_shot"], 3)
+        self.assertEqual(
+            generated.data["input_settings"]["effective_max_dialogue_per_shot"], 3,
+        )
+        self.assertTrue(any(
+            issue["code"] == "dialogue_density_high"
+            for issue in generated.data["validation"]["review_issues"]
+        ))
+        self.assertEqual(sum(
+            len(shot["dialogue"]) for shot in generated.data["draft_data"]["shots"]
+        ), 9)
+        self.assertFalse(Shot.objects.exists())
 
     def test_runtime_uses_utf8_and_parent_cleanup_grace(self):
         config = creative_config()

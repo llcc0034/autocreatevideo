@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from fractions import Fraction
+from io import BytesIO
 from pathlib import Path, PurePosixPath, PureWindowsPath
 import hashlib
 import json
@@ -13,11 +14,12 @@ from uuid import UUID
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
+from django.core.files.base import ContentFile
 from django.db.models import Q
 from django.urls import reverse
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
@@ -38,6 +40,8 @@ from studio.models import (
     SeriesProject,
     Shot,
     ShotDetailDraft,
+    ShotDetailDraftBatch,
+    ShotDetailDraftBatchItem,
     Style,
     WorkflowTemplate,
 )
@@ -51,7 +55,11 @@ from studio.services.reference_bindings import (
     VIDEO_REFERENCE_PURPOSES,
     normalize_shot_reference_bindings,
 )
-from studio.services.dialogue import DialogueContractError, normalize_dialogue
+from studio.services.dialogue import (
+    DialogueContractError,
+    normalize_dialogue,
+    validate_dialogue_timing,
+)
 from studio.services.h3_prompts import PROMPT_COMPILER_VERSION
 from studio.services.prompt_translation import (
     CanonicalTargetCollisionError,
@@ -73,8 +81,13 @@ from studio.services.resolution import (
 
 User = get_user_model()
 
-VIDEO_SHOT_MIN_DURATION_MS = 5000
-VIDEO_SHOT_MAX_DURATION_MS = 15000
+VIDEO_SHOT_MIN_DURATION_MS = settings.VIDEO_SHOT_MIN_DURATION_MS
+VIDEO_SHOT_MAX_DURATION_MS = settings.VIDEO_SHOT_MAX_DURATION_MS
+
+
+def _is_project_cover_asset(asset: Asset) -> bool:
+    metadata = asset.metadata if isinstance(asset.metadata, dict) else {}
+    return metadata.get("usage") == "project_cover"
 
 
 def _validate_video_shot_duration(media_type: str, duration_ms: int) -> None:
@@ -83,7 +96,10 @@ def _validate_video_shot_duration(media_type: str, duration_ms: int) -> None:
         and not VIDEO_SHOT_MIN_DURATION_MS <= duration_ms <= VIDEO_SHOT_MAX_DURATION_MS
     ):
         raise serializers.ValidationError({
-            "duration_ms": "视频分镜时长必须在 5000–15000ms",
+            "duration_ms": (
+                f"视频分镜时长必须在 {VIDEO_SHOT_MIN_DURATION_MS}–"
+                f"{VIDEO_SHOT_MAX_DURATION_MS}ms"
+            ),
         })
 
 
@@ -138,9 +154,18 @@ class AssetSerializer(serializers.ModelSerializer):
 
     def validate_kind(self, value):
         if self.instance is not None and value != self.instance.kind:
-            raise serializers.ValidationError(
-                "素材类别创建后不可修改；请新建正确类别的素材，避免现有 Bible 引用发生语义漂移。"
-            )
+            editable_kinds = {
+                Asset.Kind.CHARACTER,
+                Asset.Kind.SCENE,
+                Asset.Kind.PROP,
+            }
+            if value not in editable_kinds or not (
+                self.instance.kind in editable_kinds
+                or self.instance.kind == Asset.Kind.REFERENCE
+            ):
+                raise serializers.ValidationError(
+                    "只允许在人物、场景和道具图片之间更正类别；其他素材类型不可转换。"
+                )
         return value
 
     def validate_local_path(self, value):
@@ -165,35 +190,117 @@ class AssetSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         kind = attrs.get("kind", getattr(self.instance, "kind", None))
-        if self.instance is None:
-            metadata = attrs.get("metadata") or {}
-            reference_category = (
-                str(metadata.get("reference_category") or "").strip().casefold()
-                if isinstance(metadata, dict) else ""
-            )
-            classified_image = kind in {
+        existing_metadata = (
+            self.instance.metadata
+            if self.instance is not None and isinstance(self.instance.metadata, dict)
+            else {}
+        )
+        if "metadata" in attrs:
+            metadata = {**existing_metadata, **(attrs.get("metadata") or {})}
+            attrs["metadata"] = metadata
+        else:
+            metadata = existing_metadata
+        if (
+            self.instance is not None
+            and self.instance.kind == Asset.Kind.REFERENCE
+            and "metadata" in attrs
+            and metadata.get("reference_category") != existing_metadata.get("reference_category")
+        ):
+            raise serializers.ValidationError({
+                "metadata": "请通过素材类别字段更正人物、场景或道具分类，不能直接改写 reference_category。",
+            })
+        if self.instance is not None and _is_project_cover_asset(self.instance):
+            if "file" in attrs:
+                raise serializers.ValidationError({
+                    "file": "专用连续剧封面不能原位替换；请上传新封面后重新绑定项目。",
+                })
+            if "metadata" in attrs:
+                if not isinstance(metadata, dict) or metadata.get("usage", "project_cover") != "project_cover":
+                    raise serializers.ValidationError({
+                        "metadata": "专用连续剧封面的 usage 标记不可修改。",
+                    })
+                existing_project_id = str(
+                    (self.instance.metadata or {}).get("project_id") or ""
+                )
+                if (
+                    "project_id" in metadata
+                    and str(metadata.get("project_id") or "") != existing_project_id
+                ):
+                    raise serializers.ValidationError({
+                        "metadata": "专用连续剧封面的 project_id 不可修改。",
+                    })
+                attrs["metadata"] = {
+                    **(self.instance.metadata or {}),
+                    **metadata,
+                    "usage": "project_cover",
+                    "project_id": existing_project_id,
+                }
+                metadata = attrs["metadata"]
+        if (
+            self.instance is not None
+            and not _is_project_cover_asset(self.instance)
+            and isinstance(metadata, dict)
+            and metadata.get("usage") == "project_cover"
+        ):
+            raise serializers.ValidationError({
+                "metadata": "普通素材不能改为专用连续剧封面；请通过封面上传入口新建素材。",
+            })
+        if isinstance(metadata, dict) and metadata.get("usage") == "project_cover":
+            if kind != Asset.Kind.REFERENCE:
+                raise serializers.ValidationError({
+                    "metadata": "连续剧封面必须使用 reference 图片素材。",
+                })
+            project_id = str(metadata.get("project_id") or "").strip()
+            request = self.context["request"]
+            if not project_id or not SeriesProject.objects.filter(
+                pk=project_id, owner=request.user,
+            ).exists():
+                raise serializers.ValidationError({
+                    "metadata": "专用连续剧封面必须关联当前用户已有的连续剧项目。",
+                })
+            if self.instance is None and not attrs.get("file"):
+                raise serializers.ValidationError({
+                    "file": "连续剧封面必须通过受控文件上传创建。",
+                })
+        reference_category = (
+            str(metadata.get("reference_category") or "").strip().casefold()
+            if isinstance(metadata, dict) else ""
+        )
+        classified_image = kind in {
+            Asset.Kind.CHARACTER, Asset.Kind.SCENE, Asset.Kind.PROP,
+        }
+        if kind == Asset.Kind.REFERENCE and reference_category:
+            if reference_category not in {
                 Asset.Kind.CHARACTER, Asset.Kind.SCENE, Asset.Kind.PROP,
+            }:
+                raise serializers.ValidationError({
+                    "metadata": (
+                        "reference_category 仅支持 character、scene 或 prop；"
+                        "不参与 Bible 草稿的普通 reference 请不要设置该字段。"
+                    ),
+                })
+            classified_image = True
+        if classified_image:
+            description = attrs.get("description", getattr(self.instance, "description", ""))
+            prompt_hint = attrs.get("prompt_hint", getattr(self.instance, "prompt_hint", ""))
+            if not str(description or "").strip():
+                raise serializers.ValidationError({
+                    "description": "分类图片素材必须填写基础描述；自动设定草稿不会读取图片像素。",
+                })
+            if not str(prompt_hint or "").strip():
+                raise serializers.ValidationError({
+                    "prompt_hint": "分类图片素材必须填写视觉锚点；自动设定草稿只使用已保存元数据。",
+                })
+        if (
+            self.instance is not None
+            and kind in {Asset.Kind.CHARACTER, Asset.Kind.SCENE, Asset.Kind.PROP}
+            and existing_metadata.get("reference_category")
+            and "metadata" not in attrs
+        ):
+            attrs["metadata"] = {
+                key: value for key, value in existing_metadata.items()
+                if key != "reference_category"
             }
-            if kind == Asset.Kind.REFERENCE and reference_category:
-                if reference_category not in {
-                    Asset.Kind.CHARACTER, Asset.Kind.SCENE, Asset.Kind.PROP,
-                }:
-                    raise serializers.ValidationError({
-                        "metadata": (
-                            "reference_category 仅支持 character、scene 或 prop；"
-                            "不参与 Bible 草稿的普通 reference 请不要设置该字段。"
-                        ),
-                    })
-                classified_image = True
-            if classified_image:
-                if not str(attrs.get("description") or "").strip():
-                    raise serializers.ValidationError({
-                        "description": "分类图片素材必须填写基础描述；自动设定草稿不会读取图片像素。",
-                    })
-                if not str(attrs.get("prompt_hint") or "").strip():
-                    raise serializers.ValidationError({
-                        "prompt_hint": "分类图片素材必须填写视觉锚点；自动设定草稿只使用已保存元数据。",
-                    })
         file_value = attrs.get("file", getattr(self.instance, "file", None))
         local_path = attrs.get("local_path", getattr(self.instance, "local_path", ""))
         if file_value and local_path:
@@ -202,6 +309,20 @@ class AssetSerializer(serializers.ModelSerializer):
         if uploaded:
             kind = attrs.get("kind", getattr(self.instance, "kind", None))
             mime_type, verified_metadata = self._validate_upload(uploaded, kind)
+            if isinstance(metadata, dict) and metadata.get("usage") == "project_cover":
+                uploaded = self._sanitize_project_cover_upload(uploaded, mime_type)
+                if uploaded.size > settings.ASSET_UPLOAD_MAX_BYTES:
+                    raise serializers.ValidationError({
+                        "file": f"处理后的封面不能超过 {settings.ASSET_UPLOAD_MAX_BYTES} bytes",
+                    })
+                attrs["file"] = uploaded
+                verified_metadata = {
+                    **verified_metadata,
+                    "manifest_schema_version": 1,
+                    "source": "user_upload",
+                    "size_bytes": uploaded.size,
+                    "cover_processing": "static_metadata_stripped_v1",
+                }
             attrs["mime_type"] = mime_type
             attrs["checksum"] = self._uploaded_checksum(uploaded)
             attrs["metadata"] = {
@@ -211,6 +332,50 @@ class AssetSerializer(serializers.ModelSerializer):
             }
             self.enforce_tenant_quota(uploaded)
         return attrs
+
+    @staticmethod
+    def _sanitize_project_cover_upload(uploaded, mime_type: str) -> ContentFile:
+        """Normalize orientation, reject animation, and strip embedded metadata."""
+        format_by_mime = {
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+            "image/webp": "WEBP",
+        }
+        try:
+            uploaded.seek(0)
+            with Image.open(uploaded) as image:
+                if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) > 1:
+                    raise serializers.ValidationError({
+                        "file": "连续剧封面不支持动画图片。",
+                    })
+                image.load()
+                normalized = ImageOps.exif_transpose(image)
+                image_format = format_by_mime[mime_type]
+                if image_format == "JPEG" and normalized.mode not in {"RGB", "L"}:
+                    normalized = normalized.convert("RGB")
+                elif image_format == "PNG" and normalized.mode not in {
+                    "1", "L", "LA", "P", "RGB", "RGBA", "I", "I;16",
+                }:
+                    normalized = normalized.convert("RGBA" if "A" in normalized.mode else "RGB")
+                elif image_format == "WEBP" and normalized.mode not in {"RGB", "RGBA"}:
+                    normalized = normalized.convert("RGBA" if "A" in normalized.mode else "RGB")
+
+                output = BytesIO()
+                save_options = {
+                    "JPEG": {"quality": 95, "optimize": True},
+                    "PNG": {"optimize": True},
+                    "WEBP": {"quality": 95, "method": 6},
+                }[image_format]
+                normalized.save(output, format=image_format, **save_options)
+        except serializers.ValidationError:
+            raise
+        except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
+            raise serializers.ValidationError({
+                "file": "封面文件不是可安全解码的静态图片。",
+            }) from exc
+        finally:
+            uploaded.seek(0)
+        return ContentFile(output.getvalue(), name=uploaded.name)
 
     @staticmethod
     def _uploaded_checksum(uploaded) -> str:
@@ -436,9 +601,40 @@ class AssetSerializer(serializers.ModelSerializer):
 
         return _snapshot_hash([obj])
 
+class ProjectDeleteErrorDetailsSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    active_generation_tasks = serializers.IntegerField(required=False, min_value=0)
+    unresolved_remote_tasks = serializers.IntegerField(required=False, min_value=0)
+    active_assembly_jobs = serializers.IntegerField(required=False, min_value=0)
+
+
+class ProjectDeleteErrorSerializer(serializers.Serializer):
+    status_code = serializers.IntegerField()
+    code = serializers.ChoiceField(choices=(
+        "not_found",
+        "project_has_active_work",
+        "protected_resource",
+    ))
+    details = ProjectDeleteErrorDetailsSerializer()
+
+
+class ProjectDeleteErrorResponseSerializer(serializers.Serializer):
+    error = ProjectDeleteErrorSerializer()
+
+
 class SeriesProjectSerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
+    default_shot_duration_ms = serializers.IntegerField(
+        min_value=1,
+        default=VIDEO_SHOT_MIN_DURATION_MS,
+    )
+    cover_asset = serializers.PrimaryKeyRelatedField(
+        queryset=Asset.objects.all(), allow_null=True, required=False,
+    )
+    cover_url = serializers.SerializerMethodField()
     episode_count = serializers.IntegerField(read_only=True)
+    completed_episode_count = serializers.IntegerField(read_only=True)
+    total_duration_ms = serializers.IntegerField(read_only=True)
     character_count = serializers.IntegerField(read_only=True)
     scene_count = serializers.IntegerField(read_only=True)
     prop_count = serializers.IntegerField(read_only=True)
@@ -453,6 +649,50 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
         if style and style.owner_id not in (None, user.id) and not user.is_staff:
             raise serializers.ValidationError("不能使用其他用户的风格")
         return style
+
+    def validate_cover_asset(self, asset):
+        if asset is None:
+            return None
+        request = self.context["request"]
+        owner_id = self.instance.owner_id if self.instance is not None else request.user.id
+        if asset.owner_id != owner_id:
+            raise serializers.ValidationError("封面素材必须属于当前连续剧的所有者")
+        if asset.kind != Asset.Kind.REFERENCE:
+            raise serializers.ValidationError("封面素材必须是 reference 图片素材")
+        if not asset.is_active:
+            raise serializers.ValidationError("封面素材已停用")
+        allowed_mime_formats = {
+            "image/jpeg": "JPEG",
+            "image/png": "PNG",
+            "image/webp": "WEBP",
+        }
+        mime_type = str(asset.mime_type or "").casefold()
+        if not asset.file or mime_type not in allowed_mime_formats:
+            raise serializers.ValidationError("封面素材必须是受控上传的 JPEG、PNG 或 WebP 图片")
+        metadata = asset.metadata if isinstance(asset.metadata, dict) else {}
+        if metadata.get("usage") == "project_cover":
+            project_id = self.instance.pk if self.instance is not None else None
+            if str(metadata.get("project_id") or "") != str(project_id or ""):
+                raise serializers.ValidationError("专用封面素材不属于当前连续剧项目")
+        try:
+            with asset.file.open("rb") as stream, Image.open(stream) as image:
+                if (image.format or "").upper() != allowed_mime_formats[mime_type]:
+                    raise serializers.ValidationError("封面素材的 MIME 与实际图片格式不一致")
+                if getattr(image, "is_animated", False) or getattr(image, "n_frames", 1) > 1:
+                    raise serializers.ValidationError("连续剧封面不支持动画图片")
+                image.verify()
+        except serializers.ValidationError:
+            raise
+        except (UnidentifiedImageError, Image.DecompressionBombError, OSError, ValueError) as exc:
+            raise serializers.ValidationError("封面素材文件不存在或无法安全解码") from exc
+        return asset
+
+    def get_cover_url(self, obj) -> str:
+        asset = obj.cover_asset
+        if not asset or not asset.is_active or not asset.file:
+            return ""
+        token = signed_media_token(purpose="asset", object_id=asset.id, owner_id=asset.owner_id)
+        return reverse("signed-media", kwargs={"token": token})
 
     def validate_production_settings(self, value):
         if not isinstance(value, dict):
@@ -475,7 +715,8 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
         model = attrs.get("target_model", getattr(self.instance, "target_model", "minimax-h3"))
         fps = attrs.get("fps", getattr(self.instance, "fps", 24))
         default_duration = attrs.get(
-            "default_shot_duration_ms", getattr(self.instance, "default_shot_duration_ms", 5000),
+            "default_shot_duration_ms",
+            getattr(self.instance, "default_shot_duration_ms", VIDEO_SHOT_MIN_DURATION_MS),
         )
         multiple = 32 if "minimax-h3" in model.lower() else 8
         if width % multiple or height % multiple:
@@ -484,9 +725,17 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("MiniMax H3 本地工作流固定使用 24 fps")
         if "minimax-h3" in model.lower() and (min(width, height) > 768 or max(width, height) > 1344):
             raise serializers.ValidationError("当前 MiniMax H3 profile 限制短边不超过 768、长边不超过 1344；未配置 1080p/4K 放大流程")
-        if "minimax-h3" in model.lower() and not 5000 <= default_duration <= 15000:
+        if (
+            "minimax-h3" in model.lower()
+            and not VIDEO_SHOT_MIN_DURATION_MS
+            <= default_duration
+            <= VIDEO_SHOT_MAX_DURATION_MS
+        ):
             raise serializers.ValidationError({
-                "default_shot_duration_ms": "MiniMax H3 默认分镜时长必须在 5000–15000ms",
+                "default_shot_duration_ms": (
+                    "MiniMax H3 默认分镜时长必须在 "
+                    f"{VIDEO_SHOT_MIN_DURATION_MS}–{VIDEO_SHOT_MAX_DURATION_MS}ms"
+                ),
             })
         requested_status = attrs.get("status", getattr(self.instance, "status", SeriesProject.Status.DRAFT))
         if requested_status == SeriesProject.Status.COMPLETED and (
@@ -513,6 +762,10 @@ class ProjectOwnedSerializer(serializers.ModelSerializer):
         if anchor:
             assets.append(anchor)
         assets.extend(attrs.get("reference_assets") or [])
+        if any(_is_project_cover_asset(asset) for asset in assets):
+            raise serializers.ValidationError({
+                "reference_assets": "连续剧封面是项目展示专用素材，不能绑定到设定集或生成输入。",
+            })
         if not user.is_staff and any(asset.owner_id not in (None, user.id) for asset in assets):
             raise serializers.ValidationError({"reference_assets": "不能使用其他用户的素材"})
         if self.Meta.model in {CharacterBible, SceneBible, PropBible}:
@@ -756,6 +1009,9 @@ class H3ReferenceBindingsJSONField(serializers.JSONField):
 
 class ShotSerializer(serializers.ModelSerializer):
     reference_bindings = H3ReferenceBindingsJSONField(required=False)
+    duration_ms = serializers.IntegerField(
+        min_value=100, default=VIDEO_SHOT_MIN_DURATION_MS,
+    )
     legacy_negative_prompt_repair_eligible = serializers.SerializerMethodField()
 
     @extend_schema_field(serializers.BooleanField())
@@ -788,7 +1044,7 @@ class ShotSerializer(serializers.ModelSerializer):
             "media_type", getattr(self.instance, "media_type", Shot.MediaType.VIDEO),
         )
         duration_ms = attrs.get(
-            "duration_ms", getattr(self.instance, "duration_ms", 5000),
+            "duration_ms", getattr(self.instance, "duration_ms", VIDEO_SHOT_MIN_DURATION_MS),
         )
         _validate_video_shot_duration(media_type, duration_ms)
         if not episode:
@@ -803,6 +1059,12 @@ class ShotSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError({field: "条目与分镜不属于同一项目"})
         reference_assets = attrs.get("reference_assets")
         user = self.context["request"].user
+        if reference_assets is not None and any(
+            _is_project_cover_asset(asset) for asset in reference_assets
+        ):
+            raise serializers.ValidationError({
+                "reference_assets": "连续剧封面是项目展示专用素材，不能用于分镜生成。",
+            })
         if reference_assets is not None and not user.is_staff:
             if any(asset.owner_id not in (None, user.id) for asset in reference_assets):
                 raise serializers.ValidationError({"reference_assets": "不能使用其他用户的素材"})
@@ -811,6 +1073,13 @@ class ShotSerializer(serializers.ModelSerializer):
             characters = self.instance.characters.all()
         speaker_ids = {item.stable_speaker_id for item in (characters or [])}
         dialogue = attrs.get("dialogue", getattr(self.instance, "dialogue", []))
+        try:
+            attrs["dialogue"] = validate_dialogue_timing(
+                dialogue, duration_ms=duration_ms,
+            )
+            dialogue = attrs["dialogue"]
+        except DialogueContractError as exc:
+            raise serializers.ValidationError({"dialogue": str(exc)}) from exc
         unknown = {item["speaker_id"] for item in dialogue if item.get("speaker_id") not in speaker_ids}
         if unknown:
             raise serializers.ValidationError({"dialogue": f"未绑定的人物 speaker_id: {', '.join(sorted(unknown))}"})
@@ -869,6 +1138,8 @@ class ShotSyncItemSerializer(serializers.Serializer):
         queryset=Asset.objects.all(), many=True, required=False,
     )
     reference_bindings = H3ReferenceBindingsJSONField(required=False)
+    requires_first_frame_continuity = serializers.BooleanField(required=False)
+    requires_last_frame_continuity = serializers.BooleanField(required=False)
     continuity_notes = serializers.CharField(required=False, allow_blank=True)
     metadata = serializers.JSONField(required=False)
 
@@ -900,8 +1171,19 @@ class ShotSyncItemSerializer(serializers.Serializer):
         media_type = attrs.get(
             "media_type", getattr(current, "media_type", Shot.MediaType.VIDEO),
         )
-        duration_ms = attrs.get("duration_ms", getattr(current, "duration_ms", 5000))
+        duration_ms = attrs.get(
+            "duration_ms", getattr(current, "duration_ms", VIDEO_SHOT_MIN_DURATION_MS),
+        )
         _validate_video_shot_duration(media_type, duration_ms)
+        dialogue = attrs.get(
+            "dialogue", getattr(current, "dialogue", []) if current else [],
+        )
+        try:
+            attrs["dialogue"] = validate_dialogue_timing(
+                dialogue, duration_ms=duration_ms,
+            )
+        except DialogueContractError as exc:
+            raise serializers.ValidationError({"dialogue": str(exc)}) from exc
         return attrs
 
 
@@ -2300,6 +2582,17 @@ class GenerationTaskCreateSerializer(serializers.Serializer):
     generated_workflow_id = serializers.UUIDField()
     priority = serializers.IntegerField(min_value=-100, max_value=100, default=0)
     max_attempts = serializers.IntegerField(min_value=1, max_value=10, default=3)
+    extended_generation_confirmed = serializers.BooleanField(
+        default=False,
+        help_text="当前队列超过推荐值时的显式继续确认；不会提高 worker 并发。",
+    )
+
+
+class GenerationTaskRetrySerializer(serializers.Serializer):
+    extended_generation_confirmed = serializers.BooleanField(
+        default=False,
+        help_text="当前队列超过推荐值时的显式继续确认；不会改变原任务参数。",
+    )
 
 
 class NextEpisodeSerializer(serializers.Serializer):
@@ -2320,6 +2613,74 @@ class ProductionWorkflowSelectionSerializer(serializers.Serializer):
 @extend_schema_field(ProductionWorkflowSelectionSerializer(many=True))
 class ProductionWorkflowSelectionsField(serializers.JSONField):
     pass
+
+
+class ProductionBuildCountsSerializer(serializers.Serializer):
+    prompts = serializers.IntegerField(min_value=0)
+    workflows = serializers.IntegerField(min_value=0)
+    tasks = serializers.IntegerField(min_value=0)
+
+
+class ProductionBuildResponseSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    whole_episode = serializers.BooleanField(required=False)
+    episode_ids = serializers.ListField(child=serializers.UUIDField())
+    episode_number = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    episode_title = serializers.CharField(required=False, allow_blank=True)
+    prompt_artifact_ids = serializers.ListField(child=serializers.UUIDField())
+    workflow_ids = serializers.ListField(child=serializers.UUIDField())
+    task_ids = serializers.ListField(child=serializers.UUIDField())
+    batch_id = serializers.UUIDField(required=False, allow_null=True)
+    batch_kind = serializers.ChoiceField(
+        choices=("episode", "selection", "series"),
+        required=False,
+        allow_null=True,
+    )
+    batch_size = serializers.IntegerField(min_value=0)
+    extended_generation_confirmed = serializers.BooleanField(required=False)
+    idempotency_key = serializers.CharField(required=False, allow_blank=True)
+    idempotent_replay = serializers.BooleanField(required=False)
+    counts = ProductionBuildCountsSerializer()
+    production_units = serializers.ListField(child=serializers.DictField())
+    tasks = serializers.ListField(child=serializers.DictField(), required=False)
+    prompt_language_gate = serializers.ListField(
+        child=serializers.DictField(), required=False,
+    )
+
+
+class ProductionQueueConfirmationErrorDetailsSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    requested_task_count = serializers.IntegerField(min_value=1)
+    active_task_count = serializers.IntegerField(min_value=0)
+    user_active_task_count = serializers.IntegerField(min_value=0)
+    recommended_max_pending = serializers.IntegerField(min_value=1)
+    recommended_max_active_per_user = serializers.IntegerField(min_value=1)
+    max_concurrent = serializers.IntegerField(min_value=1)
+
+
+class ProductionQueueConfirmationErrorEnvelopeSerializer(serializers.Serializer):
+    status_code = serializers.IntegerField()
+    code = serializers.ChoiceField(choices=("production_queue_confirmation_required",))
+    details = ProductionQueueConfirmationErrorDetailsSerializer()
+
+
+class ProductionQueueConfirmationErrorResponseSerializer(serializers.Serializer):
+    error = ProductionQueueConfirmationErrorEnvelopeSerializer()
+
+
+class ProductionIdempotencyConflictErrorDetailsSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    idempotency_key = serializers.CharField()
+
+
+class ProductionIdempotencyConflictErrorEnvelopeSerializer(serializers.Serializer):
+    status_code = serializers.IntegerField()
+    code = serializers.ChoiceField(choices=("production_idempotency_conflict",))
+    details = ProductionIdempotencyConflictErrorDetailsSerializer()
+
+
+class ProductionIdempotencyConflictErrorResponseSerializer(serializers.Serializer):
+    error = ProductionIdempotencyConflictErrorEnvelopeSerializer()
 
 
 class ProductionBuildSerializer(serializers.Serializer):
@@ -2345,8 +2706,19 @@ class ProductionBuildSerializer(serializers.Serializer):
     )
     enqueue = serializers.BooleanField(default=True)
     whole_episode = serializers.BooleanField(default=False)
+    extended_generation_confirmed = serializers.BooleanField(
+        default=False,
+        help_text=(
+            "超过当前任务队列推荐阈值时的显式确认。确认只允许继续排队，"
+            "不会提高 worker 并发，也不会改变单镜生成参数。"
+        ),
+    )
     idempotency_key = serializers.CharField(
         required=False, allow_blank=True, default="", max_length=120, trim_whitespace=True,
+        help_text=(
+            "排队生成多个生产任务时必填；相同键与相同请求会安全重放，"
+            "不同请求会返回 409 冲突。单任务可省略。"
+        ),
     )
     priority = serializers.IntegerField(min_value=-100, max_value=100, default=0)
     max_attempts = serializers.IntegerField(min_value=1, max_value=10, default=3)
@@ -2499,20 +2871,106 @@ class ProductionBuildSerializer(serializers.Serializer):
             # A whole-episode request is always independently retryable per
             # shot, even if an older client still sends multi_shot=true.
             attrs["multi_shot"] = False
-        elif attrs.get("idempotency_key"):
+        elif attrs.get("idempotency_key") and not attrs.get("enqueue", True):
             raise serializers.ValidationError({
-                "idempotency_key": "idempotency_key 当前仅用于 whole_episode 整集生成",
+                "enqueue": (
+                    "提供 idempotency_key 时必须创建可追踪的生产任务，enqueue 必须为 true"
+                ),
             })
         return attrs
 
 
 class ScriptBreakdownSerializer(serializers.Serializer):
-    script = serializers.CharField(required=False, allow_blank=True, default="", max_length=1_000_000)
-    episode_count_hint = serializers.IntegerField(min_value=1, max_value=1000, default=1)
-    default_shot_duration_ms = serializers.IntegerField(min_value=5000, max_value=15000, default=5000)
+    script = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=settings.SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS,
+    )
+    # This is a business target, not a model/runtime batch size. The actual
+    # number remains bounded naturally by explicit headings or source blocks.
+    episode_count_hint = serializers.IntegerField(min_value=1, default=1)
+    default_shot_duration_ms = serializers.IntegerField(
+        min_value=VIDEO_SHOT_MIN_DURATION_MS,
+        max_value=VIDEO_SHOT_MAX_DURATION_MS,
+        default=settings.SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS,
+    )
+    default_first_frame_continuity = serializers.BooleanField(
+        default=settings.SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY,
+    )
+    default_last_frame_continuity = serializers.BooleanField(
+        default=settings.SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY,
+    )
     multi_shot = serializers.BooleanField(default=True)
     include_audio = serializers.BooleanField(default=True)
     replace_existing = serializers.BooleanField(default=False)
+    discard_existing_production = serializers.BooleanField(default=False)
+
+    def validate(self, attrs):
+        if attrs["discard_existing_production"] and not attrs["replace_existing"]:
+            raise serializers.ValidationError({
+                "discard_existing_production": "只有重建现有剧集时才能清理旧生产数据。",
+            })
+        return attrs
+
+
+class ScriptBreakdownCountsSerializer(serializers.Serializer):
+    episodes = serializers.IntegerField(min_value=0)
+    shots = serializers.IntegerField(min_value=0)
+
+
+class ScriptBreakdownClearedSerializer(serializers.Serializer):
+    episodes = serializers.IntegerField(min_value=0)
+    shots = serializers.IntegerField(min_value=0)
+    generation_tasks = serializers.IntegerField(min_value=0)
+    assembly_jobs = serializers.IntegerField(min_value=0)
+    prompt_artifacts = serializers.IntegerField(min_value=0)
+    generated_workflows = serializers.IntegerField(min_value=0)
+    creative_drafts = serializers.IntegerField(min_value=0)
+    shot_detail_drafts = serializers.IntegerField(min_value=0)
+    shot_detail_batches = serializers.IntegerField(min_value=0)
+    shot_detail_batch_items = serializers.IntegerField(min_value=0)
+    prompt_field_translations = serializers.IntegerField(min_value=0)
+    draft_release_bundles = serializers.IntegerField(min_value=0)
+    physical_outputs_retained = serializers.BooleanField()
+
+
+class ScriptBreakdownEpisodeResultSerializer(serializers.Serializer):
+    episode = EpisodeSerializer()
+    shots = ShotSerializer(many=True)
+
+
+class ScriptBreakdownResponseSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    method = serializers.CharField()
+    warnings = serializers.ListField(child=serializers.CharField())
+    episodes = ScriptBreakdownEpisodeResultSerializer(many=True)
+    counts = ScriptBreakdownCountsSerializer()
+    cleared = ScriptBreakdownClearedSerializer()
+
+
+class ScriptRebuildConflictDetailsSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    active_generation_tasks = serializers.IntegerField(required=False, min_value=0)
+    unresolved_remote_tasks = serializers.IntegerField(required=False, min_value=0)
+    active_assembly_jobs = serializers.IntegerField(required=False, min_value=0)
+    active_shot_detail_batches = serializers.IntegerField(required=False, min_value=0)
+    active_shot_detail_items = serializers.IntegerField(required=False, min_value=0)
+    protected_release_bundles = serializers.IntegerField(required=False, min_value=0)
+    clearable = ScriptBreakdownClearedSerializer(required=False)
+
+
+class ScriptRebuildConflictSerializer(serializers.Serializer):
+    status_code = serializers.IntegerField()
+    code = serializers.ChoiceField(choices=(
+        "script_rebuild_confirmation_required",
+        "script_rebuild_blocked",
+    ))
+    details = ScriptRebuildConflictDetailsSerializer()
+
+
+class ScriptRebuildConflictResponseSerializer(serializers.Serializer):
+    error = ScriptRebuildConflictSerializer()
 
 
 class StrictSerializer(serializers.Serializer):
@@ -2582,7 +3040,8 @@ class CreativeDialogueDraftSerializer(StrictSerializer):
 
 class CreativeShotDraftSerializer(StrictSerializer):
     client_key = serializers.RegexField(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-    order = serializers.IntegerField(min_value=1, max_value=999)
+    # Shot order is a business sequence, not a provider/runtime capacity limit.
+    order = serializers.IntegerField(min_value=1)
     title_zh = serializers.CharField(max_length=500, allow_blank=True)
     title_en = serializers.CharField(max_length=500, allow_blank=True)
     narrative_zh = serializers.CharField(max_length=4_000, allow_blank=True, trim_whitespace=False)
@@ -2674,9 +3133,13 @@ MODEL_PROVIDER_CHOICES = ("local_qwen", "deepseek_api")
 class CreativeDraftGenerateSerializer(StrictSerializer):
     episode_id = serializers.UUIDField()
     provider = serializers.ChoiceField(
-        choices=MODEL_PROVIDER_CHOICES, default="local_qwen",
+        choices=MODEL_PROVIDER_CHOICES,
+        default=settings.PROMPT_CREATIVE_DEFAULT_PROVIDER,
     )
-    target_shot_count = serializers.IntegerField(min_value=1, max_value=4, default=4)
+    # The selected provider capability supplies the UI default; the API keeps
+    # the caller's explicit business target and never invents a global value.
+    target_shot_count = serializers.IntegerField(min_value=1)
+    extended_generation_confirmed = serializers.BooleanField(default=False)
     creativity = serializers.ChoiceField(
         choices=EpisodeCreativeDraft.Creativity.choices,
         default=EpisodeCreativeDraft.Creativity.BALANCED,
@@ -2695,7 +3158,8 @@ class CreativeDraftPatchSerializer(StrictSerializer):
 class CreativeDraftRegenerateSerializer(StrictSerializer):
     expected_revision = serializers.IntegerField(min_value=1)
     provider = serializers.ChoiceField(choices=MODEL_PROVIDER_CHOICES, required=False)
-    target_shot_count = serializers.IntegerField(min_value=1, max_value=4, required=False)
+    target_shot_count = serializers.IntegerField(min_value=1, required=False)
+    extended_generation_confirmed = serializers.BooleanField(default=False)
     creativity = serializers.ChoiceField(
         choices=EpisodeCreativeDraft.Creativity.choices, required=False,
     )
@@ -2812,19 +3276,20 @@ class EpisodeCreativeDraftSerializer(serializers.ModelSerializer):
 class ShotDetailDraftDataSerializer(StrictSerializer):
     schema_version = serializers.IntegerField(min_value=1, max_value=1)
     detail_zh = serializers.CharField(
-        # 500/750 are generation recommendations.  Reviewers may temporarily
-        # keep a longer or imperfect bilingual candidate while correcting it.
-        max_length=3_000, allow_blank=True, trim_whitespace=False,
+        # Length policy is evaluated by the draft service using the policy
+        # frozen with that draft.  The serializer must not discard a model
+        # candidate or make a historic draft uneditable after env changes.
+        allow_blank=True, trim_whitespace=False,
     )
     detail_en = serializers.CharField(
-        max_length=4_500, allow_blank=True, trim_whitespace=False,
+        allow_blank=True, trim_whitespace=False,
     )
 
 
 class ShotDetailDraftGenerateSerializer(StrictSerializer):
     shot_id = serializers.UUIDField()
     provider = serializers.ChoiceField(
-        choices=MODEL_PROVIDER_CHOICES, default="local_qwen",
+        choices=MODEL_PROVIDER_CHOICES, default=settings.PROMPT_CREATIVE_DEFAULT_PROVIDER,
     )
     variation_note = serializers.CharField(
         max_length=2_000, required=False, allow_blank=True, default="", trim_whitespace=False,
@@ -2868,6 +3333,50 @@ class ShotDetailDraftApplySerializer(StrictSerializer):
         return attrs
 
 
+class ShotDetailDraftBatchCreateSerializer(StrictSerializer):
+    episode_id = serializers.UUIDField()
+    request_id = serializers.UUIDField()
+    provider = serializers.ChoiceField(
+        choices=MODEL_PROVIDER_CHOICES,
+        default=settings.PROMPT_CREATIVE_DEFAULT_PROVIDER,
+    )
+    variation_note = serializers.CharField(
+        max_length=2_000, required=False, allow_blank=True,
+        default="", trim_whitespace=False,
+    )
+    confirmation_acknowledged = serializers.BooleanField(default=False)
+
+
+class ShotDetailDraftBatchApplyItemSerializer(StrictSerializer):
+    item_id = serializers.UUIDField()
+    draft_id = serializers.UUIDField()
+    expected_revision = serializers.IntegerField(min_value=1)
+
+
+class ShotDetailDraftBatchApplySerializer(StrictSerializer):
+    expected_batch_revision = serializers.IntegerField(min_value=1)
+    items = ShotDetailDraftBatchApplyItemSerializer(many=True, allow_empty=False)
+    review_acknowledged = serializers.BooleanField(default=False)
+    language_mode = serializers.ChoiceField(
+        choices=("chinese_only", "bilingual_confirmed"),
+        default="bilingual_confirmed",
+    )
+    english_review_acknowledged = serializers.BooleanField(default=False)
+
+    def validate(self, attrs):
+        ids = [str(item["item_id"]) for item in attrs["items"]]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError({"items": "item_id 不能重复"})
+        if (
+            attrs["language_mode"] == "bilingual_confirmed"
+            and not attrs["english_review_acknowledged"]
+        ):
+            raise serializers.ValidationError({
+                "english_review_acknowledged": "应用英文高细节前必须确认已人工审核译文",
+            })
+        return attrs
+
+
 class ShotDetailDraftSerializer(serializers.ModelSerializer):
     context_current = serializers.SerializerMethodField()
     can_edit = serializers.SerializerMethodField()
@@ -2888,10 +3397,16 @@ class ShotDetailDraftSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
     def get_context_current(self, obj) -> bool:
-        from studio.services.shot_detail_drafts import shot_detail_context_hash
+        from studio.services.shot_detail_drafts import (
+            shot_detail_context_hash,
+            shot_detail_draft_policy,
+        )
 
         try:
-            return obj.context_hash == shot_detail_context_hash(obj.project, obj.episode, obj.shot)
+            return obj.context_hash == shot_detail_context_hash(
+                obj.project, obj.episode, obj.shot,
+                policy=shot_detail_draft_policy(obj),
+            )
         except Exception:
             return False
 
@@ -2926,6 +3441,46 @@ class ShotDetailDraftSerializer(serializers.ModelSerializer):
             and not requires_edit
             and self.get_context_current(obj)
         )
+
+
+class ShotDetailDraftBatchSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ShotDetailDraftBatch
+        fields = (
+            "id", "project", "episode", "created_by", "request_id", "provider",
+            "variation_note", "source_manifest_hash", "policy_snapshot", "config_hash",
+            "generation_status", "apply_status", "revision", "total_count",
+            "pending_count", "succeeded_count", "failed_count", "stale_count",
+            "skipped_count", "applied_count", "started_at", "finished_at",
+            "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+
+class ShotDetailDraftBatchCandidateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ShotDetailDraft
+        fields = (
+            "id", "shot", "status", "revision", "generation_no", "context_hash",
+            "input_settings", "draft_data", "validation", "warnings", "error_message",
+            "provider", "model", "created_at", "updated_at",
+        )
+        read_only_fields = fields
+
+
+class ShotDetailDraftBatchItemSerializer(serializers.ModelSerializer):
+    draft = ShotDetailDraftBatchCandidateSerializer(read_only=True)
+
+    class Meta:
+        model = ShotDetailDraftBatchItem
+        fields = (
+            "id", "batch", "shot", "ordinal", "source_context_hash",
+            "before_snapshot", "draft", "status", "attempts", "max_attempts",
+            "next_attempt_at", "worker_id", "claimed_at", "heartbeat_at",
+            "finished_at", "error_code", "error_message", "apply_run_id",
+            "applied_at", "created_at", "updated_at",
+        )
+        read_only_fields = fields
 
 
 class PromptFieldTranslationSerializer(serializers.ModelSerializer):
@@ -3129,6 +3684,16 @@ class PromptTranslationConfirmSerializer(serializers.Serializer):
     translation = serializers.CharField(
         max_length=30_000, trim_whitespace=False, required=False,
     )
+
+
+class PromptTranslationConflictErrorSerializer(serializers.Serializer):
+    status_code = serializers.IntegerField()
+    code = serializers.CharField()
+    details = serializers.DictField()
+
+
+class PromptTranslationConflictErrorResponseSerializer(serializers.Serializer):
+    error = PromptTranslationConflictErrorSerializer()
 
 
 class PromptTranslationPromotionEntrySerializer(serializers.Serializer):

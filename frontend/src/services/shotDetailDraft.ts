@@ -6,6 +6,13 @@ import type {
   ShotDetailDraftReviewSeverity,
   ShotDetailDraftReviewSummary,
   ShotDetailDraftValidation,
+  ShotDetailDraftBatch,
+  ShotDetailDraftBatchDetail,
+  ShotDetailDraftBatchItem,
+  ShotDetailDraftBatchApplyResult,
+  ShotDetailDraftAppliedShot,
+  ShotHighDetailPolicy,
+  PromptProviderId,
 } from '@/types'
 
 type Raw = Record<string, any>
@@ -77,7 +84,10 @@ const adaptReviewSummary = (
 /** Stable operator copy keyed only by finite public issue codes. */
 export const shotDetailDraftReviewIssueTitle = (issue: ShotDetailDraftReviewIssue): string => {
   const code = issue.code.toLowerCase()
-  if (issue.severity === 'requires_edit' || /unknown|missing_(?:entity|speaker)|invalid_(?:entity|reference)|foreign_key/.test(code)) {
+  if (/model_output_protocol_validation_failed/.test(code)) {
+    return '模型已返回可编辑正文，但结构协议未完全通过；请修改并保存校验后再应用'
+  }
+  if (/unknown|missing_(?:entity|speaker)|invalid_(?:entity|reference)|foreign_key/.test(code)) {
     return '关联的素材或说话人无效，正式应用前需要替换或删除'
   }
   if (/bilateral|both_sides|encirc/.test(code)) return '双侧动作的中英文表达可能不一致'
@@ -88,6 +98,7 @@ export const shotDetailDraftReviewIssueTitle = (issue: ShotDetailDraftReviewIssu
   if (/length|too_long|budget/.test(code)) return '说明长度接近或超过建议范围，建议保留最关键画面信息'
   if (/missing|empty|required/.test(code)) return '候选内容不完整，建议补充后再使用'
   if (/action|camera|motion|composition/.test(code)) return '镜头运动或动作画面描述可能需要人工核对'
+  if (issue.severity === 'requires_edit') return '该候选需要先人工修正并保存校验，才能正式应用'
   return '该候选可能与当前镜头事实或中英文对应关系不完全一致'
 }
 
@@ -173,27 +184,44 @@ export const shotDetailDraftIsEditable = (draft?: ShotDetailDraft | null): boole
   draft?.canEdit && ['draft', 'failed'].includes(draft.status) && draft.contextCurrent,
 )
 
-export const shotDetailDraftEditorWarnings = (data: ShotDetailDraftData): string[] => {
+export const shotDetailDraftEditorWarnings = (
+  data: ShotDetailDraftData,
+  policy?: Pick<ShotHighDetailPolicy,
+    'recommendedZhChars' | 'recommendedEnChars' | 'transportZhMaxChars' | 'transportEnMaxChars'>,
+): string[] => {
   const warnings: string[] = []
   if (!data.detailZh.trim()) warnings.push('缺少中文高细节说明；可补充后再确认。')
   if (!data.detailEn.trim()) warnings.push('缺少英文高细节说明；可人工填写或核对后再确认。')
-  if (data.detailZh.length > 500) warnings.push('中文高细节说明超过 500 字。')
-  if (data.detailEn.length > 750) warnings.push('英文高细节说明超过 750 字符。')
+  if (policy?.transportZhMaxChars && data.detailZh.length > policy.transportZhMaxChars) {
+    warnings.push(`中文高细节说明超过应用前配置阈值 ${policy.transportZhMaxChars} 字；候选会保留，请精简后保存校验。`)
+  } else if (policy?.recommendedZhChars && data.detailZh.length > policy.recommendedZhChars) {
+    warnings.push(`中文高细节说明超过当前通道建议长度 ${policy.recommendedZhChars} 字，可人工精简。`)
+  }
+  if (policy?.transportEnMaxChars && data.detailEn.length > policy.transportEnMaxChars) {
+    warnings.push(`英文高细节说明超过应用前配置阈值 ${policy.transportEnMaxChars} 字符；候选会保留，请精简后保存校验。`)
+  } else if (policy?.recommendedEnChars && data.detailEn.length > policy.recommendedEnChars) {
+    warnings.push(`英文高细节说明超过当前通道建议长度 ${policy.recommendedEnChars} 字符，可人工精简。`)
+  }
   return warnings
 }
 
 /** Normalize the small, resource-aware error vocabulary used by the detail API. */
-export const shotDetailDraftRequestError = (cause: unknown, fallback: string): string => {
+export const shotDetailDraftRequestError = (
+  cause: unknown,
+  fallback: string,
+  provider?: PromptProviderId,
+): string => {
   const candidate = objectValue(cause)
   const response = objectValue(candidate.response)
   const body = objectValue(response.data)
   const envelope = objectValue(body.error)
   const code = text(envelope.code || body.code || candidate.code)
+  const providerLabel = provider === 'deepseek_api' ? 'DeepSeek API' : provider === 'local_qwen' ? '本地 Qwen' : '所选扩写通道'
   if (['creative_resource_busy', 'shot_detail_resource_busy'].includes(code)) {
-    return '视频生产或其他本地 Qwen 请求正在占用资源；高细节候选尚未生成，当前正式分镜未修改。'
+    return '扩写资源暂时占用；单镜可稍后重试，整集扩写会入队自动等待。当前正式分镜未修改。'
   }
   if (['creative_runtime_unavailable', 'shot_detail_runtime_unavailable'].includes(code)) {
-    return '本地 Qwen CUDA 运行环境不可用或模型未就绪；当前正式分镜未修改。'
+    return `${providerLabel} 运行环境不可用或尚未就绪；当前正式分镜未修改。`
   }
   if (['creative_draft_conflict', 'shot_detail_draft_conflict'].includes(code)) {
     return '当前镜头、Bible 或上下文已变化；请刷新后基于最新镜头重新生成。'
@@ -208,7 +236,7 @@ export const shotDetailDraftRequestError = (cause: unknown, fallback: string): s
     return '候选仍引用无效素材或说话人；可继续编辑，但正式应用前必须修正。当前正式镜头未修改。'
   }
   if (['shot_detail_output_invalid_json', 'shot_detail_validation_failed'].includes(code)) {
-    return '本地 Qwen 未返回可编辑的高细节候选；请重新扩写。当前正式镜头未修改。'
+    return `${providerLabel} 未返回可编辑的高细节候选；请重新扩写。当前正式镜头未修改。`
   }
   if (code === 'ECONNABORTED' || /timeout|timed out/i.test(text(candidate.message))) {
     return '浏览器等待高细节候选超时；服务端可能仍在保存审计记录。请刷新当前镜头查看版本，正式分镜未修改。'
@@ -218,3 +246,88 @@ export const shotDetailDraftRequestError = (cause: unknown, fallback: string): s
   // recovery copy for unknown failures.
   return fallback
 }
+
+const batchStatus = (value: unknown): ShotDetailDraftBatch['generationStatus'] => {
+  const normalized = text(value)
+  return ['queued', 'running', 'completed', 'completed_with_errors', 'failed', 'cancelled'].includes(normalized)
+    ? normalized as ShotDetailDraftBatch['generationStatus'] : 'failed'
+}
+
+export const adaptShotDetailDraftBatch = (raw: Raw): ShotDetailDraftBatch => ({
+  id: text(raw.id),
+  projectId: relationId(raw.project),
+  episodeId: relationId(raw.episode),
+  requestId: text(raw.request_id ?? raw.requestId),
+  provider: text(raw.provider) === 'deepseek_api' ? 'deepseek_api' : 'local_qwen',
+  variationNote: text(raw.variation_note ?? raw.variationNote),
+  generationStatus: batchStatus(raw.generation_status ?? raw.generationStatus),
+  applyStatus: text(raw.apply_status ?? raw.applyStatus) === 'complete' ? 'complete' : 'not_started',
+  revision: Number(raw.revision || 1),
+  totalCount: Number(raw.total_count ?? raw.totalCount ?? 0),
+  pendingCount: Number(raw.pending_count ?? raw.pendingCount ?? 0),
+  succeededCount: Number(raw.succeeded_count ?? raw.succeededCount ?? 0),
+  failedCount: Number(raw.failed_count ?? raw.failedCount ?? 0),
+  staleCount: Number(raw.stale_count ?? raw.staleCount ?? 0),
+  skippedCount: Number(raw.skipped_count ?? raw.skippedCount ?? 0),
+  appliedCount: Number(raw.applied_count ?? raw.appliedCount ?? 0),
+  policySnapshot: objectValue(raw.policy_snapshot ?? raw.policySnapshot),
+  createdAt: text(raw.created_at ?? raw.createdAt) || undefined,
+  updatedAt: text(raw.updated_at ?? raw.updatedAt) || undefined,
+  startedAt: text(raw.started_at ?? raw.startedAt) || undefined,
+  finishedAt: text(raw.finished_at ?? raw.finishedAt) || undefined,
+})
+
+export const adaptShotDetailDraftBatchItem = (raw: Raw): ShotDetailDraftBatchItem => {
+  const before = objectValue(raw.before_snapshot ?? raw.beforeSnapshot)
+  const draftRaw = objectValue(raw.draft)
+  const draft = Object.keys(draftRaw).length ? adaptShotDetailDraft({
+    ...draftRaw,
+    project: '',
+    context_current: raw.status !== 'stale',
+  }) : undefined
+  return {
+    id: text(raw.id), batchId: relationId(raw.batch), shotId: relationId(raw.shot),
+    ordinal: Number(raw.ordinal || 0),
+    beforeSnapshot: { targetShot: objectValue(before.target_shot ?? before.targetShot ?? before.shot) },
+    draft,
+    status: ['pending', 'running', 'succeeded', 'failed', 'stale', 'skipped'].includes(text(raw.status))
+      ? text(raw.status) as ShotDetailDraftBatchItem['status'] : 'failed',
+    attempts: Number(raw.attempts || 0), maxAttempts: Number(raw.max_attempts ?? raw.maxAttempts ?? 0),
+    errorCode: text(raw.error_code ?? raw.errorCode) || undefined,
+    errorMessage: text(raw.error_message ?? raw.errorMessage) || undefined,
+    createdAt: text(raw.created_at ?? raw.createdAt) || undefined,
+    updatedAt: text(raw.updated_at ?? raw.updatedAt) || undefined,
+  }
+}
+
+export const adaptShotDetailDraftBatchDetail = (raw: Raw): ShotDetailDraftBatchDetail => {
+  const pagination = objectValue(raw.pagination)
+  return {
+    batch: adaptShotDetailDraftBatch(objectValue(raw.batch)),
+    items: objectList(raw.items).map(adaptShotDetailDraftBatchItem),
+    appliedShots: adaptShotDetailAppliedShots(raw.applied_shots ?? raw.appliedShots),
+    translationWritten: raw.translation_written === true || raw.translationWritten === true,
+    pagination: {
+      count: Number(pagination.count || 0),
+      next: text(pagination.next) || undefined,
+      previous: text(pagination.previous) || undefined,
+    },
+  }
+}
+
+const adaptShotDetailAppliedShots = (raw: unknown): ShotDetailDraftAppliedShot[] => (
+  objectList(raw).map((value) => ({
+    id: text(value.id),
+    detailedDescription: text(value.detailed_description ?? value.detailedDescription),
+    ...(value.metadata && typeof value.metadata === 'object'
+      ? { metadata: value.metadata as Record<string, unknown> }
+      : {}),
+  }))
+)
+
+export const adaptShotDetailDraftBatchApplyResult = (raw: Raw): ShotDetailDraftBatchApplyResult => ({
+  batch: adaptShotDetailDraftBatch(objectValue(raw.batch)),
+  items: objectList(raw.items).map(adaptShotDetailDraftBatchItem),
+  appliedShots: adaptShotDetailAppliedShots(raw.applied_shots ?? raw.appliedShots),
+  translationWritten: raw.translation_written === true || raw.translationWritten === true,
+})

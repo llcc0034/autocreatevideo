@@ -13,7 +13,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from studio.models import AssemblyJob, WorkerLease
+from studio.models import AssemblyJob, SeriesProject, WorkerLease
 from studio.services.assembly import AssemblyError, _mark_scope_complete
 from studio.services.provenance import (
     ProvenanceError,
@@ -196,6 +196,7 @@ def _record_execution_failure(job: AssemblyJob, claim_token, message: str) -> As
 def _mark_succeeded(job: AssemblyJob, claim_token) -> AssemblyJob:
     now = timezone.now()
     with transaction.atomic():
+        locked_project = SeriesProject.objects.select_for_update().get(pk=job.project_id)
         current = (
             AssemblyJob.objects.select_for_update()
             .select_related("project", "episode")
@@ -212,7 +213,7 @@ def _mark_succeeded(job: AssemblyJob, claim_token) -> AssemblyJob:
         current.save(update_fields=(
             "status", "finished_at", "heartbeat_at", "error_message", "updated_at",
         ))
-        _mark_scope_complete(current.project, current.episode)
+        _mark_scope_complete(locked_project, current.episode)
         return current
 
 
@@ -286,19 +287,30 @@ def recover_stale_assemblies(
     counts = {"succeeded": 0, "requeued": 0, "failed": 0}
     completed: list[AssemblyJob] = []
     stale_temporary_paths: list[Path] = []
+    stale_jobs = (
+        AssemblyJob.objects.filter(dry_run=False)
+        .filter(
+            Q(status=AssemblyJob.Status.RUNNING)
+            | Q(status=AssemblyJob.Status.PLANNED)
+        )
+        .filter(
+            Q(heartbeat_at__lte=threshold)
+            | Q(heartbeat_at__isnull=True, updated_at__lte=threshold)
+        )
+    )
     with transaction.atomic():
+        project_ids = list(
+            stale_jobs.order_by().values_list("project_id", flat=True).distinct()
+        )
+        list(
+            SeriesProject.objects.select_for_update()
+            .filter(pk__in=project_ids)
+            .order_by("pk")
+            .only("pk")
+        )
         jobs = list(
-            AssemblyJob.objects.select_for_update()
+            stale_jobs.select_for_update()
             .select_related("project", "episode")
-            .filter(dry_run=False)
-            .filter(
-                Q(status=AssemblyJob.Status.RUNNING)
-                | Q(status=AssemblyJob.Status.PLANNED)
-            )
-            .filter(
-                Q(heartbeat_at__lte=threshold)
-                | Q(heartbeat_at__isnull=True, updated_at__lte=threshold)
-            )
         )
         for job in jobs:
             old_token = job.claim_token

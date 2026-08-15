@@ -6,10 +6,15 @@ const props = withDefaults(defineProps<{ scope?: 'project' | 'bible' | 'shot' }>
 const copied = ref('')
 
 const projectTemplate = `第1集：雨夜来客
-镜头1：雨夜客栈外，沈砚推门进入，右手始终握住玄纹剑。
-沈砚（in a low, restrained voice）：谁在等我？
-镜头2：掌柜退到灯下，视线落在玄纹剑上。
-掌柜（voiceover; softly, with controlled breath）：你终于来了。`
+镜头1【时长=8秒】【首帧连续=否】【尾帧连续=是】：雨夜客栈外。
+[0-3秒] 动作：沈砚推门进入，右手始终握住玄纹剑。
+[3-6秒] 沈砚（in a low, restrained voice）：谁在等我？
+[6-8秒] 动作：他在柜台前停住，保持可衔接的最终姿态。
+
+镜头2【时长=6秒】【首帧连续=是】【尾帧连续=否】：掌柜退到灯下。
+[0-2.5秒] 动作：掌柜的视线落在玄纹剑上。
+[2.5-5秒] 掌柜（voiceover; softly, with controlled breath）：你终于来了。
+[5-6秒] 动作：掌柜抬眼，画面稳定结束。`
 
 const bibleTemplate = `【人物 Character visualPrompt】Lean young Chinese swordsman, narrow angular face, a shallow scar at the tail of his right eyebrow, long black hair tied in a high topknot; permanently wears a weathered blue-gray cross-collar robe and dark leather wrist guards; preserve facial geometry, wardrobe colors, and material texture in every shot.
 
@@ -83,7 +88,7 @@ const copyText = async (key: string, value: string) => {
       <article v-if="showProject">
         <header><div><span>PROJECT SCRIPT</span><strong>全剧母稿可识别模板</strong></div><button type="button" @click="copyText('project',projectTemplate)"><component :is="copied==='project'?Check:Clipboard" :size="12"/>{{ copied==='project'?'已复制':'复制模板' }}</button></header>
         <pre>{{ projectTemplate }}</pre>
-        <p>人物、场景和道具名称应与 Bible 完全一致；人物名后的括号会保存为对白演绎指令，请使用英文。括号含独立 <code>voiceover</code> token 时会生成画外旁白并要求画面人物闭唇；对白正文保持原文。</p>
+        <p><code>时长</code>、动作/对白时间段和首尾帧连续要求都会确定性写入分镜。时间可写秒、毫秒或 <code>MM:SS.mmm</code>；缺少时间段时使用整镜范围，缺少时长或连续要求时使用页面所示的服务端配置默认值。无效或越界指令只会提示并回退默认，不会中止其他镜头。人物、场景和道具名称应与 Bible 完全一致；对白括号中的演绎指令请使用英文，对白正文保持原文。</p>
       </article>
       <article v-if="showBible">
         <header><div><span>CONSISTENCY BIBLE</span><strong>人物 / 场景 / 道具锚点模板</strong></div><button type="button" @click="copyText('bible',bibleTemplate)"><component :is="copied==='bible'?Check:Clipboard" :size="12"/>{{ copied==='bible'?'已复制':'复制模板' }}</button></header>

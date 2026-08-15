@@ -105,13 +105,6 @@ CREATIVE_SCHEMA_VERSION = 1
 CREATIVE_OPERATION = "creative_storyboard"
 SHOT_DETAIL_SCHEMA_VERSION = 1
 SHOT_DETAIL_OPERATION = "shot_high_detail"
-SHOT_DETAIL_ZH_MAX_CHARS = 500
-SHOT_DETAIL_EN_MAX_CHARS = 750
-# These are reviewer-facing recommendations.  The runtime accepts a wider,
-# still bounded transport envelope so a parseable draft can be corrected by a
-# human instead of being discarded for a small-model quality imperfection.
-SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS = 3_000
-SHOT_DETAIL_EN_TRANSPORT_MAX_CHARS = 4_500
 SHOT_DETAIL_REVIEW_DRAFTS_DISABLE_MODEL_REPAIR = True
 ASSET_BIBLE_DRAFT_OPERATION = "asset_bible_draft"
 PROJECT_VISUAL_RULES_DRAFT_OPERATION = "project_visual_rules_draft"
@@ -179,16 +172,6 @@ PROJECT_VISUAL_RULES_DRAFT_SCHEMA: dict[str, Any] = {
                 "preserve_natural_skin_exposure": {"type": "boolean"},
             },
         },
-    },
-}
-SHOT_DETAIL_DRAFT_SCHEMA: dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "required": ["schema_version", "detail_zh", "detail_en"],
-    "properties": {
-        "schema_version": {"type": "integer", "enum": [SHOT_DETAIL_SCHEMA_VERSION]},
-        "detail_zh": {"type": "string", "maxLength": SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS},
-        "detail_en": {"type": "string", "maxLength": SHOT_DETAIL_EN_TRANSPORT_MAX_CHARS},
     },
 }
 CREATIVE_H3_MODES = ("T2VA", "I2VA", "FL2VA", "L2VA", "Ref2VA")
@@ -412,6 +395,10 @@ _CREATIVE_POST_REPAIR_FIELD_PATH_RE = re.compile(
 _CREATIVE_REVIEW_DRAFTS_DISABLE_MODEL_REPAIR = True
 
 _CREATIVE_REVIEW_SUGGESTIONS = {
+    "model_output_incomplete_finish_reason": (
+        "模型返回了可解析且通过结构校验的正文，但完成原因显示输出可能不完整；"
+        "请人工核对内容完整性后再确认应用。"
+    ),
     "english_contains_cjk": "请将该英文栏位完整改为英文，移除残留中文字符。",
     "numeric_facts_mismatch": "请核对中英文中的数字、数量和顺序，保持完全一致。",
     "stable_speaker_id_mismatch": "请核对中英文中的 S-ID，保持身份和顺序一致。",
@@ -423,7 +410,7 @@ _CREATIVE_REVIEW_SUGGESTIONS = {
     "model_generation_length_exceeded": "内容超过本次模型生成建议长度；请在保留事实的前提下精简。",
     "chinese_creative_prose_missing": "请补充自然的中文画面或动作描述。",
     "action_arc_dense": "请核对连续动作链是否能在当前时长内清晰完成。",
-    "action_duration_may_be_short": "可在 5–15 秒内延长该镜头，或由人工确认连续快速动作的节奏可执行。",
+    "action_duration_may_be_short": "可在当前通道配置允许的时长范围内延长该镜头，或由人工确认连续快速动作的节奏可执行。",
     "unknown_bible_reference": "请将该引用替换为当前项目 Bible 中存在的实体，或删除该引用。",
     "unknown_speaker_id": "请将说话人替换为当前项目 Bible 中存在的 S-ID，或删除该对白。",
     "dialogue_not_authored": "请将对白改为剧本中的原文，或删除该对白。",
@@ -471,7 +458,6 @@ def _record_creative_review_issue(
 # rather than model-written director fields. The creative runtime accepts the
 # same maximum synopsis envelope as request normalization, then copies both
 # values into the isolated draft verbatim after model generation.
-CREATIVE_EPISODE_TITLE_MAX_CHARS = 80
 CREATIVE_EPISODE_SOURCE_SYNOPSIS_MAX_CHARS = 8_000
 
 
@@ -504,7 +490,7 @@ CREATIVE_STORYBOARD_SCHEMA: dict[str, Any] = {
                 ],
                 "properties": {
                     "client_key": {"type": "string"},
-                    "order": {"type": "integer", "minimum": 1, "maximum": 4},
+                    "order": {"type": "integer", "minimum": 1},
                     "title_zh": _creative_string_schema(min_length=1, max_length=120),
                     "title_en": _creative_string_schema(min_length=1, max_length=180),
                     "narrative_zh": _creative_string_schema(min_length=1, max_length=600),
@@ -532,7 +518,7 @@ CREATIVE_STORYBOARD_SCHEMA: dict[str, Any] = {
                     "soundscape_en": _creative_string_schema(max_length=750),
                     "music_zh": _creative_string_schema(max_length=400),
                     "music_en": _creative_string_schema(max_length=600),
-                    "duration_ms": {"type": "integer", "minimum": 5000, "maximum": 15000},
+                    "duration_ms": {"type": "integer"},
                     "media_type": {"type": "string", "enum": ["video"]},
                     "h3_mode": {"type": "string", "enum": list(CREATIVE_H3_MODES)},
                     "include_audio": {"type": "boolean"},
@@ -625,6 +611,11 @@ def _creative_response_schema(request: "CreativeStoryboardRequest") -> dict[str,
     shot_properties["include_audio"] = {
         "type": "boolean", "enum": [request.include_audio],
     }
+    shot_properties["duration_ms"] = {
+        "type": "integer",
+        "minimum": request.minimum_duration_ms,
+        "maximum": request.maximum_duration_ms,
+    }
     character_ids = [item["id"] for item in request.bible["characters"]]
     scene_ids = [item["id"] for item in request.bible["scenes"]]
     prop_ids = [item["id"] for item in request.bible["props"]]
@@ -650,7 +641,7 @@ def _creative_response_schema(request: "CreativeStoryboardRequest") -> dict[str,
         item["text_zh"] for item in request.required_dialogue_manifest
     ))
     if request.include_audio and request.required_dialogue_manifest:
-        dialogue["maxItems"] = 2
+        dialogue["maxItems"] = request.max_dialogue_per_shot
         dialogue_properties = dialogue["items"]["properties"]
         dialogue_properties["speaker_id"] = {
             "type": "string", "enum": manifest_speakers,
@@ -681,15 +672,9 @@ def _creative_response_schema(request: "CreativeStoryboardRequest") -> dict[str,
     for field_name, budget_key in shot_budget_paths.items():
         shot_properties[field_name]["maxLength"] = CREATIVE_MODEL_FIELD_CHARACTER_BUDGETS[budget_key]
     dialogue_properties = dialogue["items"]["properties"]
-    dialogue_properties["text_zh"]["maxLength"] = (
-        CREATIVE_MODEL_FIELD_CHARACTER_BUDGETS["dialogue_text_zh"]
-    )
-    dialogue_properties["delivery_zh"]["maxLength"] = (
-        CREATIVE_MODEL_FIELD_CHARACTER_BUDGETS["delivery_zh"]
-    )
-    dialogue_properties["delivery_en"]["maxLength"] = (
-        CREATIVE_MODEL_FIELD_CHARACTER_BUDGETS["delivery_en"]
-    )
+    dialogue_properties["text_zh"]["maxLength"] = request.max_dialogue_text_chars
+    dialogue_properties["delivery_zh"]["maxLength"] = request.max_dialogue_delivery_chars
+    dialogue_properties["delivery_en"]["maxLength"] = request.max_dialogue_delivery_en_chars
     return schema
 
 
@@ -979,6 +964,22 @@ class CreativeStoryboardRequest:
     style: str
     glossary: dict[str, str]
     shot_count: int
+    min_shots: int
+    batch_shots: int
+    max_dialogue_per_shot: int
+    max_episode_title_chars: int
+    max_dialogue_text_chars: int
+    max_dialogue_delivery_chars: int
+    max_dialogue_delivery_en_chars: int
+    output_min_tokens: int
+    output_base_tokens: int
+    output_tokens_per_shot: int
+    output_tokens_per_dialogue: int
+    output_dialogue_char_threshold: int
+    max_source_chars: int
+    max_regeneration_context_chars: int
+    max_input_chars: int
+    output_headroom_per_shot: int
     minimum_duration_ms: int
     maximum_duration_ms: int
     preferred_duration_ms: int
@@ -991,6 +992,7 @@ class CreativeStoryboardRequest:
     max_tokens: int
     feedback: str
     regeneration_context: dict[str, Any] | None
+    batch_context: dict[str, Any] | None
     required_dialogue_manifest: tuple[dict[str, Any], ...]
     authorized_bilateral_attack_manifest: tuple[CreativeBilateralAttackFact, ...]
 
@@ -1019,6 +1021,7 @@ class ShotHighDetailRequest:
     seed: int
     max_tokens: int
     feedback: str
+    policy: dict[str, int]
 
 
 class PeakMemoryMonitor:
@@ -1207,6 +1210,8 @@ def _normalise_creative_entities(
     *,
     kind: str,
     limit: int,
+    speaker_id_max_chars: int = 16,
+    field_max_chars: int = 2_000,
 ) -> list[dict[str, str]]:
     if raw is None:
         raw = []
@@ -1244,7 +1249,7 @@ def _normalise_creative_entities(
                 entity.get("stable_speaker_id"),
                 f"bible.{kind}[{index}].stable_speaker_id",
                 required=True,
-                maximum=16,
+                maximum=speaker_id_max_chars,
             )
             if not re.fullmatch(r"S[1-9][0-9]*", speaker_id):
                 raise RuntimeInputError(
@@ -1259,7 +1264,7 @@ def _normalise_creative_entities(
                 entity.get(field_name),
                 f"bible.{kind}[{index}].{field_name}",
                 required=field_name == "name",
-                maximum=2_000,
+                maximum=field_max_chars,
             )
         result.append(item)
     return result
@@ -1305,15 +1310,26 @@ def _extract_required_dialogue_manifest(
 def _creative_required_output_tokens(
     shot_count: int,
     dialogue_manifest: list[dict[str, Any]],
+    *,
+    output_min_tokens: int,
+    output_base_tokens: int,
+    output_tokens_per_shot: int,
+    output_tokens_per_dialogue: int,
+    output_dialogue_char_threshold: int,
 ) -> int:
     dialogue_cost = sum(
-        128 + max(
+        output_tokens_per_dialogue + max(
             0,
-            len(item["text_zh"]) + len(item["source_delivery_zh"]) - 32,
+            len(item["text_zh"])
+            + len(item["source_delivery_zh"])
+            - output_dialogue_char_threshold,
         )
         for item in dialogue_manifest
     )
-    return max(1_024, 768 + (384 * shot_count)) + dialogue_cost
+    return max(
+        output_min_tokens,
+        output_base_tokens + (output_tokens_per_shot * shot_count),
+    ) + dialogue_cost
 
 
 def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRequest:
@@ -1332,6 +1348,85 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
     if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
         raise RuntimeInputError("source_fingerprint must be a lowercase SHA256 value")
 
+    options = payload.get("options") or {}
+    if not isinstance(options, dict):
+        raise RuntimeInputError("options must be an object")
+    policy_keys = (
+        "min_shots",
+        "batch_shots",
+        "max_dialogue_per_shot",
+        "max_episode_title_chars",
+        "max_dialogue_text_chars",
+        "max_dialogue_delivery_chars",
+        "max_dialogue_delivery_en_chars",
+        "output_min_tokens",
+        "output_base_tokens",
+        "output_tokens_per_shot",
+        "output_tokens_per_dialogue",
+        "output_dialogue_char_threshold",
+        "minimum_duration_ms",
+        "maximum_duration_ms",
+        "default_duration_ms",
+        "max_source_chars",
+        "max_regeneration_context_chars",
+        "max_input_chars",
+        "output_headroom_per_shot",
+    )
+    missing_policy_keys = [key for key in policy_keys if key not in options]
+    if missing_policy_keys:
+        raise RuntimeInputError(
+            "options is missing creative provider policy fields: "
+            + ", ".join(missing_policy_keys)
+        )
+    if any(isinstance(options[key], bool) for key in policy_keys):
+        raise RuntimeInputError("creative provider policy fields must be integers")
+    try:
+        min_shots = int(options["min_shots"])
+        batch_shots = int(options["batch_shots"])
+        max_dialogue_per_shot = int(options["max_dialogue_per_shot"])
+        max_episode_title_chars = int(options["max_episode_title_chars"])
+        max_dialogue_text_chars = int(options["max_dialogue_text_chars"])
+        max_dialogue_delivery_chars = int(options["max_dialogue_delivery_chars"])
+        max_dialogue_delivery_en_chars = int(options["max_dialogue_delivery_en_chars"])
+        output_min_tokens = int(options["output_min_tokens"])
+        output_base_tokens = int(options["output_base_tokens"])
+        output_tokens_per_shot = int(options["output_tokens_per_shot"])
+        output_tokens_per_dialogue = int(options["output_tokens_per_dialogue"])
+        output_dialogue_char_threshold = int(options["output_dialogue_char_threshold"])
+        max_source_chars = int(options["max_source_chars"])
+        max_regeneration_context_chars = int(
+            options["max_regeneration_context_chars"]
+        )
+        max_input_chars = int(options["max_input_chars"])
+        output_headroom_per_shot = int(options["output_headroom_per_shot"])
+    except (TypeError, ValueError) as exc:
+        raise RuntimeInputError("creative provider policy fields must be integers") from exc
+    if min_shots < 1 or batch_shots < min_shots:
+        raise RuntimeInputError(
+            "options.min_shots and options.batch_shots must define a positive ordered range"
+        )
+    if max_dialogue_per_shot < 1:
+        raise RuntimeInputError("options.max_dialogue_per_shot must be greater than zero")
+    if min((
+        max_episode_title_chars, max_dialogue_text_chars,
+        max_dialogue_delivery_chars, max_dialogue_delivery_en_chars,
+        output_min_tokens, output_base_tokens, output_tokens_per_shot,
+        output_tokens_per_dialogue,
+    )) < 1:
+        raise RuntimeInputError("creative provider length and output-token policies must be positive")
+    if output_dialogue_char_threshold < 0:
+        raise RuntimeInputError("options.output_dialogue_char_threshold cannot be negative")
+    if min(max_source_chars, max_regeneration_context_chars, max_input_chars) < 1:
+        raise RuntimeInputError("creative provider character budgets must be greater than zero")
+    if max_source_chars > max_input_chars:
+        raise RuntimeInputError("options.max_source_chars cannot exceed options.max_input_chars")
+    if max_regeneration_context_chars > max_input_chars:
+        raise RuntimeInputError(
+            "options.max_regeneration_context_chars cannot exceed options.max_input_chars"
+        )
+    if output_headroom_per_shot < 0:
+        raise RuntimeInputError("options.output_headroom_per_shot cannot be negative")
+
     raw_project = payload.get("project") or {}
     if not isinstance(raw_project, dict):
         raise RuntimeInputError("project must be an object")
@@ -1339,7 +1434,7 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         "title": _bounded_text(raw_project.get("title"), "project.title", maximum=200),
         "logline": _bounded_text(raw_project.get("logline"), "project.logline", maximum=2_000),
         "master_script": _bounded_text(
-            raw_project.get("master_script"), "project.master_script", maximum=16_000,
+            raw_project.get("master_script"), "project.master_script", maximum=max_source_chars,
         ),
         "continuity_summary": _bounded_text(
             raw_project.get("continuity_summary"), "project.continuity_summary", maximum=3_000,
@@ -1360,14 +1455,16 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
             raw_episode.get("title") or raw_episode.get("title_zh"),
             "episode.title",
             required=True,
-            maximum=CREATIVE_EPISODE_TITLE_MAX_CHARS,
+            maximum=max_episode_title_chars,
         ),
         "synopsis": _bounded_text(
             raw_episode.get("synopsis") or raw_episode.get("description"),
             "episode.synopsis",
             maximum=CREATIVE_EPISODE_SOURCE_SYNOPSIS_MAX_CHARS,
         ),
-        "script": _bounded_text(raw_episode.get("script"), "episode.script", maximum=16_000),
+        "script": _bounded_text(
+            raw_episode.get("script"), "episode.script", maximum=max_source_chars,
+        ),
         "continuity_from_previous": _bounded_text(
             raw_episode.get("continuity_from_previous"),
             "episode.continuity_from_previous",
@@ -1416,34 +1513,30 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
             raise RuntimeInputError(f"glossary[{source_text}] English value still contains Chinese")
         glossary[source_text] = target_text
 
-    options = payload.get("options") or {}
-    if not isinstance(options, dict):
-        raise RuntimeInputError("options must be an object")
     try:
         shot_count = int(options.get("shot_count", 2))
-        minimum_duration_ms = int(options.get("minimum_duration_ms", 5_000))
-        maximum_duration_ms = int(options.get("maximum_duration_ms", 15_000))
-        preferred_duration_ms = int(
-            options.get("default_duration_ms", options.get("preferred_duration_ms", 5_000))
-        )
+        minimum_duration_ms = int(options["minimum_duration_ms"])
+        maximum_duration_ms = int(options["maximum_duration_ms"])
+        preferred_duration_ms = int(options["default_duration_ms"])
         attempt = int(payload.get("attempt", 1))
         seed = int(payload.get("seed", 43 + attempt))
-        max_tokens = int(payload.get("max_tokens", payload.get("max_new_tokens", 3_072)))
+        raw_max_tokens = payload.get("max_tokens", payload.get("max_new_tokens"))
+        if raw_max_tokens is None:
+            raise TypeError("max_tokens is required")
+        max_tokens = int(raw_max_tokens)
     except (TypeError, ValueError) as exc:
         raise RuntimeInputError(
             "shot_count, duration values, attempt, seed, and max_tokens must be integers"
         ) from exc
-    if not 1 <= shot_count <= 4:
-        raise RuntimeInputError("options.shot_count must be between 1 and 4 on the verified CPU runtime")
-    if not 5_000 <= minimum_duration_ms <= 15_000:
-        raise RuntimeInputError("options.minimum_duration_ms must be between 5000 and 15000")
-    if not minimum_duration_ms <= maximum_duration_ms <= 15_000:
+    if shot_count < min_shots:
         raise RuntimeInputError(
-            "options.maximum_duration_ms must be between minimum_duration_ms and 15000"
+            f"options.shot_count must be at least {min_shots} for the selected provider policy"
         )
+    if minimum_duration_ms < 1 or maximum_duration_ms < minimum_duration_ms:
+        raise RuntimeInputError("creative duration bounds must define a positive ordered range")
     if not minimum_duration_ms <= preferred_duration_ms <= maximum_duration_ms:
         raise RuntimeInputError(
-            "options.default_duration_ms must be inside the requested 5000-15000 duration bounds"
+            "options.default_duration_ms must be inside the requested duration bounds"
         )
     raw_recommended_durations = options.get("recommended_shot_durations_ms")
     if raw_recommended_durations is None:
@@ -1460,14 +1553,14 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         )
     ):
         raise RuntimeInputError(
-            "options.recommended_shot_durations_ms must contain one 5000-15000ms integer per shot"
+            "options.recommended_shot_durations_ms must contain one in-range integer per shot"
         )
     else:
         recommended_shot_durations_ms = tuple(raw_recommended_durations)
     if not 1 <= attempt <= 100:
         raise RuntimeInputError("attempt must be between 1 and 100")
-    if not 1_024 <= max_tokens <= 3_072:
-        raise RuntimeInputError("creative max_tokens must be between 1024 and 3072")
+    if max_tokens < 1:
+        raise RuntimeInputError("creative max_tokens must be greater than zero")
     if not -(2**31) <= seed <= 2**31 - 1:
         raise RuntimeInputError("seed must fit in a signed 32-bit integer")
     h3_mode = str(options.get("h3_mode") or "T2VA")
@@ -1525,14 +1618,157 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         previous_size = len(json.dumps(
             previous_draft, ensure_ascii=False, separators=(",", ":"), default=str,
         ))
-        if previous_size > 16_000:
+        if previous_size > max_regeneration_context_chars:
             raise RuntimeInputError(
-                "regeneration_context.previous_draft exceeds the 16000 character runtime budget"
+                "regeneration_context.previous_draft exceeds the selected provider's "
+                f"{max_regeneration_context_chars} character budget"
             )
         regeneration_context = {
             "selected_shot_keys": selected,
             "previous_draft": previous_draft,
             "instruction": instruction,
+        }
+    raw_batch_context = payload.get("batch_context")
+    batch_context: dict[str, Any] | None = None
+    if raw_batch_context is not None:
+        expected_batch_keys = {
+            "batch_index", "batch_count", "global_shot_start",
+            "global_shot_end", "global_shot_count", "source_mode", "previous_shot",
+        }
+        if not isinstance(raw_batch_context, dict) or set(raw_batch_context) != expected_batch_keys:
+            raise RuntimeInputError(
+                "batch_context must contain exactly batch_index, batch_count, "
+                "global_shot_start, global_shot_end, global_shot_count, "
+                "source_mode, previous_shot"
+            )
+        integer_keys = (
+            "batch_index", "batch_count", "global_shot_start",
+            "global_shot_end", "global_shot_count",
+        )
+        if any(isinstance(raw_batch_context[key], bool) for key in integer_keys):
+            raise RuntimeInputError("batch_context range fields must be integers")
+        try:
+            batch_index = int(raw_batch_context["batch_index"])
+            batch_count = int(raw_batch_context["batch_count"])
+            global_shot_start = int(raw_batch_context["global_shot_start"])
+            global_shot_end = int(raw_batch_context["global_shot_end"])
+            global_shot_count = int(raw_batch_context["global_shot_count"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeInputError("batch_context range fields must be integers") from exc
+        if not 1 <= batch_index <= batch_count:
+            raise RuntimeInputError("batch_context batch index is outside its batch count")
+        if not 1 <= global_shot_start <= global_shot_end <= global_shot_count:
+            raise RuntimeInputError("batch_context global shot range is invalid")
+        if global_shot_end - global_shot_start + 1 != shot_count:
+            raise RuntimeInputError(
+                "batch_context global shot range must equal options.shot_count"
+            )
+        source_mode = _bounded_text(
+            raw_batch_context["source_mode"], "batch_context.source_mode",
+            required=True, maximum=32,
+        )
+        if source_mode not in {
+            "complete_source", "contiguous_excerpt", "shared_read_only",
+        }:
+            raise RuntimeInputError("batch_context.source_mode is unsupported")
+        if batch_count == 1 and source_mode == "shared_read_only":
+            raise RuntimeInputError(
+                "batch_context.source_mode shared_read_only requires multiple batches"
+            )
+        raw_previous = raw_batch_context["previous_shot"]
+        previous_shot: dict[str, Any] | None = None
+        if batch_index == 1:
+            if raw_previous is not None or global_shot_start != 1:
+                raise RuntimeInputError(
+                    "the first batch must start at global shot 1 without previous_shot"
+                )
+        else:
+            previous_keys = {
+                "client_key", "order", "scene_id", "character_ids", "prop_ids",
+                "action_zh", "action_en", "continuity_zh", "continuity_en",
+            }
+            if not isinstance(raw_previous, dict) or set(raw_previous) != previous_keys:
+                raise RuntimeInputError(
+                    "non-first batch_context.previous_shot has an invalid fact shape"
+                )
+            if isinstance(raw_previous["order"], bool):
+                raise RuntimeInputError("batch_context.previous_shot.order must be an integer")
+            try:
+                previous_order = int(raw_previous["order"])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeInputError(
+                    "batch_context.previous_shot.order must be an integer"
+                ) from exc
+            if previous_order != global_shot_start - 1:
+                raise RuntimeInputError(
+                    "batch_context.previous_shot must immediately precede the global shot range"
+                )
+            expected_previous_key = f"shot-{previous_order:02d}"
+            previous_key = _bounded_text(
+                raw_previous["client_key"], "batch_context.previous_shot.client_key",
+                required=True, maximum=32,
+            )
+            if previous_key != expected_previous_key:
+                raise RuntimeInputError(
+                    "batch_context.previous_shot.client_key does not match its global order"
+                )
+            scene_id = raw_previous["scene_id"]
+            if scene_id is not None:
+                scene_id = _bounded_text(
+                    scene_id, "batch_context.previous_shot.scene_id",
+                    required=True, maximum=64,
+                )
+                if scene_id not in {item["id"] for item in bible["scenes"]}:
+                    raise RuntimeInputError(
+                        "batch_context.previous_shot.scene_id is outside the Bible whitelist"
+                    )
+            normalized_bindings: dict[str, list[str]] = {}
+            for key, bible_key in (("character_ids", "characters"), ("prop_ids", "props")):
+                raw_values = raw_previous[key]
+                if (
+                    not isinstance(raw_values, list)
+                    or any(not isinstance(value, str) for value in raw_values)
+                    or len(raw_values) != len(set(raw_values))
+                ):
+                    raise RuntimeInputError(
+                        f"batch_context.previous_shot.{key} must be a unique string array"
+                    )
+                allowed_ids = {item["id"] for item in bible[bible_key]}
+                if not set(raw_values) <= allowed_ids:
+                    raise RuntimeInputError(
+                        f"batch_context.previous_shot.{key} is outside the Bible whitelist"
+                    )
+                normalized_bindings[key] = list(raw_values)
+            previous_shot = {
+                "client_key": previous_key,
+                "order": previous_order,
+                "scene_id": scene_id,
+                **normalized_bindings,
+                "action_zh": _bounded_text(
+                    raw_previous["action_zh"], "batch_context.previous_shot.action_zh",
+                    maximum=2_000,
+                ),
+                "action_en": _bounded_text(
+                    raw_previous["action_en"], "batch_context.previous_shot.action_en",
+                    maximum=2_000,
+                ),
+                "continuity_zh": _bounded_text(
+                    raw_previous["continuity_zh"],
+                    "batch_context.previous_shot.continuity_zh", maximum=1_000,
+                ),
+                "continuity_en": _bounded_text(
+                    raw_previous["continuity_en"],
+                    "batch_context.previous_shot.continuity_en", maximum=1_500,
+                ),
+            }
+        batch_context = {
+            "batch_index": batch_index,
+            "batch_count": batch_count,
+            "global_shot_start": global_shot_start,
+            "global_shot_end": global_shot_end,
+            "global_shot_count": global_shot_count,
+            "source_mode": source_mode,
+            "previous_shot": previous_shot,
         }
     raw_dialogue_manifest = payload.get("required_dialogue_manifest")
     if not isinstance(raw_dialogue_manifest, list):
@@ -1569,13 +1805,13 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
             "speaker_id": speaker_id,
             "text_zh": _bounded_text(
                 raw_item["text_zh"], f"required_dialogue_manifest[{index}].text_zh",
-                required=True, maximum=240,
+                required=True, maximum=max_dialogue_text_chars,
             ),
             "source_order": source_order,
             "source_delivery_zh": _bounded_text(
                 raw_item["source_delivery_zh"],
                 f"required_dialogue_manifest[{index}].source_delivery_zh",
-                maximum=100,
+                maximum=max_dialogue_delivery_chars,
             ),
         })
     expected_manifest = _extract_required_dialogue_manifest(
@@ -1585,10 +1821,12 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         raise RuntimeInputError(
             "required_dialogue_manifest does not exactly match the authored source dialogue"
         )
-    if len(dialogue_manifest) > shot_count * 2:
+    dialogue_capacity = shot_count * max_dialogue_per_shot
+    if len(dialogue_manifest) > dialogue_capacity:
         raise RuntimeInputError(
-            f"{len(dialogue_manifest)} required dialogue lines exceed the {shot_count * 2}-line "
-            f"capacity of {shot_count} shots; split the episode segment before generation"
+            f"{len(dialogue_manifest)} required dialogue lines exceed the {dialogue_capacity}-line "
+            f"capacity of {shot_count} shots at {max_dialogue_per_shot} lines per shot; "
+            "split the episode segment or adjust the selected provider policy"
         )
     authoritative_bilateral_events = _creative_authoritative_bilateral_attack_manifest(
         episode["script"],
@@ -1605,7 +1843,15 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         raise RuntimeInputError(
             "episode.script bilateral attack events exceed the available narrative shot capacity"
         )
-    required_output_tokens = _creative_required_output_tokens(shot_count, dialogue_manifest)
+    required_output_tokens = _creative_required_output_tokens(
+        shot_count,
+        dialogue_manifest,
+        output_min_tokens=output_min_tokens,
+        output_base_tokens=output_base_tokens,
+        output_tokens_per_shot=output_tokens_per_shot,
+        output_tokens_per_dialogue=output_tokens_per_dialogue,
+        output_dialogue_char_threshold=output_dialogue_char_threshold,
+    )
     if max_tokens != required_output_tokens:
         raise RuntimeInputError(
             f"creative max_tokens must equal the authored-dialogue-aware budget "
@@ -1621,6 +1867,22 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         style=style,
         glossary=glossary,
         shot_count=shot_count,
+        min_shots=min_shots,
+        batch_shots=batch_shots,
+        max_dialogue_per_shot=max_dialogue_per_shot,
+        max_episode_title_chars=max_episode_title_chars,
+        max_dialogue_text_chars=max_dialogue_text_chars,
+        max_dialogue_delivery_chars=max_dialogue_delivery_chars,
+        max_dialogue_delivery_en_chars=max_dialogue_delivery_en_chars,
+        output_min_tokens=output_min_tokens,
+        output_base_tokens=output_base_tokens,
+        output_tokens_per_shot=output_tokens_per_shot,
+        output_tokens_per_dialogue=output_tokens_per_dialogue,
+        output_dialogue_char_threshold=output_dialogue_char_threshold,
+        max_source_chars=max_source_chars,
+        max_regeneration_context_chars=max_regeneration_context_chars,
+        max_input_chars=max_input_chars,
+        output_headroom_per_shot=output_headroom_per_shot,
         minimum_duration_ms=minimum_duration_ms,
         maximum_duration_ms=maximum_duration_ms,
         preferred_duration_ms=preferred_duration_ms,
@@ -1633,6 +1895,7 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
         max_tokens=max_tokens,
         feedback=feedback,
         regeneration_context=regeneration_context,
+        batch_context=batch_context,
         required_dialogue_manifest=tuple(dialogue_manifest),
         authorized_bilateral_attack_manifest=authoritative_bilateral_events,
     )
@@ -1641,57 +1904,92 @@ def _normalise_creative_request(payload: dict[str, Any]) -> CreativeStoryboardRe
             "project": project, "episode": episode, "bible": bible,
             "style": style, "glossary": glossary, "feedback": feedback,
             "regeneration_context": regeneration_context,
+            "batch_context": batch_context,
         },
         ensure_ascii=False,
         separators=(",", ":"),
     ))
-    if serialized_size > 24_000:
+    if serialized_size > max_input_chars:
         raise RuntimeInputError(
-            "creative episode, Bible, style, and glossary exceed the 24000 character input budget; "
-            "submit one 1-4 shot episode segment instead of a season or full series"
+            "creative episode, Bible, style, glossary, and regeneration context exceed the selected "
+            f"provider's {max_input_chars} character input budget; shorten the episode segment or "
+            "adjust the provider policy"
         )
     return request
 
 
-def _normalise_shot_detail_dialogue(raw: Any) -> list[dict[str, Any]]:
+def _normalise_shot_detail_dialogue(
+    raw: Any, *, maximum: int, duration_ms: int, speaker_id_max_chars: int,
+    text_max_chars: int, delivery_max_chars: int,
+) -> list[dict[str, Any]]:
     if raw is None:
         return []
-    if not isinstance(raw, list) or len(raw) > 2:
-        raise RuntimeInputError("target_shot.dialogue must contain at most two objects")
+    if not isinstance(raw, list) or len(raw) > maximum:
+        raise RuntimeInputError(
+            f"target_shot.dialogue must contain at most {maximum} objects"
+        )
     result: list[dict[str, Any]] = []
     for index, item in enumerate(raw):
         if not isinstance(item, dict):
             raise RuntimeInputError(f"target_shot.dialogue[{index}] must be an object")
-        unknown = set(item) - {"speaker_id", "text", "delivery", "voiceover"}
+        unknown = set(item) - {
+            "speaker_id", "text", "delivery", "voiceover", "start_ms", "end_ms",
+        }
         if unknown:
             raise RuntimeInputError(
                 f"target_shot.dialogue[{index}] has unsupported keys: {sorted(unknown)}"
             )
-        result.append({
+        normalized = {
             "speaker_id": _bounded_text(
                 item.get("speaker_id"), f"target_shot.dialogue[{index}].speaker_id",
-                required=True, maximum=16,
+                required=True, maximum=speaker_id_max_chars,
             ),
             "text": _bounded_text(
                 item.get("text"), f"target_shot.dialogue[{index}].text",
-                required=True, maximum=240,
+                required=True, maximum=text_max_chars,
             ),
             "delivery": _bounded_text(
-                item.get("delivery"), f"target_shot.dialogue[{index}].delivery", maximum=160,
+                item.get("delivery"), f"target_shot.dialogue[{index}].delivery",
+                maximum=delivery_max_chars,
             ),
             "voiceover": bool(item.get("voiceover", False)),
-        })
+        }
+        has_start = "start_ms" in item
+        has_end = "end_ms" in item
+        if has_start != has_end:
+            raise RuntimeInputError(
+                f"target_shot.dialogue[{index}] start_ms and end_ms must be supplied together"
+            )
+        if has_start:
+            start_ms = item["start_ms"]
+            end_ms = item["end_ms"]
+            if (
+                isinstance(start_ms, bool) or isinstance(end_ms, bool)
+                or not isinstance(start_ms, int) or not isinstance(end_ms, int)
+            ):
+                raise RuntimeInputError(
+                    f"target_shot.dialogue[{index}] start_ms and end_ms must be integers"
+                )
+            if not 0 <= start_ms < end_ms <= duration_ms:
+                raise RuntimeInputError(
+                    f"target_shot.dialogue[{index}] timing must fit the target shot duration"
+                )
+            normalized.update({"start_ms": start_ms, "end_ms": end_ms})
+        result.append(normalized)
     return result
 
 
-def _normalise_shot_detail_boundary(raw: Any, path: str) -> dict[str, Any] | None:
+def _normalise_shot_detail_boundary(
+    raw: Any, path: str, *, policy: dict[str, int],
+) -> dict[str, Any] | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise RuntimeInputError(f"{path} must be an object or null")
     expected = {
         "id", "number", "title", "narrative", "detailed_description", "camera",
-        "continuity_notes", "scene_id", "character_ids", "prop_ids",
+        "continuity_notes", "requires_first_frame_continuity",
+        "requires_last_frame_continuity", "scene_id", "character_ids", "prop_ids",
     }
     if set(raw) != expected:
         raise RuntimeInputError(f"{path} has an invalid boundary schema")
@@ -1701,6 +1999,11 @@ def _normalise_shot_detail_boundary(raw: Any, path: str) -> dict[str, Any] | Non
         raise RuntimeInputError(f"{path}.number must be an integer") from exc
     if number < 1:
         raise RuntimeInputError(f"{path}.number must be positive")
+    for key in (
+        "requires_first_frame_continuity", "requires_last_frame_continuity",
+    ):
+        if not isinstance(raw[key], bool):
+            raise RuntimeInputError(f"{path}.{key} must be boolean")
     character_ids = raw.get("character_ids")
     prop_ids = raw.get("prop_ids")
     if not isinstance(character_ids, list) or not isinstance(prop_ids, list):
@@ -1708,15 +2011,26 @@ def _normalise_shot_detail_boundary(raw: Any, path: str) -> dict[str, Any] | Non
     result = {
         "id": _canonical_uuid(raw.get("id"), f"{path}.id"),
         "number": number,
-        "title": _bounded_text(raw.get("title"), f"{path}.title", maximum=200),
-        "narrative": _bounded_text(raw.get("narrative"), f"{path}.narrative", maximum=2_000),
+        "title": _bounded_text(
+            raw.get("title"), f"{path}.title", maximum=policy["shot_title_max_chars"],
+        ),
+        "narrative": _bounded_text(
+            raw.get("narrative"), f"{path}.narrative",
+            maximum=policy["shot_narrative_max_chars"],
+        ),
         "detailed_description": _bounded_text(
-            raw.get("detailed_description"), f"{path}.detailed_description", maximum=3_500,
+            raw.get("detailed_description"), f"{path}.detailed_description",
+            maximum=policy["shot_detailed_description_max_chars"],
         ),
-        "camera": _bounded_text(raw.get("camera"), f"{path}.camera", maximum=1_000),
+        "camera": _bounded_text(
+            raw.get("camera"), f"{path}.camera", maximum=policy["shot_camera_max_chars"],
+        ),
         "continuity_notes": _bounded_text(
-            raw.get("continuity_notes"), f"{path}.continuity_notes", maximum=1_000,
+            raw.get("continuity_notes"), f"{path}.continuity_notes",
+            maximum=policy["shot_continuity_notes_max_chars"],
         ),
+        "requires_first_frame_continuity": raw["requires_first_frame_continuity"],
+        "requires_last_frame_continuity": raw["requires_last_frame_continuity"],
         "scene_id": (
             _canonical_uuid(raw["scene_id"], f"{path}.scene_id")
             if raw.get("scene_id") else None
@@ -1741,6 +2055,50 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
     if not re.fullmatch(r"[0-9a-f]{64}", source_fingerprint):
         raise RuntimeInputError("source_fingerprint must be a lowercase SHA256 value")
 
+    raw_policy = payload.get("shot_detail_policy")
+    required_policy_keys = {
+        "recommended_zh_chars", "recommended_en_chars",
+        "transport_zh_max_chars", "transport_en_max_chars", "output_tokens",
+        "context_max_chars", "max_dialogue_per_shot", "minimum_duration_ms",
+        "maximum_duration_ms", "maximum_generation_number",
+        "project_title_max_chars", "project_logline_max_chars",
+        "project_continuity_summary_max_chars", "project_color_script_max_chars",
+        "project_aspect_ratio_max_chars", "style_max_chars", "glossary_max_terms",
+        "glossary_source_max_chars", "glossary_target_max_chars",
+        "reference_bindings_max_chars", "shot_title_max_chars",
+        "shot_narrative_max_chars", "shot_detailed_description_max_chars",
+        "shot_camera_max_chars", "shot_continuity_notes_max_chars",
+        "target_action_max_chars", "target_sound_effects_max_chars",
+        "target_music_max_chars", "target_h3_mode_max_chars",
+        "dialogue_speaker_id_max_chars", "dialogue_text_max_chars",
+        "dialogue_delivery_max_chars", "bible_max_characters", "bible_max_scenes",
+        "bible_max_props", "bible_speaker_id_max_chars",
+        "bible_entity_field_max_chars", "feedback_max_chars",
+    }
+    if not isinstance(raw_policy, dict) or not required_policy_keys <= set(raw_policy):
+        raise RuntimeInputError(
+            "shot_detail_policy must contain the configured detail limits"
+        )
+    policy: dict[str, int] = {}
+    for key in required_policy_keys:
+        value = raw_policy[key]
+        if isinstance(value, bool):
+            raise RuntimeInputError(f"shot_detail_policy.{key} must be a positive integer")
+        try:
+            policy[key] = int(value)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeInputError(
+                f"shot_detail_policy.{key} must be a positive integer"
+            ) from exc
+        if policy[key] < 1:
+            raise RuntimeInputError(f"shot_detail_policy.{key} must be positive")
+    if (
+        policy["transport_zh_max_chars"] < policy["recommended_zh_chars"]
+        or policy["transport_en_max_chars"] < policy["recommended_en_chars"]
+        or policy["minimum_duration_ms"] > policy["maximum_duration_ms"]
+    ):
+        raise RuntimeInputError("shot_detail_policy ranges are not ordered")
+
     raw_project = payload.get("project")
     if not isinstance(raw_project, dict):
         raise RuntimeInputError("project must be an object")
@@ -1748,28 +2106,53 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
     if set(raw_project) != expected_project:
         raise RuntimeInputError("project has an invalid high-detail schema")
     project = {
-        "title": _bounded_text(raw_project["title"], "project.title", maximum=200),
-        "logline": _bounded_text(raw_project["logline"], "project.logline", maximum=2_000),
-        "continuity_summary": _bounded_text(
-            raw_project["continuity_summary"], "project.continuity_summary", maximum=3_000,
+        "title": _bounded_text(
+            raw_project["title"], "project.title", maximum=policy["project_title_max_chars"],
         ),
-        "color_script": _bounded_text(raw_project["color_script"], "project.color_script", maximum=2_000),
-        "aspect_ratio": _bounded_text(raw_project["aspect_ratio"], "project.aspect_ratio", maximum=16),
+        "logline": _bounded_text(
+            raw_project["logline"], "project.logline",
+            maximum=policy["project_logline_max_chars"],
+        ),
+        "continuity_summary": _bounded_text(
+            raw_project["continuity_summary"], "project.continuity_summary",
+            maximum=policy["project_continuity_summary_max_chars"],
+        ),
+        "color_script": _bounded_text(
+            raw_project["color_script"], "project.color_script",
+            maximum=policy["project_color_script_max_chars"],
+        ),
+        "aspect_ratio": _bounded_text(
+            raw_project["aspect_ratio"], "project.aspect_ratio",
+            maximum=policy["project_aspect_ratio_max_chars"],
+        ),
     }
     style_raw = payload.get("style") or ""
     style = (
         json.dumps(style_raw, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if isinstance(style_raw, dict) else _bounded_text(style_raw, "style", maximum=8_000)
+        if isinstance(style_raw, dict) else _bounded_text(
+            style_raw, "style", maximum=policy["style_max_chars"],
+        )
     )
-    if len(style) > 8_000:
-        raise RuntimeInputError("style exceeds the 8000 character limit")
+    if len(style) > policy["style_max_chars"]:
+        raise RuntimeInputError(
+            f"style exceeds the {policy['style_max_chars']} character limit"
+        )
     glossary_raw = payload.get("glossary") or {}
-    if not isinstance(glossary_raw, dict) or len(glossary_raw) > 200:
-        raise RuntimeInputError("glossary must be a Chinese-to-English object with at most 200 terms")
+    if not isinstance(glossary_raw, dict) or len(glossary_raw) > policy["glossary_max_terms"]:
+        raise RuntimeInputError(
+            "glossary must be a Chinese-to-English object with at most "
+            f"{policy['glossary_max_terms']} terms"
+        )
     glossary: dict[str, str] = {}
     for source, target in glossary_raw.items():
-        source_text = _bounded_text(source, "glossary source", required=True, maximum=160)
-        target_text = _bounded_text(target, f"glossary[{source_text}]", required=True, maximum=240)
+        source_text = _bounded_text(
+            source, "glossary source", required=True,
+            maximum=policy["glossary_source_max_chars"],
+        )
+        target_text = _bounded_text(
+            target, f"glossary[{source_text}]", required=True,
+            maximum=policy["glossary_target_max_chars"],
+        )
         if CJK_RE.search(target_text):
             raise RuntimeInputError(f"glossary[{source_text}] English value still contains Chinese")
         glossary[source_text] = target_text
@@ -1780,7 +2163,9 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
     expected_target = {
         "id", "number", "title", "narrative", "detailed_description", "camera", "action",
         "dialogue", "sound_effects", "music", "continuity_notes", "duration_ms", "media_type", "h3_mode",
-        "include_audio", "scene_id", "character_ids", "prop_ids", "reference_bindings",
+        "include_audio", "requires_first_frame_continuity",
+        "requires_last_frame_continuity", "scene_id", "character_ids", "prop_ids",
+        "reference_bindings",
     }
     # ``expansion_focus`` was added by the Django service to make the scope
     # explicit to the local model.  Keep accepting the former request shape as
@@ -1795,14 +2180,24 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
         duration_ms = int(raw_target["duration_ms"])
     except (TypeError, ValueError) as exc:
         raise RuntimeInputError("target_shot.number and duration_ms must be integers") from exc
-    if number < 1 or not 100 <= duration_ms <= 15_000:
+    if number < 1 or not (
+        policy["minimum_duration_ms"] <= duration_ms <= policy["maximum_duration_ms"]
+    ):
         raise RuntimeInputError("target_shot number or duration is outside the supported range")
     include_audio = raw_target["include_audio"]
     if not isinstance(include_audio, bool):
         raise RuntimeInputError("target_shot.include_audio must be boolean")
+    for key in (
+        "requires_first_frame_continuity", "requires_last_frame_continuity",
+    ):
+        if not isinstance(raw_target[key], bool):
+            raise RuntimeInputError(f"target_shot.{key} must be boolean")
     if raw_target["media_type"] != "video":
         raise RuntimeInputError("target_shot.media_type must be video")
-    h3_mode = _bounded_text(raw_target["h3_mode"], "target_shot.h3_mode", required=True, maximum=16)
+    h3_mode = _bounded_text(
+        raw_target["h3_mode"], "target_shot.h3_mode", required=True,
+        maximum=policy["target_h3_mode_max_chars"],
+    )
     if h3_mode not in CREATIVE_H3_MODES:
         raise RuntimeInputError(f"target_shot.h3_mode must be one of {CREATIVE_H3_MODES}")
     raw_characters = raw_target["character_ids"]
@@ -1812,8 +2207,14 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
     reference_bindings = raw_target["reference_bindings"]
     if not isinstance(reference_bindings, dict):
         raise RuntimeInputError("target_shot.reference_bindings must be an object")
-    if len(json.dumps(reference_bindings, ensure_ascii=False, separators=(",", ":"))) > 4_000:
-        raise RuntimeInputError("target_shot.reference_bindings exceeds the 4000 character limit")
+    if (
+        len(json.dumps(reference_bindings, ensure_ascii=False, separators=(",", ":")))
+        > policy["reference_bindings_max_chars"]
+    ):
+        raise RuntimeInputError(
+            "target_shot.reference_bindings exceeds the "
+            f"{policy['reference_bindings_max_chars']} character limit"
+        )
     raw_expansion_focus = raw_target.get("expansion_focus")
     if raw_expansion_focus is None:
         expansion_focus = {
@@ -1828,37 +2229,68 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
             raise RuntimeInputError("target_shot.expansion_focus has an invalid high-detail schema")
         expansion_focus = {
             "camera_motion": _bounded_text(
-                raw_expansion_focus["camera_motion"], "target_shot.expansion_focus.camera_motion", maximum=1_000,
+                raw_expansion_focus["camera_motion"],
+                "target_shot.expansion_focus.camera_motion",
+                maximum=policy["shot_camera_max_chars"],
             ),
             "action_and_visual_description": _bounded_text(
                 raw_expansion_focus["action_and_visual_description"],
-                "target_shot.expansion_focus.action_and_visual_description", maximum=2_000,
+                "target_shot.expansion_focus.action_and_visual_description",
+                maximum=policy["target_action_max_chars"],
             ),
             "narrative_visual_context": _bounded_text(
                 raw_expansion_focus["narrative_visual_context"],
-                "target_shot.expansion_focus.narrative_visual_context", maximum=2_000,
+                "target_shot.expansion_focus.narrative_visual_context",
+                maximum=policy["shot_narrative_max_chars"],
             ),
         }
     target_shot = {
         "id": _canonical_uuid(raw_target["id"], "target_shot.id"),
         "number": number,
-        "title": _bounded_text(raw_target["title"], "target_shot.title", maximum=200),
-        "narrative": _bounded_text(raw_target["narrative"], "target_shot.narrative", maximum=2_000),
-        "detailed_description": _bounded_text(
-            raw_target["detailed_description"], "target_shot.detailed_description", maximum=3_500,
+        "title": _bounded_text(
+            raw_target["title"], "target_shot.title", maximum=policy["shot_title_max_chars"],
         ),
-        "camera": _bounded_text(raw_target["camera"], "target_shot.camera", maximum=1_000),
-        "action": _bounded_text(raw_target["action"], "target_shot.action", maximum=2_000),
-        "dialogue": _normalise_shot_detail_dialogue(raw_target["dialogue"]),
-        "sound_effects": _bounded_text(raw_target["sound_effects"], "target_shot.sound_effects", maximum=1_000),
-        "music": _bounded_text(raw_target["music"], "target_shot.music", maximum=1_000),
+        "narrative": _bounded_text(
+            raw_target["narrative"], "target_shot.narrative",
+            maximum=policy["shot_narrative_max_chars"],
+        ),
+        "detailed_description": _bounded_text(
+            raw_target["detailed_description"], "target_shot.detailed_description",
+            maximum=policy["shot_detailed_description_max_chars"],
+        ),
+        "camera": _bounded_text(
+            raw_target["camera"], "target_shot.camera",
+            maximum=policy["shot_camera_max_chars"],
+        ),
+        "action": _bounded_text(
+            raw_target["action"], "target_shot.action",
+            maximum=policy["target_action_max_chars"],
+        ),
+        "dialogue": _normalise_shot_detail_dialogue(
+            raw_target["dialogue"], maximum=policy["max_dialogue_per_shot"],
+            duration_ms=duration_ms,
+            speaker_id_max_chars=policy["dialogue_speaker_id_max_chars"],
+            text_max_chars=policy["dialogue_text_max_chars"],
+            delivery_max_chars=policy["dialogue_delivery_max_chars"],
+        ),
+        "sound_effects": _bounded_text(
+            raw_target["sound_effects"], "target_shot.sound_effects",
+            maximum=policy["target_sound_effects_max_chars"],
+        ),
+        "music": _bounded_text(
+            raw_target["music"], "target_shot.music",
+            maximum=policy["target_music_max_chars"],
+        ),
         "continuity_notes": _bounded_text(
-            raw_target["continuity_notes"], "target_shot.continuity_notes", maximum=1_000,
+            raw_target["continuity_notes"], "target_shot.continuity_notes",
+            maximum=policy["shot_continuity_notes_max_chars"],
         ),
         "duration_ms": duration_ms,
         "media_type": "video",
         "h3_mode": h3_mode,
         "include_audio": include_audio,
+        "requires_first_frame_continuity": raw_target["requires_first_frame_continuity"],
+        "requires_last_frame_continuity": raw_target["requires_last_frame_continuity"],
         "scene_id": (
             _canonical_uuid(raw_target["scene_id"], "target_shot.scene_id")
             if raw_target["scene_id"] else None
@@ -1882,17 +2314,34 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
     if not isinstance(raw_boundaries, dict) or set(raw_boundaries) != {"previous", "next"}:
         raise RuntimeInputError("boundaries must contain exactly previous and next")
     boundaries = {
-        "previous": _normalise_shot_detail_boundary(raw_boundaries["previous"], "boundaries.previous"),
-        "next": _normalise_shot_detail_boundary(raw_boundaries["next"], "boundaries.next"),
+        "previous": _normalise_shot_detail_boundary(
+            raw_boundaries["previous"], "boundaries.previous", policy=policy,
+        ),
+        "next": _normalise_shot_detail_boundary(
+            raw_boundaries["next"], "boundaries.next", policy=policy,
+        ),
     }
 
     raw_bible = payload.get("bible")
     if not isinstance(raw_bible, dict):
         raise RuntimeInputError("bible must be an object")
     bible = {
-        "characters": _normalise_creative_entities(raw_bible.get("characters"), kind="characters", limit=20),
-        "scenes": _normalise_creative_entities(raw_bible.get("scenes"), kind="scenes", limit=1),
-        "props": _normalise_creative_entities(raw_bible.get("props"), kind="props", limit=30),
+        "characters": _normalise_creative_entities(
+            raw_bible.get("characters"), kind="characters",
+            limit=policy["bible_max_characters"],
+            speaker_id_max_chars=policy["bible_speaker_id_max_chars"],
+            field_max_chars=policy["bible_entity_field_max_chars"],
+        ),
+        "scenes": _normalise_creative_entities(
+            raw_bible.get("scenes"), kind="scenes", limit=policy["bible_max_scenes"],
+            speaker_id_max_chars=policy["bible_speaker_id_max_chars"],
+            field_max_chars=policy["bible_entity_field_max_chars"],
+        ),
+        "props": _normalise_creative_entities(
+            raw_bible.get("props"), kind="props", limit=policy["bible_max_props"],
+            speaker_id_max_chars=policy["bible_speaker_id_max_chars"],
+            field_max_chars=policy["bible_entity_field_max_chars"],
+        ),
     }
     bible_character_ids = {item["id"] for item in bible["characters"]}
     bible_scene_ids = {item["id"] for item in bible["scenes"]}
@@ -1907,16 +2356,22 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
     try:
         attempt = int(payload.get("attempt", 1))
         seed = int(payload.get("seed", 43 + attempt))
-        max_tokens = int(payload.get("max_new_tokens", payload.get("max_tokens", 2_304)))
+        max_tokens = int(payload.get("max_new_tokens", payload.get("max_tokens")))
     except (TypeError, ValueError) as exc:
         raise RuntimeInputError("attempt, seed, and max_new_tokens must be integers") from exc
-    if not 1 <= attempt <= 100:
-        raise RuntimeInputError("attempt must be between 1 and 100")
+    if not 1 <= attempt <= policy["maximum_generation_number"]:
+        raise RuntimeInputError(
+            "attempt is outside the configured shot-detail generation range"
+        )
     if not -(2**31) <= seed <= 2**31 - 1:
         raise RuntimeInputError("seed must fit in a signed 32-bit integer")
-    if not 2_048 <= max_tokens <= 3_072:
-        raise RuntimeInputError("shot high-detail max_new_tokens must be between 2048 and 3072")
-    feedback = _bounded_text(payload.get("feedback"), "feedback", maximum=2_000)
+    if max_tokens != policy["output_tokens"]:
+        raise RuntimeInputError(
+            "shot high-detail max_new_tokens must match shot_detail_policy.output_tokens"
+        )
+    feedback = _bounded_text(
+        payload.get("feedback"), "feedback", maximum=policy["feedback_max_chars"],
+    )
     serialized_size = len(json.dumps(
         {
             "project": project, "style": style, "glossary": glossary,
@@ -1924,15 +2379,16 @@ def _normalise_shot_high_detail_request(payload: dict[str, Any]) -> ShotHighDeta
             "feedback": feedback,
         }, ensure_ascii=False, separators=(",", ":"),
     ))
-    if serialized_size > 18_000:
+    if serialized_size > policy["context_max_chars"]:
         raise RuntimeInputError(
-            "shot high-detail context exceeds the 18000 character budget; shorten the formal shot or its bound Bible"
+            "shot high-detail context exceeds the configured character budget; "
+            "shorten the formal shot or its bound Bible"
         )
     return ShotHighDetailRequest(
         request_id=request_id, source_fingerprint=source_fingerprint, project=project, style=style,
         glossary=glossary, target_shot=target_shot, boundaries=boundaries, bible=bible,
         h3_mode=h3_mode, include_audio=include_audio, attempt=attempt, seed=seed,
-        max_tokens=max_tokens, feedback=feedback,
+        max_tokens=max_tokens, feedback=feedback, policy=policy,
     )
 
 
@@ -2134,6 +2590,9 @@ def _build_creative_messages(
     prompt_character_limits = {
         **CREATIVE_MODEL_FIELD_CHARACTER_BUDGETS,
         **(character_limits or {}),
+        "dialogue_text_zh": request.max_dialogue_text_chars,
+        "delivery_zh": request.max_dialogue_delivery_chars,
+        "delivery_en": request.max_dialogue_delivery_en_chars,
     }
     system = (
         "You are a bilingual short-form drama storyboard planner for MiniMax H3. Return only one JSON "
@@ -2144,7 +2603,8 @@ def _build_creative_messages(
         "only observable staging, composition, performance micro-detail, motivated camera behavior, lighting "
         "texture, and synchronized sound that do not change story facts. Use only supplied UUIDs and stable "
         "speaker IDs; copy every UUID, ID, H3 mode, and boolean byte-for-byte. "
-        "Each 5-15 second shot has one location and exactly one motivated camera movement. A shot may contain "
+        f"Each {request.minimum_duration_ms}-{request.maximum_duration_ms}ms shot has one location and "
+        "exactly one motivated camera movement. A shot may contain "
         "a chronological chain of multiple quick, causally continuous actions when they remain readable in its "
         "assigned duration; do not treat shot_count as an action-count limit. Keep every authored visible action "
         "in source order. Do not compress a location change or unrelated story events into one shot. In "
@@ -2172,6 +2632,15 @@ def _build_creative_messages(
         "When regeneration_context is present, propose alternatives only for selected_shot_keys. Treat "
         "previous_draft as immutable boundary context: keep unselected shots, Bible bindings, authored dialogue, "
         "screen direction, prop states, and continuity boundaries unchanged. "
+        "When batch_context is present, create only the supplied contiguous source excerpt. Treat its "
+        "previous_shot as a read-only continuity boundary: continue the same identities, bindings, prop state, "
+        "screen direction, and visible end state without repeating that previous shot or resolving events from "
+        "a later excerpt. The global shot range is informational; output local contiguous shot keys for this "
+        "batch and let the server assign global keys after validation. "
+        "When batch_context.source_mode is shared_read_only, the supplied excerpt owns no authored dialogue "
+        "and is either a short dialogue-free premise or intentionally empty continuity context, never a repeated "
+        "event list: stage only this batch's proportional global-shot range, advance from previous_shot, and "
+        "never restart or duplicate an earlier batch. "
         "If include_audio is true, supply a concise synchronized soundscape in both languages; non-diegetic "
         "music may be an empty bilingual pair when deliberate silence is better. Otherwise leave all dialogue, "
         "soundscape, and music fields empty. Do not output H3 sections, reference labels, "
@@ -2213,6 +2682,7 @@ def _build_creative_messages(
         "recommended_shot_durations_ms": request.recommended_shot_durations_ms,
         "fixed_h3_mode": request.h3_mode,
         "fixed_include_audio": request.include_audio,
+        "max_dialogue_per_shot": request.max_dialogue_per_shot,
         "creativity": request.creativity,
         "creativity_rule": creativity_rule,
         "attempt": request.attempt,
@@ -2236,7 +2706,8 @@ def _build_creative_messages(
                 "not contain a bilateral attack or left/right encirclement. Each script-authorized bilateral "
                 "event may use exactly two short paired sentences in one narrative pair, "
                 "with the second as the literal from-both-sides attack sentence; "
-                "select exactly one camera motivation enum code; at most two exact script dialogue lines"
+                f"select exactly one camera motivation enum code; at most "
+                f"{request.max_dialogue_per_shot} exact script dialogue lines"
             ),
         },
         "authorized_bilateral_attack_manifest": authorized_bilateral_attack_manifest,
@@ -2248,6 +2719,7 @@ def _build_creative_messages(
         "bible_whitelist": request.bible,
         "required_dialogue_manifest": request.required_dialogue_manifest,
         "regeneration_context": request.regeneration_context,
+        "batch_context": request.batch_context,
     }
     user = (
         "Build the bilingual storyboard candidate from this immutable JSON fact contract. "
@@ -2262,8 +2734,9 @@ def _build_creative_messages(
         "that would alter the immutable fact contract. Assign every required_dialogue_manifest item exactly "
         "once, in source_order, copying speaker_id and text_zh byte-for-byte. When source_delivery_zh is "
         "non-empty, copy it byte-for-byte into delivery_zh; when it is empty, write a concise Chinese "
-        "performance note. delivery_en is the faithful English performance equivalent. Place at most two "
-        "lines in each shot and never create any dialogue outside this manifest.\n"
+        "performance note. delivery_en is the faithful English performance equivalent. Place at most "
+        f"{request.max_dialogue_per_shot} lines in each shot and never create any dialogue outside "
+        "this manifest.\n"
         + json.dumps(input_contract, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     )
     bilateral_manifest_reminder = (
@@ -2308,7 +2781,7 @@ def _build_shot_high_detail_messages(request: ShotHighDetailRequest) -> list[dic
         "value for a named entity; if the contract has no canonical English name, refer to its stable S-ID or "
         "neutral visual role instead of copying the original name. Faithfully preserve any stated S-ID, number, "
         "left/right direction, negation, action order, and end state. Do not infer gender. Keep both fields concise enough for one "
-        "shot: aim for roughly 500 Chinese characters and 750 English characters. /no_think"
+        "shot: stay near the configured Chinese and English review recommendations. /no_think"
     )
     variation = (
         "Create a visibly different but fact-equivalent staging option while preserving all fixed boundaries."
@@ -2320,8 +2793,8 @@ def _build_shot_high_detail_messages(request: ShotHighDetailRequest) -> list[dic
         "target_h3_mode": request.h3_mode,
         "target_include_audio": request.include_audio,
         "character_limits": {
-            "detail_zh": SHOT_DETAIL_ZH_MAX_CHARS,
-            "detail_en": SHOT_DETAIL_EN_MAX_CHARS,
+            "detail_zh": request.policy["recommended_zh_chars"],
+            "detail_en": request.policy["recommended_en_chars"],
         },
         "variation_rule": variation,
         "user_feedback_for_visual_variation_only": request.feedback,
@@ -2353,7 +2826,33 @@ def _build_shot_high_detail_messages(request: ShotHighDetailRequest) -> list[dic
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _shot_detail_draft_schema(request: ShotHighDetailRequest) -> dict[str, Any]:
+    """Materialise the configured transport envelope for remote providers."""
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["schema_version", "detail_zh", "detail_en"],
+        "properties": {
+            "schema_version": {
+                "type": "integer", "enum": [SHOT_DETAIL_SCHEMA_VERSION],
+            },
+            "detail_zh": {
+                "type": "string",
+                "maxLength": request.policy["transport_zh_max_chars"],
+            },
+            "detail_en": {
+                "type": "string",
+                "maxLength": request.policy["transport_en_max_chars"],
+            },
+        },
+    }
+
+
 _SHOT_DETAIL_REVIEW_SUGGESTIONS = {
+    "model_output_incomplete_finish_reason": (
+        "模型返回了可解析且通过结构校验的正文，但完成原因显示输出可能不完整；"
+        "请人工核对内容完整性后再确认应用。"
+    ),
     "model_output_shape_normalized": "本地模型返回的 JSON 形状已自动整理；请人工核对两个正文栏是否完整。",
     "model_output_unusable_fallback": "本地模型输出不可用；当前候选由原镜头的镜头运动和动作/画面字段生成，请人工补写并核对。",
     "detail_zh_missing": "请补写中文高细节说明。",
@@ -2468,10 +2967,12 @@ def _validate_shot_high_detail(
     if top["schema_version"] != SHOT_DETAIL_SCHEMA_VERSION:
         raise RuntimeError("result.schema_version is unsupported")
     detail_zh = _result_string(
-        top["detail_zh"], "result.detail_zh", maximum=SHOT_DETAIL_ZH_TRANSPORT_MAX_CHARS,
+        top["detail_zh"], "result.detail_zh",
+        maximum=request.policy["transport_zh_max_chars"],
     )
     detail_en = _result_string(
-        top["detail_en"], "result.detail_en", maximum=SHOT_DETAIL_EN_TRANSPORT_MAX_CHARS,
+        top["detail_en"], "result.detail_en",
+        maximum=request.policy["transport_en_max_chars"],
     )
     if _detail_has_unsafe_controls(detail_zh) or _detail_has_unsafe_controls(detail_en):
         raise RuntimeError("result high-detail text contains unsafe control characters")
@@ -2489,9 +2990,9 @@ def _validate_shot_high_detail(
         char.isalpha() and "LATIN" not in unicodedata.name(char, "") for char in detail_en
     ):
         issues.append(_shot_detail_review_issue("english_prompt_charset_invalid", "detail_en", severity="requires_edit"))
-    if len(detail_zh) > SHOT_DETAIL_ZH_MAX_CHARS:
+    if len(detail_zh) > request.policy["recommended_zh_chars"]:
         issues.append(_shot_detail_review_issue("field_length_above_recommendation", "detail_zh"))
-    if len(detail_en) > SHOT_DETAIL_EN_MAX_CHARS:
+    if len(detail_en) > request.policy["recommended_en_chars"]:
         issues.append(_shot_detail_review_issue("field_length_above_recommendation", "detail_en"))
     zh_numbers = re.findall(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])", detail_zh)
     en_numbers = re.findall(r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])", detail_en)
@@ -6118,7 +6619,7 @@ def _validate_creative_storyboard(
     # English episode fields stay deliberately blank for optional human review.
     title_zh = _result_string(
         request.episode["title"], "request.episode.title",
-        maximum=CREATIVE_EPISODE_TITLE_MAX_CHARS, required=True,
+        maximum=request.max_episode_title_chars, required=True,
     )
     synopsis_zh = _result_string(
         request.episode["synopsis"], "request.episode.synopsis",
@@ -6549,7 +7050,7 @@ def _validate_creative_storyboard(
         dialogues = shot["dialogue"]
         if not isinstance(dialogues, list):
             raise RuntimeError(f"{path}.dialogue must be an array")
-        if len(dialogues) > 2:
+        if len(dialogues) > request.max_dialogue_per_shot:
             if review_issues is not None:
                 _record_creative_review_issue(
                     review_issues,
@@ -6558,7 +7059,10 @@ def _validate_creative_storyboard(
                     severity="requires_edit",
                 )
             else:
-                raise RuntimeError(f"{path}.dialogue must be an array of at most 2 entries")
+                raise RuntimeError(
+                    f"{path}.dialogue must be an array of at most "
+                    f"{request.max_dialogue_per_shot} entries"
+                )
         if not request.include_audio and dialogues:
             if review_issues is not None:
                 _record_creative_review_issue(
@@ -6594,7 +7098,7 @@ def _validate_creative_storyboard(
             text_zh = _result_string(
                 dialogue["text_zh"],
                 f"{dialogue_path}.text_zh",
-                maximum=240,
+                maximum=request.max_dialogue_text_chars,
                 required=review_issues is None,
             )
             authored_dialogue_source = "\n".join(filter(None, (
@@ -6666,13 +7170,13 @@ def _validate_creative_storyboard(
             delivery_zh = _result_string(
                 dialogue["delivery_zh"],
                 f"{dialogue_path}.delivery_zh",
-                maximum=100,
+                maximum=request.max_dialogue_delivery_chars,
                 required=review_issues is None,
             )
             delivery_en = canonical_english(_result_string(
                 dialogue["delivery_en"],
                 f"{dialogue_path}.delivery_en",
-                maximum=150,
+                maximum=request.max_dialogue_delivery_en_chars,
                 required=review_issues is None,
             ), f"shots[{index - 1}].dialogue[{dialogue_index}].delivery_en")
             dialogue["delivery_en"] = delivery_en
@@ -6753,15 +7257,16 @@ def _validate_creative_storyboard(
                 f"{len(bound_shot_indexes)} of {len(normalized_shots)} shots"
             )
             continue
-        if len(source_delivery_zh) > 300:
+        if len(source_delivery_zh) > request.max_dialogue_delivery_chars:
             injection_errors.append(
                 f"cannot safely inject {speaker_id}:{text_zh}; source delivery note is too long"
             )
             continue
-        if planned_dialogue_counts[target_index] >= 2:
+        if planned_dialogue_counts[target_index] >= request.max_dialogue_per_shot:
             injection_errors.append(
                 f"cannot safely inject {speaker_id}:{text_zh}; target shot "
-                f"{target_index + 1} already has 2 planned dialogue entries"
+                f"{target_index + 1} already has {request.max_dialogue_per_shot} "
+                "planned dialogue entries"
             )
             continue
         injection_plan.append((target_index, speaker_id, text_zh, source_delivery_zh))
@@ -6801,7 +7306,7 @@ def _validate_creative_storyboard(
                 ),
                 "voiceover": False,
             })
-            if len(target_shot["dialogue"]) > 2:
+            if len(target_shot["dialogue"]) > request.max_dialogue_per_shot:
                 if review_issues is not None:
                     _record_creative_review_issue(
                         review_issues,
@@ -6811,7 +7316,8 @@ def _validate_creative_storyboard(
                     )
                 else:
                     raise RuntimeError(
-                        f"result.shots[{target_index}].dialogue exceeded the 2-entry limit "
+                        f"result.shots[{target_index}].dialogue exceeded the "
+                        f"{request.max_dialogue_per_shot}-entry limit "
                         "during deterministic authored-dialogue injection"
                     )
             generated_authored_dialogue.add((speaker_id, text_zh))
@@ -8073,6 +8579,44 @@ def _creative_completion_content(
     return content, {"finish_reason": finish_reason, "output_chars": len(content)}
 
 
+def _record_completion_audit(
+    stats: dict[str, Any], *, prompt_tokens: int, output_tokens: int,
+) -> bool:
+    """Record safe completion counters without retaining generated prose."""
+    finish_reason = str(stats.get("finish_reason") or "")
+    incomplete = bool(finish_reason and finish_reason.lower() != "stop")
+    safe_prompt_tokens = max(0, int(prompt_tokens))
+    safe_output_tokens = max(0, int(output_tokens))
+    stats["incomplete"] = incomplete
+    stats["usage"] = {
+        "prompt_tokens": safe_prompt_tokens,
+        "completion_tokens": safe_output_tokens,
+        "total_tokens": safe_prompt_tokens + safe_output_tokens,
+    }
+    return incomplete
+
+
+def _combined_completion_audit(
+    primary: dict[str, Any], repair: dict[str, Any],
+) -> dict[str, Any]:
+    """Summarize one or two local completions using scalar audit data only."""
+    completions = [item for item in (primary, repair) if item]
+    incomplete_rows = [item for item in completions if item.get("incomplete")]
+    selected = incomplete_rows[-1] if incomplete_rows else (completions[-1] if completions else {})
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for item in completions:
+        item_usage = item.get("usage") if isinstance(item.get("usage"), dict) else {}
+        for key in usage:
+            value = item_usage.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                usage[key] += value
+    return {
+        "finish_reason": str(selected.get("finish_reason") or ""),
+        "incomplete": bool(incomplete_rows),
+        "usage": usage,
+    }
+
+
 def _shot_detail_completion_content(
     model: Any,
     *,
@@ -8118,19 +8662,24 @@ def _run_shot_high_detail(payload: dict[str, Any]) -> tuple[dict[str, Any], int]
             payload.get("timeout_seconds") or os.getenv("QWEN_TRANSLATION_TIMEOUT_SECONDS") or 900
         )
         context_size = int(payload.get("context_size") or 8192)
+        minimum_context_size = int(payload.get("min_context_size", context_size))
+        maximum_context_size = int(payload.get("max_context_size", context_size))
+        reserved_input_tokens = int(payload.get("reserved_input_tokens", 1))
         threads = int(
             os.getenv("QWEN_TRANSLATION_THREADS") or max(1, min(8, (os.cpu_count() or 4) // 2))
         )
     except (TypeError, ValueError) as exc:
         raise RuntimeInputError(
-            "shot high-detail timeout_seconds, context_size, and threads must be numeric"
+            "shot high-detail timeout/context policy and threads must be numeric"
         ) from exc
-    if not 30 <= timeout_seconds <= 3600:
-        raise RuntimeInputError("shot high-detail timeout_seconds must be between 30 and 3600")
-    if not 8192 <= context_size <= 32768:
-        raise RuntimeInputError("shot high-detail context_size must be between 8192 and 32768")
-    if context_size - request.max_tokens < 2048:
-        raise RuntimeInputError("shot high-detail context_size must reserve at least 2048 input tokens")
+    if timeout_seconds <= 0:
+        raise RuntimeInputError("shot high-detail timeout_seconds must be positive")
+    if not 1 <= minimum_context_size <= context_size <= maximum_context_size:
+        raise RuntimeInputError("shot high-detail context_size is outside its configured range")
+    if reserved_input_tokens < 1 or context_size - request.max_tokens < reserved_input_tokens:
+        raise RuntimeInputError(
+            "shot high-detail context_size does not preserve its configured input reserve"
+        )
     if not 1 <= threads <= 64:
         raise RuntimeInputError("QWEN_TRANSLATION_THREADS must be between 1 and 64")
 
@@ -8163,7 +8712,7 @@ def _run_shot_high_detail(payload: dict[str, Any]) -> tuple[dict[str, Any], int]
         messages = _build_shot_high_detail_messages(request)
         prompt = "\n".join(str(item["content"]) for item in messages)
         input_token_count = len(model.tokenize(prompt.encode("utf-8"), add_bos=True))
-        maximum_input_tokens = context_size - request.max_tokens - 512
+        maximum_input_tokens = context_size - request.max_tokens
         if input_token_count > maximum_input_tokens:
             raise RuntimeInputError(
                 f"shot high-detail request uses about {input_token_count} input tokens but the safe budget is "
@@ -8183,9 +8732,11 @@ def _run_shot_high_detail(payload: dict[str, Any]) -> tuple[dict[str, Any], int]
             seed=request.seed,
         )
         primary_stats["output_tokens"] = len(model.tokenize(content.encode("utf-8"), add_bos=False))
-        if str(primary_stats.get("finish_reason") or "").lower() == "length":
-            error_code = "shot_detail_output_budget_exhausted"
-            raise RuntimeError("shot high-detail output budget was exhausted before the JSON object completed")
+        _record_completion_audit(
+            primary_stats,
+            prompt_tokens=input_token_count,
+            output_tokens=primary_stats["output_tokens"],
+        )
         if not content.strip():
             error_code = "shot_detail_output_invalid_json"
             raise RuntimeError("model returned no shot high-detail JSON")
@@ -8240,11 +8791,11 @@ def _run_shot_high_detail(payload: dict[str, Any]) -> tuple[dict[str, Any], int]
             repair_stats["output_tokens"] = len(
                 model.tokenize(repaired_content.encode("utf-8"), add_bos=False)
             )
-            if str(repair_stats.get("finish_reason") or "").lower() == "length":
-                error_code = "shot_detail_output_budget_exhausted"
-                raise RuntimeError(
-                    "shot high-detail repair output budget was exhausted before the JSON object completed"
-                )
+            _record_completion_audit(
+                repair_stats,
+                prompt_tokens=repair_input_tokens,
+                output_tokens=repair_stats["output_tokens"],
+            )
             phase = "repair_decode"
             repaired = json.loads(_clean_translation(repaired_content))
             phase = "repair_validation"
@@ -8269,6 +8820,13 @@ def _run_shot_high_detail(payload: dict[str, Any]) -> tuple[dict[str, Any], int]
         peak_working_set_bytes = monitor.stop()
 
     elapsed_ms = round((time.monotonic() - started) * 1000)
+    completion_audit = _combined_completion_audit(primary_stats, repair_stats)
+    if candidate is not None and not error and completion_audit["incomplete"]:
+        issue = _shot_detail_review_issue(
+            "model_output_incomplete_finish_reason", "result", severity="risk",
+        )
+        if issue not in review_issues:
+            review_issues.append(issue)
     metadata = {
         "runtime": "llama-cpp-python",
         "runtime_version": runtime["runtime_version"],
@@ -8302,6 +8860,7 @@ def _run_shot_high_detail(payload: dict[str, Any]) -> tuple[dict[str, Any], int]
         "first_validation_error": "" if SHOT_DETAIL_REVIEW_DRAFTS_DISABLE_MODEL_REPAIR else first_validation_error[:500],
         "review_required": bool(review_issues),
         "review_issue_count": len(review_issues),
+        **completion_audit,
     }
     if error:
         return ({
@@ -8325,24 +8884,32 @@ def _run_creative(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
     model_path = _resolve_model(payload)
     device = _runtime_device(payload)
     try:
-        timeout_seconds = float(
-            payload.get("timeout_seconds")
-            or os.getenv("QWEN_TRANSLATION_TIMEOUT_SECONDS")
-            or 900
-        )
-        context_size = int(payload.get("context_size") or 8192)
+        timeout_seconds = float(payload["timeout_seconds"])
+        context_size = int(payload["context_size"])
+        min_context_size = int(payload["min_context_size"])
+        max_context_size = int(payload["max_context_size"])
+        reserved_input_tokens = int(payload["reserved_input_tokens"])
         threads = int(
             os.getenv("QWEN_TRANSLATION_THREADS")
             or max(1, min(8, (os.cpu_count() or 4) // 2))
         )
-    except (TypeError, ValueError) as exc:
-        raise RuntimeInputError("creative timeout_seconds, context_size, and threads must be numeric") from exc
-    if not 30 <= timeout_seconds <= 3600:
-        raise RuntimeInputError("creative timeout_seconds must be between 30 and 3600")
-    if not 8192 <= context_size <= 32768:
-        raise RuntimeInputError("creative context_size must be between 8192 and 32768")
-    if context_size - request.max_tokens < 2048:
-        raise RuntimeInputError("creative context_size must reserve at least 2048 input tokens")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeInputError(
+            "creative timeout, context, reserved-input, and threads settings must be numeric"
+        ) from exc
+    if timeout_seconds <= 0:
+        raise RuntimeInputError("creative timeout_seconds must be greater than zero")
+    if not 0 < min_context_size <= context_size <= max_context_size:
+        raise RuntimeInputError(
+            "creative min_context_size, context_size, and max_context_size must define an ordered "
+            "positive range"
+        )
+    if reserved_input_tokens < 1:
+        raise RuntimeInputError("creative reserved_input_tokens must be greater than zero")
+    if context_size - request.max_tokens < reserved_input_tokens:
+        raise RuntimeInputError(
+            f"creative context_size must reserve at least {reserved_input_tokens} input tokens"
+        )
     if not 1 <= threads <= 64:
         raise RuntimeInputError("QWEN_TRANSLATION_THREADS must be between 1 and 64")
     monitor = PeakMemoryMonitor(os.getpid())
@@ -8454,12 +9021,11 @@ def _run_creative(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         primary_stats["output_tokens"] = len(model.tokenize(
             content.encode("utf-8"), add_bos=False,
         ))
-        if str(primary_stats.get("finish_reason") or "").lower() == "length":
-            phase = "primary_output_budget"
-            error_code = "creative_output_budget_exhausted"
-            raise RuntimeError(
-                "creative output token budget was exhausted before the exact JSON object completed"
-            )
+        _record_completion_audit(
+            primary_stats,
+            prompt_tokens=input_token_count,
+            output_tokens=primary_stats["output_tokens"],
+        )
         if not content.strip():
             raise RuntimeError("model returned no creative JSON")
         phase = "primary_decode"
@@ -9197,12 +9763,11 @@ def _run_creative(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
             repair_stats["output_tokens"] = len(model.tokenize(
                 repair_content.encode("utf-8"), add_bos=False,
             ))
-            if str(repair_stats.get("finish_reason") or "").lower() == "length":
-                phase = "repair_output_budget"
-                error_code = "creative_output_budget_exhausted"
-                raise RuntimeError(
-                    "creative repair output token budget was exhausted before the exact JSON object completed"
-                )
+            _record_completion_audit(
+                repair_stats,
+                prompt_tokens=repair_input_tokens,
+                output_tokens=repair_stats["output_tokens"],
+            )
             if not repair_content.strip():
                 raise RuntimeError("model returned no repaired creative JSON")
             phase = "repair_decode"
@@ -9277,6 +9842,14 @@ def _run_creative(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         peak_working_set_bytes = monitor.stop()
 
     elapsed_ms = round((time.monotonic() - started) * 1000)
+    completion_audit = _combined_completion_audit(primary_stats, repair_stats)
+    if candidate is not None and not error and completion_audit["incomplete"]:
+        _record_creative_review_issue(
+            review_issues,
+            path="result",
+            code="model_output_incomplete_finish_reason",
+            severity="risk",
+        )
     if candidate is None or error:
         applied_normalizations: list[dict[str, str]] = []
         normalization_applied_phase = ""
@@ -9376,6 +9949,7 @@ def _run_creative(payload: dict[str, Any]) -> tuple[dict[str, Any], int]:
         "review_required": bool(review_issues),
         "review_issue_count": len(review_issues),
         "review_summary": review_summary,
+        **completion_audit,
     }
     if error:
         return ({

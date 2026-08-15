@@ -522,8 +522,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: {}
+                $ref: '#/components/schemas/CreativeDraftCapability'
           description: ''
   /api/v1/capabilities/h3-prompt-optimizer/:
     get:
@@ -540,6 +539,22 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/H3PromptOptimizerCapability'
+          description: ''
+  /api/v1/capabilities/production/:
+    get:
+      operationId: api_v1_capabilities_production_retrieve
+      description: Expose queue guidance separately from business episode/shot volume.
+      tags:
+      - api
+      security:
+      - jwtAuth: []
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionCapability'
           description: ''
   /api/v1/capabilities/prompt-translation/:
     get:
@@ -1681,6 +1696,18 @@ paths:
       responses:
         '204':
           description: No response body
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDeleteErrorResponse'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectDeleteErrorResponse'
+          description: ''
   /api/v1/projects/{id}/breakdown-script/:
     post:
       operationId: api_v1_projects_breakdown_script_create
@@ -1709,12 +1736,17 @@ paths:
       - jwtAuth: []
       - jwtAuth: []
       responses:
-        '200':
+        '201':
           content:
             application/json:
               schema:
-                type: object
-                additionalProperties: {}
+                $ref: '#/components/schemas/ScriptBreakdownResponse'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScriptRebuildConflictResponse'
           description: ''
   /api/v1/projects/{id}/build-production/:
     post:
@@ -1748,7 +1780,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/SeriesProject'
+                $ref: '#/components/schemas/ProductionBuildResponse'
+          description: ''
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionBuildResponse'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionBuildConflictErrorResponse'
           description: ''
   /api/v1/projects/{id}/complete/:
     post:
@@ -2152,7 +2196,90 @@ paths:
               schema:
                 $ref: '#/components/schemas/EpisodeCreativeDraft'
           description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreativeDraftValidationErrorResponse'
+          description: ''
         '502':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
+  /api/v1/projects/{project_id}/shot-detail-draft-batches/:
+    get:
+      operationId: api_v1_projects_shot_detail_draft_batches_list
+      parameters:
+      - in: path
+        name: project_id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - api
+      security:
+      - jwtAuth: []
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ShotDetailDraftBatch'
+          description: ''
+    post:
+      operationId: api_v1_projects_shot_detail_draft_batches_create
+      parameters:
+      - in: path
+        name: project_id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShotDetailDraftBatchCreateRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ShotDetailDraftBatchCreateRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ShotDetailDraftBatchCreateRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShotDetailDraftBatch'
+          description: ''
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShotDetailDraftBatch'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
+        '503':
           content:
             application/json:
               schema:
@@ -3095,6 +3222,76 @@ paths:
       responses:
         '204':
           description: No response body
+  /api/v1/shot-detail-draft-batches/{batch_id}/:
+    get:
+      operationId: api_v1_shot_detail_draft_batches_retrieve
+      parameters:
+      - in: path
+        name: batch_id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - api
+      security:
+      - jwtAuth: []
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShotDetailBatchDetailResponse'
+          description: ''
+  /api/v1/shot-detail-draft-batches/{batch_id}/apply/:
+    post:
+      operationId: api_v1_shot_detail_draft_batches_apply_create
+      parameters:
+      - in: path
+        name: batch_id
+        schema:
+          type: string
+          format: uuid
+        required: true
+      tags:
+      - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ShotDetailDraftBatchApplyRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/ShotDetailDraftBatchApplyRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/ShotDetailDraftBatchApplyRequest'
+        required: true
+      security:
+      - jwtAuth: []
+      - jwtAuth: []
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShotDetailBatchApplyResponse'
+          description: ''
+        '400':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: {}
+          description: ''
   /api/v1/shot-detail-drafts/:
     get:
       operationId: api_v1_shot_detail_drafts_list
@@ -3846,13 +4043,13 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/GenerationTaskRequest'
+              $ref: '#/components/schemas/GenerationTaskCreateRequest'
           application/x-www-form-urlencoded:
             schema:
-              $ref: '#/components/schemas/GenerationTaskRequest'
+              $ref: '#/components/schemas/GenerationTaskCreateRequest'
           multipart/form-data:
             schema:
-              $ref: '#/components/schemas/GenerationTaskRequest'
+              $ref: '#/components/schemas/GenerationTaskCreateRequest'
         required: true
       security:
       - jwtAuth: []
@@ -3863,6 +4060,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GenerationTask'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionQueueConfirmationErrorResponse'
           description: ''
   /api/v1/tasks/{id}/:
     get:
@@ -4103,6 +4306,17 @@ paths:
         required: true
       tags:
       - api
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GenerationTaskRetryRequest'
+          application/x-www-form-urlencoded:
+            schema:
+              $ref: '#/components/schemas/GenerationTaskRetryRequest'
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/GenerationTaskRetryRequest'
       security:
       - jwtAuth: []
       - jwtAuth: []
@@ -4112,6 +4326,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GenerationTask'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductionQueueConfirmationErrorResponse'
           description: ''
   /api/v1/tasks/{id}/sync-comfyui-workflow/:
     post:
@@ -4280,6 +4500,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/PromptFieldTranslation'
+          description: ''
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PromptTranslationConflictErrorResponse'
           description: ''
   /api/v1/translations/{id}/request-retranslation/:
     post:
@@ -4791,6 +5017,14 @@ components:
         * `magenta` - magenta
         * `violet` - violet
         * `none` - none
+    ApplyStatusEnum:
+      enum:
+      - not_started
+      - complete
+      type: string
+      description: |-
+        * `not_started` - 未应用
+        * `complete` - 已全部应用
     AssembleEpisodeRequest:
       type: object
       properties:
@@ -5302,6 +5536,16 @@ components:
         * `crimson` - crimson
         * `magenta` - magenta
         * `violet` - violet
+    BatchKindEnum:
+      enum:
+      - episode
+      - selection
+      - series
+      type: string
+      description: |-
+        * `episode` - episode
+        * `selection` - selection
+        * `series` - series
     BibleEntityTypeEnum:
       enum:
       - character
@@ -6060,6 +6304,43 @@ components:
       - episode
       - shots
       - translations_written
+    CreativeDraftCapability:
+      type: object
+      properties:
+        providers:
+          type: array
+          items:
+            $ref: '#/components/schemas/CreativeDraftProviderCapability'
+        creative_generation_supported:
+          type: boolean
+        review_required:
+          type: boolean
+        default_provider:
+          $ref: '#/components/schemas/ModelProviderEnum'
+        shot_high_detail_supported:
+          type: boolean
+        shot_high_detail_schema_version:
+          type: integer
+          minimum: 1
+        shot_high_detail_policies:
+          type: object
+          additionalProperties:
+            type: object
+            additionalProperties: {}
+        shot_high_detail_shared_resource_busy:
+          type: boolean
+        shot_high_detail_review_required:
+          type: boolean
+      required:
+      - creative_generation_supported
+      - default_provider
+      - providers
+      - review_required
+      - shot_high_detail_policies
+      - shot_high_detail_review_required
+      - shot_high_detail_schema_version
+      - shot_high_detail_shared_resource_busy
+      - shot_high_detail_supported
     CreativeDraftConfirmRequest:
       type: object
       description: Serializer that rejects unknown JSON keys instead of ignoring them.
@@ -6099,13 +6380,14 @@ components:
           format: uuid
         provider:
           allOf:
-          - $ref: '#/components/schemas/ProviderEnum'
+          - $ref: '#/components/schemas/ModelProviderEnum'
           default: local_qwen
         target_shot_count:
           type: integer
-          maximum: 4
           minimum: 1
-          default: 4
+        extended_generation_confirmed:
+          type: boolean
+          default: false
         creativity:
           allOf:
           - $ref: '#/components/schemas/CreativityEnum'
@@ -6116,6 +6398,268 @@ components:
           maxLength: 4000
       required:
       - episode_id
+      - target_shot_count
+    CreativeDraftProviderCapability:
+      type: object
+      properties:
+        id:
+          $ref: '#/components/schemas/ModelProviderEnum'
+        provider:
+          $ref: '#/components/schemas/ModelProviderEnum'
+        label:
+          type: string
+        creative_generation_supported:
+          type: boolean
+        enabled:
+          type: boolean
+        configured:
+          type: boolean
+        ready:
+          type: boolean
+        temporarily_busy:
+          type: boolean
+        model:
+          type: string
+        transport:
+          $ref: '#/components/schemas/CreativeDraftProviderCapabilityTransportEnum'
+        data_egress:
+          type: boolean
+        data_egress_notice:
+          type: string
+        notice:
+          type: string
+        model_downloaded:
+          type: boolean
+        model_verified:
+          type: boolean
+        device:
+          type: string
+        gpu_layers:
+          type: integer
+        cuda_requested:
+          type: boolean
+        gpu_offload_supported:
+          type: boolean
+        gpu_context_smoke_passed:
+          type: boolean
+        gpu_ready:
+          type: boolean
+        runtime_ready:
+          type: boolean
+        runtime_version:
+          type: string
+        runtime_probe_error_code:
+          type: string
+        min_shots:
+          type: integer
+          minimum: 1
+        recommended_max_shots:
+          type: integer
+          minimum: 1
+        batch_shots:
+          type: integer
+          minimum: 1
+        max_dialogue_per_shot:
+          type: integer
+          minimum: 1
+        max_episode_title_chars:
+          type: integer
+          minimum: 1
+        max_dialogue_text_chars:
+          type: integer
+          minimum: 1
+        max_dialogue_delivery_chars:
+          type: integer
+          minimum: 1
+        max_dialogue_delivery_en_chars:
+          type: integer
+          minimum: 1
+        recommended_title_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_title_en_chars:
+          type: integer
+          minimum: 1
+        recommended_narrative_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_narrative_en_chars:
+          type: integer
+          minimum: 1
+        recommended_camera_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_camera_en_chars:
+          type: integer
+          minimum: 1
+        recommended_action_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_action_en_chars:
+          type: integer
+          minimum: 1
+        recommended_continuity_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_continuity_en_chars:
+          type: integer
+          minimum: 1
+        recommended_soundscape_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_soundscape_en_chars:
+          type: integer
+          minimum: 1
+        recommended_music_zh_chars:
+          type: integer
+          minimum: 1
+        recommended_music_en_chars:
+          type: integer
+          minimum: 1
+        max_camera_movements:
+          type: integer
+          minimum: 1
+        max_action_sequence_markers:
+          type: integer
+          minimum: 1
+        min_script_action_coverage_percent:
+          type: integer
+          maximum: 100
+          minimum: 1
+        min_shot_duration_ms:
+          type: integer
+          minimum: 1
+        max_shot_duration_ms:
+          type: integer
+          minimum: 1
+        output_min_tokens:
+          type: integer
+          minimum: 1
+        output_base_tokens:
+          type: integer
+          minimum: 1
+        output_tokens_per_shot:
+          type: integer
+          minimum: 1
+        output_tokens_per_dialogue:
+          type: integer
+          minimum: 1
+        output_dialogue_char_threshold:
+          type: integer
+          minimum: 0
+        output_headroom_per_shot:
+          type: integer
+          minimum: 0
+        max_source_chars:
+          type: integer
+          minimum: 1
+        max_regeneration_context_chars:
+          type: integer
+          minimum: 1
+        max_input_chars:
+          type: integer
+          minimum: 1
+        baseline_max_new_tokens:
+          type: integer
+          minimum: 1
+        max_new_tokens:
+          type: integer
+          minimum: 1
+        max_output_tokens:
+          type: integer
+          minimum: 1
+        configured_max_new_tokens:
+          type: integer
+          minimum: 1
+        context_size:
+          type: integer
+          minimum: 1
+        min_context_size:
+          type: integer
+          minimum: 1
+        max_context_size:
+          type: integer
+          minimum: 1
+        reserved_input_tokens:
+          type: integer
+          minimum: 1
+        runtime_timeout_seconds:
+          type: number
+          format: double
+          minimum: 0
+        process_timeout_seconds:
+          type: number
+          format: double
+          minimum: 0
+        loaded_on_demand:
+          type: boolean
+        unloaded_after_request:
+          type: boolean
+        review_required:
+          type: boolean
+        translation_review_reused:
+          type: boolean
+      required:
+      - baseline_max_new_tokens
+      - batch_shots
+      - configured
+      - configured_max_new_tokens
+      - creative_generation_supported
+      - data_egress
+      - enabled
+      - id
+      - label
+      - max_action_sequence_markers
+      - max_camera_movements
+      - max_dialogue_delivery_chars
+      - max_dialogue_delivery_en_chars
+      - max_dialogue_per_shot
+      - max_dialogue_text_chars
+      - max_episode_title_chars
+      - max_input_chars
+      - max_new_tokens
+      - max_output_tokens
+      - max_regeneration_context_chars
+      - max_shot_duration_ms
+      - max_source_chars
+      - min_script_action_coverage_percent
+      - min_shot_duration_ms
+      - min_shots
+      - model
+      - output_base_tokens
+      - output_dialogue_char_threshold
+      - output_headroom_per_shot
+      - output_min_tokens
+      - output_tokens_per_dialogue
+      - output_tokens_per_shot
+      - provider
+      - ready
+      - recommended_action_en_chars
+      - recommended_action_zh_chars
+      - recommended_camera_en_chars
+      - recommended_camera_zh_chars
+      - recommended_continuity_en_chars
+      - recommended_continuity_zh_chars
+      - recommended_max_shots
+      - recommended_music_en_chars
+      - recommended_music_zh_chars
+      - recommended_narrative_en_chars
+      - recommended_narrative_zh_chars
+      - recommended_soundscape_en_chars
+      - recommended_soundscape_zh_chars
+      - recommended_title_en_chars
+      - recommended_title_zh_chars
+      - review_required
+      - translation_review_reused
+      - transport
+    CreativeDraftProviderCapabilityTransportEnum:
+      enum:
+      - local_process
+      - remote_api
+      type: string
+      description: |-
+        * `local_process` - local_process
+        * `remote_api` - remote_api
     CreativeDraftRegenerateRequest:
       type: object
       description: Serializer that rejects unknown JSON keys instead of ignoring them.
@@ -6124,11 +6668,13 @@ components:
           type: integer
           minimum: 1
         provider:
-          $ref: '#/components/schemas/ProviderEnum'
+          $ref: '#/components/schemas/ModelProviderEnum'
         target_shot_count:
           type: integer
-          maximum: 4
           minimum: 1
+        extended_generation_confirmed:
+          type: boolean
+          default: false
         creativity:
           $ref: '#/components/schemas/CreativityEnum'
         variation_note:
@@ -6159,6 +6705,92 @@ components:
         * `applied` - 已应用
         * `superseded` - 已被新版本替代
         * `failed` - 生成失败
+    CreativeDraftValidationErrorDetails:
+      type: object
+      properties:
+        code:
+          type: string
+        detail:
+          type: string
+        errors:
+          type: array
+          items:
+            type: string
+        required_dialogue_count:
+          type: integer
+          minimum: 0
+        target_shot_count:
+          type: integer
+          minimum: 1
+        dialogue_capacity:
+          type: integer
+          minimum: 0
+        recommended_max_shots:
+          type: integer
+          minimum: 1
+        batch_shots:
+          type: integer
+          minimum: 1
+        source_char_count:
+          type: integer
+          minimum: 0
+        max_source_chars:
+          type: integer
+          minimum: 1
+        max_dialogue_per_shot:
+          type: integer
+          minimum: 1
+        effective_max_dialogue_per_shot:
+          type: integer
+          minimum: 1
+        episode_title_chars:
+          type: integer
+          minimum: 0
+        max_episode_title_chars:
+          type: integer
+          minimum: 1
+        dialogue_text_chars:
+          type: integer
+          minimum: 0
+        max_dialogue_text_chars:
+          type: integer
+          minimum: 1
+        dialogue_delivery_chars:
+          type: integer
+          minimum: 0
+        max_dialogue_delivery_chars:
+          type: integer
+          minimum: 1
+        required_output_tokens:
+          type: integer
+          minimum: 1
+        configured_max_output_tokens:
+          type: integer
+          minimum: 1
+      required:
+      - code
+      - detail
+      - errors
+    CreativeDraftValidationErrorEnvelope:
+      type: object
+      properties:
+        details:
+          $ref: '#/components/schemas/CreativeDraftValidationErrorDetails'
+        status_code:
+          type: integer
+        code:
+          type: string
+      required:
+      - code
+      - details
+      - status_code
+    CreativeDraftValidationErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/CreativeDraftValidationErrorEnvelope'
+      required:
+      - error
     CreativeEpisodeDraftRequest:
       type: object
       description: Serializer that rejects unknown JSON keys instead of ignoring them.
@@ -6195,7 +6827,6 @@ components:
           pattern: ^[a-z0-9][a-z0-9_-]{0,63}$
         order:
           type: integer
-          maximum: 999
           minimum: 1
         title_zh:
           type: string
@@ -6626,6 +7257,22 @@ components:
       - template
       - updated_at
       - workflow_json
+    GenerationStatusEnum:
+      enum:
+      - queued
+      - running
+      - completed
+      - completed_with_errors
+      - failed
+      - cancelled
+      type: string
+      description: |-
+        * `queued` - 排队中
+        * `running` - 生成中
+        * `completed` - 已完成
+        * `completed_with_errors` - 部分完成
+        * `failed` - 已失败
+        * `cancelled` - 已取消
     GenerationTask:
       type: object
       properties:
@@ -6956,6 +7603,28 @@ components:
       - total_duration_ms
       - updated_at
       - workflow_version
+    GenerationTaskCreateRequest:
+      type: object
+      properties:
+        generated_workflow_id:
+          type: string
+          format: uuid
+        priority:
+          type: integer
+          maximum: 100
+          minimum: -100
+          default: 0
+        max_attempts:
+          type: integer
+          maximum: 10
+          minimum: 1
+          default: 3
+        extended_generation_confirmed:
+          type: boolean
+          default: false
+          description: 当前队列超过推荐值时的显式继续确认；不会提高 worker 并发。
+      required:
+      - generated_workflow_id
     GenerationTaskInputParameters:
       type: object
       description: Stable task-detail contract assembled from immutable execution
@@ -7327,6 +7996,13 @@ components:
           format: uuid
       required:
       - generated_workflow
+    GenerationTaskRetryRequest:
+      type: object
+      properties:
+        extended_generation_confirmed:
+          type: boolean
+          default: false
+          description: 当前队列超过推荐值时的显式继续确认；不会改变原任务参数。
     GenerationTaskStatusEnum:
       enum:
       - queued
@@ -7396,7 +8072,7 @@ components:
         configured:
           type: boolean
         transport:
-          $ref: '#/components/schemas/TransportEnum'
+          $ref: '#/components/schemas/H3PromptOptimizerCapabilityTransportEnum'
         model:
           type: string
         failure_mode:
@@ -7410,6 +8086,16 @@ components:
       - language_gate
       - model
       - transport
+    H3PromptOptimizerCapabilityTransportEnum:
+      enum:
+      - local
+      - remote
+      - unconfigured
+      type: string
+      description: |-
+        * `local` - local
+        * `remote` - remote
+        * `unconfigured` - unconfigured
     H3ReferenceAudioBindingSchema:
       type: object
       properties:
@@ -7614,6 +8300,14 @@ components:
       description: |-
         * `video` - 视频
         * `image` - 图片
+    ModelProviderEnum:
+      enum:
+      - local_qwen
+      - deepseek_api
+      type: string
+      description: |-
+        * `local_qwen` - local_qwen
+        * `deepseek_api` - deepseek_api
     NegativePromptSourceEnum:
       enum:
       - generated_workflow.injected_values.NEGATIVE_PROMPT
@@ -8313,6 +9007,14 @@ components:
     PatchedSeriesProjectRequest:
       type: object
       properties:
+        default_shot_duration_ms:
+          type: integer
+          minimum: 1
+          default: 5000
+        cover_asset:
+          type: string
+          format: uuid
+          nullable: true
         title:
           type: string
           minLength: 1
@@ -8349,11 +9051,6 @@ components:
           type: integer
           maximum: 120
           minimum: 1
-        default_shot_duration_ms:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 100
-          format: int64
         continuity_seed:
           type: integer
           maximum: 9223372036854775807
@@ -8362,6 +9059,8 @@ components:
         continuity_summary:
           type: string
         production_settings: {}
+        is_favorite:
+          type: boolean
         style:
           type: string
           format: uuid
@@ -8380,6 +9079,10 @@ components:
       properties:
         reference_bindings:
           $ref: '#/components/schemas/H3ReferenceBindingsSchemaRequest'
+        duration_ms:
+          type: integer
+          minimum: 100
+          default: 5000
         number:
           type: integer
           maximum: 9223372036854775807
@@ -8403,16 +9106,15 @@ components:
           type: string
         music:
           type: string
-        duration_ms:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 100
-          format: int64
         media_type:
           $ref: '#/components/schemas/MediaKindEnum'
         h3_mode:
           $ref: '#/components/schemas/H3ModeEnum'
         include_audio:
+          type: boolean
+        requires_first_frame_continuity:
+          type: boolean
+        requires_last_frame_continuity:
           type: boolean
         continuity_notes:
           type: string
@@ -8507,6 +9209,26 @@ components:
       description: |-
         * `append` - append
         * `replace` - replace
+    ProductionBuildConflictErrorResponse:
+      oneOf:
+      - $ref: '#/components/schemas/ProductionQueueConfirmationErrorResponse'
+      - $ref: '#/components/schemas/ProductionIdempotencyConflictErrorResponse'
+    ProductionBuildCounts:
+      type: object
+      properties:
+        prompts:
+          type: integer
+          minimum: 0
+        workflows:
+          type: integer
+          minimum: 0
+        tasks:
+          type: integer
+          minimum: 0
+      required:
+      - prompts
+      - tasks
+      - workflows
     ProductionBuildRequest:
       type: object
       properties:
@@ -8553,9 +9275,14 @@ components:
         whole_episode:
           type: boolean
           default: false
+        extended_generation_confirmed:
+          type: boolean
+          default: false
+          description: 超过当前任务队列推荐阈值时的显式确认。确认只允许继续排队，不会提高 worker 并发，也不会改变单镜生成参数。
         idempotency_key:
           type: string
           default: ''
+          description: 排队生成多个生产任务时必填；相同键与相同请求会安全重放，不同请求会返回 409 冲突。单任务可省略。
           maxLength: 120
         priority:
           type: integer
@@ -8607,6 +9334,236 @@ components:
           nullable: true
           description: 图片尺寸取整倍数，范围 8–128 且必须为 8 的倍数；不填写时默认 32。
         workflow_overrides: {}
+    ProductionBuildResponse:
+      type: object
+      properties:
+        project_id:
+          type: string
+          format: uuid
+        whole_episode:
+          type: boolean
+        episode_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        episode_number:
+          type: integer
+          minimum: 1
+          nullable: true
+        episode_title:
+          type: string
+        prompt_artifact_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        workflow_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        task_ids:
+          type: array
+          items:
+            type: string
+            format: uuid
+        batch_id:
+          type: string
+          format: uuid
+          nullable: true
+        batch_kind:
+          nullable: true
+          oneOf:
+          - $ref: '#/components/schemas/BatchKindEnum'
+          - $ref: '#/components/schemas/NullEnum'
+        batch_size:
+          type: integer
+          minimum: 0
+        extended_generation_confirmed:
+          type: boolean
+        idempotency_key:
+          type: string
+        idempotent_replay:
+          type: boolean
+        counts:
+          $ref: '#/components/schemas/ProductionBuildCounts'
+        production_units:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        tasks:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+        prompt_language_gate:
+          type: array
+          items:
+            type: object
+            additionalProperties: {}
+      required:
+      - batch_size
+      - counts
+      - episode_ids
+      - production_units
+      - project_id
+      - prompt_artifact_ids
+      - task_ids
+      - workflow_ids
+    ProductionCapability:
+      type: object
+      properties:
+        recommended_max_pending:
+          type: integer
+          minimum: 1
+        recommended_max_active_per_user:
+          type: integer
+          minimum: 1
+        max_concurrent:
+          type: integer
+          minimum: 1
+        task_timeout_seconds:
+          type: number
+          format: double
+          minimum: 0
+        video_shot_min_duration_ms:
+          type: integer
+          minimum: 1
+        video_shot_max_duration_ms:
+          type: integer
+          minimum: 1
+        script_breakdown_default_shot_duration_ms:
+          type: integer
+          minimum: 1
+        script_breakdown_default_first_frame_continuity:
+          type: boolean
+        script_breakdown_default_last_frame_continuity:
+          type: boolean
+        script_breakdown_auto_split_trigger_chars:
+          type: integer
+          minimum: 1
+        script_breakdown_auto_split_target_chars:
+          type: integer
+          minimum: 1
+        active_task_count:
+          type: integer
+          minimum: 0
+        user_active_task_count:
+          type: integer
+          minimum: 0
+        confirmation_required:
+          type: boolean
+        business_volume_limited:
+          type: boolean
+      required:
+      - active_task_count
+      - business_volume_limited
+      - confirmation_required
+      - max_concurrent
+      - recommended_max_active_per_user
+      - recommended_max_pending
+      - script_breakdown_auto_split_target_chars
+      - script_breakdown_auto_split_trigger_chars
+      - script_breakdown_default_first_frame_continuity
+      - script_breakdown_default_last_frame_continuity
+      - script_breakdown_default_shot_duration_ms
+      - task_timeout_seconds
+      - user_active_task_count
+      - video_shot_max_duration_ms
+      - video_shot_min_duration_ms
+    ProductionIdempotencyConflictErrorDetails:
+      type: object
+      properties:
+        detail:
+          type: string
+        idempotency_key:
+          type: string
+      required:
+      - detail
+      - idempotency_key
+    ProductionIdempotencyConflictErrorEnvelope:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        code:
+          $ref: '#/components/schemas/ProductionIdempotencyConflictErrorEnvelopeCodeEnum'
+        details:
+          $ref: '#/components/schemas/ProductionIdempotencyConflictErrorDetails'
+      required:
+      - code
+      - details
+      - status_code
+    ProductionIdempotencyConflictErrorEnvelopeCodeEnum:
+      enum:
+      - production_idempotency_conflict
+      type: string
+      description: '* `production_idempotency_conflict` - production_idempotency_conflict'
+    ProductionIdempotencyConflictErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ProductionIdempotencyConflictErrorEnvelope'
+      required:
+      - error
+    ProductionQueueConfirmationErrorDetails:
+      type: object
+      properties:
+        detail:
+          type: string
+        requested_task_count:
+          type: integer
+          minimum: 1
+        active_task_count:
+          type: integer
+          minimum: 0
+        user_active_task_count:
+          type: integer
+          minimum: 0
+        recommended_max_pending:
+          type: integer
+          minimum: 1
+        recommended_max_active_per_user:
+          type: integer
+          minimum: 1
+        max_concurrent:
+          type: integer
+          minimum: 1
+      required:
+      - active_task_count
+      - detail
+      - max_concurrent
+      - recommended_max_active_per_user
+      - recommended_max_pending
+      - requested_task_count
+      - user_active_task_count
+    ProductionQueueConfirmationErrorEnvelope:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        code:
+          $ref: '#/components/schemas/ProductionQueueConfirmationErrorEnvelopeCodeEnum'
+        details:
+          $ref: '#/components/schemas/ProductionQueueConfirmationErrorDetails'
+      required:
+      - code
+      - details
+      - status_code
+    ProductionQueueConfirmationErrorEnvelopeCodeEnum:
+      enum:
+      - production_queue_confirmation_required
+      type: string
+      description: '* `production_queue_confirmation_required` - production_queue_confirmation_required'
+    ProductionQueueConfirmationErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ProductionQueueConfirmationErrorEnvelope'
+      required:
+      - error
     ProductionResolutionProfileEnum:
       enum:
       - project
@@ -8764,6 +9721,52 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/PropBibleSyncItemRequest'
+    ProjectDeleteError:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        code:
+          $ref: '#/components/schemas/ProjectDeleteErrorCodeEnum'
+        details:
+          $ref: '#/components/schemas/ProjectDeleteErrorDetails'
+      required:
+      - code
+      - details
+      - status_code
+    ProjectDeleteErrorCodeEnum:
+      enum:
+      - not_found
+      - project_has_active_work
+      - protected_resource
+      type: string
+      description: |-
+        * `not_found` - not_found
+        * `project_has_active_work` - project_has_active_work
+        * `protected_resource` - protected_resource
+    ProjectDeleteErrorDetails:
+      type: object
+      properties:
+        detail:
+          type: string
+        active_generation_tasks:
+          type: integer
+          minimum: 0
+        unresolved_remote_tasks:
+          type: integer
+          minimum: 0
+        active_assembly_jobs:
+          type: integer
+          minimum: 0
+      required:
+      - detail
+    ProjectDeleteErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ProjectDeleteError'
+      required:
+      - error
     PromptArtifact:
       type: object
       properties:
@@ -9053,7 +10056,7 @@ components:
             $ref: '#/components/schemas/PromptTranslationEntryRequestRequest'
         provider:
           allOf:
-          - $ref: '#/components/schemas/ProviderEnum'
+          - $ref: '#/components/schemas/ModelProviderEnum'
           default: local_qwen
         source_lang:
           allOf:
@@ -9077,6 +10080,27 @@ components:
           maxLength: 30000
       required:
       - expected_revision
+    PromptTranslationConflictError:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        code:
+          type: string
+        details:
+          type: object
+          additionalProperties: {}
+      required:
+      - code
+      - details
+      - status_code
+    PromptTranslationConflictErrorResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/PromptTranslationConflictError'
+      required:
+      - error
     PromptTranslationEntryRequestRequest:
       type: object
       properties:
@@ -9155,7 +10179,7 @@ components:
       properties:
         provider:
           allOf:
-          - $ref: '#/components/schemas/ProviderEnum'
+          - $ref: '#/components/schemas/ModelProviderEnum'
           default: local_qwen
         source_text:
           type: string
@@ -9327,14 +10351,6 @@ components:
       required:
       - name
       - slug
-    ProviderEnum:
-      enum:
-      - local_qwen
-      - deepseek_api
-      type: string
-      description: |-
-        * `local_qwen` - local_qwen
-        * `deepseek_api` - deepseek_api
     ReferenceModeEnum:
       enum:
       - single_reference
@@ -9690,6 +10706,85 @@ components:
       required:
       - name
       - slug
+    ScriptBreakdownCleared:
+      type: object
+      properties:
+        episodes:
+          type: integer
+          minimum: 0
+        shots:
+          type: integer
+          minimum: 0
+        generation_tasks:
+          type: integer
+          minimum: 0
+        assembly_jobs:
+          type: integer
+          minimum: 0
+        prompt_artifacts:
+          type: integer
+          minimum: 0
+        generated_workflows:
+          type: integer
+          minimum: 0
+        creative_drafts:
+          type: integer
+          minimum: 0
+        shot_detail_drafts:
+          type: integer
+          minimum: 0
+        shot_detail_batches:
+          type: integer
+          minimum: 0
+        shot_detail_batch_items:
+          type: integer
+          minimum: 0
+        prompt_field_translations:
+          type: integer
+          minimum: 0
+        draft_release_bundles:
+          type: integer
+          minimum: 0
+        physical_outputs_retained:
+          type: boolean
+      required:
+      - assembly_jobs
+      - creative_drafts
+      - draft_release_bundles
+      - episodes
+      - generated_workflows
+      - generation_tasks
+      - physical_outputs_retained
+      - prompt_artifacts
+      - prompt_field_translations
+      - shot_detail_batch_items
+      - shot_detail_batches
+      - shot_detail_drafts
+      - shots
+    ScriptBreakdownCounts:
+      type: object
+      properties:
+        episodes:
+          type: integer
+          minimum: 0
+        shots:
+          type: integer
+          minimum: 0
+      required:
+      - episodes
+      - shots
+    ScriptBreakdownEpisodeResult:
+      type: object
+      properties:
+        episode:
+          $ref: '#/components/schemas/Episode'
+        shots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Shot'
+      required:
+      - episode
+      - shots
     ScriptBreakdownRequest:
       type: object
       properties:
@@ -9699,7 +10794,6 @@ components:
           maxLength: 1000000
         episode_count_hint:
           type: integer
-          maximum: 1000
           minimum: 1
           default: 1
         default_shot_duration_ms:
@@ -9707,6 +10801,12 @@ components:
           maximum: 15000
           minimum: 5000
           default: 5000
+        default_first_frame_continuity:
+          type: boolean
+          default: false
+        default_last_frame_continuity:
+          type: boolean
+          default: false
         multi_shot:
           type: boolean
           default: true
@@ -9716,6 +10816,91 @@ components:
         replace_existing:
           type: boolean
           default: false
+        discard_existing_production:
+          type: boolean
+          default: false
+    ScriptBreakdownResponse:
+      type: object
+      properties:
+        project_id:
+          type: string
+          format: uuid
+        method:
+          type: string
+        warnings:
+          type: array
+          items:
+            type: string
+        episodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScriptBreakdownEpisodeResult'
+        counts:
+          $ref: '#/components/schemas/ScriptBreakdownCounts'
+        cleared:
+          $ref: '#/components/schemas/ScriptBreakdownCleared'
+      required:
+      - cleared
+      - counts
+      - episodes
+      - method
+      - project_id
+      - warnings
+    ScriptRebuildConflict:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        code:
+          $ref: '#/components/schemas/ScriptRebuildConflictCodeEnum'
+        details:
+          $ref: '#/components/schemas/ScriptRebuildConflictDetails'
+      required:
+      - code
+      - details
+      - status_code
+    ScriptRebuildConflictCodeEnum:
+      enum:
+      - script_rebuild_confirmation_required
+      - script_rebuild_blocked
+      type: string
+      description: |-
+        * `script_rebuild_confirmation_required` - script_rebuild_confirmation_required
+        * `script_rebuild_blocked` - script_rebuild_blocked
+    ScriptRebuildConflictDetails:
+      type: object
+      properties:
+        detail:
+          type: string
+        active_generation_tasks:
+          type: integer
+          minimum: 0
+        unresolved_remote_tasks:
+          type: integer
+          minimum: 0
+        active_assembly_jobs:
+          type: integer
+          minimum: 0
+        active_shot_detail_batches:
+          type: integer
+          minimum: 0
+        active_shot_detail_items:
+          type: integer
+          minimum: 0
+        protected_release_bundles:
+          type: integer
+          minimum: 0
+        clearable:
+          $ref: '#/components/schemas/ScriptBreakdownCleared'
+      required:
+      - detail
+    ScriptRebuildConflictResponse:
+      type: object
+      properties:
+        error:
+          $ref: '#/components/schemas/ScriptRebuildConflict'
+      required:
+      - error
     SeriesProject:
       type: object
       properties:
@@ -9726,7 +10911,24 @@ components:
         owner:
           type: integer
           readOnly: true
+        default_shot_duration_ms:
+          type: integer
+          minimum: 1
+          default: 5000
+        cover_asset:
+          type: string
+          format: uuid
+          nullable: true
+        cover_url:
+          type: string
+          readOnly: true
         episode_count:
+          type: integer
+          readOnly: true
+        completed_episode_count:
+          type: integer
+          readOnly: true
+        total_duration_ms:
           type: integer
           readOnly: true
         character_count:
@@ -9778,11 +10980,6 @@ components:
           type: integer
           maximum: 120
           minimum: 1
-        default_shot_duration_ms:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 100
-          format: int64
         continuity_seed:
           type: integer
           maximum: 9223372036854775807
@@ -9796,6 +10993,8 @@ components:
           format: date-time
           readOnly: true
           nullable: true
+        is_favorite:
+          type: boolean
         style:
           type: string
           format: uuid
@@ -9803,6 +11002,8 @@ components:
       required:
       - character_count
       - completed_at
+      - completed_episode_count
+      - cover_url
       - created_at
       - episode_count
       - id
@@ -9810,10 +11011,19 @@ components:
       - prop_count
       - scene_count
       - title
+      - total_duration_ms
       - updated_at
     SeriesProjectRequest:
       type: object
       properties:
+        default_shot_duration_ms:
+          type: integer
+          minimum: 1
+          default: 5000
+        cover_asset:
+          type: string
+          format: uuid
+          nullable: true
         title:
           type: string
           minLength: 1
@@ -9850,11 +11060,6 @@ components:
           type: integer
           maximum: 120
           minimum: 1
-        default_shot_duration_ms:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 100
-          format: int64
         continuity_seed:
           type: integer
           maximum: 9223372036854775807
@@ -9863,6 +11068,8 @@ components:
         continuity_summary:
           type: string
         production_settings: {}
+        is_favorite:
+          type: boolean
         style:
           type: string
           format: uuid
@@ -9892,6 +11099,10 @@ components:
           readOnly: true
         reference_bindings:
           $ref: '#/components/schemas/H3ReferenceBindingsSchema'
+        duration_ms:
+          type: integer
+          minimum: 100
+          default: 5000
         legacy_negative_prompt_repair_eligible:
           type: boolean
           readOnly: true
@@ -9925,16 +11136,15 @@ components:
           type: string
         music:
           type: string
-        duration_ms:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 100
-          format: int64
         media_type:
           $ref: '#/components/schemas/MediaKindEnum'
         h3_mode:
           $ref: '#/components/schemas/H3ModeEnum'
         include_audio:
+          type: boolean
+        requires_first_frame_continuity:
+          type: boolean
+        requires_last_frame_continuity:
           type: boolean
         continuity_notes:
           type: string
@@ -9982,6 +11192,67 @@ components:
       - applied_shot
       - draft
       - translation_written
+    ShotDetailBatchApplyResponse:
+      type: object
+      properties:
+        batch:
+          $ref: '#/components/schemas/ShotDetailDraftBatch'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShotDetailDraftBatchItem'
+        applied_shots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Shot'
+        translation_written:
+          type: boolean
+      required:
+      - applied_shots
+      - batch
+      - items
+      - translation_written
+    ShotDetailBatchDetailResponse:
+      type: object
+      properties:
+        batch:
+          $ref: '#/components/schemas/ShotDetailDraftBatch'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShotDetailDraftBatchItem'
+        applied_shots:
+          type: array
+          items:
+            $ref: '#/components/schemas/Shot'
+        translation_written:
+          type: boolean
+        pagination:
+          $ref: '#/components/schemas/ShotDetailBatchItemPagination'
+      required:
+      - applied_shots
+      - batch
+      - items
+      - pagination
+      - translation_written
+    ShotDetailBatchItemPagination:
+      type: object
+      properties:
+        count:
+          type: integer
+          minimum: 0
+        next:
+          type: string
+          format: uri
+          nullable: true
+        previous:
+          type: string
+          format: uri
+          nullable: true
+      required:
+      - count
+      - next
+      - previous
     ShotDetailDraft:
       type: object
       properties:
@@ -10138,6 +11409,369 @@ components:
           default: false
       required:
       - expected_revision
+    ShotDetailDraftBatch:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        project:
+          type: string
+          format: uuid
+          readOnly: true
+        episode:
+          type: string
+          format: uuid
+          readOnly: true
+        created_by:
+          type: integer
+          readOnly: true
+        request_id:
+          type: string
+          format: uuid
+          readOnly: true
+        provider:
+          type: string
+          readOnly: true
+        variation_note:
+          type: string
+          readOnly: true
+        source_manifest_hash:
+          type: string
+          readOnly: true
+        policy_snapshot:
+          readOnly: true
+        config_hash:
+          type: string
+          readOnly: true
+        generation_status:
+          allOf:
+          - $ref: '#/components/schemas/GenerationStatusEnum'
+          readOnly: true
+        apply_status:
+          allOf:
+          - $ref: '#/components/schemas/ApplyStatusEnum'
+          readOnly: true
+        revision:
+          type: integer
+          readOnly: true
+        total_count:
+          type: integer
+          readOnly: true
+        pending_count:
+          type: integer
+          readOnly: true
+        succeeded_count:
+          type: integer
+          readOnly: true
+        failed_count:
+          type: integer
+          readOnly: true
+        stale_count:
+          type: integer
+          readOnly: true
+        skipped_count:
+          type: integer
+          readOnly: true
+        applied_count:
+          type: integer
+          readOnly: true
+        started_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - applied_count
+      - apply_status
+      - config_hash
+      - created_at
+      - created_by
+      - episode
+      - failed_count
+      - finished_at
+      - generation_status
+      - id
+      - pending_count
+      - policy_snapshot
+      - project
+      - provider
+      - request_id
+      - revision
+      - skipped_count
+      - source_manifest_hash
+      - stale_count
+      - started_at
+      - succeeded_count
+      - total_count
+      - updated_at
+      - variation_note
+    ShotDetailDraftBatchApplyItemRequest:
+      type: object
+      description: Serializer that rejects unknown JSON keys instead of ignoring them.
+      properties:
+        item_id:
+          type: string
+          format: uuid
+        draft_id:
+          type: string
+          format: uuid
+        expected_revision:
+          type: integer
+          minimum: 1
+      required:
+      - draft_id
+      - expected_revision
+      - item_id
+    ShotDetailDraftBatchApplyRequest:
+      type: object
+      description: Serializer that rejects unknown JSON keys instead of ignoring them.
+      properties:
+        expected_batch_revision:
+          type: integer
+          minimum: 1
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/ShotDetailDraftBatchApplyItemRequest'
+        review_acknowledged:
+          type: boolean
+          default: false
+        language_mode:
+          allOf:
+          - $ref: '#/components/schemas/LanguageModeEnum'
+          default: bilingual_confirmed
+        english_review_acknowledged:
+          type: boolean
+          default: false
+      required:
+      - expected_batch_revision
+      - items
+    ShotDetailDraftBatchCandidate:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        shot:
+          type: string
+          format: uuid
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/CreativeDraftStatusEnum'
+          readOnly: true
+        revision:
+          type: integer
+          readOnly: true
+        generation_no:
+          type: integer
+          readOnly: true
+          default: 1
+        context_hash:
+          type: string
+          readOnly: true
+        input_settings:
+          readOnly: true
+        draft_data:
+          readOnly: true
+        validation:
+          readOnly: true
+        warnings:
+          readOnly: true
+        error_message:
+          type: string
+          readOnly: true
+        provider:
+          type: string
+          readOnly: true
+        model:
+          type: string
+          readOnly: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - context_hash
+      - created_at
+      - draft_data
+      - error_message
+      - generation_no
+      - id
+      - input_settings
+      - model
+      - provider
+      - revision
+      - shot
+      - status
+      - updated_at
+      - validation
+      - warnings
+    ShotDetailDraftBatchCreateRequest:
+      type: object
+      description: Serializer that rejects unknown JSON keys instead of ignoring them.
+      properties:
+        episode_id:
+          type: string
+          format: uuid
+        request_id:
+          type: string
+          format: uuid
+        provider:
+          allOf:
+          - $ref: '#/components/schemas/ModelProviderEnum'
+          default: local_qwen
+        variation_note:
+          type: string
+          default: ''
+          maxLength: 2000
+        confirmation_acknowledged:
+          type: boolean
+          default: false
+      required:
+      - episode_id
+      - request_id
+    ShotDetailDraftBatchItem:
+      type: object
+      properties:
+        id:
+          type: string
+          format: uuid
+          readOnly: true
+        batch:
+          type: string
+          format: uuid
+          readOnly: true
+        shot:
+          type: string
+          format: uuid
+          readOnly: true
+        ordinal:
+          type: integer
+          readOnly: true
+        source_context_hash:
+          type: string
+          readOnly: true
+        before_snapshot:
+          readOnly: true
+        draft:
+          allOf:
+          - $ref: '#/components/schemas/ShotDetailDraftBatchCandidate'
+          readOnly: true
+        status:
+          allOf:
+          - $ref: '#/components/schemas/ShotDetailDraftBatchItemStatusEnum'
+          readOnly: true
+        attempts:
+          type: integer
+          readOnly: true
+        max_attempts:
+          type: integer
+          readOnly: true
+        next_attempt_at:
+          type: string
+          format: date-time
+          readOnly: true
+        worker_id:
+          type: string
+          readOnly: true
+        claimed_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        heartbeat_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        error_code:
+          type: string
+          readOnly: true
+        error_message:
+          type: string
+          readOnly: true
+        apply_run_id:
+          type: string
+          format: uuid
+          readOnly: true
+          nullable: true
+        applied_at:
+          type: string
+          format: date-time
+          readOnly: true
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          readOnly: true
+        updated_at:
+          type: string
+          format: date-time
+          readOnly: true
+      required:
+      - applied_at
+      - apply_run_id
+      - attempts
+      - batch
+      - before_snapshot
+      - claimed_at
+      - created_at
+      - draft
+      - error_code
+      - error_message
+      - finished_at
+      - heartbeat_at
+      - id
+      - max_attempts
+      - next_attempt_at
+      - ordinal
+      - shot
+      - source_context_hash
+      - status
+      - updated_at
+      - worker_id
+    ShotDetailDraftBatchItemStatusEnum:
+      enum:
+      - pending
+      - running
+      - succeeded
+      - failed
+      - stale
+      - skipped
+      type: string
+      description: |-
+        * `pending` - 待处理
+        * `running` - 处理中
+        * `succeeded` - 已生成
+        * `failed` - 失败
+        * `stale` - 源数据已变化
+        * `skipped` - 已跳过
     ShotDetailDraftConfirmRequest:
       type: object
       description: Serializer that rejects unknown JSON keys instead of ignoring them.
@@ -10160,10 +11794,8 @@ components:
           minimum: 1
         detail_zh:
           type: string
-          maxLength: 3000
         detail_en:
           type: string
-          maxLength: 4500
       required:
       - detail_en
       - detail_zh
@@ -10177,7 +11809,7 @@ components:
           format: uuid
         provider:
           allOf:
-          - $ref: '#/components/schemas/ProviderEnum'
+          - $ref: '#/components/schemas/ModelProviderEnum'
           default: local_qwen
         variation_note:
           type: string
@@ -10193,7 +11825,7 @@ components:
           type: integer
           minimum: 1
         provider:
-          $ref: '#/components/schemas/ProviderEnum'
+          $ref: '#/components/schemas/ModelProviderEnum'
         variation_note:
           type: string
           default: ''
@@ -10205,6 +11837,10 @@ components:
       properties:
         reference_bindings:
           $ref: '#/components/schemas/H3ReferenceBindingsSchemaRequest'
+        duration_ms:
+          type: integer
+          minimum: 100
+          default: 5000
         number:
           type: integer
           maximum: 9223372036854775807
@@ -10228,16 +11864,15 @@ components:
           type: string
         music:
           type: string
-        duration_ms:
-          type: integer
-          maximum: 9223372036854775807
-          minimum: 100
-          format: int64
         media_type:
           $ref: '#/components/schemas/MediaKindEnum'
         h3_mode:
           $ref: '#/components/schemas/H3ModeEnum'
         include_audio:
+          type: boolean
+        requires_first_frame_continuity:
+          type: boolean
+        requires_last_frame_continuity:
           type: boolean
         continuity_notes:
           type: string
@@ -10326,6 +11961,10 @@ components:
             format: uuid
         reference_bindings:
           $ref: '#/components/schemas/H3ReferenceBindingsSchemaRequest'
+        requires_first_frame_continuity:
+          type: boolean
+        requires_last_frame_continuity:
+          type: boolean
         continuity_notes:
           type: string
         metadata: {}
@@ -10514,16 +12153,6 @@ components:
           minLength: 1
       required:
       - token
-    TransportEnum:
-      enum:
-      - local
-      - remote
-      - unconfigured
-      type: string
-      description: |-
-        * `local` - local
-        * `remote` - remote
-        * `unconfigured` - unconfigured
     User:
       type: object
       properties:

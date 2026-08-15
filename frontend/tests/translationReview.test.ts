@@ -18,6 +18,7 @@ import {
   missingBibleCanonicalNames,
   parseTranslationGlossary,
   reconcileTranslationDrafts,
+  translationReviewRequestError,
   translationReviewStatus,
 } from '../src/services/translationReview.ts'
 import { promptArtifactNeedsRegeneration, translationAppliesToShot } from '../src/services/promptArtifactFreshness.ts'
@@ -48,6 +49,44 @@ test('provider capability adapter accepts camelCase and leaves an unverified loc
   assert.equal(capability.defaultProvider, 'deepseek_api')
   assert.equal(capability.providers[0].ready, true)
   assert.equal(capability.providers[1].ready, false)
+})
+
+test('translation confirmation conflicts explain canonical recovery without exposing internal ids', () => {
+  const fallbackConflict = Object.assign(new Error('entry_id: internal; field_key: character.visual_identity'), {
+    response: { data: { error: { code: 'translation_promotion_conflict', details: {
+      code: 'canonical_target_missing',
+      entry_id: 'internal-entry-id', field_key: 'character.visual_identity',
+      missing_mappings: [{ source_term: '断刃', requires_glossary: 'True' }],
+    } } } },
+  })
+  const fallbackMessage = translationReviewRequestError(fallbackConflict, '视觉锚点确认失败。')
+  assert.match(fallbackMessage, /断刃/)
+  assert.match(fallbackMessage, /全剧视觉规则/)
+  assert.doesNotMatch(fallbackMessage, /entry_id|field_key|internal-entry-id/)
+
+  const configuredConflict = Object.assign(new Error('Request failed with status code 409'), {
+    response: { data: { error: { details: {
+      code: 'canonical_target_missing',
+      missing_mappings: [{ source_term: '玄纹剑', canonical_target: 'Xuanwen Sword' }],
+    } } } },
+  })
+  assert.match(
+    translationReviewRequestError(configuredConflict, '确认失败。'),
+    /玄纹剑 = Xuanwen Sword/,
+  )
+})
+
+test('translation confirmation conflict codes map to actionable review messages', () => {
+  const conflict = (code: string) => Object.assign(new Error('raw internal response'), {
+    response: { data: { error: { details: { code, entry_id: 'internal' } } } },
+  })
+  assert.match(translationReviewRequestError(conflict('context_changed'), 'fallback'), /重新翻译/)
+  assert.match(translationReviewRequestError(conflict('source_changed'), 'fallback'), /中文源文已变化/)
+  assert.match(translationReviewRequestError(conflict('revision_conflict'), 'fallback'), /刷新/)
+  assert.equal(
+    translationReviewRequestError(new Error('entry_id: internal；field_key: shot.narrative'), '安全提示'),
+    '安全提示',
+  )
 })
 
 const field: PromptTranslationField = {
@@ -372,6 +411,8 @@ test('authoritative promotion patches only director fields and preserves Chinese
 
 test('storyboard hides stale artifacts and offers one-click prompt regeneration', () => {
   const source = readFileSync(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8')
+  assert.ok(source.includes("fieldKey:'shot.narrative', label:'动作与画面描述', sourceText:shot.action"))
+  assert.ok(!source.includes("fieldKey:'shot.action', label:'动作与画面描述', sourceText:shot.action"))
   assert.ok(source.includes('promptArtifactNeedsRegeneration'))
   assert.ok(source.includes("invalidatePrompt(selectedShot,'translations_changed')"))
   assert.ok(source.includes('旧 Prompt Artifact 已失效'))

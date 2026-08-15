@@ -7,7 +7,7 @@ AutoPrompt Studio 是面向 MiniMax H3 的连续短剧生产台：Django 负责�
 ## 能力
 
 - 11 种风格与 99 张原创本地素材，包含 SHA-256、来源、用途和提示词锚点清单。
-- 连续剧项目、无限集数、角色/场景/道具 Bible、稳定 speaker ID、不可变 reference slot 和版本化一致性锁。
+- 连续剧项目列表、可上传项目封面、无限集数、角色/场景/道具 Bible、稳定 speaker ID、不可变 reference slot 和版本化一致性锁。
 - 图片与视频分镜，逐镜头时长、三类 H3 输入模式：文生视频、首尾帧生视频（0/1/2 张图自动对应 T2VA/I2VA/L2VA/FL2VA）、参考生视频（0–9 图、0–3 视频、视频配对音轨和 0–3 独立音频）。Ref2VA 可显式选择官方默认执行工作流，或实验工作流 `video_minimax_h3_r2v_t8_dual_clock_4step`、`video_minimax_h3_r2v_turbo_lora`，并按模板调整采样步数、LoRA 模型强度。
 - 按 MiniMax H3 官方格式生成 `integrated_multimodal_description` 或 Ref2VA 六段式提示词；可选用显式配置的文本模型把中文导演内容改写为英文，同时逐字保护对白、歌词和屏显文字。
 - ComfyUI 节点/模型动态探测、图片/视频/音频安全上传、按实际选择动态接线、固定加载器自动装配、API Prompt 注入、可导入 UI 画布导出、单 GPU 持久任务队列、重试/恢复/取消、输出收集。
@@ -30,10 +30,14 @@ flowchart LR
 
 ## 本地快速启动（PowerShell）
 
-环境要求：Python 3.11、Node.js 22、FFmpeg，以及可访问的 ComfyUI。Windows 便携版路径通过 `AUTOPROMPT_COMFYUI_ROOT` 或 `scripts/restart.ps1 -ComfyUIRoot` 显式提供：
+环境要求：Python 3.11、Node.js 22、FFmpeg，以及可访问的 ComfyUI。`restart.ps1` 按以下优先级解析 Windows 便携版根目录：显式 `-ComfyUIRoot` 或 `AUTOPROMPT_COMFYUI_ROOT`；进程环境的 `COMFYUI_OUTPUT_DIR`；`backend/.env` 的 `COMFYUI_OUTPUT_DIR`；进程环境的 `COMFYUI_OUTPUT_HOST_DIR`；根目录 `.env` 的 `COMFYUI_OUTPUT_HOST_DIR`。输出目录只能按绝对路径 `<portable-root>\ComfyUI\output` 反推；候选根目录必须同时包含 `python_embeded\python.exe` 和 `ComfyUI\main.py`。
 
 ```powershell
+# 方式一：直接指定便携版根目录
 $env:AUTOPROMPT_COMFYUI_ROOT = 'C:\path\to\ComfyUI_windows_portable'
+
+# 方式二：使用进程环境的实际输出目录反推便携版根目录
+$env:COMFYUI_OUTPUT_DIR = 'C:\path\to\ComfyUI_windows_portable\ComfyUI\output'
 ```
 
 首次安装：
@@ -63,7 +67,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup.ps1 -WithDemoProject
 
 首次创建 `demo` 时会使用系统安全随机源生成高熵密码，仅在该次命令的标准输出中显示一次，程序不将明文写入文件。请立即通过批准的密钥渠道保存，不要复制到日志或工单。重复执行 seed 不会重置或再次显示已有 `demo` 的密码。
 
-日常使用可直接双击仓库根目录的 `restart-all.cmd`。它会严格按“停止已登记的应用服务 → 数据库迁移 → 同步内置风格及启用的 H3/SDXL 工作流模板 → 恢复装配记录 → 确认 ComfyUI 健康 → 启动 Django API → 启动唯一的生成 worker → 启动独立的装配 worker → 启动 Vue 前端”的顺序执行；本地开发入口强制只监听 `127.0.0.1`，不会把账号和 GPU 队列暴露到局域网。ComfyUI 已健康时会复用当前 GPU 进程，否则会从 `AUTOPROMPT_COMFYUI_ROOT` 指定的便携版目录启动。生成 worker 启动后会按持久化 Prompt ID 核对并接续未完成任务；装配 worker 会恢复未完成的 FFmpeg 任务。页面只负责提交和展示状态，刷新或关闭页面不会中断组装。脚本会在数据库、存储、ComfyUI 和两个 worker 均通过 `/api/v1/health/ready/` 后才报告启动成功，运行日志写入 `.runtime/logs/`。同一工作区同时只能运行一个重启脚本，重复双击会立即提示而不会交叉停止进程；启动中途失败时只清理该次启动创建的 Django、两个 worker、Vue 或 ComfyUI，复用的 ComfyUI 不会被停止。仅在诊断模板问题时才使用 `-SkipSeedData` 跳过模板同步。
+日常使用可直接双击仓库根目录的 `restart-all.cmd`。它会严格按“停止已登记的应用服务 → 数据库迁移 → 同步内置风格及启用的 H3/SDXL 工作流模板 → 恢复装配记录 → 确认 ComfyUI 健康 → 启动 Django API → 启动唯一的生成 worker → 启动独立的装配 worker → 启动 Vue 前端”的顺序执行；本地开发入口强制只监听 `127.0.0.1`，不会把账号和 GPU 队列暴露到局域网。ComfyUI 已健康时会复用当前 GPU 进程，否则会从按上述优先级解析并验证的便携版目录启动。生成 worker 启动后会按持久化 Prompt ID 核对并接续未完成任务；装配 worker 会恢复未完成的 FFmpeg 任务。页面只负责提交和展示状态，刷新或关闭页面不会中断组装。脚本会在数据库、存储、ComfyUI 和两个 worker 均通过 `/api/v1/health/ready/` 后才报告启动成功，运行日志写入 `.runtime/logs/`。同一工作区同时只能运行一个重启脚本，重复双击会立即提示而不会交叉停止进程；任一已登记服务停止失败且对应 PID 仍存活时，脚本在尝试清理其余服务后中止，不会再启动第二套 worker。启动中途失败时只清理该次启动创建的 Django、两个 worker、Vue 或 ComfyUI，复用的 ComfyUI 不会被停止。仅在诊断模板问题时才使用 `-SkipSeedData` 跳过模板同步。
 
 ```powershell
 # 等价的 PowerShell 调用
@@ -109,9 +113,9 @@ npm run dev
 
 公开注册默认关闭（`ALLOW_PUBLIC_REGISTRATION=false`），登录页会同步隐藏注册入口；正式账号由管理员创建。只有确实需要自助注册并已配置邮件验证和必要的滥用防护时，才应显式开启该配置。
 
-API 文档位于 `http://127.0.0.1:8000/api/docs/`。前端默认使用真实 API；只有显式设置 `VITE_USE_MOCK=true` 才使用离线演示数据。
+API 使用与副作用说明见 [本地 API](./docs/api.md)，机器可读契约位于 [OpenAPI](./openapi.yaml)，开发文档页为 `http://127.0.0.1:8000/api/docs/`。前端默认使用真实 API；只有显式设置 `VITE_USE_MOCK=true` 才使用离线演示数据。
 
-系统支持 MiniMax H3 视频/原生音频工作流与本地 SDXL Base 1.0 文生图工作流。官方 H3 模板以目标环境的低成本 GPU 烟测作为运行验收；两个 Ref2VA 实验工作流目前只具备静态图构建、节点/模型可见性和参数契约验证，不具备 GPU 端到端生成验收结论。图片链路固定使用 `sd_xl_base_1.0.safetensors`，由 `CheckpointLoaderSimple → CLIPTextEncode → EmptyLatentImage → KSampler → VAEDecode → SaveImage` 生成；每次提交前使用实时 `/object_info` 校验节点和 checkpoint。图片素材只作为 Bible 文本连续性锚点，不会作为像素参考自动送入 ComfyUI，也不会静默调用收费 Partner API。
+系统支持 MiniMax H3 视频/原生音频工作流与本地 SDXL Base 1.0 文生图工作流。官方 H3 模板以目标环境的低成本 GPU 烟测作为运行验收；T8 Dual-Clock 4-Step 与 Turbo LoRA 保持实验状态，必须在每个目标环境完成 GPU 端到端、稳定性、容量和画质验收。图片链路固定使用 `sd_xl_base_1.0.safetensors`，由 `CheckpointLoaderSimple → CLIPTextEncode → EmptyLatentImage → KSampler → VAEDecode → SaveImage` 生成；每次提交前使用实时 `/object_info` 校验节点和 checkpoint。图片素材只作为 Bible 文本连续性锚点，不会作为像素参考自动送入 ComfyUI，也不会静默调用收费 Partner API。
 
 ## H3 英文提示词优化器（可选）
 
@@ -136,11 +140,11 @@ H3_PROMPT_LANGUAGE_GATE=block
 
 ## 典型制作流程
 
-1. 在“连续剧”中新建项目，选择风格、画幅、默认 H3 模式和输出规格。
+1. 在“连续剧项目”列表中新建或打开项目，可选上传 JPEG/PNG/WebP 封面，并选择风格、画幅、默认 H3 模式和输出规格；列表可收藏项目，或基于原项目创建不含任务与产物的独立重做草稿。
 2. 从素材库绑定人物、场景和道具；完善外观、声线、材质、光线和禁止项后锁定 Bible。
 3. 持续添加集数与分镜。每个分镜选择文生视频、首尾帧生视频或参考生视频，并设置叙事、镜头运动、时长、台词、环境声、配乐及实际需要的图片/视频/音频参考；未选择的槽位不会生成空连接。
 4. 生成并审阅 H3 提示词。多分镜模式会生成严格递增的切点；单分镜模式会为每个镜头单独生成任务。
-5. 在“生产工作流 → 创建生产任务”中选择 Ref2VA 执行工作流及其模板参数，再选择官方分辨率档位。官方默认保持自动匹配并固定为 20 steps；T8 Dual-Clock 默认 4 步、Turbo LoRA 默认 10 步，两者的 steps 范围为 1–20，LoRA 强度默认 1.0、范围为 0–2.2。两个变体均标记为实验工作流，并在入队前接受实时 ComfyUI 节点、端口和模型枚举预检；能力预检不代表 GPU 端到端生成通过。视频可用竖屏 `0.2 MP`（`352×608`）做低显存烟测；图片拥有独立的 `image_resolution_profile`，默认 `0.98 MP`（竖屏 `768×1344`），不会因同一集的视频选择 `0.2 MP` 而降质。两类任务都记录实际档位、尺寸倍数和工作流参数。
+5. 在“生产工作流 → 创建生产任务”中选择 Ref2VA 执行工作流及其模板参数，再选择官方分辨率档位。官方默认保持自动匹配并固定为 20 steps；T8 Dual-Clock 默认 4 步、Turbo LoRA 默认 10 步，两者的 steps 范围为 1–20，LoRA 强度默认 1.0、范围为 0–2.2。两个变体均标记为实验工作流，并在入队前接受实时 ComfyUI 节点、端口和模型枚举预检；能力预检不替代 GPU 端到端、稳定性或画质验收。视频可用竖屏 `0.2 MP`（`352×608`）做低显存烟测；图片拥有独立的 `image_resolution_profile`，默认 `0.98 MP`（竖屏 `768×1344`），不会因同一集的视频选择 `0.2 MP` 而降质。两类任务都记录实际档位、尺寸倍数和工作流参数。
 6. 为单集或所选剧集批量建立独立分镜任务。成功输出可按单集或整季装配；明确失败的任务可在页面点击“重试失败任务”，系统会保留源任务并创建可审计的新任务，不会误标整集完成。系统不会在本地失败时静默切换到收费 Partner API。
 
 ## 素材库
@@ -188,4 +192,4 @@ powershell -ExecutionPolicy Bypass -File .\scripts\security_check.ps1
 - 仓库随附 [MiniMax H3 许可证副本](./licenses/minimax-h3/LICENSE-2026-08-09.txt) 和其要求的 [NOTICE](./NOTICE)。源码、容器和离线发行包应保留这些第三方许可文件。
 - SDXL 1.0 图片链路使用 CreativeML Open RAIL++-M（2023-07-26）。MiniMax H3、SDXL、ComfyUI、FFmpeg 及其他依赖分别适用其自身许可证；请在复制或分发相关组件时遵守对应条款。
 
-需求边界见 [MVP 需求](./docs/mvp-requirements.md)，组件与数据流见 [架构](./docs/architecture.md)，配置和运行命令见 [运维](./docs/operations.md)。ComfyUI 节点、模型和安全策略见 [ComfyUI 兼容性与验证](./docs/comfyui-audit.md)，上线前验收项见 [生产技术验收](./docs/production-readiness.md)，有效架构决策见 [决策目录](./docs/decisions/README.md)。
+需求边界见 [MVP 需求](./docs/mvp-requirements.md)，组件与数据流见 [架构](./docs/architecture.md)，接口见 [本地 API](./docs/api.md)，配置和运行命令见 [运维](./docs/operations.md)。ComfyUI 节点、模型和安全策略见 [ComfyUI 兼容性与验证](./docs/comfyui-audit.md)，上线前验收项见 [生产技术验收](./docs/production-readiness.md)，有效架构决策见 [决策目录](./docs/decisions/README.md)。

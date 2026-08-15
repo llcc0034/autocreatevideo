@@ -242,7 +242,10 @@ const adaptShot = (raw: Raw): Shot => {
     ...(legacyNegativePromptRepairEligible ? { legacyNegativePromptRepairEligible: true } : {}),
     characterIds: (raw.characters || []).map(String), sceneId: raw.scene ? String(raw.scene) : undefined,
     propIds: (raw.props || []).map(String), referenceAssetIds: (raw.reference_assets || []).map(String),
-    referenceBindings: adaptReferenceBindings(raw), metadata,
+    referenceBindings: adaptReferenceBindings(raw),
+    requiresFirstFrameContinuity: raw.requires_first_frame_continuity === true,
+    requiresLastFrameContinuity: raw.requires_last_frame_continuity === true,
+    metadata,
     audioEnabled: raw.media_type !== 'image' && raw.include_audio !== false,
     audio: { dialogue: formatDialogueLines(raw.dialogue), soundscape: raw.sound_effects || '', music: raw.music || '' },
     status: 'draft'
@@ -271,12 +274,31 @@ const adaptEpisode = (raw: Raw, shotRows: Raw[], promptRows: Raw[]): Episode => 
   return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, multiShot: raw.prompt_settings?.multi_shot !== false, audioEnabled: raw.prompt_settings?.include_audio !== false, shots, createdAt: raw.created_at }
 }
 
-const projectStatus = (status: string): SeriesProject['status'] => status === 'active' ? 'producing' : status === 'completed' ? 'completed' : status === 'draft' ? 'draft' : 'writing'
-const backendStatus = (status: SeriesProject['status']) => status === 'producing' ? 'active' : status === 'completed' ? 'completed' : 'draft'
+export const projectStatus = (status: string): SeriesProject['status'] => {
+  if (status === 'active') return 'producing'
+  if (status === 'paused' || status === 'archived' || status === 'completed' || status === 'draft') return status
+  return 'draft'
+}
+export const backendStatus = (status: SeriesProject['status']) => {
+  if (status === 'producing') return 'active'
+  if (status === 'paused' || status === 'archived' || status === 'completed') return status
+  return 'draft'
+}
 const inferResolution = (raw: Raw): SeriesProject['resolution'] => Math.max(Number(raw.width || 0), Number(raw.height || 0)) >= 3000 ? '4K' : Math.max(Number(raw.width || 0), Number(raw.height || 0)) >= 1800 ? '1080p' : '720p'
 
-export const adaptProject = async (raw: Raw): Promise<SeriesProject> => {
+const emptyProjectBible = () => ({ characters: [], scenes: [], props: [], negativePrompt: '', colorScript: '' })
+
+/** Adapt one list row without issuing any child-resource requests. */
+export const adaptProjectSummary = (raw: Raw, detailLoaded = false): SeriesProject => {
   projectTitleById.set(String(raw.id), raw.title)
+  return {
+    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, styleId: styleSlug(String(raw.style || '')), status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: raw.production_settings?.default_h3_mode || 'Ref2VA',
+    bible: emptyProjectBible(), episodes: [], episodeCount: Number(raw.episode_count || 0), completedEpisodeCount: Number(raw.completed_episode_count || 0), totalDurationSeconds: Number(raw.total_duration_ms || 0) / 1000, detailLoaded, createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''),
+  }
+}
+
+export const adaptProject = async (raw: Raw): Promise<SeriesProject> => {
+  const summary = adaptProjectSummary(raw)
   const params = { project: raw.id, ordering: 'number' }
   const [episodeRows, characterRows, sceneRows, propRows, shotRows, promptRows] = await Promise.all([
     fetchAllPages<Raw>('/episodes/', { ...params, page_size: 500 }),
@@ -310,9 +332,9 @@ export const adaptProject = async (raw: Raw): Promise<SeriesProject> => {
     for (const shot of episode.shots) shotContextById.set(shot.id, { episodeId: episode.id, number: shot.order, title: shot.title })
   }
   return {
-    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, styleId: styleSlug(String(raw.style || '')), status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: raw.production_settings?.default_h3_mode || 'Ref2VA',
+    ...summary,
     bible: { characters: characterRows.map(adaptBibleItem), scenes: sceneRows.map(adaptBibleItem), props: propRows.map(adaptBibleItem), negativePrompt: raw.production_settings?.negative_prompt || '', colorScript: raw.production_settings?.color_script || '' },
-    episodes, createdAt: raw.created_at, updatedAt: raw.updated_at
+    episodes, episodeCount: episodes.length, completedEpisodeCount: episodes.filter((episode) => episode.status === 'completed').length, totalDurationSeconds: episodes.reduce((total, episode) => total + episode.shots.reduce((sum, shot) => sum + shot.duration, 0), 0), detailLoaded: true,
   }
 }
 
@@ -366,37 +388,94 @@ export const dialoguePayload = (value: string, project: SeriesProject): Raw[] | 
   parseDialogueText(value, project.bible.characters)
 )
 
+export const shotPersistencePayload = (project: SeriesProject, shot: Shot): Raw => {
+  if (shot.legacyNegativePromptRepairEligible) {
+    throw new Error(`分镜“${shot.title}”的负面约束与创作草稿连续性字段来源匹配；请先点击“审计并恢复负面约束”，或人工改为真实的英文缺陷排除词后再保存。`)
+  }
+  const isVideo = shot.mediaType !== 'image'
+  if (!isBackendId(shot.id) && !shot.action.trim()) {
+    throw new Error(`新增分镜“${shot.title}”需要先填写动作与画面描述；镜头标题只用于标识，不会替代 H3 导演描述。`)
+  }
+  const duration = Number(shot.duration)
+  if (!Number.isFinite(duration) || duration <= 0) {
+    throw new Error(`分镜“${shot.title}”的时长必须是正数；视频允许范围以生产能力配置为准。`)
+  }
+  const dialogue = isVideo ? dialoguePayload(shot.audio.dialogue, project) : []
+  if (dialogue === undefined) {
+    throw new Error(
+      `分镜“${shot.title}”的对白格式无效。请逐行填写：[可选起止秒] 角色名或 S1（voiceover; in a low, restrained voice）：中文对白。`
+    )
+  }
+  const characterIds = new Set(project.bible.characters.map((item) => item.id))
+  const sceneIds = new Set(project.bible.scenes.map((item) => item.id))
+  const propIds = new Set(project.bible.props.map((item) => item.id))
+  const staleCharacterIds = shot.characterIds.filter((id) => !characterIds.has(id))
+  const stalePropIds = shot.propIds.filter((id) => !propIds.has(id))
+  if (staleCharacterIds.length || stalePropIds.length || (shot.sceneId && !sceneIds.has(shot.sceneId))) {
+    throw new Error(
+      `分镜“${shot.title}”仍引用已删除或已重建的 Bible 对象。请刷新项目后重新绑定，或在项目总览重新生成剧集与分镜。`
+    )
+  }
+  const speakerCharacters = new Map(
+    project.bible.characters.map((item) => [item.stableSpeakerId || '', item]),
+  )
+  for (const line of dialogue) {
+    const character = speakerCharacters.get(String(line.speaker_id || ''))
+    if (!character) {
+      throw new Error(`分镜“${shot.title}”的对白说话人 ${line.speaker_id} 已不在当前角色 Bible；请重新拆解或修改对白。`)
+    }
+    if (!shot.characterIds.includes(character.id)) {
+      throw new Error(`分镜“${shot.title}”的对白说话人 ${line.speaker_id} · ${character.name} 尚未绑定到本镜头；请重新拆解或在“一致性引用”中绑定。`)
+    }
+  }
+  const shotBindings = shot.referenceBindings || { characters: [], props: [], videos: [], audios: [] }
+  const staleBinding = isVideo && (
+    shotBindings.characters.some((item) => !characterIds.has(item.entityId))
+    || shotBindings.props.some((item) => !propIds.has(item.entityId))
+    || Boolean(shotBindings.scene && !sceneIds.has(shotBindings.scene.entityId))
+  )
+  if (staleBinding) {
+    throw new Error(
+      `分镜“${shot.title}”的参考素材绑定仍指向已删除的 Bible 对象。请刷新项目后重新绑定，或重新生成剧集与分镜。`
+    )
+  }
+  const referenceBindings = isVideo ? referenceBindingsPayload(shot.referenceBindings) : {}
+  const referenceAssets = referenceAssetIdsForShot(shot)
+  shot.referenceAssetIds = referenceAssets
+  return {
+    ...(isBackendId(shot.id) ? { id: shot.id } : {}), number: shot.order, title: shot.title, narrative: shot.action, camera: shot.camera, action: '',
+    ...shotDetailedDescriptionPayload(shot),
+    dialogue,
+    sound_effects: isVideo ? shot.audio.soundscape : '', music: isVideo ? shot.audio.music : '', duration_ms: Math.round(duration * 1000),
+    media_type: shot.mediaType, h3_mode: shot.mode, include_audio: isVideo && shot.audioEnabled,
+    scene: isBackendId(shot.sceneId) ? shot.sceneId : null, characters: shot.characterIds.filter(isBackendId), props: shot.propIds.filter(isBackendId),
+    reference_assets: referenceAssets.filter(isBackendId), reference_bindings: referenceBindings,
+    requires_first_frame_continuity: shot.requiresFirstFrameContinuity,
+    requires_last_frame_continuity: shot.requiresLastFrameContinuity,
+    continuity_notes: shot.continuityDirection || '', metadata: { ...(shot.metadata || {}), framing: shot.framing, reference_bindings: referenceBindings, prompt_field_version: 2, negative_prompt: normalizeNegativePrompt(shot.negativePrompt) }
+  }
+}
+
+const preserveShotPromptState = (saved: Shot, previous: Shot): Shot => ({
+  ...saved,
+  prompt: previous.prompt,
+  generatedPrompt: previous.generatedPrompt,
+  status: previous.status,
+  promptRefreshReason: previous.promptRefreshReason,
+})
+
+export const syncShot = async (project: SeriesProject, episode: Episode, shot: Shot): Promise<Shot> => {
+  const { id: _id, ...payload } = shotPersistencePayload(project, shot)
+  const result = isBackendId(shot.id)
+    ? unwrap<Raw>((await api.patch(`/shots/${shot.id}/`, { episode: episode.id, ...payload })).data)
+    : unwrap<Raw>((await api.post('/shots/', { episode: episode.id, ...payload })).data)
+  const saved = preserveShotPromptState(adaptShot(result), shot)
+  shotContextById.set(saved.id, { episodeId: episode.id, number: saved.order, title: saved.title })
+  return saved
+}
+
 export const syncEpisode = async (project: SeriesProject, episode: Episode): Promise<Episode> => {
-  const shotPayload = episode.shots.map((shot) => {
-    if (shot.legacyNegativePromptRepairEligible) {
-      throw new Error(`分镜“${shot.title}”的负面约束来自旧创作草稿连续性字段；请先点击“审计并恢复负面约束”，或人工改为真实的英文缺陷排除词后再保存。`)
-    }
-    const isVideo = shot.mediaType !== 'image'
-    if (!isBackendId(shot.id) && !shot.action.trim()) {
-      throw new Error(`新增分镜“${shot.title}”需要先填写动作与画面描述；镜头标题只用于标识，不会替代 H3 导演描述。`)
-    }
-    const duration = isVideo ? Math.min(15, Math.max(5, Number(shot.duration || 5))) : Math.max(.1, Number(shot.duration || 5))
-    shot.duration = duration
-    const dialogue = isVideo ? dialoguePayload(shot.audio.dialogue, project) : []
-    if (dialogue === undefined) {
-      throw new Error(
-        `分镜“${shot.title}”的对白格式无效。请逐行填写：角色名或 S1（voiceover; in a low, restrained voice）：中文对白。`
-      )
-    }
-    const referenceBindings = isVideo ? referenceBindingsPayload(shot.referenceBindings) : {}
-    const referenceAssets = referenceAssetIdsForShot(shot)
-    shot.referenceAssetIds = referenceAssets
-    return {
-      ...(isBackendId(shot.id) ? { id: shot.id } : {}), number: shot.order, title: shot.title, narrative: shot.action, camera: shot.camera, action: '',
-      ...shotDetailedDescriptionPayload(shot),
-      dialogue,
-      sound_effects: isVideo ? shot.audio.soundscape : '', music: isVideo ? shot.audio.music : '', duration_ms: Math.round(duration * 1000),
-      media_type: shot.mediaType, h3_mode: shot.mode, include_audio: isVideo && shot.audioEnabled,
-      scene: isBackendId(shot.sceneId) ? shot.sceneId : null, characters: shot.characterIds.filter(isBackendId), props: shot.propIds.filter(isBackendId),
-      reference_assets: referenceAssets.filter(isBackendId), reference_bindings: referenceBindings,
-      continuity_notes: shot.continuityDirection || '', metadata: { ...(shot.metadata || {}), framing: shot.framing, reference_bindings: referenceBindings, prompt_field_version: 2, negative_prompt: normalizeNegativePrompt(shot.negativePrompt) }
-    }
-  })
+  const shotPayload = episode.shots.map((shot) => shotPersistencePayload(project, shot))
   const result = unwrap<Raw>((await api.post(`/episodes/${episode.id}/sync-shots/`, { shots: shotPayload })).data)
   await api.patch(`/episodes/${episode.id}/`, { project: project.id, number: episode.number, title: episode.title, synopsis: episode.synopsis, script: episode.script || '', status: episode.status === 'rendering' ? 'generating' : episode.status, prompt_settings: { multi_shot: episode.multiShot, include_audio: episode.audioEnabled } })
   const previousById = new Map(episode.shots.map((shot) => [shot.id, shot]))

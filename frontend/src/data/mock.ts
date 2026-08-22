@@ -28,6 +28,23 @@ const assetNames: Record<string, { character: string[]; scene: string[]; prop: s
   'healing-fantasy': { character: ['小满', '阿听', '钟爷爷'], scene: ['老树灯笼汤铺', '发光纸船河镇', '晨光钟表阁楼'], prop: ['星光瓷碗', '蓝纸船', '新芽怀表'] }
 }
 
+const mockBibleImagePromptConfig = (styleId: string): SeriesProject['bibleImagePromptConfig'] => ({
+  schemaVersion: 1,
+  stylePrompt: stylePresets.find((style) => style.id === styleId)?.promptPrefix || 'cinematic production reference',
+  styleNegativePrompt: '',
+  compositionRules: {
+    character: 'neutral full-body or three-quarter standing pose; unobstructed face; identity reference image; plain unobtrusive studio background; no other people',
+    scene: 'wide establishing view; empty environment; no people or characters; clear spatial layout and architectural continuity reference',
+    prop: 'three-quarter product view; neutral seamless background; centered; fully visible; no hands, no people, no duplicate objects',
+  },
+  negativeRules: {
+    character: 'multiple people, crowd, duplicate person, obscured face, cropped head',
+    scene: 'people, person, character, crowd, portrait, close-up',
+    prop: 'hands, person, people, multiple objects, duplicate object, clutter',
+  },
+  qualitySuffix: 'high detail, consistent identity, production reference',
+})
+
 export const mockAssets: Asset[] = stylePresets.flatMap((style) => {
   const groups = assetNames[style.id]
   return (Object.keys(groups) as Array<keyof typeof groups>).flatMap((type) => groups[type].map((name, index) => ({
@@ -59,6 +76,7 @@ const episode = (id: string, number: number, title: string, synopsis: string): E
 export const mockProjects: SeriesProject[] = [
   {
     id: 'project-rain-sword', title: '听雨不归人', logline: '失忆剑客护送一封无法打开的密信，却发现沿途追杀者都来自他曾经建立的组织。', masterScript: '第1集：雨夜来信\n镜头1：雨夜竹林中，沈砚背对镜头独行。\n镜头2：青禾从竹影中现身示警。', isFavorite: true, styleId: 'wuxia', status: 'producing', aspectRatio: '9:16', resolution: '720p', defaultMode: 'Ref2VA',
+    bibleImagePromptConfig: mockBibleImagePromptConfig('wuxia'),
     bible: {
       characters: [newBibleItem('char-shen', '沈砚', '28岁清瘦剑客，黑发高束，左眉一道浅疤，墨色窄袖长衫，沉静克制', 'wuxia-character-01'), newBibleItem('char-qing', '青禾', '24岁药师，青灰斗篷，银簪，腰间药囊，眼神敏锐', 'wuxia-character-02')],
       scenes: [newBibleItem('scene-bamboo', '竹林雨夜', '深夜冷青色竹林，斜雨、薄雾、湿润石径，远方暖色灯笼为唯一暖光', 'wuxia-scene-01')],
@@ -69,6 +87,7 @@ export const mockProjects: SeriesProject[] = [
   },
   {
     id: 'project-neon-evidence', title: '零点证词', logline: '一名失去部分记忆的法医，在每晚零点收到来自未来受害者的证词。', masterScript: '第1集：来自明天的尸检\n镜头1：零点，尚未发生的凶案报告出现在解剖台上。', isFavorite: false, styleId: 'detective', status: 'writing', aspectRatio: '9:16', resolution: '720p', defaultMode: 'FL2VA',
+    bibleImagePromptConfig: mockBibleImagePromptConfig('detective'),
     bible: { characters: [newBibleItem('char-forensic', '林默', '31岁法医，短发，深色风衣，右手戴黑色手套', 'detective-character-02')], scenes: [newBibleItem('scene-archive', '旧档案室', '冷白顶灯与窗外蓝紫霓虹交叠，潮湿墙面，密集铁柜', 'detective-scene-02')], props: [newBibleItem('prop-camera', '袖珍相机', '磨损黄铜机身，镜片边缘一道裂纹', 'detective-prop-02')], negativePrompt: '明快高调光，角色变化，现代品牌标识，水印', colorScript: '钴蓝、青绿与少量钠灯橙，真相揭示时逐步抽离彩色。' },
     episodes: [episode('episode-d1', 1, '来自明天的尸检', '零点，尚未发生的凶案报告出现在解剖台上。')], createdAt: '2026-08-05T10:00:00Z', updatedAt: now
   }

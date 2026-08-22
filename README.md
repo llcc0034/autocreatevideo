@@ -30,7 +30,7 @@ flowchart LR
 
 ## 本地快速启动（PowerShell）
 
-环境要求：Python 3.11、Node.js 22、FFmpeg，以及可访问的 ComfyUI。`restart.ps1` 按以下优先级解析 Windows 便携版根目录：显式 `-ComfyUIRoot` 或 `AUTOPROMPT_COMFYUI_ROOT`；进程环境的 `COMFYUI_OUTPUT_DIR`；`backend/.env` 的 `COMFYUI_OUTPUT_DIR`；进程环境的 `COMFYUI_OUTPUT_HOST_DIR`；根目录 `.env` 的 `COMFYUI_OUTPUT_HOST_DIR`。输出目录只能按绝对路径 `<portable-root>\ComfyUI\output` 反推；候选根目录必须同时包含 `python_embeded\python.exe` 和 `ComfyUI\main.py`。
+环境要求：Python 3.11、Node.js 22、FFmpeg，以及可访问的 ComfyUI。Python、Node.js/npm 与 FFmpeg/FFprobe 分别由 `config/python-runtime.json`、`config/node-runtime.json`、`config/ffmpeg-runtime.json` 固定；`setup.ps1` 会在缺失时校验 SHA-256 和发布方签名，并安装到 E 盘项目的 `.runtime/toolchains/`。Python 使用 Python Software Foundation 签名的完整 NuGet 包，能在 `%AppData%` 中的用户级 Python 被清理后修复既有 `backend/.venv`；npm 与 pip 缓存分别固定写入 `.runtime/npm-cache/` 和 `.runtime/pip-cache/`，下载包保留在 `.runtime/downloads/`。也可单独运行 `scripts/install_python_runtime.ps1`、`scripts/install_node_runtime.ps1` 或 `scripts/install_ffmpeg_runtime.ps1` 修复相应依赖。`restart.ps1` 按以下优先级解析 Windows 便携版根目录：显式 `-ComfyUIRoot` 或 `AUTOPROMPT_COMFYUI_ROOT`；进程环境的 `COMFYUI_OUTPUT_DIR`；`backend/.env` 的 `COMFYUI_OUTPUT_DIR`；进程环境的 `COMFYUI_OUTPUT_HOST_DIR`；根目录 `.env` 的 `COMFYUI_OUTPUT_HOST_DIR`。输出目录只能按绝对路径 `<portable-root>\ComfyUI\output` 反推；候选根目录必须同时包含 `python_embeded\python.exe` 和 `ComfyUI\main.py`。
 
 ```powershell
 # 方式一：直接指定便携版根目录

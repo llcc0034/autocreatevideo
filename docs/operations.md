@@ -6,8 +6,8 @@
 
 本地开发需要：
 
-- Windows PowerShell、Python 3.11、Node.js 22 与 npm。
-- `ffmpeg.exe` 和 `ffprobe.exe` 均可从 `Path` 找到。
+- Windows PowerShell、Python 3.11，以及 Node.js 22 与 npm。仓库优先使用 `config/python-runtime.json` 和 `config/node-runtime.json` 固定的项目本地运行时；`setup.ps1` 在缺失时将其安装到 `.runtime/toolchains/`，不依赖 `%AppData%` 中的用户级 Python 或 Node 安装。
+- FFmpeg 与 FFprobe。仓库优先使用 `config/ffmpeg-runtime.json` 固定的 BtbN Windows GPL shared 运行时（FFmpeg 官方下载页列出的构建源，包含项目组装所需的 `libx264`）；`setup.ps1` 在缺失时按固定发布标签与 SHA-256 安装并校验到 `.runtime/toolchains/`，只有本地运行时不存在时才读取系统 `Path`。
 - 可访问的 ComfyUI；由仓库脚本管理便携版时，提供可解析的便携版根目录或对应的 `ComfyUI\output` 绝对路径。
 - 足够容纳 Django 媒体、ComfyUI 输出、模型、临时文件和备份的磁盘空间。
 - SQLite 只用于单机开发。生产部署使用 PostgreSQL。
@@ -46,12 +46,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup.ps1
 
 `setup.ps1` 会执行以下写操作：
 
-1. 创建 `backend/.venv` 并安装后端与工具依赖。
-2. 在 `backend/.env` 不存在时从示例创建配置，并生成独立 Django 密钥；已有文件不被覆盖。
-3. 应用数据库迁移。
-4. 运行 `seed_data`，使系统风格和工作流模板与命令定义保持一致。
-5. 从 `assets/library/manifest.json` 导入素材元数据。
-6. 通过 `npm ci` 安装前端依赖。
+1. 解析 Node.js 22/npm；系统未提供时，根据 `config/node-runtime.json` 下载、校验并安装到 `.runtime/toolchains/`。官方压缩包保留在 `.runtime/downloads/`，npm 缓存写入 `.runtime/npm-cache/`。
+2. 解析 FFmpeg/FFprobe；系统未提供时，根据 `config/ffmpeg-runtime.json` 下载、校验并安装到 `.runtime/toolchains/`。固定压缩包同样保留在 `.runtime/downloads/`。
+3. 解析 Python 3.11；系统未提供时，根据 `config/python-runtime.json` 下载固定 SHA-256 的官方 NuGet 包，并用具有有效 Microsoft Authenticode 签名的 NuGet 工具同时验证 Python Software Foundation 作者签名和 NuGet.org 仓库签名。运行时和验证工具均保留在 `.runtime/`，pip 缓存写入 `.runtime/pip-cache/`。
+4. 创建或修复 `backend/.venv` 并安装后端与工具依赖。若仅 `%AppData%` 中的原 Python 被清理，脚本先把现有 venv 启动器重新指向 E 盘运行时，保留已安装包；无法安全复用时才重建。
+5. 在 `backend/.env` 不存在时从示例创建配置，并生成独立 Django 密钥；已有文件不被覆盖。
+6. 应用数据库迁移。
+7. 运行 `seed_data`，使系统风格和工作流模板与命令定义保持一致。
+8. 从 `assets/library/manifest.json` 导入素材元数据。
+9. 通过已解析的 npm 执行 `npm ci` 安装前端依赖。
 
 可选参数：
 
@@ -187,12 +190,27 @@ powershell -NoProfile -ExecutionPolicy Bypass -File `
 
 模型、校验清单和隔离运行时位于 `.runtime/`。Qwen 翻译、创意请求与生成 worker 共享一个非阻塞资源锁；锁被占用时，生成 worker 保持任务排队，Qwen 请求返回资源忙，不允许绕过锁并发占用同一机器内存。`restart.ps1` 在模型缺失时仍可启动工作台，但本地翻译和创意能力不可用。
 
+新建页的 `series_concept_draft` 也走同一 provider dispatcher 和共享锁，不启动第二套模型服务。它最多接收 6000 字符故事想法和 2000 字符风格提示；计划集数与每集镜数只要求正整数，不设 4 集、4 镜或全剧 12 镜等产品数量上限。单集默认预算由 `SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS` 配置（默认 60 秒），每镜模型建议时长必须位于 `VIDEO_SHOT_MIN_DURATION_MS` 至 `VIDEO_SHOT_MAX_DURATION_MS`；每集镜头最短时长之和无法放入预算时会明确拒绝这种物理不可行组合。其余规模只在页面显示所选模型的非精确资源估算；Django 不因 `QWEN_CREATIVE_MAX_NEW_TOKENS`、`DEEPSEEK_MAX_TOKENS` 或估算 token 值阻断，而是把全剧作为一次业务/API 请求交给用户选择的模型，不按集或镜头自动分批。DeepSeek 连续剧操作使用模型能力配置 `DEEPSEEK_SERIES_CONCEPT_MAX_TOKENS` 与运行时配置 `DEEPSEEK_SERIES_CONCEPT_TIMEOUT_SECONDS`，二者不随业务数量计算；模型/运行时不能承载时返回实际失败阶段。能力接口的 provider 行公开这两项安全数值，`series_concept_draft_limits` 只公开字符范围、默认单集时长和生产镜头时长范围，不公开模型目录或密钥。模型协议使用 `schema_version=2`，必须返回 `bible.characters/scenes/props` 与剧集镜头；Django 再以 `deterministic-script-breakdown-v3` 渲染闭合的 `SCRIPT_BIBLE_V1` 前置块和完整拆解正文。接口只返回浏览器待审候选，不建 Project、不入 worker 队列，也不产生可恢复任务记录；失败后直接人工填写或重试，不通过数据库/CLI 制造旁路。
+
+项目创建并保存完整母稿后，按以下唯一人工确认流程处理前置 Bible：
+
+1. 调用 `GET /api/v1/projects/{id}/script-bible-candidates/` 读取当前母稿指纹、全部候选、逐行诊断、正文证据及现有/冲突状态；GET 不写数据库，也不缓存候选。
+2. 用户勾选并可编辑最终名称、描述和英文视觉锚点；调用 `POST /api/v1/projects/{id}/script-bible-candidates/apply/` 时必须原样带回来源指纹、候选 ID 和 `reviewed=true`。
+3. 服务端锁定项目和三类 Bible 后整批校验并只增不删；整份来源指纹只做本次 stale 防护，候选确认身份使用候选 ID 加不含正文的声明指纹。过期来源指纹、声明变化、同名异类/异内容、无效 provenance、同一 provenance 的不同审核内容或并发唯一键冲突均显式失败且整批零写入。相同审核内容重放返回 `already_exists`，不会重复创建或删除旧 Bible。
+4. 拆解服务总是先用共享 parser 分离块和正文；完整原文继续保存在 Project。存在未确认候选时默认返回 `script_bible_confirmation_required`，运维或页面不得自动重试跳过。只有用户明确确认后，本次请求才可设置 `continue_without_script_bible=true`；该参数不保存为项目偏好，不创建 Bible，并在拆解 warning 中记录。人工改名后的候选通过已验证 provenance 把母稿原声明名解析到当前正式 Bible ID；若候选未确认或冲突，该别名不会进入拆解。
+
+非法或半闭合 `SCRIPT_BIBLE_V1` 块先修正文后再操作；跳过参数不能绕过结构错误。人工编辑后的最终 Bible 通过 `metadata.script_bible_v1` 中的候选 ID、声明指纹、首次来源审计指纹、审核快照与严格复算内容哈希追踪，因此正文变化、最终名称不同于模型原名或确认后的合法字段编辑都不会被误判为未确认。声明内容变化则形成新候选或 provenance 冲突。保留成员只能由 apply 写入，通用 Bible CRUD、`sync-bibles` 和 Django 管理后台均不得注入、替换或删除；这些写路径必须按 Project → Bible 行的顺序加锁，并在最终写入前以数据库最新 metadata 重检保留成员，不能让锁前验证过的旧请求覆盖 apply 的 provenance。排障时可比较 API 返回的 fingerprint 和逐行 diagnostic，但不得把完整母稿或未脱敏模型内容写入普通日志。
+
+本地 Qwen 首轮响应在 JSON 解码或完整结构校验阶段失败时，隔离运行时最多额外执行一次整份结构修复：修复提示携带原始完整业务请求和首轮不可信输出，要求重新生成完整全剧，绝不按集/镜分段或只返回补丁。修复成功时服务端把 `series_concept_structure_repaired` 映射为可见 warning；仅通过确定性字符串空白恢复时映射 `series_concept_structure_whitespace_recovered`。若发生两次推理，运行时把两轮 `prompt_tokens`、`completion_tokens`、`total_tokens` 相加为一份 usage。失败响应和结构化日志用 `diagnostic_id` 关联；普通日志只保留 provider、错误码、阶段、finish reason 与该数值摘要。可展开诊断也只含次数、耗时、配置能力、输出长度/SHA-256、解码位置和严格脱敏结构，不记录 idea、style、模型原文、Authorization 或密钥。
+
+连续剧候选的模型适用性提示由配置显式决定：`SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER=deepseek_api`、`QWEN_SERIES_CONCEPT_DRAFT_SUITABILITY=experimental`、`DEEPSEEK_SERIES_CONCEPT_DRAFT_SUITABILITY=recommended` 是当前默认值。能力 API 分别返回根级推荐 provider 和每行 provider 的 `recommended|experimental`、受控原因码及安全提示；它不读取硬件、不按 model 字符串判断，不改变通道就绪状态，也不自动切换或阻止用户选择。当前本地 Qwen 配置定位为基础/测试级，不推荐承担完整连续剧的严格结构任务。此适用性配置只描述已验证能力；本地安装链仍使用固定的 Qwen3-4B manifest/hash 校验，更换本地模型还必须扩展权威 manifest、下载校验和兼容性测试，不能只改适用性或下拉配置。
+
 标准 Compose 没有把宿主机 `.runtime` 挂载到 backend 容器。选择 `local_qwen` 前必须在容器内提供匹配的模型、Python 运行时和共享锁路径，并完成独立 smoke test；否则使用显式配置的可用提供方。
 
 DeepSeek 为可选远程通道：
 
 - 设置 `DEEPSEEK_ENABLED=true` 时必须提供 `DEEPSEEK_API_KEY`。
-- `DEEPSEEK_BASE_URL`、模型、超时、重试和 token 上限由对应环境变量控制；默认 `DEEPSEEK_MAX_TOKENS=16384`，低于本次结构化草稿所需预算时会在发送前失败，不会静默截断。
+- `DEEPSEEK_BASE_URL`、模型、超时、重试和 token 配置由对应环境变量控制；默认 `DEEPSEEK_MAX_TOKENS=16384` 继续服务既有翻译、剧集分镜草稿和逐镜扩写，这些操作仍按各自协议执行预算校验。新建项目前的 `series_concept_draft` 单独使用 `DEEPSEEK_SERIES_CONCEPT_MAX_TOKENS=384000` 和 `DEEPSEEK_SERIES_CONCEPT_TIMEOUT_SECONDS=900`；前者按当前 DeepSeek V4 Flash 模型输出能力发送，后者允许完整全剧长请求完成，两者都不是按集数、镜数或资源估算生成的业务门禁。若上游仍以 `finish_reason=length` 停止，接口返回 `series_concept_provider_output_truncated` 及安全诊断，不把截断内容继续送入 JSON/结构校验。
 - 选择 DeepSeek 会向外部服务发送完成操作所需的提示词和项目上下文。
 - 远程失败会直接报告，不会静默切换到本地 Qwen。
 - 标准 Compose 把 DeepSeek 密钥注入 backend 和 generation worker，因为整集高细节批次由 worker 调用该服务；不注入装配 worker或前端。两类进程和本地 `backend/.env` 都按含密钥的后端进程保护。
@@ -257,6 +275,10 @@ H3 提示词优化器是独立的可选外部通道。保持 `H3_PROMPT_OPTIMIZE
 
 长耗时 GPU 与 FFmpeg 工作都由持久 worker 执行，浏览器只负责创建任务和读取状态。操作要求如下：
 
+- Bible 实体图片候选使用唯一的 `GET/POST /api/v1/projects/{id}/bible-image-candidates/`。GET 为零写投影；POST 不接受模板、模型或工作流参数，只使用 `seed_data` 管理的最新启用全局 system `minimax-reference-image`。该模板必须同时满足 provider=`comfyui`、output kind=`image`、固定 SDXL、workflow mode=`text_to_image`、prompt key=`sdxl_txt2img_bible_v1` 且 `pixel_reference_inputs=false`，definition 还必须与代码内唯一审核基准的 canonical JSON/SHA-256 完全一致；任一占位符、节点输入、连线、采样参数或输出前缀变化均视为不合规。最新版本不合规时 API 返回 503 并停止，不得选旧版或其他模板兜底。项目级 `bible_image_prompt_config` 是参考图项目风格、系统构图规则、负向规则和质量后缀的唯一配置；页面保存后生效。生成前 GET 会返回当前 prompt 输入字段，POST 只接受字段级 `prompt_overrides`，不得提交最终 prompt、模板、模型或工作流。执行 `seed_data` 后可用能力/模板只读 API 核对配置，但节点与模型可见仍不等于真实画质验收。
+- 每次候选 POST 在单一事务中写 PromptArtifact、GeneratedWorkflow、GenerationTask；相同幂等键/指纹只返回原链，冲突或残链不补写。提示词质量报告是 advisory：视觉字段回退、CJK、词数、字段稀疏和 canonical 碰撞仍可排队并要求人工审核。队列超过推荐值仍沿用 `extended_generation_confirmed` 人工确认，不增加并发。
+- worker 成功后必须先封存 output provenance，才能把候选提升为 Asset；候选任务不能用当前 live Prompt/模板现场补签。提升前必须核对签名 manifest、task capability snapshot 与 Prompt request options 的 purpose、request fingerprint、`bible_target` 完全一致。提升目标只来自冻结 `bible_target`，只追加 reference asset、不改 anchor。提升 metadata 的 `manifest_sha256` 来自来源清单 `integrity.payload_sha256`。数据库写入、M2M、任务更新或事务提交失败时应确认媒体目录没有遗留 `generated-{task-id}-{index}` 孤儿文件；重复提升必须返回同一 Asset。
+- 首尾帧连续生成通过 `DeferredGenerationRequest` 建档，不使用人工脚本、外部 FFmpeg 或直接 DB/File 写入补帧。`POST /api/v1/deferred-generation-requests/` 只接受 project、source task、target shot、slot 和幂等键；output index、模板、模型、workflow 和参考素材均由服务端从冻结 contract 解析并由 worker 物化。source task 成功后，generation worker 会验证 `primary_video` manifest、抽取上游视频尾帧、创建派生 reference Asset，并用临时绑定创建下游正式 Prompt/Workflow/Task。Ref2VA 首帧承接使用软 `first_frame_reference_asset_id`，在提示词和工作流中作为 `<Picture 1>` 开场状态参考，不要求把目标镜头切换为 FL2VA。等待态、stale 或失败请求不得手工改成成功。
 - 通过 UI 或 API 创建、取消和重试任务，不直接修改队列表。`POST /tasks/`、`POST /tasks/{id}/retry/` 与整集/整剧构建共用队列推荐策略；收到 `production_queue_confirmation_required` 后必须由用户决定取消或以 `extended_generation_confirmed=true` 原样重发，服务端不会自动确认。
 - `TASK_RECOMMENDED_MAX_PENDING` 与 `TASK_RECOMMENDED_MAX_ACTIVE_PER_USER` 只控制长队列确认提示，不限制整剧总集数或总镜数；确认后完整排队。`TASK_MAX_CONCURRENT` 控制真实执行并发，单 GPU 配置保持为 `1`。`SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS` 控制单次母稿输入字符预算，可通过环境配置调整。
 - 母稿拆解默认值由 `SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS`、`SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY` 与 `SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY` 控制；默认时长必须位于 `VIDEO_SHOT_MIN_DURATION_MS` 和 `VIDEO_SHOT_MAX_DURATION_MS` 之间。`SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS` 与 `SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS` 控制没有显式镜头标记时的确定性长段落切分，必须满足 `1 <= target <= trigger`。布尔配置只接受 true/false、1/0、yes/no 或 on/off。非法配置会阻止后端启动；修改后重启并读取 `/api/v1/capabilities/production/` 核对实际值。

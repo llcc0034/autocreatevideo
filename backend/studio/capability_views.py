@@ -8,6 +8,9 @@ from rest_framework.views import APIView
 from studio.services.h3_prompt_optimizer import get_h3_prompt_optimizer_capability
 from studio.services.shot_detail_drafts import shot_detail_capability
 from studio.services.prompt_translation import get_translation_capability
+from studio.services.series_concept_drafts import (
+    SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+)
 from studio.models import GenerationTask
 
 
@@ -34,6 +37,22 @@ CreativeDraftProviderCapabilities = inline_serializer(
         "provider": serializers.ChoiceField(choices=("local_qwen", "deepseek_api")),
         "label": serializers.CharField(),
         "creative_generation_supported": serializers.BooleanField(),
+        "series_concept_draft_suitability": serializers.ChoiceField(
+            choices=("recommended", "experimental"),
+        ),
+        "series_concept_draft_suitability_reason_code": serializers.ChoiceField(
+            choices=(
+                "series_concept_strict_structure_recommended",
+                "series_concept_strict_structure_experimental",
+            ),
+        ),
+        "series_concept_draft_suitability_notice": serializers.CharField(),
+        "series_concept_draft_timeout_seconds": serializers.FloatField(
+            min_value=0,
+        ),
+        "series_concept_draft_max_output_tokens": serializers.IntegerField(
+            min_value=1,
+        ),
         "enabled": serializers.BooleanField(),
         "configured": serializers.BooleanField(),
         "ready": serializers.BooleanField(),
@@ -118,7 +137,29 @@ CreativeDraftCapabilityResponse = inline_serializer(
         "default_provider": serializers.ChoiceField(
             choices=("local_qwen", "deepseek_api"),
         ),
+        "series_concept_draft_preferred_provider": serializers.ChoiceField(
+            choices=("local_qwen", "deepseek_api"),
+        ),
         "providers": CreativeDraftProviderCapabilities,
+        "series_concept_draft_supported": serializers.BooleanField(),
+        "series_concept_draft_schema_version": serializers.IntegerField(
+            min_value=SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+            max_value=SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+        ),
+        "series_concept_draft_limits": inline_serializer(
+            name="SeriesConceptDraftLimits",
+            fields={
+                "max_idea_chars": serializers.IntegerField(min_value=1),
+                "max_style_hint_chars": serializers.IntegerField(min_value=1),
+                "default_episode_duration_seconds": serializers.IntegerField(
+                    min_value=1,
+                ),
+                "minimum_shot_duration_ms": serializers.IntegerField(min_value=1),
+                "maximum_shot_duration_ms": serializers.IntegerField(min_value=1),
+            },
+        ),
+        "series_concept_draft_review_required": serializers.BooleanField(),
+        "series_concept_draft_persisted": serializers.BooleanField(),
         "shot_high_detail_supported": serializers.BooleanField(),
         "shot_high_detail_schema_version": serializers.IntegerField(min_value=1),
         "shot_high_detail_policies": serializers.DictField(

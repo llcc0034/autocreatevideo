@@ -114,6 +114,74 @@ def project_visual_color_design(**overrides):
     return value
 
 
+def series_concept_request(**overrides):
+    payload = {
+        "operation": "series_concept_draft",
+        "request_id": "series-concept-contract-test",
+        "source_fingerprint": "c" * 64,
+        "idea": "\u4e00\u540d\u8bb0\u8005\u5728\u96e8\u591c\u53d1\u73b0\u65e7\u6848\u7684\u65b0\u8bc1\u636e\u3002",
+        "style_hint": "\u514b\u5236\u7684\u60ac\u7591\u77ed\u5267",
+        "options": {
+            "episode_count": 2,
+            "shots_per_episode": 2,
+            "minimum_duration_ms": 5_000,
+            "maximum_duration_ms": 15_000,
+            "episode_duration_ms": 60_000,
+        },
+        "attempt": 1,
+        "seed": 20260815,
+        "context_size": 8_192,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def series_concept_candidate(
+    *, episode_count=2, shots_per_episode=2, dialogue=True, duration_ms=6_000,
+):
+    episodes = []
+    for episode_index in range(episode_count):
+        shots = []
+        for shot_index in range(shots_per_episode):
+            has_dialogue = dialogue and episode_index == 0 and shot_index == 0
+            shots.append({
+                "setting": "\u96e8\u591c\u62a5\u793e\u7684\u6863\u6848\u5ba4",
+                "action": "\u6797\u9ed8\u7ffb\u5f00\u6848\u5377\uff0c\u5728\u7167\u7247\u80cc\u9762\u53d1\u73b0\u4e00\u884c\u65b0\u5b57\u3002",
+                "duration_ms": duration_ms,
+                "dialogue": {
+                    "speaker": "\u6797\u9ed8" if has_dialogue else "",
+                    "delivery": "" if has_dialogue else "",
+                    "text": "\u8fd9\u4e2a\u65e5\u671f\u4e0d\u5bf9\u3002" if has_dialogue else "",
+                },
+            })
+        episodes.append({
+            "title": f"\u7ebf\u7d22{episode_index + 1}",
+            "shots": shots,
+        })
+    return {
+        "title": "\u96e8\u591c\u65e7\u8bc1",
+        "logline": "\u8bb0\u8005\u6797\u9ed8\u8ffd\u67e5\u65e7\u6848\uff0c\u5374\u53d1\u73b0\u8bc1\u636e\u6307\u5411\u81ea\u5df1\u7684\u5bb6\u4eba\u3002",
+        "bible": {
+            "characters": [{
+                "name": "\u6797\u9ed8",
+                "description": "\u8ffd\u67e5\u65e7\u6848\u7684\u8bb0\u8005",
+                "visual_identity_en": "restrained investigative reporter in a dark raincoat",
+            }],
+            "scenes": [{
+                "name": "\u96e8\u591c\u62a5\u793e\u7684\u6863\u6848\u5ba4",
+                "description": "\u96e8\u591c\u91cc\u5806\u6ee1\u65e7\u6863\u6848\u7684\u5bc6\u95ed\u623f\u95f4",
+                "visual_identity_en": "dim newspaper archive room under cold rainlight",
+            }],
+            "props": [{
+                "name": "\u6848\u5377",
+                "description": "\u85cf\u6709\u65b0\u7ebf\u7d22\u7684\u65e7\u6848\u5377",
+                "visual_identity_en": "weathered paper case file with a faded red string",
+            }],
+        },
+        "episodes": episodes,
+    }
+
+
 def creative_request(**overrides):
     payload = {
         "operation": "creative_storyboard",
@@ -194,6 +262,7 @@ def creative_request(**overrides):
             "source_order": 1,
             "source_delivery_zh": "",
         }],
+        "source_timed_visual_segments": [],
     }
     payload.update(overrides)
     return payload
@@ -225,6 +294,8 @@ def creative_candidate():
             "media_type": "video",
             "h3_mode": "Ref2VA",
             "include_audio": True,
+            "requires_first_frame_continuity": True,
+            "requires_last_frame_continuity": False,
             "scene_id": SCENE_ID,
             "character_ids": [CHARACTER_ID],
             "prop_ids": [PROP_ID],
@@ -525,6 +596,119 @@ class ShotHighDetailProviderPolicyTests(unittest.TestCase):
                 mutate(payload)
                 with self.assertRaisesRegex(runtime.RuntimeInputError, expected_path.replace("[", r"\[")):
                     runtime._normalise_shot_high_detail_request(payload)
+
+    def test_high_detail_preserves_source_timing_ranges_as_review_issue(self):
+        payload = shot_high_detail_request()
+        payload["target_shot"] = {
+            **payload["target_shot"],
+            "duration_ms": 5000,
+            "action": (
+                "[0-2.5秒] 动作：林彻沿着雨墙前进。"
+                "[2.5-5秒] 动作：他停在门前，右手贴住门框。"
+            ),
+        }
+
+        request = runtime._normalise_shot_high_detail_request(payload)
+
+        self.assertEqual(request.target_shot["source_timed_visual_segments"], [
+            {
+                "source_order": 1,
+                "start_ms": 0,
+                "end_ms": 2500,
+                "kind": "action",
+                "text_zh": "林彻沿着雨墙前进",
+            },
+            {
+                "source_order": 2,
+                "start_ms": 2500,
+                "end_ms": 5000,
+                "kind": "action",
+                "text_zh": "他停在门前，右手贴住门框",
+            },
+        ])
+
+        issues: list[dict[str, str]] = []
+        runtime._validate_shot_high_detail(
+            {
+                "schema_version": runtime.SHOT_DETAIL_SCHEMA_VERSION,
+                "detail_zh": "林彻沿着雨墙前进，停在门前。",
+                "detail_en": "Lin Che moves along the rain wall and stops at the gate.",
+            },
+            request,
+            review_issues=issues,
+        )
+        self.assertIn(
+            ("source_timing_range_missing", "detail_zh"),
+            {(item["code"], item["path"]) for item in issues},
+        )
+
+        issues = []
+        runtime._validate_shot_high_detail(
+            {
+                "schema_version": runtime.SHOT_DETAIL_SCHEMA_VERSION,
+                "detail_zh": (
+                    "时间段标记：[0-2.5秒] [2.5-5秒]\n"
+                    "林彻沿着雨墙前进，停在门前。"
+                ),
+                "detail_en": (
+                    "Timing markers: [0-2.5s] [2.5-5s]\n"
+                    "Lin Che moves along the rain wall and stops at the gate."
+                ),
+            },
+            request,
+            review_issues=issues,
+        )
+        self.assertIn(
+            "source_timing_segment_unmapped",
+            {item["code"] for item in issues},
+        )
+
+        issues = []
+        runtime._validate_shot_high_detail(
+            {
+                "schema_version": runtime.SHOT_DETAIL_SCHEMA_VERSION,
+                "detail_zh": (
+                    "[0-2.5秒] 林彻沿着雨墙前进，镜头保持同一侧向运动。"
+                    "\n[2.5-5秒] 他停在门前，右手贴住门框，结束时仍处于同一入口空间。"
+                ),
+                "detail_en": (
+                    "[0-2.5s] Lin Che moves along the rain wall as the camera keeps the same lateral flow."
+                    "\n[2.5-5s] He stops at the gate, places the right hand on the frame, and ends in "
+                    "the same entrance space."
+                ),
+            },
+            request,
+            review_issues=issues,
+        )
+        self.assertFalse({
+            "source_timing_range_missing",
+            "source_timing_segment_unmapped",
+        } & {item["code"] for item in issues})
+
+    def test_high_detail_source_timing_ignores_previous_detailed_description(self):
+        payload = shot_high_detail_request()
+        payload["target_shot"] = {
+            **payload["target_shot"],
+            "duration_ms": 5000,
+            "action": "[0-5秒] 动作：林彻沿着雨墙前进。",
+            "detailed_description": (
+                "Timing markers: [0-2.5s] [2.5-5s]\n"
+                "Old applied high-detail prose must not become the next source."
+            ),
+        }
+
+        request = runtime._normalise_shot_high_detail_request(payload)
+        messages = runtime._build_shot_high_detail_messages(request)
+
+        self.assertEqual(request.target_shot["source_timed_visual_segments"], [{
+            "source_order": 1,
+            "start_ms": 0,
+            "end_ms": 5000,
+            "kind": "action",
+            "text_zh": "林彻沿着雨墙前进",
+        }])
+        self.assertNotIn("Old applied high-detail prose", messages[1]["content"])
+        self.assertNotIn("detailed_description", messages[1]["content"])
 
     def test_provider_env_contract_is_declared_for_every_protocol_limit(self):
         repo_root = Path(__file__).resolve().parents[1]
@@ -940,6 +1124,621 @@ class QwenProjectVisualRulesContractTests(unittest.TestCase):
         invoke.assert_called_once()
 
 
+class QwenSeriesConceptDraftContractTests(unittest.TestCase):
+    def setUp(self):
+        self.request = runtime._normalise_series_concept_draft_request(
+            series_concept_request()
+        )
+
+    def test_normaliser_uses_exact_integers_without_arbitrary_count_or_token_caps(self):
+        self.assertEqual(self.request.episode_count, 2)
+        self.assertEqual(self.request.shots_per_episode, 2)
+        self.assertEqual(self.request.episode_duration_ms, 60_000)
+
+        larger = series_concept_request()
+        larger["options"] = {
+            **larger["options"],
+            "episode_count": 5,
+            "shots_per_episode": 15,
+            "episode_duration_ms": 90_000,
+        }
+        larger_request = runtime._normalise_series_concept_draft_request(larger)
+        self.assertEqual(larger_request.episode_count, 5)
+        self.assertEqual(larger_request.shots_per_episode, 15)
+
+        configured_long_form = series_concept_request()
+        configured_long_form["options"] = {
+            **configured_long_form["options"],
+            "minimum_duration_ms": 30_000,
+            "maximum_duration_ms": 120_000,
+            "episode_duration_ms": 240_000,
+        }
+        long_form_request = runtime._normalise_series_concept_draft_request(
+            configured_long_form
+        )
+        self.assertEqual(long_form_request.maximum_duration_ms, 120_000)
+
+        invalid_payloads = []
+        for key, value in (
+            ("episode_count", 2.0),
+            ("shots_per_episode", "2"),
+            ("minimum_duration_ms", True),
+        ):
+            payload = series_concept_request()
+            payload["options"] = {**payload["options"], key: value}
+            invalid_payloads.append(payload)
+        invalid_payloads.extend((
+            series_concept_request(seed=False),
+            series_concept_request(max_new_tokens=0),
+            series_concept_request(max_new_tokens=20_000),
+            series_concept_request(options={
+                **series_concept_request()["options"],
+                "shots_per_episode": 13,
+                "episode_duration_ms": 60_000,
+            }),
+            series_concept_request(options={
+                **series_concept_request()["options"],
+                "episode_count": 0,
+            }),
+            series_concept_request(options={
+                **series_concept_request()["options"],
+                "unexpected": 1,
+            }),
+        ))
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                with self.assertRaises(runtime.RuntimeInputError):
+                    runtime._normalise_series_concept_draft_request(payload)
+
+    def test_validator_enforces_exact_shape_counts_and_parser_safe_text(self):
+        candidate = series_concept_candidate()
+        result = runtime._validate_series_concept_draft_result(candidate, self.request)
+        self.assertEqual(result["schema_version"], 2)
+        self.assertEqual(result["bible"]["characters"][0]["name"], "林默")
+        self.assertEqual(len(result["episodes"]), 2)
+        self.assertEqual(len(result["episodes"][0]["shots"]), 2)
+        self.assertEqual(result["episodes"][0]["shots"][0]["duration_ms"], 6_000)
+        self.assertEqual(
+            result["episodes"][0]["shots"][0]["dialogue"]["delivery"],
+            "in a natural, restrained voice",
+        )
+
+        wrong_count = series_concept_candidate(episode_count=1)
+        with self.assertRaises(RuntimeError):
+            runtime._validate_series_concept_draft_result(wrong_count, self.request)
+
+        extra_key = series_concept_candidate()
+        extra_key["episodes"][0]["shots"][0]["extra"] = "unsafe"
+        with self.assertRaises(RuntimeError):
+            runtime._validate_series_concept_draft_result(extra_key, self.request)
+
+        duplicate_bible = series_concept_candidate()
+        duplicate_bible["bible"]["props"].append({
+            "name": "林默",
+            "description": "冲突名称",
+            "visual_identity_en": "conflicting identity",
+        })
+        with self.assertRaises(RuntimeError):
+            runtime._validate_series_concept_draft_result(
+                duplicate_bible, self.request,
+            )
+
+        schema = runtime._series_concept_draft_schema(self.request)
+        for collection in ("characters", "scenes", "props"):
+            collection_schema = schema["properties"]["bible"]["properties"][collection]
+            self.assertNotIn("maxItems", collection_schema)
+            self.assertNotIn("minItems", collection_schema)
+
+        for duration in (True, 4_999, 15_001):
+            invalid_duration = series_concept_candidate()
+            invalid_duration["episodes"][0]["shots"][0]["duration_ms"] = duration
+            with self.subTest(duration=duration):
+                with self.assertRaises(RuntimeError):
+                    runtime._validate_series_concept_draft_result(
+                        invalid_duration, self.request,
+                    )
+
+        for delimiter in "()（）[]【】<>:：":
+            unsafe_speaker = series_concept_candidate()
+            unsafe_speaker["episodes"][0]["shots"][0]["dialogue"]["speaker"] += delimiter
+            with self.subTest(delimiter=delimiter):
+                with self.assertRaises(RuntimeError):
+                    runtime._validate_series_concept_draft_result(
+                        unsafe_speaker, self.request,
+                    )
+
+        for unsafe_value in ("\u202e", "\u200b", "\x00", "\t"):
+            unsafe_text = series_concept_candidate()
+            unsafe_text["episodes"][0]["shots"][0]["action"] += unsafe_value
+            with self.subTest(unsafe_value=repr(unsafe_value)):
+                with self.assertRaises(RuntimeError):
+                    runtime._validate_series_concept_draft_result(
+                        unsafe_text, self.request,
+                    )
+
+    def test_episode_duration_over_budget_is_reviewable_not_structural_failure(self):
+        payload = series_concept_request()
+        payload["options"] = {
+            **payload["options"], "episode_duration_ms": 20_000,
+        }
+        request = runtime._normalise_series_concept_draft_request(payload)
+        review_issues = []
+
+        result = runtime._validate_series_concept_draft_result(
+            series_concept_candidate(duration_ms=15_000),
+            request,
+            review_issues=review_issues,
+        )
+
+        self.assertEqual(len(result["episodes"]), 2)
+        self.assertEqual(
+            [issue["code"] for issue in review_issues],
+            [
+                "series_concept_episode_duration_over_budget",
+                "series_concept_episode_duration_over_budget",
+            ],
+        )
+        self.assertEqual(
+            [issue["path"] for issue in review_issues],
+            ["result.episodes[0].shots", "result.episodes[1].shots"],
+        )
+
+    def test_validator_emits_non_blocking_no_dialogue_warning(self):
+        review_issues = []
+        result = runtime._validate_series_concept_draft_result(
+            series_concept_candidate(dialogue=False),
+            self.request,
+            review_issues=review_issues,
+        )
+
+        self.assertEqual(len(result["episodes"]), 2)
+        self.assertEqual(
+            [issue["code"] for issue in review_issues],
+            ["series_concept_no_dialogue"],
+        )
+
+    def test_local_parseable_incomplete_candidate_is_returned_for_review(self):
+        candidate = series_concept_candidate()
+        calls = []
+        instances = []
+        model_init_calls = []
+
+        class IncompleteFakeLlama:
+            def __init__(self, **kwargs):
+                self.closed = False
+                instances.append(self)
+                model_init_calls.append(kwargs)
+
+            def tokenize(self, value, add_bos=True):
+                return list(range(max(1, len(value) // 16)))
+
+            def create_chat_completion(self, **kwargs):
+                calls.append(kwargs)
+                return {"choices": [{
+                    "message": {"content": json.dumps(candidate, ensure_ascii=False)},
+                    "finish_reason": "length",
+                }]}
+
+            def close(self):
+                self.closed = True
+
+        fake_module = ModuleType("llama_cpp")
+        fake_module.Llama = IncompleteFakeLlama
+        fake_module.__version__ = "0.3.34-test"
+        with tempfile.TemporaryDirectory() as directory:
+            model_path = Path(directory) / "fake.gguf"
+            model_path.write_bytes(b"fake")
+            with patch.dict(sys.modules, {"llama_cpp": fake_module}), patch.object(
+                runtime, "_resolve_model", return_value=model_path,
+            ):
+                response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(response["ok"], response)
+        self.assertEqual(response["operation"], "series_concept_draft")
+        self.assertEqual(response["source_fingerprint"], "c" * 64)
+        self.assertNotIn("source_fingerprint", response["result"])
+        self.assertEqual(len(response["result"]["episodes"]), 2)
+        self.assertTrue(response["metadata"]["incomplete"])
+        self.assertEqual(response["metadata"]["finish_reason"], "length")
+        self.assertEqual(response["review_summary"]["risk_count"], 1)
+        self.assertIn(
+            "model_output_incomplete_finish_reason",
+            {issue["code"] for issue in response["review_issues"]},
+        )
+        schema = calls[0]["response_format"]["schema"]
+        self.assertEqual(schema["properties"]["episodes"]["minItems"], 2)
+        self.assertEqual(schema["properties"]["episodes"]["maxItems"], 2)
+        shot_array = schema["properties"]["episodes"]["items"]["properties"]["shots"]
+        self.assertEqual(shot_array["minItems"], 2)
+        self.assertEqual(shot_array["maxItems"], 2)
+        duration_schema = shot_array["items"]["properties"]["duration_ms"]
+        self.assertEqual(duration_schema["minimum"], 5_000)
+        self.assertEqual(duration_schema["maximum"], 15_000)
+        self.assertIn("duration_ms", shot_array["items"]["required"])
+        self.assertIsNone(calls[0]["max_tokens"])
+        self.assertEqual(model_init_calls[0]["n_ctx"], 8_192)
+        self.assertEqual(len(instances), 1)
+        self.assertTrue(instances[0].closed)
+        self.assertFalse(response["metadata"]["repair_attempted"])
+        self.assertEqual(response["metadata"]["model_inference_count"], 1)
+
+    def test_local_decode_failure_gets_one_complete_structure_repair(self):
+        candidate = series_concept_candidate()
+
+        class DecodeRepairFakeLlama:
+            def __init__(self):
+                self.calls = []
+                self.responses = [
+                    {
+                        "choices": [{
+                            "message": {"content": "{} trailing"},
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 5,
+                            "total_tokens": 15,
+                        },
+                    },
+                    {
+                        "choices": [{
+                            "message": {
+                                "content": json.dumps(candidate, ensure_ascii=False),
+                            },
+                            "finish_reason": "stop",
+                        }],
+                        "usage": {
+                            "prompt_tokens": 20,
+                            "completion_tokens": 30,
+                            "total_tokens": 50,
+                        },
+                    },
+                ]
+
+            def tokenize(self, value, add_bos=True):
+                return [1]
+
+            def create_chat_completion(self, **kwargs):
+                self.calls.append(kwargs)
+                return self.responses.pop(0)
+
+            def close(self):
+                pass
+
+        model = DecodeRepairFakeLlama()
+        with patch.object(runtime, "_resolve_model", return_value=Path("fake.gguf")), patch.object(
+            runtime,
+            "_create_llama_model",
+            return_value=(model, {
+                "runtime_version": "0.3.34-test", "device": "cpu",
+                "n_gpu_layers": 0, "gpu_offload_supported": False,
+            }),
+        ):
+            response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 0, response)
+        self.assertEqual(len(model.calls), 2)
+        self.assertTrue(all(call["max_tokens"] is None for call in model.calls))
+        for call in model.calls:
+            schema = call["response_format"]["schema"]
+            self.assertEqual(schema["properties"]["episodes"]["minItems"], 2)
+            shots = schema["properties"]["episodes"]["items"]["properties"]["shots"]
+            self.assertEqual(shots["minItems"], 2)
+            self.assertIn("duration_ms", shots["items"]["required"])
+        self.assertIn("Regenerate the entire series", model.calls[1]["messages"][-1]["content"])
+        self.assertTrue(response["metadata"]["repair_attempted"])
+        self.assertTrue(response["metadata"]["repair_succeeded"])
+        self.assertEqual(response["metadata"]["repair_reason_code"], "output_invalid_json")
+        self.assertEqual(response["metadata"]["first_decode_error_category"], "trailing_data")
+        self.assertEqual(response["metadata"]["model_inference_count"], 2)
+        self.assertEqual(response["metadata"]["usage"], {
+            "prompt_tokens": 30,
+            "completion_tokens": 35,
+            "total_tokens": 65,
+        })
+        self.assertIn(
+            "series_concept_structure_repaired",
+            {issue["code"] for issue in response["review_issues"]},
+        )
+
+    def test_raw_quoted_whitespace_is_recovered_without_second_inference(self):
+        candidate = series_concept_candidate()
+        candidate["episodes"][0]["shots"][0]["action"] += "\n继续核对日期。"
+        malformed = json.dumps(candidate, ensure_ascii=False).replace(
+            r"\n继续核对日期。", "\n继续核对日期。", 1,
+        )
+
+        class WhitespaceRecoveryFakeLlama:
+            def __init__(self):
+                self.call_count = 0
+
+            def tokenize(self, value, add_bos=True):
+                return [1]
+
+            def create_chat_completion(self, **kwargs):
+                self.call_count += 1
+                return {"choices": [{
+                    "message": {"content": malformed},
+                    "finish_reason": "stop",
+                }]}
+
+            def close(self):
+                pass
+
+        model = WhitespaceRecoveryFakeLlama()
+        with patch.object(runtime, "_resolve_model", return_value=Path("fake.gguf")), patch.object(
+            runtime,
+            "_create_llama_model",
+            return_value=(model, {
+                "runtime_version": "0.3.34-test", "device": "cpu",
+                "n_gpu_layers": 0, "gpu_offload_supported": False,
+            }),
+        ):
+            response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 0, response)
+        self.assertEqual(model.call_count, 1)
+        self.assertFalse(response["metadata"]["repair_attempted"])
+        self.assertEqual(response["metadata"]["model_inference_count"], 1)
+        self.assertEqual(
+            response["metadata"]["primary_json_recovery_mode"],
+            "escaped_raw_quoted_whitespace",
+        )
+        action = response["result"]["episodes"][0]["shots"][0]["action"]
+        self.assertNotIn("\n", action)
+        self.assertIn(" 继续核对日期。", action)
+        self.assertIn(
+            "series_concept_structure_whitespace_recovered",
+            {issue["code"] for issue in response["review_issues"]},
+        )
+
+    def test_local_validation_failure_gets_one_complete_structure_repair(self):
+        invalid = series_concept_candidate()
+        invalid["episodes"][0]["shots"][0]["dialogue"]["speaker"] += ":\u65c1\u767d"
+        valid = series_concept_candidate()
+
+        class ValidationRepairFakeLlama:
+            def __init__(self):
+                self.calls = []
+
+            def tokenize(self, value, add_bos=True):
+                return [1]
+
+            def create_chat_completion(self, **kwargs):
+                self.calls.append(kwargs)
+                value = invalid if len(self.calls) == 1 else valid
+                return {"choices": [{
+                    "message": {"content": json.dumps(value, ensure_ascii=False)},
+                    "finish_reason": "stop",
+                }]}
+
+            def close(self):
+                pass
+
+        model = ValidationRepairFakeLlama()
+        with patch.object(runtime, "_resolve_model", return_value=Path("fake.gguf")), patch.object(
+            runtime,
+            "_create_llama_model",
+            return_value=(model, {
+                "runtime_version": "0.3.34-test", "device": "cpu",
+                "n_gpu_layers": 0, "gpu_offload_supported": False,
+            }),
+        ):
+            response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 0, response)
+        self.assertEqual(len(model.calls), 2)
+        self.assertEqual(
+            response["metadata"]["repair_reason_code"],
+            "deterministic_validation",
+        )
+        self.assertTrue(response["metadata"]["repair_succeeded"])
+        self.assertEqual(response["result"]["schema_version"], 2)
+        self.assertEqual(response["result"]["title"], valid["title"])
+        self.assertEqual(len(response["result"]["episodes"]), 2)
+        self.assertEqual(
+            response["result"]["episodes"][0]["shots"][0]["dialogue"],
+            {
+                "speaker": valid["episodes"][0]["shots"][0]["dialogue"]["speaker"],
+                "delivery": "in a natural, restrained voice",
+                "text": valid["episodes"][0]["shots"][0]["dialogue"]["text"],
+            },
+        )
+
+    def test_local_validation_failure_reports_safe_specific_phase(self):
+        candidate = series_concept_candidate()
+        del candidate["episodes"][0]["shots"][0]["duration_ms"]
+
+        class InvalidCandidateFakeLlama:
+            def tokenize(self, value, add_bos=True):
+                return list(range(max(1, len(value) // 16)))
+
+            def create_chat_completion(self, **kwargs):
+                return {"choices": [{
+                    "message": {"content": json.dumps(candidate, ensure_ascii=False)},
+                    "finish_reason": "stop",
+                }]}
+
+            def close(self):
+                pass
+
+        model = InvalidCandidateFakeLlama()
+        with patch.object(runtime, "_resolve_model", return_value=Path("fake.gguf")), patch.object(
+            runtime,
+            "_create_llama_model",
+            return_value=(model, {
+                "runtime_version": "0.3.34-test", "device": "cpu",
+                "n_gpu_layers": 0, "gpu_offload_supported": False,
+            }),
+        ):
+            response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(response["ok"])
+        self.assertEqual(response["error_code"], "series_concept_validation_failed")
+        self.assertEqual(response["metadata"]["failure_phase"], "repair_validation")
+        self.assertTrue(response["metadata"]["repair_attempted"])
+        self.assertFalse(response["metadata"]["repair_succeeded"])
+
+    def test_local_context_shortfall_reports_input_budget_phase(self):
+        class ContextBoundFakeLlama:
+            def tokenize(self, value, add_bos=True):
+                return [1]
+
+            def create_chat_completion(self, **kwargs):
+                raise ValueError(
+                    "Requested tokens (2) exceed context window of 1"
+                )
+
+            def close(self):
+                pass
+
+        model = ContextBoundFakeLlama()
+        with patch.object(runtime, "_resolve_model", return_value=Path("fake.gguf")), patch.object(
+            runtime,
+            "_create_llama_model",
+            return_value=(model, {
+                "runtime_version": "0.3.34-test", "device": "cpu",
+                "n_gpu_layers": 0, "gpu_offload_supported": False,
+            }),
+        ):
+            response, exit_code = runtime.run(series_concept_request(
+                context_size=1,
+            ))
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(
+            response["error_code"], "series_concept_input_budget_exceeded",
+        )
+        self.assertEqual(response["metadata"]["failure_phase"], "input_budget")
+
+    def test_repair_chat_template_context_shortfall_is_safe_and_phase_specific(self):
+        private_marker = "PRIVATE-MALFORMED-CANDIDATE"
+
+        class RepairContextBoundFakeLlama:
+            def __init__(self):
+                self.call_count = 0
+
+            def tokenize(self, value, add_bos=True):
+                return [1]
+
+            def create_chat_completion(self, **kwargs):
+                self.call_count += 1
+                if self.call_count == 1:
+                    return {"choices": [{
+                        "message": {"content": "{" + private_marker},
+                        "finish_reason": "stop",
+                    }]}
+                raise ValueError(
+                    "Requested tokens (8192) exceed context window of 8192"
+                )
+
+            def close(self):
+                pass
+
+        model = RepairContextBoundFakeLlama()
+        with patch.object(runtime, "_resolve_model", return_value=Path("fake.gguf")), patch.object(
+            runtime,
+            "_create_llama_model",
+            return_value=(model, {
+                "runtime_version": "0.3.34-test", "device": "cpu",
+                "n_gpu_layers": 0, "gpu_offload_supported": False,
+            }),
+        ):
+            response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(model.call_count, 2)
+        self.assertEqual(
+            response["error_code"], "series_concept_input_budget_exceeded",
+        )
+        self.assertEqual(
+            response["metadata"]["failure_phase"], "repair_input_budget",
+        )
+        self.assertTrue(response["metadata"]["repair_attempted"])
+        self.assertFalse(response["metadata"]["repair_succeeded"])
+        self.assertEqual(response["metadata"]["model_inference_count"], 2)
+        self.assertNotIn(private_marker, json.dumps(response, ensure_ascii=False))
+
+    def test_local_failure_codes_distinguish_load_inference_and_decode(self):
+        runtime_metadata = {
+            "runtime_version": "0.3.34-test", "device": "cpu",
+            "n_gpu_layers": 0, "gpu_offload_supported": False,
+        }
+
+        with patch.object(
+            runtime, "_resolve_model", side_effect=RuntimeError("model verification failed"),
+        ):
+            response, exit_code = runtime.run(series_concept_request())
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(response["error_code"], "series_concept_model_load_failed")
+        self.assertEqual(response["metadata"]["failure_phase"], "model_load")
+
+        class FailingModel:
+            def __init__(self, *, content=None, inference_error=None):
+                self.content = content
+                self.inference_error = inference_error
+                self.call_count = 0
+
+            def tokenize(self, value, add_bos=True):
+                return list(range(max(1, len(value) // 16)))
+
+            def create_chat_completion(self, **kwargs):
+                self.call_count += 1
+                if self.inference_error is not None:
+                    raise self.inference_error
+                return {"choices": [{
+                    "message": {"content": self.content},
+                    "finish_reason": "stop",
+                }]}
+
+            def close(self):
+                pass
+
+        cases = (
+            (
+                "model_load", RuntimeError("model allocation failed"), None,
+                "series_concept_model_load_failed",
+            ),
+            (
+                "inference", None,
+                FailingModel(inference_error=RuntimeError("completion failed")),
+                "series_concept_inference_failed",
+            ),
+            (
+                "repair_decode", None, FailingModel(content="{"),
+                "series_concept_output_invalid_json",
+            ),
+        )
+        for phase, load_error, model, expected_code in cases:
+            with self.subTest(phase=phase), patch.object(
+                runtime, "_resolve_model", return_value=Path("fake.gguf"),
+            ), patch.object(
+                runtime,
+                "_create_llama_model",
+                side_effect=load_error,
+                return_value=(model, runtime_metadata),
+            ):
+                response, exit_code = runtime.run(series_concept_request())
+
+            self.assertEqual(exit_code, 2)
+            self.assertEqual(response["error_code"], expected_code)
+            self.assertEqual(response["metadata"]["failure_phase"], phase)
+            if model is not None:
+                self.assertEqual(
+                    model.call_count,
+                    2 if phase == "repair_decode" else 1,
+                )
+
+    def test_dispatcher_routes_series_concept_operation(self):
+        expected = ({"ok": True, "result": {}}, 0)
+        with patch.object(runtime, "_run_series_concept_draft", return_value=expected) as invoke:
+            self.assertEqual(runtime.run(series_concept_request()), expected)
+        invoke.assert_called_once()
+
+
 class QwenCreativeStoryboardContractTests(unittest.TestCase):
     def setUp(self):
         self.request = runtime._normalise_creative_request(creative_request())
@@ -1040,6 +1839,83 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
         invalid["options"]["recommended_shot_durations_ms"] = [16_000]
         with self.assertRaisesRegex(runtime.RuntimeInputError, "recommended_shot_durations_ms"):
             runtime._normalise_creative_request(invalid)
+
+    def test_inline_timed_required_dialogue_matches_backend_manifest(self):
+        payload = creative_request()
+        payload["episode"] = {
+            **payload["episode"],
+            "script": (
+                "【1 [首帧连续:否] [尾帧连续:是]: 雨夜客栈；"
+                "[1-3.5秒] 沈砚（低声）: 别回头。】"
+            ),
+        }
+        payload["required_dialogue_manifest"] = [{
+            "speaker_id": "S1",
+            "text_zh": "别回头。",
+            "source_order": 1,
+            "source_delivery_zh": "低声",
+            "start_ms": 1000,
+            "end_ms": 3500,
+        }]
+        request = runtime._normalise_creative_request(payload)
+        self.assertEqual(request.required_dialogue_manifest[0]["start_ms"], 1000)
+        self.assertEqual(request.required_dialogue_manifest[0]["end_ms"], 3500)
+
+        candidate = creative_candidate()
+        candidate["shots"][0]["dialogue"] = []
+
+        result = runtime._validate_creative_storyboard(candidate, request)
+
+        self.assertEqual(result["shots"][0]["dialogue"], [{
+            "speaker_id": "S1",
+            "text_zh": "别回头。",
+            "delivery_zh": "低声",
+            "delivery_en": "follow the original script delivery note",
+            "voiceover": False,
+            "start_ms": 1000,
+            "end_ms": 3500,
+        }])
+
+    def test_source_timed_visual_segments_are_reviewed_without_hard_failure(self):
+        payload = creative_request()
+        payload["episode"] = {
+            **payload["episode"],
+            "script": "[0-2.5秒] 动作：沈砚绕过门槛，右手按住玄纹剑。\n沈砚：别动。",
+        }
+        payload["source_timed_visual_segments"] = [{
+            "source_order": 1,
+            "start_ms": 0,
+            "end_ms": 2500,
+            "kind": "action",
+            "text_zh": "沈砚绕过门槛，右手按住玄纹剑",
+        }]
+
+        request = runtime._normalise_creative_request(payload)
+
+        self.assertEqual(
+            request.source_timed_visual_segments,
+            tuple(payload["source_timed_visual_segments"]),
+        )
+        messages = runtime._build_creative_messages(request)
+        self.assertIn("source_timed_visual_segments", messages[1]["content"])
+
+        candidate = creative_candidate()
+        issues: list[dict[str, str]] = []
+        runtime._validate_creative_storyboard(candidate, request, review_issues=issues)
+        self.assertIn(
+            ("source_timing_range_missing", "shots"),
+            {(item["code"], item["path"]) for item in issues},
+        )
+
+        candidate["shots"][0]["action_zh"] = (
+            "[0-2.5秒] S1 绕过门槛，右手按住玄纹剑，最终保持静止。"
+        )
+        issues = []
+        runtime._validate_creative_storyboard(candidate, request, review_issues=issues)
+        self.assertNotIn(
+            "source_timing_range_missing",
+            {item["code"] for item in issues},
+        )
 
     def test_continuous_fast_action_chain_is_advisory_not_blocking(self):
         issues = []
@@ -2115,6 +2991,8 @@ class QwenCreativeStoryboardContractTests(unittest.TestCase):
         self.assertEqual(result["source_fingerprint"], "a" * 64)
         self.assertNotIn("source_fingerprint", creative_candidate())
         self.assertEqual(result["shots"][0]["scene_id"], SCENE_ID)
+        self.assertIs(result["shots"][0]["requires_first_frame_continuity"], True)
+        self.assertIs(result["shots"][0]["requires_last_frame_continuity"], False)
         self.assertEqual(
             result["shots"][0]["camera_en"],
             "medium shot, eye-level, slow push in; motivation: emphasize the subject's immediate reaction and emotional tension",

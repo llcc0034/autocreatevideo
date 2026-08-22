@@ -10,7 +10,8 @@ from dataclasses import dataclass, field
 import hashlib
 import json
 import re
-from typing import Iterable
+import unicodedata
+from typing import Any, Iterable
 
 from django.conf import settings as django_settings
 from django.db.models import Prefetch
@@ -41,10 +42,14 @@ from studio.services.h3_prompt_optimizer import (
 )
 from studio.services.dialogue import DialogueContractError, normalize_dialogue_entry
 from studio.services.prompt_translation import (
+    canonical_target_collision_inputs,
     canonical_target_collisions,
+    canonical_target_collisions_from_inputs,
     confirmed_translation,
     confirmed_translation_fingerprint,
+    confirmed_translation_with_snapshot,
 )
+from studio.services.prompt_quality_gate import build_bible_image_candidate_quality
 
 
 BASE_MODES = {Shot.H3Mode.T2VA, Shot.H3Mode.I2VA, Shot.H3Mode.FL2VA, Shot.H3Mode.L2VA}
@@ -58,6 +63,30 @@ _PROTECTED_AUTHORED_TEXT_RE = re.compile(
 )
 
 SDXL_BASE_MODEL_ID = "stabilityai/stable-diffusion-xl-base-1.0"
+BIBLE_IMAGE_PROMPT_CONFIG_KEY = "bible_image_prompt_config"
+BIBLE_IMAGE_PROMPT_CONFIG_VERSION = 1
+BIBLE_IMAGE_PROMPT_INPUTS_VERSION = 1
+BIBLE_IMAGE_DEFAULT_COMPOSITION_RULES = {
+    "character": (
+        "neutral full-body or three-quarter standing pose; unobstructed face; "
+        "identity reference image; plain unobtrusive studio background; no other people"
+    ),
+    "scene": (
+        "wide establishing view; empty environment; no people or characters; "
+        "clear spatial layout and architectural continuity reference"
+    ),
+    "prop": (
+        "three-quarter product view; neutral seamless background; centered; "
+        "fully visible; no hands, no people, no duplicate objects"
+    ),
+}
+BIBLE_IMAGE_DEFAULT_NEGATIVE_RULES = {
+    "character": "multiple people, crowd, duplicate person, obscured face, cropped head",
+    "scene": "people, person, character, crowd, portrait, close-up",
+    "prop": "hands, person, people, multiple objects, duplicate object, clutter",
+}
+BIBLE_IMAGE_DEFAULT_QUALITY_SUFFIX = "high detail, consistent identity, production reference"
+BIBLE_IMAGE_DEFAULT_TEXT_GUARD_NEGATIVE = "text, watermark, logo, low detail"
 _FRAMING_DIRECTIONS = {
     "特写": "a close-up",
     "近景": "a close shot",
@@ -81,6 +110,7 @@ class H3PromptResult:
     consistency_snapshot: dict
     total_duration_ms: int
     content_hash: str
+    source_snapshot: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -99,6 +129,99 @@ class H3PromptOptions:
 
 def _compact(value: str | None) -> str:
     return " ".join((value or "").split())
+
+
+def _config_text(value: object, *, limit: int = 4_000) -> str:
+    text = _compact(str(value or ""))
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in text):
+        raise PromptBuildError("实体参考图提示词配置不能包含控制字符")
+    return text[:limit]
+
+
+def default_bible_image_prompt_config(project: SeriesProject | None = None) -> dict[str, Any]:
+    style_prompt = (
+        project.style.visual_prompt
+        if project is not None and project.style else "cinematic production reference"
+    )
+    style_negative = (
+        project.style.negative_prompt
+        if project is not None and project.style else ""
+    )
+    return {
+        "schema_version": BIBLE_IMAGE_PROMPT_CONFIG_VERSION,
+        "style_prompt": _config_text(style_prompt),
+        "style_negative_prompt": _config_text(style_negative),
+        "composition_rules": dict(BIBLE_IMAGE_DEFAULT_COMPOSITION_RULES),
+        "negative_rules": dict(BIBLE_IMAGE_DEFAULT_NEGATIVE_RULES),
+        "quality_suffix": BIBLE_IMAGE_DEFAULT_QUALITY_SUFFIX,
+    }
+
+
+def normalize_bible_image_prompt_config(
+    value: object,
+    project: SeriesProject | None = None,
+) -> dict[str, Any]:
+    base = default_bible_image_prompt_config(project)
+    if not isinstance(value, dict):
+        return base
+    result = {
+        **base,
+        "schema_version": BIBLE_IMAGE_PROMPT_CONFIG_VERSION,
+        "composition_rules": dict(base["composition_rules"]),
+        "negative_rules": dict(base["negative_rules"]),
+    }
+    for key in ("style_prompt", "style_negative_prompt", "quality_suffix"):
+        if key in value:
+            result[key] = _config_text(value.get(key))
+    for group_key in ("composition_rules", "negative_rules"):
+        raw_group = value.get(group_key)
+        if not isinstance(raw_group, dict):
+            continue
+        for entity_type in ("character", "scene", "prop"):
+            if entity_type in raw_group:
+                text = _config_text(raw_group.get(entity_type))
+                if text:
+                    result[group_key][entity_type] = text
+    return result
+
+
+def project_bible_image_prompt_config(project: SeriesProject) -> dict[str, Any]:
+    settings = project.production_settings if isinstance(project.production_settings, dict) else {}
+    return normalize_bible_image_prompt_config(
+        settings.get(BIBLE_IMAGE_PROMPT_CONFIG_KEY),
+        project,
+    )
+
+
+def _prompt_override(prompt_overrides: dict[str, str], key: str, default: str) -> str:
+    if key not in prompt_overrides:
+        return default
+    return _config_text(prompt_overrides.get(key), limit=4_000)
+
+
+def _prompt_input(
+    *,
+    key: str,
+    label: str,
+    value: str,
+    role: str,
+    source: str,
+    editable: bool = True,
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "label": label,
+        "value": _compact(value),
+        "role": role,
+        "source": source,
+        "editable": editable,
+    }
+
+
+def _split_prompt_segments(value: str) -> list[str]:
+    return _dedupe_text(
+        segment for segment in re.split(r"[\n;；]+", _compact(value)) if segment.strip()
+    )
 
 
 def _normalized_translation_glossary(value: object) -> dict[str, str]:
@@ -1058,6 +1181,18 @@ def _classified_reference_fields(
                 f"{entity_label}: fully_preserved — preserve silhouette, material, scale, color, distinctive "
                 "marks, and continuity state; change only scripted position or interaction."
             )
+        elif category == "continuity_frame":
+            detail = _compact(item.get("prompt_hint") or item.get("description"))
+            detail_suffix = f" Declared guidance: {detail}." if detail else ""
+            media_definitions.append(
+                f"{label} is the extracted tail frame of the previous shot and the first-frame continuity "
+                f"reference for the target video.{detail_suffix}"
+            )
+            media_retention.append(
+                f"{label}: first_frame_continuity_reference — start from its composition, lighting, spatial "
+                "relations, subject pose, and object placement as the opening state; then follow the scripted "
+                "action and the continuity Bible for all identities instead of inventing a new scene."
+            )
         elif category == "video":
             video_purpose = _video_reference_purpose(item)
             detail = _compact(item.get("prompt_hint") or item.get("description"))
@@ -1209,7 +1344,7 @@ def _reference_summary(bindings: list[dict], shots: list[Shot]) -> str:
     for item in bindings:
         category = item.get("category")
         input_label = item.get("input_label")
-        if category in {"character", "scene", "prop"}:
+        if category in {"character", "scene", "prop", "continuity_frame"}:
             has_generation_reference = True
         elif category == "video" and input_label:
             purpose = _video_reference_purpose(item)
@@ -1280,6 +1415,10 @@ def _reference_summary(bindings: list[dict], shots: list[Shot]) -> str:
         if category in role_names and item.get("entity_label") and input_label:
             statements.append(
                 f"{item['entity_label']} is sourced from {input_label} for the {role_names[category]}."
+            )
+        elif category == "continuity_frame" and input_label:
+            statements.append(
+                f"{input_label} is the previous shot's tail frame and must guide the target video's opening state."
             )
         elif category == "video" and input_label:
             if video_purposes[input_label] == "motion_camera_reference":
@@ -2164,3 +2303,373 @@ def build_consistent_image_prompt(
     }
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return H3PromptResult(text, payload, snapshot, 0, digest)
+
+
+def build_bible_image_candidate_prompt(
+    project: SeriesProject,
+    entity_type: str,
+    entity: CharacterBible | SceneBible | PropBible,
+    extra_direction: str = "",
+    prompt_overrides: dict[str, str] | None = None,
+) -> H3PromptResult:
+    """Compile one text-only SDXL reference candidate for a Bible entity."""
+
+    expected_model = {
+        "character": CharacterBible,
+        "scene": SceneBible,
+        "prop": PropBible,
+    }.get(entity_type)
+    if expected_model is None or not isinstance(entity, expected_model):
+        raise PromptBuildError("实体类型与 Bible 记录不匹配")
+    if entity.project_id != project.id:
+        raise PromptBuildError("Bible 实体不属于当前连续剧项目")
+
+    scope_id = entity.id
+    overrides = {
+        str(key): str(value)
+        for key, value in (prompt_overrides or {}).items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+    prompt_config = project_bible_image_prompt_config(project)
+    positive_inputs: list[dict[str, Any]] = []
+    negative_inputs: list[dict[str, Any]] = []
+    translation_snapshots: dict[str, dict] = {}
+
+    def translated(field_key: str, value: str | None) -> str:
+        effective, translation_snapshot = confirmed_translation_with_snapshot(
+            project_id=project.id,
+            scope_type=entity_type,
+            scope_id=scope_id,
+            field_key=f"{entity_type}.{field_key}",
+            source_text=str(value or ""),
+        )
+        compacted = _compact(effective)
+        translation_snapshots[f"{entity_type}.{field_key}"] = {
+            **translation_snapshot,
+            "effective_text": compacted,
+        }
+        return compacted
+
+    def translated_project(field_key: str, value: str | None) -> str:
+        effective, translation_snapshot = confirmed_translation_with_snapshot(
+            project_id=project.id,
+            scope_type="project",
+            scope_id=project.id,
+            field_key=field_key,
+            source_text=str(value or ""),
+        )
+        compacted = _compact(effective)
+        translation_snapshots[f"project.{field_key}"] = {
+            **translation_snapshot,
+            "effective_text": compacted,
+        }
+        return compacted
+
+    def add_positive(key: str, label: str, value: str, source: str, *, editable: bool = True) -> str:
+        resolved = _prompt_override(overrides, key, value)
+        positive_inputs.append(_prompt_input(
+            key=key, label=label, value=resolved, role="positive",
+            source="manual_override" if key in overrides else source,
+            editable=editable,
+        ))
+        return resolved
+
+    def add_negative(key: str, label: str, value: str, source: str, *, editable: bool = True) -> str:
+        resolved = _prompt_override(overrides, key, value)
+        negative_inputs.append(_prompt_input(
+            key=key, label=label, value=resolved, role="negative",
+            source="manual_override" if key in overrides else source,
+            editable=editable,
+        ))
+        return resolved
+
+    entity_name = add_positive(
+        "entity.name", "实体名称", translated("name", entity.name) or _compact(entity.name),
+        f"{entity_type}.name",
+    )
+    visual_identity = translated("visual_identity", entity.visual_identity)
+    if visual_identity:
+        visual_anchor = visual_identity
+        visual_fallback_source = "visual_identity"
+    else:
+        description = translated("description", entity.description)
+        if description:
+            visual_anchor = description
+            visual_fallback_source = "description"
+        else:
+            visual_anchor = entity_name
+            visual_fallback_source = "name"
+    visual_anchor = add_positive(
+        "entity.visual_anchor",
+        "视觉锚点",
+        visual_anchor,
+        f"{entity_type}.{visual_fallback_source}",
+    )
+    composition_rule = add_positive(
+        f"system.composition.{entity_type}",
+        "系统构图规则",
+        str(prompt_config["composition_rules"][entity_type]),
+        "project.production_settings.bible_image_prompt_config.composition_rules",
+    )
+    quality_suffix = add_positive(
+        "system.quality_suffix",
+        "参考图质量规则",
+        str(prompt_config["quality_suffix"]),
+        "project.production_settings.bible_image_prompt_config.quality_suffix",
+    )
+
+    if entity_type == "character":
+        subject_rule = add_positive(
+            "system.subject.character", "系统主体规则",
+            f"one single character, {entity_name}",
+            "system.bible_image_subject_rule",
+        )
+        source_fields = {
+            "实体名称": entity_name,
+            "视觉锚点": visual_anchor,
+            "年龄外观": add_positive(
+                "character.age_appearance", "年龄外观",
+                translated("age_appearance", entity.age_appearance),
+                "character.age_appearance",
+            ),
+            "脸部身份": add_positive(
+                "character.face_identity", "面部身份",
+                translated("face_identity", entity.face_identity),
+                "character.face_identity",
+            ),
+            "服装": add_positive(
+                "character.wardrobe", "固定服装",
+                translated("wardrobe", entity.wardrobe),
+                "character.wardrobe",
+            ),
+            "额外导演要求": add_positive(
+                "request.extra_direction", "手工调整提示词",
+                _compact(extra_direction), "request.extra_direction",
+            ),
+        }
+        prompt_segments = [
+            subject_rule,
+            visual_anchor,
+            source_fields["年龄外观"],
+            source_fields["脸部身份"],
+            source_fields["服装"],
+            *_split_prompt_segments(composition_rule),
+        ]
+    elif entity_type == "scene":
+        subject_rule = add_positive(
+            "system.subject.scene", "系统主体规则",
+            f"wide establishing view of {entity_name}",
+            "system.bible_image_subject_rule",
+        )
+        source_fields = {
+            "实体名称": entity_name,
+            "视觉锚点": visual_anchor,
+            "地点": add_positive(
+                "scene.location", "地点结构",
+                translated("location", entity.location),
+                "scene.location",
+            ),
+            "时段": add_positive(
+                "scene.time_of_day", "时间",
+                translated("time_of_day", entity.time_of_day),
+                "scene.time_of_day",
+            ),
+            "光线": add_positive(
+                "scene.lighting", "光线",
+                translated("lighting", entity.lighting),
+                "scene.lighting",
+            ),
+            "色彩": add_positive(
+                "scene.color_palette", "色板",
+                translated("color_palette", entity.color_palette),
+                "scene.color_palette",
+            ),
+            "额外导演要求": add_positive(
+                "request.extra_direction", "手工调整提示词",
+                _compact(extra_direction), "request.extra_direction",
+            ),
+        }
+        prompt_segments = [
+            subject_rule,
+            visual_anchor,
+            source_fields["地点"],
+            source_fields["时段"],
+            source_fields["光线"],
+            source_fields["色彩"],
+            *_split_prompt_segments(composition_rule),
+        ]
+    else:
+        subject_rule = add_positive(
+            "system.subject.prop", "系统主体规则",
+            f"one single isolated object, {entity_name}",
+            "system.bible_image_subject_rule",
+        )
+        source_fields = {
+            "实体名称": entity_name,
+            "视觉锚点": visual_anchor,
+            "材质": add_positive(
+                "prop.material", "材质",
+                translated("material", entity.material),
+                "prop.material",
+            ),
+            "识别标记": add_positive(
+                "prop.distinctive_marks", "固定标记",
+                translated("distinctive_marks", entity.distinctive_marks),
+                "prop.distinctive_marks",
+            ),
+            "连续性状态": add_positive(
+                "prop.continuity_state", "连续性状态",
+                translated("continuity_state", entity.continuity_state),
+                "prop.continuity_state",
+            ),
+            "额外导演要求": add_positive(
+                "request.extra_direction", "手工调整提示词",
+                _compact(extra_direction), "request.extra_direction",
+            ),
+        }
+        prompt_segments = [
+            subject_rule,
+            visual_anchor,
+            source_fields["材质"],
+            source_fields["识别标记"],
+            source_fields["连续性状态"],
+            *_split_prompt_segments(composition_rule),
+        ]
+
+    style = add_positive(
+        "project.style_prompt",
+        "项目风格",
+        str(prompt_config["style_prompt"]),
+        "project.production_settings.bible_image_prompt_config.style_prompt",
+    )
+    source_fields["视觉风格"] = style
+    text = ", ".join(_dedupe_text([
+        *prompt_segments,
+        style,
+        source_fields["额外导演要求"],
+        quality_suffix,
+    ]))
+    fixed_negative = add_negative(
+        f"negative.system.{entity_type}",
+        "系统负面构图规则",
+        str(prompt_config["negative_rules"][entity_type]),
+        "project.production_settings.bible_image_prompt_config.negative_rules",
+    )
+    entity_negative = add_negative(
+        "negative.entity_constraints",
+        "实体负面约束",
+        translated("negative_constraints", entity.negative_constraints),
+        f"{entity_type}.negative_constraints",
+    )
+    style_negative = add_negative(
+        "negative.project_style",
+        "项目风格负面规则",
+        str(prompt_config["style_negative_prompt"]),
+        "project.production_settings.bible_image_prompt_config.style_negative_prompt",
+    )
+    text_guard_negative = add_negative(
+        "negative.text_guard",
+        "基础文字水印负面规则",
+        BIBLE_IMAGE_DEFAULT_TEXT_GUARD_NEGATIVE,
+        "system.sdxl_text_guard",
+        editable=True,
+    )
+    negative_prompt = ", ".join(_dedupe_text([
+        fixed_negative,
+        entity_negative,
+        style_negative,
+        text_guard_negative,
+    ]))
+    collision_inputs = canonical_target_collision_inputs(project)
+    collisions = canonical_target_collisions_from_inputs(collision_inputs)
+    quality = build_bible_image_candidate_quality(
+        prompt_text=text,
+        source_fields=source_fields,
+        visual_fallback_source=visual_fallback_source,
+        canonical_collisions=collisions,
+    )
+    snapshot = {
+        "schema_version": 1,
+        "generation_purpose": "bible_image_candidate",
+        "bible_target": {
+            "reference_category": entity_type,
+            "entity_id": str(entity.id),
+            "entity_name": entity.name,
+        },
+    }
+    payload = {
+        "model": SDXL_BASE_MODEL_ID,
+        "prompt_compiler_version": PROMPT_COMPILER_VERSION,
+        "mode": "BIBLE_IMAGE_CANDIDATE",
+        "effective_conditioning_mode": "TEXT_ONLY",
+        "prompt_template_key": "sdxl_txt2img_bible_v1",
+        "conditioning_contract": "text_only_bible_entity_candidate",
+        "pixel_reference_inputs": False,
+        "duration_ms": 0,
+        "fields": source_fields,
+        "quality": quality,
+        "negative_prompt": negative_prompt,
+        "prompt_inputs": {
+            "schema_version": BIBLE_IMAGE_PROMPT_INPUTS_VERSION,
+            "positive": positive_inputs,
+            "negative": negative_inputs,
+            "final_prompt_text": text,
+            "negative_prompt": negative_prompt,
+        },
+        "reference_bindings": [],
+        "reference_assets": [],
+        "continuity_assets": [],
+    }
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    source_snapshot = {
+        "schema_version": 1,
+        "generation_purpose": "bible_image_candidate",
+        "prompt_compiler_version": PROMPT_COMPILER_VERSION,
+        "entity_type": entity_type,
+        "entity_id": str(entity.id),
+        "entity_name": entity.name,
+        "render": {
+            "style_id": str(project.style_id) if project.style_id else None,
+            "aspect_ratio": project.aspect_ratio,
+            "width": project.width,
+            "height": project.height,
+        },
+        "source_fields": source_fields,
+        "negative_fields": {
+            "fixed": fixed_negative,
+            "entity": entity_negative,
+            "style": style_negative,
+            "text_guard": text_guard_negative,
+        },
+        "prompt_config": prompt_config,
+        "prompt_overrides": {
+            key: _config_text(value)
+            for key, value in sorted(overrides.items())
+        },
+        "prompt_inputs": {
+            "schema_version": BIBLE_IMAGE_PROMPT_INPUTS_VERSION,
+            "positive": positive_inputs,
+            "negative": negative_inputs,
+            "final_prompt_text": text,
+            "negative_prompt": negative_prompt,
+        },
+        "visual_fallback_source": visual_fallback_source,
+        "extra_direction": _compact(extra_direction),
+        "prompt_text": text,
+        "negative_prompt": negative_prompt,
+        "translations": {
+            key: translation_snapshots[key]
+            for key in sorted(translation_snapshots)
+        },
+        "canonical_collision_inputs": collision_inputs,
+        "canonical_collisions": collisions,
+        "prompt_contract": {
+            "model": SDXL_BASE_MODEL_ID,
+            "mode": "BIBLE_IMAGE_CANDIDATE",
+            "effective_conditioning_mode": "TEXT_ONLY",
+            "prompt_template_key": "sdxl_txt2img_bible_v1",
+            "conditioning_contract": "text_only_bible_entity_candidate",
+            "pixel_reference_inputs": False,
+        },
+    }
+    return H3PromptResult(text, payload, snapshot, 0, digest, source_snapshot)

@@ -78,6 +78,8 @@ const mockData = (project: SeriesProject, episode: Episode, targetShotCount: num
         Math.max(capability.minShotDurationMs ?? 0, Math.round(Number(shot.duration || 0) * 1000)),
       ),
       mediaType: 'video' as const, h3Mode: shot.mode, includeAudio: shot.audioEnabled,
+      requiresFirstFrameContinuity: Boolean(shot.requiresFirstFrameContinuity),
+      requiresLastFrameContinuity: Boolean(shot.requiresLastFrameContinuity),
       sceneId: shot.sceneId, characterIds: [...shot.characterIds], propIds: [...shot.propIds], dialogue: [],
     })),
   }

@@ -1,10 +1,13 @@
+from django import forms
 from django.contrib import admin
+from django.db import transaction
 
 from studio.models import (
     Asset,
     AssemblyJob,
     CharacterBible,
     ConsistencyLock,
+    DeferredGenerationRequest,
     Episode,
     EpisodeCreativeDraft,
     GeneratedWorkflow,
@@ -19,6 +22,43 @@ from studio.models import (
     Style,
     WorkflowTemplate,
 )
+from studio.services.script_bible import (
+    ScriptBibleProvenanceProtectedError,
+    validate_untrusted_script_bible_metadata,
+)
+
+
+class ImmutableProductionAuditAdmin(admin.ModelAdmin):
+    """Expose immutable production evidence without an admin write bypass."""
+
+    def get_readonly_fields(self, request, obj=None):
+        return tuple(field.name for field in self.model._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
+class BibleAdminForm(forms.ModelForm):
+    """Keep reserved Script Bible provenance exclusive to the apply API."""
+
+    class Meta:
+        model = CharacterBible
+        fields = "__all__"
+
+    def clean_metadata(self):
+        incoming = self.cleaned_data.get("metadata")
+        previous = self.instance.metadata if self.instance.pk else {}
+        try:
+            validate_untrusted_script_bible_metadata(previous, incoming)
+        except ScriptBibleProvenanceProtectedError as exc:
+            raise forms.ValidationError(str(exc)) from exc
+        return incoming
 
 
 @admin.register(Style)
@@ -44,9 +84,57 @@ class SeriesProjectAdmin(admin.ModelAdmin):
 
 @admin.register(CharacterBible, SceneBible, PropBible)
 class BibleAdmin(admin.ModelAdmin):
+    form = BibleAdminForm
     list_display = ("name", "project", "slug", "is_locked", "updated_at")
     list_filter = ("is_locked",)
     search_fields = ("name", "slug", "visual_identity")
+
+    def save_model(self, request, obj, form, change):
+        """Recheck reserved provenance against the locked latest row."""
+
+        model = type(obj)
+        with transaction.atomic():
+            if not change or not obj.pk:
+                project = SeriesProject.objects.select_for_update().get(
+                    pk=obj.project_id,
+                )
+                try:
+                    validate_untrusted_script_bible_metadata({}, obj.metadata)
+                except ScriptBibleProvenanceProtectedError as exc:
+                    raise forms.ValidationError(str(exc)) from exc
+                obj.project = project
+                return super().save_model(request, obj, form, change)
+
+            current_project_id = model.objects.filter(pk=obj.pk).values_list(
+                "project_id", flat=True,
+            ).first()
+            if current_project_id is None:
+                raise forms.ValidationError("Bible 已不存在，请刷新后重试。")
+            requested_project_id = obj.project_id
+            projects = {
+                project.pk: project
+                for project in SeriesProject.objects.select_for_update()
+                .filter(pk__in={current_project_id, requested_project_id})
+                .order_by("pk")
+            }
+            if len(projects) != len({current_project_id, requested_project_id}):
+                raise forms.ValidationError("项目已不存在，请刷新后重试。")
+            try:
+                latest = model.objects.select_for_update().get(pk=obj.pk)
+            except model.DoesNotExist as exc:
+                raise forms.ValidationError("Bible 已不存在，请刷新后重试。") from exc
+            if latest.project_id != current_project_id:
+                raise forms.ValidationError(
+                    "Bible 所属项目已被并发修改，请刷新后重试。",
+                )
+            try:
+                validate_untrusted_script_bible_metadata(
+                    latest.metadata, obj.metadata,
+                )
+            except ScriptBibleProvenanceProtectedError as exc:
+                raise forms.ValidationError(str(exc)) from exc
+            obj.project = projects[requested_project_id]
+            return super().save_model(request, obj, form, change)
 
 
 @admin.register(ConsistencyLock)
@@ -84,11 +172,10 @@ class ShotAdmin(admin.ModelAdmin):
 
 
 @admin.register(PromptArtifact)
-class PromptArtifactAdmin(admin.ModelAdmin):
+class PromptArtifactAdmin(ImmutableProductionAuditAdmin):
     list_display = ("project", "episode", "shot", "prompt_type", "h3_mode", "revision", "created_at")
     list_filter = ("prompt_type", "h3_mode", "is_multi_shot", "include_audio")
     search_fields = ("prompt_text", "content_hash")
-    readonly_fields = ("content_hash", "consistency_snapshot", "structured_payload")
 
 
 @admin.register(PromptFieldTranslation)
@@ -111,18 +198,29 @@ class WorkflowTemplateAdmin(admin.ModelAdmin):
 
 
 @admin.register(GeneratedWorkflow)
-class GeneratedWorkflowAdmin(admin.ModelAdmin):
+class GeneratedWorkflowAdmin(ImmutableProductionAuditAdmin):
     list_display = ("project", "episode", "template", "content_hash", "created_at")
     search_fields = ("project__title", "content_hash")
-    readonly_fields = ("workflow_json", "injected_values", "content_hash")
 
 
 @admin.register(GenerationTask)
-class GenerationTaskAdmin(admin.ModelAdmin):
+class GenerationTaskAdmin(ImmutableProductionAuditAdmin):
     list_display = ("id", "project", "kind", "status", "progress", "attempts", "priority", "queued_at")
     list_filter = ("kind", "status")
     search_fields = ("comfy_prompt_id", "project__title", "error_message")
-    readonly_fields = ("outputs", "error_message", "queued_at", "started_at", "finished_at")
+
+
+@admin.register(DeferredGenerationRequest)
+class DeferredGenerationRequestAdmin(ImmutableProductionAuditAdmin):
+    list_display = (
+        "id", "project", "source_task", "target_shot", "frame_slot",
+        "status", "attempts", "priority", "created_at",
+    )
+    list_filter = ("status", "frame_slot")
+    search_fields = (
+        "project__title", "idempotency_key", "request_fingerprint",
+        "target_input_fingerprint", "error_code",
+    )
 
 
 @admin.register(AssemblyJob)

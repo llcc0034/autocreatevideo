@@ -20,6 +20,7 @@ from django.urls import reverse
 from django.utils.dateparse import parse_datetime
 from django.utils import timezone
 from PIL import Image, ImageOps, UnidentifiedImageError
+from drf_spectacular.extensions import OpenApiSerializerExtension
 from drf_spectacular.utils import extend_schema_field
 from rest_framework import serializers
 
@@ -28,6 +29,7 @@ from studio.models import (
     AssemblyJob,
     CharacterBible,
     ConsistencyLock,
+    DeferredGenerationRequest,
     Episode,
     EpisodeCreativeDraft,
     GeneratedWorkflow,
@@ -60,7 +62,13 @@ from studio.services.dialogue import (
     normalize_dialogue,
     validate_dialogue_timing,
 )
-from studio.services.h3_prompts import PROMPT_COMPILER_VERSION
+from studio.services.h3_prompts import (
+    BIBLE_IMAGE_PROMPT_CONFIG_KEY,
+    default_bible_image_prompt_config,
+    normalize_bible_image_prompt_config,
+    PromptBuildError,
+    PROMPT_COMPILER_VERSION,
+)
 from studio.services.prompt_translation import (
     CanonicalTargetCollisionError,
     TranslationValidationError,
@@ -68,7 +76,20 @@ from studio.services.prompt_translation import (
     resolve_current_source,
     translation_entry_context_current,
 )
+from studio.services.production_pipeline import (
+    BIBLE_IMAGE_CANDIDATE_PURPOSE,
+    BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
+)
+from studio.services.production_batch_slots import (
+    build_production_batch_slots,
+    effective_batch_snapshot_for_task,
+)
 from studio.services.shot_prompt_recovery import legacy_negative_prompt_repair_evidence
+from studio.services.shot_versions import RESERVED_SHOT_VERSION_METADATA_KEYS
+from studio.services.script_bible import (
+    ScriptBibleProvenanceProtectedError,
+    validate_untrusted_script_bible_metadata,
+)
 from studio.services.resolution import (
     H3_RESOLUTION_MULTIPLE_DEFAULT,
     H3_RESOLUTION_MULTIPLE_MAX,
@@ -83,6 +104,10 @@ User = get_user_model()
 
 VIDEO_SHOT_MIN_DURATION_MS = settings.VIDEO_SHOT_MIN_DURATION_MS
 VIDEO_SHOT_MAX_DURATION_MS = settings.VIDEO_SHOT_MAX_DURATION_MS
+SCRIPT_BIBLE_METADATA_HELP = (
+    "扩展元数据对象。script_bible_v1 是完整剧本候选 apply 专属保留成员；"
+    "通用创建、更新和 sync-bibles 不得注入、替换或删除。"
+)
 
 
 def _is_project_cover_asset(asset: Asset) -> bool:
@@ -624,6 +649,7 @@ class ProjectDeleteErrorResponseSerializer(serializers.Serializer):
 
 class SeriesProjectSerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
+    expected_updated_at = serializers.DateTimeField(required=False, write_only=True)
     default_shot_duration_ms = serializers.IntegerField(
         min_value=1,
         default=VIDEO_SHOT_MIN_DURATION_MS,
@@ -697,6 +723,19 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
     def validate_production_settings(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("production_settings 必须是 JSON 对象")
+        if BIBLE_IMAGE_PROMPT_CONFIG_KEY in value:
+            try:
+                value = {
+                    **value,
+                    BIBLE_IMAGE_PROMPT_CONFIG_KEY: normalize_bible_image_prompt_config(
+                        value.get(BIBLE_IMAGE_PROMPT_CONFIG_KEY),
+                        self.instance,
+                    ),
+                }
+            except PromptBuildError as exc:
+                raise serializers.ValidationError({
+                    BIBLE_IMAGE_PROMPT_CONFIG_KEY: str(exc),
+                }) from exc
         if self.instance is not None:
             try:
                 ensure_no_canonical_target_collisions(
@@ -745,6 +784,21 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
             ).exists()
         ):
             raise serializers.ValidationError({"status": "只有成功完成整剧组装后才能标记 completed"})
+        if self.instance is None or "production_settings" in attrs:
+            settings_value = attrs.get(
+                "production_settings",
+                getattr(self.instance, "production_settings", {}) if self.instance is not None else {},
+            )
+            if isinstance(settings_value, dict) and BIBLE_IMAGE_PROMPT_CONFIG_KEY not in settings_value:
+                project_for_config = self.instance or SeriesProject()
+                project_for_config.style = attrs.get(
+                    "style",
+                    getattr(self.instance, "style", None),
+                )
+                attrs["production_settings"] = {
+                    **settings_value,
+                    BIBLE_IMAGE_PROMPT_CONFIG_KEY: default_bible_image_prompt_config(project_for_config),
+                }
         return attrs
 
 
@@ -769,6 +823,25 @@ class ProjectOwnedSerializer(serializers.ModelSerializer):
         if not user.is_staff and any(asset.owner_id not in (None, user.id) for asset in assets):
             raise serializers.ValidationError({"reference_assets": "不能使用其他用户的素材"})
         if self.Meta.model in {CharacterBible, SceneBible, PropBible}:
+            if "metadata" in attrs:
+                incoming_metadata = attrs["metadata"]
+                if not isinstance(incoming_metadata, dict):
+                    raise serializers.ValidationError({
+                        "metadata": "metadata 必须是 JSON 对象。",
+                    })
+                previous_metadata = (
+                    getattr(self.instance, "metadata", {})
+                    if self.instance is not None else {}
+                )
+                try:
+                    validate_untrusted_script_bible_metadata(
+                        previous_metadata,
+                        incoming_metadata,
+                    )
+                except ScriptBibleProvenanceProtectedError as exc:
+                    raise serializers.ValidationError({
+                        "metadata": str(exc),
+                    }) from exc
             expected_kind = {
                 CharacterBible: Asset.Kind.CHARACTER,
                 SceneBible: Asset.Kind.SCENE,
@@ -903,6 +976,10 @@ class ProjectOwnedSerializer(serializers.ModelSerializer):
 
 
 class CharacterBibleSerializer(ProjectOwnedSerializer):
+    metadata = serializers.JSONField(
+        required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
+    )
+
     class Meta:
         model = CharacterBible
         fields = "__all__"
@@ -916,6 +993,10 @@ class CharacterBibleSerializer(ProjectOwnedSerializer):
 
 
 class SceneBibleSerializer(ProjectOwnedSerializer):
+    metadata = serializers.JSONField(
+        required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
+    )
+
     class Meta:
         model = SceneBible
         fields = "__all__"
@@ -923,6 +1004,10 @@ class SceneBibleSerializer(ProjectOwnedSerializer):
 
 
 class PropBibleSerializer(ProjectOwnedSerializer):
+    metadata = serializers.JSONField(
+        required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
+    )
+
     class Meta:
         model = PropBible
         fields = "__all__"
@@ -1040,6 +1125,27 @@ class ShotSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         episode = self._episode(attrs)
+        if self.instance is not None and "metadata" in attrs:
+            current_metadata = (
+                self.instance.metadata
+                if isinstance(self.instance.metadata, dict)
+                else {}
+            )
+            if not isinstance(attrs["metadata"], dict):
+                raise serializers.ValidationError({"metadata": "metadata 必须是 JSON 对象"})
+            submitted_metadata = dict(attrs["metadata"])
+            for key in RESERVED_SHOT_VERSION_METADATA_KEYS:
+                if key in submitted_metadata and submitted_metadata[key] != current_metadata.get(key):
+                    raise serializers.ValidationError({
+                        "metadata": (
+                            f"{key} 是服务端维护的分镜版本字段，不能通过普通分镜更新修改"
+                        ),
+                    })
+                if key in current_metadata:
+                    submitted_metadata[key] = current_metadata[key]
+                else:
+                    submitted_metadata.pop(key, None)
+            attrs["metadata"] = submitted_metadata
         media_type = attrs.get(
             "media_type", getattr(self.instance, "media_type", Shot.MediaType.VIDEO),
         )
@@ -1188,6 +1294,7 @@ class ShotSyncItemSerializer(serializers.Serializer):
 
 
 class EpisodeShotSyncSerializer(serializers.Serializer):
+    shot_version_key = serializers.CharField(max_length=191)
     shots = ShotSyncItemSerializer(many=True, allow_empty=True)
 
     def validate_shots(self, shots):
@@ -1216,7 +1323,9 @@ class BibleSyncBaseSerializer(serializers.Serializer):
     reference_assets = serializers.PrimaryKeyRelatedField(
         queryset=Asset.objects.all(), many=True, required=False,
     )
-    metadata = serializers.JSONField(required=False)
+    metadata = serializers.JSONField(
+        required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
+    )
     is_locked = serializers.BooleanField(required=False)
 
     def validate_metadata(self, value):
@@ -1250,6 +1359,7 @@ class PropBibleSyncItemSerializer(BibleSyncBaseSerializer):
 
 
 class ProjectBibleSyncSerializer(serializers.Serializer):
+    expected_updated_at = serializers.DateTimeField(required=False, write_only=True)
     characters = CharacterBibleSyncItemSerializer(many=True, required=False, allow_empty=True)
     scenes = SceneBibleSyncItemSerializer(many=True, required=False, allow_empty=True)
     props = PropBibleSyncItemSerializer(many=True, required=False, allow_empty=True)
@@ -1550,7 +1660,104 @@ class GenerationTaskInputPromptSerializer(serializers.Serializer):
     )
 
 
+class GenerationTaskBibleTargetSerializer(serializers.Serializer):
+    """Safe public projection of one frozen Bible image candidate target."""
+
+    schema_version = serializers.IntegerField(
+        min_value=BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
+        max_value=BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
+    )
+    reference_category = serializers.ChoiceField(
+        choices=("character", "scene", "prop"),
+    )
+    entity_id = serializers.UUIDField()
+    entity_name = serializers.CharField(max_length=160, trim_whitespace=False)
+    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
+
+    def to_internal_value(self, data):
+        expected_fields = {
+            "schema_version",
+            "reference_category",
+            "entity_id",
+            "entity_name",
+            "source_fingerprint",
+        }
+        if not isinstance(data, dict) or set(data) != expected_fields:
+            raise serializers.ValidationError("Invalid frozen Bible target shape.")
+        if type(data.get("schema_version")) is not int:
+            raise serializers.ValidationError({
+                "schema_version": "schema_version must be an integer.",
+            })
+        for field_name in (
+            "reference_category", "entity_id", "entity_name", "source_fingerprint",
+        ):
+            if type(data.get(field_name)) is not str:
+                raise serializers.ValidationError({
+                    field_name: f"{field_name} must be a string.",
+                })
+        entity_name = data["entity_name"]
+        if not entity_name or any(
+            unicodedata.category(character).startswith("C") for character in entity_name
+        ):
+            raise serializers.ValidationError({
+                "entity_name": "entity_name must be non-empty and contain no control characters.",
+            })
+        return super().to_internal_value(data)
+
+
+class GenerationTaskBibleTargetSchemaExtension(OpenApiSerializerExtension):
+    target_class = GenerationTaskBibleTargetSerializer
+
+    def map_serializer(self, auto_schema, direction):
+        schema = auto_schema._map_serializer(
+            self.target, direction, bypass_extensions=True,
+        )
+        schema["additionalProperties"] = False
+        return schema
+
+
+class GenerationTaskBatchSlotSerializer(serializers.Serializer):
+    batch_id = serializers.CharField(read_only=True, allow_null=True)
+    batch_kind = serializers.CharField(read_only=True, allow_null=True)
+    shot_version_key = serializers.CharField(
+        read_only=True, allow_blank=True, required=False,
+    )
+    shot_version_label = serializers.CharField(
+        read_only=True, allow_blank=True, required=False,
+    )
+    batch_index = serializers.IntegerField(read_only=True)
+    batch_size = serializers.IntegerField(read_only=True)
+    slot_status = serializers.ChoiceField(
+        choices=(
+            "materialized",
+            "waiting_deferred",
+            "cancelled",
+            "cancelled_by_upstream",
+            "not_created",
+        ),
+        read_only=True,
+    )
+    message = serializers.CharField(read_only=True)
+    workflow_mode = serializers.CharField(read_only=True, allow_null=True, required=False)
+    task_id = serializers.UUIDField(read_only=True, allow_null=True)
+    task_status = serializers.CharField(read_only=True, allow_null=True)
+    workflow_id = serializers.UUIDField(read_only=True, allow_null=True)
+    deferred_generation_request_id = serializers.UUIDField(read_only=True, allow_null=True)
+    deferred_generation_status = serializers.CharField(read_only=True, allow_null=True)
+    deferred_upstream_request_id = serializers.UUIDField(read_only=True, allow_null=True)
+    episode_id = serializers.UUIDField(read_only=True, allow_null=True)
+    episode_number = serializers.IntegerField(read_only=True, allow_null=True)
+    episode_title = serializers.CharField(read_only=True, allow_blank=True)
+    shot_id = serializers.UUIDField(read_only=True, allow_null=True)
+    shot_number = serializers.IntegerField(read_only=True, allow_null=True)
+    shot_title = serializers.CharField(read_only=True, allow_blank=True)
+    created_at = serializers.DateTimeField(read_only=True, allow_null=True)
+    updated_at = serializers.DateTimeField(read_only=True, allow_null=True)
+
+
 class GenerationTaskSerializer(serializers.ModelSerializer):
+    generation_purpose = serializers.SerializerMethodField()
+    bible_target = serializers.SerializerMethodField()
     input_parameters = serializers.SerializerMethodField()
     output_media = serializers.SerializerMethodField()
     completed_at = serializers.SerializerMethodField()
@@ -1563,6 +1770,7 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
     batch_role = serializers.SerializerMethodField()
     batch_index = serializers.SerializerMethodField()
     batch_size = serializers.SerializerMethodField()
+    batch_slots = serializers.SerializerMethodField()
     episode_id = serializers.SerializerMethodField()
     episode_number = serializers.SerializerMethodField()
     episode_title = serializers.SerializerMethodField()
@@ -1579,13 +1787,13 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GenerationTask
-        fields = "__all__"
+        exclude = ("capability_snapshot",)
         read_only_fields = (
             "id", "owner", "project", "episode", "kind", "status", "progress", "attempts",
             "comfy_prompt_id", "client_id", "outputs", "error_message", "queued_at", "started_at",
             "finished_at", "created_at", "updated_at",
             "backend", "model_profile", "workflow_version", "seed", "effective_frames",
-            "effective_duration_ms", "capability_snapshot", "staged_inputs",
+            "effective_duration_ms", "staged_inputs",
             "submission_token", "submission_state", "submission_prepared_at", "submission_submitted_at",
             "heartbeat_at", "stalled_at", "remote_state", "remote_error",
             "progress_source", "comfy_progress", "progress_node_id", "progress_updated_at",
@@ -2116,7 +2324,6 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
             # Polling responses expose the stable, path-free input_parameters
             # summary instead of raw worker payloads and verbose detail logs.
             representation.update({
-                "capability_snapshot": {},
                 "staged_inputs": [],
                 "outputs": [],
                 "error_message": "",
@@ -2175,117 +2382,172 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         }
 
     def get_output_media(self, obj) -> list[dict]:
-        if obj.status != GenerationTask.Status.SUCCEEDED or not isinstance(obj.outputs, list):
+        if obj.status != GenerationTask.Status.SUCCEEDED:
             return []
         media = []
-        for index, item in enumerate(obj.outputs):
-            kind = classify_task_output(item)
-            if not kind:
-                continue
-            token = signed_media_token(
-                purpose="task_output", object_id=obj.id, owner_id=obj.owner_id,
-                claims={"output_index": index},
-            )
-            preview_url = reverse("signed-media", kwargs={"token": token})
-            provenance = item.get("provenance") if isinstance(item, dict) else None
-            distribution = item.get("distribution") if isinstance(item, dict) else None
-            provenance_url = ""
-            if (
-                isinstance(provenance, dict)
-                and provenance.get("ai_generated") is True
-            ):
-                provenance_token = signed_media_token(
-                    purpose="task_provenance", object_id=obj.id, owner_id=obj.owner_id,
+        if isinstance(obj.outputs, list):
+            for index, item in enumerate(obj.outputs):
+                kind = classify_task_output(item)
+                if not kind:
+                    continue
+                token = signed_media_token(
+                    purpose="task_output", object_id=obj.id, owner_id=obj.owner_id,
                     claims={"output_index": index},
                 )
-                provenance_url = reverse(
-                    "signed-media", kwargs={"token": provenance_token},
+                preview_url = reverse("signed-media", kwargs={"token": token})
+                provenance = item.get("provenance") if isinstance(item, dict) else None
+                distribution = item.get("distribution") if isinstance(item, dict) else None
+                provenance_url = ""
+                if (
+                    isinstance(provenance, dict)
+                    and provenance.get("ai_generated") is True
+                ):
+                    provenance_token = signed_media_token(
+                        purpose="task_provenance", object_id=obj.id, owner_id=obj.owner_id,
+                        claims={"output_index": index},
+                    )
+                    provenance_url = reverse(
+                        "signed-media", kwargs={"token": provenance_token},
+                    )
+                public_download_url = ""
+                public_provenance_url = ""
+                development_master_download = (
+                    str(getattr(settings, "DEPLOYMENT_PROFILE", "development")).casefold()
+                    != "production"
                 )
-            public_download_url = ""
-            public_provenance_url = ""
-            development_master_download = (
-                str(getattr(settings, "DEPLOYMENT_PROFILE", "development")).casefold()
-                != "production"
-            )
-            distribution_ready = (
-                isinstance(distribution, dict)
-                and distribution.get("status") == "ready"
-            )
-            if distribution_ready:
-                distribution_token = signed_media_token(
-                    purpose="task_distribution", object_id=obj.id, owner_id=obj.owner_id,
-                    claims={"output_index": index},
+                distribution_ready = (
+                    isinstance(distribution, dict)
+                    and distribution.get("status") == "ready"
                 )
-                public_download_url = (
-                    f"{reverse('signed-media', kwargs={'token': distribution_token})}?download=1"
-                )
-                distribution_provenance_token = signed_media_token(
-                    purpose="task_distribution_provenance",
-                    object_id=obj.id,
-                    owner_id=obj.owner_id,
-                    claims={"output_index": index},
-                )
-                public_provenance_url = reverse(
-                    "signed-media", kwargs={"token": distribution_provenance_token},
-                )
-            elif development_master_download and preview_url:
-                # Development is a production-workflow workbench, not a public
-                # release surface.  Let the owner download the exact ComfyUI
-                # master they are iterating on; production keeps requiring the
-                # independently rendered and verified distribution copy.
-                public_download_url = f"{preview_url}?download=1"
-            media.append({
-                "index": index,
-                "kind": kind,
-                "filename": self._task_public_text(item["filename"]),
-                "preview_url": preview_url,
-                "download_url": public_download_url,
-                "ai_generated": True,
-                "provenance_url": provenance_url,
-                "artifact_sha256": (
-                    self._task_public_text(provenance.get("artifact_sha256"))
-                    if isinstance(provenance, dict) else ""
-                ),
-                "manifest_sha256": (
-                    self._task_public_text(provenance.get("manifest_sha256"))
-                    if isinstance(provenance, dict) else ""
-                ),
-                "distribution_status": (
-                    self._task_public_text(distribution.get("status"))
-                    if isinstance(distribution, dict) else "not_prepared"
-                ) if distribution_ready or not development_master_download else "development_master",
-                "distribution_error": (
-                    self._task_public_text(distribution.get("error"))
-                    if isinstance(distribution, dict) else ""
-                ),
-                "public_provenance_url": public_provenance_url,
-                "public_artifact_sha256": (
-                    self._task_public_text(distribution.get("artifact_sha256"))
-                    if isinstance(distribution, dict) else ""
-                ),
-                "public_manifest_sha256": (
-                    self._task_public_text(distribution.get("manifest_sha256"))
-                    if isinstance(distribution, dict) else ""
-                ),
-                "public_label": (
-                    self._task_public_text(distribution.get("label"))
-                    if isinstance(distribution, dict) else ""
-                ),
-                "public_version": (
-                    self._task_public_text(distribution.get("version"))
-                    if isinstance(distribution, dict) else ""
-                ),
-                "publish_url": reverse("task-publish-output", kwargs={"pk": obj.id}),
-                "promoted_asset_id": (
-                    self._task_public_text(item.get("promoted_asset_id"))
-                    if kind == "image" and isinstance(item, dict) else ""
-                ),
-                "promote_to_asset_url": (
-                    reverse("task-promote-output-to-asset", kwargs={"pk": obj.id})
-                    if kind == "image" else ""
-                ),
-            })
+                if distribution_ready:
+                    distribution_token = signed_media_token(
+                        purpose="task_distribution", object_id=obj.id, owner_id=obj.owner_id,
+                        claims={"output_index": index},
+                    )
+                    public_download_url = (
+                        f"{reverse('signed-media', kwargs={'token': distribution_token})}?download=1"
+                    )
+                    distribution_provenance_token = signed_media_token(
+                        purpose="task_distribution_provenance",
+                        object_id=obj.id,
+                        owner_id=obj.owner_id,
+                        claims={"output_index": index},
+                    )
+                    public_provenance_url = reverse(
+                        "signed-media", kwargs={"token": distribution_provenance_token},
+                    )
+                elif development_master_download and preview_url:
+                    # Development is a production-workflow workbench, not a public
+                    # release surface.  Let the owner download the exact ComfyUI
+                    # master they are iterating on; production keeps requiring the
+                    # independently rendered and verified distribution copy.
+                    public_download_url = f"{preview_url}?download=1"
+                media.append({
+                    "index": index,
+                    "kind": kind,
+                    "filename": self._task_public_text(item["filename"]),
+                    "preview_url": preview_url,
+                    "download_url": public_download_url,
+                    "ai_generated": True,
+                    "provenance_url": provenance_url,
+                    "artifact_sha256": (
+                        self._task_public_text(provenance.get("artifact_sha256"))
+                        if isinstance(provenance, dict) else ""
+                    ),
+                    "manifest_sha256": (
+                        self._task_public_text(provenance.get("manifest_sha256"))
+                        if isinstance(provenance, dict) else ""
+                    ),
+                    "distribution_status": (
+                        self._task_public_text(distribution.get("status"))
+                        if isinstance(distribution, dict) else "not_prepared"
+                    ) if distribution_ready or not development_master_download else "development_master",
+                    "distribution_error": (
+                        self._task_public_text(distribution.get("error"))
+                        if isinstance(distribution, dict) else ""
+                    ),
+                    "public_provenance_url": public_provenance_url,
+                    "public_artifact_sha256": (
+                        self._task_public_text(distribution.get("artifact_sha256"))
+                        if isinstance(distribution, dict) else ""
+                    ),
+                    "public_manifest_sha256": (
+                        self._task_public_text(distribution.get("manifest_sha256"))
+                        if isinstance(distribution, dict) else ""
+                    ),
+                    "public_label": (
+                        self._task_public_text(distribution.get("label"))
+                        if isinstance(distribution, dict) else ""
+                    ),
+                    "public_version": (
+                        self._task_public_text(distribution.get("version"))
+                        if isinstance(distribution, dict) else ""
+                    ),
+                    "publish_url": reverse("task-publish-output", kwargs={"pk": obj.id}),
+                    "promoted_asset_id": (
+                        self._task_public_text(item.get("promoted_asset_id"))
+                        if kind == "image" and isinstance(item, dict) else ""
+                    ),
+                    "promote_to_asset_url": (
+                        reverse("task-promote-output-to-asset", kwargs={"pk": obj.id})
+                        if kind == "image" else ""
+                    ),
+                })
+        media.extend(self._derived_frame_output_media(obj, len(media)))
         return media
+
+    def _derived_frame_output_media(self, obj, start_index: int) -> list[dict]:
+        """Expose extracted continuity frames as source-task image outputs on detail reads."""
+        request = self.context.get("request")
+        view = self.context.get("view")
+        user = getattr(request, "user", None)
+        if getattr(view, "action", None) not in {"retrieve", "list"} or not getattr(user, "is_authenticated", False):
+            return []
+        queryset = (
+            DeferredGenerationRequest.objects
+            .select_related("derived_asset")
+            .filter(source_task=obj, derived_asset__isnull=False)
+            .order_by("created_at", "id")
+        )
+        if not getattr(user, "is_staff", False):
+            queryset = queryset.filter(owner=user)
+        result: list[dict] = []
+        for offset, deferred in enumerate(queryset):
+            asset = deferred.derived_asset
+            if asset is None:
+                continue
+            preview_url = self._task_asset_preview_url(asset)
+            filename = ""
+            if asset.file:
+                filename = Path(str(asset.file.name)).name
+            filename = filename or asset.name or f"deferred-frame-{deferred.id}.png"
+            public_label = (
+                "尾帧抽取图"
+                if deferred.frame_slot == DeferredGenerationRequest.FrameSlot.FIRST_FRAME
+                else "首帧抽取图"
+            )
+            result.append({
+                "index": start_index + offset,
+                "kind": "image",
+                "filename": self._task_public_text(filename),
+                "preview_url": preview_url,
+                "download_url": f"{preview_url}?download=1" if preview_url else "",
+                "ai_generated": True,
+                "provenance_url": "",
+                "artifact_sha256": self._task_public_text(asset.checksum),
+                "manifest_sha256": self._task_public_text(deferred.source_manifest_sha256),
+                "distribution_status": "not_prepared",
+                "distribution_error": "",
+                "public_provenance_url": "",
+                "public_artifact_sha256": "",
+                "public_manifest_sha256": "",
+                "public_label": public_label,
+                "public_version": "deferred-frame-v1",
+                "publish_url": "",
+                "promoted_asset_id": str(asset.id),
+                "promote_to_asset_url": "",
+            })
+        return result
 
     @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_completed_at(self, obj):
@@ -2438,6 +2700,37 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         return obj.capability_snapshot if isinstance(obj.capability_snapshot, dict) else {}
 
     @staticmethod
+    def _batch_snapshot(obj) -> dict:
+        return effective_batch_snapshot_for_task(obj)
+
+    @extend_schema_field(serializers.ChoiceField(
+        choices=(BIBLE_IMAGE_CANDIDATE_PURPOSE,),
+        allow_null=True,
+    ))
+    def get_generation_purpose(self, obj) -> str | None:
+        snapshot = self._snapshot(obj)
+        if snapshot.get("generation_purpose") == BIBLE_IMAGE_CANDIDATE_PURPOSE:
+            return BIBLE_IMAGE_CANDIDATE_PURPOSE
+        return None
+
+    @extend_schema_field(GenerationTaskBibleTargetSerializer(allow_null=True))
+    def get_bible_target(self, obj) -> dict | None:
+        snapshot = self._snapshot(obj)
+        if snapshot.get("generation_purpose") != BIBLE_IMAGE_CANDIDATE_PURPOSE:
+            return None
+        target = GenerationTaskBibleTargetSerializer(data=snapshot.get("bible_target"))
+        if not target.is_valid():
+            return None
+        validated = target.validated_data
+        return {
+            "schema_version": validated["schema_version"],
+            "reference_category": validated["reference_category"],
+            "entity_id": str(validated["entity_id"]),
+            "entity_name": validated["entity_name"],
+            "source_fingerprint": validated["source_fingerprint"],
+        }
+
+    @staticmethod
     def _episode(obj):
         if obj.episode_id:
             return obj.episode
@@ -2448,19 +2741,32 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         return obj.generated_workflow.prompt_artifact.shot
 
     def get_batch_id(self, obj) -> str | None:
-        return self._snapshot(obj).get("batch_id") or None
+        return self._batch_snapshot(obj).get("batch_id") or None
 
     def get_batch_kind(self, obj) -> str | None:
-        return self._snapshot(obj).get("batch_kind") or None
+        return self._batch_snapshot(obj).get("batch_kind") or None
 
     def get_batch_role(self, obj) -> str | None:
-        return self._snapshot(obj).get("batch_role") or None
+        return self._batch_snapshot(obj).get("batch_role") or None
 
     def get_batch_index(self, obj) -> int | None:
-        return self._snapshot(obj).get("batch_index")
+        return self._batch_snapshot(obj).get("batch_index")
 
     def get_batch_size(self, obj) -> int | None:
-        return self._snapshot(obj).get("batch_size")
+        return self._batch_snapshot(obj).get("batch_size")
+
+    @extend_schema_field(GenerationTaskBatchSlotSerializer(many=True))
+    def get_batch_slots(self, obj) -> list[dict]:
+        snapshot = self._batch_snapshot(obj)
+        batch_id = snapshot.get("batch_id")
+        batch_size = self._task_optional_int(snapshot.get("batch_size")) or 0
+        if not batch_id or batch_size <= 1:
+            return []
+        cache = self.context.setdefault("_production_batch_slots_cache", {})
+        cache_key = (str(obj.owner_id), str(obj.project_id), str(batch_id))
+        if cache_key not in cache:
+            cache[cache_key] = build_production_batch_slots(obj)
+        return cache[cache_key]
 
     def get_episode_id(self, obj) -> str | None:
         snapshot = self._snapshot(obj)
@@ -2559,6 +2865,10 @@ class ComfyUIWorkflowSyncSerializer(serializers.Serializer):
 class TaskOutputPromoteSerializer(serializers.Serializer):
     output_index = serializers.IntegerField(min_value=0)
     name = serializers.CharField(max_length=160, required=False, allow_blank=True)
+    accept_stale_bible_image_candidate = serializers.BooleanField(
+        required=False,
+        default=False,
+    )
     reference_category = serializers.ChoiceField(
         choices=(Asset.Kind.CHARACTER, Asset.Kind.SCENE, Asset.Kind.PROP),
         required=False,
@@ -2566,6 +2876,16 @@ class TaskOutputPromoteSerializer(serializers.Serializer):
         default=None,
     )
     entity_id = serializers.UUIDField(required=False, allow_null=True, default=None)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict):
+            raise serializers.ValidationError("请求体必须是 JSON 对象。")
+        unknown = sorted(set(data) - set(self.fields))
+        if unknown:
+            raise serializers.ValidationError({
+                key: "不支持的字段。" for key in unknown
+            })
+        return super().to_internal_value(data)
 
     def validate(self, attrs):
         category = attrs.get("reference_category")
@@ -2576,6 +2896,17 @@ class TaskOutputPromoteSerializer(serializers.Serializer):
                 "entity_id": "分类参考必须同时选择人物、场景或道具实体",
             })
         return attrs
+
+
+class TaskOutputPromoteRequestSchemaExtension(OpenApiSerializerExtension):
+    target_class = TaskOutputPromoteSerializer
+
+    def map_serializer(self, auto_schema, direction):
+        schema = auto_schema._map_serializer(
+            self.target, direction, bypass_extensions=True,
+        )
+        schema["additionalProperties"] = False
+        return schema
 
 
 class GenerationTaskCreateSerializer(serializers.Serializer):
@@ -2592,6 +2923,44 @@ class GenerationTaskRetrySerializer(serializers.Serializer):
     extended_generation_confirmed = serializers.BooleanField(
         default=False,
         help_text="当前队列超过推荐值时的显式继续确认；不会改变原任务参数。",
+    )
+
+
+class ProductionBatchResumeSkippedTaskSerializer(serializers.Serializer):
+    task_id = serializers.UUIDField()
+    batch_index = serializers.IntegerField(min_value=0, required=False, allow_null=True)
+    status = serializers.CharField()
+    reason = serializers.CharField()
+
+
+class ProductionBatchResumeResponseSerializer(serializers.Serializer):
+    batch_id = serializers.CharField()
+    batch_kind = serializers.CharField(required=False, allow_blank=True)
+    scanned_task_count = serializers.IntegerField(min_value=0)
+    retried_task_ids = serializers.ListField(child=serializers.UUIDField())
+    skipped = ProductionBatchResumeSkippedTaskSerializer(many=True)
+    tasks = GenerationTaskSerializer(many=True)
+
+
+class ProductionBatchCancelResponseSerializer(serializers.Serializer):
+    batch_id = serializers.CharField()
+    batch_kind = serializers.CharField(required=False, allow_blank=True)
+    scanned_task_count = serializers.IntegerField(min_value=0)
+    cancelled_task_ids = serializers.ListField(child=serializers.UUIDField())
+    cancel_requested_task_ids = serializers.ListField(child=serializers.UUIDField())
+    skipped = ProductionBatchResumeSkippedTaskSerializer(many=True)
+    downstream_cancellations = serializers.DictField()
+    tasks = GenerationTaskSerializer(many=True)
+
+
+class ProductionBatchDeleteResponseSerializer(serializers.Serializer):
+    batch_id = serializers.CharField()
+    batch_kind = serializers.CharField(required=False, allow_blank=True)
+    scanned_task_count = serializers.IntegerField(min_value=0)
+    deleted_task_ids = serializers.ListField(child=serializers.UUIDField())
+    deleted_deferred_generation_request_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
     )
 
 
@@ -2619,17 +2988,27 @@ class ProductionBuildCountsSerializer(serializers.Serializer):
     prompts = serializers.IntegerField(min_value=0)
     workflows = serializers.IntegerField(min_value=0)
     tasks = serializers.IntegerField(min_value=0)
+    deferred_generation_requests = serializers.IntegerField(min_value=0, required=False)
 
 
 class ProductionBuildResponseSerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     whole_episode = serializers.BooleanField(required=False)
+    shot_version_key = serializers.CharField(required=False, allow_blank=True)
+    shot_version_label = serializers.CharField(required=False, allow_blank=True)
+    batch_shot_ids = serializers.ListField(
+        child=serializers.UUIDField(), required=False,
+    )
     episode_ids = serializers.ListField(child=serializers.UUIDField())
     episode_number = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     episode_title = serializers.CharField(required=False, allow_blank=True)
     prompt_artifact_ids = serializers.ListField(child=serializers.UUIDField())
     workflow_ids = serializers.ListField(child=serializers.UUIDField())
     task_ids = serializers.ListField(child=serializers.UUIDField())
+    deferred_generation_request_ids = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+    )
     batch_id = serializers.UUIDField(required=False, allow_null=True)
     batch_kind = serializers.ChoiceField(
         choices=("episode", "selection", "series"),
@@ -2642,6 +3021,7 @@ class ProductionBuildResponseSerializer(serializers.Serializer):
     idempotent_replay = serializers.BooleanField(required=False)
     counts = ProductionBuildCountsSerializer()
     production_units = serializers.ListField(child=serializers.DictField())
+    batch_slots = GenerationTaskBatchSlotSerializer(many=True, required=False)
     tasks = serializers.ListField(child=serializers.DictField(), required=False)
     prompt_language_gate = serializers.ListField(
         child=serializers.DictField(), required=False,
@@ -2706,6 +3086,17 @@ class ProductionBuildSerializer(serializers.Serializer):
     )
     enqueue = serializers.BooleanField(default=True)
     whole_episode = serializers.BooleanField(default=False)
+    shot_version_key = serializers.CharField(
+        required=False,
+        allow_blank=True,
+        default="",
+        max_length=191,
+        trim_whitespace=True,
+        help_text=(
+            "whole_episode=true 时必填；服务端只为该分镜版本冻结并创建整集任务，"
+            "不会合并同一剧集的其他历史分镜版本。"
+        ),
+    )
     extended_generation_confirmed = serializers.BooleanField(
         default=False,
         help_text=(
@@ -2858,7 +3249,11 @@ class ProductionBuildSerializer(serializers.Serializer):
                 })
             if attrs.get("shot_ids"):
                 raise serializers.ValidationError({
-                    "shot_ids": "whole_episode=true 时会选择该集全部分镜，不能再传 shot_ids",
+                    "shot_ids": "whole_episode=true 时会选择指定分镜版本的完整镜头，不能再传 shot_ids",
+                })
+            if not attrs.get("shot_version_key"):
+                raise serializers.ValidationError({
+                    "shot_version_key": "整集生成必须明确选择一个分镜版本",
                 })
             if not attrs.get("enqueue", True):
                 raise serializers.ValidationError({
@@ -2871,12 +3266,17 @@ class ProductionBuildSerializer(serializers.Serializer):
             # A whole-episode request is always independently retryable per
             # shot, even if an older client still sends multi_shot=true.
             attrs["multi_shot"] = False
-        elif attrs.get("idempotency_key") and not attrs.get("enqueue", True):
-            raise serializers.ValidationError({
-                "enqueue": (
-                    "提供 idempotency_key 时必须创建可追踪的生产任务，enqueue 必须为 true"
-                ),
-            })
+        else:
+            if attrs.get("shot_version_key"):
+                raise serializers.ValidationError({
+                    "shot_version_key": "shot_version_key 只用于 whole_episode=true 的整集生产",
+                })
+            if attrs.get("idempotency_key") and not attrs.get("enqueue", True):
+                raise serializers.ValidationError({
+                    "enqueue": (
+                        "提供 idempotency_key 时必须创建可追踪的生产任务，enqueue 必须为 true"
+                    ),
+                })
         return attrs
 
 
@@ -2886,6 +3286,7 @@ class ScriptBreakdownSerializer(serializers.Serializer):
         allow_blank=True,
         default="",
         max_length=settings.SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS,
+        trim_whitespace=False,
     )
     # This is a business target, not a model/runtime batch size. The actual
     # number remains bounded naturally by explicit headings or source blocks.
@@ -2905,6 +3306,7 @@ class ScriptBreakdownSerializer(serializers.Serializer):
     include_audio = serializers.BooleanField(default=True)
     replace_existing = serializers.BooleanField(default=False)
     discard_existing_production = serializers.BooleanField(default=False)
+    continue_without_script_bible = serializers.BooleanField(default=False)
 
     def validate(self, attrs):
         if attrs["discard_existing_production"] and not attrs["replace_existing"]:
@@ -2973,6 +3375,18 @@ class ScriptRebuildConflictResponseSerializer(serializers.Serializer):
     error = ScriptRebuildConflictSerializer()
 
 
+class APIValidationErrorSerializer(serializers.Serializer):
+    """The single envelope produced by ``api_exception_handler`` for 400s."""
+
+    status_code = serializers.IntegerField()
+    code = serializers.CharField(max_length=64)
+    details = serializers.JSONField()
+
+
+class APIValidationErrorEnvelopeSerializer(serializers.Serializer):
+    error = APIValidationErrorSerializer()
+
+
 class StrictSerializer(serializers.Serializer):
     """Serializer that rejects unknown JSON keys instead of ignoring them."""
 
@@ -2985,6 +3399,138 @@ class StrictSerializer(serializers.Serializer):
                 key: "不支持的字段" for key in sorted(unknown)
             })
         return super().to_internal_value(data)
+
+
+class ScriptBibleEvidenceSerializer(serializers.Serializer):
+    line = serializers.IntegerField(min_value=1)
+    kind = serializers.ChoiceField(choices=(
+        "body_mention", "dialogue_speaker", "shot_setting",
+    ))
+    excerpt = serializers.CharField(max_length=240)
+
+
+class ScriptBibleDiagnosticSerializer(serializers.Serializer):
+    line = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    severity = serializers.ChoiceField(choices=("info", "warning", "error"))
+    code = serializers.CharField(max_length=64)
+    detail = serializers.CharField(required=False)
+    entity_type = serializers.ChoiceField(
+        choices=("character", "scene", "prop"), required=False,
+    )
+    candidate_id = serializers.RegexField(r"^[0-9a-f]{64}$", required=False)
+
+
+class ScriptBibleCandidateSerializer(serializers.Serializer):
+    candidate_id = serializers.RegexField(r"^[0-9a-f]{64}$")
+    entity_type = serializers.ChoiceField(choices=("character", "scene", "prop"))
+    name = serializers.CharField(max_length=160)
+    description = serializers.CharField(max_length=2_000, allow_blank=True)
+    visual_identity_en = serializers.CharField(max_length=3_000, allow_blank=True)
+    declaration_line = serializers.IntegerField(min_value=1)
+    occurrence = serializers.IntegerField(min_value=0)
+    evidence = ScriptBibleEvidenceSerializer(many=True)
+    recommended = serializers.BooleanField()
+    matched_bible_id = serializers.UUIDField(allow_null=True)
+    existing = serializers.BooleanField()
+    confirmed = serializers.BooleanField()
+    conflict_code = serializers.ChoiceField(
+        choices=(
+            "script_bible_cross_type_name_conflict",
+            "script_bible_content_conflict",
+            "script_bible_reviewed_content_conflict",
+            "script_bible_provenance_conflict",
+        ),
+        allow_null=True,
+    )
+
+
+class ScriptBibleCandidatesResponseSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(min_value=1, max_value=1)
+    project_id = serializers.UUIDField()
+    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
+    has_block = serializers.BooleanField()
+    candidates = ScriptBibleCandidateSerializer(many=True)
+    diagnostics = ScriptBibleDiagnosticSerializer(many=True)
+
+
+class ScriptBibleReviewedSelectionSerializer(StrictSerializer):
+    candidate_id = serializers.RegexField(r"^[0-9a-f]{64}$")
+    reviewed = serializers.BooleanField()
+    name = serializers.CharField(max_length=160, trim_whitespace=False)
+    description = serializers.CharField(
+        max_length=2_000, allow_blank=True, trim_whitespace=False,
+    )
+    visual_identity_en = serializers.CharField(
+        max_length=3_000, allow_blank=True, trim_whitespace=False,
+    )
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or data.get("reviewed") is not True:
+            raise serializers.ValidationError({
+                "reviewed": "只有字面 JSON true 才表示已人工确认。",
+            })
+        return super().to_internal_value(data)
+
+    def validate_reviewed(self, value):
+        if value is not True:
+            raise serializers.ValidationError("只有人工确认的候选才能应用。")
+        return value
+
+
+class ScriptBibleApplyRequestSerializer(StrictSerializer):
+    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
+    selections = ScriptBibleReviewedSelectionSerializer(many=True, allow_empty=False)
+
+    def validate_selections(self, value):
+        candidate_ids = [item["candidate_id"] for item in value]
+        if len(candidate_ids) != len(set(candidate_ids)):
+            raise serializers.ValidationError("candidate_id 不能重复。")
+        return value
+
+
+class ScriptBibleApplyCountsSerializer(serializers.Serializer):
+    requested = serializers.IntegerField(min_value=1)
+    created = serializers.IntegerField(min_value=0)
+    already_exists = serializers.IntegerField(min_value=0)
+
+
+class ScriptBibleApplyCollectionsSerializer(serializers.Serializer):
+    characters = CharacterBibleSerializer(many=True)
+    scenes = SceneBibleSerializer(many=True)
+    props = PropBibleSerializer(many=True)
+
+
+class ScriptBibleApplyResponseSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(min_value=1, max_value=1)
+    project_id = serializers.UUIDField()
+    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
+    updated_at = serializers.DateTimeField()
+    created = ScriptBibleApplyCollectionsSerializer()
+    already_exists = ScriptBibleApplyCollectionsSerializer()
+    counts = ScriptBibleApplyCountsSerializer()
+
+
+class ScriptBibleErrorDetailsSerializer(serializers.Serializer):
+    detail = serializers.CharField()
+    line = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    diagnostic = ScriptBibleDiagnosticSerializer(required=False)
+    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$", required=False)
+    current_source_fingerprint = serializers.RegexField(
+        r"^[0-9a-f]{64}$", required=False,
+    )
+    pending_count = serializers.IntegerField(min_value=0, required=False)
+    conflict_count = serializers.IntegerField(min_value=0, required=False)
+    candidates = ScriptBibleCandidateSerializer(many=True, required=False)
+
+
+class ScriptBibleErrorSerializer(serializers.Serializer):
+    status_code = serializers.IntegerField()
+    code = serializers.CharField(max_length=64)
+    details = ScriptBibleErrorDetailsSerializer()
+
+
+class ScriptBibleErrorEnvelopeSerializer(serializers.Serializer):
+    error = ScriptBibleErrorSerializer()
 
 
 _CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
@@ -3036,6 +3582,21 @@ class CreativeDialogueDraftSerializer(StrictSerializer):
         trim_whitespace=False,
     )
     voiceover = serializers.BooleanField(default=False)
+    start_ms = serializers.IntegerField(min_value=0, required=False)
+    end_ms = serializers.IntegerField(min_value=1, required=False)
+
+    def validate(self, attrs):
+        has_start = "start_ms" in attrs
+        has_end = "end_ms" in attrs
+        if has_start != has_end:
+            raise serializers.ValidationError(
+                "start_ms 与 end_ms 必须同时提供"
+            )
+        if has_start and attrs["end_ms"] <= attrs["start_ms"]:
+            raise serializers.ValidationError(
+                "对白时间范围必须满足 start_ms < end_ms"
+            )
+        return attrs
 
 
 class CreativeShotDraftSerializer(StrictSerializer):
@@ -3085,6 +3646,8 @@ class CreativeShotDraftSerializer(StrictSerializer):
     media_type = serializers.ChoiceField(choices=(Shot.MediaType.VIDEO,), default=Shot.MediaType.VIDEO)
     h3_mode = serializers.ChoiceField(choices=Shot.H3Mode.choices)
     include_audio = serializers.BooleanField(default=True)
+    requires_first_frame_continuity = serializers.BooleanField(default=False)
+    requires_last_frame_continuity = serializers.BooleanField(default=False)
     scene_id = serializers.UUIDField(required=False, allow_null=True, default=None)
     character_ids = serializers.ListField(
         child=serializers.UUIDField(), required=False, allow_empty=True, default=list,
@@ -3098,6 +3661,16 @@ class CreativeShotDraftSerializer(StrictSerializer):
         # Duplicate bindings, audio conflicts and dense dialogue are all
         # editable content risks.  Preserve the proposal exactly and let the
         # review service describe them instead of rejecting the whole draft.
+        duration_ms = attrs.get("duration_ms")
+        if duration_ms is not None:
+            for index, line in enumerate(attrs.get("dialogue", [])):
+                if line.get("end_ms", 0) > duration_ms:
+                    raise serializers.ValidationError({
+                        "dialogue": (
+                            f"dialogue[{index}].end_ms 不能超过镜头时长 "
+                            f"{duration_ms}ms"
+                        ),
+                    })
         return attrs
 
 
@@ -3335,6 +3908,7 @@ class ShotDetailDraftApplySerializer(StrictSerializer):
 
 class ShotDetailDraftBatchCreateSerializer(StrictSerializer):
     episode_id = serializers.UUIDField()
+    shot_version_key = serializers.CharField(min_length=1, max_length=191)
     request_id = serializers.UUIDField()
     provider = serializers.ChoiceField(
         choices=MODEL_PROVIDER_CHOICES,
@@ -3448,7 +4022,8 @@ class ShotDetailDraftBatchSerializer(serializers.ModelSerializer):
         model = ShotDetailDraftBatch
         fields = (
             "id", "project", "episode", "created_by", "request_id", "provider",
-            "variation_note", "source_manifest_hash", "policy_snapshot", "config_hash",
+            "variation_note", "shot_version_key", "shot_version_label",
+            "version_scope_status", "source_manifest_hash", "policy_snapshot", "config_hash",
             "generation_status", "apply_status", "revision", "total_count",
             "pending_count", "succeeded_count", "failed_count", "stale_count",
             "skipped_count", "applied_count", "started_at", "finished_at",
@@ -3660,6 +4235,7 @@ class CanonicalGlossaryVisualTranslationSerializer(serializers.Serializer):
 
 class CanonicalGlossaryEnsureResponseSerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
+    updated_at = serializers.DateTimeField()
     translation_glossary = serializers.DictField(child=serializers.CharField())
     summary = CanonicalGlossarySummarySerializer()
     entries = CanonicalGlossaryResultEntrySerializer(many=True)

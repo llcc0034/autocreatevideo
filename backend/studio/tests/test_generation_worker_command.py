@@ -62,6 +62,7 @@ class GenerationWorkerCommandTests(TestCase):
                 "timeout_seconds": 30,
             }
             creative_config = dict(translation_config)
+            creative_config["process_cleanup_grace_seconds"] = 1
             with patch("studio.services.prompt_translation.subprocess.run") as translate_run:
                 with self.assertRaises(prompt_translation.PromptTranslationResourceBusy):
                     prompt_translation._run_runtime({"text": "测试"}, translation_config)
@@ -78,3 +79,39 @@ class GenerationWorkerCommandTests(TestCase):
         call_command("run_generation_worker", once=True, recover_minutes=30)
 
         process.assert_called_once()
+
+    @patch("studio.management.commands.run_generation_worker.process_shot_detail_item")
+    @patch("studio.management.commands.run_generation_worker.claim_next_shot_detail_item")
+    @patch("studio.management.commands.run_generation_worker.process_deferred_request")
+    @patch("studio.management.commands.run_generation_worker.claim_next_deferred_request")
+    @patch("studio.management.commands.run_generation_worker.claim_next_task", return_value=None)
+    @patch("studio.management.commands.run_generation_worker.recover_stale_deferred_requests", return_value=0)
+    @patch("studio.management.commands.run_generation_worker.recover_stale_shot_detail_items", return_value=0)
+    @patch("studio.management.commands.run_generation_worker.recover_stale_tasks", return_value=0)
+    def test_worker_processes_deferred_request_before_shot_detail_when_no_gpu_task(
+        self,
+        _recover_tasks,
+        _recover_details,
+        _recover_deferred,
+        _claim_task,
+        claim_deferred,
+        process_deferred,
+        claim_detail,
+        process_detail,
+    ):
+        deferred_request = SimpleNamespace(
+            id="deferred-1",
+            attempts=1,
+            max_attempts=3,
+            status="waiting_upstream",
+        )
+        processed = SimpleNamespace(id="deferred-1", status="materialized")
+        claim_deferred.return_value = deferred_request
+        process_deferred.return_value = processed
+
+        call_command("run_generation_worker", once=True, recover_minutes=30)
+
+        claim_deferred.assert_called_once()
+        process_deferred.assert_called_once_with(deferred_request)
+        claim_detail.assert_not_called()
+        process_detail.assert_not_called()

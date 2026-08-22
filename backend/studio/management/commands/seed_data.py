@@ -15,6 +15,10 @@ from studio.services.resolution import (
     H3_RESOLUTION_MULTIPLE_STEP,
     H3_RESOLUTION_PROFILES,
 )
+from studio.services.system_workflow_contracts import (
+    approved_minimax_reference_image_definition,
+    video_output_contract,
+)
 
 
 STYLES = [
@@ -162,50 +166,14 @@ SDXL_IMAGE_CHECKPOINT = "sd_xl_base_1.0.safetensors"
 SDXL_IMAGE_CHECKPOINT_SHA256 = "31e35c80fc4829d14f90153f4c74cd59c90b779f6afe05a74cd6120b893f7e5b"
 
 
-def _native_sdxl_image_workflow():
-    """Reviewed, local-only SDXL text-to-image API graph.
-
-    Reference images selected in a shot are continuity-library material only in
-    this v1 workflow. Their Bible descriptions are compiled into ``PROMPT``;
-    no LoadImage/IP-Adapter/ControlNet pixel conditioning is created here.
-    """
-
-    return {
-        "1": {"class_type": "CheckpointLoaderSimple", "inputs": {
-            "ckpt_name": "${MODEL}",
-        }},
-        "2": {"class_type": "CLIPTextEncode", "inputs": {
-            "text": "${PROMPT}", "clip": ["1", 1],
-        }},
-        "3": {"class_type": "CLIPTextEncode", "inputs": {
-            "text": "${NEGATIVE_PROMPT}", "clip": ["1", 1],
-        }},
-        "4": {"class_type": "EmptyLatentImage", "inputs": {
-            "width": "${WIDTH}", "height": "${HEIGHT}", "batch_size": 1,
-        }},
-        "5": {"class_type": "KSampler", "inputs": {
-            "model": ["1", 0], "positive": ["2", 0], "negative": ["3", 0],
-            "latent_image": ["4", 0], "seed": "${SEED}",
-            "steps": 30, "cfg": 6.5, "sampler_name": "dpmpp_2m",
-            "scheduler": "karras", "denoise": 1.0,
-        }},
-        "6": {"class_type": "VAEDecode", "inputs": {
-            "samples": ["5", 0], "vae": ["1", 2],
-        }},
-        "7": {"class_type": "SaveImage", "inputs": {
-            "images": ["6", 0], "filename_prefix": "${OUTPUT_PREFIX}",
-        }},
-    }
-
-
-SDXL_IMAGE_WORKFLOW = _native_sdxl_image_workflow()
+SDXL_IMAGE_WORKFLOW = approved_minimax_reference_image_definition()
 
 REVIEWED_WORKFLOW_VERSIONS = {
-    "minimax-h3-base-video": 1,
-    "minimax-h3-first-last-video": 1,
-    "minimax-h3-reference-video": 1,
-    "minimax-h3-r2v-t8-dual-clock-4step": 1,
-    "minimax-h3-r2v-turbo-lora": 1,
+    "minimax-h3-base-video": 2,
+    "minimax-h3-first-last-video": 2,
+    "minimax-h3-reference-video": 2,
+    "minimax-h3-r2v-t8-dual-clock-4step": 2,
+    "minimax-h3-r2v-turbo-lora": 2,
     "minimax-reference-image": 1,
 }
 
@@ -338,6 +306,7 @@ class Command(BaseCommand):
                 "input_schema": {
                     **schema, **i2v_source, **binding_schema,
                     "workflow_mode": "text_to_video",
+                    "output_contract": video_output_contract(VIDEO_WORKFLOW),
                     "h3_modes": ["T2VA"],
                     "is_default": True,
                     "prompt_template_keys": ["h3_t2v_text_v1"],
@@ -359,6 +328,7 @@ class Command(BaseCommand):
                 "input_schema": {
                     **schema, **i2v_source, **binding_schema,
                     "workflow_mode": "first_last_to_video",
+                    "output_contract": video_output_contract(VIDEO_WORKFLOW),
                     "is_default": True,
                     # I2VA/L2VA remain executable for historical records. New
                     # UI writes FL2VA and actual conditioning is persisted as
@@ -386,6 +356,7 @@ class Command(BaseCommand):
                 "input_schema": {
                     **schema, **r2v_source, **binding_schema,
                     "workflow_mode": "reference_to_video",
+                    "output_contract": video_output_contract(REF_VIDEO_WORKFLOW),
                     "h3_modes": ["Ref2VA"],
                     "is_default": True,
                     "prompt_template_keys": ["h3_r2v_zero_reference_v1", "h3_r2v_classified_v1"],
@@ -421,6 +392,7 @@ class Command(BaseCommand):
                     "source_workflow": "video_minimax_h3_r2v_t8_dual_clock_4step.json",
                     "official_node_type": "MiniMaxH3AudioConditioningT8",
                     "workflow_mode": "reference_to_video",
+                    "output_contract": video_output_contract(T8_DUAL_CLOCK_REF_VIDEO_WORKFLOW),
                     "model_profile": "local_h3_ref2va_t8_dual_clock_4step",
                     "h3_modes": ["Ref2VA"],
                     "is_default": False,
@@ -461,6 +433,7 @@ class Command(BaseCommand):
                     **schema, **r2v_source, **binding_schema,
                     "source_workflow": "video_minimax_h3_r2v_turbo_lora.json",
                     "workflow_mode": "reference_to_video",
+                    "output_contract": video_output_contract(TURBO_LORA_REF_VIDEO_WORKFLOW),
                     "model_profile": "local_h3_ref2va_turbo_lora",
                     "h3_modes": ["Ref2VA"],
                     "is_default": False,

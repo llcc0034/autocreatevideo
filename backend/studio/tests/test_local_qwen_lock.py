@@ -32,6 +32,7 @@ class LocalQwenRuntimeLockTests(SimpleTestCase):
         config = {
             "runtime_python": Path("python"), "runtime_script": Path("runtime.py"),
             "timeout_seconds": 30,
+            "process_cleanup_grace_seconds": 1,
         }
         with local_qwen_runtime_lock(), patch(
             "studio.services.prompt_translation.subprocess.run",
@@ -44,6 +45,7 @@ class LocalQwenRuntimeLockTests(SimpleTestCase):
         config = {
             "runtime_python": Path("python"), "runtime_script": Path("runtime.py"),
             "timeout_seconds": 30,
+            "process_cleanup_grace_seconds": 1,
         }
         with local_qwen_runtime_lock(), patch(
             "studio.services.creative_drafts.subprocess.run",

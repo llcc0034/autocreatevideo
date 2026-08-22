@@ -25,6 +25,9 @@ $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $ServiceRecords = [System.Collections.Generic.List[object]]::new()
 $KnownProjectProcessIds = [System.Collections.Generic.HashSet[int]]::new()
 . (Join-Path $PSScriptRoot 'restart_config.ps1')
+. (Join-Path $PSScriptRoot 'node_runtime.ps1')
+. (Join-Path $PSScriptRoot 'ffmpeg_runtime.ps1')
+. (Join-Path $PSScriptRoot 'python_runtime.ps1')
 
 if ($SkipComfyUI -and $RestartComfyUI) {
     throw '-SkipComfyUI and -RestartComfyUI cannot be used together.'
@@ -382,8 +385,8 @@ $PreviousServicesStopped = $false
 try {
 New-Item -ItemType Directory -Path $LogRoot -Force | Out-Null
 
-if (-not (Test-Path -LiteralPath $BackendPython)) {
-    throw "Backend virtual environment is missing: $BackendPython. Run scripts\setup.ps1 first."
+if (-not (Test-AutoPromptPythonExecutable -PythonPath $BackendPython)) {
+    throw "Backend Python virtual environment is missing or references a removed base runtime: $BackendPython. Run scripts\setup.ps1 to repair it from the pinned E-drive Python runtime."
 }
 if (-not (Test-Path -LiteralPath (Join-Path $BackendRoot '.env'))) {
     throw 'backend\.env is missing. Run scripts\setup.ps1 first.'
@@ -395,15 +398,18 @@ if (-not (Test-Path -LiteralPath $LocalTranslationModel) -or -not (Test-Path -Li
     Write-Warning 'Optional local Qwen director-field translation is not installed; the studio can start, but local automatic translation will remain unavailable.'
     Write-Host 'Install it once with: powershell -ExecutionPolicy Bypass -File .\scripts\download_local_translation_model.ps1 -Runtime cpu' -ForegroundColor Yellow
 }
-$npmCommand = Get-Command npm.cmd -ErrorAction SilentlyContinue
-if (-not $npmCommand) {
-    throw 'npm.cmd was not found. Install Node.js 22 and reopen PowerShell.'
+$nodeRuntime = Resolve-AutoPromptNodeRuntime -ProjectRoot $ProjectRoot
+if (-not $nodeRuntime) {
+    throw 'A complete Node.js 22/npm runtime was not found. Run scripts\install_node_runtime.ps1 to install the pinned runtime under .runtime\toolchains.'
 }
-$ffmpegCommand = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue
-$ffprobeCommand = Get-Command ffprobe.exe -ErrorAction SilentlyContinue
-if (-not $ffmpegCommand -or -not $ffprobeCommand) {
-    throw 'ffmpeg.exe and ffprobe.exe must both be available on Path.'
+$npmCacheRoot = Set-AutoPromptNpmCacheEnvironment -ProjectRoot $ProjectRoot
+Write-Host "Node runtime: $($nodeRuntime.Version) from $($nodeRuntime.Source); npm cache: $npmCacheRoot" -ForegroundColor DarkGray
+$ffmpegRuntime = Resolve-AutoPromptFfmpegRuntime -ProjectRoot $ProjectRoot
+if (-not $ffmpegRuntime) {
+    throw 'A complete FFmpeg/FFprobe runtime was not found. Run scripts\install_ffmpeg_runtime.ps1 to install the pinned runtime under .runtime\toolchains.'
 }
+Set-AutoPromptFfmpegEnvironment -Runtime $ffmpegRuntime
+Write-Host "FFmpeg runtime: $($ffmpegRuntime.Version) from $($ffmpegRuntime.Source)" -ForegroundColor DarkGray
 $env:PYTHONUNBUFFERED = '1'
 
 $ComfyPython = Join-Path $ComfyUIRoot 'python_embeded\python.exe'
@@ -502,7 +508,7 @@ Wait-Http 'Django API' 'http://127.0.0.1:8000/api/v1/health/' $StartupTimeoutSec
 # the readiness endpoint observes the same deterministic order on every run.
 Start-ServiceProcess 'Generation worker' $BackendPython @('-u', 'manage.py', 'run_generation_worker', '--startup-recover-minutes', '0') $BackendRoot | Out-Null
 Start-ServiceProcess 'Assembly worker' $BackendPython @('-u', 'manage.py', 'run_assembly_worker') $BackendRoot | Out-Null
-Start-ServiceProcess 'Vue frontend' $npmCommand.Source @('run', 'dev', '--', '--host', '127.0.0.1', '--port', '5173', '--strictPort') $FrontendRoot | Out-Null
+Start-ServiceProcess 'Vue frontend' $nodeRuntime.NpmPath @('run', 'dev', '--', '--host', '127.0.0.1', '--port', '5173', '--strictPort') $FrontendRoot | Out-Null
 
 $stateTempPath = "$StatePath.$PID.tmp"
 [pscustomobject]@{

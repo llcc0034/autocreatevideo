@@ -6,6 +6,7 @@ from uuid import UUID
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command
 from django.test import TestCase, override_settings
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from studio.models import (
@@ -18,6 +19,7 @@ from studio.models import (
     WorkflowTemplate,
 )
 from studio.tests.factories import build_story
+from studio.services.shot_versions import legacy_shot_version_key
 from studio.views import _episode_batch_fingerprint
 
 
@@ -72,6 +74,7 @@ class WholeEpisodeGenerationTests(TestCase):
         return {
             "episode_ids": [str(self.episode.id)],
             "whole_episode": True,
+            "shot_version_key": legacy_shot_version_key(self.episode.id),
             # The server must still split per shot when an older caller sends
             # the historical default value.
             "multi_shot": True,
@@ -80,6 +83,30 @@ class WholeEpisodeGenerationTests(TestCase):
             **overrides,
         }
 
+    def create_storyboard_version(self, key: str, label: str, count: int = 2):
+        start_number = Shot.objects.filter(episode=self.episode).count() + 1
+        shots = []
+        for ordinal in range(1, count + 1):
+            shot = Shot.objects.create(
+                episode=self.episode,
+                number=start_number + ordinal - 1,
+                title=f"{label} 镜头 {ordinal}",
+                narrative=f"{label} 的第 {ordinal} 个连续动作。",
+                camera="中景跟拍",
+                scene=self.scene,
+                duration_ms=5000,
+                h3_mode=Shot.H3Mode.T2VA,
+                metadata={
+                    "creative_version_key": key,
+                    "creative_version_label": label,
+                    "creative_version_shot_number": ordinal,
+                    "creative_version_active": True,
+                },
+            )
+            shot.characters.add(self.character)
+            shots.append(shot)
+        return shots
+
     def test_whole_episode_creates_one_traceable_task_per_ordered_shot(self):
         response = self.client.post(
             f"/api/v1/projects/{self.project.id}/build-production/",
@@ -87,7 +114,11 @@ class WholeEpisodeGenerationTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(response.data["counts"], {"prompts": 2, "workflows": 2, "tasks": 2})
+        self.assertEqual(response.data["counts"], {
+            "prompts": 2,
+            "workflows": 2,
+            "tasks": 2,
+        })
         self.assertFalse(response.data["idempotent_replay"])
         self.assertEqual(response.data["batch_kind"], "episode")
         self.assertEqual(response.data["batch_size"], 2)
@@ -136,6 +167,400 @@ class WholeEpisodeGenerationTests(TestCase):
         self.assertEqual(by_shot.status_code, 200, by_shot.data)
         shot_results = by_shot.data.get("results", by_shot.data)
         self.assertEqual([item["shot_id"] for item in shot_results], [str(self.shot2.id)])
+
+    def test_whole_episode_freezes_only_the_selected_storyboard_version(self):
+        version_key = "creative-draft:11111111-1111-4111-8111-111111111111"
+        version_shots = self.create_storyboard_version(version_key, "V2", count=3)
+
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("selected-storyboard-version", shot_version_key=version_key),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        expected_ids = [str(shot.id) for shot in version_shots]
+        self.assertEqual(response.data["shot_version_key"], version_key)
+        self.assertEqual(response.data["shot_version_label"], "V2")
+        self.assertEqual(response.data["batch_size"], 3)
+        self.assertEqual(response.data["batch_shot_ids"], expected_ids)
+        self.assertEqual(
+            [item["shot_id"] for item in response.data["production_units"]],
+            expected_ids,
+        )
+        self.assertEqual(
+            [item["shot_number"] for item in response.data["production_units"]],
+            [1, 2, 3],
+        )
+        self.assertEqual(
+            [item["shot_id"] for item in response.data["batch_slots"]],
+            expected_ids,
+        )
+        self.assertEqual(
+            {item["shot_version_key"] for item in response.data["batch_slots"]},
+            {version_key},
+        )
+        self.assertEqual(
+            {item["shot_version_label"] for item in response.data["batch_slots"]},
+            {"V2"},
+        )
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        self.assertEqual(len(tasks), 3)
+        for index, task in enumerate(tasks, start=1):
+            snapshot = task.capability_snapshot
+            self.assertEqual(snapshot["shot_version_key"], version_key)
+            self.assertEqual(snapshot["shot_version_label"], "V2")
+            self.assertEqual(snapshot["batch_shot_ids"], expected_ids)
+            self.assertEqual(snapshot["shot_number"], index)
+
+    def test_whole_episode_rejects_unknown_version_without_partial_writes(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload(
+                "unknown-storyboard-version",
+                shot_version_key="creative-draft:22222222-2222-4222-8222-222222222222",
+            ),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("shot_version_key", str(response.data))
+        self.assertEqual(PromptArtifact.objects.count(), 0)
+        self.assertEqual(GeneratedWorkflow.objects.count(), 0)
+        self.assertEqual(GenerationTask.objects.count(), 0)
+
+    def test_whole_episode_idempotency_key_cannot_switch_storyboard_version(self):
+        version_key = "creative-draft:33333333-3333-4333-8333-333333333333"
+        self.create_storyboard_version(version_key, "V3")
+        url = f"/api/v1/projects/{self.project.id}/build-production/"
+        first = self.client.post(
+            url,
+            self.payload("version-bound-idempotency", shot_version_key=version_key),
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+
+        changed = self.client.post(
+            url,
+            self.payload(
+                "version-bound-idempotency",
+                shot_version_key=legacy_shot_version_key(self.episode.id),
+            ),
+            format="json",
+        )
+
+        self.assertEqual(changed.status_code, 409, changed.data)
+        self.assertEqual(
+            changed.data["error"]["code"],
+            "production_idempotency_conflict",
+        )
+        self.assertEqual(GenerationTask.objects.count(), 2)
+
+    def test_task_list_exposes_not_created_slots_without_active_deferred(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("batch-slots-not-created"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        shot3 = Shot.objects.create(
+            episode=self.episode,
+            number=3,
+            title="第三镜",
+            narrative="第三镜动作",
+            camera="稳定推进",
+            duration_ms=5000,
+            h3_mode=Shot.H3Mode.FL2VA,
+            scene=self.scene,
+            requires_first_frame_continuity=True,
+        )
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        frozen_ids = [str(self.shot1.id), str(self.shot2.id), str(shot3.id)]
+        for task in tasks:
+            snapshot = dict(task.capability_snapshot)
+            snapshot["batch_size"] = 3
+            snapshot["batch_shot_ids"] = frozen_ids
+            task.capability_snapshot = snapshot
+            task.save(update_fields=("capability_snapshot", "updated_at"))
+
+        by_batch = self.client.get("/api/v1/tasks/", {"batch_id": response.data["batch_id"]})
+
+        self.assertEqual(by_batch.status_code, 200, by_batch.data)
+        batch_results = by_batch.data.get("results", by_batch.data)
+        self.assertEqual(len(batch_results), 2)
+        slots = batch_results[0]["batch_slots"]
+        self.assertEqual([slot["batch_index"] for slot in slots], [1, 2, 3])
+        self.assertEqual(
+            [slot["slot_status"] for slot in slots],
+            ["materialized", "materialized", "not_created"],
+        )
+        self.assertEqual(slots[2]["shot_id"], str(shot3.id))
+        self.assertIn("没有 active deferred", slots[2]["message"])
+
+    def test_legacy_batch_without_manifest_does_not_guess_missing_slot_from_episode(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("legacy-batch-no-manifest"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        anchor = tasks[0]
+        tasks[1].delete()
+        snapshot = dict(anchor.capability_snapshot)
+        snapshot.pop("batch_shot_ids", None)
+        snapshot.pop("shot_version_key", None)
+        snapshot.pop("shot_version_label", None)
+        anchor.capability_snapshot = snapshot
+        anchor.save(update_fields=("capability_snapshot", "updated_at"))
+
+        Shot.objects.create(
+            episode=self.episode,
+            number=3,
+            title="后来新增的镜头",
+            narrative="不得被旧批次读侧吸收。",
+            camera="固定镜头",
+            duration_ms=5000,
+            h3_mode=Shot.H3Mode.T2VA,
+            scene=self.scene,
+        )
+
+        by_batch = self.client.get(
+            "/api/v1/tasks/", {"batch_id": response.data["batch_id"]},
+        )
+
+        self.assertEqual(by_batch.status_code, 200, by_batch.data)
+        batch_results = by_batch.data.get("results", by_batch.data)
+        slots = batch_results[0]["batch_slots"]
+        self.assertEqual([slot["slot_status"] for slot in slots], ["materialized", "not_created"])
+        self.assertIsNone(slots[1]["shot_id"])
+        self.assertEqual(slots[1]["shot_title"], "")
+
+    def test_resume_batch_retries_only_latest_failed_child(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("resume-failed-child"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        tasks[1].status = GenerationTask.Status.FAILED
+        tasks[1].error_message = "fixture failure"
+        tasks[1].finished_at = timezone.now()
+        tasks[1].save(update_fields=("status", "error_message", "finished_at", "updated_at"))
+
+        resumed = self.client.post(
+            f"/api/v1/tasks/{tasks[0].id}/resume-batch/",
+            {"extended_generation_confirmed": False},
+            format="json",
+        )
+
+        self.assertEqual(resumed.status_code, 201, resumed.data)
+        self.assertEqual(resumed.data["batch_id"], response.data["batch_id"])
+        self.assertEqual(len(resumed.data["retried_task_ids"]), 1)
+        retry = GenerationTask.objects.get(pk=resumed.data["retried_task_ids"][0])
+        self.assertEqual(retry.capability_snapshot["retry_of"], str(tasks[1].id))
+        self.assertEqual(retry.capability_snapshot["batch_id"], response.data["batch_id"])
+        self.assertEqual(retry.capability_snapshot["batch_index"], 2)
+        self.assertEqual(retry.capability_snapshot["batch_role"], "retry")
+
+    def test_resume_batch_does_not_duplicate_existing_retry(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("resume-existing-retry"),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        tasks = list(GenerationTask.objects.order_by("capability_snapshot__batch_index"))
+        tasks[1].status = GenerationTask.Status.FAILED
+        tasks[1].error_message = "fixture failure"
+        tasks[1].finished_at = timezone.now()
+        tasks[1].save(update_fields=("status", "error_message", "finished_at", "updated_at"))
+        first_resume = self.client.post(
+            f"/api/v1/tasks/{tasks[1].id}/resume-batch/",
+            {"extended_generation_confirmed": False},
+            format="json",
+        )
+        self.assertEqual(first_resume.status_code, 201, first_resume.data)
+
+        second_resume = self.client.post(
+            f"/api/v1/tasks/{tasks[1].id}/resume-batch/",
+            {"extended_generation_confirmed": False},
+            format="json",
+        )
+
+        self.assertEqual(second_resume.status_code, 200, second_resume.data)
+        self.assertEqual(second_resume.data["retried_task_ids"], [])
+        self.assertEqual(
+            GenerationTask.objects.filter(
+                capability_snapshot__batch_id=response.data["batch_id"],
+            ).count(),
+            3,
+        )
+        retry_id = first_resume.data["retried_task_ids"][0]
+        self.assertTrue(any(
+            item["task_id"] == retry_id and item["reason"] == "仍在排队或运行中，跳过。"
+            for item in second_resume.data["skipped"]
+        ))
+
+    def test_resume_batch_is_scoped_to_exact_batch_id(self):
+        first = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("resume-exact-batch-a", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        second = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("resume-exact-batch-b", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(second.status_code, 201, second.data)
+        first_tasks = list(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=first.data["batch_id"],
+        ).order_by("capability_snapshot__batch_index"))
+        second_tasks = list(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=second.data["batch_id"],
+        ).order_by("capability_snapshot__batch_index"))
+        for task in (first_tasks[1], second_tasks[1]):
+            task.status = GenerationTask.Status.FAILED
+            task.error_message = "fixture failure"
+            task.finished_at = timezone.now()
+            task.save(update_fields=("status", "error_message", "finished_at", "updated_at"))
+
+        resumed = self.client.post(
+            f"/api/v1/tasks/{second_tasks[0].id}/resume-batch/",
+            {"extended_generation_confirmed": True},
+            format="json",
+        )
+
+        self.assertEqual(resumed.status_code, 201, resumed.data)
+        self.assertEqual(resumed.data["batch_id"], second.data["batch_id"])
+        self.assertEqual(len(resumed.data["retried_task_ids"]), 1)
+        retry = GenerationTask.objects.get(pk=resumed.data["retried_task_ids"][0])
+        self.assertEqual(retry.capability_snapshot["batch_id"], second.data["batch_id"])
+        self.assertEqual(
+            GenerationTask.objects.filter(
+                capability_snapshot__batch_id=first.data["batch_id"],
+                capability_snapshot__retry_of=str(first_tasks[1].id),
+            ).count(),
+            0,
+        )
+
+    def test_cancel_batch_is_scoped_to_exact_batch_id(self):
+        first = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("cancel-exact-batch-a", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        second = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("cancel-exact-batch-b", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(second.status_code, 201, second.data)
+        first_tasks = list(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=first.data["batch_id"],
+        ).order_by("capability_snapshot__batch_index"))
+        second_tasks = list(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=second.data["batch_id"],
+        ).order_by("capability_snapshot__batch_index"))
+
+        cancelled = self.client.post(
+            f"/api/v1/tasks/{second_tasks[0].id}/cancel-batch/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(cancelled.status_code, 200, cancelled.data)
+        self.assertEqual(cancelled.data["batch_id"], second.data["batch_id"])
+        self.assertEqual(set(cancelled.data["cancelled_task_ids"]), {
+            str(task.id) for task in second_tasks
+        })
+        self.assertEqual(
+            set(GenerationTask.objects.filter(
+                capability_snapshot__batch_id=first.data["batch_id"],
+            ).values_list("status", flat=True)),
+            {GenerationTask.Status.QUEUED},
+        )
+        self.assertEqual(
+            set(GenerationTask.objects.filter(
+                capability_snapshot__batch_id=second.data["batch_id"],
+            ).values_list("status", flat=True)),
+            {GenerationTask.Status.CANCELLED},
+        )
+
+    def test_delete_batch_is_scoped_to_exact_batch_id(self):
+        first = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("delete-exact-batch-a", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(first.status_code, 201, first.data)
+        second = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("delete-exact-batch-b", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(second.status_code, 201, second.data)
+        second_tasks = list(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=second.data["batch_id"],
+        ).order_by("capability_snapshot__batch_index"))
+        for task in second_tasks:
+            task.status = GenerationTask.Status.FAILED
+            task.error_message = "fixture terminal failure"
+            task.finished_at = timezone.now()
+            task.save(update_fields=("status", "error_message", "finished_at", "updated_at"))
+
+        deleted = self.client.delete(
+            f"/api/v1/tasks/{second_tasks[0].id}/delete-batch/",
+            format="json",
+        )
+
+        self.assertEqual(deleted.status_code, 200, deleted.data)
+        self.assertEqual(deleted.data["batch_id"], second.data["batch_id"])
+        self.assertEqual(set(deleted.data["deleted_task_ids"]), {
+            str(task.id) for task in second_tasks
+        })
+        self.assertFalse(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=second.data["batch_id"],
+        ).exists())
+        self.assertEqual(
+            GenerationTask.objects.filter(
+                capability_snapshot__batch_id=first.data["batch_id"],
+            ).count(),
+            2,
+        )
+
+    def test_delete_batch_rejects_non_terminal_tasks(self):
+        response = self.client.post(
+            f"/api/v1/projects/{self.project.id}/build-production/",
+            self.payload("delete-active-batch", extended_generation_confirmed=True),
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201, response.data)
+        tasks = list(GenerationTask.objects.filter(
+            capability_snapshot__batch_id=response.data["batch_id"],
+        ).order_by("capability_snapshot__batch_index"))
+        tasks[0].status = GenerationTask.Status.FAILED
+        tasks[0].error_message = "fixture terminal failure"
+        tasks[0].finished_at = timezone.now()
+        tasks[0].save(update_fields=("status", "error_message", "finished_at", "updated_at"))
+
+        deleted = self.client.delete(
+            f"/api/v1/tasks/{tasks[0].id}/delete-batch/",
+            format="json",
+        )
+
+        self.assertEqual(deleted.status_code, 400, deleted.data)
+        self.assertIn("active_tasks", deleted.data["error"]["details"])
+        self.assertEqual(
+            GenerationTask.objects.filter(
+                capability_snapshot__batch_id=response.data["batch_id"],
+            ).count(),
+            2,
+        )
 
     def test_whole_episode_reuses_each_latest_unchanged_shot_preview(self):
         preview_ids = []
@@ -475,6 +900,7 @@ class WholeEpisodeGenerationTests(TestCase):
             metadata={},
         )
         data = {
+            "shot_version_key": legacy_shot_version_key(self.episode.id),
             "template_id": None,
             "priority": 0,
             "max_attempts": 3,
@@ -893,10 +1319,20 @@ class WholeEpisodeGenerationTests(TestCase):
         missing_key = self.client.post(url, {
             "episode_ids": [str(self.episode.id)],
             "whole_episode": True,
+            "shot_version_key": legacy_shot_version_key(self.episode.id),
             "enqueue": True,
         }, format="json")
         self.assertEqual(missing_key.status_code, 400, missing_key.data)
         self.assertIn("idempotency_key", str(missing_key.data))
+
+        missing_version = self.client.post(url, {
+            "episode_ids": [str(self.episode.id)],
+            "whole_episode": True,
+            "idempotency_key": "missing-version-key",
+            "enqueue": True,
+        }, format="json")
+        self.assertEqual(missing_version.status_code, 400, missing_version.data)
+        self.assertIn("shot_version_key", str(missing_version.data))
 
         selected_shot = self.client.post(url, self.payload(
             "selected-shot-key", shot_ids=[str(self.shot1.id)],

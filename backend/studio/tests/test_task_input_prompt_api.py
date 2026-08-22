@@ -327,7 +327,7 @@ class GenerationTaskInputPromptAPITests(TestCase):
             for query in captured.captured_queries
         ), [query["sql"] for query in captured.captured_queries])
         for row in rows:
-            self.assertEqual(row["capability_snapshot"], {})
+            self.assertNotIn("capability_snapshot", row)
             self.assertEqual(row["staged_inputs"], [])
             self.assertEqual(row["outputs"], [])
             self.assertEqual(row["error_message"], "")

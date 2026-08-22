@@ -159,7 +159,7 @@ class H3WorkflowModeContractTests(TestCase):
         old_system = WorkflowTemplate.objects.create(
             owner=None,
             slug="minimax-h3-base-video",
-            version=2,
+            version=1,
             name="old system workflow",
             provider="comfyui",
             output_kind=WorkflowTemplate.OutputKind.VIDEO,
@@ -309,6 +309,48 @@ class H3WorkflowModeContractTests(TestCase):
         self.assertFalse(any(item["class_type"] == "LoadVideo" for item in workflow.values()))
         self.assertFalse(any(item["class_type"] == "LoadImage" for item in workflow.values()))
         self.assertIn("ref_audios.ref_audio_0", workflow["5"]["inputs"])
+        self.assert_ref_fixed_graph(workflow)
+
+    def test_ref2va_soft_first_frame_reference_reserves_picture_one(self):
+        previous_tail = self.asset(
+            Asset.Kind.REFERENCE,
+            "previous-tail.png",
+            "image/png",
+            metadata={"generation_purpose": "deferred_generation"},
+        )
+        portrait = self.asset(Asset.Kind.CHARACTER, "portrait.png", "image/png")
+        self.character.anchor_asset = portrait
+        self.character.save(update_fields=("anchor_asset", "updated_at"))
+        self.shot.h3_mode = Shot.H3Mode.REF2VA
+        self.shot.requires_first_frame_continuity = True
+        self.shot.reference_bindings = {
+            "first_frame_reference_asset_id": str(previous_tail.id),
+            "characters": [{
+                "entity_id": str(self.character.id),
+                "asset_id": str(portrait.id),
+            }],
+        }
+        self.shot.save(update_fields=(
+            "h3_mode", "requires_first_frame_continuity",
+            "reference_bindings", "updated_at",
+        ))
+        self.shot.reference_assets.set([previous_tail])
+
+        result, prompt = self.prompt(Shot.H3Mode.REF2VA)
+
+        records = result.payload["reference_bindings"]
+        self.assertEqual(
+            [(item["category"], item["input_label"]) for item in records],
+            [("continuity_frame", "<Picture 1>"), ("character", "<Picture 2>")],
+        )
+        self.assertIn("previous shot's tail frame", result.text)
+        self.assertIn("target video's opening state", result.text)
+        template = WorkflowTemplate.objects.get(slug="minimax-h3-reference-video", owner=None)
+        workflow, _, _ = build_workflow(template, prompt, self.project)
+        self.assertEqual(sum(item["class_type"] == "LoadImage" for item in workflow.values()), 2)
+        ref_inputs = workflow["5"]["inputs"]
+        self.assertIn("ref_images.ref_image_0", ref_inputs)
+        self.assertIn("ref_images.ref_image_1", ref_inputs)
         self.assert_ref_fixed_graph(workflow)
 
     def test_ref2va_rejects_mixed_embedded_external_audio_and_media_count_overflow(self):

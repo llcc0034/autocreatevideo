@@ -252,16 +252,10 @@ def canonical_identity_mappings(project: SeriesProject) -> dict[str, str]:
     return mappings
 
 
-def canonical_target_collisions(
+def canonical_target_collision_inputs(
     project: SeriesProject, *, production_settings: dict | None = None,
 ) -> list[dict]:
-    """Return cross-entity collisions in explicit canonical-English mappings.
-
-    Only current authoritative Character/Scene/Prop Bible names participate.
-    Comparison is Unicode NFKC, whitespace-normalised and case-insensitive, so
-    cosmetic spelling differences cannot create two identities that downstream
-    prompts treat as the same proper name.
-    """
+    """Return the exact Bible/glossary rows considered by collision checks."""
 
     settings_value = (
         production_settings
@@ -279,7 +273,7 @@ def canonical_target_collisions(
         for source, target in raw_glossary.items()
         if str(source).strip() and str(target).strip()
     }
-    grouped: dict[str, list[dict]] = {}
+    inputs = []
     for scope_type, model in (
         (PromptFieldTranslation.ScopeType.CHARACTER, CharacterBible),
         (PromptFieldTranslation.ScopeType.SCENE, SceneBible),
@@ -290,27 +284,40 @@ def canonical_target_collisions(
             target = glossary.get(name, "")
             if not target:
                 continue
-            normalized = " ".join(
+            normalized_target = " ".join(
                 unicodedata.normalize("NFKC", target).split()
             ).casefold()
-            if not normalized:
+            if not normalized_target:
                 continue
-            grouped.setdefault(normalized, []).append({
+            inputs.append({
                 "scope_type": scope_type,
                 "scope_id": str(entity.id),
                 "name": name,
                 "canonical_target": target,
-                "_normalized_source": " ".join(
+                "normalized_target": normalized_target,
+                "normalized_source": " ".join(
                     unicodedata.normalize("NFKC", name).split()
                 ).casefold(),
             })
+    return sorted(
+        inputs,
+        key=lambda item: (item["scope_type"], item["name"], item["scope_id"]),
+    )
+
+
+def canonical_target_collisions_from_inputs(inputs: Iterable[dict]) -> list[dict]:
+    """Return public collision diagnostics from a frozen input collection."""
+
+    grouped: dict[str, list[dict]] = {}
+    for item in inputs:
+        grouped.setdefault(str(item["normalized_target"]), []).append(dict(item))
     collisions = []
     for normalized, entities in sorted(grouped.items()):
-        if len({item["_normalized_source"] for item in entities}) < 2:
+        if len({item["normalized_source"] for item in entities}) < 2:
             continue
         public_entities = [{
             key: value for key, value in item.items()
-            if key != "_normalized_source"
+            if key not in {"normalized_source", "normalized_target"}
         } for item in entities]
         collisions.append({
             "code": CanonicalTargetCollisionError.code,
@@ -321,6 +328,24 @@ def canonical_target_collisions(
             ),
         })
     return collisions
+
+
+def canonical_target_collisions(
+    project: SeriesProject, *, production_settings: dict | None = None,
+) -> list[dict]:
+    """Return cross-entity collisions in explicit canonical-English mappings.
+
+    Only current authoritative Character/Scene/Prop Bible names participate.
+    Comparison is Unicode NFKC, whitespace-normalised and case-insensitive, so
+    cosmetic spelling differences cannot create two identities that downstream
+    prompts treat as the same proper name.
+    """
+
+    return canonical_target_collisions_from_inputs(
+        canonical_target_collision_inputs(
+            project, production_settings=production_settings,
+        ),
+    )
 
 
 def ensure_no_canonical_target_collisions(
@@ -1155,34 +1180,72 @@ def validate_manual_translation(source: str, translated: str) -> str:
     return restored
 
 
-def confirmed_translation(
+def confirmed_translation_with_snapshot(
     *, project_id, scope_type: str, scope_id, field_key: str, source_text: str,
-) -> str:
+) -> tuple[str, dict]:
+    """Resolve one confirmed overlay and return the exact adopted evidence."""
+
     source = str(source_text or "")
+    source_hash = source_text_hash(source)
+    base_snapshot = {
+        "scope_type": str(scope_type),
+        "scope_id": str(scope_id),
+        "field_key": str(field_key),
+        "source_text": source,
+        "source_hash": source_hash,
+        "translation": None,
+    }
     if not source:
-        return source
+        return source, {**base_snapshot, "effective_text": source}
     entry = PromptFieldTranslation.objects.filter(
         project_id=project_id,
         scope_type=scope_type,
         scope_id=scope_id,
         field_key=field_key,
-        source_hash=source_text_hash(source),
+        source_hash=source_hash,
         status=PromptFieldTranslation.Status.CONFIRMED,
     ).only(
-        "scope_type", "scope_id", "field_key", "source_hash",
-        "translated_text", "runtime_metadata",
+        "id", "scope_type", "scope_id", "field_key", "source_hash",
+        "translated_text", "runtime_metadata", "revision",
     ).first()
     if entry is None:
-        return source
+        return source, {**base_snapshot, "effective_text": source}
     try:
         project = SeriesProject.objects.get(pk=project_id)
     except SeriesProject.DoesNotExist:
-        return source
+        return source, {**base_snapshot, "effective_text": source}
     if not translation_entry_context_current(
         entry, project=project, current_source=source,
     ):
-        return source
-    return entry.translated_text or source
+        return source, {**base_snapshot, "effective_text": source}
+    effective = entry.translated_text or source
+    metadata = entry.runtime_metadata if isinstance(entry.runtime_metadata, dict) else {}
+    return effective, {
+        **base_snapshot,
+        "effective_text": effective,
+        "translation": {
+            "id": str(entry.id),
+            "revision": entry.revision,
+            "source_hash": entry.source_hash,
+            "translated_text": entry.translated_text,
+            "translated_text_sha256": source_text_hash(entry.translated_text),
+            "context_hash": str(metadata.get("translation_context_hash") or ""),
+            "context_version": metadata.get("translation_context_version"),
+        },
+    }
+
+
+def confirmed_translation(
+    *, project_id, scope_type: str, scope_id, field_key: str, source_text: str,
+) -> str:
+    value, _snapshot = confirmed_translation_with_snapshot(
+        project_id=project_id,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        field_key=field_key,
+        source_text=source_text,
+    )
+    return value
 
 
 def confirmed_translation_fingerprint(

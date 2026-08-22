@@ -30,7 +30,6 @@ import type {
 const props = defineProps<{
   project: SeriesProject
   style?: StylePreset
-  prepareSource: () => Promise<SeriesProject | null>
   blockedReason?: string
 }>()
 const emit = defineEmits<{ applied: [result: VisualRulesDraftApplyResult] }>()
@@ -111,15 +110,13 @@ const generate = async () => {
   const localSourceChanged = sourceChanged.value
   error.value = ''; notice.value = ''; phase.value = 'generating'
   try {
-    const mustPersistCurrentSource = !result.value || localSourceChanged || restartingAfterApply
-    const saved = mustPersistCurrentSource ? await props.prepareSource() : props.project
-    if (!saved) throw new Error('当前故事资料保存失败；尚未调用本地 Qwen。')
+    const saved = await repository.getProject(props.project.id)
     const requestSnapshot = visualRulesLocalContextSnapshot(saved, props.style)
     const nextAttempt = Math.min(100, attempt.value + 1)
     const next = await repository.generateVisualRulesDraft(saved.id, {
       attempt: nextAttempt,
       variationNote: variationNote.value,
-      expectedContextFingerprint: result.value && !mustPersistCurrentSource
+      expectedContextFingerprint: result.value && !localSourceChanged && !restartingAfterApply
         ? result.value.contextFingerprint
         : undefined,
     })
@@ -131,7 +128,9 @@ const generate = async () => {
     generatedVariationNote.value = variationNote.value.trim()
     sourceSnapshot.value = requestSnapshot
     phase.value = 'ready'
-    notice.value = '英文候选只保存在当前页面；尚未修改任何正式字段。请逐项核对后再采用。'
+    notice.value = sourceChanged.value
+      ? '英文候选已生成，但当前页面与服务端已保存来源不一致。请先保存或刷新项目，再重新生成后采用。'
+      : '英文候选只保存在当前页面；尚未修改任何正式字段。请逐项核对后再采用。'
   } catch (cause) {
     const detail = visualRulesDraftError(cause)
     phase.value = detail.kind === 'resource_busy' ? 'busy' : detail.kind === 'source_conflict' ? 'conflict' : 'failed'
@@ -218,7 +217,7 @@ const rowChanged = (key: keyof VisualRulesDraftData): boolean => Boolean(candida
 
     <div class="visual-draft-sources">
       <Database :size="15"/><span><strong>自动读取已保存来源</strong><small>项目名称、故事简介、全剧母稿、风格文本、画幅与尺寸、目标模型、三类 Bible 稳定身份字段、canonical 术语表、现行项目规则，以及已有剧集的编号 / 标题 / 梗概。</small><em>不会读取剧集剧本、分镜、参考图像素，也不会修改风格模板或术语表。</em><em v-if="result">本次服务端确认：角色 {{ result.sourceSummary.characterCount }}、场景 {{ result.sourceSummary.sceneCount }}、道具 {{ result.sourceSummary.propCount }}、剧集摘要 {{ result.sourceSummary.episodeSummaryCount }}；剧集剧本 / 分镜均未读取。</em></span>
-      <details><summary>查看边界 <ChevronDown :size="12"/></summary><p>本地 Qwen 只提议结构化色彩设计，不得输出人物、场景、道具事实或某一集的具体动作；负面词与连续性摘要由服务端确定性构造。生成前会保存当前页面资料；候选生成后若任何来源变化，旧候选会被阻止采用。</p></details>
+      <details><summary>查看边界 <ChevronDown :size="12"/></summary><p>本地 Qwen 只提议结构化色彩设计，不得输出人物、场景、道具事实或某一集的具体动作；负面词与连续性摘要由服务端确定性构造。生成候选前不会自动保存当前页面资料，只读取服务端已保存来源；候选生成后若任何来源变化，旧候选会被阻止采用。</p></details>
     </div>
 
     <div class="visual-draft-controls">
@@ -227,7 +226,7 @@ const rowChanged = (key: keyof VisualRulesDraftData): boolean => Boolean(candida
     </div>
 
     <div v-if="blockedReason" class="visual-draft-message danger"><AlertTriangle :size="14"/><span><strong>canonical 术语碰撞 · 已暂停生成与采用</strong><small>{{ blockedReason }} 请先在上方术语表修正并保存。</small></span></div>
-    <div v-if="sourceChanged" class="visual-draft-message danger"><AlertTriangle :size="14"/><span><strong>候选依据已变化</strong><small>当前页面与生成时的故事上下文不一致。旧候选不能采用；点击“重新生成候选”会先保存当前资料，再建立新的故事指纹。</small></span></div>
+    <div v-if="sourceChanged" class="visual-draft-message danger"><AlertTriangle :size="14"/><span><strong>候选依据已变化</strong><small>当前页面与生成时的已保存故事上下文不一致。旧候选不能采用；请先手动保存或刷新项目，再点击“重新生成候选”建立新的故事指纹。</small></span></div>
     <div v-if="error" class="visual-draft-message danger"><AlertTriangle :size="14"/><span><strong>{{ phaseProfile.label }}</strong><small>{{ error }}</small></span><button type="button" :disabled="actionBusy" @click="generate"><RefreshCw :size="12"/>重试</button></div>
     <div v-if="notice" class="visual-draft-message success"><ShieldCheck :size="14"/><span><strong>{{ phase==='applied'?'正式规则已保存':'候选与正式值隔离' }}</strong><small>{{ notice }}</small></span></div>
     <div v-if="result?.warnings.length" class="visual-draft-message warning"><AlertTriangle :size="14"/><span><strong>服务端提示</strong><small v-for="warning in result.warnings" :key="warning">{{ warning }}</small></span></div>

@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { fileURLToPath } from 'node:url'
+
+import { createServer } from 'vite'
 
 import { buildGeneratedImageAssetPromotionPayload } from '../src/services/outputAssetPromotion.ts'
 import { adaptPromptArtifact } from '../src/services/promptArtifactAdapter.ts'
@@ -56,6 +59,35 @@ test('video prompt retains mode, duration and reference bindings', () => {
   assert.equal(adapted.mode, 'Ref2VA')
   assert.equal(adapted.duration, 5)
   assert.deepEqual(adapted.reference_bindings, bindings)
+})
+
+test('Ref2VA first-frame continuity reference is serialized as a soft picture slot', async (context) => {
+  const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
+  const server = await createServer({
+    root: frontendRoot,
+    logLevel: 'silent',
+    appType: 'custom',
+    server: { middlewareMode: true, hmr: false },
+  })
+  context.after(async () => { await server.close() })
+  const { referenceAssetIdsForShot, referenceBindingsPayload } = await server.ssrLoadModule('/src/services/backendAdapters.ts')
+  const bindings = {
+    firstFrameReferenceAssetId: 'asset-tail-frame',
+    characters: [{ entityId: 'character-1', assetId: 'asset-character' }],
+    props: [],
+  }
+  assert.deepEqual(referenceBindingsPayload(bindings), {
+    first_frame_reference_asset_id: 'asset-tail-frame',
+    characters: [{ entity_id: 'character-1', asset_id: 'asset-character' }],
+  })
+  const shot = {
+    mode: 'Ref2VA',
+    referenceBindings: bindings,
+  }
+  assert.deepEqual(
+    referenceAssetIdsForShot(shot),
+    ['asset-tail-frame', 'asset-character'],
+  )
 })
 
 test('prompt artifact adapter keeps backend-authoritative compiler freshness metadata', () => {

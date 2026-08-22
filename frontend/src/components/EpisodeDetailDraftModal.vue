@@ -16,6 +16,8 @@ const props = defineProps<{
   projectId: string
   episode: Episode
   shots: Shot[]
+  shotVersionKey: string
+  shotVersionLabel: string
   initialMode: 'expand' | 'apply'
   blockedReason?: string
   persistEpisode: () => Promise<unknown>
@@ -94,6 +96,12 @@ const loadCapability = async (epoch = requestEpoch) => {
 const loadBatch = async (batchId: string, epoch = requestEpoch) => {
   const next = await shotDetailDraftRepository.batchDetailAll(batchId)
   if (epoch !== requestEpoch || !props.open) return
+  if (
+    next.batch.versionScopeStatus !== 'resolved'
+    || next.batch.shotVersionKey !== props.shotVersionKey
+  ) {
+    throw new Error('服务端返回的扩写批次不属于当前分镜版本；已阻止跨版本展示和应用。')
+  }
   detail.value = next
   provider.value = next.batch.provider
   if (
@@ -123,7 +131,9 @@ const schedulePoll = () => {
 }
 
 const restoreLatest = async (epoch = requestEpoch) => {
-  const rows = await shotDetailDraftRepository.listBatches(props.projectId, props.episode.id)
+  const rows = await shotDetailDraftRepository.listBatches(
+    props.projectId, props.episode.id, props.shotVersionKey,
+  )
   if (epoch !== requestEpoch || !props.open) return
   if (rows[0]) await loadBatch(rows[0].id, epoch)
   else detail.value = null
@@ -147,6 +157,7 @@ const create = async (acknowledged = false) => {
     pendingRequestId.value ||= uuid()
     const created = await shotDetailDraftRepository.createBatch(props.projectId, {
       episodeId: props.episode.id,
+      shotVersionKey: props.shotVersionKey,
       requestId: pendingRequestId.value,
       provider: provider.value,
       variationNote: variationNote.value.trim(),
@@ -232,6 +243,9 @@ const applyBatch = async () => {
 
 const hydrateModal = async () => {
   const epoch = ++requestEpoch
+  window.clearTimeout(pollTimer)
+  detail.value = null
+  reconciledAppliedBatchId = ''
   loading.value = true; error.value = ''; notice.value = ''; confirmation.value = null
   pendingRequestId.value = ''; languageMode.value = 'chinese_only'
   englishReviewAcknowledged.value = false; reviewAcknowledged.value = false
@@ -245,13 +259,20 @@ const hydrateModal = async () => {
   }
 }
 
-watch(() => props.open, (value) => {
-  if (value) void hydrateModal()
-  else { requestEpoch += 1; window.clearTimeout(pollTimer) }
-})
-watch(() => [props.projectId, props.episode.id], () => {
-  if (props.open) void hydrateModal()
-})
+watch(
+  () => [props.open, props.projectId, props.episode.id, props.shotVersionKey] as const,
+  ([isOpen]) => {
+    requestEpoch += 1
+    window.clearTimeout(pollTimer)
+    detail.value = null
+    confirmation.value = null
+    pendingRequestId.value = ''
+    error.value = ''
+    notice.value = ''
+    if (isOpen) void hydrateModal()
+  },
+  { immediate: true },
+)
 watch(() => batch.value?.generationStatus, schedulePoll)
 onBeforeUnmount(() => window.clearTimeout(pollTimer))
 </script>
@@ -259,7 +280,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
 <template>
   <BaseModal :open="props.open" :title="initialMode==='apply' ? '整集应用高细节扩写' : '整集高细节扩写'" eyebrow="EPISODE HIGH-DETAIL DRAFT" width="1120px" @close="emit('close')">
     <div class="episode-detail-modal" :aria-busy="loading||creating||applying">
-      <p class="scope-note">仅视频镜头进入扩写队列；图片镜头会明确标记为“已跳过”。批次创建时冻结扩写前内容，应用时必须一次提交全部视频候选，任一镜头失败都不会部分写入。</p>
+      <p class="scope-note"><strong>当前分镜版本：{{ props.shotVersionLabel }}</strong>。仅本版本的视频镜头进入扩写队列；图片镜头会明确标记为“已跳过”。批次创建时冻结扩写前内容，其他分镜版本的记录不会在这里显示或应用。</p>
       <div v-if="error" class="modal-alert error" role="alert"><AlertTriangle :size="15"/><span>{{ error }}</span></div>
       <div v-if="notice" class="modal-alert success" role="status"><Check :size="15"/><span>{{ notice }}</span></div>
       <div v-if="confirmation" class="confirmation" role="alertdialog" aria-labelledby="detail-confirm-title">
@@ -282,7 +303,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
 
       <template v-if="batch&&detail">
         <section class="batch-summary">
-          <div><strong>{{ batch.provider==='deepseek_api' ? 'DeepSeek API' : '本地 Qwen' }}</strong><small>批次 {{ batch.id.slice(0,8) }} · 通道在创建后锁定</small></div>
+          <div><strong>{{ batch.provider==='deepseek_api' ? 'DeepSeek API' : '本地 Qwen' }}</strong><small>{{ batch.shotVersionLabel }} · 批次 {{ batch.id.slice(0,8) }} · 通道在创建后锁定</small></div>
           <div class="progress-copy"><b>{{ progress }}%</b><span>{{ batch.succeededCount }} 成功 · {{ batch.pendingCount }} 待处理 · {{ batch.failedCount }} 失败 · {{ batch.staleCount }} 已变化 · {{ batch.skippedCount }} 跳过</span></div>
           <div class="progress" role="progressbar" aria-label="整集扩写进度" :aria-valuenow="progress" aria-valuemin="0" aria-valuemax="100"><i :style="{width:`${progress}%`}"></i></div>
         </section>
@@ -305,7 +326,7 @@ onBeforeUnmount(() => window.clearTimeout(pollTimer))
         </section>
       </template>
       <div v-else-if="loading" class="loading"><LoaderCircle class="spin" :size="16"/>读取整集扩写状态…</div>
-      <div v-else-if="initialMode==='apply'" class="empty"><strong>当前剧集还没有整集扩写批次</strong><p>请从“整集扩写”创建批次，候选全部完成后再原子应用。</p></div>
+      <div v-else-if="initialMode==='apply'" class="empty"><strong>{{ props.shotVersionLabel }}还没有整集扩写批次</strong><p>请在当前分镜版本中创建批次，候选全部完成后再原子应用。</p></div>
     </div>
   </BaseModal>
 </template>

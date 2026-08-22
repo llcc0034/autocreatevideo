@@ -21,8 +21,8 @@ from studio.models import Asset, Shot
 
 
 REFERENCE_BINDING_KEYS = frozenset({
-    "first_frame_asset_id", "last_frame_asset_id", "characters", "scene", "props",
-    "videos", "audios",
+    "first_frame_asset_id", "last_frame_asset_id", "first_frame_reference_asset_id",
+    "characters", "scene", "props", "videos", "audios",
 })
 ENTITY_BINDING_KEYS = frozenset({"entity_id", "asset_id"})
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
@@ -312,6 +312,11 @@ def normalize_shot_reference_bindings(
         normalized["last_frame_asset_id"] = _uuid_string(
             bindings["last_frame_asset_id"], "last_frame_asset_id",
         )
+    if bindings.get("first_frame_reference_asset_id") not in (None, ""):
+        normalized["first_frame_reference_asset_id"] = _uuid_string(
+            bindings["first_frame_reference_asset_id"],
+            "first_frame_reference_asset_id",
+        )
     character_items = _normalize_entity_items(bindings.get("characters", []), "characters")
     prop_items = _normalize_entity_items(bindings.get("props", []), "props")
     scene_item = _normalize_scene(bindings.get("scene"))
@@ -332,6 +337,7 @@ def normalize_shot_reference_bindings(
         value for key in ("first_frame_asset_id", "last_frame_asset_id")
         if (value := normalized.get(key))
     ]
+    continuity_frame_id = normalized.get("first_frame_reference_asset_id")
     classified = [*character_items, *prop_items, *([scene_item] if scene_item else [])]
     classified_ids = [item["asset_id"] for item in classified]
     video_asset_ids = [item["asset_id"] for item in video_items]
@@ -340,7 +346,12 @@ def normalize_shot_reference_bindings(
     ]
     standalone_audio_ids = [item["asset_id"] for item in audio_items]
     all_asset_ids = [
-        *frame_ids, *classified_ids, *video_asset_ids, *paired_audio_ids, *standalone_audio_ids,
+        *frame_ids,
+        *([continuity_frame_id] if continuity_frame_id else []),
+        *classified_ids,
+        *video_asset_ids,
+        *paired_audio_ids,
+        *standalone_audio_ids,
     ]
     if len(all_asset_ids) != len(set(all_asset_ids)):
         raise ReferenceBindingError(
@@ -366,9 +377,9 @@ def normalize_shot_reference_bindings(
         if frame_ids:
             raise ReferenceBindingError(
                 "Ref2VA 不使用 first_frame_asset_id / last_frame_asset_id；"
-                "可使用 characters、scene、props、videos 和 audios"
+                "可使用 first_frame_reference_asset_id、characters、scene、props、videos 和 audios"
             )
-        if len(classified) > 9:
+        if len(classified) + (1 if continuity_frame_id else 0) > 9:
             raise ReferenceBindingError("Ref2VA 最多允许 9 张分类参考图")
     else:
         raise ReferenceBindingError(f"不支持的 H3 模式: {mode}")
@@ -420,7 +431,11 @@ def normalize_shot_reference_bindings(
             )
 
     shot_asset_ids = {str(item.id) for item in shot_reference_assets}
-    for field in ("first_frame_asset_id", "last_frame_asset_id"):
+    for field in (
+        "first_frame_asset_id",
+        "last_frame_asset_id",
+        "first_frame_reference_asset_id",
+    ):
         asset_id = normalized.get(field)
         if asset_id and asset_id not in shot_asset_ids:
             raise ReferenceBindingError(
@@ -540,6 +555,15 @@ def resolve_group_reference_bindings(
             asset_ids.append(last_id)
             categories.append(("last_frame", None, None))
     elif mode == Shot.H3Mode.REF2VA:
+        continuity_ids = {
+            item["first_frame_reference_asset_id"]
+            for item in normalized
+            if item.get("first_frame_reference_asset_id")
+        }
+        if continuity_ids and len(normalized) > 1:
+            raise ReferenceBindingError("Ref2VA 首帧连续参考只能用于单镜任务")
+        if len(continuity_ids) > 1:
+            raise ReferenceBindingError("Ref2VA 首帧连续参考只能绑定一张图片")
         merged: dict[tuple[str, str], str] = {}
         for item in normalized:
             for category, values in (
@@ -557,7 +581,7 @@ def resolve_group_reference_bindings(
                     merged[key] = value["asset_id"]
         if len(set(merged.values())) != len(merged):
             raise ReferenceBindingError("Ref2VA 合并后同一 asset_id 不能映射到不同实体")
-        if len(merged) > 9:
+        if len(merged) + len(continuity_ids) > 9:
             raise ReferenceBindingError("Ref2VA 多分镜合并后最多允许 9 张参考图")
         media_videos = normalized[0].get("videos", [])
         media_audios = normalized[0].get("audios", [])
@@ -587,11 +611,17 @@ def resolve_group_reference_bindings(
             raise ReferenceBindingError(
                 "分类参考图尚未写入项目稳定槽位；请先运行 sync_consistency_locks"
             )
-        asset_ids = [asset_id for _, asset_id in ordered]
-        categories = [
+        asset_ids = []
+        categories = []
+        if continuity_ids:
+            continuity_id = next(iter(continuity_ids))
+            asset_ids.append(continuity_id)
+            categories.append(("continuity_frame", None, None))
+        asset_ids.extend(asset_id for _, asset_id in ordered)
+        categories.extend(
             (category, entity_id, entities[(category, entity_id)])
             for (category, entity_id), _ in ordered
-        ]
+        )
     else:
         raise ReferenceBindingError(f"不支持的 H3 模式: {mode}")
 
@@ -611,6 +641,15 @@ def resolve_group_reference_bindings(
             "entity_label": _binding_entity_label(category, entity_id, subject_slots)
             if category in {"character", "scene", "prop"} else "",
         })
+        if category == "continuity_frame":
+            record.update({
+                "purpose": "first_frame_continuity_reference",
+                "entity_name": "",
+                "prompt_hint": (
+                    record.get("prompt_hint")
+                    or "Use as the previous-shot tail frame and target starting-state reference."
+                ),
+            })
         records.append(record)
     audio_ordinal = 1
     for video_ordinal, item in enumerate(media_videos, start=1):

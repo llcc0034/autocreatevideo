@@ -151,6 +151,12 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             {
                 "creative_generation_supported", "review_required",
                 "default_provider", "providers",
+                "series_concept_draft_preferred_provider",
+                "series_concept_draft_supported",
+                "series_concept_draft_schema_version",
+                "series_concept_draft_limits",
+                "series_concept_draft_review_required",
+                "series_concept_draft_persisted",
                 "shot_high_detail_supported", "shot_high_detail_schema_version",
                 "shot_high_detail_policies",
                 "shot_high_detail_shared_resource_busy",
@@ -185,8 +191,118 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "baseline_max_new_tokens", "max_new_tokens", "max_output_tokens",
             "configured_max_new_tokens", "runtime_timeout_seconds",
             "min_context_size", "max_context_size", "reserved_input_tokens",
+            "series_concept_draft_suitability",
+            "series_concept_draft_suitability_reason_code",
+            "series_concept_draft_suitability_notice",
+            "series_concept_draft_timeout_seconds",
+            "series_concept_draft_max_output_tokens",
         } <= set(provider))
         self.assertIn("temporarily_busy", provider)
+        suitability_ref = provider["series_concept_draft_suitability"]["$ref"]
+        self.assertEqual(
+            components[suitability_ref.rsplit("/", 1)[-1]]["enum"],
+            ["recommended", "experimental"],
+        )
+        reason_ref = provider[
+            "series_concept_draft_suitability_reason_code"
+        ]["$ref"]
+        self.assertEqual(
+            components[reason_ref.rsplit("/", 1)[-1]]["enum"],
+            [
+                "series_concept_strict_structure_recommended",
+                "series_concept_strict_structure_experimental",
+            ],
+        )
+
+    def test_series_concept_contract_documents_duration_and_unbounded_counts(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        components = schema["components"]["schemas"]
+        operation = schema["paths"][
+            "/api/v1/series-concept-drafts/generate/"
+        ]["post"]
+
+        request_ref = operation["requestBody"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        request = components[request_ref.rsplit("/", 1)[-1]]["properties"]
+        self.assertEqual(request["episode_count"]["minimum"], 1)
+        self.assertNotIn("maximum", request["episode_count"])
+        self.assertEqual(request["shots_per_episode"]["minimum"], 1)
+        self.assertNotIn("maximum", request["shots_per_episode"])
+        self.assertEqual(
+            request["episode_duration_seconds"],
+            {"type": "integer", "minimum": 1, "default": 60},
+        )
+
+        response_ref = operation["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        response = components[response_ref.rsplit("/", 1)[-1]]["properties"]
+        candidate_ref = response["candidate"]["$ref"]
+        candidate = components[candidate_ref.rsplit("/", 1)[-1]]
+        self.assertIn("bible", candidate["properties"])
+        self.assertEqual(
+            set(candidate["required"]),
+            {"title", "logline", "master_script", "bible"},
+        )
+        bible_ref = candidate["properties"]["bible"]["$ref"]
+        bible = components[bible_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(bible["required"]), {"characters", "scenes", "props"})
+        entity_ref = bible["properties"]["characters"]["items"]["$ref"]
+        entity = components[entity_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(
+            set(entity["required"]),
+            {"name", "description", "visual_identity_en"},
+        )
+        estimate_ref = response["resource_estimate"]["$ref"]
+        estimate = components[estimate_ref.rsplit("/", 1)[-1]]["properties"]
+        self.assertEqual(set(estimate), {
+            "total_shots",
+            "estimated_input_chars",
+            "estimated_output_tokens",
+            "configured_output_token_hint",
+            "output_hint_utilization_percent",
+        })
+        format_ref = response["format"]["$ref"]
+        format_properties = components[
+            format_ref.rsplit("/", 1)[-1]
+        ]["properties"]
+        self.assertEqual(format_properties["schema_version"], {
+            "type": "integer", "maximum": 2, "minimum": 2,
+        })
+        template_ref = format_properties["template_id"]["$ref"]
+        self.assertEqual(
+            components[template_ref.rsplit("/", 1)[-1]]["enum"],
+            ["deterministic-script-breakdown-v3"],
+        )
+        self.assertIn("episode_duration_seconds", format_properties)
+        self.assertIn("total_duration_ms", format_properties)
+        self.assertIn("shot_durations_ms", format_properties)
+
+        for status_code in ("502", "503"):
+            error_ref = operation["responses"][status_code]["content"][
+                "application/json"
+            ]["schema"]["$ref"]
+            error = components[error_ref.rsplit("/", 1)[-1]]["properties"]
+            nested_error = components[
+                error["error"]["$ref"].rsplit("/", 1)[-1]
+            ]["properties"]
+            details = components[
+                nested_error["details"]["$ref"].rsplit("/", 1)[-1]
+            ]["properties"]
+            diagnostic = components[
+                details["diagnostic"]["$ref"].rsplit("/", 1)[-1]
+            ]["properties"]
+            self.assertEqual(set(diagnostic), {
+                "diagnostic_id", "provider", "error_code", "failure_phase",
+                "finish_reason", "usage", "details_available", "details",
+            })
+            expanded = components[
+                diagnostic["details"]["$ref"].rsplit("/", 1)[-1]
+            ]["properties"]
+            self.assertIn("configured_timeout_seconds", expanded)
+            self.assertIn("configured_max_tokens", expanded)
+            self.assertIn("output", expanded)
 
     def test_shot_detail_batch_contract_is_async_confirmed_and_atomic(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -201,12 +317,46 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         create = paths[create_path]["post"]
         self.assertEqual(set(create["responses"]), {"200", "202", "409", "503"})
         request_ref = create["requestBody"]["content"]["application/json"]["schema"]["$ref"]
-        request = schema["components"]["schemas"][request_ref.rsplit("/", 1)[-1]]["properties"]
+        request_schema = schema["components"]["schemas"][request_ref.rsplit("/", 1)[-1]]
+        request = request_schema["properties"]
+        self.assertIn("shot_version_key", request_schema["required"])
         self.assertEqual(
             request["confirmation_acknowledged"],
             {"type": "boolean", "default": False},
         )
         self.assertNotIn("max_shots", request)
+
+        batch_component = schema["components"]["schemas"]["ShotDetailDraftBatch"]
+        self.assertTrue({
+            "shot_version_key", "shot_version_label", "version_scope_status",
+        }.issubset(batch_component["properties"]))
+        version_scope_schema = batch_component["properties"]["version_scope_status"]
+        version_scope_ref = version_scope_schema.get("$ref")
+        if not version_scope_ref:
+            version_scope_ref = version_scope_schema.get("allOf", [{}])[0].get("$ref")
+        self.assertTrue(version_scope_ref)
+        version_scope_enum = schema["components"]["schemas"][
+            version_scope_ref.rsplit("/", 1)[-1]
+        ]["enum"]
+        self.assertEqual(
+            set(version_scope_enum),
+            {"resolved", "legacy_mixed", "legacy_partial", "legacy_unknown"},
+        )
+
+        list_operation = paths[create_path]["get"]
+        parameters = {item["name"]: item for item in list_operation["parameters"]}
+        self.assertTrue(parameters["episode"]["required"])
+        self.assertEqual(parameters["episode"]["schema"]["format"], "uuid")
+        self.assertTrue(parameters["shot_version_key"]["required"])
+        list_ref = list_operation["responses"]["200"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        list_schema = schema["components"]["schemas"][list_ref.rsplit("/", 1)[-1]]
+        self.assertIn("results", list_schema["properties"])
+        self.assertEqual(
+            list_schema["properties"]["results"]["items"]["$ref"],
+            "#/components/schemas/ShotDetailDraftBatch",
+        )
 
         apply = paths[apply_path]["post"]
         self.assertEqual(set(apply["responses"]), {"200", "400", "409"})
@@ -233,6 +383,24 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         ]["properties"]
         self.assertIn("applied_shots", detail_response)
         self.assertIn("translation_written", detail_response)
+
+    def test_episode_shot_sync_requires_an_explicit_storyboard_version(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        operation = schema["paths"]["/api/v1/episodes/{id}/sync-shots/"]["post"]
+        request_ref = operation["requestBody"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        request_schema = schema["components"]["schemas"][
+            request_ref.rsplit("/", 1)[-1]
+        ]
+        self.assertEqual(
+            set(request_schema["required"]),
+            {"shot_version_key", "shots"},
+        )
+        self.assertEqual(
+            request_schema["properties"]["shot_version_key"]["maxLength"],
+            191,
+        )
 
     def test_production_queue_guidance_and_confirmation_are_explicit_contracts(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -264,6 +432,12 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         )
 
         request = components["ProductionBuildRequest"]["properties"]
+        self.assertEqual(request["shot_version_key"]["maxLength"], 191)
+        self.assertIn("whole_episode=true", request["shot_version_key"]["description"])
+        self.assertNotIn(
+            "shot_version_key",
+            components["ProductionBuildRequest"].get("required", []),
+        )
         self.assertEqual(
             request["extended_generation_confirmed"],
             {
@@ -303,7 +477,24 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         self.assertTrue({
             "batch_id", "batch_kind", "batch_size", "task_ids",
             "production_units", "extended_generation_confirmed",
+            "deferred_generation_request_ids",
+            "shot_version_key", "shot_version_label", "batch_shot_ids",
+            "batch_slots",
         } <= set(build_response))
+        self.assertEqual(
+            build_response["batch_slots"]["items"]["$ref"],
+            "#/components/schemas/GenerationTaskBatchSlot",
+        )
+        slot_properties = components["GenerationTaskBatchSlot"]["properties"]
+        self.assertTrue({
+            "shot_version_key", "shot_version_label", "batch_index",
+            "batch_size", "slot_status", "shot_id", "task_id",
+            "deferred_generation_request_id",
+        } <= set(slot_properties))
+        build_counts = components["ProductionBuildCounts"]["properties"]
+        self.assertTrue({
+            "prompts", "workflows", "tasks", "deferred_generation_requests",
+        } <= set(build_counts))
         details = components["ProductionQueueConfirmationErrorDetails"]["properties"]
         self.assertEqual(
             set(details),
@@ -342,6 +533,42 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             self.assertEqual(confirmation["type"], "boolean")
             self.assertFalse(confirmation["default"])
 
+        resume_batch = schema["paths"]["/api/v1/tasks/{id}/resume-batch/"]["post"]
+        self.assertEqual(
+            resume_batch["requestBody"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/GenerationTaskRetryRequest",
+        )
+        self.assertEqual(set(resume_batch["responses"]), {"200", "201", "409"})
+        for status_code in ("200", "201"):
+            self.assertEqual(
+                resume_batch["responses"][status_code]["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/ProductionBatchResumeResponse",
+            )
+        self.assertEqual(
+            resume_batch["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProductionQueueConfirmationErrorResponse",
+        )
+
+        cancel_batch = schema["paths"]["/api/v1/tasks/{id}/cancel-batch/"]["post"]
+        self.assertNotIn("requestBody", cancel_batch)
+        self.assertEqual(set(cancel_batch["responses"]), {"200"})
+        self.assertEqual(
+            cancel_batch["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProductionBatchCancelResponse",
+        )
+
+        delete_batch = schema["paths"]["/api/v1/tasks/{id}/delete-batch/"]["delete"]
+        self.assertNotIn("requestBody", delete_batch)
+        self.assertEqual(set(delete_batch["responses"]), {"200", "400"})
+        self.assertEqual(
+            delete_batch["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProductionBatchDeleteResponse",
+        )
+        self.assertEqual(
+            delete_batch["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/APIValidationErrorEnvelope",
+        )
+
         project_create = schema["paths"]["/api/v1/projects/"]["post"]
         self.assertEqual(
             project_create["requestBody"]["content"]["application/json"]["schema"]["$ref"],
@@ -353,14 +580,18 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         operation = schema["paths"][
             "/api/v1/projects/{id}/breakdown-script/"
         ]["post"]
-        self.assertEqual(set(operation["responses"]), {"201", "409"})
+        self.assertEqual(set(operation["responses"]), {"201", "400", "409"})
         self.assertEqual(
             operation["responses"]["201"]["content"]["application/json"]["schema"]["$ref"],
             "#/components/schemas/ScriptBreakdownResponse",
         )
         self.assertEqual(
+            operation["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/APIValidationErrorEnvelope",
+        )
+        self.assertEqual(
             operation["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
-            "#/components/schemas/ScriptRebuildConflictResponse",
+            "#/components/schemas/ScriptBreakdownConflictResponse",
         )
         request = schema["components"]["schemas"]["ScriptBreakdownRequest"]["properties"]
         self.assertTrue({
@@ -368,6 +599,7 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "default_first_frame_continuity",
             "default_last_frame_continuity",
             "discard_existing_production",
+            "continue_without_script_bible",
         } <= set(request))
         response = schema["components"]["schemas"]["ScriptBreakdownResponse"]["properties"]
         self.assertIn("cleared", response)
@@ -376,3 +608,232 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "requires_first_frame_continuity",
             "requires_last_frame_continuity",
         } <= set(shot))
+
+    def test_script_bible_apply_documents_the_global_validation_envelope(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        operation = schema["paths"][
+            "/api/v1/projects/{id}/script-bible-candidates/apply/"
+        ]["post"]
+        self.assertEqual(
+            operation["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/APIValidationErrorEnvelope",
+        )
+        components = schema["components"]["schemas"]
+        envelope = components["APIValidationErrorEnvelope"]
+        self.assertEqual(set(envelope["required"]), {"error"})
+        error = components["APIValidationError"]
+        self.assertEqual(
+            set(error["required"]), {"status_code", "code", "details"},
+        )
+        self.assertEqual(error["properties"]["details"], {})
+        for component_name in (
+            "CharacterBibleRequest",
+            "SceneBibleRequest",
+            "PropBibleRequest",
+            "CharacterBibleSyncItemRequest",
+        ):
+            description = components[component_name]["properties"][
+                "metadata"
+            ]["description"]
+            self.assertIn("script_bible_v1", description)
+            self.assertIn("apply", description)
+
+    def test_bible_image_candidate_and_promotion_contracts_are_closed_and_explicit(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        components = schema["components"]["schemas"]
+        candidate_operation = schema["paths"][
+            "/api/v1/projects/{id}/bible-image-candidates/"
+        ]["post"]
+        request_ref = candidate_operation["requestBody"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        candidate_request = components[request_ref.rsplit("/", 1)[-1]]
+        self.assertIs(candidate_request["additionalProperties"], False)
+        self.assertEqual(
+            set(candidate_request["required"]),
+            {"entity_type", "entity_id", "idempotency_key"},
+        )
+        self.assertIn("prompt_overrides", candidate_request["properties"])
+        latest = components["BibleImageLatestCandidate"]
+        latest_properties = latest["properties"]
+        projection = components["BibleImageCandidateProjection"]
+        response_ref = schema["paths"][
+            "/api/v1/projects/{id}/bible-image-candidates/"
+        ]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        response_schema = components[response_ref.rsplit("/", 1)[-1]]
+        self.assertIn("prompt_config", response_schema["properties"])
+        prompt_config_ref = response_schema["properties"]["prompt_config"]["$ref"]
+        self.assertIs(
+            components[prompt_config_ref.rsplit("/", 1)[-1]]["additionalProperties"],
+            False,
+        )
+        self.assertIn("current_prompt_inputs", projection["properties"])
+        prompt_inputs_ref = projection["properties"]["current_prompt_inputs"]["$ref"]
+        prompt_inputs = components[prompt_inputs_ref.rsplit("/", 1)[-1]]
+        self.assertIs(prompt_inputs["additionalProperties"], False)
+        self.assertEqual(
+            prompt_inputs["properties"]["positive"]["items"]["$ref"],
+            "#/components/schemas/BibleImagePromptInput",
+        )
+        self.assertIn("prompt_inputs", latest_properties)
+        prompt_input = components["BibleImagePromptInput"]
+        self.assertIs(prompt_input["additionalProperties"], False)
+        self.assertEqual(
+            set(prompt_input["required"]),
+            {"key", "label", "value", "role", "source", "editable"},
+        )
+        self.assertIn("candidate_history", projection["properties"])
+        self.assertIn("candidate_history", projection["required"])
+        self.assertEqual(
+            projection["properties"]["candidate_history"]["items"]["$ref"],
+            "#/components/schemas/BibleImageLatestCandidate",
+        )
+        quality_ref = latest_properties["quality"]["$ref"]
+        quality = components[quality_ref.rsplit("/", 1)[-1]]
+        self.assertIs(quality["additionalProperties"], False)
+        self.assertIn("warnings", quality["properties"])
+        self.assertIn("issues", quality["properties"])
+        issue_ref = quality["properties"]["issues"]["items"]["$ref"]
+        self.assertIs(components[issue_ref.rsplit("/", 1)[-1]]["additionalProperties"], False)
+        output_ref = latest_properties["output_media"]["items"]["$ref"]
+        output = components[output_ref.rsplit("/", 1)[-1]]
+        self.assertIs(output["additionalProperties"], False)
+        self.assertIn("promote_to_asset_url", output["properties"])
+
+        task_schema = components["GenerationTask"]
+        task_properties = task_schema["properties"]
+        self.assertNotIn("capability_snapshot", task_properties)
+        self.assertTrue(task_properties["generation_purpose"]["nullable"])
+        self.assertTrue(task_properties["generation_purpose"]["readOnly"])
+        purpose_ref = next(
+            item["$ref"] for item in task_properties["generation_purpose"]["oneOf"]
+            if item["$ref"] != "#/components/schemas/NullEnum"
+        )
+        self.assertEqual(
+            components[purpose_ref.rsplit("/", 1)[-1]]["enum"],
+            ["bible_image_candidate"],
+        )
+        self.assertTrue(task_properties["bible_target"]["nullable"])
+        self.assertTrue(task_properties["bible_target"]["readOnly"])
+        target_ref = task_properties["bible_target"]["allOf"][0]["$ref"]
+        target = components[target_ref.rsplit("/", 1)[-1]]
+        self.assertIs(target["additionalProperties"], False)
+        self.assertEqual(
+            set(target["required"]),
+            {
+                "schema_version", "reference_category", "entity_id",
+                "entity_name", "source_fingerprint",
+            },
+        )
+        self.assertEqual(target["properties"]["schema_version"]["minimum"], 1)
+        self.assertEqual(target["properties"]["schema_version"]["maximum"], 1)
+        self.assertEqual(target["properties"]["entity_id"]["format"], "uuid")
+        self.assertEqual(
+            target["properties"]["source_fingerprint"]["pattern"],
+            "^[0-9a-f]{64}$",
+        )
+        category_ref = target["properties"]["reference_category"]["$ref"]
+        self.assertEqual(
+            set(components[category_ref.rsplit("/", 1)[-1]]["enum"]),
+            {"character", "scene", "prop"},
+        )
+        self.assertEqual(
+            schema["paths"]["/api/v1/tasks/"]["get"]["responses"]["200"]
+            ["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/PaginatedGenerationTaskList",
+        )
+        for path, method, status_code in (
+            ("/api/v1/tasks/{id}/", "get", "200"),
+            ("/api/v1/tasks/{id}/retry/", "post", "201"),
+        ):
+            self.assertEqual(
+                schema["paths"][path][method]["responses"][status_code]
+                ["content"]["application/json"]["schema"]["$ref"],
+                "#/components/schemas/GenerationTask",
+            )
+
+        promotion = schema["paths"][
+            "/api/v1/tasks/{id}/promote-output-to-asset/"
+        ]["post"]
+        promotion_request_ref = promotion["requestBody"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        promotion_request = components[promotion_request_ref.rsplit("/", 1)[-1]]
+        self.assertIs(promotion_request["additionalProperties"], False)
+        self.assertEqual(
+            promotion_request["properties"]["accept_stale_bible_image_candidate"]["type"],
+            "boolean",
+        )
+        self.assertEqual(set(promotion["responses"]), {"200", "201", "400", "404", "409"})
+        self.assertEqual(
+            promotion["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/APIValidationErrorEnvelope",
+        )
+        self.assertEqual(
+            promotion["responses"]["404"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BibleImageCandidateErrorResponse",
+        )
+
+    def test_deferred_generation_request_contract_is_closed_and_explicit(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        components = schema["components"]["schemas"]
+        create_operation = schema["paths"][
+            "/api/v1/deferred-generation-requests/"
+        ]["post"]
+        create_request_ref = create_operation["requestBody"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        create_request = components[create_request_ref.rsplit("/", 1)[-1]]
+        self.assertIs(create_request["additionalProperties"], False)
+        self.assertEqual(
+            set(create_request["required"]),
+            {
+                "project_id",
+                "source_task_id",
+                "target_shot_id",
+                "frame_slot",
+                "idempotency_key",
+            },
+        )
+        self.assertNotIn("output_index", create_request["properties"])
+        self.assertNotIn("template_id", create_request["properties"])
+        self.assertNotIn("workflow_id", create_request["properties"])
+        self.assertNotIn("reference_asset", create_request["properties"])
+        self.assertEqual(set(create_operation["responses"]), {"200", "201", "400", "404", "409", "503"})
+        self.assertEqual(
+            create_operation["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/APIValidationErrorEnvelope",
+        )
+        self.assertEqual(
+            create_operation["responses"]["409"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/DeferredGenerationErrorResponse",
+        )
+
+        list_response = schema["paths"][
+            "/api/v1/deferred-generation-requests/"
+        ]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            list_response["$ref"],
+            "#/components/schemas/PaginatedDeferredGenerationRequestListList",
+        )
+        detail_response = schema["paths"][
+            "/api/v1/deferred-generation-requests/{id}/"
+        ]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        self.assertEqual(
+            detail_response["$ref"],
+            "#/components/schemas/DeferredGenerationRequestDetail",
+        )
+        cancel_operation = schema["paths"][
+            "/api/v1/deferred-generation-requests/{id}/cancel/"
+        ]["post"]
+        cancel_request_ref = cancel_operation["requestBody"]["content"][
+            "application/json"
+        ]["schema"]["$ref"]
+        cancel_request = components[cancel_request_ref.rsplit("/", 1)[-1]]
+        self.assertIs(cancel_request["additionalProperties"], False)
+        self.assertNotIn("properties", cancel_request)
+        self.assertEqual(set(cancel_operation["responses"]), {"200", "400", "409"})
+        self.assertEqual(
+            cancel_operation["responses"]["400"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/APIValidationErrorEnvelope",
+        )

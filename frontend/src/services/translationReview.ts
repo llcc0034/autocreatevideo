@@ -80,6 +80,7 @@ export const adaptCanonicalGlossaryEnsureResult = (payload: unknown): CanonicalG
     : {}
   return {
     projectId: String(raw.project_id || ''),
+    updatedAt: String(raw.updated_at || '') || undefined,
     translationGlossary,
     summary: {
       requested: Number(summary.requested || 0), generated: Number(summary.generated || 0),

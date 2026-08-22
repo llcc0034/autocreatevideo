@@ -31,6 +31,12 @@ from studio.models import (
     ShotDetailDraft,
     ShotDetailDraftBatchItem,
 )
+from studio.services.shot_versions import (
+    ShotVersionResolutionError,
+    adjacent_version_shots,
+    shot_version_key,
+    shot_version_number,
+)
 from studio.services.creative_drafts import (
     CreativeContextConflict,
     CreativeDraftError,
@@ -63,6 +69,17 @@ CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 ENGLISH_DIRECTOR_FORBIDDEN_RE = re.compile(
     r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u0400-\u052f"
     r"\u200b-\u200f\u202a-\u202e\u2060\ufeff]"
+)
+_SOURCE_TIME_VALUE_RE = (
+    r"(?:\d+:\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:ms|毫秒|s|秒)?"
+)
+_SOURCE_TIME_RANGE_RE = re.compile(
+    rf"[【\[]\s*(?P<start>{_SOURCE_TIME_VALUE_RE})"
+    rf"\s*(?:-|–|—|~|～|至|到)\s*"
+    rf"(?P<end>{_SOURCE_TIME_VALUE_RE})\s*[】\]]"
+)
+_SOURCE_TIMING_LABEL_RE = re.compile(
+    r"^\s*(?P<label>动作|画面|旁白|镜头|对白)\s*[：:]\s*(?P<body>.*)$"
 )
 
 
@@ -164,6 +181,10 @@ def _has_unsafe_text_controls(value: str) -> bool:
 def shot_detail_capability() -> dict[str, Any]:
     """Expose a small capability payload without duplicating runtime checks."""
     from studio.services.creative_drafts import get_creative_capability
+    from studio.services.series_concept_drafts import (
+        SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+        series_concept_draft_limits,
+    )
 
     capability = dict(get_creative_capability())
     policies = {
@@ -202,6 +223,11 @@ def shot_detail_capability() -> dict[str, Any]:
             )
         )
     capability.update({
+        "series_concept_draft_supported": True,
+        "series_concept_draft_schema_version": SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+        "series_concept_draft_limits": series_concept_draft_limits(),
+        "series_concept_draft_review_required": True,
+        "series_concept_draft_persisted": False,
         "shot_high_detail_supported": True,
         "shot_high_detail_schema_version": SHOT_DETAIL_SCHEMA_VERSION,
         "shot_high_detail_policies": policies,
@@ -244,22 +270,122 @@ def _dialogue_snapshot(
     return entries
 
 
+def _parse_source_time_ms(value: str) -> int | None:
+    normalized = re.sub(r"\s+", "", str(value or "")).lower()
+    try:
+        if ":" in normalized:
+            minutes_text, seconds_text = normalized.split(":", 1)
+            seconds_text = re.sub(r"(?:s|秒)$", "", seconds_text)
+            milliseconds = (float(minutes_text) * 60 + float(seconds_text)) * 1000
+        elif re.search(r"(?:ms|毫秒)$", normalized):
+            milliseconds = float(re.sub(r"(?:ms|毫秒)$", "", normalized))
+        else:
+            milliseconds = float(re.sub(r"(?:s|秒)$", "", normalized)) * 1000
+    except ValueError:
+        return None
+    rounded = round(milliseconds)
+    return rounded if rounded >= 0 else None
+
+
+def _timed_visual_segments_from_fields(
+    fields: tuple[tuple[str, str], ...],
+) -> list[dict[str, Any]]:
+    segments: list[dict[str, Any]] = []
+    for field_name, value in fields:
+        matches = list(_SOURCE_TIME_RANGE_RE.finditer(value))
+        for index, match in enumerate(matches):
+            start_ms = _parse_source_time_ms(match.group("start") or "")
+            end_ms = _parse_source_time_ms(match.group("end") or "")
+            if start_ms is None or end_ms is None or start_ms >= end_ms:
+                continue
+            end_at = matches[index + 1].start() if index + 1 < len(matches) else len(value)
+            body = value[match.end():end_at].strip(" \t\r\n；;，,。】]")
+            label_match = _SOURCE_TIMING_LABEL_RE.match(body)
+            if label_match:
+                raw_label = label_match.group("label")
+                body = label_match.group("body").strip()
+                if raw_label == "对白":
+                    continue
+            segments.append({
+                "source_order": len(segments) + 1,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "kind": field_name,
+                "text_zh": body[:500],
+            })
+            if len(segments) >= 40:
+                return segments
+    return segments
+
+
+def _shot_source_timed_visual_segments(shot: Shot) -> list[dict[str, Any]]:
+    return _timed_visual_segments_from_fields((
+        ("action", str(shot.action or "")),
+        ("narrative", str(shot.narrative or "")),
+        ("camera", str(shot.camera or "")),
+    ))
+
+
+def _runtime_target_snapshot(target: dict[str, Any]) -> dict[str, Any]:
+    """Return a model-facing target that never reuses prior high-detail output.
+
+    Older queued batches may have frozen ``detailed_description`` and even
+    source-timing entries derived from it.  Runtime requests are sanitized so
+    already-applied high-detail prose cannot become the next expansion source.
+    """
+    value = dict(target)
+    # Version identity participates in the persisted context hash, but it is
+    # orchestration metadata rather than creative model input.  Keep the
+    # existing strict local/remote generation protocol unchanged.
+    value.pop("shot_version_key", None)
+    value["detailed_description"] = ""
+    value["source_timed_visual_segments"] = _timed_visual_segments_from_fields((
+        ("action", str(value.get("action") or "")),
+        ("narrative", str(value.get("narrative") or "")),
+        ("camera", str(value.get("camera") or "")),
+    ))
+    return value
+
+
+def _runtime_boundary_snapshot(
+    boundary: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if boundary is None:
+        return None
+    value = dict(boundary)
+    value.pop("shot_version_key", None)
+    return value
+
+
+def _snapshot_source_timed_visual_segments(snapshot: dict[str, Any] | None) -> list[dict[str, Any]]:
+    target = (snapshot or {}).get("target_shot")
+    if not isinstance(target, dict):
+        return []
+    return list(_runtime_target_snapshot(target).get("source_timed_visual_segments", []))
+
+
 def _shot_snapshot(
     shot: Shot, *, boundary: bool = False,
     policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the formal source snapshot for one detail-review candidate.
 
-    ``expansion_focus`` is deliberately narrow: the model expands camera motion
-    and the action/visible picture only.  The remaining shot fields are kept as
-    read-only continuity constraints and must never be rewritten by this flow.
+    ``expansion_focus`` is deliberately narrow: every new candidate expands the
+    authored storyboard fields only.  ``detailed_description`` is the formal
+    output written after a previous high-detail apply, so the target shot keeps
+    it empty here to prevent a later batch from recursively expanding an older
+    candidate.  Boundary shots still expose their formal detail as continuity
+    context.
     """
     value: dict[str, Any] = {
         "id": str(shot.id),
-        "number": shot.number,
+        "number": shot_version_number(shot),
+        "shot_version_key": shot_version_key(shot),
         "title": str(shot.title or ""),
         "narrative": str(shot.narrative or ""),
-        "detailed_description": str(shot.detailed_description or ""),
+        "detailed_description": (
+            str(shot.detailed_description or "") if boundary else ""
+        ),
         "camera": str(shot.camera or ""),
         "continuity_notes": str(shot.continuity_notes or ""),
         "requires_first_frame_continuity": bool(shot.requires_first_frame_continuity),
@@ -280,6 +406,7 @@ def _shot_snapshot(
         "h3_mode": shot.h3_mode,
         "include_audio": bool(shot.include_audio),
         "reference_bindings": shot.reference_bindings or {},
+        "source_timed_visual_segments": _shot_source_timed_visual_segments(shot),
         "expansion_focus": {
             "camera_motion": str(shot.camera or ""),
             "action_and_visual_description": str(shot.action or ""),
@@ -329,13 +456,11 @@ def _prop_snapshot(item: PropBible) -> dict[str, str]:
 
 
 def _adjacent_shots(shot: Shot) -> tuple[Shot | None, Shot | None]:
-    """Return the immediate numeric boundaries only, never an entire episode."""
-    base = Shot.objects.filter(episode_id=shot.episode_id).select_related("scene").prefetch_related(
-        "characters", "props",
-    )
-    previous = base.filter(number__lt=shot.number).order_by("-number").first()
-    following = base.filter(number__gt=shot.number).order_by("number").first()
-    return previous, following
+    """Return immediate boundaries within the target storyboard version."""
+    try:
+        return adjacent_version_shots(shot)
+    except ShotVersionResolutionError as exc:
+        raise ShotDetailValidationError(str(exc)) from exc
 
 
 def shot_detail_context_snapshot(
@@ -381,6 +506,7 @@ def shot_detail_context_snapshot(
         } if project.style else None),
         "episode": {
             "id": str(episode.id), "number": episode.number,
+            "shot_version_key": shot_version_key(shot),
             "continuity_from_previous": episode.continuity_from_previous,
             "continuity_to_next": episode.continuity_to_next,
         },
@@ -431,6 +557,7 @@ def _runtime_request(
 ) -> dict[str, Any]:
     config = creative_config()
     policy = policy or shot_detail_policy(provider)
+    target_shot = _runtime_target_snapshot(snapshot["target_shot"])
     source = {
         "project": {
             "title": snapshot["project"]["title"],
@@ -445,9 +572,12 @@ def _runtime_request(
         },
         "style": snapshot["style"],
         "glossary": snapshot["project"]["translation_glossary"],
-        "target_shot": snapshot["target_shot"],
+        "target_shot": target_shot,
         "expansion_scope": {
-            "primary_fields": snapshot["target_shot"].get("expansion_focus", {}),
+            "primary_fields": target_shot.get("expansion_focus", {}),
+            "source_timed_visual_segments": target_shot.get(
+                "source_timed_visual_segments", []
+            ),
             "read_only_constraints": {
                 "title": snapshot["target_shot"].get("title", ""),
                 "continuity_notes": snapshot["target_shot"].get("continuity_notes", ""),
@@ -456,7 +586,10 @@ def _runtime_request(
                 "music": snapshot["target_shot"].get("music", ""),
             },
         },
-        "boundaries": snapshot["boundaries"],
+        "boundaries": {
+            "previous": _runtime_boundary_snapshot(snapshot["boundaries"]["previous"]),
+            "next": _runtime_boundary_snapshot(snapshot["boundaries"]["next"]),
+        },
         "bible": snapshot["bible"],
     }
     context_size = len(json.dumps(source, ensure_ascii=False, separators=(",", ":")))
@@ -528,6 +661,8 @@ _DETAIL_REVIEW_SUGGESTIONS = {
         "请人工精简并保存校验后再应用。"
     ),
     "canonical_target_collision": "多个 Bible 实体共用了同一英文 canonical 名称，请人工核对。",
+    "source_timing_range_missing": "正式镜头中的非对白时间段没有在扩写正文中保留；请按每个时间段分段补写。",
+    "source_timing_segment_unmapped": "时间段只作为总标记出现或缺少对应正文；请按每个时间段分别写清动作/画面，并保持同一镜头连续场景。",
     "model_output_protocol_validation_failed": (
         "模型返回了可编辑正文，但没有通过共享结构协议；请修改并重新保存后再应用。"
     ),
@@ -614,10 +749,128 @@ def _detail_bilingual_review_issues(
     return issues
 
 
+def _source_timing_range_count(text: str, *, start_ms: int, end_ms: int) -> int:
+    count = 0
+    for match in _SOURCE_TIME_RANGE_RE.finditer(str(text or "")):
+        start = _parse_source_time_ms(match.group("start") or "")
+        end = _parse_source_time_ms(match.group("end") or "")
+        if start == start_ms and end == end_ms:
+            count += 1
+    return count
+
+
+def _source_timing_range_matches(
+    text: str, *, start_ms: int, end_ms: int,
+) -> list[re.Match[str]]:
+    matches: list[re.Match[str]] = []
+    for match in _SOURCE_TIME_RANGE_RE.finditer(str(text or "")):
+        start = _parse_source_time_ms(match.group("start") or "")
+        end = _parse_source_time_ms(match.group("end") or "")
+        if start == start_ms and end == end_ms:
+            matches.append(match)
+    return matches
+
+
+def _source_timing_body_after_marker(text: str, match: re.Match[str]) -> str:
+    value = str(text or "")
+    next_match = _SOURCE_TIME_RANGE_RE.search(value, match.end())
+    line_end = value.find("\n", match.end())
+    end_at = len(value)
+    if next_match:
+        end_at = min(end_at, next_match.start())
+    if line_end != -1:
+        end_at = min(end_at, line_end)
+    body = value[match.end():end_at]
+    return re.sub(r"^[\s:：;；,，.。|/\\\-–—]+", "", body).strip()
+
+
+def _format_source_time_value(value: int) -> str:
+    seconds = int(value) / 1000
+    return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
+
+def _source_timing_marker(
+    *, start_ms: int, end_ms: int, english: bool = False,
+) -> str:
+    unit = "s" if english else "秒"
+    return f"[{_format_source_time_value(start_ms)}-{_format_source_time_value(end_ms)}{unit}]"
+
+
+def _required_source_timing_counts(
+    segments: list[dict[str, Any]] | None,
+) -> dict[tuple[int, int], int]:
+    counts: dict[tuple[int, int], int] = {}
+    if not isinstance(segments, list):
+        return counts
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        try:
+            start_ms = int(segment["start_ms"])
+            end_ms = int(segment["end_ms"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if start_ms < 0 or end_ms <= start_ms:
+            continue
+        key = (start_ms, end_ms)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _missing_source_timing_ranges(
+    *, text: str, segments: list[dict[str, Any]] | None,
+) -> list[tuple[int, int]]:
+    missing: list[tuple[int, int]] = []
+    for (start_ms, end_ms), expected in _required_source_timing_counts(segments).items():
+        if _source_timing_range_count(text, start_ms=start_ms, end_ms=end_ms) < expected:
+            missing.append((start_ms, end_ms))
+    return missing
+
+
+def _unmapped_source_timing_ranges(
+    *, text: str, segments: list[dict[str, Any]] | None,
+) -> list[tuple[int, int]]:
+    unmapped: list[tuple[int, int]] = []
+    for (start_ms, end_ms), expected in _required_source_timing_counts(segments).items():
+        mapped = sum(
+            1 for match in _source_timing_range_matches(
+                text, start_ms=start_ms, end_ms=end_ms,
+            )
+            if _source_timing_body_after_marker(text, match)
+        )
+        if mapped < expected:
+            unmapped.append((start_ms, end_ms))
+    return unmapped
+
+
+def _source_timing_review_issues(
+    normalized: dict[str, str], segments: list[dict[str, Any]] | None,
+) -> list[dict[str, str]]:
+    if not _required_source_timing_counts(segments):
+        return []
+    issues: list[dict[str, str]] = []
+    for field_name in ("detail_zh", "detail_en"):
+        value = normalized.get(field_name, "")
+        if not value.strip():
+            continue
+        missing = _missing_source_timing_ranges(text=value, segments=segments)
+        unmapped = _unmapped_source_timing_ranges(text=value, segments=segments)
+        if missing:
+            issues.append(_detail_review_issue(
+                "source_timing_range_missing", field_name, severity="requires_edit",
+            ))
+        elif unmapped:
+            issues.append(_detail_review_issue(
+                "source_timing_segment_unmapped", field_name, severity="requires_edit",
+            ))
+    return issues
+
+
 def _validate_detail_data(
     candidate: Any, *, project: SeriesProject | None = None,
     runtime_review_issues: list[dict[str, str]] | None = None,
     policy: dict[str, Any] | None = None,
+    source_timed_visual_segments: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]]:
     policy = policy or shot_detail_policy()
     if not isinstance(candidate, dict):
@@ -665,6 +918,7 @@ def _validate_detail_data(
         }
 
     issues = _normalise_detail_review_issues(runtime_review_issues)
+    issues.extend(_source_timing_review_issues(normalized, source_timed_visual_segments))
     if len(normalized["detail_zh"]) > policy["transport_zh_max_chars"]:
         issues.append(_detail_review_issue(
             "field_length_above_transport_envelope", "detail_zh",
@@ -785,6 +1039,7 @@ def _source_fallback_candidate(
         starter,
         project=project,
         policy=policy,
+        source_timed_visual_segments=_snapshot_source_timed_visual_segments(snapshot),
         runtime_review_issues=[_detail_review_issue(
             "model_output_unusable_fallback", "detail_zh", severity="requires_edit",
         )],
@@ -795,6 +1050,7 @@ def _source_fallback_candidate(
 def _salvage_deepseek_detail_candidate(
     error: CreativeDraftError, *, project: SeriesProject,
     policy: dict[str, Any],
+    source_timed_visual_segments: list[dict[str, Any]] | None = None,
 ) -> tuple[dict[str, str], dict[str, Any]] | None:
     """Keep only a bounded, editable bilingual candidate from protocol failure.
 
@@ -820,6 +1076,7 @@ def _salvage_deepseek_detail_candidate(
         },
         project=project,
         policy=policy,
+        source_timed_visual_segments=source_timed_visual_segments,
         runtime_review_issues=[_detail_review_issue(
             "model_output_protocol_validation_failed",
             "result",
@@ -906,6 +1163,7 @@ def generate_shot_detail_candidate(
         ):
             salvaged = _salvage_deepseek_detail_candidate(
                 exc, project=project, policy=policy,
+                source_timed_visual_segments=_snapshot_source_timed_visual_segments(snapshot),
             )
         if salvaged is not None:
             if _live_context_hash(
@@ -947,6 +1205,7 @@ def generate_shot_detail_candidate(
     data, validation = _validate_detail_data(
         result, project=project, runtime_review_issues=runtime_issues,
         policy=policy,
+        source_timed_visual_segments=_snapshot_source_timed_visual_segments(snapshot),
     )
     fallback_used = False
     if validation.get("status") == "failed" and provider == LOCAL_QWEN_PROVIDER:
@@ -1223,6 +1482,9 @@ def confirm_shot_detail_draft(
             project=project,
             runtime_review_issues=shot_detail_review_issues(locked.validation),
             policy=policy,
+            source_timed_visual_segments=_snapshot_source_timed_visual_segments(
+                locked.context_snapshot,
+            ),
         )
         if validation["status"] not in {"passed", "ready", "needs_review"}:
             raise ShotDetailValidationError("高细节草稿未通过校验", errors=validation["errors"])
@@ -1274,6 +1536,9 @@ def patch_shot_detail_draft(
             raise ShotDetailContextConflict("当前镜头、相邻连续性或绑定 Bible 已变化，请重新生成")
         data, validation = _validate_detail_data(
             draft_data, project=project, policy=policy,
+            source_timed_visual_segments=_snapshot_source_timed_visual_segments(
+                locked.context_snapshot,
+            ),
         )
         append_revision_history(locked)
         locked.revision += 1
@@ -1381,6 +1646,9 @@ def prepare_locked_shot_detail_application(
         project=project,
         runtime_review_issues=shot_detail_review_issues(draft.validation),
         policy=policy,
+        source_timed_visual_segments=_snapshot_source_timed_visual_segments(
+            draft.context_snapshot,
+        ),
     )
     if validation["status"] not in {"passed", "ready", "needs_review"}:
         raise ShotDetailValidationError(

@@ -31,6 +31,15 @@ const safeCodeValue = (value: unknown): string | undefined => {
   return /^[a-z][a-z0-9_]{0,79}$/.test(code) ? code : undefined
 }
 
+const seriesConceptSuitabilityValue = (
+  value: unknown,
+): PromptProviderCapability['seriesConceptDraftSuitability'] => {
+  const suitability = String(value ?? '').trim().toLowerCase()
+  return suitability === 'recommended' || suitability === 'experimental'
+    ? suitability
+    : undefined
+}
+
 const positiveNumberValue = (raw: Raw, snake: string, camel: string): number | undefined => {
   const value = Number(raw[snake] ?? raw[camel])
   return Number.isFinite(value) && value > 0 ? value : undefined
@@ -116,6 +125,15 @@ export const adaptPromptProviderCapability = (
     contextSize: positiveIntegerValue(raw, 'context_size', 'contextSize'),
     runtimeTimeoutSeconds: positiveNumberValue(raw, 'runtime_timeout_seconds', 'runtimeTimeoutSeconds'),
     processTimeoutSeconds: positiveNumberValue(raw, 'process_timeout_seconds', 'processTimeoutSeconds'),
+    seriesConceptDraftSuitability: seriesConceptSuitabilityValue(
+      raw.series_concept_draft_suitability,
+    ),
+    seriesConceptDraftSuitabilityReasonCode: safeCodeValue(
+      raw.series_concept_draft_suitability_reason_code,
+    ),
+    seriesConceptDraftSuitabilityNotice: String(
+      raw.series_concept_draft_suitability_notice ?? '',
+    ).trim() || undefined,
   }
 }
 

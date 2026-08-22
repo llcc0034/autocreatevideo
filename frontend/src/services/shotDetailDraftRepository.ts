@@ -133,16 +133,17 @@ export const shotDetailDraftRepository = {
     }
   },
 
-  async listBatches(projectId: string, episodeId: string): Promise<ShotDetailDraftBatch[]> {
+  async listBatches(projectId: string, episodeId: string, shotVersionKey: string): Promise<ShotDetailDraftBatch[]> {
     if (useMock) return []
     const response = await api.get(`/projects/${projectId}/shot-detail-draft-batches/`, {
-      params: { episode: episodeId, page_size: 50 },
+      params: { episode: episodeId, shot_version_key: shotVersionKey, page_size: 50 },
     })
     return unwrapRows(response.data).map(adaptShotDetailDraftBatch)
   },
 
   async createBatch(projectId: string, options: {
     episodeId: string
+    shotVersionKey: string
     requestId: string
     provider: PromptProviderId
     variationNote?: string
@@ -151,6 +152,7 @@ export const shotDetailDraftRepository = {
     if (useMock) throw new Error('Mock 模式暂不支持整集高细节扩写。')
     const response = await api.post(`/projects/${projectId}/shot-detail-draft-batches/`, {
       episode_id: options.episodeId,
+      shot_version_key: options.shotVersionKey,
       request_id: options.requestId,
       provider: options.provider,
       variation_note: options.variationNote || '',

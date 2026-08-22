@@ -260,6 +260,11 @@ export const adaptShotDetailDraftBatch = (raw: Raw): ShotDetailDraftBatch => ({
   requestId: text(raw.request_id ?? raw.requestId),
   provider: text(raw.provider) === 'deepseek_api' ? 'deepseek_api' : 'local_qwen',
   variationNote: text(raw.variation_note ?? raw.variationNote),
+  shotVersionKey: text(raw.shot_version_key ?? raw.shotVersionKey),
+  shotVersionLabel: text(raw.shot_version_label ?? raw.shotVersionLabel),
+  versionScopeStatus: ['resolved', 'legacy_mixed', 'legacy_partial', 'legacy_unknown'].includes(text(raw.version_scope_status ?? raw.versionScopeStatus))
+    ? text(raw.version_scope_status ?? raw.versionScopeStatus) as ShotDetailDraftBatch['versionScopeStatus']
+    : 'legacy_unknown',
   generationStatus: batchStatus(raw.generation_status ?? raw.generationStatus),
   applyStatus: text(raw.apply_status ?? raw.applyStatus) === 'complete' ? 'complete' : 'not_started',
   revision: Number(raw.revision || 1),

@@ -195,6 +195,195 @@ export interface GeneratedImageAssetTarget {
   entityId: string
 }
 
+export type BibleImageEntityType = 'character' | 'scene' | 'prop'
+export type BibleImageGenerationPurpose = 'bible_image_candidate'
+export type BibleImageTaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancel_requested' | 'cancelled' | 'incomplete'
+
+export interface BibleImagePromptConfig {
+  schemaVersion: 1
+  stylePrompt: string
+  styleNegativePrompt: string
+  compositionRules: Record<BibleImageEntityType, string>
+  negativeRules: Record<BibleImageEntityType, string>
+  qualitySuffix: string
+}
+
+export interface BibleImagePromptInput {
+  key: string
+  label: string
+  value: string
+  role: 'positive' | 'negative'
+  source: string
+  editable: boolean
+}
+
+export interface BibleImagePromptInputs {
+  schemaVersion: 1
+  positive: BibleImagePromptInput[]
+  negative: BibleImagePromptInput[]
+  finalPromptText: string
+  negativePrompt: string
+}
+
+export interface BibleImageAssetSummary {
+  id: string
+  kind: string
+  name: string
+  checksum: string
+  previewUrl: string
+}
+
+export interface BibleImageQualityIssue {
+  code: string
+  severity: string
+  path: string
+  message: string
+}
+
+export interface BibleImageCandidateQuality {
+  policyId?: string
+  status?: string
+  advisoryOnly?: boolean
+  wouldBlockEnqueue?: boolean
+  issues: BibleImageQualityIssue[]
+  warnings: string[]
+  raw: Record<string, unknown>
+}
+
+export interface BibleImageLatestCandidate {
+  promptArtifactId: string
+  generatedWorkflowId: string | null
+  generationTaskId: string | null
+  taskStatus: BibleImageTaskStatus
+  createdAt: string
+  idempotencyKey: string
+  requestFingerprint: string
+  sourceFingerprint: string
+  sourceCurrent: boolean
+  quality: BibleImageCandidateQuality
+  promptInputs: BibleImagePromptInputs
+  outputMedia: TaskOutputMedia[]
+  promotedAssets: BibleImageAssetSummary[]
+  reviewRequired: boolean
+  persistedAsAsset: boolean
+}
+
+export interface BibleImageCandidateProjection {
+  entityType: BibleImageEntityType
+  entityId: string
+  entityName: string
+  sourceFingerprint: string
+  currentPromptInputs: BibleImagePromptInputs
+  anchorAsset: BibleImageAssetSummary | null
+  referenceAssets: BibleImageAssetSummary[]
+  latestCandidate: BibleImageLatestCandidate | null
+  candidateHistory: BibleImageLatestCandidate[]
+}
+
+export interface BibleImageCandidatesResult {
+  projectId: string
+  promptConfig: BibleImagePromptConfig
+  candidates: BibleImageCandidateProjection[]
+  counts: {
+    characters: number
+    scenes: number
+    props: number
+    total: number
+    withCandidate: number
+  }
+}
+
+export interface BibleImageCandidateCreateOptions {
+  entityType: BibleImageEntityType
+  entityId: string
+  idempotencyKey: string
+  extraDirection: string
+  promptOverrides?: Record<string, string>
+  seed?: number | null
+  priority: number
+  maxAttempts: number
+  extendedGenerationConfirmed: boolean
+}
+
+export interface BibleImageCandidateCreateResult {
+  projectId: string
+  promptArtifactId: string
+  generatedWorkflowId: string
+  generationTaskId: string
+  idempotentReplay: boolean
+  reviewRequired: boolean
+  persistedAsAsset: boolean
+  candidate: BibleImageCandidateProjection
+}
+
+export interface BibleImageFrozenTarget {
+  schemaVersion: 1
+  referenceCategory: BibleImageEntityType
+  entityId: string
+  entityName: string
+  sourceFingerprint: string
+}
+
+export type DeferredFrameSlot = 'first_frame' | 'last_frame'
+export type DeferredGenerationStatus =
+  | 'preparing_prompt'
+  | 'waiting_upstream'
+  | 'extracting'
+  | 'materializing'
+  | 'materialized'
+  | 'failed'
+  | 'stale'
+  | 'cancelled'
+
+export interface DeferredGenerationRequest {
+  id: string
+  projectId: string
+  sourceTaskId: string
+  sourceOutputRole: 'primary_video'
+  targetShotId: string
+  frameSlot: DeferredFrameSlot
+  targetTemplateId: string
+  targetTemplateHash: string
+  idempotencyKey: string
+  requestFingerprint: string
+  targetInputFingerprint: string
+  status: DeferredGenerationStatus
+  resolvedSourceOutputIndex: number | null
+  sourceArtifactSha256: string | null
+  sourceManifestSha256: string | null
+  derivedAssetId: string | null
+  materializedTaskId: string | null
+  materializedPromptArtifactId: string | null
+  materializedWorkflowId: string | null
+  priority: number
+  attempts: number
+  maxAttempts: number
+  nextAttemptAt: string | null
+  extendedGenerationConfirmed: boolean
+  cancelAllowed: boolean
+  retryAllowed: boolean
+  errorCode: string
+  errorMessage: string
+  startedAt: string | null
+  finishedAt: string | null
+  createdAt: string
+  updatedAt: string
+  provisionalPromptText?: string
+  provisionalNegativePrompt?: string
+  provisionalPromptSha256?: string
+}
+
+export interface DeferredGenerationCreateInput {
+  projectId: string
+  sourceTaskId: string
+  targetShotId: string
+  frameSlot: DeferredFrameSlot
+  idempotencyKey: string
+  priority?: number
+  maxAttempts?: number
+  extendedGenerationConfirmed?: boolean
+}
+
 export interface BibleItem {
   id: string
   slug?: string
@@ -202,6 +391,9 @@ export interface BibleItem {
   name: string
   description: string
   visualPrompt: string
+  /** Canonical identity anchor. It is never inferred from referenceAssetIds. */
+  anchorAssetId?: string | null
+  /** Supplemental, human-managed reference images; excludes the anchor role. */
   referenceAssetIds: string[]
   locked: boolean
   seed?: number
@@ -219,6 +411,82 @@ export interface BibleItem {
   material?: string
   distinctiveMarks?: string
   continuityState?: string
+}
+
+export type ScriptBibleEntityType = 'character' | 'scene' | 'prop'
+export type ScriptBibleEvidenceKind = 'body_mention' | 'dialogue_speaker' | 'shot_setting'
+export type ScriptBibleConflictCode =
+  | 'script_bible_cross_type_name_conflict'
+  | 'script_bible_content_conflict'
+  | 'script_bible_reviewed_content_conflict'
+  | 'script_bible_provenance_conflict'
+
+export interface ScriptBibleEvidence {
+  line: number
+  kind: ScriptBibleEvidenceKind
+  excerpt: string
+}
+
+export interface ScriptBibleCandidate {
+  candidateId: string
+  entityType: ScriptBibleEntityType
+  name: string
+  description: string
+  visualIdentityEn: string
+  declarationLine: number
+  occurrence: number
+  evidence: ScriptBibleEvidence[]
+  recommended: boolean
+  matchedBibleId: string | null
+  existing: boolean
+  confirmed: boolean
+  conflictCode: ScriptBibleConflictCode | null
+}
+
+export interface ScriptBibleDiagnostic {
+  line?: number | null
+  severity: 'info' | 'warning' | 'error'
+  code: string
+  detail?: string
+  entityType?: ScriptBibleEntityType
+  candidateId?: string
+}
+
+export interface ScriptBibleCandidatesResult {
+  schemaVersion: 1
+  projectId: string
+  sourceFingerprint: string
+  hasBlock: boolean
+  candidates: ScriptBibleCandidate[]
+  diagnostics: ScriptBibleDiagnostic[]
+}
+
+export interface ScriptBibleReviewedSelection {
+  candidateId: string
+  reviewed: true
+  name: string
+  description: string
+  visualIdentityEn: string
+}
+
+export interface ScriptBibleApplyCollections {
+  characters: BibleItem[]
+  scenes: BibleItem[]
+  props: BibleItem[]
+}
+
+export interface ScriptBibleApplyResult {
+  schemaVersion: 1
+  projectId: string
+  sourceFingerprint: string
+  updatedAt?: string
+  created: ScriptBibleApplyCollections
+  alreadyExists: ScriptBibleApplyCollections
+  counts: {
+    requested: number
+    created: number
+    alreadyExists: number
+  }
 }
 
 export interface ContinuityBible {
@@ -263,6 +531,7 @@ export interface H3ReferenceAudioBinding {
 export interface H3ReferenceBindings {
   firstFrameAssetId?: string
   lastFrameAssetId?: string
+  firstFrameReferenceAssetId?: string
   characters: H3ReferenceEntityBinding[]
   scene?: H3ReferenceEntityBinding
   props: H3ReferenceEntityBinding[]
@@ -319,7 +588,19 @@ export interface Episode {
   multiShot: boolean
   audioEnabled: boolean
   shots: Shot[]
+  shotVersions?: EpisodeShotVersion[]
+  activeShotVersionKey?: string
   createdAt: string
+}
+
+export interface EpisodeShotVersion {
+  key: string
+  label: string
+  active: boolean
+  mode?: string
+  shotCount: number
+  createdAt?: string
+  shots: Shot[]
 }
 
 export interface SeriesProject {
@@ -334,6 +615,7 @@ export interface SeriesProject {
   coverUrl?: string
   continuitySummary?: string
   translationGlossary?: Record<string, string>
+  bibleImagePromptConfig: BibleImagePromptConfig
   styleId: string
   status: ProjectStatus
   aspectRatio: '9:16' | '16:9' | '1:1'
@@ -514,6 +796,90 @@ export interface PromptProviderCapability {
   contextSize?: number
   runtimeTimeoutSeconds?: number
   processTimeoutSeconds?: number
+  /** Operation-specific guidance only; it never blocks or rewrites a request. */
+  seriesConceptDraftSuitability?: 'recommended' | 'experimental'
+  seriesConceptDraftSuitabilityReasonCode?: string
+  seriesConceptDraftSuitabilityNotice?: string
+}
+
+/** Detached project-level proposal generated before a SeriesProject exists. */
+export interface SeriesConceptBibleEntity {
+  name: string
+  description: string
+  visualIdentityEn: string
+}
+
+export interface SeriesConceptBible {
+  characters: SeriesConceptBibleEntity[]
+  scenes: SeriesConceptBibleEntity[]
+  props: SeriesConceptBibleEntity[]
+}
+
+export interface SeriesConceptCandidate {
+  title: string
+  logline: string
+  masterScript: string
+  bible: SeriesConceptBible
+}
+
+export interface SeriesConceptDraftInput {
+  idea: string
+  provider: PromptProviderId
+  episodeCount: number
+  shotsPerEpisode: number
+  episodeDurationSeconds: number
+  styleHint: string
+  attempt: number
+}
+
+export interface SeriesConceptDraftFormat {
+  schemaVersion: 2
+  templateId: 'deterministic-script-breakdown-v3'
+  compatible: true
+  episodeCount: number
+  shotCount: number
+  episodeDurationSeconds: number
+  totalDurationMs: number
+  shotDurationsMs: number[][]
+}
+
+export interface SeriesConceptResourceEstimate {
+  totalShots: number
+  estimatedInputChars: number
+  estimatedOutputTokens: number
+  configuredOutputTokenHint: number
+  outputHintUtilizationPercent: number
+}
+
+export interface SeriesConceptDraftRuntime {
+  provider: PromptProviderId
+  model: string
+  transport: 'local_process' | 'remote_api'
+  elapsedMs: number | null
+  reviewRequired: boolean
+  /** This pre-project flow must never persist model output automatically. */
+  persisted: false
+}
+
+export interface SeriesConceptDraftResult {
+  sourceFingerprint: string
+  candidate: SeriesConceptCandidate
+  format: SeriesConceptDraftFormat
+  resourceEstimate: SeriesConceptResourceEstimate
+  warnings: string[]
+  runtime: SeriesConceptDraftRuntime
+}
+
+export interface SeriesConceptGenerationCapability {
+  supported: boolean
+  defaultProvider: PromptProviderId
+  preferredProvider: PromptProviderId
+  providers: PromptProviderCapability[]
+  reviewRequired: boolean
+  defaultEpisodeDurationSeconds: number
+  minimumShotDurationMs: number
+  maximumShotDurationMs: number
+  notice?: string
 }
 
 export interface TranslationCapability {
@@ -575,6 +941,7 @@ export interface CanonicalGlossaryEnsureEntry {
 
 export interface CanonicalGlossaryEnsureResult {
   projectId: string
+  updatedAt?: string
   translationGlossary: Record<string, string>
   summary: {
     requested: number
@@ -657,6 +1024,8 @@ export interface CreativeDraftDialogueLine {
   deliveryZh: string
   deliveryEn: string
   voiceover: boolean
+  startMs?: number
+  endMs?: number
 }
 
 export interface CreativeDraftShot {
@@ -680,6 +1049,8 @@ export interface CreativeDraftShot {
   mediaType: 'video'
   h3Mode: H3Mode
   includeAudio: boolean
+  requiresFirstFrameContinuity: boolean
+  requiresLastFrameContinuity: boolean
   sceneId?: string
   characterIds: string[]
   propIds: string[]
@@ -709,6 +1080,7 @@ export type CreativeDraftReviewField =
   | 'soundscapeZh' | 'soundscapeEn'
   | 'musicZh' | 'musicEn'
   | 'durationMs' | 'h3Mode' | 'includeAudio'
+  | 'requiresFirstFrameContinuity' | 'requiresLastFrameContinuity'
   | 'sceneId' | 'characterIds' | 'propIds'
   | 'dialogueSpeakerId' | 'dialogueTextZh' | 'dialogueDeliveryZh' | 'dialogueDeliveryEn'
 
@@ -859,6 +1231,11 @@ export interface ShotDetailDraftApplyResult {
 export type ShotDetailDraftBatchGenerationStatus =
   | 'queued' | 'running' | 'completed' | 'completed_with_errors' | 'failed' | 'cancelled'
 export type ShotDetailDraftBatchApplyStatus = 'not_started' | 'complete'
+export type ShotDetailDraftBatchVersionScopeStatus =
+  | 'resolved'
+  | 'legacy_mixed'
+  | 'legacy_partial'
+  | 'legacy_unknown'
 export type ShotDetailDraftBatchItemStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'stale' | 'skipped'
 
 export interface ShotDetailDraftBatch {
@@ -868,6 +1245,9 @@ export interface ShotDetailDraftBatch {
   requestId: string
   provider: PromptProviderId
   variationNote: string
+  shotVersionKey: string
+  shotVersionLabel: string
+  versionScopeStatus: ShotDetailDraftBatchVersionScopeStatus
   generationStatus: ShotDetailDraftBatchGenerationStatus
   applyStatus: ShotDetailDraftBatchApplyStatus
   revision: number
@@ -1010,6 +1390,8 @@ export interface Workflow {
   effectiveFrames?: number
   effectiveDurationMs?: number
   inputParameters?: Record<string, unknown>
+  generationPurpose?: BibleImageGenerationPurpose
+  bibleImageTarget?: BibleImageFrozenTarget
   referenceAssets?: TaskReferenceAssetSummary[]
   continuityAssets?: TaskReferenceAssetSummary[]
   promptAvailable?: boolean
@@ -1061,7 +1443,18 @@ export interface Workflow {
   batchIndex?: number
   batchSize?: number
   batchKind?: string
+  shotVersionKey?: string
+  shotVersionLabel?: string
+  batchSlots?: WorkflowBatchSlot[]
   batchTaskIds?: string[]
+  isVirtualProductionUnit?: boolean
+  virtualProductionUnitKind?: 'deferred_first_frame_continuity' | 'waiting_for_deferred_first_frame_source' | 'waiting_for_deferred_first_frame_chain'
+  deferredGenerationRequestId?: string
+  deferredGenerationStatus?: string
+  deferredSourceTaskId?: string
+  deferredUpstreamRequestId?: string
+  deferredFrameSlot?: 'first_frame' | 'last_frame'
+  batchWorkflows?: Workflow[]
   episodeId?: string
   episodeNumber?: number
   episodeTitle?: string
@@ -1069,6 +1462,39 @@ export interface Workflow {
   shotIds?: string[]
   shotNumber?: number
   shotTitle?: string
+}
+
+export type WorkflowBatchSlotStatus =
+  | 'materialized'
+  | 'waiting_deferred'
+  | 'cancelled'
+  | 'cancelled_by_upstream'
+  | 'not_created'
+
+export interface WorkflowBatchSlot {
+  batchId?: string
+  batchKind?: string
+  shotVersionKey?: string
+  shotVersionLabel?: string
+  batchIndex: number
+  batchSize: number
+  slotStatus: WorkflowBatchSlotStatus
+  message?: string
+  workflowMode?: string
+  taskId?: string
+  taskStatus?: string
+  workflowId?: string
+  deferredGenerationRequestId?: string
+  deferredGenerationStatus?: string
+  deferredUpstreamRequestId?: string
+  episodeId?: string
+  episodeNumber?: number
+  episodeTitle?: string
+  shotId?: string
+  shotNumber?: number
+  shotTitle?: string
+  createdAt?: string
+  updatedAt?: string
 }
 
 export interface GeneratedWorkflowExport {

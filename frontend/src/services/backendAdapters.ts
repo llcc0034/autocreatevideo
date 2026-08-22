@@ -5,7 +5,8 @@ import { adaptPromptArtifact } from './promptArtifactAdapter'
 import { adaptShotDetailedDescription, shotDetailedDescriptionPayload } from './shotDetailSync'
 import { visualRulesProjectPersistenceFields } from './visualRulesDraft'
 import { adaptTaskProgressTelemetry } from './taskProgress'
-import type { Asset, AssetType, BibleItem, Episode, H3PromptPayload, H3ReferenceAudioPurpose, H3ReferenceBindings, H3ReferenceEntityBinding, H3ReferenceVideoPurpose, SeriesProject, Shot, StylePreset, TaskReferenceAssetSummary, Workflow, WorkflowNode } from '@/types'
+import { legacyShotVersionKey, normalizeShotVersionScopeKey } from './shotVersionScope'
+import type { Asset, AssetType, BibleImageEntityType, BibleImagePromptConfig, BibleItem, Episode, EpisodeShotVersion, H3PromptPayload, H3ReferenceAudioPurpose, H3ReferenceBindings, H3ReferenceEntityBinding, H3ReferenceVideoPurpose, SeriesProject, Shot, StylePreset, TaskOutputMedia, TaskReferenceAssetSummary, Workflow, WorkflowBatchSlot, WorkflowNode } from '@/types'
 
 export { adaptPromptArtifact } from './promptArtifactAdapter'
 
@@ -16,6 +17,56 @@ const styleSlugById = new Map<string, string>()
 const projectTitleById = new Map<string, string>()
 const episodeContextById = new Map<string, { projectId: string; number: number; title: string }>()
 const shotContextById = new Map<string, { episodeId: string; number: number; title: string }>()
+
+const defaultCompositionRules: Record<BibleImageEntityType, string> = {
+  character: 'neutral full-body or three-quarter standing pose; unobstructed face; identity reference image; plain unobtrusive studio background; no other people',
+  scene: 'wide establishing view; empty environment; no people or characters; clear spatial layout and architectural continuity reference',
+  prop: 'three-quarter product view; neutral seamless background; centered; fully visible; no hands, no people, no duplicate objects',
+}
+const defaultNegativeRules: Record<BibleImageEntityType, string> = {
+  character: 'multiple people, crowd, duplicate person, obscured face, cropped head',
+  scene: 'people, person, character, crowd, portrait, close-up',
+  prop: 'hands, person, people, multiple objects, duplicate object, clutter',
+}
+export const defaultBibleImagePromptConfig = (style?: StylePreset): BibleImagePromptConfig => ({
+  schemaVersion: 1,
+  stylePrompt: style?.promptPrefix || 'cinematic production reference',
+  styleNegativePrompt: '',
+  compositionRules: { ...defaultCompositionRules },
+  negativeRules: { ...defaultNegativeRules },
+  qualitySuffix: 'high detail, consistent identity, production reference',
+})
+const normalizePromptConfigGroup = (
+  value: unknown,
+  fallback: Record<BibleImageEntityType, string>,
+): Record<BibleImageEntityType, string> => {
+  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value as Raw : {}
+  return {
+    character: typeof raw.character === 'string' ? raw.character : fallback.character,
+    scene: typeof raw.scene === 'string' ? raw.scene : fallback.scene,
+    prop: typeof raw.prop === 'string' ? raw.prop : fallback.prop,
+  }
+}
+export const adaptBibleImagePromptConfig = (value: unknown, style?: StylePreset): BibleImagePromptConfig => {
+  const fallback = defaultBibleImagePromptConfig(style)
+  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value as Raw : {}
+  return {
+    schemaVersion: 1,
+    stylePrompt: typeof raw.style_prompt === 'string' ? raw.style_prompt : fallback.stylePrompt,
+    styleNegativePrompt: typeof raw.style_negative_prompt === 'string' ? raw.style_negative_prompt : fallback.styleNegativePrompt,
+    compositionRules: normalizePromptConfigGroup(raw.composition_rules, fallback.compositionRules),
+    negativeRules: normalizePromptConfigGroup(raw.negative_rules, fallback.negativeRules),
+    qualitySuffix: typeof raw.quality_suffix === 'string' ? raw.quality_suffix : fallback.qualitySuffix,
+  }
+}
+export const bibleImagePromptConfigPayload = (config?: BibleImagePromptConfig): Raw | undefined => config ? ({
+  schema_version: 1,
+  style_prompt: config.stylePrompt,
+  style_negative_prompt: config.styleNegativePrompt,
+  composition_rules: { ...config.compositionRules },
+  negative_rules: { ...config.negativeRules },
+  quality_suffix: config.qualitySuffix,
+}) : undefined
 
 export const isBackendId = (value?: string) => Boolean(value && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))
 
@@ -76,10 +127,7 @@ const taskInputParameters = (raw: Raw): Record<string, unknown> => {
   const current = raw.input_parameters && typeof raw.input_parameters === 'object' && !Array.isArray(raw.input_parameters)
     ? raw.input_parameters
     : undefined
-  const legacy = raw.capability_snapshot && typeof raw.capability_snapshot === 'object' && !Array.isArray(raw.capability_snapshot)
-    ? raw.capability_snapshot
-    : undefined
-  return (safeTaskParameterValue(current && Object.keys(current).length ? current : legacy || {}, 'input_parameters') || {}) as Record<string, unknown>
+  return (safeTaskParameterValue(current || {}, 'input_parameters') || {}) as Record<string, unknown>
 }
 const taskAssetSummaries = (
   parameters: Record<string, unknown>,
@@ -136,8 +184,8 @@ export const adaptAssets = (payload: unknown): Asset[] => asList(payload).map((r
   id: String(raw.id), styleId: styleSlug(String(raw.style || '')), type, backendKind:String(raw.kind||''), name: raw.name, description: raw.description || '', promptHint:String(raw.prompt_hint||''), checksum:String(raw.checksum||'')||undefined, ownerId:raw.owner===null?null:String(raw.owner||'')||undefined, updatedAt:String(raw.updated_at||'')||undefined, metadataSha256:String(raw.metadata_sha256||'')||undefined, isActive:raw.is_active!==false, thumbnail: ['character','scene','prop','image'].includes(type) ? raw.preview_url || raw.reference_url || '' : String(raw.metadata?.thumbnail_url||''), mediaUrl: raw.preview_url || raw.reference_url || '', mimeType:String(raw.mime_type||''), metadata:raw.metadata&&typeof raw.metadata==='object'?raw.metadata:{}, hasEmbeddedAudio:raw.metadata?.has_audio===true, tags: Array.isArray(raw.metadata?.tags) ? raw.metadata.tags : [raw.kind, '一致性参考'], seed: Number(raw.metadata?.seed || 0) || undefined
 }))
 
-const adaptBibleItem = (raw: Raw): BibleItem => ({
-  id: String(raw.id), slug: raw.slug, name: raw.name, description: raw.description || '', visualPrompt: raw.visual_identity || '', referenceAssetIds: [...new Set([raw.anchor_asset, ...(raw.reference_assets || [])].filter(Boolean).map(String))], locked: raw.is_locked !== false, seed: Number(raw.metadata?.seed || 0) || undefined, metadata:raw.metadata&&typeof raw.metadata==='object'?raw.metadata:{}, stableSpeakerId: raw.stable_speaker_id,
+export const adaptBibleItem = (raw: Raw): BibleItem => ({
+  id: String(raw.id), slug: raw.slug, name: raw.name, description: raw.description || '', visualPrompt: raw.visual_identity || '', anchorAssetId: relationId(raw.anchor_asset) || null, referenceAssetIds: [...new Set<string>((Array.isArray(raw.reference_assets) ? raw.reference_assets : []).map((value: unknown) => relationId(value)).filter((value: string) => Boolean(value)))], locked: raw.is_locked !== false, seed: Number(raw.metadata?.seed || 0) || undefined, metadata:raw.metadata&&typeof raw.metadata==='object'?raw.metadata:{}, stableSpeakerId: raw.stable_speaker_id,
   ageAppearance: raw.age_appearance || '', faceIdentity: raw.face_identity || '', wardrobe: raw.wardrobe || '', voiceProfile: raw.voice_profile || '', personality: raw.personality || '',
   location: raw.location || '', timeOfDay: raw.time_of_day || '', lighting: raw.lighting || '', colorPalette: raw.color_palette || '', ambientSound: raw.ambient_sound || '',
   material: raw.material || '', distinctiveMarks: raw.distinctive_marks || '', continuityState: raw.continuity_state || ''
@@ -183,6 +231,7 @@ const adaptReferenceBindings = (raw: Raw): H3ReferenceBindings => {
   return {
     firstFrameAssetId: relationId(source.first_frame_asset_id ?? source.firstFrameAssetId) || (['I2VA', 'FL2VA'].includes(raw.h3_mode) ? legacyAssets[0] : undefined),
     lastFrameAssetId: relationId(source.last_frame_asset_id ?? source.lastFrameAssetId) || (raw.h3_mode === 'L2VA' ? legacyAssets[0] : raw.h3_mode === 'FL2VA' ? legacyAssets[1] : undefined),
+    firstFrameReferenceAssetId: relationId(source.first_frame_reference_asset_id ?? source.firstFrameReferenceAssetId) || undefined,
     characters,
     scene: adaptEntityBinding(source.scene),
     props,
@@ -194,6 +243,7 @@ const adaptReferenceBindings = (raw: Raw): H3ReferenceBindings => {
 export const referenceBindingsPayload = (bindings?: H3ReferenceBindings) => ({
   ...(bindings?.firstFrameAssetId ? { first_frame_asset_id: bindings.firstFrameAssetId } : {}),
   ...(bindings?.lastFrameAssetId ? { last_frame_asset_id: bindings.lastFrameAssetId } : {}),
+  ...(bindings?.firstFrameReferenceAssetId ? { first_frame_reference_asset_id: bindings.firstFrameReferenceAssetId } : {}),
   ...((bindings?.characters || []).length ? { characters: bindings!.characters.map((item) => ({ entity_id: item.entityId, asset_id: item.assetId })) } : {}),
   ...(bindings?.scene ? { scene: { entity_id: bindings.scene.entityId, asset_id: bindings.scene.assetId } } : {}),
   ...((bindings?.props || []).length ? { props: bindings!.props.map((item) => ({ entity_id: item.entityId, asset_id: item.assetId })) } : {}),
@@ -216,7 +266,7 @@ export const referenceAssetIdsForShot = (shot: Shot): string[] => {
   const ordered = shot.mode === 'FL2VA'
     ? [bindings?.firstFrameAssetId, bindings?.lastFrameAssetId]
     : shot.mode === 'Ref2VA'
-      ? [...(bindings?.characters || []).map((item) => item.assetId), bindings?.scene?.assetId, ...(bindings?.props || []).map((item) => item.assetId), ...(bindings?.videos || []).flatMap((item)=>[item.assetId,item.audioAssetId]), ...(bindings?.audios || []).map((item)=>item.assetId)]
+      ? [bindings?.firstFrameReferenceAssetId, ...(bindings?.characters || []).map((item) => item.assetId), bindings?.scene?.assetId, ...(bindings?.props || []).map((item) => item.assetId), ...(bindings?.videos || []).flatMap((item)=>[item.assetId,item.audioAssetId]), ...(bindings?.audios || []).map((item)=>item.assetId)]
       : []
   return [...new Set(ordered.filter(Boolean).map(String))]
 }
@@ -227,8 +277,10 @@ const adaptShot = (raw: Raw): Shot => {
   const creativeDraftProvenance = Boolean(metadata.creative_draft_id && metadata.client_key)
   const storedNegativePrompt = normalizeNegativePrompt(metadata.negative_prompt || '')
   const legacyNegativePromptRepairEligible = raw.legacy_negative_prompt_repair_eligible === true
+  const versionNumber = Number(metadata.creative_version_shot_number || 0)
+  const displayNumber = Number.isFinite(versionNumber) && versionNumber > 0 ? versionNumber : Number(raw.number || 1)
   return {
-    id: String(raw.id), order: Number(raw.number || 1), title: raw.title || `镜头 ${raw.number || 1}`,
+    id: String(raw.id), order: displayNumber, title: raw.title || `镜头 ${displayNumber || 1}`,
     mediaType: raw.media_type === 'image' ? 'image' : 'video', duration: Math.max(.1, Number(raw.duration_ms || 3500) / 1000),
     mode: raw.h3_mode || 'T2VA', framing: metadata.framing || '中景', camera: raw.camera || '',
     action: raw.action || raw.narrative || '',
@@ -252,6 +304,48 @@ const adaptShot = (raw: Raw): Shot => {
   }
 }
 
+const shotCreativeVersionKey = (shot: Shot): string => String(shot.metadata?.creative_version_key || '').trim()
+const shotCreativeVersionActive = (shot: Shot): boolean => shot.metadata?.creative_version_active === true
+const shotCreativeVersionSort = (shot: Shot): number => Number(shot.metadata?.creative_version_shot_number || shot.order || 0)
+
+const groupEpisodeShotVersions = (episodeId: string, shots: Shot[]): { shots: Shot[]; shotVersions?: EpisodeShotVersion[]; activeShotVersionKey?: string } => {
+  const initialVersionKey = legacyShotVersionKey(episodeId)
+  const groups = new Map<string, EpisodeShotVersion>()
+  for (const shot of shots) {
+    const key = shotCreativeVersionKey(shot) || initialVersionKey
+    const label = String(shot.metadata?.creative_version_label || (key === initialVersionKey ? '初始分镜' : '分镜版本'))
+    const group = groups.get(key) || {
+      key,
+      label,
+      active: false,
+      mode: String(shot.metadata?.creative_version_mode || '') || undefined,
+      shotCount: 0,
+      createdAt: String(shot.metadata?.creative_version_applied_at || '') || undefined,
+      shots: [],
+    }
+    group.active = group.active || shotCreativeVersionActive(shot)
+    group.shots.push(shot)
+    group.shotCount = group.shots.length
+    if (!group.createdAt && shot.metadata?.creative_version_applied_at) {
+      group.createdAt = String(shot.metadata.creative_version_applied_at)
+    }
+    groups.set(key, group)
+  }
+  const shotVersions = [...groups.values()].map((group) => ({
+    ...group,
+    shots: group.shots.slice().sort((left, right) => shotCreativeVersionSort(left) - shotCreativeVersionSort(right)),
+  })).sort((left, right) => {
+    if (left.active !== right.active) return left.active ? -1 : 1
+    return String(right.createdAt || '').localeCompare(String(left.createdAt || ''))
+  })
+  const active = shotVersions.find((group) => group.active) || shotVersions[0]
+  return {
+    shots: active ? active.shots : [],
+    shotVersions,
+    activeShotVersionKey: active?.key,
+  }
+}
+
 const adaptEpisode = (raw: Raw, shotRows: Raw[], promptRows: Raw[]): Episode => {
   const latestPrompt = new Map<string, Raw>()
   for (const prompt of [...promptRows].sort((left, right) => String(right.created_at || '').localeCompare(String(left.created_at || '')))) {
@@ -262,7 +356,7 @@ const adaptEpisode = (raw: Raw, shotRows: Raw[], promptRows: Raw[]): Episode => 
       if (!latestPrompt.has(key)) latestPrompt.set(key, prompt)
     }
   }
-  const shots = [...shotRows].sort((left, right) => Number(left.number || 0) - Number(right.number || 0)).map(adaptShot).map((shot) => {
+  const allShots = [...shotRows].sort((left, right) => Number(left.number || 0) - Number(right.number || 0)).map(adaptShot).map((shot) => {
     const prompt = latestPrompt.get(`${shot.id}:${shot.mediaType}`)
     if (!prompt) return shot
     const generatedPrompt = adaptPromptArtifact(prompt)
@@ -271,7 +365,8 @@ const adaptEpisode = (raw: Raw, shotRows: Raw[], promptRows: Raw[]): Episode => 
     }
     return { ...shot, prompt: generatedPrompt.integrated_multimodal_description, generatedPrompt, status: 'ready' as const }
   })
-  return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, multiShot: raw.prompt_settings?.multi_shot !== false, audioEnabled: raw.prompt_settings?.include_audio !== false, shots, createdAt: raw.created_at }
+  const grouped = groupEpisodeShotVersions(String(raw.id), allShots)
+  return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, multiShot: raw.prompt_settings?.multi_shot !== false, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: grouped.shots, shotVersions: grouped.shotVersions, activeShotVersionKey: grouped.activeShotVersionKey, createdAt: raw.created_at }
 }
 
 export const projectStatus = (status: string): SeriesProject['status'] => {
@@ -291,8 +386,10 @@ const emptyProjectBible = () => ({ characters: [], scenes: [], props: [], negati
 /** Adapt one list row without issuing any child-resource requests. */
 export const adaptProjectSummary = (raw: Raw, detailLoaded = false): SeriesProject => {
   projectTitleById.set(String(raw.id), raw.title)
+  const projectStyleId = styleSlug(String(raw.style || ''))
+  const style = stylePresets.find((item) => item.id === projectStyleId || item.slug === projectStyleId)
   return {
-    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, styleId: styleSlug(String(raw.style || '')), status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: raw.production_settings?.default_h3_mode || 'Ref2VA',
+    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, bibleImagePromptConfig: adaptBibleImagePromptConfig(raw.production_settings?.bible_image_prompt_config, style), styleId: projectStyleId, status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: raw.production_settings?.default_h3_mode || 'Ref2VA',
     bible: emptyProjectBible(), episodes: [], episodeCount: Number(raw.episode_count || 0), completedEpisodeCount: Number(raw.completed_episode_count || 0), totalDurationSeconds: Number(raw.total_duration_ms || 0) / 1000, detailLoaded, createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''),
   }
 }
@@ -347,9 +444,14 @@ const dimensions = (ratio: SeriesProject['aspectRatio'], resolution: SeriesProje
 
 export const projectPayload = (project: Partial<SeriesProject>) => {
   const visualRules = visualRulesProjectPersistenceFields(project)
+  const style = stylePresets.find((item) => item.id === project.styleId || item.slug === project.styleId)
+  const bibleImagePromptConfig = bibleImagePromptConfigPayload(
+    project.bibleImagePromptConfig || defaultBibleImagePromptConfig(style),
+  )
   return {
     title: project.title, logline: project.logline || '', master_script: project.masterScript || '', status: backendStatus(project.status || 'draft'), style: backendStyleId(project.styleId), target_model: 'minimax-h3', language: 'Chinese', aspect_ratio: project.aspectRatio || '9:16', ...(project.width && project.height ? { width: project.width, height: project.height } : dimensions(project.aspectRatio || '9:16', project.resolution || '720p')), fps: 24,
-    production_settings: { default_h3_mode: project.defaultMode || 'Ref2VA', negative_prompt: visualRules.negativePrompt, color_script: visualRules.colorScript, translation_glossary: project.translationGlossary || {} }, continuity_summary: visualRules.continuitySummary,
+    production_settings: { default_h3_mode: project.defaultMode || 'Ref2VA', negative_prompt: visualRules.negativePrompt, color_script: visualRules.colorScript, translation_glossary: project.translationGlossary || {}, bible_image_prompt_config: bibleImagePromptConfig }, continuity_summary: visualRules.continuitySummary,
+    ...(project.id && project.updatedAt ? { expected_updated_at: project.updatedAt } : {}),
   }
 }
 
@@ -363,7 +465,9 @@ export const syncBible = async (project: SeriesProject) => {
   }
   const serialize = (items: BibleItem[], prefix: string, characters = false) => items.map((item, index) => ({
     ...(isBackendId(item.id) ? { id: item.id } : {}), slug: item.slug || slugValue(item, index, prefix), name: item.name,
-    description: item.description, visual_identity: item.visualPrompt, reference_assets: item.referenceAssetIds.filter(isBackendId),
+    description: item.description, visual_identity: item.visualPrompt,
+    anchor_asset: isBackendId(item.anchorAssetId || '') ? item.anchorAssetId : null,
+    reference_assets: item.referenceAssetIds.filter(isBackendId),
     is_locked: item.locked, metadata: { ...(item.metadata || {}), seed: item.seed }, ...(characters ? {
       stable_speaker_id: item.stableSpeakerId, age_appearance: item.ageAppearance || '', face_identity: item.faceIdentity || '',
       wardrobe: item.wardrobe || '', voice_profile: item.voiceProfile || '', personality: item.personality || '',
@@ -375,11 +479,13 @@ export const syncBible = async (project: SeriesProject) => {
     })
   }))
   const result = unwrap<Raw>((await api.post(`/projects/${project.id}/sync-bibles/`, {
+    expected_updated_at: project.updatedAt,
     characters: serialize(project.bible.characters, 'character', true), scenes: serialize(project.bible.scenes, 'scene'), props: serialize(project.bible.props, 'prop')
   })).data)
   project.bible.characters = (result.characters || []).map(adaptBibleItem)
   project.bible.scenes = (result.scenes || []).map(adaptBibleItem)
   project.bible.props = (result.props || []).map(adaptBibleItem)
+  project.updatedAt = String(result.updated_at || project.updatedAt)
 }
 
 export const adaptCreatedEpisode = (raw: Raw): Episode => ({ id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status, multiShot: raw.prompt_settings?.multi_shot !== false, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: [], createdAt: raw.created_at })
@@ -476,7 +582,11 @@ export const syncShot = async (project: SeriesProject, episode: Episode, shot: S
 
 export const syncEpisode = async (project: SeriesProject, episode: Episode): Promise<Episode> => {
   const shotPayload = episode.shots.map((shot) => shotPersistencePayload(project, shot))
-  const result = unwrap<Raw>((await api.post(`/episodes/${episode.id}/sync-shots/`, { shots: shotPayload })).data)
+  const shotVersionKey = normalizeShotVersionScopeKey(episode.activeShotVersionKey, episode.id)
+  const result = unwrap<Raw>((await api.post(`/episodes/${episode.id}/sync-shots/`, {
+    shot_version_key: shotVersionKey,
+    shots: shotPayload,
+  })).data)
   await api.patch(`/episodes/${episode.id}/`, { project: project.id, number: episode.number, title: episode.title, synopsis: episode.synopsis, script: episode.script || '', status: episode.status === 'rendering' ? 'generating' : episode.status, prompt_settings: { multi_shot: episode.multiShot, include_audio: episode.audioEnabled } })
   const previousById = new Map(episode.shots.map((shot) => [shot.id, shot]))
   episode.shots = (result.shots || []).map(adaptShot).map((shot: Shot) => {
@@ -490,12 +600,114 @@ export const syncEpisode = async (project: SeriesProject, episode: Episode): Pro
       legacyNegativePromptRepairEligible: previous.legacyNegativePromptRepairEligible,
     } : shot
   })
+  if (episode.shotVersions?.length) {
+    episode.shotVersions = episode.shotVersions.map((version) => version.key === shotVersionKey
+      ? {
+          ...version,
+          active: true,
+          shotCount: episode.shots.length,
+          shots: episode.shots.map((shot) => ({ ...shot, metadata: { ...(shot.metadata || {}) } })),
+        }
+      : { ...version, active: false })
+  }
+  episode.activeShotVersionKey = shotVersionKey
   return episode
 }
 
 const taskNode = (kind: string, status: Workflow['status'], progress: number): WorkflowNode[] => {
   const nodeStatus: WorkflowNode['status'] = status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : status === 'running' ? 'running' : 'pending'
   return [{ id: `generation-${kind}`, type: kind === 'image' ? 'image' : 'video', label: `${kind === 'image' ? '图片' : '视频'}生成任务`, status: nodeStatus, progress: status === 'completed' ? 100 : progress }]
+}
+
+export const adaptTaskOutputMedia = (value: unknown, position = 0): TaskOutputMedia => {
+  const media = value && typeof value === 'object' && !Array.isArray(value) ? value as Raw : {}
+  return {
+    index: Number.isFinite(Number(media.index)) ? Number(media.index) : position,
+    kind: String(media.kind || 'file'),
+    filename: String(media.filename || `output-${position + 1}`),
+    previewUrl: String(media.preview_url || ''),
+    // Production returns a managed distribution URL. Development may
+    // explicitly return the signed ComfyUI master for rapid iteration.
+    downloadUrl: String(media.download_url || ''),
+    aiGenerated: media.ai_generated !== false,
+    provenanceUrl: String(media.provenance_url || '') || undefined,
+    artifactSha256: String(media.artifact_sha256 || '') || undefined,
+    manifestSha256: String(media.manifest_sha256 || '') || undefined,
+    distributionStatus: String(media.distribution_status || 'not_prepared'),
+    distributionError: String(media.distribution_error || '') || undefined,
+    publicProvenanceUrl: String(media.public_provenance_url || '') || undefined,
+    publicArtifactSha256: String(media.public_artifact_sha256 || '') || undefined,
+    publicManifestSha256: String(media.public_manifest_sha256 || '') || undefined,
+    publicLabel: String(media.public_label || '') || undefined,
+    publicVersion: String(media.public_version || '') || undefined,
+    publishUrl: String(media.publish_url || '') || undefined,
+    promotedAssetId: String(media.promoted_asset_id || '') || undefined,
+    promoteToAssetUrl: String(media.promote_to_asset_url || '') || undefined,
+  }
+}
+
+const adaptBibleImageFrozenTarget = (value: unknown): Workflow['bibleImageTarget'] => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const target = value as Raw
+  const referenceCategory = String(target.reference_category || '')
+  const entityId = String(target.entity_id || '')
+  const entityName = String(target.entity_name || '')
+  const sourceFingerprint = String(target.source_fingerprint || '')
+  if (
+    Number(target.schema_version) !== 1
+    || !['character', 'scene', 'prop'].includes(referenceCategory)
+    || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(entityId)
+    || !entityName
+    || !/^[0-9a-f]{64}$/.test(sourceFingerprint)
+  ) return undefined
+  return {
+    schemaVersion: 1,
+    referenceCategory: referenceCategory as 'character' | 'scene' | 'prop',
+    entityId,
+    entityName,
+    sourceFingerprint,
+  }
+}
+
+export const adaptTaskBatchSlots = (value: unknown): WorkflowBatchSlot[] => {
+  const slots: WorkflowBatchSlot[] = []
+  for (const raw of asList(value)) {
+  const status = String(raw.slot_status || '')
+  if (!['materialized', 'waiting_deferred', 'cancelled', 'cancelled_by_upstream', 'not_created'].includes(status)) {
+    continue
+  }
+  const batchIndex = Number(raw.batch_index || 0)
+  const batchSize = Number(raw.batch_size || 0)
+  if (!Number.isFinite(batchIndex) || batchIndex <= 0 || !Number.isFinite(batchSize) || batchSize <= 0) {
+    continue
+  }
+  slots.push({
+    batchId: String(raw.batch_id || '') || undefined,
+    batchKind: String(raw.batch_kind || '') || undefined,
+    shotVersionKey: String(raw.shot_version_key || '') || undefined,
+    shotVersionLabel: String(raw.shot_version_label || '') || undefined,
+    batchIndex,
+    batchSize,
+    slotStatus: status as WorkflowBatchSlot['slotStatus'],
+    message: String(raw.message || '') || undefined,
+    workflowMode: String(raw.workflow_mode || '') || undefined,
+    taskId: relationId(raw.task_id) || undefined,
+    taskStatus: String(raw.task_status || '') || undefined,
+    workflowId: relationId(raw.workflow_id) || undefined,
+    deferredGenerationRequestId: relationId(raw.deferred_generation_request_id) || undefined,
+    deferredGenerationStatus: String(raw.deferred_generation_status || '') || undefined,
+    deferredUpstreamRequestId: relationId(raw.deferred_upstream_request_id) || undefined,
+    episodeId: relationId(raw.episode_id) || undefined,
+    episodeNumber: Number(raw.episode_number || 0) || undefined,
+    episodeTitle: String(raw.episode_title || '') || undefined,
+    shotId: relationId(raw.shot_id) || undefined,
+    shotNumber: Number(raw.shot_number || 0) || undefined,
+    shotTitle: String(raw.shot_title || '') || undefined,
+    createdAt: String(raw.created_at || '') || undefined,
+    updatedAt: String(raw.updated_at || '') || undefined,
+  })
+  }
+  return slots
 }
 
 export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map((raw: Raw) => {
@@ -507,32 +719,7 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
   const isStalled = raw.is_stalled === true || raw.stalled === true
   const stallReason = String(raw.stall_reason || raw.runtime_message || raw.remote_error || '') || undefined
   const currentStep = raw.status === 'cancelled' ? '任务已取消，可重新创建重试任务' : raw.status === 'cancel_requested' ? '正在取消 ComfyUI 任务' : status === 'completed' ? `${kindLabel}生成已完成` : isStalled ? stallReason || '任务长时间没有新的执行心跳' : progressTelemetry.progressSource === 'comfyui' && progressTelemetry.comfyProgress !== undefined ? `ComfyUI 当前节点采样 · ${progressTelemetry.comfyProgress}%` : progressIndeterminate ? '已提交，尚未收到 ComfyUI 量化进度' : status === 'running' ? `ComfyUI ${kindLabel}生成中` : status === 'failed' ? `${kindLabel}生成失败，请在任务详情中查看原因` : `等待 ComfyUI ${kindLabel}调度`
-  const outputMedia = Array.isArray(raw.output_media) ? raw.output_media.map((item, position) => {
-    const media = item as Raw
-    return {
-      index: Number.isFinite(Number(media.index)) ? Number(media.index) : position,
-      kind: String(media.kind || 'file'),
-      filename: String(media.filename || `output-${position + 1}`),
-      previewUrl: String(media.preview_url || ''),
-      // Production returns a managed distribution URL. Development may
-      // explicitly return the signed ComfyUI master for rapid iteration.
-      downloadUrl: String(media.download_url || ''),
-      aiGenerated: media.ai_generated !== false,
-      provenanceUrl: String(media.provenance_url || '') || undefined,
-      artifactSha256: String(media.artifact_sha256 || '') || undefined,
-      manifestSha256: String(media.manifest_sha256 || '') || undefined,
-      distributionStatus: String(media.distribution_status || 'not_prepared'),
-      distributionError: String(media.distribution_error || '') || undefined,
-      publicProvenanceUrl: String(media.public_provenance_url || '') || undefined,
-      publicArtifactSha256: String(media.public_artifact_sha256 || '') || undefined,
-      publicManifestSha256: String(media.public_manifest_sha256 || '') || undefined,
-      publicLabel: String(media.public_label || '') || undefined,
-      publicVersion: String(media.public_version || '') || undefined,
-      publishUrl: String(media.publish_url || '') || undefined,
-      promotedAssetId: String(media.promoted_asset_id || '') || undefined,
-      promoteToAssetUrl: String(media.promote_to_asset_url || '') || undefined
-    }
-  }) : []
+  const outputMedia = Array.isArray(raw.output_media) ? raw.output_media.map(adaptTaskOutputMedia) : []
   const projectId = relationId(raw.project_id ?? raw.project)
   const episodeId = relationId(raw.episode_id ?? raw.episode)
   const episodeContext = episodeContextById.get(episodeId)
@@ -548,6 +735,7 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
   const batchIndex = Number(raw.batch_index || 0) || undefined
   const batchSize = Number(raw.batch_size || 0) || undefined
   const batchKind = String(raw.batch_kind || '') || undefined
+  const batchSlots = adaptTaskBatchSlots(raw.batch_slots)
   const projectName = projectTitleById.get(projectId) || String(raw.project_title || '') || `项目 ${projectId.slice(0, 8)}`
   const episodeLabel = episodeNumber ? `第${episodeNumber}集` : episodeTitle
   const shotLabel = shotNumber ? `镜头${String(shotNumber).padStart(2, '0')}${shotTitle ? ` ${shotTitle}` : ''}` : shotTitle
@@ -577,6 +765,8 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
     workflowVersion: Number(raw.workflow_version || 0) || undefined, seed: Number(raw.seed || 0),
     effectiveFrames: Number(raw.effective_frames || 0), effectiveDurationMs: Number(raw.effective_duration_ms || 0),
     inputParameters, referenceAssets, continuityAssets,
+    generationPurpose: raw.generation_purpose === 'bible_image_candidate' ? 'bible_image_candidate' : undefined,
+    bibleImageTarget: adaptBibleImageFrozenTarget(raw.bible_target),
     promptAvailable: typeof inputParameters.prompt_available === 'boolean' ? inputParameters.prompt_available : undefined,
     promptCharacterCount: Number(inputParameters.prompt_character_count || 0),
     negativePromptCharacterCount: Number(inputParameters.negative_prompt_character_count || 0),
@@ -603,7 +793,10 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
     progressNote: isStalled ? stallReason || '任务长时间没有新的执行心跳，请检查 ComfyUI 状态或取消任务。' : progressTelemetry.progressSource === 'comfyui' && progressTelemetry.comfyProgress !== undefined ? '来自 ComfyUI 当前节点的量化采样进度，不等于整项任务完成度。' : progressIndeterminate ? '任务已提交或正在初始化，尚未收到 ComfyUI 量化进度。' : undefined,
     currentStep, nodes: taskNode(raw.kind, status, progress), createdAt,
     eta: status === 'running' ? '计算中' : undefined, attempts: Number(raw.attempts || 0), maxAttempts: Number(raw.max_attempts || 0),
-    batchId, batchIndex, batchSize, batchKind, episodeId: episodeId || undefined, episodeNumber, episodeTitle,
+    batchId, batchIndex, batchSize, batchKind,
+    shotVersionKey: String(raw.shot_version_key || '') || undefined,
+    shotVersionLabel: String(raw.shot_version_label || '') || undefined,
+    batchSlots, episodeId: episodeId || undefined, episodeNumber, episodeTitle,
     shotId: shotId || undefined, shotIds, shotNumber, shotTitle
   }
 })

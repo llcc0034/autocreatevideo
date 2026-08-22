@@ -1,6 +1,13 @@
 import { createRouter, createWebHistory } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
 import AppShell from '@/layouts/AppShell.vue'
+import {
+  clearRouteModuleFailure,
+  clearRouteModuleRecovery,
+  reportRouteModuleFailure,
+  resolveRouteRecoveryStorage,
+  routeModuleRecoveryAction,
+} from '@/services/routeModuleRecovery'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -27,6 +34,22 @@ router.beforeEach((to) => {
   const auth = useAuthStore()
   if (!to.meta.public && !auth.isAuthenticated) return { name: 'login', query: { redirect: to.fullPath } }
   if (to.meta.public && auth.isAuthenticated && !to.meta.allowAuthenticated) return { name: 'dashboard' }
+})
+
+router.onError((error, to) => {
+  const storage = resolveRouteRecoveryStorage(() => window.sessionStorage)
+  const action = routeModuleRecoveryAction(error, to.fullPath, storage)
+  if (action === 'reload') {
+    window.location.replace(to.fullPath)
+    return
+  }
+  if (action === 'report') reportRouteModuleFailure(to.fullPath)
+})
+
+router.afterEach((_to, _from, failure) => {
+  if (failure) return
+  clearRouteModuleRecovery(resolveRouteRecoveryStorage(() => window.sessionStorage))
+  clearRouteModuleFailure()
 })
 
 export default router

@@ -24,7 +24,10 @@ from studio.shot_detail_batch_views import (
     ShotDetailDraftBatchDetailView,
 )
 from studio.health_views import ReadinessView
+from studio.series_concept_draft_views import SeriesConceptDraftGenerateView
 from studio.asset_draft_views import ProjectAssetBibleDraftGenerateView
+from studio.bible_image_candidate_views import ProjectBibleImageCandidatesView
+from studio.deferred_generation_views import DeferredGenerationRequestViewSet
 from studio.visual_rule_draft_views import (
     ProjectVisualRuleDraftApplyView,
     ProjectVisualRuleDraftGenerateView,
@@ -70,6 +73,11 @@ router.register("shot-detail-drafts", ShotDetailDraftViewSet, basename="shot-det
 router.register("workflow-templates", WorkflowTemplateViewSet, basename="workflow-template")
 router.register("workflows", GeneratedWorkflowViewSet, basename="workflow")
 router.register("tasks", GenerationTaskViewSet, basename="task")
+router.register(
+    "deferred-generation-requests",
+    DeferredGenerationRequestViewSet,
+    basename="deferred-generation-request",
+)
 router.register("assemblies", AssemblyJobViewSet, basename="assembly")
 router.register("release-bundles", ReleaseBundleViewSet, basename="release-bundle")
 
@@ -96,6 +104,11 @@ urlpatterns = [
         "capabilities/production/",
         ProductionCapabilityView.as_view(),
         name="production-capability",
+    ),
+    path(
+        "series-concept-drafts/generate/",
+        SeriesConceptDraftGenerateView.as_view(),
+        name="series-concept-draft-generate",
     ),
     path(
         "projects/<uuid:project_id>/creative-drafts/generate/",
@@ -136,6 +149,11 @@ urlpatterns = [
         "projects/<uuid:project_id>/bible-drafts/from-assets/",
         ProjectAssetBibleDraftGenerateView.as_view(),
         name="project-asset-bible-draft-generate",
+    ),
+    path(
+        "projects/<uuid:id>/bible-image-candidates/",
+        ProjectBibleImageCandidatesView.as_view(),
+        name="project-bible-image-candidates",
     ),
     path(
         "projects/<uuid:project_id>/visual-rules-drafts/generate/",

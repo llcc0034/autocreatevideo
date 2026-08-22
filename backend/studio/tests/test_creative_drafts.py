@@ -15,6 +15,7 @@ from studio.models import (
     CharacterBible,
     Episode,
     EpisodeCreativeDraft,
+    PromptArtifact,
     PromptFieldTranslation,
     PropBible,
     SceneBible,
@@ -36,6 +37,8 @@ from studio.services.creative_drafts import (
     creative_config,
     creative_provider_config,
     ensure_creative_resources_available,
+    required_dialogue_manifest,
+    source_timed_visual_segments,
     validate_creative_draft_data,
 )
 from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
@@ -110,6 +113,11 @@ User = get_user_model()
         "max_input_chars": 120000,
         "output_headroom_per_shot": 384,
     },
+    SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER="deepseek_api",
+    SERIES_CONCEPT_DRAFT_PROVIDER_SUITABILITY={
+        "local_qwen": "experimental",
+        "deepseek_api": "recommended",
+    },
 )
 class CreativeDraftAPITests(TestCase):
     def setUp(self):
@@ -165,7 +173,10 @@ class CreativeDraftAPITests(TestCase):
                 "music_zh": "低沉古琴单音。",
                 "music_en": "Sparse low guqin notes.",
                 "duration_ms": 5000, "media_type": "video", "h3_mode": h3_mode,
-                "include_audio": True, "scene_id": str(self.scene.id),
+                "include_audio": True,
+                "requires_first_frame_continuity": index > 1,
+                "requires_last_frame_continuity": index < count,
+                "scene_id": str(self.scene.id),
                 "character_ids": [str(self.character.id)], "prop_ids": [],
                 "dialogue": ([{
                     "speaker_id": "S1", "text_zh": "别回头。",
@@ -233,6 +244,103 @@ class CreativeDraftAPITests(TestCase):
         self.assertEqual(response.data["draft_data"]["episode"]["title_en"], "")
         self.assertEqual(response.data["draft_data"]["episode"]["synopsis_en"], "")
 
+    def test_inline_timed_script_dialogue_is_required_and_applied(self):
+        self.episode.script = (
+            "【1 [首帧连续:否] [尾帧连续:是]: 凌霜在雨夜客栈拔剑；"
+            "[1-3.5秒] 凌霜（低声）: 别回头。】"
+        )
+        self.episode.save(update_fields=("script", "updated_at"))
+        snapshot = creative_context_snapshot(self.project, self.episode)
+        self.assertEqual(
+            required_dialogue_manifest(snapshot, include_audio=True),
+            [{
+                "speaker_id": "S1",
+                "text_zh": "别回头。",
+                "source_order": 1,
+                "source_delivery_zh": "低声",
+                "start_ms": 1000,
+                "end_ms": 3500,
+            }],
+        )
+
+        candidate = self.candidate(count=1)
+        candidate["shots"][0]["dialogue"] = []
+        generated, _captured = self.generate(count=1, candidate=candidate)
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(
+            generated.data["draft_data"]["shots"][0]["dialogue"][0]["start_ms"],
+            1000,
+        )
+        self.assertEqual(
+            generated.data["draft_data"]["shots"][0]["dialogue"][0]["end_ms"],
+            3500,
+        )
+        confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{generated.data['id']}/confirm/",
+            {
+                "expected_revision": generated.data["revision"],
+                "review_acknowledged": True,
+            },
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        applied = self.client.post(
+            f"/api/v1/creative-drafts/{generated.data['id']}/apply/",
+            {
+                "expected_revision": confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "append",
+                "review_acknowledged": True,
+            },
+            format="json",
+        )
+        self.assertEqual(applied.status_code, 200, applied.data)
+        shot = Shot.objects.get()
+        self.assertEqual(shot.dialogue, [{
+            "speaker_id": "S1",
+            "text": "别回头。",
+            "delivery": "低声",
+            "start_ms": 1000,
+            "end_ms": 3500,
+        }])
+
+    def test_non_dialogue_source_time_ranges_are_sent_and_reviewed(self):
+        self.episode.script = (
+            "[0-2.5秒] 动作：凌霜绕过桌案，右手压住剑柄。\n"
+            "[2.5-5秒] 凌霜：别回头。"
+        )
+        self.episode.save(update_fields=("script", "updated_at"))
+        snapshot = creative_context_snapshot(self.project, self.episode)
+        self.assertEqual(
+            source_timed_visual_segments(snapshot),
+            [{
+                "source_order": 1,
+                "start_ms": 0,
+                "end_ms": 2500,
+                "kind": "action",
+                "text_zh": "凌霜绕过桌案，右手压住剑柄",
+            }],
+        )
+
+        candidate = self.candidate(count=1)
+        candidate["shots"][0]["narrative_zh"] = "凌霜绕过桌案，右手压住剑柄。"
+        candidate["shots"][0]["action_zh"] = "凌霜绕过桌案，最终停步。"
+        generated, captured = self.generate(count=1, candidate=candidate)
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(
+            captured["source_timed_visual_segments"][0]["start_ms"], 0,
+        )
+        self.assertEqual(
+            captured["source_timed_visual_segments"][0]["end_ms"], 2500,
+        )
+        self.assertIn(
+            ("source_timing_range_missing", "shots"),
+            {
+                (issue["code"], issue["path"])
+                for issue in generated.data["validation"]["review_issues"]
+            },
+        )
+
     def test_worker_resource_lease_maps_creative_generate_to_409(self):
         with tempfile.TemporaryDirectory() as temp, override_settings(
             LOCAL_QWEN_LOCK_PATH=str(Path(temp) / "shared-local-ai.lock"),
@@ -273,6 +381,199 @@ class CreativeDraftAPITests(TestCase):
         self.assertEqual(applied.data["translations_written"], 0)
         self.assertEqual(Shot.objects.count(), 2)
         self.assertEqual(PromptFieldTranslation.objects.count(), 0)
+        first_shot, second_shot = Shot.objects.order_by("number")
+        self.assertFalse(first_shot.requires_first_frame_continuity)
+        self.assertTrue(first_shot.requires_last_frame_continuity)
+        self.assertTrue(second_shot.requires_first_frame_continuity)
+        self.assertFalse(second_shot.requires_last_frame_continuity)
+
+    def test_applying_new_draft_demotes_previous_applied_draft(self):
+        first, _ = self.generate(count=1)
+        first_confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{first.data['id']}/confirm/",
+            {"expected_revision": first.data["revision"]}, format="json",
+        )
+        self.assertEqual(first_confirmed.status_code, 200, first_confirmed.data)
+        first_applied = self.client.post(
+            f"/api/v1/creative-drafts/{first.data['id']}/apply/",
+            {
+                "expected_revision": first_confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "append",
+            },
+            format="json",
+        )
+        self.assertEqual(first_applied.status_code, 200, first_applied.data)
+
+        second, _ = self.generate(count=1)
+        second_confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{second.data['id']}/confirm/",
+            {"expected_revision": second.data["revision"]}, format="json",
+        )
+        self.assertEqual(second_confirmed.status_code, 200, second_confirmed.data)
+        second_applied = self.client.post(
+            f"/api/v1/creative-drafts/{second.data['id']}/apply/",
+            {
+                "expected_revision": second_confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "append",
+            },
+            format="json",
+        )
+        self.assertEqual(second_applied.status_code, 200, second_applied.data)
+
+        first_draft = EpisodeCreativeDraft.objects.get(pk=first.data["id"])
+        second_draft = EpisodeCreativeDraft.objects.get(pk=second.data["id"])
+        self.assertEqual(first_draft.status, EpisodeCreativeDraft.Status.CONFIRMED)
+        self.assertIsNone(first_draft.applied_at)
+        self.assertEqual(first_draft.applied_shot_ids, [])
+        self.assertEqual(second_draft.status, EpisodeCreativeDraft.Status.APPLIED)
+        self.assertEqual(
+            EpisodeCreativeDraft.objects.filter(
+                episode=self.episode,
+                status=EpisodeCreativeDraft.Status.APPLIED,
+            ).count(),
+            1,
+        )
+        listed = self.client.get(
+            f"/api/v1/projects/{self.project.id}/creative-drafts/",
+            {"episode": str(self.episode.id)},
+        )
+        self.assertEqual(listed.status_code, 200, listed.data)
+        statuses = {item["generation_no"]: item["status"] for item in listed.data}
+        self.assertEqual(statuses[1], EpisodeCreativeDraft.Status.CONFIRMED)
+        self.assertEqual(statuses[2], EpisodeCreativeDraft.Status.APPLIED)
+
+    def test_replace_with_existing_production_records_creates_new_episode_shot_version(self):
+        first, _ = self.generate(count=1)
+        first_confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{first.data['id']}/confirm/",
+            {"expected_revision": first.data["revision"]}, format="json",
+        )
+        first_applied = self.client.post(
+            f"/api/v1/creative-drafts/{first.data['id']}/apply/",
+            {
+                "expected_revision": first_confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "replace",
+            },
+            format="json",
+        )
+        self.assertEqual(first_applied.status_code, 200, first_applied.data)
+        original_shot = Shot.objects.get()
+        PromptArtifact.objects.create(
+            project=self.project,
+            episode=self.episode,
+            shot=original_shot,
+            created_by=self.user,
+            prompt_type=PromptArtifact.PromptType.VIDEO,
+            prompt_text="verified prompt",
+            content_hash="a" * 64,
+        )
+
+        second, _ = self.generate(count=1)
+        second_confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{second.data['id']}/confirm/",
+            {"expected_revision": second.data["revision"]}, format="json",
+        )
+        second_applied = self.client.post(
+            f"/api/v1/creative-drafts/{second.data['id']}/apply/",
+            {
+                "expected_revision": second_confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "replace",
+            },
+            format="json",
+        )
+
+        self.assertEqual(second_applied.status_code, 200, second_applied.data)
+        shots = list(Shot.objects.order_by("number"))
+        self.assertEqual(len(shots), 2)
+        self.assertEqual(shots[0].id, original_shot.id)
+        self.assertFalse(shots[0].metadata["creative_version_active"])
+        self.assertEqual(shots[0].metadata["creative_version_mode"], "direct_replace")
+        self.assertEqual(shots[1].metadata["creative_version_mode"], "versioned_replace")
+        self.assertTrue(shots[1].metadata["creative_version_active"])
+        self.assertEqual(shots[1].metadata["creative_version_shot_number"], 1)
+        self.assertEqual(shots[1].number, 2)
+        self.assertEqual(Shot.objects.filter(prompt_artifacts__isnull=False).count(), 1)
+
+    def test_sync_shots_preserves_hidden_creative_versions(self):
+        first, _ = self.generate(count=1)
+        first_confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{first.data['id']}/confirm/",
+            {"expected_revision": first.data["revision"]}, format="json",
+        )
+        first_applied = self.client.post(
+            f"/api/v1/creative-drafts/{first.data['id']}/apply/",
+            {
+                "expected_revision": first_confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "replace",
+            },
+            format="json",
+        )
+        self.assertEqual(first_applied.status_code, 200, first_applied.data)
+        original_shot = Shot.objects.get()
+        PromptArtifact.objects.create(
+            project=self.project,
+            episode=self.episode,
+            shot=original_shot,
+            created_by=self.user,
+            prompt_type=PromptArtifact.PromptType.VIDEO,
+            prompt_text="verified prompt",
+            content_hash="b" * 64,
+        )
+        second, _ = self.generate(count=1)
+        second_confirmed = self.client.post(
+            f"/api/v1/creative-drafts/{second.data['id']}/confirm/",
+            {"expected_revision": second.data["revision"]}, format="json",
+        )
+        second_applied = self.client.post(
+            f"/api/v1/creative-drafts/{second.data['id']}/apply/",
+            {
+                "expected_revision": second_confirmed.data["revision"],
+                "language_mode": "chinese_only",
+                "placement": "replace",
+            },
+            format="json",
+        )
+        self.assertEqual(second_applied.status_code, 200, second_applied.data)
+        active_shot = Shot.objects.order_by("-number").first()
+
+        synced = self.client.post(
+            f"/api/v1/episodes/{self.episode.id}/sync-shots/",
+            {
+                "shot_version_key": active_shot.metadata["creative_version_key"],
+                "shots": [{
+                    "id": str(active_shot.id),
+                    "number": 1,
+                    "title": "当前版本已编辑",
+                    "narrative": active_shot.narrative,
+                    "camera": active_shot.camera,
+                    "dialogue": active_shot.dialogue,
+                    "duration_ms": active_shot.duration_ms,
+                    "media_type": active_shot.media_type,
+                    "h3_mode": active_shot.h3_mode,
+                    "include_audio": active_shot.include_audio,
+                    "scene": str(self.scene.id),
+                    "characters": [str(self.character.id)],
+                    "props": [],
+                    "reference_assets": [],
+                    "reference_bindings": {},
+                    "metadata": active_shot.metadata,
+                }],
+            },
+            format="json",
+        )
+
+        self.assertEqual(synced.status_code, 200, synced.data)
+        self.assertEqual(Shot.objects.count(), 2)
+        original_shot.refresh_from_db()
+        active_shot.refresh_from_db()
+        self.assertFalse(original_shot.metadata["creative_version_active"])
+        self.assertTrue(active_shot.metadata["creative_version_active"])
+        self.assertEqual(active_shot.title, "当前版本已编辑")
 
     def test_apply_never_overwrites_authoritative_episode_source(self):
         original_title = self.episode.title
@@ -1113,10 +1414,35 @@ class CreativeDraftAPITests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.data["creative_generation_supported"])
         self.assertTrue(response.data["review_required"])
+        self.assertEqual(
+            response.data["series_concept_draft_preferred_provider"],
+            "deepseek_api",
+        )
+        self.assertTrue(response.data["series_concept_draft_supported"])
+        self.assertEqual(response.data["series_concept_draft_schema_version"], 2)
+        self.assertEqual(response.data["series_concept_draft_limits"], {
+            "max_idea_chars": 6000,
+            "max_style_hint_chars": 2000,
+            "default_episode_duration_seconds": 60,
+            "minimum_shot_duration_ms": 5000,
+            "maximum_shot_duration_ms": 15000,
+        })
+        self.assertTrue(response.data["series_concept_draft_review_required"])
+        self.assertFalse(response.data["series_concept_draft_persisted"])
         self.assertNotIn("min_shots", response.data)
         providers = {item["id"]: item for item in response.data["providers"]}
 
         local = providers["local_qwen"]
+        self.assertEqual(
+            local["series_concept_draft_suitability"], "experimental",
+        )
+        self.assertEqual(
+            local["series_concept_draft_suitability_reason_code"],
+            "series_concept_strict_structure_experimental",
+        )
+        self.assertEqual(local["series_concept_draft_timeout_seconds"], 900)
+        self.assertEqual(local["series_concept_draft_max_output_tokens"], 3072)
+        self.assertIn("基础/测试级", local["series_concept_draft_suitability_notice"])
         self.assertEqual(local["min_shots"], 1)
         self.assertEqual(local["recommended_max_shots"], 4)
         self.assertEqual(local["batch_shots"], 4)
@@ -1142,11 +1468,48 @@ class CreativeDraftAPITests(TestCase):
         self.assertEqual(local["min_script_action_coverage_percent"], 80)
 
         deepseek = providers["deepseek_api"]
+        self.assertEqual(
+            deepseek["series_concept_draft_suitability"], "recommended",
+        )
+        self.assertEqual(
+            deepseek["series_concept_draft_suitability_reason_code"],
+            "series_concept_strict_structure_recommended",
+        )
+        self.assertEqual(deepseek["series_concept_draft_timeout_seconds"], 900)
+        self.assertEqual(
+            deepseek["series_concept_draft_max_output_tokens"], 384000,
+        )
+        self.assertIn("仍需人工确认", deepseek["series_concept_draft_suitability_notice"])
         self.assertEqual(deepseek["min_shots"], 1)
         self.assertEqual(deepseek["recommended_max_shots"], 4)
         self.assertEqual(deepseek["batch_shots"], 16)
         self.assertEqual(deepseek["max_dialogue_per_shot"], 2)
         self.assertEqual(deepseek["max_output_tokens"], 16384)
+
+    @override_settings(
+        SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER="local_qwen",
+        SERIES_CONCEPT_DRAFT_PROVIDER_SUITABILITY={
+            "local_qwen": "recommended",
+            "deepseek_api": "experimental",
+        },
+    )
+    def test_series_concept_provider_guidance_is_configuration_driven(self):
+        response = self.client.get("/api/v1/capabilities/creative-drafts/")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            response.data["series_concept_draft_preferred_provider"],
+            "local_qwen",
+        )
+        providers = {item["id"]: item for item in response.data["providers"]}
+        self.assertEqual(
+            providers["local_qwen"]["series_concept_draft_suitability"],
+            "recommended",
+        )
+        self.assertEqual(
+            providers["deepseek_api"]["series_concept_draft_suitability"],
+            "experimental",
+        )
 
     def test_capability_maps_custom_deepseek_policy_without_root_level_duplicates(self):
         policy = {
@@ -1192,6 +1555,7 @@ class CreativeDraftAPITests(TestCase):
             CREATIVE_DRAFT_REVIEW,
             _validate_creative_provider_policy,
             _validate_creative_review_policy,
+            _validate_series_concept_draft_suitability,
         )
 
         valid = {
@@ -1246,6 +1610,10 @@ class CreativeDraftAPITests(TestCase):
                 **CREATIVE_DRAFT_REVIEW,
                 "min_script_action_coverage_percent": 101,
             })
+        with self.assertRaisesRegex(ImproperlyConfigured, "experimental, recommended"):
+            _validate_series_concept_draft_suitability(
+                "auto", "QWEN_SERIES_CONCEPT_DRAFT_SUITABILITY",
+            )
 
     def test_review_recommendations_are_configurable_advisories(self):
         from django.conf import settings

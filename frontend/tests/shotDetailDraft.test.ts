@@ -14,6 +14,7 @@ import {
   shotDetailDraftReviewIssueTitle,
 } from '../src/services/shotDetailDraft.ts'
 import { adaptShotDetailedDescription, shotDetailedDescriptionPayload } from '../src/services/shotDetailSync.ts'
+import { legacyShotVersionKey, normalizeShotVersionScopeKey, wholeEpisodeRetryStorageKey } from '../src/services/shotVersionScope.ts'
 import type { Shot } from '../src/types/index.ts'
 
 const rawDraft = {
@@ -159,6 +160,8 @@ test('episode detail batch adapter preserves frozen before snapshots and atomic 
   const result = adaptShotDetailDraftBatchDetail({
     batch: {
       id: 'batch-1', project: 'project-1', episode: 'episode-1', request_id: 'request-1',
+      shot_version_key: 'creative-draft:version-1', shot_version_label: 'V1',
+      version_scope_status: 'resolved',
       provider: 'deepseek_api', generation_status: 'completed', apply_status: 'not_started',
       revision: 4, total_count: 2, pending_count: 0, succeeded_count: 1,
       failed_count: 0, stale_count: 0, skipped_count: 1, applied_count: 0,
@@ -178,12 +181,44 @@ test('episode detail batch adapter preserves frozen before snapshots and atomic 
     translation_written: false,
   })
   assert.equal(result.batch.provider, 'deepseek_api')
+  assert.equal(result.batch.shotVersionKey, 'creative-draft:version-1')
+  assert.equal(result.batch.shotVersionLabel, 'V1')
+  assert.equal(result.batch.versionScopeStatus, 'resolved')
   assert.equal(result.batch.revision, 4)
   assert.equal(result.items[0].beforeSnapshot.targetShot.title, '冻结标题')
   assert.equal(result.items[0].draft?.revision, 3)
   assert.equal(result.items[1].status, 'skipped')
   assert.deepEqual(result.appliedShots, [])
   assert.equal(result.translationWritten, false)
+})
+
+test('storyboard version scope uses one deterministic initial-version key', () => {
+  assert.equal(legacyShotVersionKey('episode-1'), 'legacy:episode-1:initial')
+  assert.equal(normalizeShotVersionScopeKey('', 'episode-1'), 'legacy:episode-1:initial')
+  assert.equal(
+    normalizeShotVersionScopeKey(' creative-draft:version-2 ', 'episode-1'),
+    'creative-draft:version-2',
+  )
+  assert.notEqual(
+    wholeEpisodeRetryStorageKey('episode-1', 'creative-draft:version-1'),
+    wholeEpisodeRetryStorageKey('episode-1', 'creative-draft:version-2'),
+  )
+})
+
+test('unscoped historical batches remain audit-only instead of falling into current version', () => {
+  const result = adaptShotDetailDraftBatchDetail({
+    batch: {
+      id: 'legacy-unknown', project: 'project-1', episode: 'episode-1',
+      request_id: 'request-unknown', provider: 'local_qwen',
+      generation_status: 'completed', apply_status: 'complete', revision: 1,
+      total_count: 6, applied_count: 6,
+    },
+    items: [], pagination: { count: 0, next: null, previous: null },
+    applied_shots: [], translation_written: false,
+  })
+  assert.equal(result.batch.shotVersionKey, '')
+  assert.equal(result.batch.versionScopeStatus, 'legacy_unknown')
+  assert.notEqual(result.batch.shotVersionKey, legacyShotVersionKey('episode-1'))
 })
 
 test('episode detail batch detail exposes committed shots for lost-apply-response recovery', () => {
@@ -246,12 +281,20 @@ test('Storyboard uses one current-shot drawer, retains stale-response protection
   assert.ok(storyboard.includes("fieldKey:'shot.detailed_description'"))
   assert.ok(storyboard.includes("invalidatePrompt(target, 'inputs_changed')"))
   assert.ok(adapters.includes('...shotDetailedDescriptionPayload(shot)'))
+  assert.ok(adapters.includes('shot_version_key: shotVersionKey'))
+  assert.ok(adapters.includes('normalizeShotVersionScopeKey(episode.activeShotVersionKey, episode.id)'))
   assert.ok(translations.includes("field.fieldKey === 'shot.detailed_description'"))
   assert.ok(!workbench.includes('ShotDetailDraftPanel'))
   assert.ok(storyboard.includes('class="episode-tool-group"'))
   assert.ok(storyboard.indexOf('整集扩写') < storyboard.indexOf('整集应用'))
   assert.ok(storyboard.indexOf('整集应用') < storyboard.indexOf('生成全部提示词'))
   assert.ok(episodeModal.includes('batchDetailAll'))
+  assert.ok(storyboard.includes(':shot-version-key="selectedShotVersionScopeKey"'))
+  assert.ok(episodeModal.includes('props.projectId, props.episode.id, props.shotVersionKey'))
+  assert.ok(episodeModal.includes('next.batch.versionScopeStatus !== \'resolved\''))
+  assert.ok(episodeModal.includes('next.batch.shotVersionKey !== props.shotVersionKey'))
+  assert.ok(episodeModal.includes('props.projectId, props.episode.id, props.shotVersionKey'))
+  assert.ok(episodeModal.includes('detail.value = null'))
   assert.ok(episodeModal.includes("next.batch.applyStatus === 'complete'"))
   assert.ok(episodeModal.includes('appliedShots: next.appliedShots'))
   assert.ok(episodeModal.includes('expectedBatchRevision'))
@@ -269,6 +312,8 @@ test('detail repository forwards explicit review acknowledgement for confirm and
   assert.ok(repository.includes('async confirm(id: string, expectedRevision: number, reviewAcknowledged = false)'))
   assert.ok(repository.includes('review_acknowledged: reviewAcknowledged'))
   assert.ok(repository.includes('review_acknowledged: options.reviewAcknowledged === true'))
+  assert.ok(repository.includes('params: { episode: episodeId, shot_version_key: shotVersionKey'))
+  assert.ok(repository.includes('shot_version_key: options.shotVersionKey'))
   assert.ok(repository.includes('current.reviewSummary.requiresEditCount'))
   assert.ok(repository.includes('VITE_SHOT_DETAIL_DRAFT_TIMEOUT_MS'))
   assert.ok(!repository.includes('720_000'))

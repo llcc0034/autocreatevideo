@@ -5,6 +5,7 @@ import tempfile
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import connection
 from django.test import TestCase, override_settings
@@ -51,6 +52,7 @@ def jpeg_upload_with_exif(name="cover-exif.jpg"):
 
 class SeriesProjectCoverAPITests(TestCase):
     def setUp(self):
+        cache.clear()
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.media_root = Path(self.temp.name) / "media"

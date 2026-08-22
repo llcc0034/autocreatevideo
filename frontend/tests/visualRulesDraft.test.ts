@@ -163,6 +163,21 @@ test('local drift guard tracks visual sources and episode summaries but ignores 
   assert.notEqual(visualRulesLocalContextSnapshot(independentContinuityChanged, style), snapshot)
 })
 
+test('visual rules candidate generation reads persisted source without pre-saving the project', () => {
+  const studio = readFileSync(new URL('../src/views/SeriesStudioView.vue', import.meta.url), 'utf8')
+  const component = readFileSync(new URL('../src/components/GlobalVisualRulesDraft.vue', import.meta.url), 'utf8')
+  const manual = readFileSync(new URL('../src/content/productionManual.ts', import.meta.url), 'utf8')
+
+  assert.ok(component.includes('repository.getProject(props.project.id)'))
+  assert.ok(component.includes('生成候选前不会自动保存当前页面资料'))
+  assert.ok(component.includes('请先手动保存或刷新项目，再点击“重新生成候选”'))
+  assert.ok(!component.includes('prepareSource'))
+  assert.ok(!component.includes('props.prepareSource'))
+  assert.ok(!component.includes('当前故事资料保存失败'))
+  assert.ok(!studio.includes(':prepare-source="save"'))
+  assert.ok(manual.includes('页面不会在候选生成前自动保存整项目'))
+})
+
 test('the full repository check gate runs the visual rules regression suite', () => {
   const checkScript = readFileSync(new URL('../../scripts/check.ps1', import.meta.url), 'utf8')
   assert.ok(checkScript.includes('npm run test:visual-rules'))

@@ -209,6 +209,8 @@ SPECTACULAR_SETTINGS = {
         # Name that shared choice set explicitly so the generated OpenAPI
         # component remains stable instead of receiving a hash suffix.
         "CreativeDraftStatusEnum": "studio.models.EpisodeCreativeDraft.Status",
+        "DeferredGenerationStatusEnum": "studio.models.DeferredGenerationRequest.Status",
+        "DeferredFrameSlotEnum": "studio.models.DeferredGenerationRequest.FrameSlot",
     },
 }
 
@@ -229,6 +231,18 @@ if not 1 <= VIDEO_SHOT_MIN_DURATION_MS <= VIDEO_SHOT_MAX_DURATION_MS:
     raise ImproperlyConfigured(
         "VIDEO_SHOT_MIN_DURATION_MS and VIDEO_SHOT_MAX_DURATION_MS must define "
         "a positive ordered range"
+    )
+SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS = int(
+    os.getenv("SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS", "60")
+)
+if (
+    SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS < 1
+    or SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS * 1000
+    < VIDEO_SHOT_MIN_DURATION_MS
+):
+    raise ImproperlyConfigured(
+        "SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS must be positive and "
+        "long enough for one configured minimum-duration video shot"
     )
 if not 1 <= H3_MIN_ALIGNED_FRAMES <= H3_MAX_ALIGNED_FRAMES:
     raise ImproperlyConfigured(
@@ -323,15 +337,34 @@ DEEPSEEK_API = {
     "api_key": os.getenv("DEEPSEEK_API_KEY", "").strip(),
     "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
     "timeout_seconds": float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "180")),
+    "series_concept_timeout_seconds": float(
+        os.getenv("DEEPSEEK_SERIES_CONCEPT_TIMEOUT_SECONDS", "900")
+    ),
     "max_retries": int(os.getenv("DEEPSEEK_MAX_RETRIES", "1")),
     "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "16384")),
+    # DeepSeek V4 exposes a much larger model output capability than the
+    # legacy creative/translation budget above. Series concept generation
+    # sends this provider capability verbatim; it is not derived from episode
+    # or shot counts and therefore is not a product-volume gate.
+    "series_concept_max_tokens": int(
+        os.getenv("DEEPSEEK_SERIES_CONCEPT_MAX_TOKENS", "384000")
+    ),
 }
 if DEEPSEEK_API["timeout_seconds"] <= 0:
     raise ImproperlyConfigured("DEEPSEEK_TIMEOUT_SECONDS must be greater than zero")
+if not 0 < DEEPSEEK_API["series_concept_timeout_seconds"] <= 3600:
+    raise ImproperlyConfigured(
+        "DEEPSEEK_SERIES_CONCEPT_TIMEOUT_SECONDS must be greater than zero "
+        "and no more than 3600"
+    )
 if not 0 <= DEEPSEEK_API["max_retries"] <= 3:
     raise ImproperlyConfigured("DEEPSEEK_MAX_RETRIES must be between 0 and 3")
 if DEEPSEEK_API["max_tokens"] < 1:
     raise ImproperlyConfigured("DEEPSEEK_MAX_TOKENS must be greater than zero")
+if DEEPSEEK_API["series_concept_max_tokens"] < 1:
+    raise ImproperlyConfigured(
+        "DEEPSEEK_SERIES_CONCEPT_MAX_TOKENS must be greater than zero"
+    )
 if not DEEPSEEK_API["base_url"]:
     raise ImproperlyConfigured("DEEPSEEK_BASE_URL must not be empty")
 if not DEEPSEEK_API["model"]:
@@ -562,6 +595,37 @@ PROMPT_CREATIVE_DEFAULT_PROVIDER = _validate_prompt_provider(
     os.getenv("PROMPT_CREATIVE_DEFAULT_PROVIDER", "local_qwen"),
     "PROMPT_CREATIVE_DEFAULT_PROVIDER",
 )
+
+_SERIES_CONCEPT_DRAFT_SUITABILITY_VALUES = {"recommended", "experimental"}
+
+
+def _validate_series_concept_draft_suitability(
+    value: str, setting_name: str,
+) -> str:
+    suitability = str(value or "").strip().lower()
+    if suitability not in _SERIES_CONCEPT_DRAFT_SUITABILITY_VALUES:
+        allowed = ", ".join(sorted(_SERIES_CONCEPT_DRAFT_SUITABILITY_VALUES))
+        raise ImproperlyConfigured(f"{setting_name} must be one of: {allowed}")
+    return suitability
+
+
+# Operation-specific UI guidance only. These settings never reject a request,
+# inspect hardware/model names, or silently switch the provider selected by the
+# user. Provider readiness remains a separate, factual capability signal.
+SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER = _validate_prompt_provider(
+    os.getenv("SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER", "deepseek_api"),
+    "SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER",
+)
+SERIES_CONCEPT_DRAFT_PROVIDER_SUITABILITY = {
+    "local_qwen": _validate_series_concept_draft_suitability(
+        os.getenv("QWEN_SERIES_CONCEPT_DRAFT_SUITABILITY", "experimental"),
+        "QWEN_SERIES_CONCEPT_DRAFT_SUITABILITY",
+    ),
+    "deepseek_api": _validate_series_concept_draft_suitability(
+        os.getenv("DEEPSEEK_SERIES_CONCEPT_DRAFT_SUITABILITY", "recommended"),
+        "DEEPSEEK_SERIES_CONCEPT_DRAFT_SUITABILITY",
+    ),
+}
 
 # Human-reviewed local translation.  The model is loaded in a disposable child
 # process only for a translation request and exits before any ComfyUI task is

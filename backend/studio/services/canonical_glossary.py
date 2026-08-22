@@ -979,6 +979,7 @@ def ensure_canonical_glossary(
     }
     return {
         "project_id": str(project.pk),
+        "updated_at": locked.updated_at,
         "translation_glossary": glossary,
         "summary": summary,
         "entries": rows,

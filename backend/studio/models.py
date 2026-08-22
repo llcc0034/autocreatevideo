@@ -490,6 +490,11 @@ class EpisodeCreativeDraft(UUIDTimeStampedModel):
                 fields=("episode", "generation_no"),
                 name="unique_creative_generation_per_episode",
             ),
+            models.UniqueConstraint(
+                fields=("episode",),
+                condition=Q(status="applied"),
+                name="unique_applied_creative_draft_per_episode",
+            ),
         ]
         indexes = [
             models.Index(
@@ -598,6 +603,12 @@ class ShotDetailDraftBatch(UUIDTimeStampedModel):
         NOT_STARTED = "not_started", "未应用"
         COMPLETE = "complete", "已全部应用"
 
+    class VersionScopeStatus(models.TextChoices):
+        RESOLVED = "resolved", "已归属分镜版本"
+        LEGACY_MIXED = "legacy_mixed", "历史混合版本"
+        LEGACY_PARTIAL = "legacy_partial", "历史镜头记录不完整"
+        LEGACY_UNKNOWN = "legacy_unknown", "历史归属未知"
+
     project = models.ForeignKey(
         SeriesProject, on_delete=models.CASCADE, related_name="shot_detail_batches",
     )
@@ -611,6 +622,12 @@ class ShotDetailDraftBatch(UUIDTimeStampedModel):
     request_id = models.UUIDField(unique=True, editable=False)
     provider = models.CharField(max_length=80, default="local_qwen")
     variation_note = models.TextField(blank=True)
+    shot_version_key = models.CharField(max_length=191, null=True, blank=True)
+    shot_version_label = models.CharField(max_length=200, blank=True)
+    version_scope_status = models.CharField(
+        max_length=20, choices=VersionScopeStatus.choices,
+        default=VersionScopeStatus.RESOLVED,
+    )
     source_manifest_hash = models.CharField(max_length=64, db_index=True)
     policy_snapshot = models.JSONField(default=dict)
     config_hash = models.CharField(max_length=64)
@@ -637,15 +654,33 @@ class ShotDetailDraftBatch(UUIDTimeStampedModel):
         ordering = ("-created_at",)
         constraints = [
             models.UniqueConstraint(
-                fields=("episode",),
-                condition=Q(generation_status__in=("queued", "running")),
-                name="unique_active_shot_detail_batch",
+                fields=("episode", "shot_version_key"),
+                condition=Q(
+                    version_scope_status="resolved",
+                    generation_status__in=("queued", "running"),
+                ),
+                name="unique_active_sdetail_version",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(version_scope_status="resolved", shot_version_key__isnull=False)
+                    | Q(
+                        version_scope_status__in=(
+                            "legacy_mixed", "legacy_partial", "legacy_unknown",
+                        ),
+                        shot_version_key__isnull=True,
+                    )
+                ),
+                name="sdetail_version_scope_consistent",
             ),
         ]
         indexes = [
             models.Index(
-                fields=("project", "episode", "generation_status", "created_at"),
-                name="studio_sdbatch_scope_idx",
+                fields=(
+                    "project", "episode", "shot_version_key",
+                    "generation_status", "created_at",
+                ),
+                name="studio_sdbatch_ver_idx",
             ),
         ]
 
@@ -665,7 +700,7 @@ class ShotDetailDraftBatchItem(UUIDTimeStampedModel):
         ShotDetailDraftBatch, on_delete=models.CASCADE, related_name="items",
     )
     shot = models.ForeignKey(
-        Shot, on_delete=models.CASCADE, related_name="detail_batch_items",
+        Shot, on_delete=models.RESTRICT, related_name="detail_batch_items",
     )
     ordinal = models.PositiveIntegerField()
     source_context_hash = models.CharField(max_length=64, db_index=True)
@@ -868,6 +903,156 @@ class GenerationTask(UUIDTimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.kind}:{self.id} [{self.status}]"
+
+
+class DeferredGenerationRequest(UUIDTimeStampedModel):
+    """Persisted first/last-frame dependency between two generation tasks.
+
+    The provisional prompt is reviewable immediately, while the formal
+    PromptArtifact -> GeneratedWorkflow -> GenerationTask chain is created only
+    after the declared upstream video output has a verified signed manifest and
+    its last decodable frame has been materialized as an Asset.
+    """
+
+    class FrameSlot(models.TextChoices):
+        FIRST_FRAME = "first_frame", "首帧"
+        LAST_FRAME = "last_frame", "尾帧"
+
+    class Status(models.TextChoices):
+        PREPARING_PROMPT = "preparing_prompt", "正在准备提示词"
+        WAITING_UPSTREAM = "waiting_upstream", "等待上游视频"
+        EXTRACTING = "extracting", "正在提取末帧"
+        MATERIALIZING = "materializing", "正在物化正式任务"
+        MATERIALIZED = "materialized", "已物化"
+        FAILED = "failed", "已失败"
+        STALE = "stale", "目标输入已过期"
+        CANCELLED = "cancelled", "已取消"
+
+    SOURCE_OUTPUT_ROLE_PRIMARY_VIDEO = "primary_video"
+    ACTIVE_STATUSES = (
+        Status.PREPARING_PROMPT,
+        Status.WAITING_UPSTREAM,
+        Status.EXTRACTING,
+        Status.MATERIALIZING,
+    )
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="deferred_generation_requests",
+    )
+    project = models.ForeignKey(
+        SeriesProject,
+        on_delete=models.CASCADE,
+        related_name="deferred_generation_requests",
+    )
+    source_task = models.ForeignKey(
+        GenerationTask,
+        on_delete=models.PROTECT,
+        related_name="downstream_deferred_requests",
+    )
+    source_output_role = models.CharField(
+        max_length=32,
+        default=SOURCE_OUTPUT_ROLE_PRIMARY_VIDEO,
+        editable=False,
+    )
+    target_shot = models.ForeignKey(
+        Shot,
+        on_delete=models.PROTECT,
+        related_name="deferred_generation_requests",
+    )
+    frame_slot = models.CharField(max_length=20, choices=FrameSlot.choices)
+    target_template = models.ForeignKey(
+        WorkflowTemplate,
+        on_delete=models.PROTECT,
+        related_name="deferred_generation_requests",
+    )
+    target_template_hash = models.CharField(max_length=64)
+    idempotency_key = models.CharField(max_length=120)
+    request_fingerprint = models.CharField(max_length=64)
+    target_input_fingerprint = models.CharField(max_length=64)
+    target_workflow_overrides = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=24,
+        choices=Status.choices,
+        default=Status.PREPARING_PROMPT,
+    )
+    provisional_prompt_text = models.TextField()
+    provisional_negative_prompt = models.TextField(blank=True)
+    provisional_prompt_sha256 = models.CharField(max_length=64)
+    resolved_source_output_index = models.PositiveIntegerField(null=True, blank=True)
+    source_artifact_sha256 = models.CharField(max_length=64, blank=True)
+    source_manifest_sha256 = models.CharField(max_length=64, blank=True)
+    derived_asset = models.ForeignKey(
+        Asset,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="derived_deferred_generation_requests",
+    )
+    materialized_task = models.OneToOneField(
+        GenerationTask,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="deferred_generation_request",
+    )
+    priority = models.SmallIntegerField(default=0)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    max_attempts = models.PositiveSmallIntegerField(
+        default=3,
+        validators=[MinValueValidator(1)],
+    )
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    extended_generation_confirmed = models.BooleanField(default=False)
+    worker_id = models.CharField(max_length=120, blank=True)
+    claim_token = models.CharField(max_length=64, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True)
+    error_code = models.CharField(max_length=80, blank=True)
+    error_message = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-priority", "created_at")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("project", "idempotency_key"),
+                name="uk_deferred_project_idem",
+            ),
+            models.UniqueConstraint(
+                fields=("target_shot", "frame_slot"),
+                condition=Q(status__in=(
+                    "preparing_prompt", "waiting_upstream", "extracting", "materializing",
+                )),
+                name="uk_deferred_active_slot",
+            ),
+            models.CheckConstraint(
+                condition=Q(attempts__lte=models.F("max_attempts")),
+                name="ck_deferred_attempts_lte_max",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status="materialized", materialized_task__isnull=False)
+                    | (~Q(status="materialized") & Q(materialized_task__isnull=True))
+                ),
+                name="ck_deferred_materialized_task",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("status", "next_attempt_at", "created_at"),
+                name="idx_deferred_due",
+            ),
+            models.Index(
+                fields=("source_task", "status"),
+                name="idx_deferred_source_status",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.source_task_id}->{self.target_shot_id}:{self.frame_slot} [{self.status}]"
 
 
 class AssemblyJob(UUIDTimeStampedModel):

@@ -945,6 +945,30 @@ class PromptTranslationApiTests(TestCase):
             confirmed_compiled.payload["quality"]["production_language_gate"]["would_block_enqueue"]
         )
 
+    @patch("studio.services.canonical_glossary.translate_texts_once")
+    def test_auto_glossary_response_returns_project_updated_at(self, translate):
+        self.character.name = "沈砚"
+        self.character.save(update_fields=("name", "updated_at"))
+        translate.return_value = [TranslationResult(
+            text="Shen Yan", provider="local_qwen",
+            model="Qwen/Qwen3-4B-GGUF", metadata={"elapsed_ms": 10},
+        )]
+
+        response = self.client.post(
+            reverse("project-ensure-canonical-glossary", args=[self.project.id]),
+            {
+                "entries": [{
+                    "scope_type": "character", "scope_id": str(self.character.id),
+                }],
+            }, format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertIn("updated_at", response.data)
+        self.project.refresh_from_db()
+        self.assertEqual(response.data["translation_glossary"]["沈砚"], "Shen Yan")
+        self.assertEqual(response.data["updated_at"], self.project.updated_at)
+
     def test_glossary_change_invalidates_confirmed_translation_context(self):
         self.shot.action = "她拔出玄纹剑挡在门前。"
         self.shot.save(update_fields=("action", "updated_at"))

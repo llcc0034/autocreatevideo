@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from collections.abc import Mapping
 import math
 import re
 
@@ -28,6 +29,11 @@ from studio.models import (
     ShotDetailDraftBatchItem,
 )
 from studio.services.dialogue import parse_delivery_annotation
+from studio.services.script_bible import (
+    longest_non_overlapping_entities,
+    normalize_script_bible_name,
+    parse_script_bible,
+)
 
 
 EPISODE_RE = re.compile(
@@ -71,7 +77,16 @@ _FALSE_VALUES = {"0", "false", "no", "off", "否", "不需要", "无"}
 class BreakdownResult:
     episodes: list[Episode]
     warnings: list[str] = field(default_factory=list)
-    method: str = "deterministic-script-breakdown-v2"
+    method: str = "deterministic-script-breakdown-v3"
+
+
+@dataclass(frozen=True)
+class ConfirmedScriptBibleAliases:
+    """Trusted original declaration names resolved to current Bible rows."""
+
+    characters: Mapping[str, CharacterBible] = field(default_factory=dict)
+    scenes: Mapping[str, SceneBible] = field(default_factory=dict)
+    props: Mapping[str, PropBible] = field(default_factory=dict)
 
 
 class ScriptRebuildConflict(Exception):
@@ -575,6 +590,31 @@ def _episode_sections(script: str, hint: int) -> tuple[list[tuple[str, list[str]
     return [(f"第 {index + 1} 集", blocks[index * size:(index + 1) * size]) for index in range(count)], False
 
 
+def _entity_name_pairs(
+    rows: list,
+    aliases: Mapping[str, object],
+) -> list[tuple[str, object]]:
+    """Merge current names with trusted aliases, with aliases taking precedence."""
+
+    rows_by_id = {row.pk: row for row in rows}
+    by_name = {
+        normalize_script_bible_name(row.name): (row.name, row)
+        for row in rows
+        if normalize_script_bible_name(row.name)
+    }
+    for alias, row in aliases.items():
+        normalized_alias = normalize_script_bible_name(alias)
+        current = rows_by_id.get(getattr(row, "pk", None))
+        if (
+            not normalized_alias
+            or current is None
+            or type(current) is not type(row)
+        ):
+            raise ValueError("已确认 SCRIPT_BIBLE_V1 别名不属于当前项目或类型不匹配")
+        by_name[normalized_alias] = (alias, current)
+    return list(by_name.values())
+
+
 def breakdown_script(
     project: SeriesProject,
     script: str,
@@ -584,6 +624,7 @@ def breakdown_script(
     default_last_frame_continuity: bool | None = None,
     multi_shot: bool = True,
     include_audio: bool = True,
+    confirmed_bible_aliases: ConfirmedScriptBibleAliases | None = None,
 ) -> BreakdownResult:
     if default_shot_duration_ms is None:
         default_shot_duration_ms = settings.SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS
@@ -595,20 +636,42 @@ def breakdown_script(
         default_last_frame_continuity = (
             settings.SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY
         )
-    sections, explicit_headings = _episode_sections(script, episode_count_hint)
+    parsed_script = parse_script_bible(script)
+    sections, explicit_headings = _episode_sections(
+        parsed_script.body, episode_count_hint,
+    )
     if not sections:
         raise ValueError("剧本为空或无法识别有效内容")
     characters = list(project.characters.order_by("name"))
     scenes = list(project.scenes.order_by("name"))
     props = list(project.props.order_by("name"))
+    aliases = confirmed_bible_aliases or ConfirmedScriptBibleAliases()
+    character_name_pairs = _entity_name_pairs(characters, aliases.characters)
+    character_names = {
+        normalize_script_bible_name(name): (name, item)
+        for name, item in character_name_pairs
+    }
+    # One authoritative character-name map serves both dialogue and generic
+    # scans. Stable speaker IDs must win over an identical current/alias name.
+    character_names.update({
+        normalize_script_bible_name(item.stable_speaker_id): (
+            item.stable_speaker_id, item,
+        )
+        for item in characters
+    })
+    character_name_pairs = list(character_names.values())
+    scene_name_pairs = _entity_name_pairs(scenes, aliases.scenes)
+    prop_name_pairs = _entity_name_pairs(props, aliases.props)
     configured_mode = (project.production_settings or {}).get("default_h3_mode")
     default_h3_mode = (
         configured_mode
         if configured_mode in {Shot.H3Mode.T2VA, Shot.H3Mode.FL2VA, Shot.H3Mode.REF2VA}
         else Shot.H3Mode.T2VA
     )
-    character_by_name = {item.name: item for item in characters}
-    character_by_name.update({item.stable_speaker_id: item for item in characters})
+    character_by_name = {
+        normalize_script_bible_name(name): item
+        for name, item in character_name_pairs
+    }
     warnings = []
     created = []
     next_episode_number = (project.episodes.order_by("-number").values_list("number", flat=True).first() or 0) + 1
@@ -625,7 +688,7 @@ def breakdown_script(
             prompt_settings={
                 "multi_shot": multi_shot, "include_audio": include_audio,
                 "default_h3_mode": default_h3_mode,
-                "breakdown_method": "deterministic-script-breakdown-v2",
+                "breakdown_method": "deterministic-script-breakdown-v3",
                 "default_shot_duration_ms": default_shot_duration_ms,
                 "default_first_frame_continuity": default_first_frame_continuity,
                 "default_last_frame_continuity": default_last_frame_continuity,
@@ -652,7 +715,9 @@ def breakdown_script(
                 if forced_kind == "dialogue":
                     body = DIALOGUE_LABEL_RE.sub("", body)
                 match = DIALOGUE_RE.match(body) if forced_kind != "action" else None
-                character = character_by_name.get(match.group("name").strip()) if match else None
+                character = character_by_name.get(
+                    normalize_script_bible_name(match.group("name"))
+                ) if match else None
                 if match and character:
                     start_ms, end_ms = _effective_range(
                         timing,
@@ -696,11 +761,18 @@ def breakdown_script(
                         plain_narrative_lines.append(action_text)
                     if match and not character:
                         warnings.append(f"{title} 分镜 {shot_index}: 对白人物“{match.group('name').strip()}”未在角色 bible 中找到")
-            for character in characters:
-                if character.name in block:
-                    bound_characters.add(character)
-            scene = next((item for item in scenes if item.name in block), scenes[0] if len(scenes) == 1 else None)
-            bound_props = [item for item in props if item.name in block]
+            bound_characters.update(longest_non_overlapping_entities(
+                block, character_name_pairs,
+            ))
+            matched_scenes = longest_non_overlapping_entities(
+                block, scene_name_pairs,
+            )
+            scene = matched_scenes[0] if matched_scenes else (
+                scenes[0] if len(scenes) == 1 else None
+            )
+            bound_props = longest_non_overlapping_entities(
+                block, prop_name_pairs,
+            )
             narrative = "\n".join(filter(None, narrative_lines)).strip()
             if not narrative:
                 names = "、".join(item.name for item in bound_characters)

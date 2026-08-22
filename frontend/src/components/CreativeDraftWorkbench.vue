@@ -24,6 +24,7 @@ import {
   creativeProviderFailureFallback,
   creativeSafeFailureCode,
   creativeSafeFailureDiagnostic,
+  inferCreativeDraftShotCountFromScript,
 } from '@/services/creativeDraft'
 import type {
   CreativeDraft, CreativeDraftCreativity, CreativeDraftData, CreativeDraftLanguageMode,
@@ -164,7 +165,31 @@ const providerEgressNotice = computed(() => selectedProvider.value === 'deepseek
   : '')
 const minShots = computed(() => selectedProviderCapability.value?.minShots)
 const recommendedMaxShots = computed(() => selectedProviderCapability.value?.recommendedMaxShots)
-const defaultShots = computed(() => selectedProviderCapability.value?.defaultShots ?? recommendedMaxShots.value ?? minShots.value ?? null)
+const episodeFormalShotCount = computed(() => {
+  const count = activeEpisode.value?.shots.length || 0
+  return count > 0 ? count : null
+})
+const episodeScriptShotCount = computed(() => inferCreativeDraftShotCountFromScript(activeEpisode.value?.script || ''))
+const contextualDefaultShots = computed(() => episodeFormalShotCount.value ?? episodeScriptShotCount.value)
+const defaultShots = computed(() => (
+  contextualDefaultShots.value
+  ?? selectedProviderCapability.value?.defaultShots
+  ?? recommendedMaxShots.value
+  ?? minShots.value
+  ?? null
+))
+const targetShotCountUsesAutoDefault = computed(() => (
+  !targetShotCountWasEdited.value
+  && defaultShots.value !== null
+  && Number(targetShotCount.value) === defaultShots.value
+))
+const targetShotCountDefaultHint = computed(() => {
+  if (!targetShotCountUsesAutoDefault.value) return ''
+  if (episodeFormalShotCount.value) return `默认值来自当前集已有 ${episodeFormalShotCount.value} 个正式分镜`
+  if (episodeScriptShotCount.value) return `默认值来自本集剧本中识别到的 ${episodeScriptShotCount.value} 个镜头段落`
+  if (selectedProviderCapability.value?.defaultShots) return `默认值来自 ${selectedProviderCapability.value.label || '所选通道'} 推荐`
+  return ''
+})
 const batchShots = computed(() => selectedProviderCapability.value?.batchShots)
 const maxDialoguePerShot = computed(() => selectedProviderCapability.value?.maxDialoguePerShot)
 const maxSourceChars = computed(() => selectedProviderCapability.value?.maxSourceChars)
@@ -217,6 +242,11 @@ const canConfirm = computed(() => Boolean(
 const canApply = computed(() => Boolean(
   activeDraft.value?.canApply && activeDraft.value.status === 'confirmed' && !dirty.value
   && activeDraft.value.contextCurrent && !requiresEditCount.value,
+))
+const activeEpisodeFormalShotCount = computed(() => activeEpisode.value?.shots.length || 0)
+const defaultPlacementForActiveEpisode = computed<CreativeDraftPlacement>(() => 'replace')
+const replaceMayBeProtected = computed(() => (
+  placement.value === 'replace' && activeEpisodeFormalShotCount.value > 0
 ))
 const authoritativeVisibleSourceChars = computed(() => {
   const episode = activeEpisode.value
@@ -343,6 +373,7 @@ const selectDraft = (draft: CreativeDraft) => {
   selectedDraftId.value = draft.id
   workingData.value = clone(draft.draftData)
   selectedShotKeys.value = draft.draftData.shots.map((shot) => shot.clientKey)
+  placement.value = defaultPlacementForActiveEpisode.value
   englishReviewAcknowledged.value = false
   riskDialogOpen.value = false
   riskAcknowledged.value = false
@@ -442,6 +473,22 @@ const replaceDraft = (draft: CreativeDraft) => {
   drafts.value = drafts.value.map((item) => item.id === draft.id ? draft : item)
   if (!drafts.value.some((item) => item.id === draft.id)) drafts.value.unshift(draft)
   selectDraft(draft)
+}
+
+const demoteOtherAppliedDrafts = (appliedDraft: CreativeDraft) => {
+  drafts.value = drafts.value.map((item) => {
+    if (item.id === appliedDraft.id) return item
+    if (item.episodeId !== appliedDraft.episodeId || item.status !== 'applied') return item
+    return {
+      ...item,
+      status: 'confirmed',
+      contextCurrent: false,
+      appliedAt: undefined,
+      canConfirm: false,
+      canApply: false,
+      canRegenerate: false,
+    }
+  })
 }
 
 const saveCurrent = async (): Promise<CreativeDraft | null> => {
@@ -561,6 +608,7 @@ const applyDraft = async (
       reviewAcknowledged,
     })
     replaceDraft(result.draft)
+    demoteOtherAppliedDrafts(result.draft)
     notice.value = languageMode === 'bilingual_confirmed'
       ? `已创建 ${result.appliedShotIds.length} 个正式分镜，并写入 ${result.translationsWritten} 条人工确认英文；尚未创建生产任务。`
       : `已创建 ${result.appliedShotIds.length} 个正式中文分镜；未写入英文翻译，后续可继续使用翻译审核流程。`
@@ -620,6 +668,14 @@ const setIncludeAudio = (shotIndex: number, enabled: boolean) => {
     shot.soundscapeZh = ''; shot.soundscapeEn = ''; shot.musicZh = ''; shot.musicEn = ''
   }
 }
+const setFrameContinuity = (
+  shotIndex: number,
+  field: 'requiresFirstFrameContinuity' | 'requiresLastFrameContinuity',
+  enabled: boolean,
+) => {
+  if (!workingData.value) return
+  workingData.value.shots[shotIndex][field] = enabled
+}
 const toggleShot = (key: string) => {
   selectedShotKeys.value = selectedShotKeys.value.includes(key)
     ? selectedShotKeys.value.filter((item) => item !== key)
@@ -636,8 +692,14 @@ watch(() => props.project.episodes.map((item) => item.id).join('|'), () => {
   }
 })
 watch(selectedEpisodeId, () => {
+  targetShotCountWasEdited.value = false
+  placement.value = defaultPlacementForActiveEpisode.value
+  applySelectedProviderDefaultShotCount()
   closeExtendedGenerationDialog()
   void loadDrafts()
+})
+watch(defaultShots, () => {
+  applySelectedProviderDefaultShotCount()
 })
 watch(selectedProvider, () => {
   closeExtendedGenerationDialog()
@@ -679,7 +741,14 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
 
       <div class="generation-controls">
         <label><span>处理通道</span><select v-model="selectedProvider" :disabled="Boolean(action)" @change="selectedProviderWasEdited=true"><option v-for="provider in capability?.providers || []" :key="provider.id" :value="provider.id" :disabled="!provider.ready">{{ provider.label }}{{ provider.ready ? '' : '（未就绪）' }}</option></select><small>{{ selectedProvider==='deepseek_api' ? '外部 API，通常响应更快。' : '默认本地处理，不发送项目上下文。' }}</small></label>
-        <label><span>生成镜数</span><input v-model.number="targetShotCount" type="number" :min="minShots" :aria-invalid="Boolean(targetShotCountError)" @input="targetShotCountWasEdited=true"><small v-if="targetShotCountError" class="field-error">{{ targetShotCountError }}</small><small v-else-if="targetShotCountNeedsConfirmation" class="field-warning">{{ requestedTargetShotCount }} 镜超过当前单次建议值；点击生成后确认，系统会按原镜数提交。</small><small v-else-if="targetDurationRange">{{ requestedTargetShotCount }} 镜总时长约 {{ targetDurationRange.min }}–{{ targetDurationRange.max }} 秒（每镜 {{ shotDurationGuide }}）；多个快速动作可组成一条连续动作链。</small><small v-else>镜头时长由所选通道的服务端配置决定；多个快速动作可组成一条连续动作链。</small></label>
+        <label>
+          <span>生成镜数</span>
+          <input v-model.number="targetShotCount" type="number" :min="minShots" :aria-invalid="Boolean(targetShotCountError)" @input="targetShotCountWasEdited=true">
+          <small v-if="targetShotCountError" class="field-error">{{ targetShotCountError }}</small>
+          <small v-else-if="targetShotCountNeedsConfirmation" class="field-warning">{{ targetShotCountDefaultHint ? `${targetShotCountDefaultHint}；` : '' }}{{ requestedTargetShotCount }} 镜超过当前单次建议值；点击生成后确认，系统会按原镜数提交。</small>
+          <small v-else-if="targetDurationRange">{{ targetShotCountDefaultHint ? `${targetShotCountDefaultHint}；` : '' }}{{ requestedTargetShotCount }} 镜总时长约 {{ targetDurationRange.min }}–{{ targetDurationRange.max }} 秒（每镜 {{ shotDurationGuide }}）；多个快速动作可组成一条连续动作链。</small>
+          <small v-else>{{ targetShotCountDefaultHint ? `${targetShotCountDefaultHint}；` : '' }}镜头时长由所选通道的服务端配置决定；多个快速动作可组成一条连续动作链。</small>
+        </label>
         <label><span>创意幅度</span><select v-model="creativity"><option value="conservative">保守补全 · 忠于原剧本</option><option value="balanced">均衡创作 · 推荐</option><option value="bold">大胆变化 · 仍锁定事实</option></select><small>不会改写人物身份、对白正文或事件顺序。</small></label>
         <label class="variation"><span>本次创作要求（可选）</span><input v-model="variationNote" placeholder="例如：加强雨夜压迫感，运镜更克制；不要新增角色"><small>只影响构图、运镜、节奏和声景，不替代剧本事实。</small></label>
         <button class="creative-primary" :disabled="Boolean(action)||capabilityLoading||!generationReady||!activeEpisode||Boolean(targetShotCountError)" :title="generationNeedsConfirmation?'当前镜数或权威剧本超过单批建议参考值；点击后确认是否继续。':'按当前镜数生成一份可审核草稿。'" @click="requestGenerate">
@@ -758,11 +827,11 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
               <input type="checkbox" :checked="selectedShotKeys.includes(shot.clientKey)" @click.stop @change="toggleShot(shot.clientKey)">
               <span class="shot-number">{{ String(shot.order).padStart(2,'0') }}</span>
               <span><strong>{{ shot.titleZh || `镜头 ${shot.order}` }}</strong><small>{{ shot.titleEn || 'English title pending' }}</small><small class="shot-action-summary">动作：{{ firstActionSentence(shot.actionZh) }}</small></span>
-              <span class="shot-metrics"><Clock3 :size="12"/>{{ (shot.durationMs/1000).toFixed(1) }}s · {{ shot.h3Mode }} · {{ shot.includeAudio?'含音频':'静音' }}</span>
+              <span class="shot-metrics"><Clock3 :size="12"/>{{ (shot.durationMs/1000).toFixed(1) }}s · {{ shot.h3Mode }} · {{ shot.includeAudio?'含音频':'静音' }} · {{ shot.requiresFirstFrameContinuity?'承接上一镜':'不承接' }}/{{ shot.requiresLastFrameContinuity?'衔接下一镜':'不衔接' }}</span>
             </summary>
             <div class="shot-body">
               <div class="shot-rules"><ShieldCheck :size="14"/><span>质量合同：{{ shotDurationGuide }}、一个连贯动作弧、一个有动机的运镜；动作弧可包含多个节奏清楚的快速连续动作，叙事写清 setup → action chain → end state，连续性写清 in/out。人物、场景、道具和原对白被锁定。</span><button :disabled="Boolean(action)||!activeDraft.canRegenerate" @click="requestRegenerate([shot.clientKey])"><LoaderCircle v-if="action==='regenerate'&&actionShotKey===shot.clientKey" class="spin" :size="12"/><RotateCcw v-else :size="12"/>仅重新生成此镜</button></div>
-              <div class="shot-settings"><label :id="fieldDomId(index,'durationMs')"><span>时长（秒）</span><input type="number" :min="minShotDurationSeconds" :max="maxShotDurationSeconds" step="0.5" :value="shot.durationMs/1000" :disabled="!editable" @change="setDuration(index,($event.target as HTMLInputElement).value)"></label><label :id="fieldDomId(index,'h3Mode')"><span>H3 模式意图</span><select v-model="shot.h3Mode" :disabled="!editable"><option value="T2VA">T2VA 文生视频</option><option value="I2VA">I2VA 首帧</option><option value="L2VA">L2VA 尾帧</option><option value="FL2VA">FL2VA 首尾帧</option><option value="Ref2VA">Ref2VA 参考生视频</option></select><small>没有合规参考槽位时，应用会安全降为 T2VA；之后可在分镜编辑器绑定首尾帧。</small></label><label :id="fieldDomId(index,'includeAudio')" class="audio-toggle"><input :checked="shot.includeAudio" type="checkbox" :disabled="!editable" @change="setIncludeAudio(index,($event.target as HTMLInputElement).checked)"><span>原生音频</span></label></div>
+              <div class="shot-settings"><label :id="fieldDomId(index,'durationMs')"><span>时长（秒）</span><input type="number" :min="minShotDurationSeconds" :max="maxShotDurationSeconds" step="0.5" :value="shot.durationMs/1000" :disabled="!editable" @change="setDuration(index,($event.target as HTMLInputElement).value)"></label><label :id="fieldDomId(index,'h3Mode')"><span>H3 模式意图</span><select v-model="shot.h3Mode" :disabled="!editable"><option value="T2VA">T2VA 文生视频</option><option value="I2VA">I2VA 首帧</option><option value="L2VA">L2VA 尾帧</option><option value="FL2VA">FL2VA 首尾帧</option><option value="Ref2VA">Ref2VA 参考生视频</option></select><small>没有合规参考槽位时，应用会安全降为 T2VA；之后可在分镜编辑器绑定首尾帧。</small></label><label :id="fieldDomId(index,'includeAudio')" class="audio-toggle"><input :checked="shot.includeAudio" type="checkbox" :disabled="!editable" @change="setIncludeAudio(index,($event.target as HTMLInputElement).checked)"><span>原生音频</span></label><label :id="fieldDomId(index,'requiresFirstFrameContinuity')" class="audio-toggle"><input :checked="shot.requiresFirstFrameContinuity" type="checkbox" :disabled="!editable" @change="setFrameContinuity(index,'requiresFirstFrameContinuity',($event.target as HTMLInputElement).checked)"><span>首帧承接上一镜</span></label><label :id="fieldDomId(index,'requiresLastFrameContinuity')" class="audio-toggle"><input :checked="shot.requiresLastFrameContinuity" type="checkbox" :disabled="!editable" @change="setFrameContinuity(index,'requiresLastFrameContinuity',($event.target as HTMLInputElement).checked)"><span>尾帧衔接下一镜</span></label></div>
               <div class="bible-locks"><span><Lock :size="12"/>Bible 白名单 · 只读</span><i v-for="id in shot.characterIds" :key="`c-${id}`"><UserRound :size="11"/>{{ entityName('character',id) }}</i><i v-if="shot.sceneId"><MapPin :size="11"/>{{ entityName('scene',shot.sceneId) }}</i><i v-for="id in shot.propIds" :key="`p-${id}`"><Box :size="11"/>{{ entityName('prop',id) }}</i><small v-if="!shot.characterIds.length&&!shot.sceneId&&!shot.propIds.length">本镜未绑定 Bible 实体；如不符合剧本，请仅重新生成此镜。</small><div v-for="field in relationReviewFields" :id="fieldDomId(index,field)" :key="field" class="relation-review-anchor"><small v-for="issue in issuesForField(index,field)" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></div></div>
               <div class="bilingual-grid">
                 <label :id="fieldDomId(index,'titleZh')"><span>中文镜头标题</span><input v-model="shot.titleZh" :disabled="!editable"><small v-for="issue in issuesForField(index,'titleZh')" :key="issue.code" class="field-review-issue"><AlertTriangle :size="11"/>{{ creativeDraftReviewIssueTitle(issue) }}<em v-if="issue.suggestionZh">{{ issue.suggestionZh }}</em></small></label>
@@ -789,7 +858,7 @@ onMounted(async () => { await loadCapability(); await loadDrafts() })
 
         <footer class="draft-actions">
           <div><span v-if="dirty" class="dirty-dot">有未保存修改 · 保存后问题清单会重新计算</span><span v-else>修订 {{ activeDraft.revision }} · {{ activeDraft.updatedAt ? new Date(activeDraft.updatedAt).toLocaleString('zh-CN') : '刚刚更新' }}</span><button :disabled="Boolean(action)||!dirty||!editable" title="保存始终允许；服务端会重新计算人工检查项" @click="save"><LoaderCircle v-if="action==='save'" class="spin" :size="12"/><Save v-else :size="12"/>保存并重新检查</button><button :disabled="Boolean(action)||!activeDraft.canRegenerate||Boolean(targetShotCountError)" @click="requestRegenerate()"><RotateCcw :size="12"/>整稿重新生成</button><button class="confirm" :disabled="Boolean(action)||!canConfirm" @click="requestConfirm"><Check :size="12"/>{{ reviewIssueCount?'查看风险并确认':'确认整份草稿' }}</button></div>
-          <div class="apply-zone"><header><span><strong>应用到正式分镜</strong><small>这是唯一会改变正式剧集的步骤；内容风险不会锁死按钮，但会要求再次明确确认。</small></span><select v-model="placement" :disabled="!canApply"><option value="replace">替换本集现有分镜</option><option value="append">追加到本集末尾</option></select></header><div v-if="requiresEditCount" class="requires-edit-note"><AlertTriangle :size="13"/>还有 {{ requiresEditCount }} 项未知素材、说话人或数据引用。它们不是内容审核，但为避免写入无效 ID，正式应用前必须替换、删除或重新生成对应镜头。</div><label class="review-ack"><input v-model="englishReviewAcknowledged" type="checkbox" :disabled="!canApply"><span>我已逐项核对英文中的人物、方位、动作、运镜、数字、道具部位和连续性；允许写入已确认翻译。</span></label><div><button :disabled="Boolean(action)||!canApply||!selectedCount" @click="requestApply('chinese_only',selectedShotKeys.length===workingData.shots.length?[]:selectedShotKeys)"><Languages :size="13"/>{{ selectedCount===workingData.shots.length?'整批仅采用中文':`仅采用中文 · ${selectedCount} 镜` }}</button><button class="bilingual-apply" :disabled="Boolean(action)||!canApply||!selectedCount||!englishReviewAcknowledged" @click="requestApply('bilingual_confirmed',selectedShotKeys.length===workingData.shots.length?[]:selectedShotKeys)"><ShieldCheck :size="13"/>{{ selectedCount===workingData.shots.length?'采用已审中英整集':`采用已审中英 · ${selectedCount} 镜` }}</button></div></div>
+          <div class="apply-zone"><header><span><strong>应用到正式分镜</strong><small>这是唯一会改变正式剧集的步骤；替换会成为当前分镜版本，已有生产审计时后端会保留旧版并创建新版本。</small></span><select v-model="placement" :disabled="!canApply"><option value="replace">替换为当前版本</option><option value="append">追加到本集末尾</option></select></header><div v-if="replaceMayBeProtected" class="requires-edit-note"><AlertTriangle :size="13"/>当前集已有 {{ activeEpisodeFormalShotCount }} 个正式分镜；如旧版已有提示词、生成任务或组装记录，后端会创建新的同集分镜版本，不覆盖旧版。</div><div v-if="requiresEditCount" class="requires-edit-note"><AlertTriangle :size="13"/>还有 {{ requiresEditCount }} 项未知素材、说话人或数据引用。它们不是内容审核，但为避免写入无效 ID，正式应用前必须替换、删除或重新生成对应镜头。</div><label class="review-ack"><input v-model="englishReviewAcknowledged" type="checkbox" :disabled="!canApply"><span>我已逐项核对英文中的人物、方位、动作、运镜、数字、道具部位和连续性；允许写入已确认翻译。</span></label><div><button :disabled="Boolean(action)||!canApply||!selectedCount" @click="requestApply('chinese_only',selectedShotKeys.length===workingData.shots.length?[]:selectedShotKeys)"><Languages :size="13"/>{{ selectedCount===workingData.shots.length?'整批仅采用中文':`仅采用中文 · ${selectedCount} 镜` }}</button><button class="bilingual-apply" :disabled="Boolean(action)||!canApply||!selectedCount||!englishReviewAcknowledged" @click="requestApply('bilingual_confirmed',selectedShotKeys.length===workingData.shots.length?[]:selectedShotKeys)"><ShieldCheck :size="13"/>{{ selectedCount===workingData.shots.length?'采用已审中英整集':`采用已审中英 · ${selectedCount} 镜` }}</button></div></div>
         </footer>
         </template>
       </template>

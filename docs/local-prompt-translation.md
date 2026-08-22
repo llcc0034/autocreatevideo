@@ -18,8 +18,10 @@
 
 ## 可选外部 DeepSeek API
 
-DeepSeek 是按次显式选择的外部通道，适用于翻译、完整创作草稿和逐镜高细节扩写。默认通道仍是
-`local_qwen`；远程请求失败时会原样报告失败，**不会静默切换到本地 Qwen**，避免用户误判实际
+DeepSeek 是可显式选择的外部通道，适用于翻译、完整创作草稿和逐镜高细节扩写。翻译与既有剧集
+创作草稿的全局默认通道仍是 `local_qwen`；新建连续剧故事基础候选另有操作级推荐配置，当前默认
+优先展示 DeepSeek，并把本地 4B 标为实验级。页面在提交前明确显示实际所选通道和外发提示，用户
+仍可显式改选；远程请求失败时会原样报告失败，**不会静默切换到本地 Qwen**，避免用户误判实际
 模型、数据边界或结果来源。
 
 启用前必须理解数据边界：被处理的提示词，以及生成该候选所需的项目、剧本、Bible、连续性和
@@ -59,13 +61,19 @@ DEEPSEEK_CREATIVE_MAX_REGENERATION_CONTEXT_CHARS=96000
 DEEPSEEK_CREATIVE_MAX_INPUT_CHARS=120000
 DEEPSEEK_CREATIVE_OUTPUT_HEADROOM_PER_SHOT=384
 
-# 默认仍保持本地；界面可对每次操作单独选择 DeepSeek。
+# 翻译与既有剧集创作草稿默认仍保持本地。
 PROMPT_TRANSLATION_DEFAULT_PROVIDER=local_qwen
 PROMPT_CREATIVE_DEFAULT_PROVIDER=local_qwen
+
+# 新建连续剧故事基础候选独立推荐 DeepSeek；适用性只提示，不拦截或改写用户选择。
+SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER=deepseek_api
+QWEN_SERIES_CONCEPT_DRAFT_SUITABILITY=experimental
+DEEPSEEK_SERIES_CONCEPT_DRAFT_SUITABILITY=recommended
 ```
 
 `DEEPSEEK_ENABLED=true` 与非空 API key 缺一不可。若希望默认选择远程通道，可把对应默认值改成
-`deepseek_api`；这只改变初始选择，不改变逐次选择、人工审核和失败不回退规则。
+`deepseek_api`；新建连续剧入口则读取 `SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER`。这些配置只改变
+初始推荐/选择，不改变逐次选择、人工审核和失败不回退规则。
 
 ## 安装与资源隔离
 
@@ -165,6 +173,31 @@ H3 英文门禁会重新阻止生产，直到新源文对应的译文被确认�
 `剑柄/剑把 => hilt`、`剑锋 => blade edge/blade tip/sword tip`。若源文和上下文都未明确
 性别，却生成 `he/she/him/her` 等性别代词，该字段会按失败处理，不会把猜测保存为成功候选。
 
+## 新建连续剧故事基础候选
+
+新建项目页可在任何正式 Project 存在之前，用一段“故事想法”请求本地 Qwen 或 DeepSeek 生成项目名、
+一句话梗概和完整剧本的同一版可编辑候选。入口为
+`POST /api/v1/series-concept-drafts/generate/`，provider 就绪状态仍来自
+`GET /api/v1/capabilities/creative-drafts/`。
+
+这条链路不复用需要既有 Project/Episode 的双语分镜草稿，也不预建空项目：
+
+1. 页面收集故事想法、provider、正整数计划集数、每集镜数和单集时长，可将当前所选视觉风格作为故事方向一并提交；单集默认 60 秒，实际默认值和生产可用的单镜时长范围从能力接口读取；
+2. 页面不设置任意集数或镜头数上限，提交前只给出镜头总数、预计输出规模、等待级别、本地资源压力和 DeepSeek 费用级别等非精确估算；当前模型配置的 token/context 建议值可触发提示，但不禁用生成、不截断请求，也不自动分批。每集镜数乘生产最短单镜时长大于单集预算时属于物理不可行输入，必须提高单集时长或减少镜头；
+3. 模型在一次业务/API 请求中生成严格的项目级结构化 IR，并为每个镜头建议生产范围内的 `duration_ms`，不直接输出或决定正式母稿语法；本地首轮 JSON 解码或完整结构校验失败时，最多再用完整请求执行一次整份结构修复，仍不按集或镜头拆分；模型或运行时无法承载时返回实际失败阶段，不将某一型号的容量写成业务数量规则；
+4. 单集模型建议总时长超出用户预算时，Django 在保留生产最短单镜时长的前提下按相对建议确定性压缩并给出警告，再渲染 `第N集 / 镜头N / 时间段 / 连续性` 模板，返回 `format.compatible=true` 的隔离候选；
+5. 候选区三个字段都可人工修改，警告不阻止采用。用户点击“确认并填入故事基础”才把三项一次性复制到
+   新建表单；这一步仍不写数据库；
+6. 只有用户点击原有“创建并进入工作室”，既有 `POST /projects/` 才成为正式写入；创建后还需先建立
+   与对白说话者同名的角色 Bible，再执行确定性分集分镜；
+7. 想法、provider、数量、单集时长或风格变化会把候选标记为依据已变化，但不替用户作决定；重新生成失败保留上一版
+   候选，模型故障也不阻止手工填写和创建。
+
+本地 Qwen 继续使用共享资源锁和 disposable 子进程；只有页面实际选中 DeepSeek 且用户提交生成时，才会外发本次想法与风格
+上下文，失败不回退。提供方的 context/output 配置只作为所选模型的资源提示，不构成集数或整剧镜数上限；
+响应公开预计输入/输出规模和相对预算利用率，供人工判断耗时和资源。本功能生成的是全剧母稿，不是 MiniMax
+H3 单镜成品提示词：候选母稿不受 H3 每个文本输入 7000 字符的上限约束；超过当前剧本拆解参考预算时完整返回并提示管理员调整配置，真正拆解时再执行该服务的输入预算。
+
 ## 双语创作草稿
 
 本地 Qwen 也可根据现有项目、剧集说明、剧本、风格、术语表和人物/场景/道具 Bible 生成
@@ -228,6 +261,7 @@ Ref2VA 只有在能从所选 Bible 找到无冲突的分类锚点素材时才会
 - `POST /api/v1/translations/{id}/request-retranslation/`
 - `POST /api/v1/translations/{id}/revoke/`
 - `GET /api/v1/capabilities/creative-drafts/`
+- `POST /api/v1/series-concept-drafts/generate/`
 - `GET /api/v1/projects/{project_id}/creative-drafts/?episode={episode_id}`
 - `POST /api/v1/projects/{project_id}/creative-drafts/generate/`
 - `GET/PATCH /api/v1/creative-drafts/{id}/`

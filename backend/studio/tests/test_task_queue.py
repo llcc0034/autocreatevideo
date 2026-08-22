@@ -33,6 +33,10 @@ from studio.services.h3_prompts import (
     build_consistent_image_prompt,
     build_h3_video_prompt,
 )
+from studio.services.production_pipeline import (
+    ProductionQueueConfirmationRequired,
+    assert_queue_capacity,
+)
 from studio.serializers import GenerationTaskSerializer
 from studio.services.task_queue import (
     _authorized_asset_source,
@@ -42,7 +46,6 @@ from studio.services.task_queue import (
 )
 from studio.services.workflow import build_workflow
 from studio.tests.factories import build_story
-from studio.views import ProductionQueueConfirmationRequired, _assert_queue_capacity
 
 
 class FakeClient:
@@ -706,9 +709,9 @@ class TaskQueueTests(TestCase):
         task = self._task()
         with self.assertRaises(ProductionQueueConfirmationRequired):
             with transaction.atomic():
-                _assert_queue_capacity(task.owner)
+                assert_queue_capacity(task.owner)
         with transaction.atomic():
-            snapshot = _assert_queue_capacity(
+            snapshot = assert_queue_capacity(
                 task.owner,
                 extended_generation_confirmed=True,
             )

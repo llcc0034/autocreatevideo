@@ -32,6 +32,36 @@ const h3Mode = (value: unknown): H3Mode => (
   ['T2VA', 'I2VA', 'FL2VA', 'L2VA', 'Ref2VA'].includes(String(value)) ? String(value) as H3Mode : 'T2VA'
 )
 
+const collectPositiveShotNumbers = (source: string, pattern: RegExp): number[] => {
+  const matches: number[] = []
+  pattern.lastIndex = 0
+  let match = pattern.exec(source)
+  while (match) {
+    const value = Number(match[1])
+    if (Number.isInteger(value) && value > 0) matches.push(value)
+    match = pattern.exec(source)
+  }
+  return matches
+}
+
+export const inferCreativeDraftShotCountFromScript = (value: unknown): number | null => {
+  const source = text(value).replace(/\r\n/g, '\n').trim()
+  if (!source) return null
+  const numbers = new Set<number>([
+    ...collectPositiveShotNumbers(source, /^\s*(?:镜头|分镜)\s*(?:#|第)?\s*0*([1-9]\d*)\b/gmu),
+    ...collectPositiveShotNumbers(source, /^\s*shot\s*#?\s*0*([1-9]\d*)\b/gimu),
+    ...collectPositiveShotNumbers(source, /(?:^|\n)\s*[【\[]\s*0*([1-9]\d*)\s*(?=(?:[\[【][^\]\n】]*[\]】]\s*)*[:：])/gu),
+  ])
+  if (!numbers.size) return null
+  const ordered = [...numbers].sort((left, right) => left - right)
+  let contiguous = 0
+  for (const number of ordered) {
+    if (number === contiguous + 1) contiguous = number
+    else if (number > contiguous + 1) break
+  }
+  return contiguous || ordered.length
+}
+
 const reviewSeverity = (value: unknown): CreativeDraftReviewSeverity => {
   const normalized = String(value || '').trim().toLowerCase()
   if (normalized === 'requires_edit') return 'requires_edit'
@@ -53,6 +83,10 @@ const reviewFieldAliases: Record<string, CreativeDraftReviewField> = {
   ambient_zh: 'soundscapeZh', ambient_en: 'soundscapeEn',
   music_zh: 'musicZh', musiczh: 'musicZh', music_en: 'musicEn', musicen: 'musicEn',
   duration_ms: 'durationMs', duration: 'durationMs', h3_mode: 'h3Mode', include_audio: 'includeAudio',
+  requires_first_frame_continuity: 'requiresFirstFrameContinuity',
+  first_frame_continuity: 'requiresFirstFrameContinuity',
+  requires_last_frame_continuity: 'requiresLastFrameContinuity',
+  last_frame_continuity: 'requiresLastFrameContinuity',
   scene_id: 'sceneId', character_ids: 'characterIds', prop_ids: 'propIds',
   speaker_id: 'dialogueSpeakerId', text_zh: 'dialogueTextZh', dialogue: 'dialogueSpeakerId',
   delivery_zh: 'dialogueDeliveryZh', delivery_en: 'dialogueDeliveryEn',
@@ -181,6 +215,17 @@ const adaptDialogue = (raw: Raw): CreativeDraftDialogueLine => ({
   deliveryZh: text(raw.delivery_zh ?? raw.deliveryZh),
   deliveryEn: text(raw.delivery_en ?? raw.deliveryEn),
   voiceover: raw.voiceover === true,
+  ...(
+    Number.isSafeInteger(Number(raw.start_ms ?? raw.startMs))
+    && Number.isSafeInteger(Number(raw.end_ms ?? raw.endMs))
+    && Number(raw.start_ms ?? raw.startMs) >= 0
+    && Number(raw.end_ms ?? raw.endMs) > Number(raw.start_ms ?? raw.startMs)
+      ? {
+        startMs: Number(raw.start_ms ?? raw.startMs),
+        endMs: Number(raw.end_ms ?? raw.endMs),
+      }
+      : {}
+  ),
 })
 
 const adaptShot = (raw: Raw, position: number): CreativeDraftShot => ({
@@ -204,6 +249,8 @@ const adaptShot = (raw: Raw, position: number): CreativeDraftShot => ({
   mediaType: 'video',
   h3Mode: h3Mode(raw.h3_mode ?? raw.h3Mode),
   includeAudio: raw.include_audio !== false && raw.includeAudio !== false,
+  requiresFirstFrameContinuity: raw.requires_first_frame_continuity === true || raw.requiresFirstFrameContinuity === true,
+  requiresLastFrameContinuity: raw.requires_last_frame_continuity === true || raw.requiresLastFrameContinuity === true,
   sceneId: relationId(raw.scene_id ?? raw.sceneId) || undefined,
   characterIds: ids(raw.character_ids ?? raw.characterIds),
   propIds: ids(raw.prop_ids ?? raw.propIds),
@@ -309,6 +356,8 @@ export const creativeDraftDataPayload = (data: CreativeDraftData) => ({
     media_type: 'video',
     h3_mode: shot.h3Mode,
     include_audio: shot.includeAudio,
+    requires_first_frame_continuity: shot.requiresFirstFrameContinuity,
+    requires_last_frame_continuity: shot.requiresLastFrameContinuity,
     scene_id: shot.sceneId || null,
     character_ids: shot.characterIds,
     prop_ids: shot.propIds,
@@ -318,6 +367,14 @@ export const creativeDraftDataPayload = (data: CreativeDraftData) => ({
       delivery_zh: line.deliveryZh,
       delivery_en: line.deliveryEn,
       voiceover: line.voiceover,
+      ...(
+        Number.isSafeInteger(line.startMs)
+        && Number.isSafeInteger(line.endMs)
+        && line.startMs! >= 0
+        && line.endMs! > line.startMs!
+          ? { start_ms: line.startMs, end_ms: line.endMs }
+          : {}
+      ),
     })),
   })),
 })

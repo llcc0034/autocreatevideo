@@ -20,6 +20,12 @@ import {
   SessionInvalidatedError,
   sortProjectsForManagement,
 } from '../src/services/projectManagement.ts'
+import {
+  clearRouteModuleRecovery,
+  ROUTE_MODULE_RECOVERY_KEY,
+  resolveRouteRecoveryStorage,
+  routeModuleRecoveryAction,
+} from '../src/services/routeModuleRecovery.ts'
 import type { SeriesProject } from '../src/types/index.ts'
 
 const makeProject = (patch: Partial<SeriesProject> = {}): SeriesProject => ({
@@ -126,6 +132,40 @@ test('delete confirmation trims both values but otherwise requires an exact matc
   assert.equal(isProjectDeleteConfirmed('听雨不归人', '听雨不归'), false)
   assert.equal(isProjectDeleteConfirmed('AutoPrompt', 'autoprompt'), false)
   assert.equal(isProjectDeleteConfirmed('   ', '   '), false)
+})
+
+test('route module recovery reloads once, then reports a repeated lazy import failure', () => {
+  const values = new Map<string, string>()
+  const storage = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value) },
+    removeItem: (key: string) => { values.delete(key) },
+  }
+  const error = new TypeError('Failed to fetch dynamically imported module: http://127.0.0.1:5173/src/views/SeriesStudioView.vue')
+
+  assert.equal(routeModuleRecoveryAction(error, '/projects/new', storage), 'reload')
+  assert.equal(values.get(ROUTE_MODULE_RECOVERY_KEY), '/projects/new')
+  assert.equal(routeModuleRecoveryAction(error, '/projects/new', storage), 'report')
+  assert.equal(values.get(ROUTE_MODULE_RECOVERY_KEY), '/projects/new')
+
+  clearRouteModuleRecovery(storage)
+  assert.equal(values.has(ROUTE_MODULE_RECOVERY_KEY), false)
+})
+
+test('route module recovery ignores unrelated route errors and fails closed without storage', () => {
+  const unavailableStorage = {
+    getItem: () => { throw new Error('blocked') },
+    setItem: () => { throw new Error('blocked') },
+    removeItem: () => { throw new Error('blocked') },
+  }
+
+  assert.equal(routeModuleRecoveryAction(new Error('Navigation aborted'), '/projects/new', unavailableStorage), 'ignore')
+  assert.equal(routeModuleRecoveryAction(new Error('Importing a module script failed.'), '/projects/new', unavailableStorage), 'report')
+  assert.doesNotThrow(() => clearRouteModuleRecovery(unavailableStorage))
+  const inaccessibleStorage = resolveRouteRecoveryStorage(() => { throw new Error('SecurityError') })
+  assert.equal(inaccessibleStorage, undefined)
+  assert.equal(routeModuleRecoveryAction(new Error('Importing a module script failed.'), '/projects/new', inaccessibleStorage), 'report')
+  assert.doesNotThrow(() => clearRouteModuleRecovery(inaccessibleStorage))
 })
 
 test('session epoch invalidates asynchronous results captured before reset', async () => {

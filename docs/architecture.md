@@ -30,7 +30,7 @@ flowchart LR
 | 生成 worker | 串行领取 GenerationTask、暂存素材、实时契约预检、提交/轮询/取消/恢复 ComfyUI 任务、封存产物来源 | GenerationTask、ComfyUI prompt ID、暂存映射与输出清单 |
 | ComfyUI | 执行 MiniMax H3 视频图和 SDXL 图片图，提供节点/模型枚举、队列、进度、执行记录和输出 | 独立进程及其 input/output 目录 |
 | 装配 worker | 领取 AssemblyJob、维护心跳、执行 FFmpeg、原子发布成片、封存成片来源 | AssemblyJob、ffconcat、MP4 与来源清单 |
-| 本地 Qwen 子进程 | 翻译、剧集创意、逐镜扩写、视觉规则和素材 Bible 候选 | 候选记录或浏览器待审数据；进程按需启动并退出 |
+| 本地 Qwen 子进程 | 新建项目前故事基础、翻译、剧集创意、逐镜扩写、视觉规则和素材 Bible 候选 | 各业务入口定义的候选记录或浏览器待审数据；进程按需启动并退出 |
 | Nginx 与外部 TLS 代理 | 前端静态文件、API 转发、内部素材路由、生产 HTTPS 边界 | 无业务状态 |
 
 API 不承载长时间 GPU 或 FFmpeg 进程。浏览器只负责发起操作和读取状态，页面生命周期不影响持久任务。
@@ -67,14 +67,19 @@ SeriesProject
 
 ### 3.3 候选模型
 
+- 新建项目前的故事基础候选不落数据库：页面只收集正整数集数、每集镜数和可配置单集时长，并先展示所选模型的资源粗估；全剧作为一次业务/API 请求交给用户选择的模型，不按固定 token 数截断，也不按集或镜头自动分批。本地首轮 JSON 解码或完整结构校验失败时，隔离运行时最多额外执行一次携带完整请求的整份结构修复，始终重新生成全剧；两次推理 usage 聚合，修复或确定性空白恢复以审核 warning 显式呈现。模型结构版本 2 返回无数量上限的 `bible.characters/scenes/props` 与剧集镜头 IR；Django 统一校验逐镜时长、单集总预算和跨类型 NFKC 名称唯一性，并以 `deterministic-script-breakdown-v3` 确定性渲染闭合 `SCRIPT_BIBLE_V1` 前置块及拆解正文。浏览器独立编辑并显式复制到新建表单；既有 `POST /projects/` 仍是唯一正式创建入口。
+- 母稿 Bible 建议不新增候选表：`GET /projects/{id}/script-bible-candidates/` 每次从完整 `master_script` 严格解析闭合前置块，返回整份来源指纹、逐行诊断、证据和现有/冲突投影，绝不写库。`POST .../apply/` 只接受带来源指纹的人工审核选择及可编辑最终字段，在锁定 Project 与三类 Bible 的单一事务中执行全成全败的追加创建；未选旧 Bible 不删除。整份来源指纹只负责陈旧请求防护与审计；确认身份使用候选 ID 加仅由实体类型和原声明规范字段计算的声明指纹，不依赖剧集正文。正式 Bible 的保留 metadata 保存这组身份、审核快照及其严格复算的内容哈希，使正文变化、人工改名和确认后的合法字段编辑不会撤销确认，同时让声明变化、伪造 provenance 或不同审核内容重放显式冲突。保留成员只有 apply 可以写，通用 CRUD、全量同步与管理后台不能注入、替换或删除。
 - `PromptFieldTranslation` 以 scope、字段、源文哈希、上下文哈希、候选译文、状态和修订组织逐字段翻译。
 - `EpisodeCreativeDraft` 保存整集分镜候选、上下文快照、校验结果、确认者和应用者。
 - `ShotDetailDraft` 保存单镜高细节候选、相邻连续性边界、相关 Bible 快照、确认者和应用者。
 - `ShotDetailDraftBatch` 保存整集 provider、幂等 request ID、源清单指纹、resolved policy、生成/应用状态和计数；`ShotDetailDraftBatchItem` 保存每镜冻结输入、claim/heartbeat、尝试、失败、候选关联和应用运行 ID。
 - 全剧视觉规则候选由请求返回；应用接口使用上下文指纹和生成指纹复核后写入允许字段。
 - 素材 Bible 候选由素材的文字元数据生成；返回的 provenance 包含素材 checksum、元数据哈希和更新时间，正式保存时再次复核。
+- Bible 实体图片候选不新增候选表。`GET /projects/{id}/bible-image-candidates/` 从三类 Bible 与现有 `PromptArtifact → GeneratedWorkflow → GenerationTask` 链实时投影；POST 在 Project、实体与最新全局 system `minimax-reference-image` 模板锁内，一次事务物化三件套。请求只选择实体和排队参数，模板、模型、工作流与 text-only SDXL 契约由服务端冻结；source fingerprint 来自同一次编译实际采用的字段、确认译文证据、相关 canonical 碰撞输入和编译参数。通用 workflow/task 入口拒绝候选用途，worker 签名来源清单与 Prompt/Task 冻结目标在提升时三方校验。质量策略只给 advisory，不替代结构、租户、模板、幂等或队列门禁。候选 output 经人工确认后仍通过任务提升入口创建 Asset，并只追加到实体 reference assets。`source_current=false` 的历史候选不再被视为无效；默认返回需确认的 stale 冲突，用户显式接受后可入库，Asset metadata 保留冻结来源指纹、当前来源指纹和 stale 接受标记用于追溯。
+- 实体图片候选的参考图提示词默认配置保存在 `SeriesProject.production_settings.bible_image_prompt_config`，创建项目时按所选风格生成默认值，页面可编辑项目风格、三类构图规则、负向规则和质量后缀。GET 投影返回当前与历史候选的 prompt 输入字段；POST 只接受这些字段的本次覆盖值并写入来源指纹，不允许前端直接提交最终 prompt 文本或改变模板/模型。
+- 首尾帧连续依赖使用独立 `DeferredGenerationRequest`，不把 `GenerationTask`、`PromptArtifact` 或临时 Shot 绑定当作等待状态。创建请求时只冻结 source task、target shot、slot、目标模板 hash、目标输入 fingerprint 与临时提示词预览；正式 `PromptArtifact → GeneratedWorkflow → GenerationTask` 只有在 source task 成功、声明 `primary_video` manifest 通过、帧提取和目标 stale 复核完成后才能由 worker 物化。`frame_slot=first_frame` 的来源始终是上游视频尾帧；I2VA/FL2VA 使用严格首帧槽位，Ref2VA 在 `requires_first_frame_continuity=true` 时使用软 `first_frame_reference_asset_id`，并在 H3 多参考图中固定为 `<Picture 1>`。公开 API 覆盖建档、查询、详情、取消、删除保护和 worker 物化；前端不能传 output index、模板、模型、workflow 或参考素材绕过。
 
-候选生成与正式写入分离。确认和应用使用数据库事务、行锁、`expected_revision` 或上下文指纹，避免过期页面覆盖已更新内容。
+候选生成与正式写入分离。确认和应用使用数据库事务、行锁、`expected_revision` 或上下文指纹，避免过期页面覆盖已更新内容。确定性拆解先由共享 parser 分离 Bible 块与正文；完整原文继续保存在 Project，非法块失败，未确认块默认以 409 要求人工处理，只有显式的一次性 `continue_without_script_bible=true` 才可跳过候选后继续拆解。已确认 provenance 还会形成“原声明名 → 当前 Bible 行”的类型化可信别名，并显式传给唯一拆解服务，使人工改名不破坏对白、人物、场景、道具的正式 ID 绑定；冲突或未确认项不参与该映射。
 
 ## 4. H3 模式与模板路由
 
@@ -86,7 +91,7 @@ SeriesProject
 - I2VA：必须且只能有 `first_frame_asset_id`。
 - L2VA：必须且只能有 `last_frame_asset_id`。
 - FL2VA：允许首帧、尾帧或两者；执行时按实际槽位计算有效模式，无图为 T2VA，单首帧为 I2VA，单尾帧为 L2VA，双帧为 FL2VA；双帧不能引用同一素材。
-- Ref2VA：不使用首尾帧字段；分类图片、参考视频、独立音频和视频配对音频分别限量，素材 ID 必须唯一并属于用户可访问范围。
+- Ref2VA：不使用严格 `first_frame_asset_id / last_frame_asset_id`；分类图片、参考视频、独立音频和视频配对音频分别限量，素材 ID 必须唯一并属于用户可访问范围。若该镜头启用了首帧承接，延迟连续任务可临时注入 `first_frame_reference_asset_id` 作为软开场状态参考，固定占用 `<Picture 1>` 和 9 张 Picture 容量中的 1 张，普通人物/场景/道具参考从后续 Picture 槽位开始。
 
 `resolve_group_reference_bindings` 把语义绑定转换为有序记录。图片使用连续 `<Picture N>`，视频和音频使用连续索引；工作流只为实际记录创建 `LoadImage`、`LoadVideo → GetVideoComponents` 或 `LoadAudio` 节点。
 
@@ -142,6 +147,7 @@ GenerationTask 引用 GeneratedWorkflow，并冻结执行参数：
 - Output 不是独立数据库表，而是 GenerationTask 的 `outputs` 列表。每项保存 ComfyUI 文件名、子目录、媒体类别、来源清单、SHA-256，以及可选的素材提升或受管发行状态。
 - `persist_task_provenance` 在任务成功前封存任务、模板、Prompt 哈希、输入媒体哈希和输出哈希；封存失败时任务不能标记成功。
 - 图片 Output 可复制到用户 Asset，重复请求返回同一提升结果，不修改 ComfyUI 母版。
+- `generation_purpose=bible_image_candidate` 的图片提升只信任任务能力快照中的冻结实体目标，并要求 worker 已在生成时封存 provenance；客户端不能改绑。提升证据保存来源/请求指纹、Prompt/Workflow/模板 hash、artifact/manifest hash 与确认人/时间，anchor 不变；复制文件后的事务失败会清理未提交文件。
 - `AssemblyJob` 选择成功视频任务，保存镜头顺序、输出路径、ffconcat、FFmpeg 参数、源签名、状态和领取令牌。
 - `ReleaseBundle` 通过持久 ID 显式选择镜头产物与装配母版；封存后不可修改选择。
 
@@ -167,7 +173,7 @@ GenerationTask 引用 GeneratedWorkflow，并冻结执行参数：
 - `WorkerLease` 为生成容量、生成领取、装配入队和装配领取提供数据库互斥。
 - 生成任务按优先级和入队时间领取，`TASK_MAX_CONCURRENT` 控制实际 worker 并发；全局待处理量和单用户活动任务量使用可配置推荐阈值，超过时要求用户明确确认后仍完整入队，不构成整集或整剧业务上限。
 - 本地 Qwen 与生成 worker 共享文件锁。Qwen 占用资源时生成任务保持 queued；生成任务持锁时本地 Qwen 请求返回资源忙。
-- 整集高细节 item 使用独立 claim token、heartbeat 和可配置重试；`shared_resource_busy` 只恢复为 pending，不消耗失败次数。批次生成允许逐镜部分失败并保留所有候选/失败记录；整集应用不允许部分写入，必须统一预检后在一个事务内写全或零写。
+- 整集高细节批次以 `shot_version_key` 冻结一个明确的分镜版本；批次创建、历史查询、相邻镜头上下文、worker 陈旧校验和原子应用都只读取该版本，绝不回退到同剧集其他版本。分镜编辑器保存同样必须显式携带版本键，只同步该版本并保留其他版本；`creative_version_*` 是服务端维护的版本元数据，普通镜头更新不得改写。批次 item 对正式 Shot 使用 `RESTRICT`，已有高细节审计历史的镜头不能被普通同步硬删除。无法由历史 items 唯一证明归属的旧批次保留为只读审计事实，不会重新执行或应用。item 使用独立 claim token、heartbeat 和可配置重试；`shared_resource_busy` 只恢复为 pending，不消耗失败次数。批次生成允许逐镜部分失败并保留所有候选/失败记录；整集应用不允许部分写入，必须统一预检后在一个事务内写全或零写。
 
 ### 7.2 整集、选区与整剧幂等
 

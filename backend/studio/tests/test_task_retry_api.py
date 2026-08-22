@@ -9,6 +9,10 @@ from rest_framework.test import APIClient
 
 from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
 from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
+from studio.services.system_workflow_contracts import (
+    canonical_workflow_sha256,
+    video_output_contract,
+)
 from studio.services.workflow import build_workflow
 from studio.tests.factories import build_story
 
@@ -29,12 +33,14 @@ class GenerationTaskRetryAPITests(TestCase):
             consistency_snapshot=result.consistency_snapshot,
             content_hash=result.content_hash,
         )
+        definition = {"1": {"class_type": "SaveVideo", "inputs": {}}}
         template = WorkflowTemplate.objects.create(
             name="retry-system-template",
             slug="retry-system-template",
             output_kind="video",
             is_system=True,
-            definition={"1": {"class_type": "SaveImage", "inputs": {}}},
+            definition=definition,
+            input_schema={"output_contract": video_output_contract(definition)},
         )
         workflow = GeneratedWorkflow.objects.create(
             project=project,
@@ -42,7 +48,7 @@ class GenerationTaskRetryAPITests(TestCase):
             prompt_artifact=prompt,
             template=template,
             created_by=user,
-            workflow_json=template.definition,
+            workflow_json=definition,
             injected_values={
                 "SEED": 42,
                 "WIDTH": 416,
@@ -53,7 +59,7 @@ class GenerationTaskRetryAPITests(TestCase):
                 "RESOLUTION_PROFILE": "0.3",
                 "RESOLUTION_MULTIPLE": 20,
             },
-            content_hash="a" * 64,
+            content_hash=canonical_workflow_sha256(definition),
         )
         self.user = user
         self.task = GenerationTask.objects.create(

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import importlib
 import uuid
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from django.apps import apps
 from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.test import APIClient
 
@@ -16,6 +18,7 @@ from studio.services.shot_detail_batches import (
     claim_next_shot_detail_item,
     create_shot_detail_batch,
     process_shot_detail_item,
+    ShotDetailBatchConflict,
 )
 from studio.services.shot_detail_drafts import shot_detail_context_hash
 from studio.tests.factories import build_story
@@ -57,8 +60,13 @@ TEST_PROVIDER_POLICIES = {
 
 class ShotDetailGenerationWorkerPriorityTests(SimpleTestCase):
     def test_comfy_task_is_claimed_before_shot_detail_item(self):
-        task = SimpleNamespace(id="comfy-1", attempts=1, max_attempts=3)
-        result = SimpleNamespace(id="comfy-1", status="succeeded")
+        task = SimpleNamespace(
+            id="comfy-1", kind="video", attempts=1, max_attempts=3,
+        )
+        result = SimpleNamespace(
+            id="comfy-1", kind="video", status="succeeded",
+            Status=SimpleNamespace(SUCCEEDED="succeeded"),
+        )
         options = {
             "startup_recover_minutes": None,
             "recover_minutes": 30,
@@ -76,6 +84,9 @@ class ShotDetailGenerationWorkerPriorityTests(SimpleTestCase):
             "studio.management.commands.run_generation_worker.recover_stale_shot_detail_items",
             return_value=0,
         ), patch(
+            "studio.management.commands.run_generation_worker.recover_stale_deferred_requests",
+            return_value=0,
+        ), patch(
             "studio.management.commands.run_generation_worker.local_qwen_runtime_lock",
             return_value=nullcontext(),
         ), patch(
@@ -85,6 +96,9 @@ class ShotDetailGenerationWorkerPriorityTests(SimpleTestCase):
             "studio.management.commands.run_generation_worker.process_task",
             return_value=result,
         ) as process_task_mock, patch(
+            "studio.management.commands.run_generation_worker.ensure_next_first_frame_deferred_for_task",
+            return_value=None,
+        ), patch(
             "studio.management.commands.run_generation_worker.claim_next_shot_detail_item",
         ) as detail_claim:
             Command()._run_worker(options)
@@ -103,6 +117,7 @@ class ShotDetailBatchTests(TestCase):
             self.user, self.project, self.character, self.scene, self.episode,
             self.shot, self.next_shot,
         ) = build_story()
+        self.version_key = f"legacy:{self.episode.pk}:initial"
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
@@ -134,9 +149,35 @@ class ShotDetailBatchTests(TestCase):
                 episode=self.episode,
                 user=self.user,
                 request_id=uuid.uuid4(),
+                shot_version_key=self.version_key,
                 provider="local_qwen",
                 confirmation_acknowledged=True,
             )[0]
+
+    def _create_version_shots(self, key="creative-draft:test-version"):
+        rows = []
+        for local_number, source in enumerate((self.shot, self.next_shot), 1):
+            shot = Shot.objects.create(
+                episode=self.episode,
+                number=2 + local_number,
+                title=f"新版 {source.title}",
+                narrative=f"新版描述 {local_number}",
+                camera=source.camera,
+                dialogue=source.dialogue,
+                scene=self.scene,
+                duration_ms=5000,
+                sound_effects=source.sound_effects,
+                music=source.music,
+                metadata={
+                    "creative_version_key": key,
+                    "creative_version_label": "V2",
+                    "creative_version_shot_number": local_number,
+                    "creative_version_active": True,
+                },
+            )
+            shot.characters.add(self.character)
+            rows.append(shot)
+        return key, rows
 
     def _process_success(self, item):
         def runtime(request, _config):
@@ -160,6 +201,7 @@ class ShotDetailBatchTests(TestCase):
         url = f"/api/v1/projects/{self.project.pk}/shot-detail-draft-batches/"
         payload = {
             "episode_id": str(self.episode.pk),
+            "shot_version_key": self.version_key,
             "request_id": str(request_id),
             "provider": "local_qwen",
         }
@@ -194,6 +236,7 @@ class ShotDetailBatchTests(TestCase):
                 episode=self.episode,
                 user=self.user,
                 request_id=request_id,
+                shot_version_key=self.version_key,
                 provider="local_qwen",
                 variation_note="preserve the rain",
                 confirmation_acknowledged=True,
@@ -216,6 +259,7 @@ class ShotDetailBatchTests(TestCase):
                 episode=self.episode,
                 user=self.user,
                 request_id=request_id,
+                shot_version_key=self.version_key,
                 provider="local_qwen",
                 variation_note="preserve the rain",
                 confirmation_acknowledged=True,
@@ -224,6 +268,217 @@ class ShotDetailBatchTests(TestCase):
         self.assertFalse(replay_created)
         self.assertEqual(replayed.pk, original.pk)
         self.assertEqual(original.policy_snapshot["output_tokens"], 2304)
+
+    def test_version_scoped_create_and_list_never_mix_storyboard_versions(self):
+        new_key, new_shots = self._create_version_shots()
+        legacy_batch = self._create_batch()
+        with patch(
+            "studio.services.shot_detail_batches._provider_queue_available",
+            return_value=True,
+        ):
+            new_batch, created = create_shot_detail_batch(
+                project=self.project,
+                episode=self.episode,
+                user=self.user,
+                request_id=uuid.uuid4(),
+                shot_version_key=new_key,
+                provider="local_qwen",
+                confirmation_acknowledged=True,
+            )
+        self.assertTrue(created)
+        self.assertEqual(
+            list(new_batch.items.order_by("ordinal").values_list("shot_id", flat=True)),
+            [shot.pk for shot in new_shots],
+        )
+        self.assertNotEqual(new_batch.pk, legacy_batch.pk)
+
+        url = f"/api/v1/projects/{self.project.pk}/shot-detail-draft-batches/"
+        response = self.client.get(url, {
+            "episode": str(self.episode.pk), "shot_version_key": new_key,
+        })
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual([row["id"] for row in response.data["results"]], [str(new_batch.pk)])
+        self.assertEqual(response.data["results"][0]["shot_version_key"], new_key)
+
+        invalid = self.client.get(url, {
+            "episode": str(self.episode.pk), "shot_version_key": "creative-draft:missing",
+        })
+        self.assertEqual(invalid.status_code, 400, invalid.data)
+
+    def test_version_scoped_save_preserves_other_storyboard_versions(self):
+        new_key, new_shots = self._create_version_shots()
+        url = f"/api/v1/episodes/{self.episode.pk}/sync-shots/"
+        response = self.client.post(url, {
+            "shot_version_key": new_key,
+            "shots": [{
+                "id": str(new_shots[0].pk),
+                "number": 1,
+                "title": "新版第一镜已编辑",
+                "narrative": new_shots[0].narrative,
+                "camera": new_shots[0].camera,
+                "dialogue": new_shots[0].dialogue,
+                "duration_ms": new_shots[0].duration_ms,
+                "media_type": new_shots[0].media_type,
+                "h3_mode": new_shots[0].h3_mode,
+                "include_audio": new_shots[0].include_audio,
+                "scene": str(self.scene.pk),
+                "characters": [str(self.character.pk)],
+                "props": [],
+                "reference_assets": [],
+                "reference_bindings": {},
+                "metadata": new_shots[0].metadata,
+            }],
+        }, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["counts"]["deleted"], 1)
+        self.assertEqual(
+            Shot.objects.filter(episode=self.episode).count(),
+            3,
+        )
+        self.assertTrue(Shot.objects.filter(pk=self.shot.pk).exists())
+        self.assertTrue(Shot.objects.filter(pk=self.next_shot.pk).exists())
+        self.assertFalse(Shot.objects.filter(pk=new_shots[1].pk).exists())
+
+    def test_version_scoped_save_cannot_delete_batch_history(self):
+        batch = self._create_batch()
+        url = f"/api/v1/episodes/{self.episode.pk}/sync-shots/"
+        response = self.client.post(url, {
+            "shot_version_key": self.version_key,
+            "shots": [{
+                "id": str(self.shot.pk),
+                "number": 1,
+                "narrative": self.shot.narrative,
+                "dialogue": self.shot.dialogue,
+                "duration_ms": 5000,
+                "media_type": self.shot.media_type,
+                "h3_mode": self.shot.h3_mode,
+                "include_audio": self.shot.include_audio,
+                "scene": str(self.scene.pk),
+                "characters": [str(self.character.pk)],
+                "props": [],
+                "reference_assets": [],
+                "reference_bindings": {},
+                "metadata": self.shot.metadata,
+            }],
+        }, format="json")
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("高细节扩写历史", str(response.data))
+        self.assertEqual(Shot.objects.filter(episode=self.episode).count(), 2)
+        self.assertEqual(batch.items.count(), 2)
+
+    def test_regular_shot_update_cannot_move_it_to_another_version(self):
+        response = self.client.patch(
+            f"/api/v1/shots/{self.shot.pk}/",
+            {
+                "metadata": {
+                    **dict(self.shot.metadata or {}),
+                    "creative_version_key": "creative-draft:tampered",
+                },
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.shot.refresh_from_db()
+        self.assertNotIn("creative_version_key", self.shot.metadata)
+
+    def test_request_id_cannot_be_reused_for_another_storyboard_version(self):
+        request_id = uuid.uuid4()
+        new_key, _new_shots = self._create_version_shots()
+        with patch(
+            "studio.services.shot_detail_batches._provider_queue_available",
+            return_value=True,
+        ):
+            create_shot_detail_batch(
+                project=self.project, episode=self.episode, user=self.user,
+                request_id=request_id, shot_version_key=self.version_key,
+                provider="local_qwen", confirmation_acknowledged=True,
+            )
+            with self.assertRaises(ShotDetailBatchConflict):
+                create_shot_detail_batch(
+                    project=self.project, episode=self.episode, user=self.user,
+                    request_id=request_id, shot_version_key=new_key,
+                    provider="local_qwen", confirmation_acknowledged=True,
+                )
+
+    def test_worker_marks_item_stale_when_version_membership_changes(self):
+        batch = self._create_batch()
+        item = claim_next_shot_detail_item("test-worker")
+        self.assertIsNotNone(item)
+        self.shot.metadata = {
+            "creative_version_key": "creative-draft:moved",
+            "creative_version_shot_number": 1,
+        }
+        self.shot.save(update_fields=("metadata", "updated_at"))
+
+        result = process_shot_detail_item(item)
+
+        self.assertEqual(result.status, ShotDetailDraftBatchItem.Status.STALE)
+        self.assertEqual(result.error_code, "shot_detail_batch_version_stale")
+        batch.refresh_from_db()
+        self.assertEqual(batch.stale_count, 1)
+
+    def test_version_backfill_preserves_unverifiable_historical_facts(self):
+        batch = self._create_batch()
+        ShotDetailDraftBatchItem.objects.filter(batch=batch).delete()
+        ShotDetailDraftBatch.objects.filter(pk=batch.pk).update(
+            generation_status=ShotDetailDraftBatch.GenerationStatus.COMPLETED,
+            apply_status=ShotDetailDraftBatch.ApplyStatus.COMPLETE,
+            succeeded_count=2,
+            applied_count=2,
+        )
+
+        migration = importlib.import_module(
+            "studio.migrations.0029_shot_detail_batch_versions",
+        )
+        migration.backfill_batch_versions(apps, None)
+
+        batch.refresh_from_db()
+        self.assertIsNone(batch.shot_version_key)
+        self.assertEqual(
+            batch.version_scope_status,
+            ShotDetailDraftBatch.VersionScopeStatus.LEGACY_UNKNOWN,
+        )
+        self.assertEqual(
+            batch.generation_status,
+            ShotDetailDraftBatch.GenerationStatus.COMPLETED,
+        )
+        self.assertEqual(batch.apply_status, ShotDetailDraftBatch.ApplyStatus.COMPLETE)
+        self.assertEqual((batch.succeeded_count, batch.applied_count), (2, 2))
+
+    def test_version_backfill_classifies_partial_and_mixed_history(self):
+        partial = self._create_batch()
+        partial.items.order_by("ordinal").last().delete()
+        migration = importlib.import_module(
+            "studio.migrations.0029_shot_detail_batch_versions",
+        )
+        migration.backfill_batch_versions(apps, None)
+        partial.refresh_from_db()
+        self.assertIsNone(partial.shot_version_key)
+        self.assertEqual(
+            partial.version_scope_status,
+            ShotDetailDraftBatch.VersionScopeStatus.LEGACY_PARTIAL,
+        )
+
+        # A separate request owns the second classification because an active
+        # batch is unique per version.  Reuse the historical row after the
+        # partial case has been classified audit-only.
+        mixed = self._create_batch()
+        second = mixed.items.order_by("ordinal").last().shot
+        second.metadata = {
+            "creative_version_key": "creative-draft:foreign-history",
+            "creative_version_shot_number": 2,
+        }
+        second.save(update_fields=("metadata", "updated_at"))
+        migration.backfill_batch_versions(apps, None)
+        mixed.refresh_from_db()
+        self.assertIsNone(mixed.shot_version_key)
+        self.assertEqual(
+            mixed.version_scope_status,
+            ShotDetailDraftBatch.VersionScopeStatus.LEGACY_MIXED,
+        )
 
     def test_worker_executes_with_frozen_batch_policy(self):
         batch = self._create_batch()
@@ -397,6 +652,54 @@ class ShotDetailBatchTests(TestCase):
                 item.draft.context_hash,
                 shot_detail_context_hash(self.project, self.episode, item.shot),
             )
+
+    def test_batch_apply_rejects_storyboard_version_membership_drift_without_writes(self):
+        batch = self._create_batch()
+        while True:
+            item = claim_next_shot_detail_item("test-worker")
+            if item is None:
+                break
+            self._process_success(item)
+        batch.refresh_from_db()
+        items = list(batch.items.select_related("draft", "shot").order_by("ordinal"))
+        original_values = {
+            item.shot_id: item.shot.detailed_description for item in items
+        }
+        Shot.objects.create(
+            episode=self.episode,
+            number=3,
+            title="版本成员变化后的第三镜",
+            narrative="这条正式镜头在批次冻结后才加入。",
+            camera="locked-off medium shot",
+            scene=self.scene,
+            duration_ms=5000,
+        )
+
+        response = self.client.post(
+            f"/api/v1/shot-detail-draft-batches/{batch.pk}/apply/",
+            {
+                "expected_batch_revision": batch.revision,
+                "items": [{
+                    "item_id": str(item.pk),
+                    "draft_id": str(item.draft_id),
+                    "expected_revision": item.draft.revision,
+                } for item in items],
+                "language_mode": "bilingual_confirmed",
+                "english_review_acknowledged": True,
+                "review_acknowledged": True,
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(response.data["code"], "shot_detail_batch_version_stale")
+        for item in items:
+            item.shot.refresh_from_db()
+            self.assertEqual(
+                item.shot.detailed_description, original_values[item.shot_id],
+            )
+            item.draft.refresh_from_db()
+            self.assertEqual(item.draft.status, ShotDetailDraft.Status.DRAFT)
 
     def test_batch_detail_recovers_committed_apply_result_after_response_loss(self):
         batch = self._create_batch()

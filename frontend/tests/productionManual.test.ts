@@ -37,6 +37,9 @@ test('project creation starts from the managed list and redo remains an isolated
   for (const term of ['项目列表', '新建连续剧', '基于此项目重做', '不复制 bible、剧集、任务或产物', '不会自动触发 gpu']) {
     assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `project management guidance missing ${term}`)
   }
+  for (const term of ['ai 故事基础候选', '本地 qwen', 'deepseek', '确认并填入故事基础', '正式表单保持不变', '唯一正式保存', '母稿不使用 h3 的 7000 字符限制', '重新生成失败会保留上一版']) {
+    assert.ok(text.includes(term.toLocaleLowerCase('zh-CN')), `series concept guidance missing ${term}`)
+  }
 })
 
 test('H3 instructions cover text, optional first/last frames and sparse Ref2VA inputs', () => {

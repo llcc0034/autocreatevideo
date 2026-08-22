@@ -10,6 +10,12 @@ from studio.services.h3_prompts import (
     build_h3_video_prompt,
     sync_consistency_locks,
 )
+from studio.services.system_workflow_contracts import (
+    MINIMAX_REFERENCE_IMAGE_DEFINITION_SHA256,
+    approved_minimax_reference_image_definition,
+    canonical_workflow_sha256,
+    is_approved_minimax_reference_image_definition,
+)
 from studio.services.workflow import WorkflowBuildError, build_workflow
 from studio.tests.factories import build_story
 
@@ -231,6 +237,16 @@ class NativeH3WorkflowTests(TestCase):
         )
         self.assertNotIn("LoadImage", str(template.definition))
         self.assertNotIn("MiniMaxImage", str(template.definition))
+        self.assertTrue(is_approved_minimax_reference_image_definition(
+            template.definition,
+        ))
+        self.assertEqual(
+            template.definition, approved_minimax_reference_image_definition(),
+        )
+        self.assertEqual(
+            canonical_workflow_sha256(template.definition),
+            MINIMAX_REFERENCE_IMAGE_DEFINITION_SHA256,
+        )
 
     def test_sdxl_image_workflow_pins_checkpoint_and_injects_only_text_conditioning(self):
         prompt = self._image_prompt()

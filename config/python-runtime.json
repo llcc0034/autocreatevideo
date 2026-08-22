@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "version": "3.11.9",
+  "platform": "amd64",
+  "package_id": "python",
+  "package_name": "python.3.11.9.nupkg",
+  "download_url": "https://api.nuget.org/v3-flatcontainer/python/3.11.9/python.3.11.9.nupkg",
+  "sha256": "9283876d58c017e0e846f95b490da3bca0fc0a6ee1134b2870677cfb7eec3c67",
+  "runtime_subdirectory": "tools",
+  "nuget_version": "6.14.0",
+  "nuget_name": "nuget-6.14.0.exe",
+  "nuget_download_url": "https://dist.nuget.org/win-x86-commandline/v6.14.0/nuget.exe",
+  "nuget_sha256": "92dbed160ddee0f64b901e907439e021211b428e57c089ecc12fc38dcc4bd9a5"
+}

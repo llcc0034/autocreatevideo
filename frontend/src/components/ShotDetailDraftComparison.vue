@@ -5,12 +5,33 @@ import { shotDetailDraftReviewIssueTitle } from '@/services/shotDetailDraft'
 import type { Shot, ShotDetailDraftBatchItem } from '@/types'
 
 const props = defineProps<{ item: ShotDetailDraftBatchItem; shot?: Shot }>()
-const source = computed(() => props.item.beforeSnapshot.targetShot)
-const beforeText = computed(() => String(
-  source.value.detailed_description || source.value.detailedDescription
-  || [source.value.camera, source.value.action, source.value.narrative].filter(Boolean).join('\n')
-  || '冻结快照中没有可展示的扩写源文本。',
-))
+const source = computed<Record<string, unknown>>(() => props.item.beforeSnapshot.targetShot || {})
+const objectValue = (value: unknown): Record<string, unknown> => (
+  value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+)
+const textValue = (value: unknown): string => (typeof value === 'string' ? value.trim() : '')
+const expansionFocus = computed(() => objectValue(source.value.expansion_focus ?? source.value.expansionFocus))
+const beforeText = computed(() => {
+  const camera = textValue(expansionFocus.value.camera_motion ?? expansionFocus.value.cameraMotion ?? source.value.camera)
+  const action = textValue(
+    expansionFocus.value.action_and_visual_description
+    ?? expansionFocus.value.actionAndVisualDescription
+    ?? source.value.action,
+  )
+  const narrative = textValue(
+    expansionFocus.value.narrative_visual_context
+    ?? expansionFocus.value.narrativeVisualContext
+    ?? source.value.narrative,
+  )
+  const lines = [
+    camera ? `镜头运动：${camera}` : '',
+    action ? `动作与画面：${action}` : '',
+    narrative ? `视觉简述：${narrative}` : '',
+  ].filter(Boolean)
+  if (lines.length) return lines.join('\n')
+  return textValue(source.value.detailed_description ?? source.value.detailedDescription)
+    || '冻结快照中没有可展示的扩写源文本。'
+})
 const statusCopy = computed(() => ({
   pending: '排队中', running: '扩写中', succeeded: '候选已生成', failed: '生成失败',
   stale: '源镜头已变化', skipped: '图片镜头已跳过',

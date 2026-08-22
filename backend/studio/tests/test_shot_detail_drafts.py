@@ -25,7 +25,10 @@ from studio.services.prompt_translation import (
     source_text_hash,
     translation_context_hash,
 )
-from studio.services.shot_detail_drafts import shot_detail_context_hash
+from studio.services.shot_detail_drafts import (
+    shot_detail_context_hash,
+    shot_detail_context_snapshot,
+)
 from studio.tests.factories import build_story
 
 
@@ -205,13 +208,40 @@ class ShotDetailDraftApiTests(TestCase):
         self.shot.requires_first_frame_continuity = True
         self.shot.requires_last_frame_continuity = False
         self.shot.duration_ms = 5000
+        self.shot.action = (
+            "[0-2.5秒] 动作：林默绕过档案桌，右手按住信纸。"
+            "[2.5-5秒] 动作：她抬头看向门口阴影，停在桌边。"
+        )
         self.shot.save(update_fields=(
             "dialogue", "requires_first_frame_continuity",
-            "requires_last_frame_continuity", "duration_ms", "updated_at",
+            "requires_last_frame_continuity", "duration_ms", "action", "updated_at",
         ))
 
-        generated, captured = self._generate()
+        segmented_candidate = {
+            "schema_version": 1,
+            "detail_zh": (
+                "[0-2.5秒] 林默从左侧绕过档案桌，右手压住烧焦信纸，镜头保持低速推近。"
+                "\n[2.5-5秒] 她抬头锁定门口阴影，肩线收紧，最终停在桌边维持同一空间方向。"
+            ),
+            "detail_en": (
+                "[0-2.5s] Lin Mo moves around the archive desk from the left and presses the "
+                "scorched letter down with the right hand as the camera keeps a slow push-in."
+                "\n[2.5-5s] She looks up toward the doorway shadow, tightens the shoulders, "
+                "and ends beside the same desk in the same spatial direction."
+            ),
+        }
+        generated, captured = self._generate(segmented_candidate)
         self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertIn("[0-2.5秒]", generated.data["draft_data"]["detail_zh"])
+        self.assertIn("[2.5-5秒]", generated.data["draft_data"]["detail_zh"])
+        self.assertIn("[0-2.5s]", generated.data["draft_data"]["detail_en"])
+        self.assertIn("[2.5-5s]", generated.data["draft_data"]["detail_en"])
+        self.assertFalse(
+            {
+                "source_timing_range_missing",
+                "source_timing_segment_unmapped",
+            } & {issue["code"] for issue in generated.data["validation"]["review_issues"]},
+        )
         runtime_path = Path(__file__).resolve().parents[3] / "scripts" / "qwen_translate_once.py"
         spec = importlib.util.spec_from_file_location(
             "qwen_detail_real_request_for_test", runtime_path,
@@ -231,8 +261,151 @@ class ShotDetailDraftApiTests(TestCase):
             normalized.target_shot["dialogue"][0]["end_ms"], 2600,
         )
         self.assertEqual(
+            normalized.target_shot["source_timed_visual_segments"],
+            [{
+                "source_order": 1,
+                "start_ms": 0,
+                "end_ms": 2500,
+                "kind": "action",
+                "text_zh": "林默绕过档案桌，右手按住信纸",
+            }, {
+                "source_order": 2,
+                "start_ms": 2500,
+                "end_ms": 5000,
+                "kind": "action",
+                "text_zh": "她抬头看向门口阴影，停在桌边",
+            }],
+        )
+        self.assertEqual(
+            normalized.target_shot["source_timed_visual_segments"],
+            captured["target_shot"]["source_timed_visual_segments"],
+        )
+        self.assertEqual(
             normalized.max_tokens, captured["shot_detail_policy"]["output_tokens"],
         )
+
+    def test_new_detail_generation_ignores_previous_applied_detail_as_source(self):
+        self.shot.duration_ms = 5000
+        self.shot.action = (
+            "[0-2.5秒] 动作：林默沿着档案桌左侧移动，右手按住信纸。"
+            "[2.5-5秒] 动作：她停在门口阴影前，保持同一空间方向。"
+        )
+        self.shot.detailed_description = (
+            "Timing markers: [0-2.5s] [2.5-5s]\n"
+            "Old high-detail candidate with a different staging should not become the next source."
+        )
+        self.shot.save(update_fields=("duration_ms", "action", "detailed_description", "updated_at"))
+
+        generated, captured = self._generate({
+            "schema_version": 1,
+            "detail_zh": (
+                "[0-2.5秒] 林默沿着档案桌左侧移动，右手压住信纸，镜头保持连续。"
+                "\n[2.5-5秒] 她停在门口阴影前，维持同一空间方向并收住动作。"
+            ),
+            "detail_en": (
+                "[0-2.5s] Lin Mo moves along the left side of the archive desk and keeps "
+                "the right hand pressing the letter as the camera stays continuous."
+                "\n[2.5-5s] She stops before the doorway shadow, preserving the same "
+                "spatial direction and settling the action."
+            ),
+        })
+
+        self.assertEqual(generated.status_code, 201, generated.data)
+        self.assertEqual(captured["target_shot"]["detailed_description"], "")
+        self.assertNotIn(
+            "detailed_description",
+            captured["expansion_scope"]["read_only_constraints"],
+        )
+        self.assertEqual(
+            captured["target_shot"]["source_timed_visual_segments"],
+            [{
+                "source_order": 1,
+                "start_ms": 0,
+                "end_ms": 2500,
+                "kind": "action",
+                "text_zh": "林默沿着档案桌左侧移动，右手按住信纸",
+            }, {
+                "source_order": 2,
+                "start_ms": 2500,
+                "end_ms": 5000,
+                "kind": "action",
+                "text_zh": "她停在门口阴影前，保持同一空间方向",
+            }],
+        )
+
+    def test_adjacent_context_isolated_by_storyboard_version(self):
+        version_key = "creative-draft:context-version"
+        version_shots = []
+        for local_number in (1, 2):
+            shot = Shot.objects.create(
+                episode=self.episode,
+                number=2 + local_number,
+                title=f"V2 镜头 {local_number}",
+                narrative=f"V2 正式描述 {local_number}",
+                camera="slow push in",
+                scene=self.scene,
+                duration_ms=5000,
+                metadata={
+                    "creative_version_key": version_key,
+                    "creative_version_label": "V2",
+                    "creative_version_shot_number": local_number,
+                },
+            )
+            shot.characters.add(self.character)
+            version_shots.append(shot)
+
+        first_snapshot = shot_detail_context_snapshot(
+            self.project, self.episode, version_shots[0],
+        )
+        self.assertIsNone(first_snapshot["boundaries"]["previous"])
+        self.assertEqual(
+            first_snapshot["boundaries"]["next"]["id"], str(version_shots[1].pk),
+        )
+        initial_hash = shot_detail_context_hash(
+            self.project, self.episode, version_shots[0],
+        )
+
+        self.next_shot.narrative = "旧版本边界被修改"
+        self.next_shot.save(update_fields=("narrative", "updated_at"))
+        self.assertEqual(
+            shot_detail_context_hash(self.project, self.episode, version_shots[0]),
+            initial_hash,
+        )
+
+        version_shots[1].narrative = "同版本边界被修改"
+        version_shots[1].save(update_fields=("narrative", "updated_at"))
+        self.assertNotEqual(
+            shot_detail_context_hash(self.project, self.episode, version_shots[0]),
+            initial_hash,
+        )
+
+    def test_high_detail_requires_timing_markers_to_map_to_segment_body(self):
+        self.shot.duration_ms = 5000
+        self.shot.action = (
+            "[0-2.5秒] 动作：林默绕过档案桌，右手按住信纸。"
+            "[2.5-5秒] 动作：她抬头看向门口阴影，停在桌边。"
+        )
+        self.shot.save(update_fields=("duration_ms", "action", "updated_at"))
+
+        generated, _ = self._generate({
+            "schema_version": 1,
+            "detail_zh": (
+                "时间段标记：[0-2.5秒] [2.5-5秒]\n"
+                "中近景，镜头缓慢推近，林默压住信纸后抬头看向门口。"
+            ),
+            "detail_en": (
+                "Timing markers: [0-2.5s] [2.5-5s]\n"
+                "Medium close-up, slow push-in as Lin Mo presses the letter and looks at the doorway."
+            ),
+        })
+
+        self.assertEqual(generated.status_code, 201, generated.data)
+        issues = {
+            (issue["code"], issue["path"])
+            for issue in generated.data["validation"]["review_issues"]
+        }
+        self.assertIn(("source_timing_segment_unmapped", "detail_zh"), issues)
+        self.assertIn(("source_timing_segment_unmapped", "detail_en"), issues)
 
     def test_post_apply_boundary_and_bible_changes_make_draft_stale(self):
         generated, _ = self._generate()

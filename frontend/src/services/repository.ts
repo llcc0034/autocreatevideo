@@ -1,14 +1,18 @@
 import { api, fetchAllPages, unwrap } from './api'
 import { mockAssets, mockProjects, mockSettings, mockWorkflows, stylePresets } from '@/data/mock'
 import { DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, normalizeImageProductionResolutionMultiple, normalizeProductionResolutionMultiple } from '@/constants/productionResolution'
-import type { AssemblyResult, Asset, BibleAssetDraftResult, BibleDraftEntityType, BibleDraftLanguage, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, ComfySettings, ComfyUIWorkflowSyncResult, Episode, GeneratedImageAssetTarget, GeneratedWorkflowExport, H3Mode, H3PromptOptimizerCapability, H3PromptPayload, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, ReleaseSelection, ScriptBreakdownOptions, SeriesProject, Shot, ShotTranslationPromotionResult, StylePreset, TaskInputPrompt, TranslationCapability, VisualRulesColorDesign, VisualRulesDraftApplyResult, VisualRulesDraftResult, Workflow, WorkflowUserParameterDefinition } from '@/types'
+import type { AssemblyResult, Asset, BibleAssetDraftResult, BibleDraftEntityType, BibleDraftLanguage, BibleImageCandidateCreateOptions, BibleImageCandidateCreateResult, BibleImageCandidatesResult, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, ComfySettings, ComfyUIWorkflowSyncResult, DeferredGenerationCreateInput, DeferredGenerationRequest, DeferredGenerationStatus, Episode, GeneratedImageAssetTarget, GeneratedWorkflowExport, H3Mode, H3PromptOptimizerCapability, H3PromptPayload, ProductionResolutionProfile, ProductionWorkflowSelection, ProductionWorkflowTemplate, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, ReleaseSelection, ScriptBibleApplyResult, ScriptBibleCandidatesResult, ScriptBibleReviewedSelection, ScriptBreakdownOptions, SeriesProject, Shot, ShotTranslationPromotionResult, StylePreset, TaskInputPrompt, TranslationCapability, VisualRulesColorDesign, VisualRulesDraftApplyResult, VisualRulesDraftResult, Workflow, WorkflowUserParameterDefinition } from '@/types'
 import type { PromptProviderId } from '@/types'
-import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptProjectSummary, adaptPromptArtifact, adaptStyles, adaptTasks, backendStyleId, isBackendId, projectPayload, referenceAssetIdsForShot, referenceBindingsPayload, syncBible, syncEpisode, syncShot } from './backendAdapters'
+import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptProjectSummary, adaptPromptArtifact, adaptStyles, adaptTaskBatchSlots, adaptTasks, backendStyleId, defaultBibleImagePromptConfig, isBackendId, projectPayload, referenceAssetIdsForShot, referenceBindingsPayload, syncBible, syncEpisode, syncShot } from './backendAdapters'
 import { buildGeneratedImageAssetPromotionPayload } from './outputAssetPromotion'
 import { adaptCanonicalGlossaryEnsureResult, adaptShotTranslationPromotionResult, adaptTranslationEntry } from './translationReview'
 import { adaptVisualRulesDraftApplyResult, adaptVisualRulesDraftResult, visualRulesDraftApplyPayload, visualRulesDraftGeneratePayload } from './visualRulesDraft'
 import { adaptPromptProviders } from './providerCapabilities'
 import { parseDialogueText } from './dialogue'
+import { adaptScriptBibleApplyResult, adaptScriptBibleCandidates, scriptBibleApplyPayload } from './scriptBibleCandidates'
+import { adaptBibleImageCandidateCreateResult, adaptBibleImageCandidates, bibleImageCandidateCreatePayload } from './bibleImageCandidates'
+import { adaptDeferredGenerationRequest, deferredGenerationCreatePayload } from './deferredGeneration'
+import { normalizeShotVersionScopeKey } from './shotVersionScope'
 
 const sleep = (ms = 180) => new Promise((resolve) => setTimeout(resolve, ms))
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value))
@@ -71,6 +75,53 @@ export interface ProductionCapability {
   userActiveTaskCount: number
   confirmationRequired: boolean
   businessVolumeLimited: boolean
+}
+
+export interface DeferredGenerationRequestFilters {
+  project?: string
+  sourceTask?: string
+  targetShot?: string
+  status?: DeferredGenerationStatus
+  frameSlot?: 'first_frame' | 'last_frame'
+}
+
+export interface ProductionBatchResumeSkippedTask {
+  taskId: string
+  batchIndex?: number
+  status: string
+  reason: string
+}
+
+export interface ProductionBatchResumeResult {
+  batchId: string
+  batchKind?: string
+  scannedTaskCount: number
+  retriedTaskIds: string[]
+  skipped: ProductionBatchResumeSkippedTask[]
+  tasks: Workflow[]
+}
+
+export interface ProductionBatchCancelResult {
+  batchId: string
+  batchKind?: string
+  scannedTaskCount: number
+  cancelledTaskIds: string[]
+  cancelRequestedTaskIds: string[]
+  skipped: ProductionBatchResumeSkippedTask[]
+  downstreamCancellations: {
+    deferredRequestsCancelled: number
+    tasksCancelled: number
+    tasksCancelRequested: number
+  }
+  tasks: Workflow[]
+}
+
+export interface ProductionBatchDeleteResult {
+  batchId: string
+  batchKind?: string
+  scannedTaskCount: number
+  deletedTaskIds: string[]
+  deletedDeferredGenerationRequestIds: string[]
 }
 
 export interface ScriptBreakdownResult {
@@ -387,7 +438,7 @@ const mockBreakdown = (project: SeriesProject, options: ScriptBreakdownOptions):
   saveLocal('cineforge_projects', projects)
   return {
     project: clone(project),
-    method: 'deterministic-script-breakdown-v2-mock',
+    method: 'deterministic-script-breakdown-v3-mock',
     warnings: [],
     counts: {
       episodes: project.episodes.length,
@@ -561,7 +612,7 @@ export const repository = {
         }
       }) : []
       return {
-        projectId, translationGlossary: { ...(project?.translationGlossary || {}) }, entries,
+        projectId, updatedAt: project?.updatedAt, translationGlossary: { ...(project?.translationGlossary || {}) }, entries,
         summary: { requested: entries.length, generated: 0, reused: entries.filter((entry) => entry.status === 'reused').length, conflict: 0, failed: entries.filter((entry) => entry.status === 'failed').length },
         visualSummary: {
           requested: visualTranslations.length, generated: 0, reused: 0,
@@ -862,6 +913,68 @@ export const repository = {
       return { ...project, episodeCount: project.episodes.length, completedEpisodeCount: project.episodes.filter((episode) => episode.status === 'completed').length, totalDurationSeconds: project.episodes.reduce((total, episode) => total + episode.shots.reduce((sum, shot) => sum + shot.duration, 0), 0), detailLoaded: true }
     })
   },
+  async getScriptBibleCandidates(projectId: string): Promise<ScriptBibleCandidatesResult> {
+    return fromConfiguredSource(async () => {
+      const response = await api.get(`/projects/${projectId}/script-bible-candidates/`)
+      const result = adaptScriptBibleCandidates(unwrap<unknown>(response.data))
+      if (result.projectId !== projectId) throw new Error('服务端返回的剧本 Bible 候选项目不匹配。')
+      return result
+    }, () => {
+      throw new Error('Mock 模式不提供剧本 Bible 候选，未执行任何写入。')
+    })
+  },
+  async applyScriptBibleCandidates(
+    projectId: string,
+    sourceFingerprint: string,
+    selections: ScriptBibleReviewedSelection[],
+  ): Promise<ScriptBibleApplyResult> {
+    return fromConfiguredSource(async () => {
+      const response = await api.post(
+        `/projects/${projectId}/script-bible-candidates/apply/`,
+        scriptBibleApplyPayload(sourceFingerprint, selections),
+      )
+      const result = adaptScriptBibleApplyResult(unwrap<unknown>(response.data))
+      if (
+        result.projectId !== projectId
+        || result.sourceFingerprint !== sourceFingerprint
+        || result.counts.requested !== selections.length
+      ) throw new Error('服务端返回的剧本 Bible 确认结果与请求不匹配。')
+      return result
+    }, () => {
+      throw new Error('Mock 模式不提供剧本 Bible 候选确认，未执行任何写入。')
+    })
+  },
+  async getBibleImageCandidates(projectId: string): Promise<BibleImageCandidatesResult> {
+    return fromConfiguredSource(async () => {
+      const response = await api.get(`/projects/${projectId}/bible-image-candidates/`)
+      const result = adaptBibleImageCandidates(unwrap<unknown>(response.data))
+      if (result.projectId !== projectId) throw new Error('服务端返回的实体图片候选项目不匹配。')
+      return result
+    }, () => {
+      throw new Error('Mock 模式不提供实体图片候选，未执行任何写入。')
+    })
+  },
+  async createBibleImageCandidate(
+    projectId: string,
+    options: BibleImageCandidateCreateOptions,
+  ): Promise<BibleImageCandidateCreateResult> {
+    return fromConfiguredSource(async () => {
+      const response = await api.post(
+        `/projects/${projectId}/bible-image-candidates/`,
+        bibleImageCandidateCreatePayload(options),
+      )
+      const result = adaptBibleImageCandidateCreateResult(unwrap<unknown>(response.data))
+      if (
+        result.projectId !== projectId
+        || result.candidate.entityType !== options.entityType
+        || result.candidate.entityId !== options.entityId
+        || result.candidate.latestCandidate?.generationTaskId !== result.generationTaskId
+      ) throw new Error('服务端返回的实体图片候选与请求目标不匹配。')
+      return result
+    }, () => {
+      throw new Error('Mock 模式不提供实体图片候选生成，未创建任何任务。')
+    })
+  },
   async generateVisualRulesDraft(projectId: string, payload: {
     attempt: number
     variationNote?: string
@@ -938,8 +1051,9 @@ export const repository = {
     return fromConfiguredSource(async () => adaptProjectSummary(unwrap<Record<string, unknown>>((await api.post('/projects/', projectPayload(payload))).data), true), () => {
       const projects = loadLocal('cineforge_projects', mockProjects)
       const timestamp = new Date().toISOString()
+      const styleId = payload.styleId || 'wuxia'
       const project: SeriesProject = {
-        id: `project-${Date.now()}`, title: payload.title || '未命名连续剧', logline: payload.logline || '', masterScript: payload.masterScript || '', isFavorite: payload.isFavorite === true, continuitySummary: payload.continuitySummary || '', translationGlossary: payload.translationGlossary || {}, styleId: payload.styleId || 'wuxia', status: 'draft', aspectRatio: payload.aspectRatio || '9:16', resolution: payload.resolution || '720p', defaultMode: payload.defaultMode || 'Ref2VA',
+        id: `project-${Date.now()}`, title: payload.title || '未命名连续剧', logline: payload.logline || '', masterScript: payload.masterScript || '', isFavorite: payload.isFavorite === true, continuitySummary: payload.continuitySummary || '', translationGlossary: payload.translationGlossary || {}, bibleImagePromptConfig: payload.bibleImagePromptConfig || defaultBibleImagePromptConfig(stylePresets.find((item) => item.id === styleId)), styleId, status: 'draft', aspectRatio: payload.aspectRatio || '9:16', resolution: payload.resolution || '720p', defaultMode: payload.defaultMode || 'Ref2VA',
         bible: payload.bible || { characters: [], scenes: [], props: [], negativePrompt: '身份漂移，面部变化，服装变化，低清晰度，文字水印', colorScript: '' }, episodes: [], episodeCount: 0, completedEpisodeCount: 0, totalDurationSeconds: 0, detailLoaded: true, createdAt: timestamp, updatedAt: timestamp
       }
       projects.unshift(project); saveLocal('cineforge_projects', projects); return clone(project)
@@ -947,7 +1061,9 @@ export const repository = {
   },
   async updateProject(project: SeriesProject): Promise<SeriesProject> {
     return fromConfiguredSource(async () => {
-      await api.patch(`/projects/${project.id}/`, projectPayload(project)); await syncBible(project)
+      const patched = unwrap<Record<string, unknown>>((await api.patch(`/projects/${project.id}/`, projectPayload(project))).data)
+      const bibleSyncProject = { ...project, updatedAt: String(patched.updated_at || project.updatedAt) }
+      await syncBible(bibleSyncProject)
       return adaptProject(unwrap<Record<string, unknown>>(
         (await api.get(`/projects/${project.id}/`)).data,
       ))
@@ -1023,7 +1139,11 @@ export const repository = {
       return clone(shot)
     })
   },
-  async breakdownScript(project: SeriesProject, options: ScriptBreakdownOptions): Promise<ScriptBreakdownResult> {
+  async breakdownScript(
+    project: SeriesProject,
+    options: ScriptBreakdownOptions,
+    continueWithoutScriptBible = false,
+  ): Promise<ScriptBreakdownResult> {
     return fromConfiguredSource(async () => {
       if (!isBackendId(project.id)) throw new Error('当前项目不是后端项目，无法执行真实剧本拆解')
       const response = unwrap<Record<string, unknown>>((await api.post(`/projects/${project.id}/breakdown-script/`, {
@@ -1036,6 +1156,7 @@ export const repository = {
         default_last_frame_continuity: options.defaultLastFrameContinuity,
         replace_existing: options.replaceExisting,
         discard_existing_production: options.discardExistingProduction,
+        continue_without_script_bible: continueWithoutScriptBible,
       })).data)
       const counts = response.counts && typeof response.counts === 'object'
         ? response.counts as Record<string, unknown>
@@ -1045,7 +1166,7 @@ export const repository = {
         : {}
       return {
         project: await adaptProject(unwrap<Record<string, unknown>>((await api.get(`/projects/${project.id}/`)).data)),
-        method: String(response.method || 'deterministic-script-breakdown-v2'),
+        method: String(response.method || 'deterministic-script-breakdown-v3'),
         warnings: Array.isArray(response.warnings) ? response.warnings.map(String) : [],
         counts: {
           episodes: Number(counts.episodes || 0),
@@ -1170,6 +1291,36 @@ export const repository = {
       return clone(workflow)
     })
   },
+  async getDeferredGenerationRequests(filters: DeferredGenerationRequestFilters = {}): Promise<DeferredGenerationRequest[]> {
+    return fromConfiguredSource(async () => {
+      const params: Record<string, unknown> = { page_size: 100 }
+      if (filters.project) params.project = filters.project
+      if (filters.sourceTask) params.source_task = filters.sourceTask
+      if (filters.targetShot) params.target_shot = filters.targetShot
+      if (filters.status) params.status = filters.status
+      if (filters.frameSlot) params.frame_slot = filters.frameSlot
+      return (await fetchAllPages<unknown>('/deferred-generation-requests/', params))
+        .map(adaptDeferredGenerationRequest)
+    }, () => [])
+  },
+  async createDeferredGenerationRequest(input: DeferredGenerationCreateInput): Promise<DeferredGenerationRequest> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<unknown>((await api.post(
+        '/deferred-generation-requests/',
+        deferredGenerationCreatePayload(input),
+      )).data)
+      return adaptDeferredGenerationRequest(raw)
+    }, () => { throw new Error('Mock 模式不创建延迟连续生成请求') })
+  },
+  async cancelDeferredGenerationRequest(requestId: string): Promise<DeferredGenerationRequest> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<unknown>((await api.post(
+        `/deferred-generation-requests/${requestId}/cancel/`,
+        {},
+      )).data)
+      return adaptDeferredGenerationRequest(raw)
+    }, () => { throw new Error('Mock 模式没有可取消的延迟连续生成请求') })
+  },
   async publishTaskOutput(taskId: string, outputIndex: number): Promise<Workflow> {
     return fromConfiguredSource(async () => {
       try {
@@ -1211,11 +1362,12 @@ export const repository = {
     outputIndex: number,
     name = '',
     target?: GeneratedImageAssetTarget,
+    options: { acceptStaleBibleImageCandidate?: boolean } = {},
   ): Promise<Asset> {
     return fromConfiguredSource(async () => {
       const raw = unwrap<Record<string, any>>((await api.post(
         `/tasks/${taskId}/promote-output-to-asset/`,
-        buildGeneratedImageAssetPromotionPayload(outputIndex, name, target),
+        buildGeneratedImageAssetPromotionPayload(outputIndex, name, target, options),
       )).data)
       const asset = adaptAssets([raw])[0]
       if (!asset) throw new Error('服务端未返回可用的图片素材')
@@ -1377,23 +1529,56 @@ export const repository = {
     }, () => makeWorkflow([], true))
   },
   async generateWholeEpisode(project: SeriesProject, episode: Episode, idempotencyKey: string, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false): Promise<Workflow> {
-    const workflowFromUnit = (taskId: string, unit: Record<string, any>, index: number, taskIds: string[], batchId: string): Workflow => {
+    const shotVersionKey = normalizeShotVersionScopeKey(episode.activeShotVersionKey, episode.id)
+    const workflowFromUnit = (taskId: string, unit: Record<string, any>, index: number, taskIds: string[], batchId: string, batchSlots: Workflow['batchSlots'] = []): Workflow => {
       const shotIds = Array.isArray(unit.shot_ids) ? unit.shot_ids.map(String) : []
-      const shot = episode.shots.find((item) => shotIds.includes(item.id)) || episode.shots[index]
+      const shot = episode.shots.find((item) => shotIds.includes(item.id))
       const shotNumber = Number(unit.shot_number || shot?.order || index + 1)
       const shotTitle = String(unit.shot_title || shot?.title || `镜头 ${String(shotNumber).padStart(2, '0')}`)
       const kind = String(unit.media_type || shot?.mediaType || 'video')
-      const batchSize = Number(unit.batch_size || taskIds.length)
+      const batchIndex = Number(unit.batch_index || index + 1)
+      const batchSize = Number(unit.batch_size || episode.shots.length || taskIds.length)
+      const unitTaskId = String(taskId || unit.task_id || '')
+      const workflowMode = String(unit.workflow_mode || '')
+      const deferredStatus = String(unit.deferred_generation_status || '')
+      const isVirtual = !unitTaskId
+      const shotId = String(unit.shot_id || shotIds[0] || shot?.id || '') || undefined
+      const virtualId = `episode-batch-${batchId || idempotencyKey}-${batchIndex}-${shotId || index + 1}`
+      const virtualStep = workflowMode === 'waiting_for_deferred_first_frame_chain'
+        ? '等待上游镜头完成尾帧抽取链路'
+        : workflowMode === 'waiting_for_deferred_first_frame_source'
+          ? '等待上一镜尾帧抽取任务物化'
+          : '等待上一镜视频完成后抽取尾帧并创建本镜任务'
       return {
-        id: taskId, taskId, kind: kind === 'image' ? 'image' : 'video', backendStatus: 'queued', projectId: project.id,
+        id: unitTaskId || virtualId,
+        taskId: unitTaskId || undefined,
+        kind: kind === 'image' ? 'image' : 'video',
+        backendStatus: isVirtual ? (deferredStatus || workflowMode || 'waiting_for_deferred_first_frame') : 'queued',
+        projectId: project.id,
         projectTitle: `${project.title} · 第${episode.number}集 · 镜头${String(shotNumber).padStart(2, '0')} ${shotTitle}`,
-        status: 'queued', progress: 0, currentStep: `整集批次 ${index + 1}/${batchSize} · 等待 ComfyUI 调度`,
+        status: 'queued', progress: 0,
+        currentStep: isVirtual ? `整集镜头 ${batchIndex}/${batchSize} · ${virtualStep}` : `整集镜头 ${batchIndex}/${batchSize} · 等待 ComfyUI 调度`,
         createdAt: new Date().toISOString(), eta: '等待估算',
-        nodes: [{ id: taskId, label: `${kind === 'image' ? '图片' : '视频'}生成任务`, type: kind === 'image' ? 'image' : 'video', status: 'pending', progress: 0 }],
-        batchId, batchIndex: Number(unit.batch_index || index + 1), batchSize,
+        nodes: [{ id: unitTaskId || virtualId, label: isVirtual ? '尾帧抽取与下游任务占位' : `${kind === 'image' ? '图片' : '视频'}生成任务`, type: isVirtual ? 'compose' : (kind === 'image' ? 'image' : 'video'), status: 'pending', progress: 0 }],
+        batchId, batchIndex, batchSize, batchSlots,
         batchKind: String(unit.batch_kind || 'whole_episode'), batchTaskIds: taskIds,
+        shotVersionKey: String(unit.shot_version_key || shotVersionKey),
+        shotVersionLabel: String(unit.shot_version_label || '') || undefined,
+        isVirtualProductionUnit: isVirtual || undefined,
+        virtualProductionUnitKind: isVirtual ? (
+          workflowMode === 'waiting_for_deferred_first_frame_source'
+            ? 'waiting_for_deferred_first_frame_source'
+            : workflowMode === 'waiting_for_deferred_first_frame_chain'
+              ? 'waiting_for_deferred_first_frame_chain'
+              : 'deferred_first_frame_continuity'
+        ) : undefined,
+        deferredGenerationRequestId: String(unit.deferred_generation_request_id || '') || undefined,
+        deferredGenerationStatus: deferredStatus || undefined,
+        deferredSourceTaskId: String(unit.deferred_source_task_id || '') || undefined,
+        deferredUpstreamRequestId: String(unit.deferred_upstream_request_id || '') || undefined,
+        deferredFrameSlot: unit.deferred_frame_slot === 'last_frame' ? 'last_frame' : unit.deferred_frame_slot === 'first_frame' ? 'first_frame' : undefined,
         episodeId: episode.id, episodeNumber: episode.number, episodeTitle: episode.title,
-        shotId: String(unit.shot_id || shotIds[0] || shot?.id || '') || undefined,
+        shotId,
         shotIds: shotIds.length ? shotIds : shot ? [shot.id] : [], shotNumber, shotTitle
       }
     }
@@ -1402,6 +1587,7 @@ export const repository = {
       const payload = {
         whole_episode: true,
         episode_ids: [episode.id],
+        shot_version_key: shotVersionKey,
         idempotency_key: idempotencyKey,
         multi_shot: false,
         enqueue: true,
@@ -1417,12 +1603,24 @@ export const repository = {
       }
       const result = unwrap<Record<string, any>>((await api.post(`/projects/${project.id}/build-production/`, payload, { timeout: 0 })).data)
       const units = Array.isArray(result.production_units) ? result.production_units as Record<string, any>[] : []
+      const batchSlots = adaptTaskBatchSlots(result.batch_slots)
       const taskIds = Array.isArray(result.task_ids)
         ? result.task_ids.map(String)
         : units.map((unit) => unit.task_id).filter(Boolean).map(String)
-      if (!taskIds.length) throw new Error('服务端未创建整集分镜任务')
+      if (!taskIds.length && !units.length) throw new Error('服务端未创建整集分镜任务')
       const batchId = String(result.batch_id || units[0]?.batch_id || idempotencyKey)
-      return workflowFromUnit(taskIds[0], units.find((unit) => String(unit.task_id) === taskIds[0]) || units[0] || {}, 0, taskIds, batchId)
+      const sourceUnits = units.length ? units : taskIds.map((taskId, index) => ({ task_id: taskId, batch_index: index + 1, batch_size: taskIds.length }))
+      const responseVersionKey = String(result.shot_version_key || '')
+      if (responseVersionKey && responseVersionKey !== shotVersionKey) {
+        throw new Error('服务端返回的整集批次不属于当前分镜版本，请刷新后重试')
+      }
+      const flows = sourceUnits.map((unit, index) => workflowFromUnit(String(unit.task_id || ''), {
+        shot_version_key: responseVersionKey || shotVersionKey,
+        shot_version_label: result.shot_version_label,
+        ...unit,
+      }, index, taskIds, batchId, batchSlots))
+      const primary = flows.find((item) => item.taskId) || flows[0]
+      return clone({ ...primary, batchWorkflows: flows })
     }, () => {
       if (!episode.shots.length) throw new Error('本集还没有分镜，无法生成整集')
       const batchId = `mock-episode-batch-${Date.now()}`
@@ -1430,7 +1628,7 @@ export const repository = {
       const flows = episode.shots.map((shot, index) => workflowFromUnit(taskIds[index], { shot_ids: [shot.id], media_type: shot.mediaType, batch_index: index + 1, batch_size: taskIds.length }, index, taskIds, batchId))
       const workflows = loadLocal('cineforge_workflows', mockWorkflows)
       saveLocal('cineforge_workflows', [...flows, ...workflows])
-      return clone(flows[0])
+      return clone({ ...flows[0], batchWorkflows: flows })
     })
   },
   async regenerateShot(project: SeriesProject, episode: Episode, shot: Shot, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false): Promise<{ taskId: string; taskIds: string[] }> {
@@ -1468,13 +1666,21 @@ export const repository = {
       return { taskId, taskIds: [taskId] }
     })
   },
-  async cancelGenerationTask(taskId: string): Promise<{ id: string; status: string; warning?: string }> {
+  async cancelGenerationTask(taskId: string): Promise<{ id: string; status: string; warning?: string; downstreamCancellations?: { deferredRequestsCancelled: number; tasksCancelled: number; tasksCancelRequested: number } }> {
     return fromConfiguredSource(async () => {
       const raw = unwrap<Record<string, any>>((await api.post(`/tasks/${taskId}/cancel/`, {})).data)
+      const downstream = raw.downstream_cancellations && typeof raw.downstream_cancellations === 'object'
+        ? raw.downstream_cancellations as Record<string, unknown>
+        : {}
       return {
         id: String(raw.id || taskId),
         status: String(raw.status || 'cancel_requested'),
-        warning: String(raw.warning || '') || undefined
+        warning: String(raw.warning || '') || undefined,
+        downstreamCancellations: {
+          deferredRequestsCancelled: Math.max(0, Number(downstream.deferred_requests_cancelled || 0) || 0),
+          tasksCancelled: Math.max(0, Number(downstream.tasks_cancelled || 0) || 0),
+          tasksCancelRequested: Math.max(0, Number(downstream.tasks_cancel_requested || 0) || 0),
+        },
       }
     }, () => {
       const workflows = loadLocal('cineforge_workflows', mockWorkflows)
@@ -1489,6 +1695,45 @@ export const repository = {
       saveLocal('cineforge_workflows', workflows)
       return { id: taskId, status: 'cancelled' }
     })
+  },
+  async cancelGenerationBatch(taskId: string): Promise<ProductionBatchCancelResult> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<Record<string, any>>((await api.post(`/tasks/${taskId}/cancel-batch/`, {})).data)
+      const skipped = Array.isArray(raw.skipped)
+        ? raw.skipped
+          .filter((item: unknown): item is Record<string, any> => Boolean(item && typeof item === 'object'))
+          .map((item) => ({
+            taskId: String(item.task_id || ''),
+            batchIndex: item.batch_index !== null && item.batch_index !== undefined && Number.isSafeInteger(Number(item.batch_index))
+              ? Number(item.batch_index)
+              : undefined,
+            status: String(item.status || ''),
+            reason: String(item.reason || ''),
+          }))
+          .filter((item) => item.taskId)
+        : []
+      const downstream = raw.downstream_cancellations && typeof raw.downstream_cancellations === 'object'
+        ? raw.downstream_cancellations as Record<string, unknown>
+        : {}
+      return {
+        batchId: String(raw.batch_id || ''),
+        batchKind: String(raw.batch_kind || '') || undefined,
+        scannedTaskCount: Number(raw.scanned_task_count || 0),
+        cancelledTaskIds: Array.isArray(raw.cancelled_task_ids)
+          ? raw.cancelled_task_ids.map(String).filter(Boolean)
+          : [],
+        cancelRequestedTaskIds: Array.isArray(raw.cancel_requested_task_ids)
+          ? raw.cancel_requested_task_ids.map(String).filter(Boolean)
+          : [],
+        skipped,
+        downstreamCancellations: {
+          deferredRequestsCancelled: Math.max(0, Number(downstream.deferred_requests_cancelled || 0) || 0),
+          tasksCancelled: Math.max(0, Number(downstream.tasks_cancelled || 0) || 0),
+          tasksCancelRequested: Math.max(0, Number(downstream.tasks_cancel_requested || 0) || 0),
+        },
+        tasks: Array.isArray(raw.tasks) ? adaptTasks(raw.tasks) : [],
+      }
+    }, () => { throw new Error('Mock 模式不支持取消真实生产批次') })
   },
   async deleteGenerationTask(taskId: string): Promise<{ id: string }> {
     return fromConfiguredSource(async () => {
@@ -1507,12 +1752,51 @@ export const repository = {
       return { id: taskId }
     })
   },
-  async retryGenerationTask(taskId: string, extendedGenerationConfirmed = false): Promise<{ id: string }> {
+  async deleteGenerationBatch(taskId: string): Promise<ProductionBatchDeleteResult> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<Record<string, any>>((await api.delete(`/tasks/${taskId}/delete-batch/`)).data)
+      return {
+        batchId: String(raw.batch_id || ''),
+        batchKind: String(raw.batch_kind || '') || undefined,
+        scannedTaskCount: Number(raw.scanned_task_count || 0),
+        deletedTaskIds: Array.isArray(raw.deleted_task_ids)
+          ? raw.deleted_task_ids.map(String).filter(Boolean)
+          : [],
+        deletedDeferredGenerationRequestIds: Array.isArray(raw.deleted_deferred_generation_request_ids)
+          ? raw.deleted_deferred_generation_request_ids.map(String).filter(Boolean)
+          : [],
+      }
+    }, () => {
+      const workflows = loadLocal('cineforge_workflows', mockWorkflows)
+      const source = workflows.find((item) => (item.taskId || item.id) === taskId)
+      if (!source?.batchId) throw new Error('没有找到需要删除的整集批次')
+      const batchItems = workflows.filter((item) => item.batchId === source.batchId)
+      if (!batchItems.length) throw new Error('没有找到需要删除的整集批次')
+      const nonTerminal = batchItems.find((item) => {
+        const terminal = ['succeeded', 'failed', 'cancelled'].includes(item.backendStatus || '')
+          || (!item.backendStatus && ['completed', 'failed'].includes(item.status))
+        return !terminal
+      })
+      if (nonTerminal) throw new Error('仅能删除全部进入终态的整集批次')
+      const deletedTaskIds = batchItems.map((item) => item.taskId || item.id)
+      saveLocal('cineforge_workflows', workflows.filter((item) => item.batchId !== source.batchId))
+      return {
+        batchId: source.batchId,
+        batchKind: source.batchKind,
+        scannedTaskCount: batchItems.length,
+        deletedTaskIds,
+        deletedDeferredGenerationRequestIds: [],
+      }
+    })
+  },
+  async retryGenerationTask(taskId: string, extendedGenerationConfirmed = false): Promise<Workflow> {
     return fromConfiguredSource(async () => {
       const raw = unwrap<Record<string, any>>((await api.post(`/tasks/${taskId}/retry/`, {
         extended_generation_confirmed: extendedGenerationConfirmed,
       })).data)
-      return { id: String(raw.id || taskId) }
+      const workflow = adaptTasks([raw])[0]
+      if (!workflow) throw new Error('服务端未返回重试后的任务详情')
+      return workflow
     }, () => {
       const workflows = loadLocal('cineforge_workflows', mockWorkflows)
       const original = workflows.find((item) => item.id === taskId)
@@ -1524,8 +1808,38 @@ export const repository = {
         nodes: original.nodes.map((node) => ({ ...node, status: 'pending', progress: 0 }))
       }
       workflows.unshift(retried); saveLocal('cineforge_workflows', workflows)
-      return { id }
+      return retried
     })
+  },
+  async resumeGenerationBatch(taskId: string, extendedGenerationConfirmed = false): Promise<ProductionBatchResumeResult> {
+    return fromConfiguredSource(async () => {
+      const raw = unwrap<Record<string, any>>((await api.post(`/tasks/${taskId}/resume-batch/`, {
+        extended_generation_confirmed: extendedGenerationConfirmed,
+      })).data)
+      const skipped = Array.isArray(raw.skipped)
+        ? raw.skipped
+          .filter((item: unknown): item is Record<string, any> => Boolean(item && typeof item === 'object'))
+          .map((item) => ({
+            taskId: String(item.task_id || ''),
+            batchIndex: item.batch_index !== null && item.batch_index !== undefined && Number.isSafeInteger(Number(item.batch_index))
+              ? Number(item.batch_index)
+              : undefined,
+            status: String(item.status || ''),
+            reason: String(item.reason || ''),
+          }))
+          .filter((item) => item.taskId)
+        : []
+      return {
+        batchId: String(raw.batch_id || ''),
+        batchKind: String(raw.batch_kind || '') || undefined,
+        scannedTaskCount: Number(raw.scanned_task_count || 0),
+        retriedTaskIds: Array.isArray(raw.retried_task_ids)
+          ? raw.retried_task_ids.map(String).filter(Boolean)
+          : [],
+        skipped,
+        tasks: Array.isArray(raw.tasks) ? adaptTasks(raw.tasks) : [],
+      }
+    }, () => { throw new Error('Mock 模式不支持恢复真实生产批次') })
   },
   async getEpisodeAssemblies(projectId: string): Promise<AssemblyResult[]> {
     return fromConfiguredSource(async () => {

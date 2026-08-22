@@ -9,6 +9,9 @@ $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BackendRoot = Join-Path $ProjectRoot 'backend'
 $FrontendRoot = Join-Path $ProjectRoot 'frontend'
 $PythonPath = Join-Path $BackendRoot '.venv\Scripts\python.exe'
+. (Join-Path $PSScriptRoot 'node_runtime.ps1')
+. (Join-Path $PSScriptRoot 'ffmpeg_runtime.ps1')
+. (Join-Path $PSScriptRoot 'python_runtime.ps1')
 
 function Assert-NativeSuccess([string]$Step) {
     if ($LASTEXITCODE -ne 0) {
@@ -27,8 +30,36 @@ function New-StrongDjangoSecret {
     return [Convert]::ToBase64String($bytes)
 }
 
-if (-not (Test-Path -LiteralPath $PythonPath)) {
-    python -m venv (Join-Path $BackendRoot '.venv')
+$NodeRuntime = Resolve-AutoPromptNodeRuntime -ProjectRoot $ProjectRoot
+if (-not $NodeRuntime) {
+    & (Join-Path $PSScriptRoot 'install_node_runtime.ps1')
+    Assert-NativeSuccess 'Project-local Node.js runtime installation'
+    $NodeRuntime = Resolve-AutoPromptNodeRuntime -ProjectRoot $ProjectRoot
+}
+$npmCacheRoot = Set-AutoPromptNpmCacheEnvironment -ProjectRoot $ProjectRoot
+Write-Host "Node runtime: $($NodeRuntime.Version) from $($NodeRuntime.Source); npm cache: $npmCacheRoot" -ForegroundColor DarkGray
+
+$FfmpegRuntime = Resolve-AutoPromptFfmpegRuntime -ProjectRoot $ProjectRoot
+if (-not $FfmpegRuntime) {
+    & (Join-Path $PSScriptRoot 'install_ffmpeg_runtime.ps1')
+    Assert-NativeSuccess 'Project-local FFmpeg runtime installation'
+    $FfmpegRuntime = Resolve-AutoPromptFfmpegRuntime -ProjectRoot $ProjectRoot
+}
+Set-AutoPromptFfmpegEnvironment -Runtime $FfmpegRuntime
+Write-Host "FFmpeg runtime: $($FfmpegRuntime.Version) from $($FfmpegRuntime.Source)" -ForegroundColor DarkGray
+
+$PythonRuntime = Resolve-AutoPromptPythonRuntime -ProjectRoot $ProjectRoot
+if (-not $PythonRuntime) {
+    & (Join-Path $PSScriptRoot 'install_python_runtime.ps1')
+    Assert-NativeSuccess 'Project-local Python runtime installation'
+    $PythonRuntime = Resolve-AutoPromptPythonRuntime -ProjectRoot $ProjectRoot
+}
+$pipCacheRoot = Set-AutoPromptPipCacheEnvironment -ProjectRoot $ProjectRoot
+Write-Host "Python runtime: $($PythonRuntime.Version) from $($PythonRuntime.Source); pip cache: $pipCacheRoot" -ForegroundColor DarkGray
+
+$PythonPath = Repair-AutoPromptBackendVenv -BackendRoot $BackendRoot -Runtime $PythonRuntime
+if (-not (Test-AutoPromptPythonExecutable -PythonPath $PythonPath)) {
+    throw "Backend virtual environment remains unusable after repair: $PythonPath"
 }
 
 & $PythonPath -m pip install -r (Join-Path $BackendRoot 'requirements.txt')
@@ -63,7 +94,7 @@ try {
 
 Push-Location $FrontendRoot
 try {
-    npm ci
+    & $NodeRuntime.NpmPath ci
     Assert-NativeSuccess 'Frontend dependency installation'
 } finally {
     Pop-Location

@@ -21,6 +21,11 @@ from django.utils import timezone
 
 from studio.media_signing import classify_task_output
 from studio.models import AssemblyJob, GenerationTask
+from studio.services.production_pipeline import (
+    BIBLE_IMAGE_CANDIDATE_PURPOSE,
+    bible_image_candidate_reserved_snapshot,
+)
+from studio.services.workflow import WorkflowBuildError
 
 
 PROVENANCE_SCHEMA = "https://autoprompt.local/schemas/provenance/v1"
@@ -235,11 +240,43 @@ def _task_body(
     workflow = task.generated_workflow
     prompt = workflow.prompt_artifact
     template = workflow.template
-    prompt_text = str(prompt.prompt_text or "")
-    negative_prompt = str(prompt.negative_prompt or "")
+    injected = workflow.injected_values if isinstance(workflow.injected_values, dict) else {}
+    prompt_text = str(injected.get("PROMPT", prompt.prompt_text) or "")
+    negative_prompt = str(injected.get("NEGATIVE_PROMPT", prompt.negative_prompt) or "")
     sources = _source_media_snapshot(task)
+    capability = task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
+    workflow_sha256 = _canonical_sha256(workflow.workflow_json)
+    prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
+    try:
+        reserved_candidate = bible_image_candidate_reserved_snapshot(prompt)
+    except WorkflowBuildError as exc:
+        raise ProvenanceError("Bible image candidate Prompt provenance is invalid") from exc
+    candidate_generation = {}
+    if reserved_candidate is not None:
+        if workflow_sha256 != workflow.content_hash:
+            raise ProvenanceError("Generated workflow content hash is invalid")
+        if (
+            capability.get("generated_workflow_id") != str(workflow.id)
+            or capability.get("workflow_hash") != workflow.content_hash
+            or capability.get("prompt_artifact_id") != str(prompt.id)
+            or capability.get("prompt_content_hash") != prompt_sha256
+        ):
+            raise ProvenanceError("Frozen task input identifiers do not match its workflow")
+        for key in (
+            "generation_purpose", "request_fingerprint", "bible_target",
+            "source_snapshot_sha256",
+        ):
+            if capability.get(key) != reserved_candidate.get(key):
+                raise ProvenanceError(
+                    "Bible image candidate task and Prompt provenance do not match"
+                )
+        candidate_generation = {
+            "generation_purpose": BIBLE_IMAGE_CANDIDATE_PURPOSE,
+            "request_fingerprint": reserved_candidate["request_fingerprint"],
+            "bible_target": deepcopy(reserved_candidate["bible_target"]),
+        }
     safe_input_snapshot = {
-        "prompt_sha256": hashlib.sha256(prompt_text.encode("utf-8")).hexdigest(),
+        "prompt_sha256": prompt_sha256,
         "negative_prompt_sha256": (
             hashlib.sha256(negative_prompt.encode("utf-8")).hexdigest()
             if negative_prompt else None
@@ -247,6 +284,7 @@ def _task_body(
         "workflow_sha256": workflow.content_hash,
         "seed": task.seed,
         "sources": sources,
+        **candidate_generation,
     }
     artifact_sha256 = sha256_file(artifact_path)
     return {
@@ -267,6 +305,7 @@ def _task_body(
         },
         "generation": {
             "task_id": str(task.id),
+            "generated_workflow_id": str(workflow.id),
             "project_id": str(task.project_id),
             "episode_id": str(task.episode_id) if task.episode_id else None,
             "shot_ids": [
@@ -276,15 +315,22 @@ def _task_body(
                     or ([prompt.shot_id] if prompt.shot_id else [])
                 )
             ],
-            "model": _public_identifier(prompt.model or template.model),
+            "model": _public_identifier(
+                capability.get("model")
+                or (workflow.injected_values or {}).get("MODEL")
+                or template.model
+            ),
             "model_profile": _public_identifier(task.model_profile),
-            "template_slug": template.slug,
+            "template_id": str(capability.get("template_id") or workflow.template_id),
+            "template_hash": str(capability.get("template_hash") or ""),
+            "template_slug": str(capability.get("template_slug") or template.slug),
             "template_version": task.workflow_version,
             "workflow_sha256": workflow.content_hash,
             "prompt_artifact_id": str(prompt.id),
             "prompt_sha256": safe_input_snapshot["prompt_sha256"],
             "negative_prompt_sha256": safe_input_snapshot["negative_prompt_sha256"],
             "input_snapshot_sha256": _canonical_sha256(safe_input_snapshot),
+            **candidate_generation,
         },
         "source_media": sources,
     }
@@ -392,6 +438,71 @@ def verified_task_manifest(task: GenerationTask, output_index: int) -> dict:
     )
 
 
+def resolve_declared_task_output(
+    task: GenerationTask,
+    role: str = "primary_video",
+) -> dict:
+    """Resolve one frozen output role without output-index or filename guessing."""
+
+    if task.status != GenerationTask.Status.SUCCEEDED:
+        raise ProvenanceError("Source generation task has not succeeded")
+    capability = (
+        task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
+    )
+    contract = capability.get("output_contract")
+    if not isinstance(contract, dict) or set(contract) != {"schema_version", role}:
+        raise ProvenanceError("Source task has no supported frozen output contract")
+    if contract.get("schema_version") != 1:
+        raise ProvenanceError("Source task output contract version is unsupported")
+    declaration = contract.get(role)
+    if (
+        not isinstance(declaration, dict)
+        or set(declaration) != {"node_id", "media_kind", "required"}
+        or not isinstance(declaration.get("node_id"), str)
+        or not declaration["node_id"]
+        or declaration.get("media_kind") != "video"
+        or declaration.get("required") is not True
+    ):
+        raise ProvenanceError("Source task output role declaration is invalid")
+    outputs = task.outputs if isinstance(task.outputs, list) else []
+    matches = [
+        (index, item)
+        for index, item in enumerate(outputs)
+        if isinstance(item, dict)
+        and str(item.get("node_id") or "") == declaration["node_id"]
+        and classify_task_output(item) == declaration["media_kind"]
+    ]
+    if len(matches) != 1:
+        raise ProvenanceError(
+            "Source task declared output must resolve to exactly one persisted video"
+        )
+    output_index, item = matches[0]
+    manifest = verified_task_manifest(task, output_index)
+    artifact = manifest.get("artifact") if isinstance(manifest, dict) else None
+    integrity = manifest.get("integrity") if isinstance(manifest, dict) else None
+    if (
+        not isinstance(artifact, dict)
+        or artifact.get("output_index") != output_index
+        or artifact.get("media_kind") != declaration["media_kind"]
+        or not isinstance(integrity, dict)
+    ):
+        raise ProvenanceError("Source task signed output does not match its declaration")
+    artifact_sha256 = str(artifact.get("sha256") or "")
+    manifest_sha256 = str(integrity.get("payload_sha256") or "")
+    if not _SHA256_RE.fullmatch(artifact_sha256) or not _SHA256_RE.fullmatch(
+        manifest_sha256
+    ):
+        raise ProvenanceError("Source task signed output digests are invalid")
+    return {
+        "output_index": output_index,
+        "item": deepcopy(item),
+        "path": resolve_task_output_path(task, output_index),
+        "manifest": manifest,
+        "artifact_sha256": artifact_sha256,
+        "manifest_sha256": manifest_sha256,
+    }
+
+
 def persist_assembly_provenance(job: AssemblyJob, *, generated_at=None) -> dict:
     output = Path(job.output_path).resolve()
     if not output.is_file():
@@ -406,7 +517,14 @@ def persist_assembly_provenance(job: AssemblyJob, *, generated_at=None) -> dict:
     output_lookup: dict[Path, tuple[GenerationTask, int]] = {}
     for task in source_tasks:
         prompt = task.generated_workflow.prompt_artifact
-        models.add(_public_identifier(prompt.model or task.generated_workflow.template.model))
+        capability = (
+            task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
+        )
+        models.add(_public_identifier(
+            capability.get("model")
+            or (task.generated_workflow.injected_values or {}).get("MODEL")
+            or task.generated_workflow.template.model
+        ))
         for index, item in enumerate(task.outputs or []):
             if not isinstance(item, dict) or classify_task_output(item) != "video":
                 continue

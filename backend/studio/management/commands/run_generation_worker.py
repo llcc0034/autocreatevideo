@@ -12,6 +12,12 @@ from studio.services.local_qwen_lock import (
     local_qwen_runtime_lock,
 )
 from studio.services.task_queue import claim_next_task, process_task, recover_stale_tasks
+from studio.services.deferred_generation import (
+    claim_next_deferred_request,
+    ensure_next_first_frame_deferred_for_task,
+    process_deferred_request,
+    recover_stale_deferred_requests,
+)
 from studio.services.shot_detail_batches import (
     claim_next_shot_detail_item,
     process_shot_detail_item,
@@ -55,6 +61,9 @@ class Command(BaseCommand):
         recovered_details = recover_stale_shot_detail_items()
         if recovered_details:
             self.stdout.write(f"Recovered {recovered_details} stale shot-detail items")
+        recovered_deferred = recover_stale_deferred_requests(startup_recover_minutes)
+        if recovered_deferred:
+            self.stdout.write(f"Recovered {recovered_deferred} stale deferred requests")
         worker_id = f"generation-worker-{os.getpid()}"
         last_recovery = time.monotonic()
         while True:
@@ -67,6 +76,11 @@ class Command(BaseCommand):
                 if recovered_details:
                     self.stdout.write(
                         f"Recovered {recovered_details} stale shot-detail items",
+                    )
+                recovered_deferred = recover_stale_deferred_requests(options["recover_minutes"])
+                if recovered_deferred:
+                    self.stdout.write(
+                        f"Recovered {recovered_deferred} stale deferred requests",
                     )
                 last_recovery = current
             task = None
@@ -85,14 +99,43 @@ class Command(BaseCommand):
                             task, client=client, wait_timeout=options["wait_timeout"],
                         )
                         self.stdout.write(f"Task {result.id}: {result.status}")
+                        if result.status == result.Status.SUCCEEDED:
+                            try:
+                                created = ensure_next_first_frame_deferred_for_task(result)
+                            except Exception as exc:
+                                self.stderr.write(
+                                    "Deferred continuity registration failed for "
+                                    f"task {result.id}: {exc}",
+                                )
+                            else:
+                                if created:
+                                    deferred_request, is_new = created
+                                    verb = "Created" if is_new else "Reused"
+                                    self.stdout.write(
+                                        f"{verb} deferred request {deferred_request.id} "
+                                        f"for task {result.id}",
+                                    )
             except LocalQwenResourceBusy:
                 # A local translation/creative request owns the machine memory
                 # budget.  Leave queued work untouched and retry on the normal
                 # short worker poll instead of claiming a task we cannot run.
                 task = None
 
-            detail_item = None
+            deferred_request = None
             if task is None:
+                deferred_request = claim_next_deferred_request(worker_id)
+                if deferred_request:
+                    self.stdout.write(
+                        f"Processing deferred request {deferred_request.id} "
+                        f"attempt {deferred_request.attempts}/{deferred_request.max_attempts}",
+                    )
+                    result = process_deferred_request(deferred_request)
+                    self.stdout.write(
+                        f"Deferred request {result.id}: {result.status}",
+                    )
+
+            detail_item = None
+            if task is None and deferred_request is None:
                 detail_item = claim_next_shot_detail_item(worker_id)
                 if detail_item:
                     self.stdout.write(
@@ -104,7 +147,7 @@ class Command(BaseCommand):
                         f"Shot-detail item {result.id}: {result.status}",
                     )
 
-            if task is None and detail_item is None and not options["once"]:
+            if task is None and deferred_request is None and detail_item is None and not options["once"]:
                 time.sleep(max(0.1, options["poll"]))
             if options["once"]:
                 return

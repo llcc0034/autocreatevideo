@@ -17,6 +17,7 @@ import {
   creativeProviderFailureFallback,
   creativeSafeFailureCode,
   creativeSafeFailureDiagnostic,
+  inferCreativeDraftShotCountFromScript,
 } from '../src/services/creativeDraft.ts'
 import {
   adaptPromptProviderCapability,
@@ -39,8 +40,13 @@ const rawDraft = {
       continuity_zh: '门外站立进入门内停步。', continuity_en: 'standing outside to a stop just inside',
       soundscape_zh: '雨声连续。', soundscape_en: 'continuous rainfall', music_zh: '无', music_en: 'no music',
       duration_ms: 5000, media_type: 'video', h3_mode: 'Ref2VA', include_audio: true,
+      requires_first_frame_continuity: true, requires_last_frame_continuity: false,
       scene_id: 'scene-1', character_ids: ['character-1'], prop_ids: [],
-      dialogue: [{ speaker_id: 'character-1', text_zh: '谁在那里？', delivery_zh: '压低声音', delivery_en: 'in a low voice', voiceover: false }],
+      dialogue: [{
+        speaker_id: 'character-1', text_zh: '谁在那里？',
+        delivery_zh: '压低声音', delivery_en: 'in a low voice',
+        voiceover: false, start_ms: 1000, end_ms: 3500,
+      }],
     }],
   },
 }
@@ -49,7 +55,11 @@ test('creative draft adapter preserves bilingual structured IR and operator gate
   const draft = adaptCreativeDraft(rawDraft)
   assert.equal(draft.draftData.shots[0].clientKey, 's1')
   assert.equal(draft.draftData.shots[0].h3Mode, 'Ref2VA')
+  assert.equal(draft.draftData.shots[0].requiresFirstFrameContinuity, true)
+  assert.equal(draft.draftData.shots[0].requiresLastFrameContinuity, false)
   assert.equal(draft.draftData.shots[0].dialogue[0].textZh, '谁在那里？')
+  assert.equal(draft.draftData.shots[0].dialogue[0].startMs, 1000)
+  assert.equal(draft.draftData.shots[0].dialogue[0].endMs, 3500)
   assert.equal(draft.validation.status, 'passed')
   assert.equal(draft.canEdit, true)
   assert.equal(draft.canApply, false)
@@ -60,8 +70,12 @@ test('creative draft payload round-trips without translating locked dialogue tex
   const payload = creativeDraftDataPayload(draft.draftData)
   assert.equal(payload.shots[0].dialogue[0].text_zh, '谁在那里？')
   assert.equal(payload.shots[0].dialogue[0].delivery_en, 'in a low voice')
+  assert.equal(payload.shots[0].dialogue[0].start_ms, 1000)
+  assert.equal(payload.shots[0].dialogue[0].end_ms, 3500)
   assert.equal(payload.shots[0].character_ids[0], 'character-1')
   assert.equal(payload.shots[0].duration_ms, 5000)
+  assert.equal(payload.shots[0].requires_first_frame_continuity, true)
+  assert.equal(payload.shots[0].requires_last_frame_continuity, false)
   assert.equal((payload.shots[0].dialogue[0] as Record<string, unknown>).text_en, undefined)
 })
 
@@ -82,6 +96,9 @@ test('episode copy is a read-only formal source, with optional empty English syn
 
   const workbench = readFileSync(new URL('../src/components/CreativeDraftWorkbench.vue', import.meta.url), 'utf8')
   assert.ok(workbench.includes('本集标题与梗概 · 正式来源'))
+  assert.ok(workbench.includes('首帧承接上一镜'))
+  assert.ok(workbench.includes('尾帧衔接下一镜'))
+  assert.ok(workbench.includes('setFrameContinuity(index'))
   assert.ok(workbench.includes('English synopsis · 可选只读'))
   assert.ok(workbench.includes('未生成英文摘要，不影响分镜或视频；本栏仅供只读查看。'))
   assert.ok(workbench.includes(':value="activeEpisode?.title??workingData.episode.titleZh"'))
@@ -248,6 +265,11 @@ test('creative workbench keeps review issues advisory and requires explicit risk
   assert.ok(source.includes('await confirmReview(true)'))
   assert.ok(source.includes('reviewAcknowledged,'))
   assert.ok(source.includes('&& !requiresEditCount.value'))
+  assert.ok(source.includes('const defaultPlacementForActiveEpisode = computed<CreativeDraftPlacement>'))
+  assert.ok(source.includes("const defaultPlacementForActiveEpisode = computed<CreativeDraftPlacement>(() => 'replace')"))
+  assert.ok(source.includes('替换会成为当前分镜版本'))
+  assert.ok(source.includes('后端会创建新的同集分镜版本'))
+  assert.ok(source.includes('replaceMayBeProtected'))
   assert.ok(!source.includes("if (saved.validation.status !== 'passed')"))
   assert.ok(!source.includes('不能改为静音；请重新生成'))
   assert.ok(repository.includes('review_acknowledged: reviewAcknowledged'))
@@ -262,6 +284,15 @@ test('apply adapter exposes exact applied shots and confirmed translation count'
   assert.equal(result.episodeId, 'episode-1')
   assert.deepEqual(result.appliedShotIds, ['shot-9'])
   assert.equal(result.translationsWritten, 8)
+})
+
+test('creative workbench demotes older applied chips after applying another draft', () => {
+  const source = readFileSync(new URL('../src/components/CreativeDraftWorkbench.vue', import.meta.url), 'utf8')
+  assert.ok(source.includes('const demoteOtherAppliedDrafts = (appliedDraft: CreativeDraft)'))
+  assert.ok(source.includes("item.episodeId !== appliedDraft.episodeId || item.status !== 'applied'"))
+  assert.ok(source.includes("status: 'confirmed'"))
+  assert.ok(source.includes('contextCurrent: false'))
+  assert.ok(source.includes('demoteOtherAppliedDrafts(result.draft)'))
 })
 
 test('failed candidate remains editable for human repair but stale context never does', () => {
@@ -677,4 +708,31 @@ test('creative provider capabilities keep recommendations configurable and allow
   assert.match(sourceConfirmationMessage, /权威剧本 28000 字符超过单批 24000 字符参考值/)
   assert.match(sourceConfirmationMessage, /不会截断镜数或剧本/)
   assert.doesNotMatch(sourceConfirmationMessage, /1 镜超过当前建议单次 4 镜/)
+})
+
+test('creative workbench defaults target shots from current episode structure before provider fallback', () => {
+  assert.equal(inferCreativeDraftShotCountFromScript([
+    '镜头 1：族长举起木杖。',
+    '镜头 2：火光照亮石坛。',
+    '镜头 3：少年回头。',
+  ].join('\n')), 3)
+  assert.equal(inferCreativeDraftShotCountFromScript([
+    '【1 [尾帧连续:否]: 石村祭坛，族长低声宣告。】',
+    '【2 [尾帧连续:是]: 神秘女子从雾中出现。】',
+    '【3: 火把依次熄灭。】',
+    '【4: 众人屏息。】',
+  ].join('\n')), 4)
+  assert.equal(inferCreativeDraftShotCountFromScript('第 3 集 · 血脉觉醒\n本集讲述族人集会。'), null)
+
+  const componentSource = readFileSync(new URL('../src/components/CreativeDraftWorkbench.vue', import.meta.url), 'utf8')
+  assert.ok(componentSource.includes('const episodeFormalShotCount = computed('))
+  assert.ok(componentSource.includes('activeEpisode.value?.shots.length'))
+  assert.ok(componentSource.includes("inferCreativeDraftShotCountFromScript(activeEpisode.value?.script || '')"))
+  assert.ok(componentSource.includes('contextualDefaultShots.value'))
+  assert.ok(componentSource.includes('targetShotCountUsesAutoDefault'))
+  assert.ok(componentSource.includes('默认值来自当前集已有'))
+  assert.ok(componentSource.includes('默认值来自本集剧本中识别到的'))
+  assert.ok(componentSource.includes('watch(defaultShots'))
+  assert.ok(componentSource.includes('targetShotCountWasEdited.value = false'))
+  assert.ok(!componentSource.includes('const defaultShots = computed(() => selectedProviderCapability.value?.defaultShots'))
 })

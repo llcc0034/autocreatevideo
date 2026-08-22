@@ -13,6 +13,7 @@ from rest_framework.test import APIClient
 from studio.models import (
     Asset,
     CharacterBible,
+    DeferredGenerationRequest,
     GeneratedWorkflow,
     GenerationTask,
     PromptArtifact,
@@ -209,6 +210,7 @@ class APIFlowTests(TestCase):
         for unsafe_duration in (4999, 15001):
             with self.subTest(duration_ms=unsafe_duration):
                 response = self.client.post(f"/api/v1/episodes/{self.episode.id}/sync-shots/", {
+                    "shot_version_key": f"legacy:{self.episode.id}:initial",
                     "shots": [{
                         "id": str(self.shot1.id), "number": 1,
                         "duration_ms": unsafe_duration, "media_type": Shot.MediaType.VIDEO,
@@ -221,6 +223,7 @@ class APIFlowTests(TestCase):
         self.shot1.duration_ms = 100
         self.shot1.save(update_fields=("media_type", "duration_ms", "updated_at"))
         image_response = self.client.post(f"/api/v1/episodes/{self.episode.id}/sync-shots/", {
+            "shot_version_key": f"legacy:{self.episode.id}:initial",
             "shots": [{"id": str(self.shot1.id), "number": 1}],
         }, format="json")
         self.assertEqual(image_response.status_code, 200, image_response.data)
@@ -376,6 +379,139 @@ class APIFlowTests(TestCase):
         self.project.refresh_from_db()
         self.assertEqual(self.project.status, "active")
         self.assertIsNone(self.project.completed_at)
+
+    def test_build_production_defers_ref2va_first_frame_after_previous_tail_task(self):
+        call_command("seed_data", verbosity=0)
+        self.shot1.duration_ms = 5000
+        self.shot1.h3_mode = Shot.H3Mode.T2VA
+        self.shot1.requires_last_frame_continuity = True
+        self.shot1.save(update_fields=(
+            "duration_ms", "h3_mode", "requires_last_frame_continuity", "updated_at",
+        ))
+        self.shot2.duration_ms = 5000
+        self.shot2.h3_mode = Shot.H3Mode.REF2VA
+        self.shot2.requires_first_frame_continuity = True
+        self.shot2.reference_bindings = {}
+        self.shot2.save(update_fields=(
+            "duration_ms", "h3_mode", "requires_first_frame_continuity",
+            "reference_bindings", "updated_at",
+        ))
+        variant = WorkflowTemplate.objects.get(
+            owner=None,
+            slug="minimax-h3-r2v-turbo-lora",
+        )
+
+        response = self.client.post(f"/api/v1/projects/{self.project.id}/build-production/", {
+            "episode_ids": [str(self.episode.id)],
+            "shot_ids": [str(self.shot1.id), str(self.shot2.id)],
+            "multi_shot": True,
+            "enqueue": True,
+            "idempotency_key": "chain-first-frame-ref2va",
+            "resolution_profile": "0.2",
+            "workflow_selections": [{
+                "output_kind": Shot.MediaType.VIDEO,
+                "h3_mode": Shot.H3Mode.REF2VA,
+                "template_id": str(variant.id),
+                "parameters": {"STEPS": 8, "LORA_STRENGTH": 0.65},
+            }],
+        }, format="json")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            response.data["counts"],
+            {"prompts": 1, "workflows": 1, "tasks": 1, "deferred_generation_requests": 1},
+        )
+        self.assertEqual(len(response.data["production_units"]), 2)
+        immediate, deferred = response.data["production_units"]
+        self.assertEqual(immediate["shot_id"], str(self.shot1.id))
+        self.assertIsNotNone(immediate["task_id"])
+        self.assertEqual(deferred["shot_id"], str(self.shot2.id))
+        self.assertIsNone(deferred["task_id"])
+        self.assertEqual(deferred["workflow_mode"], "deferred_first_frame_continuity")
+        self.assertEqual(deferred["deferred_frame_slot"], "first_frame")
+        request_id = response.data["deferred_generation_request_ids"][0]
+        self.assertEqual(deferred["deferred_generation_request_id"], request_id)
+        deferred_request = DeferredGenerationRequest.objects.get(pk=request_id)
+        self.assertEqual(deferred_request.source_task_id, GenerationTask.objects.get(pk=immediate["task_id"]).id)
+        self.assertEqual(deferred_request.target_shot_id, self.shot2.id)
+        self.assertEqual(deferred_request.frame_slot, DeferredGenerationRequest.FrameSlot.FIRST_FRAME)
+        self.assertEqual(deferred_request.target_template_id, variant.id)
+        self.assertEqual(
+            deferred_request.target_workflow_overrides,
+            {
+                "RESOLUTION_PROFILE": "0.2",
+                "RESOLUTION_MULTIPLE": 32,
+                "WIDTH": 352,
+                "HEIGHT": 608,
+                "STEPS": 8,
+                "LORA_STRENGTH": 0.65,
+            },
+        )
+
+    def test_whole_episode_accepts_chained_ref2va_first_frame_waits(self):
+        call_command("seed_data", verbosity=0)
+        self.shot1.duration_ms = 5000
+        self.shot1.h3_mode = Shot.H3Mode.T2VA
+        self.shot1.requires_last_frame_continuity = True
+        self.shot1.save(update_fields=(
+            "duration_ms", "h3_mode", "requires_last_frame_continuity", "updated_at",
+        ))
+        chained_shots = [self.shot2]
+        for number in (3, 4):
+            shot = Shot.objects.create(
+                episode=self.episode,
+                number=number,
+                title=f"连续镜头 {number}",
+                narrative=f"林默继续推进到第 {number} 个连续动作。",
+                camera="中景跟拍",
+                scene=self.scene,
+                duration_ms=5000,
+                h3_mode=Shot.H3Mode.REF2VA,
+            )
+            shot.characters.add(self.character)
+            chained_shots.append(shot)
+        for shot in chained_shots:
+            shot.duration_ms = 5000
+            shot.h3_mode = Shot.H3Mode.REF2VA
+            shot.requires_first_frame_continuity = True
+            shot.requires_last_frame_continuity = True
+            shot.reference_bindings = {}
+            shot.save(update_fields=(
+                "duration_ms", "h3_mode", "requires_first_frame_continuity",
+                "requires_last_frame_continuity", "reference_bindings", "updated_at",
+            ))
+
+        response = self.client.post(f"/api/v1/projects/{self.project.id}/build-production/", {
+            "episode_ids": [str(self.episode.id)],
+            "whole_episode": True,
+            "shot_version_key": f"legacy:{self.episode.id}:initial",
+            "multi_shot": True,
+            "enqueue": True,
+            "idempotency_key": "whole-episode-chained-ref2va",
+        }, format="json")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(
+            response.data["counts"],
+            {"prompts": 1, "workflows": 1, "tasks": 1, "deferred_generation_requests": 1},
+        )
+        self.assertEqual(len(response.data["production_units"]), 4)
+        self.assertEqual(response.data["production_units"][0]["shot_id"], str(self.shot1.id))
+        self.assertIsNotNone(response.data["production_units"][0]["task_id"])
+        self.assertEqual(
+            response.data["production_units"][1]["workflow_mode"],
+            "deferred_first_frame_continuity",
+        )
+        self.assertEqual(
+            response.data["production_units"][2]["workflow_mode"],
+            "waiting_for_deferred_first_frame_source",
+        )
+        self.assertEqual(
+            response.data["production_units"][3]["workflow_mode"],
+            "waiting_for_deferred_first_frame_chain",
+        )
+        self.assertEqual(GenerationTask.objects.count(), 1)
+        self.assertEqual(DeferredGenerationRequest.objects.count(), 1)
 
     def test_build_production_plan_without_enqueue_marks_selected_episode_ready(self):
         call_command("seed_data", verbosity=0)
@@ -621,6 +757,7 @@ class APIFlowTests(TestCase):
         self.shot1.metadata = {"framing": "特写", "lens": "50mm"}
         self.shot1.save(update_fields=("metadata", "updated_at"))
         response = self.client.post(f"/api/v1/episodes/{self.episode.id}/sync-shots/", {
+            "shot_version_key": f"legacy:{self.episode.id}:initial",
             "shots": [
                 {
                     "id": str(self.shot2.id), "number": 1, "narrative": self.shot2.narrative,
@@ -663,7 +800,7 @@ class APIFlowTests(TestCase):
         self.assertEqual(created.metadata["framing"], "中景")
         self.assertFalse(created.include_audio)
 
-    def test_sync_bibles_deletes_missing_and_uses_first_reference_as_anchor(self):
+    def test_sync_bibles_keeps_anchor_and_reference_assets_independent(self):
         second_reference = Asset.objects.create(
             owner=self.user, style=self.project.style, kind=Asset.Kind.CHARACTER,
             name="第二人物参考", local_path="C:/fixtures/lin-2.png", mime_type="image/png",
@@ -695,7 +832,11 @@ class APIFlowTests(TestCase):
         other.refresh_from_db()
         self.assertEqual((self.character.slug, self.character.stable_speaker_id), ("other", "S2"))
         self.assertEqual((other.slug, other.stable_speaker_id), ("lin", "S1"))
-        self.assertEqual(self.character.anchor_asset_id, second_reference.id)
+        self.assertNotEqual(self.character.anchor_asset_id, second_reference.id)
+        self.assertEqual(
+            set(self.character.reference_assets.values_list("id", flat=True)),
+            {second_reference.id, self.character.anchor_asset_id},
+        )
         self.assertTrue(PropBible.objects.filter(pk=prop.pk).exists())
 
     def test_build_production_respects_each_shot_mode_and_auto_selects_templates(self):
@@ -866,7 +1007,7 @@ class APIFlowTests(TestCase):
             self.assertNotIn(video_only_key, unit)
         prompt = PromptArtifact.objects.get(pk=unit["prompt_artifact_id"])
         workflow = GeneratedWorkflow.objects.get(pk=unit["workflow_id"])
-        self.assertEqual(prompt.model, "sd_xl_base_1.0.safetensors")
+        self.assertEqual(prompt.model, "stabilityai/stable-diffusion-xl-base-1.0")
         self.assertEqual(
             prompt.structured_payload["model"],
             "stabilityai/stable-diffusion-xl-base-1.0",
@@ -887,6 +1028,7 @@ class APIFlowTests(TestCase):
         }, format="json")
         self.assertEqual(task_response.status_code, 201, task_response.data)
         task = GenerationTask.objects.get(pk=task_response.data["id"])
+        self.assertEqual(task.capability_snapshot["model"], "sd_xl_base_1.0.safetensors")
         self.assertEqual(task.effective_frames, 0)
         self.assertEqual(task.effective_duration_ms, 0)
         for video_only_key in ("fps", "include_audio", "requested_duration_ms"):

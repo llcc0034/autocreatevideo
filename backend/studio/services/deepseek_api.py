@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 from functools import lru_cache
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -22,14 +23,18 @@ import requests
 
 
 PROVIDER_ID = "deepseek_api"
+_SERIES_CONCEPT_OPERATION = "series_concept_draft"
 _OFFICIAL_HOST = "api.deepseek.com"
 _SAFE_MODEL_RE = re.compile(r"[^A-Za-z0-9._:/-]+")
 _RETRY_BACKOFF_SECONDS = (0.25, 0.75, 1.5)
 _SAFE_VALIDATOR_PATH_RE = re.compile(
-    r"(?:result\.)?shots\[\d+\](?:\.[a-z][a-z0-9_]*(?:\[\d+\])?)*\Z"
+    r"(?:result\.)?(?:title|logline|bible\.(?:characters|scenes|props)\[\d+\]"
+    r"(?:\.(?:name|description|visual_identity_en))?|(?:shots|episodes)\[\d+\]"
+    r"(?:\.[a-z][a-z0-9_]*(?:\[\d+\])?)*)\Z"
 )
 _VALIDATOR_PATH_SEARCH_RE = re.compile(
-    r"result(?:\.shots\[\d+\])?(?:\.[a-z][a-z0-9_]*(?:\[\d+\])?)*"
+    r"result(?:\.(?:(?:shots|episodes)\[\d+\]|bible\.(?:characters|scenes|props)"
+    r"\[\d+\]))?(?:\.[a-z][a-z0-9_]*(?:\[\d+\])?)*"
 )
 _CREATIVE_LENGTH_ERROR_RE = re.compile(
     r"^(?P<path>result\.shots\[(?P<shot_index>\d+)\]\."
@@ -52,6 +57,12 @@ _CREATIVE_REPAIR_BUDGET_KEYS = {
 _DEEPSEEK_CREATIVE_FIELD_CHARACTER_BUDGETS = {
     "narrative_en": 1000,
     "action_en": 1000,
+}
+_SERIES_CONCEPT_JSON_KEYS = {
+    "title", "logline", "episodes", "shots", "setting", "action",
+    "dialogue", "speaker", "delivery", "text", "duration_ms",
+    "schema_version", "bible", "characters", "scenes", "props", "name",
+    "description", "visual_identity_en",
 }
 
 
@@ -106,6 +117,102 @@ def _safe_usage(value: Any) -> dict[str, int]:
     return safe
 
 
+def _redacted_json_shape(value: str, *, maximum: int = 900) -> str:
+    """Keep JSON structure while replacing every authored string value.
+
+    The scanner is intentionally tolerant of truncated JSON. Unknown keys and
+    unterminated values are redacted too, so provider/user text can never cross
+    the diagnostic boundary merely because decoding failed.
+    """
+
+    source = str(value or "")
+    parts: list[str] = []
+    index = 0
+    while index < len(source):
+        char = source[index]
+        if char == '"':
+            start = index
+            index += 1
+            escaped = False
+            closed = False
+            while index < len(source):
+                current = source[index]
+                index += 1
+                if escaped:
+                    escaped = False
+                    continue
+                if current == "\\":
+                    escaped = True
+                    continue
+                if current == '"':
+                    closed = True
+                    break
+            token = source[start:index]
+            lookahead = index
+            while lookahead < len(source) and source[lookahead].isspace():
+                lookahead += 1
+            is_key = closed and lookahead < len(source) and source[lookahead] == ":"
+            if is_key:
+                try:
+                    decoded_key = json.loads(token)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    decoded_key = ""
+                safe_key = (
+                    decoded_key
+                    if decoded_key in _SERIES_CONCEPT_JSON_KEYS
+                    else "<unknown_key>"
+                )
+                parts.append(json.dumps(safe_key, ensure_ascii=True))
+            elif closed:
+                parts.append('"<redacted_text>"')
+            else:
+                parts.append('"<unterminated_text>"')
+                break
+            continue
+        if char in "{}[]:,":
+            parts.append(char)
+            index += 1
+            continue
+        if char in "-+0123456789":
+            index += 1
+            while index < len(source) and source[index] in "+-0123456789.eE":
+                index += 1
+            parts.append("0")
+            continue
+        matched_literal = next(
+            (item for item in ("true", "false", "null") if source.startswith(item, index)),
+            None,
+        )
+        if matched_literal:
+            parts.append(matched_literal)
+            index += len(matched_literal)
+            continue
+        if char.isspace():
+            if not parts or parts[-1] != " ":
+                parts.append(" ")
+            index += 1
+            continue
+        parts.append("?")
+        index += 1
+    shape = "".join(parts).strip()
+    if len(shape) <= maximum:
+        return shape
+    marker = "<redacted_middle>"
+    side = max(1, (maximum - len(marker)) // 2)
+    return f"{shape[:side]}{marker}{shape[-side:]}"[:maximum]
+
+
+def _raw_output_diagnostic(content: str) -> dict[str, Any]:
+    encoded = content.encode("utf-8", errors="replace")
+    return {
+        "raw_diagnostic_available": True,
+        "output_chars": len(content),
+        "output_utf8_bytes": len(encoded),
+        "output_sha256": hashlib.sha256(encoded).hexdigest(),
+        "redacted_output_shape": _redacted_json_shape(content),
+    }
+
+
 def _safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
     """Allow only non-secret scalar audit fields across the service boundary."""
     safe: dict[str, Any] = {}
@@ -116,13 +223,19 @@ def _safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
         "repair_reason_code", "review_required", "review_issue_count",
         "validation_error_code", "validation_path",
         "requested_max_tokens", "configured_max_tokens",
-        "incomplete",
+        "configured_timeout_seconds",
+        "incomplete", "failure_phase", "raw_diagnostic_available",
+        "output_chars", "output_utf8_bytes", "json_decode_line",
+        "json_decode_column", "json_decode_position",
     ):
         item = value.get(key)
         if isinstance(item, (str, int, float, bool)) and not isinstance(item, bytes):
             if key == "model":
                 safe[key] = _safe_model(item)
-            elif key in {"validation_error_code", "repair_reason_code"}:
+            elif key in {
+                "validation_error_code", "repair_reason_code", "failure_phase",
+                "finish_reason", "operation", "provider", "transport",
+            }:
                 safe[key] = _safe_code(item)
             elif key == "validation_path":
                 path = _safe_validator_path(item)
@@ -130,6 +243,16 @@ def _safe_metadata(value: dict[str, Any]) -> dict[str, Any]:
                     safe[key] = path
             else:
                 safe[key] = item
+    output_sha256 = str(value.get("output_sha256") or "").lower()
+    if re.fullmatch(r"[0-9a-f]{64}", output_sha256):
+        safe["output_sha256"] = output_sha256
+    redacted_shape = str(value.get("redacted_output_shape") or "")[:900]
+    if redacted_shape:
+        # The producer already removes authored text. This second boundary
+        # strips anything outside the diagnostic grammar before exposure.
+        safe["redacted_output_shape"] = re.sub(
+            r'[^A-Za-z0-9_{}\[\]":,.\-<>?/ ]', "?", redacted_shape,
+        )
     usage = _safe_usage(value.get("usage"))
     if usage:
         safe["usage"] = usage
@@ -145,6 +268,12 @@ def _config() -> dict[str, Any]:
     except (TypeError, ValueError):
         timeout = 0.0
     try:
+        series_concept_timeout = float(
+            configured.get("series_concept_timeout_seconds", 900)
+        )
+    except (TypeError, ValueError):
+        series_concept_timeout = 0.0
+    try:
         retries = int(configured.get("max_retries", 1))
     except (TypeError, ValueError):
         retries = -1
@@ -152,14 +281,22 @@ def _config() -> dict[str, Any]:
         max_tokens = int(configured.get("max_tokens", 16384))
     except (TypeError, ValueError):
         max_tokens = 0
+    try:
+        series_concept_max_tokens = int(
+            configured.get("series_concept_max_tokens", 384000)
+        )
+    except (TypeError, ValueError):
+        series_concept_max_tokens = 0
     return {
         "enabled": bool(configured.get("enabled", False)),
         "base_url": str(configured.get("base_url") or "").strip(),
         "api_key": str(configured.get("api_key") or "").strip(),
         "model": _safe_model(configured.get("model")),
         "timeout_seconds": timeout,
+        "series_concept_timeout_seconds": series_concept_timeout,
         "max_retries": retries,
         "max_tokens": max_tokens,
+        "series_concept_max_tokens": series_concept_max_tokens,
     }
 
 
@@ -195,8 +332,10 @@ def get_deepseek_capability() -> dict[str, Any]:
         and config["api_key"]
         and config["model"]
         and 0 < config["timeout_seconds"] <= 3600
+        and 0 < config["series_concept_timeout_seconds"] <= 3600
         and 0 <= config["max_retries"] <= 5
         and config["max_tokens"] >= 1
+        and config["series_concept_max_tokens"] >= 1
     )
     return {
         "id": PROVIDER_ID,
@@ -266,38 +405,55 @@ def _http_error_code(status: int) -> str:
 def _chat_completion(
     *,
     messages: list[dict[str, str]],
-    max_tokens: int,
+    max_tokens: int | None,
     operation: str,
     response_format: dict[str, str] | None = None,
     temperature: float = 0.0,
     accept_incomplete_content: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     config = _require_config()
-    if isinstance(max_tokens, bool):
+    configured_max_tokens = (
+        config["series_concept_max_tokens"]
+        if operation == _SERIES_CONCEPT_OPERATION
+        else config["max_tokens"]
+    )
+    configured_timeout_seconds = (
+        config["series_concept_timeout_seconds"]
+        if operation == _SERIES_CONCEPT_OPERATION
+        else config["timeout_seconds"]
+    )
+    if max_tokens is None:
+        requested_max_tokens = None
+    elif isinstance(max_tokens, bool):
         requested_max_tokens = 0
     else:
         try:
             requested_max_tokens = int(max_tokens)
         except (TypeError, ValueError):
             requested_max_tokens = 0
-    if requested_max_tokens < 1:
+    if requested_max_tokens is not None and requested_max_tokens < 1:
         raise DeepSeekConfigurationError(
             "DeepSeek API output budget must be greater than zero.",
             code="deepseek_output_budget_invalid",
             runtime_metadata={
                 "operation": operation,
                 "requested_max_tokens": requested_max_tokens,
-                "configured_max_tokens": config["max_tokens"],
+                "configured_max_tokens": configured_max_tokens,
+                "configured_timeout_seconds": configured_timeout_seconds,
             },
         )
-    if requested_max_tokens > config["max_tokens"]:
+    if (
+        requested_max_tokens is not None
+        and requested_max_tokens > configured_max_tokens
+    ):
         raise DeepSeekConfigurationError(
             "DeepSeek API output budget exceeds the configured maximum.",
             code="deepseek_output_budget_exceeded",
             runtime_metadata={
                 "operation": operation,
                 "requested_max_tokens": requested_max_tokens,
-                "configured_max_tokens": config["max_tokens"],
+                "configured_max_tokens": configured_max_tokens,
+                "configured_timeout_seconds": configured_timeout_seconds,
             },
         )
     started = time.monotonic()
@@ -305,10 +461,11 @@ def _chat_completion(
         "model": config["model"],
         "messages": messages,
         "temperature": temperature,
-        "max_tokens": requested_max_tokens,
         "stream": False,
         "thinking": {"type": "disabled"},
     }
+    if requested_max_tokens is not None:
+        body["max_tokens"] = requested_max_tokens
     if response_format is not None:
         body["response_format"] = response_format
     headers = {
@@ -322,7 +479,7 @@ def _chat_completion(
         try:
             response = requests.post(
                 config["endpoint"], headers=headers, json=body,
-                timeout=config["timeout_seconds"],
+                timeout=configured_timeout_seconds,
             )
         except requests.RequestException as exc:
             if attempt < config["max_retries"]:
@@ -334,6 +491,7 @@ def _chat_completion(
                 runtime_metadata={
                     "operation": operation, "attempts": attempts,
                     "elapsed_ms": round((time.monotonic() - started) * 1000),
+                    "configured_timeout_seconds": configured_timeout_seconds,
                 },
             ) from exc
         status = int(getattr(response, "status_code", 0) or 0)
@@ -352,6 +510,7 @@ def _chat_completion(
                 "operation": operation, "http_status": status,
                 "attempts": attempts,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "configured_timeout_seconds": configured_timeout_seconds,
             },
         )
     try:
@@ -367,10 +526,16 @@ def _chat_completion(
             runtime_metadata={
                 "operation": operation, "attempts": attempts,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "configured_timeout_seconds": configured_timeout_seconds,
             },
         ) from exc
     elapsed = round((time.monotonic() - started) * 1000)
     incomplete = finish_reason != "stop"
+    raw_diagnostic = (
+        _raw_output_diagnostic(content)
+        if isinstance(content, str) and operation == _SERIES_CONCEPT_OPERATION
+        else {}
+    )
     if not isinstance(content, str) or not content.strip():
         raise DeepSeekAPIError(
             "DeepSeek API returned no content.", code=f"{operation}_empty_output",
@@ -379,11 +544,17 @@ def _chat_completion(
                 "elapsed_ms": elapsed, "finish_reason": finish_reason,
                 "incomplete": incomplete,
                 "usage": _safe_usage(payload.get("usage")),
+                "requested_max_tokens": requested_max_tokens,
+                "configured_max_tokens": configured_max_tokens,
+                "configured_timeout_seconds": configured_timeout_seconds,
+                **raw_diagnostic,
             },
         )
     if incomplete and not accept_incomplete_content:
         code = (
-            f"{operation}_output_budget_exhausted"
+            f"{operation}_output_truncated"
+            if finish_reason == "length" and operation == _SERIES_CONCEPT_OPERATION
+            else f"{operation}_output_budget_exhausted"
             if finish_reason == "length"
             else f"{operation}_incomplete_response"
         )
@@ -394,6 +565,11 @@ def _chat_completion(
                 "elapsed_ms": elapsed, "finish_reason": finish_reason,
                 "incomplete": True,
                 "usage": _safe_usage(payload.get("usage")),
+                "requested_max_tokens": requested_max_tokens,
+                "configured_max_tokens": configured_max_tokens,
+                "configured_timeout_seconds": configured_timeout_seconds,
+                "failure_phase": "provider_output",
+                **raw_diagnostic,
             },
         )
     return content, _safe_metadata({
@@ -406,6 +582,10 @@ def _chat_completion(
         "finish_reason": finish_reason,
         "incomplete": incomplete,
         "usage": payload.get("usage"),
+        "requested_max_tokens": requested_max_tokens,
+        "configured_max_tokens": configured_max_tokens,
+        "configured_timeout_seconds": configured_timeout_seconds,
+        **raw_diagnostic,
     })
 
 
@@ -831,7 +1011,7 @@ def _repair_creative_length_once(
 
 
 def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
-    """Run a validated creative storyboard or shot-detail proposal."""
+    """Run one supported, validated structured-language proposal."""
     config = _require_config()
     protocol = _protocol_module()
     operation = str(request_payload.get("operation") or "").strip().lower()
@@ -842,11 +1022,25 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
             protocol, request,
         )
         validator = protocol._validate_creative_storyboard
+        output_token_limit = _deepseek_creative_max_tokens
+        accept_incomplete_content = True
+    elif operation == protocol.SERIES_CONCEPT_DRAFT_OPERATION:
+        normalise = protocol._normalise_series_concept_draft_request
+        build_messages = protocol._build_series_concept_draft_messages
+        schema_builder = protocol._series_concept_draft_schema
+        validator = protocol._validate_series_concept_draft_result
+        # This is the configured model capability, not an estimate derived
+        # from business episode/shot volume. The complete series remains one
+        # upstream request and is never pre-rejected or split into batches.
+        output_token_limit = lambda _request: config["series_concept_max_tokens"]
+        accept_incomplete_content = False
     elif operation == protocol.SHOT_DETAIL_OPERATION:
         normalise = protocol._normalise_shot_high_detail_request
         build_messages = protocol._build_shot_high_detail_messages
         schema_builder = protocol._shot_detail_draft_schema
         validator = protocol._validate_shot_high_detail
+        output_token_limit = lambda request: request.max_tokens
+        accept_incomplete_content = True
     else:
         raise DeepSeekAPIError(
             "The structured operation is unsupported.",
@@ -865,24 +1059,28 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
     try:
         content, call_metadata = _chat_completion(
             messages=messages,
-            max_tokens=(
-                _deepseek_creative_max_tokens(request)
-                if operation == protocol.CREATIVE_OPERATION else request.max_tokens
-            ),
+            max_tokens=output_token_limit(request),
             operation=operation, response_format={"type": "json_object"},
             temperature=0.3,
-            accept_incomplete_content=True,
+            accept_incomplete_content=accept_incomplete_content,
         )
         decoded = json.loads(protocol._clean_translation(content))
     except DeepSeekAPIError:
         raise
     except (json.JSONDecodeError, TypeError, ValueError) as exc:
+        decode_diagnostic = ({
+            "json_decode_line": exc.lineno,
+            "json_decode_column": exc.colno,
+            "json_decode_position": exc.pos,
+        } if isinstance(exc, json.JSONDecodeError) else {})
         raise DeepSeekAPIError(
             "DeepSeek API returned invalid JSON.", code=f"{operation}_output_invalid_json",
             runtime_metadata=_safe_metadata({
                 **call_metadata,
                 "operation": operation,
                 "elapsed_ms": round((time.monotonic() - started) * 1000),
+                "failure_phase": "provider_decode",
+                **decode_diagnostic,
             }),
         ) from exc
     review_issues: list[dict[str, str]] = []
@@ -913,6 +1111,7 @@ def run_structured_operation(request_payload: dict[str, Any]) -> dict[str, Any]:
                     "review_required": bool(review_issues),
                     "review_issue_count": len(review_issues),
                     "repair_attempted": False,
+                    "failure_phase": "provider_validation",
                     **diagnostic,
                 },
             ) from first_exc

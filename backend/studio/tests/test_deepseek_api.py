@@ -24,8 +24,10 @@ CONFIG = {
     "api_key": "test-secret-key",
     "model": "deepseek-v4-flash",
     "timeout_seconds": 12,
+    "series_concept_timeout_seconds": 900,
     "max_retries": 0,
     "max_tokens": 16384,
+    "series_concept_max_tokens": 384000,
 }
 
 SHOT_DETAIL_POLICY = {
@@ -115,6 +117,71 @@ def shot_request():
     }
 
 
+def series_concept_request(**overrides):
+    payload = {
+        "operation": "series_concept_draft",
+        "request_id": "series-concept-deepseek-test",
+        "source_fingerprint": "c" * 64,
+        "idea": "\u4e00\u540d\u8bb0\u8005\u5728\u96e8\u591c\u53d1\u73b0\u65e7\u6848\u7684\u65b0\u8bc1\u636e\u3002",
+        "style_hint": "\u514b\u5236\u7684\u60ac\u7591\u77ed\u5267",
+        "options": {
+            "episode_count": 2,
+            "shots_per_episode": 2,
+            "minimum_duration_ms": 5_000,
+            "maximum_duration_ms": 15_000,
+            "episode_duration_ms": 60_000,
+        },
+        "attempt": 1,
+        "seed": 20260815,
+    }
+    payload.update(overrides)
+    return payload
+
+
+def series_concept_candidate(*, dialogue=True, duration_ms=6_000):
+    episodes = []
+    for episode_index in range(2):
+        shots = []
+        for shot_index in range(2):
+            has_dialogue = dialogue and episode_index == 0 and shot_index == 0
+            shots.append({
+                "setting": "\u96e8\u591c\u62a5\u793e\u7684\u6863\u6848\u5ba4",
+                "action": "\u6797\u9ed8\u7ffb\u5f00\u6848\u5377\uff0c\u5728\u7167\u7247\u80cc\u9762\u53d1\u73b0\u4e00\u884c\u65b0\u5b57\u3002",
+                "duration_ms": duration_ms,
+                "dialogue": {
+                    "speaker": "\u6797\u9ed8" if has_dialogue else "",
+                    "delivery": "in a low, steady voice" if has_dialogue else "",
+                    "text": "\u8fd9\u4e2a\u65e5\u671f\u4e0d\u5bf9\u3002" if has_dialogue else "",
+                },
+            })
+        episodes.append({
+            "title": f"\u7ebf\u7d22{episode_index + 1}",
+            "shots": shots,
+        })
+    return {
+        "title": "\u96e8\u591c\u65e7\u8bc1",
+        "logline": "\u8bb0\u8005\u6797\u9ed8\u8ffd\u67e5\u65e7\u6848\uff0c\u5374\u53d1\u73b0\u8bc1\u636e\u6307\u5411\u81ea\u5df1\u7684\u5bb6\u4eba\u3002",
+        "bible": {
+            "characters": [{
+                "name": "\u6797\u9ed8",
+                "description": "\u8ffd\u67e5\u65e7\u6848\u7684\u8bb0\u8005",
+                "visual_identity_en": "restrained investigative reporter in a dark raincoat",
+            }],
+            "scenes": [{
+                "name": "\u96e8\u591c\u62a5\u793e\u7684\u6863\u6848\u5ba4",
+                "description": "\u96e8\u591c\u91cc\u5806\u6ee1\u65e7\u6863\u6848\u7684\u623f\u95f4",
+                "visual_identity_en": "dim newspaper archive room under cold rainlight",
+            }],
+            "props": [{
+                "name": "\u6848\u5377",
+                "description": "\u85cf\u6709\u65b0\u7ebf\u7d22\u7684\u65e7\u6848\u5377",
+                "visual_identity_en": "weathered case file tied with faded red string",
+            }],
+        },
+        "episodes": episodes,
+    }
+
+
 @override_settings(DEEPSEEK_API=CONFIG)
 class DeepSeekCapabilityTests(SimpleTestCase):
     def test_capability_is_remote_and_never_contains_secret_or_endpoint(self):
@@ -159,6 +226,18 @@ class DeepSeekCapabilityTests(SimpleTestCase):
         post.assert_not_called()
 
 
+    def test_invalid_series_runtime_capability_marks_provider_misconfigured(self):
+        for override in (
+            {"series_concept_timeout_seconds": 0},
+            {"series_concept_timeout_seconds": 3601},
+            {"series_concept_max_tokens": 0},
+        ):
+            with self.subTest(override=override), override_settings(
+                DEEPSEEK_API={**CONFIG, **override},
+            ):
+                self.assertFalse(get_deepseek_capability()["configured"])
+
+
 @override_settings(DEEPSEEK_API=CONFIG)
 class DeepSeekTranslationTests(SimpleTestCase):
     @patch("studio.services.deepseek_api.requests.post")
@@ -179,6 +258,7 @@ class DeepSeekTranslationTests(SimpleTestCase):
         self.assertFalse(kwargs["json"]["stream"])
         self.assertEqual(kwargs["json"]["thinking"], {"type": "disabled"})
         self.assertEqual(kwargs["json"]["max_tokens"], 128)
+        self.assertEqual(kwargs["timeout"], 12)
         self.assertNotIn("response_format", kwargs["json"])
         serialized = json.dumps(result)
         self.assertNotIn("test-secret-key", serialized)
@@ -277,6 +357,165 @@ class DeepSeekStructuredTests(SimpleTestCase):
         self.assertEqual(request_body["response_format"], {"type": "json_object"})
         self.assertIn("JSON_SCHEMA", request_body["messages"][-1]["content"])
         self.assertNotIn("test-secret-key", json.dumps(result))
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_series_concept_operation_preserves_exact_contract_and_fingerprint(self, post):
+        post.return_value = response(json.dumps(
+            series_concept_candidate(), ensure_ascii=False,
+        ))
+
+        result = run_structured_operation(series_concept_request())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["operation"], "series_concept_draft")
+        self.assertEqual(result["source_fingerprint"], "c" * 64)
+        self.assertNotIn("source_fingerprint", result["result"])
+        self.assertEqual(result["result"]["schema_version"], 2)
+        self.assertEqual(result["result"]["bible"]["characters"][0]["name"], "林默")
+        self.assertEqual(len(result["result"]["episodes"]), 2)
+        self.assertTrue(all(
+            len(episode["shots"]) == 2 for episode in result["result"]["episodes"]
+        ))
+        self.assertTrue(all(
+            shot["duration_ms"] == 6_000
+            for episode in result["result"]["episodes"]
+            for shot in episode["shots"]
+        ))
+        request_body = post.call_args.kwargs["json"]
+        self.assertEqual(request_body["max_tokens"], 384000)
+        self.assertEqual(post.call_args.kwargs["timeout"], 900)
+        self.assertEqual(request_body["response_format"], {"type": "json_object"})
+        schema_prompt = request_body["messages"][-1]["content"]
+        self.assertIn("JSON_SCHEMA", schema_prompt)
+        self.assertIn("Requested structure: 2 episodes", request_body["messages"][1]["content"])
+        self.assertIn('"minItems":2', schema_prompt)
+        self.assertIn('"maxItems":2', schema_prompt)
+        self.assertIn('"duration_ms"', schema_prompt)
+        self.assertIn('"minimum":5000', schema_prompt)
+        self.assertIn('"maximum":15000', schema_prompt)
+        schema_payload = json.loads(schema_prompt.split("JSON_SCHEMA:\n", 1)[1])
+        for collection in ("characters", "scenes", "props"):
+            bible_array = schema_payload["properties"]["bible"]["properties"][collection]
+            self.assertNotIn("minItems", bible_array)
+            self.assertNotIn("maxItems", bible_array)
+        self.assertEqual(result["review_summary"], {
+            "status": "ready", "issue_count": 0,
+            "risk_count": 0, "requires_edit_count": 0,
+        })
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_series_concept_uses_configured_model_capability_not_volume_estimate(
+        self, post,
+    ):
+        post.return_value = response(json.dumps(
+            series_concept_candidate(), ensure_ascii=False,
+        ))
+
+        with override_settings(DEEPSEEK_API={
+            **CONFIG,
+            "series_concept_max_tokens": 222222,
+            "series_concept_timeout_seconds": 777,
+        }):
+            result = run_structured_operation(series_concept_request())
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 222222)
+        self.assertEqual(post.call_args.kwargs["timeout"], 777)
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_series_concept_rejects_any_max_new_tokens_field(self, post):
+        with self.assertRaises(DeepSeekAPIError) as raised:
+            run_structured_operation(series_concept_request(max_new_tokens=0))
+
+        post.assert_not_called()
+        self.assertEqual(
+            raised.exception.code, "series_concept_draft_invalid_request",
+        )
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_series_concept_length_finish_is_explicit_safe_truncation_failure(self, post):
+        secret = "PRIVATE-AUTHORED-STORY-SENTINEL"
+        candidate = series_concept_candidate(dialogue=False)
+        candidate["episodes"][0]["shots"][0]["action"] = secret
+        content = json.dumps(candidate, ensure_ascii=False)
+        post.return_value = response(
+            content,
+            finish_reason="length",
+            usage={
+                "prompt_tokens": 781,
+                "completion_tokens": 8192,
+                "total_tokens": 8973,
+            },
+        )
+
+        with self.assertRaises(DeepSeekAPIError) as raised:
+            run_structured_operation(series_concept_request())
+
+        self.assertEqual(
+            raised.exception.code, "series_concept_draft_output_truncated",
+        )
+        metadata = raised.exception.runtime_metadata
+        self.assertTrue(metadata["incomplete"])
+        self.assertEqual(metadata["finish_reason"], "length")
+        self.assertEqual(metadata["failure_phase"], "provider_output")
+        self.assertEqual(metadata["requested_max_tokens"], 384000)
+        self.assertEqual(metadata["configured_max_tokens"], 384000)
+        self.assertEqual(metadata["configured_timeout_seconds"], 900)
+        self.assertEqual(
+            metadata["usage"],
+            {"prompt_tokens": 781, "completion_tokens": 8192, "total_tokens": 8973},
+        )
+        self.assertEqual(metadata["output_chars"], len(content))
+        self.assertRegex(metadata["output_sha256"], r"^[0-9a-f]{64}$")
+        serialized = json.dumps(metadata, ensure_ascii=False)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn(CONFIG["api_key"], serialized)
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_series_concept_episode_duration_over_budget_is_a_risk(self, post):
+        request = series_concept_request()
+        request["options"] = {
+            **request["options"], "episode_duration_ms": 20_000,
+        }
+        post.return_value = response(json.dumps(
+            series_concept_candidate(duration_ms=15_000), ensure_ascii=False,
+        ))
+
+        result = run_structured_operation(request)
+
+        self.assertTrue(result["ok"])
+        duration_issues = [
+            issue for issue in result["review_issues"]
+            if issue["code"] == "series_concept_episode_duration_over_budget"
+        ]
+        self.assertEqual(
+            [issue["path"] for issue in duration_issues],
+            ["result.episodes[0].shots", "result.episodes[1].shots"],
+        )
+        self.assertTrue(all(issue["severity"] == "risk" for issue in duration_issues))
+        self.assertEqual(result["review_summary"]["risk_count"], 2)
+
+    @patch("studio.services.deepseek_api.requests.post")
+    def test_series_concept_validation_retains_only_safe_nested_path(self, post):
+        candidate = series_concept_candidate()
+        candidate["episodes"][0]["shots"][0]["dialogue"]["speaker"] = "\u6797\u9ed8:\u65c1\u767d"
+        post.return_value = response(json.dumps(candidate, ensure_ascii=False))
+
+        with self.assertRaises(DeepSeekAPIError) as raised:
+            run_structured_operation(series_concept_request())
+
+        self.assertEqual(
+            raised.exception.code,
+            "series_concept_draft_validation_failed",
+        )
+        self.assertEqual(
+            raised.exception.runtime_metadata["validation_path"],
+            "episodes[0].shots[0].dialogue.speaker",
+        )
+        serialized = json.dumps(raised.exception.runtime_metadata)
+        self.assertNotIn("\u6797\u9ed8", serialized)
+        self.assertNotIn(CONFIG["api_key"], serialized)
+        self.assertNotIn(CONFIG["base_url"], serialized)
 
     @patch("studio.services.deepseek_api.requests.post")
     def test_strict_validation_error_carries_bounded_structured_candidate(self, post):

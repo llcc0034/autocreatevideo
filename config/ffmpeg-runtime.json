@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "version": "9.0.1",
+  "platform": "win-x64",
+  "provider": "btbn",
+  "release_tag": "autobuild-2026-08-21-13-40",
+  "build_version": "n9.0.1-6-g9d4ca21220",
+  "variant": "gpl-shared-9.0",
+  "archive_name": "ffmpeg-n9.0.1-6-g9d4ca21220-win64-gpl-shared-9.0.zip",
+  "archive_root": "ffmpeg-n9.0.1-6-g9d4ca21220-win64-gpl-shared-9.0",
+  "download_url": "https://github.com/BtbN/FFmpeg-Builds/releases/download/autobuild-2026-08-21-13-40/ffmpeg-n9.0.1-6-g9d4ca21220-win64-gpl-shared-9.0.zip",
+  "sha256": "52d6d3bd85a8f8c6a1946d63fc6537d4507422d13af2769ee2317efa794bafdc"
+}

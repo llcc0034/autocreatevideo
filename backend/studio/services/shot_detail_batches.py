@@ -43,6 +43,12 @@ from studio.services.shot_detail_drafts import (
     shot_detail_context_snapshot,
     shot_detail_policy,
 )
+from studio.services.shot_versions import (
+    ShotVersionResolutionError,
+    normalize_requested_shot_version_key,
+    resolve_episode_shot_version,
+    shot_version_key,
+)
 
 
 TERMINAL_ITEM_STATUSES = {
@@ -102,12 +108,14 @@ def _provider_queue_available(provider: str) -> bool:
 
 def _batch_request_matches(
     batch: ShotDetailDraftBatch, *, user, project: SeriesProject,
-    episode: Episode, provider: str, variation_note: str, config_hash: str,
+    episode: Episode, shot_version_key: str, provider: str,
+    variation_note: str, config_hash: str,
 ) -> bool:
     if not (
         batch.created_by_id == user.pk
         and batch.project_id == project.pk
         and batch.episode_id == episode.pk
+        and batch.shot_version_key == shot_version_key
     ):
         return False
     if batch.config_hash == config_hash:
@@ -120,14 +128,19 @@ def _batch_request_matches(
         "variation_note": variation_note,
         "policy": batch.policy_snapshot or {},
     })
-    return batch.config_hash == legacy_hash
+    legacy_request_hash = _json_hash({
+        "provider": provider,
+        "variation_note": variation_note,
+    })
+    return batch.config_hash in {legacy_hash, legacy_request_hash}
 
 
 def create_shot_detail_batch(
     *, project: SeriesProject, episode: Episode, user, request_id: uuid.UUID,
-    provider: str, variation_note: str = "", confirmation_acknowledged: bool = False,
+    shot_version_key: str, provider: str, variation_note: str = "",
+    confirmation_acknowledged: bool = False,
 ) -> tuple[ShotDetailDraftBatch, bool]:
-    """Freeze every shot and enqueue the video items.
+    """Freeze one exact storyboard version and enqueue its video items.
 
     ``request_id`` is a globally unique idempotency key.  Reusing it for the
     same owner/project/episode and exact options returns the original batch;
@@ -136,9 +149,16 @@ def create_shot_detail_batch(
     provider = normalise_creative_provider(provider)
     policy = shot_detail_policy(provider)
     request_id = uuid.UUID(str(request_id))
+    try:
+        requested_version_key = normalize_requested_shot_version_key(shot_version_key)
+    except ShotVersionResolutionError as exc:
+        raise ShotDetailBatchConflict(
+            str(exc), code="shot_detail_batch_version_invalid",
+        ) from exc
     # Idempotency is defined exclusively by the client request.  Runtime
     # policy is frozen separately and may legitimately change after creation.
     config_hash = _json_hash({
+        "shot_version_key": requested_version_key,
         "provider": provider,
         "variation_note": variation_note,
     })
@@ -147,6 +167,7 @@ def create_shot_detail_batch(
     if existing:
         if _batch_request_matches(
             existing, user=user, project=project, episode=episode,
+            shot_version_key=requested_version_key,
             provider=provider, variation_note=variation_note, config_hash=config_hash,
         ):
             return existing, False
@@ -178,6 +199,7 @@ def create_shot_detail_batch(
         if existing:
             if _batch_request_matches(
                 existing, user=user, project=locked_project, episode=locked_episode,
+                shot_version_key=requested_version_key,
                 provider=provider, variation_note=variation_note, config_hash=config_hash,
             ):
                 return existing, False
@@ -187,22 +209,26 @@ def create_shot_detail_batch(
             )
         if ShotDetailDraftBatch.objects.filter(
             episode=locked_episode,
+            shot_version_key=requested_version_key,
             generation_status__in=(
                 ShotDetailDraftBatch.GenerationStatus.QUEUED,
                 ShotDetailDraftBatch.GenerationStatus.RUNNING,
             ),
         ).exists():
             raise ShotDetailBatchConflict(
-                "当前剧集已有整集扩写任务正在处理",
+                "当前分镜版本已有整集扩写任务正在处理",
                 code="shot_detail_batch_active_conflict",
             )
 
-        shots = list(
-            Shot.objects.filter(episode=locked_episode)
-            .select_related("scene")
-            .prefetch_related("characters", "props")
-            .order_by("number", "id")
-        )
+        try:
+            resolved_version = resolve_episode_shot_version(
+                locked_episode, requested_version_key, for_update=True,
+            )
+        except ShotVersionResolutionError as exc:
+            raise ShotDetailBatchConflict(
+                str(exc), code="shot_detail_batch_version_not_found",
+            ) from exc
+        shots = list(resolved_version.shots)
         video_count = sum(shot.media_type == Shot.MediaType.VIDEO for shot in shots)
         recommended = int(policy["recommended_max_shots"])
         if video_count > recommended and not confirmation_acknowledged:
@@ -257,7 +283,13 @@ def create_shot_detail_batch(
                 request_id=request_id,
                 provider=provider,
                 variation_note=variation_note,
-                source_manifest_hash=_json_hash(manifest),
+                shot_version_key=resolved_version.key,
+                shot_version_label=resolved_version.label,
+                version_scope_status=ShotDetailDraftBatch.VersionScopeStatus.RESOLVED,
+                source_manifest_hash=_json_hash({
+                    "shot_version_key": resolved_version.key,
+                    "items": manifest,
+                }),
                 policy_snapshot=policy,
                 config_hash=config_hash,
                 generation_status=(
@@ -271,7 +303,7 @@ def create_shot_detail_batch(
             )
         except IntegrityError as exc:
             raise ShotDetailBatchConflict(
-                "当前剧集已有整集扩写任务正在处理",
+                "当前分镜版本已有整集扩写任务正在处理",
                 code="shot_detail_batch_active_conflict",
             ) from exc
         ShotDetailDraftBatchItem.objects.bulk_create([
@@ -363,6 +395,7 @@ def claim_next_shot_detail_item(worker_id: str) -> ShotDetailDraftBatchItem | No
         batch = (
             ShotDetailDraftBatch.objects.select_for_update(skip_locked=True)
             .filter(
+                version_scope_status=ShotDetailDraftBatch.VersionScopeStatus.RESOLVED,
                 generation_status__in=(
                     ShotDetailDraftBatch.GenerationStatus.QUEUED,
                     ShotDetailDraftBatch.GenerationStatus.RUNNING,
@@ -471,6 +504,35 @@ def process_shot_detail_item(item: ShotDetailDraftBatchItem) -> ShotDetailDraftB
         )
 
     try:
+        if (
+            batch.version_scope_status
+            != ShotDetailDraftBatch.VersionScopeStatus.RESOLVED
+            or shot_version_key(item.shot) != batch.shot_version_key
+        ):
+            return finish(
+                status=ShotDetailDraftBatchItem.Status.STALE,
+                error_code="shot_detail_batch_version_stale",
+                error_message="该镜头已不属于批次冻结的分镜版本",
+            )
+        try:
+            resolved_version = resolve_episode_shot_version(
+                batch.episode, batch.shot_version_key,
+            )
+        except ShotVersionResolutionError:
+            return finish(
+                status=ShotDetailDraftBatchItem.Status.STALE,
+                error_code="shot_detail_batch_version_stale",
+                error_message="该分镜版本的成员或顺序已变化",
+            )
+        frozen_shot_ids = list(
+            batch.items.order_by("ordinal").values_list("shot_id", flat=True)
+        )
+        if frozen_shot_ids != [shot.pk for shot in resolved_version.shots]:
+            return finish(
+                status=ShotDetailDraftBatchItem.Status.STALE,
+                error_code="shot_detail_batch_version_stale",
+                error_message="该分镜版本的成员或顺序已变化",
+            )
         current_hash = shot_detail_context_hash(
             batch.project, batch.episode, item.shot, policy=frozen_policy,
         )
@@ -675,6 +737,11 @@ def apply_shot_detail_batch(
             raise ShotDetailBatchConflict(
                 "无权应用该整集扩写批次", code="shot_detail_batch_forbidden",
             )
+        if locked_batch.version_scope_status != ShotDetailDraftBatch.VersionScopeStatus.RESOLVED:
+            raise ShotDetailBatchConflict(
+                "该历史批次无法归属到一个完整分镜版本，只能查看审计记录",
+                code="shot_detail_batch_version_unscoped",
+            )
         if locked_batch.revision != expected_batch_revision:
             raise ShotDetailBatchConflict(
                 "整集扩写批次已变化，请刷新对比后再应用",
@@ -691,6 +758,27 @@ def apply_shot_detail_batch(
             .filter(batch=locked_batch)
             .order_by("ordinal")
         )
+        try:
+            resolved_version = resolve_episode_shot_version(
+                episode, locked_batch.shot_version_key, for_update=True,
+            )
+        except ShotVersionResolutionError as exc:
+            raise ShotDetailBatchConflict(
+                str(exc), code="shot_detail_batch_version_stale",
+            ) from exc
+        if [item.shot_id for item in batch_items] != [shot.pk for shot in resolved_version.shots]:
+            raise ShotDetailBatchConflict(
+                "该分镜版本的镜头成员或顺序已变化；本次未写入任何镜头",
+                code="shot_detail_batch_version_stale",
+            )
+        if any(
+            shot_version_key(item.shot) != locked_batch.shot_version_key
+            for item in batch_items
+        ):
+            raise ShotDetailBatchConflict(
+                "批次中存在不属于所选分镜版本的镜头；本次未写入任何镜头",
+                code="shot_detail_batch_version_stale",
+            )
         eligible = [
             item for item in batch_items
             if item.status != ShotDetailDraftBatchItem.Status.SKIPPED
@@ -713,11 +801,10 @@ def apply_shot_detail_batch(
             )
 
         shot_ids = [item.shot_id for item in eligible]
+        eligible_shot_ids = set(shot_ids)
         shots = {
-            shot.pk: shot
-            for shot in Shot.objects.select_for_update().select_related("scene").prefetch_related(
-                "characters", "props",
-            ).filter(episode=episode, pk__in=shot_ids).order_by("number", "id")
+            shot.pk: shot for shot in resolved_version.shots
+            if shot.pk in eligible_shot_ids
         }
         draft_ids = [item.draft_id for item in eligible]
         drafts = {

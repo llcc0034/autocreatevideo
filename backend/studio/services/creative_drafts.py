@@ -30,6 +30,7 @@ from studio.models import (
     PromptFieldTranslation,
     SeriesProject,
     Shot,
+    ShotDetailDraft,
 )
 from studio.services.prompt_translation import (
     CanonicalTargetCollisionError,
@@ -92,6 +93,24 @@ CREATIVE_OPERATION = "creative_storyboard"
 LOCAL_QWEN_PROVIDER = "local_qwen"
 DEEPSEEK_API_PROVIDER = "deepseek_api"
 CREATIVE_PROVIDERS = {LOCAL_QWEN_PROVIDER, DEEPSEEK_API_PROVIDER}
+_SERIES_CONCEPT_SUITABILITY_METADATA = {
+    "recommended": {
+        "series_concept_draft_suitability_reason_code": (
+            "series_concept_strict_structure_recommended"
+        ),
+        "series_concept_draft_suitability_notice": (
+            "当前配置推荐此通道用于完整连续剧的严格结构候选；生成内容仍需人工确认。"
+        ),
+    },
+    "experimental": {
+        "series_concept_draft_suitability_reason_code": (
+            "series_concept_strict_structure_experimental"
+        ),
+        "series_concept_draft_suitability_notice": (
+            "当前配置将此通道标记为基础/测试级；完整连续剧严格结构任务建议优先选择推荐通道，仍可人工选择使用。"
+        ),
+    },
+}
 CREATIVE_REVIEW_FIELD_NAMES = (
     "title_zh", "title_en", "narrative_zh", "narrative_en",
     "camera_zh", "camera_en", "action_zh", "action_en",
@@ -185,6 +204,11 @@ class CreativeValidationError(CreativeDraftError):
         "effective_max_dialogue_per_shot",
         "required_output_tokens",
         "configured_max_output_tokens",
+        "episode_count",
+        "shots_per_episode",
+        "total_shots",
+        "episode_duration_seconds",
+        "minimum_episode_duration_seconds",
     }
 
     def __init__(
@@ -228,6 +252,77 @@ def creative_required_output_token_budget(
     ) + dialogue_cost
 
 
+_DIALOGUE_TIME_VALUE_RE = (
+    r"(?:\d+:\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:ms|毫秒|s|秒)?"
+)
+_SOURCE_TIME_RANGE_RE = re.compile(
+    rf"[【\[]\s*(?P<start>{_DIALOGUE_TIME_VALUE_RE})"
+    rf"\s*(?:-|–|—|~|～|至|到)\s*"
+    rf"(?P<end>{_DIALOGUE_TIME_VALUE_RE})\s*[】\]]"
+)
+_SOURCE_TIMING_LABEL_RE = re.compile(
+    r"^\s*(?P<label>动作|画面|旁白|镜头|对白)\s*[：:]\s*(?P<body>.*)$"
+)
+
+
+def _parse_dialogue_time_ms(value: str) -> int | None:
+    normalized = re.sub(r"\s+", "", str(value or "")).lower()
+    try:
+        if ":" in normalized:
+            minutes_text, seconds_text = normalized.split(":", 1)
+            seconds_text = re.sub(r"(?:s|秒)$", "", seconds_text)
+            milliseconds = (float(minutes_text) * 60 + float(seconds_text)) * 1000
+        elif re.search(r"(?:ms|毫秒)$", normalized):
+            milliseconds = float(re.sub(r"(?:ms|毫秒)$", "", normalized))
+        else:
+            milliseconds = float(re.sub(r"(?:s|秒)$", "", normalized)) * 1000
+    except ValueError:
+        return None
+    rounded = round(milliseconds)
+    return rounded if rounded >= 0 else None
+
+
+def _dialogue_speaker_aliases(snapshot: dict[str, Any]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for character in snapshot["bible"]["characters"]:
+        speaker_id = str(character.get("stable_speaker_id") or "").strip()
+        if not speaker_id:
+            continue
+        for alias in (character.get("name"), speaker_id):
+            normalized = str(alias or "").strip()
+            if normalized:
+                aliases.setdefault(normalized, speaker_id)
+    return aliases
+
+
+def _dialogue_pattern(alias_to_speaker: dict[str, str]) -> re.Pattern[str] | None:
+    aliases = sorted(alias_to_speaker, key=len, reverse=True)
+    if not aliases:
+        return None
+    alias_group = "|".join(re.escape(alias) for alias in aliases)
+    timing = (
+        rf"(?:[【\[]\s*(?P<start>{_DIALOGUE_TIME_VALUE_RE})"
+        rf"\s*(?:-|–|—|~|～|至|到)\s*"
+        rf"(?P<end>{_DIALOGUE_TIME_VALUE_RE})\s*[】\]]\s*)?"
+    )
+    speaker = (
+        rf"(?P<speaker>{alias_group})"
+        rf"\s*(?:[（(](?P<delivery>[^）)\n]{{0,500}})[）)])?"
+        rf"\s*[：:]"
+    )
+    next_speaker = (
+        rf"(?:[【\[]\s*{_DIALOGUE_TIME_VALUE_RE}"
+        rf"\s*(?:-|–|—|~|～|至|到)\s*"
+        rf"{_DIALOGUE_TIME_VALUE_RE}\s*[】\]]\s*)?"
+        rf"(?:{alias_group})"
+        rf"\s*(?:[（(][^）)\n]{{0,500}}[）)])?\s*[：:]"
+    )
+    return re.compile(
+        rf"{timing}{speaker}\s*(?P<text>.+?)(?=\s*{next_speaker}|\s*$)",
+        re.IGNORECASE,
+    )
+
+
 def required_dialogue_manifest(
     snapshot: dict[str, Any],
     *,
@@ -239,33 +334,105 @@ def required_dialogue_manifest(
     source = snapshot["episode"].get("script") or snapshot["project"].get("master_script") or ""
     if not source:
         return []
+    alias_to_speaker = _dialogue_speaker_aliases(snapshot)
+    pattern = _dialogue_pattern(alias_to_speaker)
+    if pattern is None:
+        return []
     manifest: list[dict[str, Any]] = []
     for line in source.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        for character in snapshot["bible"]["characters"]:
-            for name in (character.get("name"), character.get("stable_speaker_id")):
-                if not name:
-                    continue
-                match = re.match(
-                    rf"^\s*{re.escape(str(name))}\s*(?:[（(](?P<delivery>[^）)\n]*)[）)])?"
-                    rf"\s*[：:]\s*(?P<text>.+?)\s*$",
-                    line,
-                )
-                if not match:
-                    continue
-                item = {
-                    "speaker_id": str(character["stable_speaker_id"]),
-                    "text_zh": match.group("text"),
-                    "source_order": len(manifest) + 1,
-                    "source_delivery_zh": (match.group("delivery") or "").strip(),
-                }
-                # Every authored occurrence is significant, including repeated
-                # text with the same or a different delivery annotation.
-                manifest.append(item)
-                break
-            else:
+        for match in pattern.finditer(line):
+            text = re.sub(r"\s*[】\]]\s*$", "", (match.group("text") or "").strip())
+            speaker_id = alias_to_speaker.get((match.group("speaker") or "").strip())
+            if not text or not speaker_id:
                 continue
-            break
+            item = {
+                "speaker_id": speaker_id,
+                "text_zh": text,
+                "source_order": len(manifest) + 1,
+                "source_delivery_zh": (match.group("delivery") or "").strip(),
+            }
+            start_ms = _parse_dialogue_time_ms(match.group("start") or "")
+            end_ms = _parse_dialogue_time_ms(match.group("end") or "")
+            if start_ms is not None and end_ms is not None and start_ms < end_ms:
+                item.update({"start_ms": start_ms, "end_ms": end_ms})
+            # Every authored occurrence is significant, including repeated
+            # text with the same or a different delivery annotation.
+            manifest.append(item)
     return manifest
+
+
+def _is_source_dialogue_body(body: str, alias_to_speaker: dict[str, str]) -> bool:
+    aliases = sorted(alias_to_speaker, key=len, reverse=True)
+    if not aliases:
+        return False
+    alias_group = "|".join(re.escape(alias) for alias in aliases)
+    return bool(re.match(
+        rf"^\s*(?:{alias_group})\s*(?:[（(][^）)\n]{{0,500}}[）)])?\s*[：:]",
+        body,
+        re.IGNORECASE,
+    ))
+
+
+def _source_timing_range_present(text: str, *, start_ms: int, end_ms: int) -> bool:
+    return _source_timing_range_count(text, start_ms=start_ms, end_ms=end_ms) > 0
+
+
+def _source_timing_range_count(text: str, *, start_ms: int, end_ms: int) -> int:
+    count = 0
+    for match in _SOURCE_TIME_RANGE_RE.finditer(str(text or "")):
+        start = _parse_dialogue_time_ms(match.group("start") or "")
+        end = _parse_dialogue_time_ms(match.group("end") or "")
+        if start == start_ms and end == end_ms:
+            count += 1
+    return count
+
+
+def source_timed_visual_segments(snapshot: dict[str, Any]) -> list[dict[str, Any]]:
+    """Extract source-authored non-dialogue timing markers for draft review.
+
+    Dialogue timing is already carried by ``required_dialogue_manifest`` and
+    stored as structured ``start_ms/end_ms``. This manifest covers visible
+    action or narration ranges such as ``[0-2.5秒] 动作：...`` so model drafts
+    and high-detail expansion do not silently erase them.
+    """
+    source = snapshot["episode"].get("script") or snapshot["project"].get("master_script") or ""
+    if not source:
+        return []
+    alias_to_speaker = _dialogue_speaker_aliases(snapshot)
+    segments: list[dict[str, Any]] = []
+    for line in source.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        matches = list(_SOURCE_TIME_RANGE_RE.finditer(line))
+        for index, match in enumerate(matches):
+            start_ms = _parse_dialogue_time_ms(match.group("start") or "")
+            end_ms = _parse_dialogue_time_ms(match.group("end") or "")
+            if start_ms is None or end_ms is None or start_ms >= end_ms:
+                continue
+            end_at = matches[index + 1].start() if index + 1 < len(matches) else len(line)
+            body = line[match.end():end_at].strip(" \t\r\n；;，,。】]")
+            label = "visual"
+            label_match = _SOURCE_TIMING_LABEL_RE.match(body)
+            if label_match:
+                raw_label = label_match.group("label")
+                body = label_match.group("body").strip()
+                label = {
+                    "动作": "action",
+                    "画面": "visual",
+                    "旁白": "voiceover",
+                    "镜头": "camera",
+                    "对白": "dialogue",
+                }.get(raw_label, "visual")
+            if not body or label == "dialogue" or _is_source_dialogue_body(body, alias_to_speaker):
+                continue
+            segments.append({
+                "source_order": len(segments) + 1,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
+                "kind": label,
+                "text_zh": body[:500],
+            })
+            if len(segments) >= 80:
+                return segments
+    return segments
 
 
 def _creative_review_policy(configured: dict[str, Any] | None = None) -> dict[str, int]:
@@ -357,6 +524,12 @@ def creative_provider_config(provider: str) -> dict[str, Any]:
         "enabled": bool(api_config.get("enabled", False)),
         "model_id": str(api_config.get("model") or ""),
         "timeout_seconds": float(api_config.get("timeout_seconds", 180)),
+        "series_concept_timeout_seconds": float(
+            api_config.get("series_concept_timeout_seconds", 900)
+        ),
+        "series_concept_max_tokens": int(
+            api_config.get("series_concept_max_tokens", 384000)
+        ),
         "min_shots": int(configured.get("min_shots", 1)),
         "recommended_max_shots": int(configured.get("recommended_max_shots", 4)),
         "batch_shots": int(configured.get("batch_shots", 1)),
@@ -440,6 +613,18 @@ def _model_state(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _series_concept_suitability_capability(provider: str) -> dict[str, str]:
+    """Return safe, configuration-driven UI guidance without routing effects."""
+    suitability = str(
+        settings.SERIES_CONCEPT_DRAFT_PROVIDER_SUITABILITY[provider]
+    )
+    metadata = _SERIES_CONCEPT_SUITABILITY_METADATA[suitability]
+    return {
+        "series_concept_draft_suitability": suitability,
+        **metadata,
+    }
+
+
 def get_creative_capability() -> dict[str, Any]:
     config = creative_config()
     deepseek_config = creative_provider_config(DEEPSEEK_API_PROVIDER)
@@ -454,6 +639,9 @@ def get_creative_capability() -> dict[str, Any]:
         "id": LOCAL_QWEN_PROVIDER,
         "label": "本地 Qwen",
         "creative_generation_supported": True,
+        **_series_concept_suitability_capability(LOCAL_QWEN_PROVIDER),
+        "series_concept_draft_timeout_seconds": config["timeout_seconds"],
+        "series_concept_draft_max_output_tokens": config["max_output_tokens"],
         "configured": configured,
         "provider": "local_qwen",
         "model": config["model_id"],
@@ -499,6 +687,13 @@ def get_creative_capability() -> dict[str, Any]:
         "provider": DEEPSEEK_API_PROVIDER,
         "label": "DeepSeek API",
         "creative_generation_supported": True,
+        **_series_concept_suitability_capability(DEEPSEEK_API_PROVIDER),
+        "series_concept_draft_timeout_seconds": deepseek_config[
+            "series_concept_timeout_seconds"
+        ],
+        "series_concept_draft_max_output_tokens": deepseek_config[
+            "series_concept_max_tokens"
+        ],
         "min_shots": deepseek_config["min_shots"],
         **_creative_policy_audit(deepseek_config, include_runtime=False),
         "max_source_chars": deepseek_config["max_source_chars"],
@@ -535,6 +730,9 @@ def get_creative_capability() -> dict[str, Any]:
         "creative_generation_supported": True,
         "review_required": True,
         "default_provider": default_provider,
+        "series_concept_draft_preferred_provider": (
+            settings.SERIES_CONCEPT_DRAFT_PREFERRED_PROVIDER
+        ),
         "providers": [local_capability, deepseek_capability],
     }
 
@@ -836,6 +1034,7 @@ def _runtime_request(
         maximum_ms=config["max_shot_duration_ms"],
     )
     dialogue_manifest = required_dialogue_manifest(snapshot, include_audio=include_audio)
+    timed_visual_segments = source_timed_visual_segments(snapshot)
     max_dialogue_per_shot = config["max_dialogue_per_shot"]
     if len(dialogue_manifest) > target_shot_count * max_dialogue_per_shot:
         dialogue_capacity = target_shot_count * max_dialogue_per_shot
@@ -931,6 +1130,7 @@ def _runtime_request(
         "timeout_seconds": config["timeout_seconds"],
         "input_warnings": input_warnings,
         "required_dialogue_manifest": dialogue_manifest,
+        "source_timed_visual_segments": timed_visual_segments,
     }
     if "model_dir" in config:
         request.update({
@@ -1073,6 +1273,9 @@ _CREATIVE_REVIEW_SUGGESTIONS = {
     "dialogue_delivery_translation_missing": (
         "剧本中的中文表演标注缺少可保留的英文提示，请人工补译或知情确认。"
     ),
+    "source_timing_range_missing": (
+        "剧本中的非对白时间段没有在分镜画面或动作字段中保留；请人工补回该时间段或确认改写。"
+    ),
     "audio_disabled_content_present": "镜头标记为静音，但仍包含对白、声景或配乐。",
     "dialogue_density_high": "短镜头中的对白较多，请确认节奏是否可执行。",
     "camera_movement_dense": "同一镜头可能包含多种运镜，请人工取舍。",
@@ -1191,6 +1394,32 @@ def _dialogue_identity(value: dict[str, Any]) -> tuple[str, str]:
     )
 
 
+def _dialogue_contract_identity(value: dict[str, Any]) -> tuple[str, str, Any, Any]:
+    return (
+        *_dialogue_identity(value),
+        value.get("start_ms"),
+        value.get("end_ms"),
+    )
+
+
+def _dialogue_timing_fields(
+    source: dict[str, Any],
+    fallback: dict[str, Any],
+) -> dict[str, int]:
+    for candidate in (source, fallback):
+        if "start_ms" not in candidate and "end_ms" not in candidate:
+            continue
+        start_ms = candidate.get("start_ms")
+        end_ms = candidate.get("end_ms")
+        if (
+            type(start_ms) is int
+            and type(end_ms) is int
+            and 0 <= start_ms < end_ms
+        ):
+            return {"start_ms": start_ms, "end_ms": end_ms}
+    return {}
+
+
 def _reconcile_authoritative_dialogue_manifest(
     shots: list[dict[str, Any]],
     expected: list[dict[str, Any]],
@@ -1210,8 +1439,8 @@ def _reconcile_authoritative_dialogue_manifest(
     global validator and never turns a parseable candidate into a failed draft.
     """
     actual = _flatten_creative_dialogue(shots)
-    actual_identity = [_dialogue_identity(line) for _, _, line in actual]
-    expected_identity = [_dialogue_identity(line) for line in expected]
+    actual_identity = [_dialogue_contract_identity(line) for _, _, line in actual]
+    expected_identity = [_dialogue_contract_identity(line) for line in expected]
     if actual_identity == expected_identity:
         return False
     if not shots:
@@ -1289,6 +1518,7 @@ def _reconcile_authoritative_dialogue_manifest(
             ),
             "delivery_en": str(model_line.get("delivery_en") or ""),
             "voiceover": bool(model_line.get("voiceover", False)),
+            **_dialogue_timing_fields(source, model_line),
         })
     for shot, dialogue in zip(shots, rebuilt, strict=True):
         shot["dialogue"] = dialogue
@@ -1483,6 +1713,14 @@ def validate_creative_draft_data(
             "stable_speaker_id": item.stable_speaker_id,
         } for item in characters.values()]},
     }, include_audio=any(bool(item.get("include_audio")) for item in data["shots"]))
+    timed_visual_segments = source_timed_visual_segments({
+        "episode": {"script": episode.script},
+        "project": {"master_script": project.master_script},
+        "bible": {"characters": [{
+            "name": item.name,
+            "stable_speaker_id": item.stable_speaker_id,
+        } for item in characters.values()]},
+    })
     if _reconcile_authoritative_dialogue_manifest(
         data["shots"], authored_dialogue,
         max_dialogue_per_shot=max_dialogue_per_shot,
@@ -1646,6 +1884,30 @@ def validate_creative_draft_data(
                 "missing_character_binding", f"{base_path}.character_ids", severity="warning",
             ))
 
+    if timed_visual_segments:
+        generated_timing_text = "\n".join(
+            str(shot.get(field_name) or "")
+            for shot in data["shots"]
+            for field_name in (
+                "title_zh", "title_en", "narrative_zh", "narrative_en",
+                "camera_zh", "camera_en", "action_zh", "action_en",
+                "continuity_zh", "continuity_en",
+            )
+        )
+        expected_counts: dict[tuple[int, int], int] = {}
+        for segment in timed_visual_segments:
+            key = (int(segment["start_ms"]), int(segment["end_ms"]))
+            expected_counts[key] = expected_counts.get(key, 0) + 1
+        if any(
+            _source_timing_range_count(
+                generated_timing_text, start_ms=start_ms, end_ms=end_ms,
+            ) < expected
+            for (start_ms, end_ms), expected in expected_counts.items()
+        ):
+            issues.append(_creative_review_issue(
+                "source_timing_range_missing", "shots",
+            ))
+
     coverage_issue = _script_action_coverage_issue(
         episode.script,
         data["shots"],
@@ -1719,7 +1981,11 @@ def _runtime_metadata(payload: dict[str, Any]) -> dict[str, Any]:
     metadata.update({
         "provider": str(payload.get("provider") or metadata.get("provider") or LOCAL_QWEN_PROVIDER),
         "model": str(payload.get("model") or metadata.get("model") or ""),
-        "operation": CREATIVE_OPERATION,
+        "operation": str(
+            payload.get("operation")
+            or metadata.get("operation")
+            or CREATIVE_OPERATION
+        ),
     })
     is_local = metadata["provider"] == LOCAL_QWEN_PROVIDER
     metadata.setdefault("loaded_on_demand", is_local)
@@ -3081,6 +3347,102 @@ def _resolve_draft_h3_mode(project: SeriesProject, item: dict[str, Any]):
     return Shot.H3Mode.REF2VA, bindings, assets, ""
 
 
+def _shot_creative_version_key(shot: Shot) -> str:
+    metadata = shot.metadata if isinstance(shot.metadata, dict) else {}
+    return str(metadata.get("creative_version_key") or "").strip()
+
+
+def _shot_creative_version_number(shot: Shot, fallback: int) -> int:
+    metadata = shot.metadata if isinstance(shot.metadata, dict) else {}
+    value = metadata.get("creative_version_shot_number")
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = fallback
+    return number if number > 0 else fallback
+
+
+def _active_episode_creative_version(episode: Episode) -> dict[str, Any]:
+    shots = list(episode.shots.select_for_update().order_by("number"))
+    groups: dict[str, dict[str, Any]] = {}
+    for index, shot in enumerate(shots, start=1):
+        metadata = shot.metadata if isinstance(shot.metadata, dict) else {}
+        key = str(metadata.get("creative_version_key") or "").strip()
+        if not key:
+            continue
+        group = groups.setdefault(
+            key,
+            {
+                "key": key,
+                "label": str(metadata.get("creative_version_label") or "分镜版本"),
+                "active": False,
+                "max_number": 0,
+                "count": 0,
+            },
+        )
+        group["active"] = group["active"] or metadata.get("creative_version_active") is True
+        group["count"] += 1
+        group["max_number"] = max(int(group["max_number"]), _shot_creative_version_number(shot, index))
+    active = next((item for item in groups.values() if item["active"]), None)
+    if active:
+        return active
+    return {"key": "", "label": "", "active": False, "max_number": len(shots), "count": len(shots)}
+
+
+def _set_episode_creative_version_active(
+    episode: Episode,
+    *,
+    active_key: str,
+    legacy_label: str,
+) -> None:
+    shots = list(episode.shots.select_for_update().order_by("number"))
+    legacy_key = f"legacy:{episode.id}:initial"
+    legacy_count = sum(1 for shot in shots if not _shot_creative_version_key(shot))
+    legacy_seen = 0
+    for shot in shots:
+        metadata = dict(shot.metadata or {})
+        key = str(metadata.get("creative_version_key") or "").strip()
+        if key:
+            metadata["creative_version_active"] = key == active_key
+        else:
+            legacy_seen += 1
+            metadata.update({
+                "creative_version_key": legacy_key,
+                "creative_version_label": legacy_label,
+                "creative_version_mode": "legacy_snapshot",
+                "creative_version_active": active_key == legacy_key,
+                "creative_version_shot_number": legacy_seen,
+                "creative_version_shot_count": legacy_count,
+            })
+        if metadata != (shot.metadata or {}):
+            shot.metadata = metadata
+            shot.save(update_fields=("metadata", "updated_at"))
+
+
+def _creative_version_metadata(
+    *,
+    draft: EpisodeCreativeDraft,
+    key: str,
+    label: str,
+    mode: str,
+    local_number: int,
+    shot_count: int,
+    active: bool,
+    applied_at,
+) -> dict[str, Any]:
+    return {
+        "creative_version_key": key,
+        "creative_version_label": label,
+        "creative_version_mode": mode,
+        "creative_version_active": active,
+        "creative_version_shot_number": local_number,
+        "creative_version_shot_count": shot_count,
+        "creative_version_draft_id": str(draft.id),
+        "creative_version_generation_no": draft.generation_no,
+        "creative_version_applied_at": applied_at.isoformat(),
+    }
+
+
 def apply_creative_draft(
     *, draft: EpisodeCreativeDraft, user, language_mode: str, placement: str,
     shot_keys: list[str] | None, expected_revision: int,
@@ -3166,24 +3528,65 @@ def apply_creative_draft(
         if not shots_data:
             raise CreativeValidationError("没有可应用的草稿镜头")
 
+        applied_at = timezone.now()
+        version_key = f"creative-draft:{locked.id}"
+        version_label = f"V{locked.generation_no}"
+        version_mode = "direct_replace"
+        version_start_number = 1
+        version_shot_count = len(shots_data)
+        append_existing_version_key = ""
+
         if placement == "replace":
-            if (
+            replace_blocked = (
                 episode.prompt_artifacts.exists()
                 or project.generation_tasks.filter(episode=episode).exists()
                 or episode.assembly_jobs.exists()
-            ):
-                raise CreativeValidationError(
-                    "该集已有提示词、生成任务或组装审计记录，不能替换正式镜头；请使用追加。"
+                or episode.shot_detail_batches.exists()
+                or ShotDetailDraft.objects.filter(episode=episode).exists()
                 )
-            old_ids = list(episode.shots.values_list("id", flat=True))
-            PromptFieldTranslation.objects.filter(
-                project=project,
-                scope_type=PromptFieldTranslation.ScopeType.SHOT,
-                scope_id__in=old_ids,
-            ).delete()
-            episode.shots.all().delete()
-            next_number = 1
+            if replace_blocked:
+                _set_episode_creative_version_active(
+                    episode,
+                    active_key=version_key,
+                    legacy_label="原正式分镜",
+                )
+                version_mode = "versioned_replace"
+                next_number = int(
+                    episode.shots.aggregate(value=Max("number"))["value"] or 0
+                ) + 1
+            else:
+                old_ids = list(episode.shots.values_list("id", flat=True))
+                PromptFieldTranslation.objects.filter(
+                    project=project,
+                    scope_type=PromptFieldTranslation.ScopeType.SHOT,
+                    scope_id__in=old_ids,
+                ).delete()
+                episode.shots.all().delete()
+                next_number = 1
         else:
+            active_version = _active_episode_creative_version(episode)
+            append_existing_version_key = str(active_version.get("key") or "").strip()
+            if append_existing_version_key:
+                version_key = append_existing_version_key
+                version_label = str(active_version.get("label") or "当前正式分镜")
+                version_start_number = int(active_version.get("max_number") or 0) + 1
+                version_shot_count = int(active_version.get("count") or 0) + len(shots_data)
+                _set_episode_creative_version_active(
+                    episode,
+                    active_key=version_key,
+                    legacy_label="原正式分镜",
+                )
+            elif episode.shots.exists():
+                version_key = f"legacy:{episode.id}:initial"
+                version_label = "当前正式分镜"
+                version_start_number = int(active_version.get("max_number") or 0) + 1
+                version_shot_count = int(active_version.get("count") or 0) + len(shots_data)
+                _set_episode_creative_version_active(
+                    episode,
+                    active_key=version_key,
+                    legacy_label=version_label,
+                )
+            version_mode = "append"
             next_number = int(
                 episode.shots.aggregate(value=Max("number"))["value"] or 0
             ) + 1
@@ -3194,6 +3597,7 @@ def apply_creative_draft(
         created: list[Shot] = []
         translation_count = 0
         for offset, item in enumerate(shots_data):
+            local_number = version_start_number + offset
             effective_mode, reference_bindings, reference_assets, downgraded_from = (
                 _resolve_draft_h3_mode(project, item)
             )
@@ -3211,6 +3615,7 @@ def apply_creative_draft(
                     ),
                 } if line.get("delivery_en" if promote_english else "delivery_zh") else {}),
                 **({"voiceover": True} if line.get("voiceover") else {}),
+                **_dialogue_timing_fields(line, {}),
             } for line in item.get("dialogue", [])]
             shot = Shot.objects.create(
                 episode=episode, number=next_number + offset,
@@ -3229,7 +3634,14 @@ def apply_creative_draft(
                     else item.get("music_zh", "")
                 ), duration_ms=item["duration_ms"],
                 media_type=Shot.MediaType.VIDEO, h3_mode=effective_mode,
-                include_audio=item["include_audio"], scene_id=item.get("scene_id"),
+                include_audio=item["include_audio"],
+                requires_first_frame_continuity=bool(
+                    item.get("requires_first_frame_continuity", False)
+                ),
+                requires_last_frame_continuity=bool(
+                    item.get("requires_last_frame_continuity", False)
+                ),
+                scene_id=item.get("scene_id"),
                 continuity_notes=(
                     item.get("continuity_en", "") if promote_english
                     else item.get("continuity_zh", "")
@@ -3237,6 +3649,16 @@ def apply_creative_draft(
                 reference_bindings=reference_bindings,
                 metadata={
                     "creative_draft_id": str(locked.id), "client_key": item["client_key"],
+                    **_creative_version_metadata(
+                        draft=locked,
+                        key=version_key,
+                        label=version_label,
+                        mode=version_mode,
+                        local_number=local_number,
+                        shot_count=version_shot_count,
+                        active=True,
+                        applied_at=applied_at,
+                    ),
                     # Split positive continuity from true negative constraints
                     # on first persistence.  Older clients treated continuity
                     # as a fallback negative prompt when this marker was
@@ -3282,11 +3704,43 @@ def apply_creative_draft(
                         },
                     ))
 
+        if placement == "append" and append_existing_version_key:
+            for shot in episode.shots.select_for_update().all():
+                metadata = dict(shot.metadata or {})
+                if metadata.get("creative_version_key") != append_existing_version_key:
+                    continue
+                if metadata.get("creative_version_shot_count") == version_shot_count:
+                    continue
+                metadata["creative_version_shot_count"] = version_shot_count
+                shot.metadata = metadata
+                shot.save(update_fields=("metadata", "updated_at"))
+
+        previous_applied = list(
+            EpisodeCreativeDraft.objects.select_for_update()
+            .filter(
+                project=project,
+                episode=episode,
+                status=EpisodeCreativeDraft.Status.APPLIED,
+            )
+            .exclude(pk=locked.pk)
+            .order_by("generation_no", "created_at")
+        )
+        for previous in previous_applied:
+            append_revision_history(previous)
+            previous.revision += 1
+            previous.status = EpisodeCreativeDraft.Status.CONFIRMED
+            previous.applied_by = None
+            previous.applied_at = None
+            previous.applied_shot_ids = []
+            previous.save(update_fields=(
+                "revision", "status", "applied_by", "applied_at",
+                "applied_shot_ids", "revision_history", "updated_at",
+            ))
         append_revision_history(locked)
         locked.revision += 1
         locked.status = EpisodeCreativeDraft.Status.APPLIED
         locked.applied_by = user
-        locked.applied_at = timezone.now()
+        locked.applied_at = applied_at
         locked.applied_shot_ids = [str(item.id) for item in created]
         locked.save()
     return episode, created, translation_count

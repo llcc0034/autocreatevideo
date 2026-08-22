@@ -108,6 +108,7 @@ class SingleShotPromptScopeTests(TestCase):
         response = self.client.post(
             f"/api/v1/episodes/{self.episode.id}/sync-shots/",
             {
+                "shot_version_key": f"legacy:{self.episode.id}:initial",
                 "shots": [
                     {
                         "id": str(self.shot1.id),

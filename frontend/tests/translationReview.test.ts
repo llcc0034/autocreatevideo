@@ -188,6 +188,7 @@ test('canonical ensure accepts the row-locked server glossary over a stale brows
 test('canonical ensure adapter follows the project endpoint contract', () => {
   const result = adaptCanonicalGlossaryEnsureResult({ data: {
     project_id: 'project-1',
+    updated_at: '2026-08-20T14:45:00Z',
     translation_glossary: { 沈砚: 'Shen Yan' },
     summary: { requested: 1, generated: 1, reused: 0, conflict: 0, failed: 0 },
     entries: [{
@@ -196,6 +197,7 @@ test('canonical ensure adapter follows the project endpoint contract', () => {
     }],
   } })
   assert.equal(result.projectId, 'project-1')
+  assert.equal(result.updatedAt, '2026-08-20T14:45:00Z')
   assert.deepEqual(result.translationGlossary, { 沈砚: 'Shen Yan' })
   assert.equal(result.summary.generated, 1)
   assert.deepEqual(result.entries[0], {
@@ -436,6 +438,13 @@ test('canonical target collisions visibly block save translation sync and genera
   assert.ok(studio.includes('canonicalTargetCollisionError'))
   assert.ok(studio.includes(':blocked-reason="canonicalGlossaryBlockedReason"'))
   assert.ok(studio.includes('if (glossaryChanged) translationReviewRefreshKey.value += 1'))
+  const canonicalBackfill = studio.slice(
+    studio.indexOf('const backfillMissingCanonicalGlossary = async'),
+    studio.indexOf('\nconst addBibleItem', studio.indexOf('const backfillMissingCanonicalGlossary = async')),
+  )
+  assert.ok(canonicalBackfill.includes('studio.ensureCanonicalGlossary(project.value, { includeAllMissing: true })'))
+  assert.ok(canonicalBackfill.includes('检测到术语表有未保存的人工修改'))
+  assert.ok(!canonicalBackfill.includes('await save('))
   assert.ok(studio.includes('episode.shots.length||Boolean(canonicalGlossaryBlockedReason)'))
   assert.ok(storyboard.includes('canonicalTargetCollisionError'))
   assert.ok(storyboard.includes('canonical 术语碰撞 · 保存、翻译同步和生成已暂停'))

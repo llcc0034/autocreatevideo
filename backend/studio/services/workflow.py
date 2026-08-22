@@ -194,13 +194,15 @@ def _adapt_native_h3(workflow: dict, variables: dict, mode: str) -> dict:
     elif ref_node:
         if mode != "Ref2VA":
             raise WorkflowBuildError("Reference 工作流只能用于 Ref2VA")
-        allowed_categories = {"character", "scene", "prop", "video", "audio"}
+        allowed_categories = {"character", "scene", "prop", "continuity_frame", "video", "audio"}
         if set(by_category) - allowed_categories:
             raise WorkflowBuildError(
-                "Ref2VA 工作流只能接收图片分类、参考视频和参考音频"
+                "Ref2VA 工作流只能接收图片分类、首帧连续参考、参考视频和参考音频"
             )
         image_references = [
-            item for item in references if item.get("category") in {"character", "scene", "prop"}
+            item
+            for item in references
+            if item.get("category") in {"character", "scene", "prop", "continuity_frame"}
         ]
         if len(image_references) > 9:
             raise WorkflowBuildError("Ref2VA 工作流最多允许 9 张参考图")
@@ -384,10 +386,14 @@ def _validate_h3_prompt_contract(template: WorkflowTemplate, prompt: PromptArtif
         if effective_mode != expected_effective:
             raise WorkflowBuildError("effective_conditioning_mode 与实际首/尾帧槽位不一致")
     elif workflow_mode == "reference_to_video":
-        allowed = {"character", "scene", "prop", "video", "audio"}
+        allowed = {"character", "scene", "prop", "continuity_frame", "video", "audio"}
         if set(categories) - allowed:
-            raise WorkflowBuildError("Ref2VA 只允许分类图片、参考视频和参考音频")
-        images = [item for item in references if item.get("category") in {"character", "scene", "prop"}]
+            raise WorkflowBuildError("Ref2VA 只允许分类图片、首帧连续参考、参考视频和参考音频")
+        images = [
+            item
+            for item in references
+            if item.get("category") in {"character", "scene", "prop", "continuity_frame"}
+        ]
         videos = [item for item in references if item.get("category") == "video"]
         audios = [item for item in references if item.get("category") == "audio"]
         if len(images) > 9 or len(videos) > 3 or len(audios) > 3:
@@ -416,6 +422,8 @@ def _validate_h3_prompt_contract(template: WorkflowTemplate, prompt: PromptArtif
         if effective_mode != "Ref2VA":
             raise WorkflowBuildError("Ref2VA effective_conditioning_mode 必须为 Ref2VA")
         for item in images:
+            if item.get("category") == "continuity_frame":
+                continue
             if not item.get("entity_id") or not item.get("entity_name"):
                 raise WorkflowBuildError("Ref2VA 每个 Picture 必须绑定明确的分类实体")
     else:

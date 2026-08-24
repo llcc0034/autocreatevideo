@@ -6,7 +6,7 @@ from collections.abc import Mapping
 import math
 import re
 
-from django.conf import settings
+from studio.services.configuration import resolve_configuration
 from django.db.models import Q
 
 from studio.models import (
@@ -78,6 +78,21 @@ class BreakdownResult:
     episodes: list[Episode]
     warnings: list[str] = field(default_factory=list)
     method: str = "deterministic-script-breakdown-v3"
+
+
+def project_default_h3_mode(project: SeriesProject) -> str:
+    """Return the exact H3 mode future deterministic storyboard shots will use."""
+
+    configured_mode = (project.production_settings or {}).get("default_h3_mode")
+    return (
+        configured_mode
+        if configured_mode in {
+            Shot.H3Mode.T2VA,
+            Shot.H3Mode.FL2VA,
+            Shot.H3Mode.REF2VA,
+        }
+        else Shot.H3Mode.T2VA
+    )
 
 
 @dataclass(frozen=True)
@@ -419,6 +434,8 @@ def _parse_shot_header(
     title: str,
     shot_index: int,
     default_duration_ms: int,
+    minimum_duration_ms: int,
+    maximum_duration_ms: int,
     default_first_frame_continuity: bool,
     default_last_frame_continuity: bool,
     warnings: list[str],
@@ -448,12 +465,12 @@ def _parse_shot_header(
                     parsed = _parse_time_ms(value)
                 except (InvalidOperation, ValueError):
                     parsed = 0
-                if settings.VIDEO_SHOT_MIN_DURATION_MS <= parsed <= settings.VIDEO_SHOT_MAX_DURATION_MS:
+                if minimum_duration_ms <= parsed <= maximum_duration_ms:
                     duration_ms = parsed
                 else:
                     warnings.append(
                         f"{title} 分镜 {shot_index}: 时长“{value}”不在配置范围 "
-                        f"{settings.VIDEO_SHOT_MIN_DURATION_MS}–{settings.VIDEO_SHOT_MAX_DURATION_MS}ms，"
+                        f"{minimum_duration_ms}–{maximum_duration_ms}ms，"
                         f"已使用默认 {default_duration_ms}ms"
                     )
             elif key in {"首帧连续", "承接上一镜", "first_frame_continuity"}:
@@ -536,7 +553,12 @@ def _effective_range(
     return 0, duration_ms
 
 
-def _paragraphs(text: str) -> list[str]:
+def _paragraphs(
+    text: str,
+    *,
+    auto_split_trigger_chars: int,
+    auto_split_target_chars: int,
+) -> list[str]:
     normalized = text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if not normalized:
         return []
@@ -557,11 +579,11 @@ def _paragraphs(text: str) -> list[str]:
             shots.append("\n".join(current).strip())
         return [value for value in shots if value]
     blocks = [value.strip() for value in re.split(r"\n\s*\n+", normalized) if value.strip()]
-    if len(blocks) == 1 and len(blocks[0]) > settings.SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS:
+    if len(blocks) == 1 and len(blocks[0]) > auto_split_trigger_chars:
         sentences = [value.strip() for value in re.split(r"(?<=[。！？!?])", blocks[0]) if value.strip()]
         blocks, current, size = [], [], 0
         for sentence in sentences:
-            if current and size + len(sentence) > settings.SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS:
+            if current and size + len(sentence) > auto_split_target_chars:
                 blocks.append("".join(current))
                 current, size = [], 0
             current.append(sentence)
@@ -571,7 +593,13 @@ def _paragraphs(text: str) -> list[str]:
     return blocks
 
 
-def _episode_sections(script: str, hint: int) -> tuple[list[tuple[str, list[str]]], bool]:
+def _episode_sections(
+    script: str,
+    hint: int,
+    *,
+    auto_split_trigger_chars: int,
+    auto_split_target_chars: int,
+) -> tuple[list[tuple[str, list[str]]], bool]:
     lines = script.replace("\r\n", "\n").replace("\r", "\n").split("\n")
     headings = [(index, EPISODE_RE.match(line)) for index, line in enumerate(lines) if EPISODE_RE.match(line)]
     if headings:
@@ -580,9 +608,17 @@ def _episode_sections(script: str, hint: int) -> tuple[list[tuple[str, list[str]
             end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
             number = int(match.group("zh") or match.group("en"))
             title = match.group("title").strip() or f"第 {number} 集"
-            sections.append((title, _paragraphs("\n".join(lines[line_index + 1:end]))))
+            sections.append((title, _paragraphs(
+                "\n".join(lines[line_index + 1:end]),
+                auto_split_trigger_chars=auto_split_trigger_chars,
+                auto_split_target_chars=auto_split_target_chars,
+            )))
         return sections, True
-    blocks = _paragraphs(script)
+    blocks = _paragraphs(
+        script,
+        auto_split_trigger_chars=auto_split_trigger_chars,
+        auto_split_target_chars=auto_split_target_chars,
+    )
     if not blocks:
         return [], False
     count = min(hint, len(blocks))
@@ -622,23 +658,52 @@ def breakdown_script(
     default_shot_duration_ms: int | None = None,
     default_first_frame_continuity: bool | None = None,
     default_last_frame_continuity: bool | None = None,
+    video_shot_min_duration_ms: int | None = None,
+    video_shot_max_duration_ms: int | None = None,
+    auto_split_trigger_chars: int | None = None,
+    auto_split_target_chars: int | None = None,
     multi_shot: bool = True,
     include_audio: bool = True,
     confirmed_bible_aliases: ConfirmedScriptBibleAliases | None = None,
 ) -> BreakdownResult:
+    required_config = (
+        "production.default_shot_duration_ms",
+        "production.default_first_frame_continuity",
+        "production.default_last_frame_continuity",
+        "production.video_shot_min_duration_ms",
+        "production.video_shot_max_duration_ms",
+        "production.script_auto_split_trigger_chars",
+        "production.script_auto_split_target_chars",
+    )
+    configured = resolve_configuration(required_keys=required_config).values
     if default_shot_duration_ms is None:
-        default_shot_duration_ms = settings.SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS
+        default_shot_duration_ms = configured["production.default_shot_duration_ms"]
     if default_first_frame_continuity is None:
         default_first_frame_continuity = (
-            settings.SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY
+            configured["production.default_first_frame_continuity"]
         )
     if default_last_frame_continuity is None:
         default_last_frame_continuity = (
-            settings.SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY
+            configured["production.default_last_frame_continuity"]
         )
+    if video_shot_min_duration_ms is None:
+        video_shot_min_duration_ms = configured["production.video_shot_min_duration_ms"]
+    if video_shot_max_duration_ms is None:
+        video_shot_max_duration_ms = configured["production.video_shot_max_duration_ms"]
+    if auto_split_trigger_chars is None:
+        auto_split_trigger_chars = configured["production.script_auto_split_trigger_chars"]
+    if auto_split_target_chars is None:
+        auto_split_target_chars = configured["production.script_auto_split_target_chars"]
+    if not 1 <= video_shot_min_duration_ms <= default_shot_duration_ms <= video_shot_max_duration_ms:
+        raise ValueError("默认镜头时长必须位于配置的视频镜头时长范围内")
+    if not 1 <= auto_split_target_chars <= auto_split_trigger_chars:
+        raise ValueError("自动分段目标字符数不能超过触发字符数")
     parsed_script = parse_script_bible(script)
     sections, explicit_headings = _episode_sections(
-        parsed_script.body, episode_count_hint,
+        parsed_script.body,
+        episode_count_hint,
+        auto_split_trigger_chars=auto_split_trigger_chars,
+        auto_split_target_chars=auto_split_target_chars,
     )
     if not sections:
         raise ValueError("剧本为空或无法识别有效内容")
@@ -662,12 +727,7 @@ def breakdown_script(
     character_name_pairs = list(character_names.values())
     scene_name_pairs = _entity_name_pairs(scenes, aliases.scenes)
     prop_name_pairs = _entity_name_pairs(props, aliases.props)
-    configured_mode = (project.production_settings or {}).get("default_h3_mode")
-    default_h3_mode = (
-        configured_mode
-        if configured_mode in {Shot.H3Mode.T2VA, Shot.H3Mode.FL2VA, Shot.H3Mode.REF2VA}
-        else Shot.H3Mode.T2VA
-    )
+    default_h3_mode = project_default_h3_mode(project)
     character_by_name = {
         normalize_script_bible_name(name): item
         for name, item in character_name_pairs
@@ -692,6 +752,10 @@ def breakdown_script(
                 "default_shot_duration_ms": default_shot_duration_ms,
                 "default_first_frame_continuity": default_first_frame_continuity,
                 "default_last_frame_continuity": default_last_frame_continuity,
+                "video_shot_min_duration_ms": video_shot_min_duration_ms,
+                "video_shot_max_duration_ms": video_shot_max_duration_ms,
+                "auto_split_trigger_chars": auto_split_trigger_chars,
+                "auto_split_target_chars": auto_split_target_chars,
             },
         )
         for shot_index, block in enumerate(shot_blocks, start=1):
@@ -705,6 +769,8 @@ def breakdown_script(
                 title=title,
                 shot_index=shot_index,
                 default_duration_ms=default_shot_duration_ms,
+                minimum_duration_ms=video_shot_min_duration_ms,
+                maximum_duration_ms=video_shot_max_duration_ms,
                 default_first_frame_continuity=default_first_frame_continuity,
                 default_last_frame_continuity=default_last_frame_continuity,
                 warnings=warnings,

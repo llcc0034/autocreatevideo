@@ -484,10 +484,10 @@ def creative_config() -> dict[str, Any]:
             configured.get("max_dialogue_delivery_en_chars", 150)
         ),
         "min_shot_duration_ms": int(configured.get(
-            "min_shot_duration_ms", settings.VIDEO_SHOT_MIN_DURATION_MS,
+            "min_shot_duration_ms", settings.LEGACY_VIDEO_SHOT_MIN_DURATION_MS,
         )),
         "max_shot_duration_ms": int(configured.get(
-            "max_shot_duration_ms", settings.VIDEO_SHOT_MAX_DURATION_MS,
+            "max_shot_duration_ms", settings.LEGACY_VIDEO_SHOT_MAX_DURATION_MS,
         )),
         "output_min_tokens": int(configured.get("output_min_tokens", 1024)),
         "output_base_tokens": int(configured.get("output_base_tokens", 768)),
@@ -543,10 +543,10 @@ def creative_provider_config(provider: str) -> dict[str, Any]:
             configured.get("max_dialogue_delivery_en_chars", 150)
         ),
         "min_shot_duration_ms": int(configured.get(
-            "min_shot_duration_ms", settings.VIDEO_SHOT_MIN_DURATION_MS,
+            "min_shot_duration_ms", settings.LEGACY_VIDEO_SHOT_MIN_DURATION_MS,
         )),
         "max_shot_duration_ms": int(configured.get(
-            "max_shot_duration_ms", settings.VIDEO_SHOT_MAX_DURATION_MS,
+            "max_shot_duration_ms", settings.LEGACY_VIDEO_SHOT_MAX_DURATION_MS,
         )),
         "output_min_tokens": int(configured.get("output_min_tokens", 1024)),
         "output_base_tokens": int(configured.get("output_base_tokens", 768)),

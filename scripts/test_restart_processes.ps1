@@ -40,6 +40,65 @@ $restartPath = Join-Path $PSScriptRoot 'restart.ps1'
 # the restart workflow and is intentionally forbidden in this test.
 Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Stop-ProcessTree')
 Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Stop-RecordedServices')
+Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Assert-JwtSigningKeyConfiguration')
+
+# The JWT preflight must provide Django's module selector to raw python, restore
+# the caller environment afterwards, and remain before every destructive stop.
+$preflightRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('autoprompt-restart-preflight-' + [guid]::NewGuid().ToString('N'))
+$hadOriginalSettingsModule = Test-Path Env:DJANGO_SETTINGS_MODULE
+$originalSettingsModule = $env:DJANGO_SETTINGS_MODULE
+try {
+    New-Item -ItemType Directory -Path $preflightRoot -Force | Out-Null
+    $fakePython = Join-Path $preflightRoot 'python.cmd'
+    Set-Content -LiteralPath $fakePython -Encoding ASCII -Value @(
+        '@echo off',
+        'if not "%DJANGO_SETTINGS_MODULE%"=="autoprompt_backend.settings" exit /b 17',
+        'exit /b 0'
+    )
+    $env:DJANGO_SETTINGS_MODULE = 'fixture.original.settings'
+    Assert-JwtSigningKeyConfiguration `
+        -PythonPath $fakePython `
+        -WorkingDirectory $preflightRoot
+    Assert-Equal $env:DJANGO_SETTINGS_MODULE 'fixture.original.settings' 'JWT preflight must restore the caller settings module.'
+
+    $tokens = $null
+    $parseErrors = $null
+    $restartAst = [System.Management.Automation.Language.Parser]::ParseFile(
+        $restartPath,
+        [ref]$tokens,
+        [ref]$parseErrors
+    )
+    $topLevelCommands = @($restartAst.FindAll({
+        param($node)
+        if (-not ($node -is [System.Management.Automation.Language.CommandAst])) { return $false }
+        $parent = $node.Parent
+        while ($null -ne $parent) {
+            if ($parent -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                return $false
+            }
+            $parent = $parent.Parent
+        }
+        return $true
+    }, $true))
+    $preflightCall = $topLevelCommands | Where-Object {
+        $_.GetCommandName() -eq 'Assert-JwtSigningKeyConfiguration'
+    } | Select-Object -First 1
+    $stopCall = $topLevelCommands | Where-Object {
+        $_.GetCommandName() -eq 'Stop-RecordedServices'
+    } | Select-Object -First 1
+    Assert-True ($null -ne $preflightCall) 'restart.ps1 must invoke the JWT preflight.'
+    Assert-True ($null -ne $stopCall) 'restart.ps1 must invoke recorded-service cleanup.'
+    Assert-True ($preflightCall.Extent.StartOffset -lt $stopCall.Extent.StartOffset) 'JWT preflight must run before recorded services are stopped.'
+} finally {
+    if ($hadOriginalSettingsModule) {
+        $env:DJANGO_SETTINGS_MODULE = $originalSettingsModule
+    } else {
+        Remove-Item Env:DJANGO_SETTINGS_MODULE -ErrorAction SilentlyContinue
+    }
+    if (Test-Path -LiteralPath $preflightRoot) {
+        Remove-Item -LiteralPath $preflightRoot -Recurse -Force
+    }
+}
 
 # A target can exit after the initial lookup and before Stop-Process reaches it.
 # That state is already stopped and must not fail the cleanup workflow.

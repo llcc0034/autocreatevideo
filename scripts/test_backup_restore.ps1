@@ -33,6 +33,10 @@ if ($postgresDescriptor.Password -ne 'p@ss') {
 $tempBase = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
 $tempRoot = Join-Path $tempBase ('autoprompt-backup-test-' + [Guid]::NewGuid().ToString('N'))
 $tempRoot = [System.IO.Path]::GetFullPath($tempRoot)
+$originalProcessPath = $env:PATH
+$testBackendRoot = Join-Path (Split-Path -Parent $PSScriptRoot) 'backend'
+$testPython = Get-AutoPromptPython -BackendRoot $testBackendRoot
+$env:PATH = (Split-Path -Parent $testPython) + [System.IO.Path]::PathSeparator + $env:PATH
 if (-not $tempRoot.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $tempRoot) -notlike 'autoprompt-backup-test-*') {
     throw 'Refusing to create an unsafe temporary test directory.'
 }
@@ -42,13 +46,13 @@ try {
     $mediaRoot = Join-Path $backendRoot 'media'
     $comfyRoot = Join-Path $tempRoot 'comfy-output'
     $configRoot = Join-Path $tempRoot 'config'
+    $unsafeConfigRoot = Join-Path $tempRoot 'unsafe-config'
     $archiveRoot = Join-Path $tempRoot 'archives'
-    New-Item -ItemType Directory -Path $mediaRoot, $comfyRoot, $configRoot, $archiveRoot -Force | Out-Null
+    New-Item -ItemType Directory -Path $mediaRoot, $comfyRoot, $configRoot, $unsafeConfigRoot, $archiveRoot -Force | Out-Null
 
-    $pythonCommand = Get-Command python -ErrorAction Stop
     $databasePath = Join-Path $backendRoot 'db.sqlite3'
     $createCode = "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute('create table sample(id integer primary key, value text not null)'); db.execute('insert into sample(value) values (?)', ('backup-test',)); db.commit(); db.close()"
-    & $pythonCommand.Source -c $createCode $databasePath
+    & $testPython -c $createCode $databasePath
     if ($LASTEXITCODE -ne 0) { throw 'Unable to create temporary SQLite fixture.' }
 
     Set-Content -LiteralPath (Join-Path $mediaRoot 'sample.txt') -Value 'media fixture' -Encoding UTF8
@@ -56,9 +60,69 @@ try {
     Set-Content -LiteralPath (Join-Path $configRoot 'runtime.json') -Value '{"fixture":true}' -Encoding UTF8
     $backendEnv = @(
         'DATABASE_URL=sqlite:///db.sqlite3',
-        ('COMFYUI_OUTPUT_DIR=' + $comfyRoot.Replace('\', '/'))
+        ('COMFYUI_OUTPUT_DIR=' + $comfyRoot.Replace('\', '/')),
+        'AUTOPROMPT_CONFIG_MASTER_KEYS=test-v1:synthetic-test-material'
     )
     Set-Content -LiteralPath (Join-Path $backendRoot '.env') -Value $backendEnv -Encoding UTF8
+
+    Set-Content `
+        -LiteralPath (Join-Path $unsafeConfigRoot 'keyring.yaml') `
+        -Value 'AUTOPROMPT_CONFIG_ACTIVE_KEY_ID: test-v1' `
+        -Encoding UTF8
+    foreach ($mode in @('dry-run', 'backup')) {
+        $unsafeName = 'reject-keyring-' + $mode
+        $keyringRejected = $false
+        try {
+            $unsafeParameters = @{
+                ProjectRoot = $tempRoot
+                DestinationRoot = $archiveRoot
+                BackupName = $unsafeName
+                MediaRoot = $mediaRoot
+                ComfyUIOutputDir = $comfyRoot
+                IncludeConfig = $true
+                ConfigPath = @($unsafeConfigRoot)
+            }
+            if ($mode -eq 'dry-run') { $unsafeParameters['DryRun'] = $true }
+            & (Join-Path $PSScriptRoot 'backup.ps1') @unsafeParameters | Out-Null
+        } catch {
+            if ($_.Exception.Message -match 'separate offline secret escrow') {
+                $keyringRejected = $true
+            } else {
+                throw
+            }
+        }
+        if (-not $keyringRejected) {
+            throw "Backup $mode did not reject an explicitly selected database keyring file."
+        }
+        if (Test-Path -LiteralPath (Join-Path $archiveRoot $unsafeName)) {
+            throw "Backup $mode created an archive directory before rejecting a database keyring file."
+        }
+    }
+
+    $explicitEnvRejected = $false
+    try {
+        & (Join-Path $PSScriptRoot 'backup.ps1') `
+            -ProjectRoot $tempRoot `
+            -DestinationRoot $archiveRoot `
+            -BackupName 'reject-explicit-env' `
+            -MediaRoot $mediaRoot `
+            -ComfyUIOutputDir $comfyRoot `
+            -IncludeConfig `
+            -ConfigPath (Join-Path $backendRoot '.env') `
+            -DryRun | Out-Null
+    } catch {
+        if ($_.Exception.Message -match 'Deployment \.env files') {
+            $explicitEnvRejected = $true
+        } else {
+            throw
+        }
+    }
+    if (-not $explicitEnvRejected) {
+        throw 'Backup Dry-run did not reject an explicitly selected deployment .env file.'
+    }
+    if (Test-Path -LiteralPath (Join-Path $archiveRoot 'reject-explicit-env')) {
+        throw 'Backup Dry-run created an archive directory before rejecting a deployment .env file.'
+    }
 
     $dryBackup = @(& (Join-Path $PSScriptRoot 'backup.ps1') `
         -ProjectRoot $tempRoot `
@@ -66,7 +130,6 @@ try {
         -MediaRoot $mediaRoot `
         -ComfyUIOutputDir $comfyRoot `
         -IncludeConfig `
-        -ConfigPath $configRoot `
         -DryRun)
     if ($dryBackup[-1] -ne 'DRY_RUN_OK') { throw 'Backup Dry-run did not complete successfully.' }
 
@@ -75,11 +138,18 @@ try {
         -DestinationRoot $archiveRoot `
         -MediaRoot $mediaRoot `
         -ComfyUIOutputDir $comfyRoot `
-        -IncludeConfig `
-        -ConfigPath $configRoot)
+        -IncludeConfig)
     $backupPath = [string]$backupOutput[-1]
     if (-not (Test-Path -LiteralPath (Join-Path $backupPath 'manifest.json') -PathType Leaf)) {
         throw 'Temporary backup did not produce manifest.json.'
+    }
+    $manifest = Get-Content -LiteralPath (Join-Path $backupPath 'manifest.json') -Raw | ConvertFrom-Json
+    $restoredConfigPaths = @($manifest.config.items | ForEach-Object { [string]$_.restore_relative_path })
+    if ($restoredConfigPaths -contains '.env' -or $restoredConfigPaths -contains 'backend/.env') {
+        throw 'Default configuration backup unexpectedly included a deployment .env file.'
+    }
+    if ($restoredConfigPaths -notcontains 'config/runtime.json') {
+        throw 'Default configuration backup did not include the dedicated config directory.'
     }
 
     $sourceHashesBefore = @{
@@ -144,6 +214,7 @@ try {
 
     Write-Host 'Backup creation, manifest/hash verification, tamper rejection, and restore Dry-run tests passed.' -ForegroundColor Green
 } finally {
+    $env:PATH = $originalProcessPath
     if (Test-Path -LiteralPath $tempRoot) {
         $resolvedTemp = [System.IO.Path]::GetFullPath($tempRoot)
         if (-not $resolvedTemp.StartsWith($tempBase, [System.StringComparison]::OrdinalIgnoreCase) -or (Split-Path -Leaf $resolvedTemp) -notlike 'autoprompt-backup-test-*') {

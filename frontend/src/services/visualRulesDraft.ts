@@ -1,22 +1,14 @@
 import type {
   SeriesProject,
-  StylePreset,
   VisualRulesColor,
   VisualRulesColorDesign,
   VisualRulesContrast,
-  VisualRulesDraftApplyResult,
-  VisualRulesDraftData,
-  VisualRulesDraftResult,
   VisualRulesExposure,
   VisualRulesLighting,
   VisualRulesPaletteRelation,
   VisualRulesProgression,
   VisualRulesSaturation,
 } from '@/types'
-
-const CJK = /[\u3400-\u4dbf\u4e00-\u9fff]/
-const LATIN_LETTER = /\p{Script=Latin}/u
-const LETTER = /\p{L}/u
 
 const objectValue = (value: unknown): Record<string, any> => (
   value && typeof value === 'object' ? value as Record<string, any> : {}
@@ -39,8 +31,6 @@ export const visualRulesColorDesignLabel = (value: string): string => ({
 }[value] || value.replace(/_/g, ' '))
 
 const COLOR_DESIGN_KEYS = ['base_colors','accent_color','palette_relation','lighting','contrast','saturation','exposure','progression','preserve_natural_skin_exposure'] as const
-const unsafeNoteCharacters = (value: string) => /[\u200B-\u200F\u202A-\u202E\u2060-\u206F\uFEFF]/.test(value) || /\p{Extended_Pictographic}/u.test(value)
-
 export const visualRulesColorDesignErrors = (payload: unknown): string[] => {
   const raw = objectValue(payload)
   const keys = Object.keys(raw)
@@ -96,236 +86,8 @@ export const visualRulesColorDesignSummary = (design: VisualRulesColorDesign): s
   design.preserveNaturalSkinExposure ? '保持自然肤色曝光' : '肤色跟随整体曝光',
 ].join(' · ')
 
-export const visualRulesVariationNoteErrors = (value: string): string[] => unsafeNoteCharacters(value)
-  ? ['本次视觉倾向不能包含 emoji、双向控制符或零宽字符']
-  : []
-
-export const adaptVisualRulesDraftResult = (payload: unknown): VisualRulesDraftResult => {
-  const raw = objectValue(payload)
-  const draft = objectValue(raw.draft)
-  const sourceSummary = objectValue(raw.source_summary)
-  const generation = objectValue(raw.generation)
-  const runtime = objectValue(raw.runtime)
-  return {
-    projectId: String(raw.project_id || ''),
-    contextFingerprint: String(raw.context_fingerprint || ''),
-    contextCurrent: raw.context_current !== false,
-    candidateLanguage: 'en',
-    reviewRequired: true,
-    persisted: false,
-    draft: {
-      negativePrompt: String(draft.negative_prompt || ''),
-      colorScript: String(draft.color_script || ''),
-      continuitySummary: String(draft.continuity_summary || ''),
-    },
-    colorDesign: adaptVisualRulesColorDesign(raw.color_design),
-    fieldModes: {
-      negativePrompt: 'deterministic_guard',
-      colorScript: 'structured_design',
-      continuitySummary: 'deterministic_guard',
-    },
-    sourceSummary: {
-      projectFields: Array.isArray(sourceSummary.project_fields) ? sourceSummary.project_fields.map(String) : [],
-      productionSettingFields: Array.isArray(sourceSummary.production_setting_fields) ? sourceSummary.production_setting_fields.map(String) : [],
-      styleIncluded: sourceSummary.style_included === true,
-      characterCount: Number(sourceSummary.character_count || 0),
-      sceneCount: Number(sourceSummary.scene_count || 0),
-      propCount: Number(sourceSummary.prop_count || 0),
-      episodeSummaryCount: Number(sourceSummary.episode_summary_count || 0),
-      episodeScriptsIncluded: false,
-      shotsIncluded: false,
-    },
-    generation: {
-      attempt: Math.max(1, Number(generation.attempt || 1)),
-      directionNoteProvided: generation.direction_note_provided === true,
-      variationNoteProvided: generation.variation_note_provided === true,
-      generationFingerprint: String(generation.generation_fingerprint || ''),
-    },
-    warnings: Array.isArray(raw.warnings) ? raw.warnings.map(String) : [],
-    runtime: {
-      provider: String(runtime.provider || ''),
-      model: String(runtime.model || ''),
-      loadedOnDemand: runtime.loaded_on_demand === true,
-      unloadedAfterRequest: runtime.unloaded_after_request === true,
-      reviewRequired: runtime.review_required !== false,
-      persisted: false,
-      elapsedMs: Number(runtime.elapsed_ms || 0),
-      repairAttempted: runtime.repair_attempted === true,
-      repairSucceeded: runtime.repair_succeeded === true,
-    },
-  }
-}
-
-export const adaptVisualRulesDraftApplyResult = (payload: unknown): VisualRulesDraftApplyResult => {
-  const raw = objectValue(payload)
-  const applied = objectValue(raw.applied)
-  return {
-    projectId: String(raw.project_id || ''),
-    appliedContextFingerprint: String(raw.applied_context_fingerprint || ''),
-    currentContextFingerprint: String(raw.current_context_fingerprint || ''),
-    updatedAt: String(raw.updated_at || ''),
-    applied: {
-      negativePrompt: String(applied.negative_prompt || ''),
-      colorScript: String(applied.color_script || ''),
-      continuitySummary: String(applied.continuity_summary || ''),
-    },
-  }
-}
-
-export const visualRulesDraftGeneratePayload = (input: {
-  attempt: number
-  variationNote?: string
-  expectedContextFingerprint?: string
-}) => ({
-  attempt: Math.max(1, Math.min(100, Math.trunc(Number(input.attempt) || 1))),
-  ...(input.variationNote?.trim() ? { variation_note: input.variationNote.trim() } : {}),
-  ...(input.expectedContextFingerprint?.trim()
-    ? { expected_context_fingerprint: input.expectedContextFingerprint.trim() }
-    : {}),
-})
-
-export const visualRulesDraftApplyPayload = (input: {
-  contextFingerprint: string
-  generationFingerprint: string
-  attempt: number
-  directionNote?: string
-  variationNote?: string
-  colorDesign: VisualRulesColorDesign
-}) => ({
-  context_fingerprint: input.contextFingerprint.trim(),
-  generation_fingerprint: input.generationFingerprint.trim(),
-  attempt: Math.max(1, Math.min(100, Math.trunc(Number(input.attempt) || 1))),
-  direction_note: input.directionNote || '',
-  variation_note: input.variationNote || '',
-  color_design: visualRulesColorDesignPayload(input.colorDesign),
-})
-
 export const visualRulesProjectPersistenceFields = (project: Partial<SeriesProject>) => ({
   negativePrompt: project.bible?.negativePrompt || '',
   colorScript: project.bible?.colorScript || '',
   continuitySummary: project.continuitySummary || '',
 })
-
-export const visualRulesDraftValidationErrors = (draft: VisualRulesDraftData): string[] => {
-  const fields: Array<[keyof VisualRulesDraftData, string]> = [
-    ['negativePrompt', '全局负面提示词'],
-    ['colorScript', '色彩脚本'],
-    ['continuitySummary', '连续性摘要'],
-  ]
-  const errors = fields.flatMap(([key, label]) => {
-    const value = draft[key].trim()
-    if (!value) return [`${label}不能为空`]
-    if (key === 'negativePrompt' && !/^[\x00-\x7F]*$/.test(value)) return [`${label}保护项只允许 ASCII 英文缺陷短语；请重新生成`]
-    if (CJK.test(value)) return [key === 'colorScript' ? `${label}仍含中文；请改成纯英文后再采用` : `${label}确定性保护项仍含中文；请重新生成`]
-    if (key !== 'negativePrompt' && [...value].some((char) => LETTER.test(char) && !LATIN_LETTER.test(char))) {
-      return [`${label}含非拉丁文字；请使用纯英文后再采用`]
-    }
-    return []
-  })
-  if (draft.colorScript.trim() && !/\b(?:color|palette|light|lighting|shadow|highlight|tone|contrast|saturation|exposure)\b/i.test(draft.colorScript)) {
-    errors.push('色彩脚本必须明确包含 color / palette / light 等色彩或光线规则')
-  }
-  return errors
-}
-
-const stableGlossary = (value: Record<string, string> | undefined) => Object.fromEntries(
-  Object.entries(value || {}).sort(([left], [right]) => left.localeCompare(right, 'zh-CN')),
-)
-
-const stableBibleItem = (item: SeriesProject['bible']['characters'][number]) => ({
-  id: item.id,
-  name: item.name,
-  description: item.description,
-  visualPrompt: item.visualPrompt,
-  ageAppearance: item.ageAppearance || '',
-  faceIdentity: item.faceIdentity || '',
-  wardrobe: item.wardrobe || '',
-  voiceProfile: item.voiceProfile || '',
-  personality: item.personality || '',
-  location: item.location || '',
-  timeOfDay: item.timeOfDay || '',
-  lighting: item.lighting || '',
-  colorPalette: item.colorPalette || '',
-  ambientSound: item.ambientSound || '',
-  material: item.material || '',
-  distinctiveMarks: item.distinctiveMarks || '',
-  continuityState: item.continuityState || '',
-})
-
-/**
- * Browser-side drift guard for unsaved edits. The service remains authoritative:
- * apply performs the same check under a database lock before writing anything.
- */
-export const visualRulesLocalContextSnapshot = (project: SeriesProject, style?: StylePreset): string => JSON.stringify({
-  project: {
-    id: project.id,
-    title: project.title,
-    logline: project.logline,
-    masterScript: project.masterScript,
-    aspectRatio: project.aspectRatio,
-    resolution: project.resolution,
-    width: project.width || null,
-    height: project.height || null,
-    defaultMode: project.defaultMode,
-    continuitySummary: project.continuitySummary || '',
-  },
-  productionSettings: {
-    negativePrompt: project.bible.negativePrompt,
-    colorScript: project.bible.colorScript,
-    translationGlossary: stableGlossary(project.translationGlossary),
-  },
-  style: style ? {
-    id: style.backendId || style.id,
-    name: style.name,
-    category: style.category,
-    description: style.description,
-    visualPrompt: style.promptPrefix,
-  } : null,
-  bible: {
-    characters: project.bible.characters.map(stableBibleItem),
-    scenes: project.bible.scenes.map(stableBibleItem),
-    props: project.bible.props.map(stableBibleItem),
-  },
-  episodes: project.episodes.map((episode) => ({
-    number: episode.number,
-    title: episode.title,
-    synopsis: episode.synopsis,
-  })),
-})
-
-export type VisualRulesDraftErrorKind = 'resource_busy' | 'source_conflict' | 'runtime_unavailable' | 'validation' | 'unknown'
-
-const errorDetailText = (value: unknown): string[] => {
-  if (typeof value === 'string' && value.trim()) return [value.trim()]
-  if (Array.isArray(value)) return value.flatMap(errorDetailText)
-  if (value && typeof value === 'object') return Object.values(value as Record<string, unknown>).flatMap(errorDetailText)
-  return []
-}
-
-export const visualRulesDraftError = (cause: unknown): { kind: VisualRulesDraftErrorKind; code: string; message: string } => {
-  const candidate = objectValue(cause)
-  const response = objectValue(candidate.response)
-  const data = objectValue(response.data)
-  const envelope = objectValue(data.error)
-  const envelopeDetails = objectValue(envelope.details)
-  const code = String(envelope.code || data.code || '')
-  const status = Number(response.status || 0)
-  const kind: VisualRulesDraftErrorKind = code === 'visual_rules_resource_busy'
-    ? 'resource_busy'
-    : code === 'visual_rules_source_conflict'
-      ? 'source_conflict'
-      : code === 'visual_rules_runtime_unavailable'
-        ? 'runtime_unavailable'
-        : status === 400
-          ? 'validation'
-          : 'unknown'
-  const fallback = kind === 'resource_busy'
-    ? '视频生产正在占用本地资源；请等任务结束后再生成全剧视觉规则。'
-    : kind === 'source_conflict'
-      ? '故事或 Bible 已在候选生成后发生变化；请核对并重新生成。'
-      : kind === 'runtime_unavailable'
-        ? '本地 Qwen 暂时不可用或候选未通过严格校验；正式字段保持不变。'
-        : '全剧视觉规则候选生成失败；正式字段保持不变。'
-  const detailedMessage = errorDetailText(envelopeDetails.detail || envelopeDetails).join('；')
-  return { kind, code, message: detailedMessage || String(envelope.message || candidate.message || fallback) }
-}

@@ -14,12 +14,14 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 from studio.models import AssemblyJob, SeriesProject, WorkerLease
-from studio.services.assembly import AssemblyError, _mark_scope_complete
+from studio.services.assembly import AssemblyError, _mark_scope_complete, verify_assembly_sources
+from studio.services.configuration import resolve_configuration
 from studio.services.provenance import (
     ProvenanceError,
     persist_assembly_provenance,
     verified_assembly_manifest,
 )
+from studio.services.production_run_auto_advance import schedule_assembly_job_run_advance
 
 
 ASSEMBLY_WORKER_HEARTBEAT_KEY = "assembly-worker-heartbeat"
@@ -42,17 +44,21 @@ def claim_next_assembly(*, worker_id: str | None = None) -> AssemblyJob | None:
     with transaction.atomic():
         WorkerLease.objects.get_or_create(key="assembly-claim")
         WorkerLease.objects.select_for_update().get(key="assembly-claim")
-        AssemblyJob.objects.filter(
+        exhausted = AssemblyJob.objects.filter(
             status=AssemblyJob.Status.QUEUED,
             dry_run=False,
             attempts__gte=F("max_attempts"),
-        ).update(
+        )
+        exhausted_ids = list(exhausted.values_list("id", flat=True))
+        exhausted.update(
             status=AssemblyJob.Status.FAILED,
             error_message="Assembly retry limit was reached before the job could be claimed",
             finished_at=now,
             heartbeat_at=now,
             updated_at=now,
         )
+        for job_id in exhausted_ids:
+            schedule_assembly_job_run_advance(job_id)
         job = (
             AssemblyJob.objects.select_for_update()
             .select_related("project", "episode", "owner")
@@ -121,7 +127,9 @@ def _run_ffmpeg(command: list[str], *, heartbeat) -> subprocess.CompletedProcess
     separate worker to distinguish a live long encode from an abandoned claim.
     """
 
-    timeout_seconds = max(1.0, float(settings.ASSEMBLY_TIMEOUT_SECONDS))
+    timeout_seconds = max(1.0, float(resolve_configuration(
+        required_keys=("delivery.assembly_timeout_seconds",),
+    ).values["delivery.assembly_timeout_seconds"]))
     heartbeat_seconds = max(
         0.25, float(getattr(settings, "ASSEMBLY_HEARTBEAT_SECONDS", 5)),
     )
@@ -190,6 +198,7 @@ def _record_execution_failure(job: AssemblyJob, claim_token, message: str) -> As
             current.save(update_fields=(
                 "status", "finished_at", "heartbeat_at", "error_message", "updated_at",
             ))
+            schedule_assembly_job_run_advance(current.pk)
         return current
 
 
@@ -214,6 +223,7 @@ def _mark_succeeded(job: AssemblyJob, claim_token) -> AssemblyJob:
             "status", "finished_at", "heartbeat_at", "error_message", "updated_at",
         ))
         _mark_scope_complete(locked_project, current.episode)
+        schedule_assembly_job_run_advance(current.pk)
         return current
 
 
@@ -236,6 +246,7 @@ def process_assembly_job(job: AssemblyJob) -> AssemblyJob:
         command_output = Path(str(command[-1])).resolve()
         if command_output != output:
             raise AssemblyError("持久化 FFmpeg 命令与任务输出路径不一致")
+        verify_assembly_sources(job)
         output.parent.mkdir(parents=True, exist_ok=True)
         temporary_output = _temporary_output_path(output, claim_token)
         if temporary_output.exists():
@@ -331,6 +342,7 @@ def recover_stale_assemblies(
                 ))
                 completed.append(job)
                 counts["succeeded"] += 1
+                schedule_assembly_job_run_advance(job.pk)
             elif job.status == AssemblyJob.Status.PLANNED:
                 # Legacy synchronous versions could be interrupted after the
                 # command was persisted but before status changed to RUNNING.
@@ -358,6 +370,7 @@ def recover_stale_assemblies(
                         "status", "finished_at", "heartbeat_at", "error_message", "updated_at",
                     ))
                     counts["failed"] += 1
+                    schedule_assembly_job_run_advance(job.pk)
             elif job.attempts < job.max_attempts:
                 job.status = AssemblyJob.Status.QUEUED
                 job.queued_at = now
@@ -380,6 +393,7 @@ def recover_stale_assemblies(
                     "status", "finished_at", "heartbeat_at", "error_message", "updated_at",
                 ))
                 counts["failed"] += 1
+                schedule_assembly_job_run_advance(job.pk)
         for job in completed:
             _mark_scope_complete(job.project, job.episode)
 

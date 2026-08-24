@@ -3,8 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import re
 
-from django.conf import settings
-
 from studio.models import PromptArtifact
 
 
@@ -71,10 +69,11 @@ def evaluate_prompt_language_gate(prompt: PromptArtifact) -> PromptLanguageGateR
 
     quality = (prompt.structured_payload or {}).get("quality") or {}
     policy_id = str(quality.get("policy_id") or "")
+    stored_gate = quality.get("production_language_gate") or {}
     mode = (
         "advisory"
         if policy_id == BIBLE_IMAGE_CANDIDATE_QUALITY_POLICY
-        else str(getattr(settings, "H3_PROMPT_LANGUAGE_GATE", "block")).strip().lower()
+        else str(stored_gate.get("mode") or "block").strip().lower()
     )
     if mode not in {"block", "warn", "advisory"}:
         # Settings validates this at startup. Keep the runtime path fail-safe in

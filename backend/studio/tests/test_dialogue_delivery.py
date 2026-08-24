@@ -147,7 +147,8 @@ class DialogueContractTests(TestCase):
         self.shot1.requires_first_frame_continuity = True
         self.shot1.requires_last_frame_continuity = True
         result = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1],
+            H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="warn"),
         )
         self.assertIn("From 0.500s to 2.500s", result.text)
         self.assertIn(
@@ -176,7 +177,8 @@ class DialogueContractTests(TestCase):
             return_value=[binding],
         ):
             result = build_h3_video_prompt(
-                self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self.project, [self.shot1],
+                H3PromptOptions(mode=Shot.H3Mode.REF2VA, language_gate_mode="warn"),
             )
         self.assertIn(
             "From 0.000s to 3.500s, <Subject 1> (S1) says in an off-screen "
@@ -190,7 +192,8 @@ class DialogueContractTests(TestCase):
             "speaker_id": "S1", "text": "中文对白。", "delivery": "压低声音",
         }]
         result = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1],
+            H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="warn"),
         )
         fields = result.payload["quality"]["fields_requiring_english_rewrite"]
         self.assertIn("镜头 1 对白 S1 演绎方式", fields)
@@ -199,7 +202,9 @@ class DialogueContractTests(TestCase):
         audio_disabled = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA, include_audio=False),
+            H3PromptOptions(
+                mode=Shot.H3Mode.T2VA, include_audio=False, language_gate_mode="warn",
+            ),
         )
         disabled_fields = audio_disabled.payload["quality"]["fields_requiring_english_rewrite"]
         self.assertNotIn("镜头 1 对白 S1 演绎方式", disabled_fields)
@@ -219,7 +224,8 @@ class DialogueContractTests(TestCase):
             return_value=[binding],
         ):
             result = build_h3_video_prompt(
-                self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self.project, [self.shot1],
+                H3PromptOptions(mode=Shot.H3Mode.REF2VA, language_gate_mode="warn"),
             )
         warnings = result.payload["quality"]["warnings"]
         self.assertFalse(any("350–500" in warning for warning in warnings))

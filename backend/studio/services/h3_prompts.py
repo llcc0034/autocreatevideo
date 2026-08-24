@@ -13,7 +13,6 @@ import re
 import unicodedata
 from typing import Any, Iterable
 
-from django.conf import settings as django_settings
 from django.db.models import Prefetch
 
 from studio.models import (
@@ -125,6 +124,8 @@ class H3PromptOptions:
     single_shot_reference_bindings: dict | None = None
     single_shot_reference_assets: list | None = None
     consistency_snapshot: dict | None = None
+    optimizer_fingerprint: str = ""
+    language_gate_mode: str = "block"
 
 
 def _compact(value: str | None) -> str:
@@ -300,7 +301,11 @@ def _shot_negative_constraints(shot: Shot) -> str:
     except (TypeError, ValueError):
         prompt_field_version = 0
     if prompt_field_version >= 2:
-        return _compact(str(metadata.get("negative_prompt", "")))
+        source = str(metadata.get("negative_prompt", ""))
+        return _compact(_translated(
+            shot.episode.project_id, "shot", shot.id,
+            "shot.negative_prompt", source,
+        ))
     # Backward compatibility for records written before the field split.
     return _compact(shot.continuity_notes)
 
@@ -666,7 +671,10 @@ def prompt_input_fingerprint(
         ),
         "extra_direction": _semantic_override(options.extra_direction, direction_values),
         "optimizer_fingerprint": (
-            h3_prompt_optimizer_input_fingerprint() if prompt_type == "video" else "not-applicable"
+            h3_prompt_optimizer_input_fingerprint(
+                deployment_fingerprint=options.optimizer_fingerprint,
+                language_gate=options.language_gate_mode,
+            ) if prompt_type == "video" else "not-applicable"
         ),
         # Keep this explicit as well as in the consistency snapshot.  Some
         # callers supply a pre-captured snapshot for a whole batch; the direct
@@ -1596,9 +1604,17 @@ def _prompt_quality_report(
         [*raw_direction_values, *effective_direction_values],
     )))
     sources.extend((label, value) for label, value in override_sources if value)
+    project_negative = str(settings.get("negative_prompt", ""))
+    style_negative = project.style.negative_prompt if project.style else ""
     negative_sources = [
-        ("全剧负面约束", str(settings.get("negative_prompt", ""))),
-        ("视觉风格负面约束", project.style.negative_prompt if project.style else ""),
+        ("全剧负面约束", _translated(
+            project.id, "project", project.id,
+            "project.production_settings.negative_prompt", project_negative,
+        )),
+        ("视觉风格负面约束", _translated(
+            project.id, "project", project.id,
+            "style.negative_prompt", style_negative,
+        )),
     ]
     contamination_fields = []
     for shot in shots:
@@ -1613,15 +1629,24 @@ def _prompt_quality_report(
         if value and _negative_repeats_positive(value, positive_values):
             contamination_fields.append(f"{label}（疑似混入正向剧情或对白）")
         negative_sources.extend(
-            (f"人物 {character.stable_speaker_id} 负面约束", character.negative_constraints)
+            (f"人物 {character.stable_speaker_id} 负面约束", _translated(
+                project.id, "character", character.id,
+                "character.negative_constraints", character.negative_constraints,
+            ))
             for character in shot.characters.all()
         )
         if shot.scene:
             negative_sources.append((
-                f"场景 {shot.scene.slug} 负面约束", shot.scene.negative_constraints,
+                f"场景 {shot.scene.slug} 负面约束", _translated(
+                    project.id, "scene", shot.scene.id,
+                    "scene.negative_constraints", shot.scene.negative_constraints,
+                ),
             ))
         negative_sources.extend(
-            (f"道具 {prop.slug} 负面约束", prop.negative_constraints)
+            (f"道具 {prop.slug} 负面约束", _translated(
+                project.id, "prop", prop.id,
+                "prop.negative_constraints", prop.negative_constraints,
+            ))
             for prop in shot.props.all()
         )
     negative_chinese_fields = [
@@ -1747,9 +1772,7 @@ def _prompt_quality_report(
         fields_requiring_rewrite.append(
             "未归类导演描述（参考素材职责或绑定说明）"
         )
-    language_gate_mode = str(
-        getattr(django_settings, "H3_PROMPT_LANGUAGE_GATE", "block")
-    ).strip().lower()
+    language_gate_mode = str(options.language_gate_mode or "block").strip().lower()
     if language_gate_mode not in {"block", "warn"}:
         language_gate_mode = "block"
     # Negative-channel corruption is not a stylistic language warning.  It can
@@ -1790,17 +1813,40 @@ def build_negative_prompt(project: SeriesProject, shots: list[Shot]) -> str:
     """Create a de-duplicated exclusion audit field for a prompt artifact."""
     values = []
     settings = project.production_settings or {}
-    if settings.get("negative_prompt"):
-        values.append(str(settings["negative_prompt"]))
-    if project.style and project.style.negative_prompt:
-        values.append(project.style.negative_prompt)
+    project_negative = str(settings.get("negative_prompt", "") or "")
+    if project_negative:
+        values.append(_translated(
+            project.id, "project", project.id,
+            "project.production_settings.negative_prompt", project_negative,
+        ))
+    style_negative = project.style.negative_prompt if project.style else ""
+    if style_negative:
+        values.append(_translated(
+            project.id, "project", project.id,
+            "style.negative_prompt", style_negative,
+        ))
     for shot in shots:
         if value := _shot_negative_constraints(shot):
             values.append(value)
-        values.extend(item.negative_constraints for item in shot.characters.all() if item.negative_constraints)
+        values.extend(
+            _translated(
+                project.id, "character", item.id,
+                "character.negative_constraints", item.negative_constraints,
+            )
+            for item in shot.characters.all() if item.negative_constraints
+        )
         if shot.scene and shot.scene.negative_constraints:
-            values.append(shot.scene.negative_constraints)
-        values.extend(item.negative_constraints for item in shot.props.all() if item.negative_constraints)
+            values.append(_translated(
+                project.id, "scene", shot.scene.id,
+                "scene.negative_constraints", shot.scene.negative_constraints,
+            ))
+        values.extend(
+            _translated(
+                project.id, "prop", item.id,
+                "prop.negative_constraints", item.negative_constraints,
+            )
+            for item in shot.props.all() if item.negative_constraints
+        )
     phrases = []
     for value in values:
         # Legacy records used both Chinese/English commas and semicolons.  Split
@@ -2022,7 +2068,11 @@ def build_h3_video_prompt(
             f"expected={sorted(expected_reference_labels)}, found={sorted(found_reference_labels)}"
         )
     try:
-        optimization = optimize_h3_video_prompt(text, mode=options.mode)
+        optimization = optimize_h3_video_prompt(
+            text,
+            mode=options.mode,
+            failure_mode=options.language_gate_mode,
+        )
     except H3PromptOptimizationBlocked as exc:
         raise PromptBuildError(str(exc)) from exc
     text = optimization.text
@@ -2067,6 +2117,7 @@ def build_consistent_image_prompt(
     extra_direction: str = "",
     *,
     consistency_snapshot: dict | None = None,
+    language_gate_mode: str = "block",
 ) -> H3PromptResult:
     """Compile concise SDXL text conditioning plus an auditable Bible snapshot."""
     style_source = project.style.visual_prompt if project.style else "cinematic production still"
@@ -2162,19 +2213,36 @@ def build_consistent_image_prompt(
     quality_sources.append(
         ("全剧色彩脚本", str(production_settings.get("color_script", "")))
     )
+    project_negative = str(production_settings.get("negative_prompt", ""))
+    style_negative = project.style.negative_prompt if project.style else ""
     negative_sources = [
-        ("全剧负面约束", str(production_settings.get("negative_prompt", ""))),
-        ("视觉风格负面约束", project.style.negative_prompt if project.style else ""),
+        ("全剧负面约束", _translated(
+            project.id, "project", project.id,
+            "project.production_settings.negative_prompt", project_negative,
+        )),
+        ("视觉风格负面约束", _translated(
+            project.id, "project", project.id,
+            "style.negative_prompt", style_negative,
+        )),
         (f"镜头 {shot.number} 负面约束", shot_negative),
     ]
     negative_sources.extend(
-        (f"人物 {character.stable_speaker_id} 负面约束", character.negative_constraints)
+        (f"人物 {character.stable_speaker_id} 负面约束", _translated(
+            project.id, "character", character.id,
+            "character.negative_constraints", character.negative_constraints,
+        ))
         for character in characters
     )
     if shot.scene:
-        negative_sources.append((f"场景 {shot.scene.slug} 负面约束", shot.scene.negative_constraints))
+        negative_sources.append((f"场景 {shot.scene.slug} 负面约束", _translated(
+            project.id, "scene", shot.scene.id,
+            "scene.negative_constraints", shot.scene.negative_constraints,
+        )))
     negative_sources.extend(
-        (f"道具 {prop.slug} 负面约束", prop.negative_constraints)
+        (f"道具 {prop.slug} 负面约束", _translated(
+            project.id, "prop", prop.id,
+            "prop.negative_constraints", prop.negative_constraints,
+        ))
         for prop in shot_props
     )
     quality_sources.extend(negative_sources)
@@ -2202,9 +2270,7 @@ def build_consistent_image_prompt(
     director_text = _PROTECTED_AUTHORED_TEXT_RE.sub("", text)
     if _CJK_RE.search(director_text) and not fields_requiring_rewrite:
         fields_requiring_rewrite.append("未归类图片导演描述")
-    gate_mode = str(
-        getattr(django_settings, "H3_PROMPT_LANGUAGE_GATE", "block")
-    ).strip().lower()
+    gate_mode = str(language_gate_mode or "block").strip().lower()
     if gate_mode not in {"block", "warn"}:
         gate_mode = "block"
     prompt_word_count = len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", text))

@@ -90,6 +90,55 @@ test('Ref2VA first-frame continuity reference is serialized as a soft picture sl
   )
 })
 
+test('style adapters use only backend facts and preserve unknown server identifiers', async (context) => {
+  const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
+  const server = await createServer({
+    root: frontendRoot,
+    logLevel: 'silent',
+    appType: 'custom',
+    server: { middlewareMode: true, hmr: false },
+  })
+  context.after(async () => { await server.close() })
+  const adapters = await server.ssrLoadModule('/src/services/backendAdapters.ts')
+  const backendId = '11111111-1111-4111-8111-111111111111'
+  const [style] = adapters.adaptStyles([{
+    id: backendId,
+    slug: 'wuxia',
+    name: '服务端武侠',
+    category: '服务端分类',
+    description: '服务端说明',
+    visual_prompt: 'server-owned visual prompt',
+    asset_count: 7,
+  }])
+
+  assert.equal(style.name, '服务端武侠')
+  assert.equal(style.description, '服务端说明')
+  assert.equal(style.promptPrefix, 'server-owned visual prompt')
+  assert.deepEqual(style.tags, ['服务端分类'])
+  assert.equal(style.assetCount, 7)
+  assert.equal(adapters.backendStyleId('wuxia'), backendId)
+  assert.equal(adapters.styleSlug(backendId), 'wuxia')
+  assert.equal(adapters.styleSlug('future-server-style'), 'future-server-style')
+  assert.equal(adapters.styleSlug(), '')
+
+  const project = adapters.adaptProjectSummary({
+    id: 'project-1', title: '项目', style: backendId, production_settings: {},
+  })
+  assert.equal(project.styleId, 'wuxia')
+  assert.equal(project.defaultMode, 'T2VA')
+  assert.equal(project.bibleImagePromptConfig.stylePrompt, 'server-owned visual prompt')
+
+  const payload = adapters.projectPayload({ title: '新项目' })
+  assert.equal(payload.production_settings.default_h3_mode, 'T2VA')
+
+  const [withoutCount] = adapters.adaptStyles([{
+    id: '22222222-2222-4222-8222-222222222222',
+    slug: 'server-only',
+    name: '仅服务端风格',
+  }])
+  assert.equal(withoutCount.assetCount, null)
+})
+
 test('prompt artifact adapter keeps backend-authoritative compiler freshness metadata', () => {
   const adapted = adaptPromptArtifact({
     id: 'artifact-1', revision: 7, created_at: '2026-08-10T09:30:00Z',

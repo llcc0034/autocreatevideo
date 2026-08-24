@@ -35,8 +35,6 @@ const rawDeferred = (status = 'waiting_upstream') => ({
   max_attempts: 3,
   next_attempt_at: null,
   extended_generation_confirmed: false,
-  cancel_allowed: true,
-  retry_allowed: false,
   error_code: '',
   error_message: '',
   started_at: null,
@@ -62,8 +60,7 @@ test('deferred generation frontend contract is strict and uses only the public A
   const { repository } = await server.ssrLoadModule('/src/services/repository.ts')
   const { api } = await server.ssrLoadModule('/src/services/api.ts')
   const originalGet = api.get
-  const originalPost = api.post
-  context.after(() => { api.get = originalGet; api.post = originalPost })
+  context.after(() => { api.get = originalGet })
 
   await context.test('adapter accepts only the declared status, frame slot and primary video role', () => {
     const adapted = service.adaptDeferredGenerationRequest(rawDeferred())
@@ -76,40 +73,11 @@ test('deferred generation frontend contract is strict and uses only the public A
     assert.throws(() => service.adaptDeferredGenerationRequest({ ...rawDeferred(), status: 'done' }), /契约无效/)
   })
 
-  await context.test('create and cancel repository methods use closed request bodies', async () => {
-    let postedUrl = ''
-    let postedPayload: Record<string, unknown> = {}
-    api.post = async (url: string, payload: Record<string, unknown>) => {
-      postedUrl = url
-      postedPayload = payload
-      return { data: rawDeferred(url.includes('/cancel/') ? 'cancelled' : 'waiting_upstream') }
-    }
-    const created = await repository.createDeferredGenerationRequest({
-      projectId,
-      sourceTaskId,
-      targetShotId,
-      frameSlot: 'last_frame',
-      idempotencyKey: 'deferred-key',
-    })
-    assert.equal(created.id, requestId)
-    assert.equal(postedUrl, '/deferred-generation-requests/')
-    assert.deepEqual(postedPayload, {
-      project_id: projectId,
-      source_task_id: sourceTaskId,
-      target_shot_id: targetShotId,
-      frame_slot: 'last_frame',
-      idempotency_key: 'deferred-key',
-      priority: 0,
-      max_attempts: 3,
-      extended_generation_confirmed: false,
-    })
-    for (const forbidden of ['output_index', 'template', 'template_id', 'model', 'workflow', 'workflow_id', 'reference_asset']) {
-      assert.equal(forbidden in postedPayload, false)
-    }
-
-    await repository.cancelDeferredGenerationRequest(requestId)
-    assert.equal(postedUrl, `/deferred-generation-requests/${requestId}/cancel/`)
-    assert.deepEqual(postedPayload, {})
+  await context.test('repository exposes diagnostics only', () => {
+    assert.equal('createDeferredGenerationRequest' in repository, false)
+    assert.equal('cancelDeferredGenerationRequest' in repository, false)
+    assert.equal('cancelGenerationTask' in repository, false)
+    assert.equal('retryGenerationTask' in repository, false)
   })
 
   await context.test('list query uses public filters and never reads capability snapshots', async () => {
@@ -126,12 +94,12 @@ test('deferred generation frontend contract is strict and uses only the public A
   })
 })
 
-test('WorkflowView exposes deferred continuity without private task snapshots', () => {
+test('WorkflowView keeps deferred continuity read-only without private task snapshots', () => {
   const workflowView = readFileSync(new URL('../src/views/WorkflowView.vue', import.meta.url), 'utf8')
-  assert.ok(workflowView.includes('衔接后续镜头'))
-  assert.ok(workflowView.includes('repository.createDeferredGenerationRequest'))
   assert.ok(workflowView.includes('repository.getDeferredGenerationRequests({ sourceTask: taskId })'))
-  assert.ok(workflowView.includes('repository.cancelDeferredGenerationRequest'))
-  assert.ok(workflowView.includes('不会提交 output_index、模板、模型、工作流或参考素材'))
+  assert.ok(workflowView.includes('自动连续生成请求'))
+  assert.ok(!workflowView.includes('@click="openDeferredGeneration"'))
+  assert.ok(!workflowView.includes('@click="createDeferredGeneration"'))
+  assert.ok(!workflowView.includes('@click="cancelDeferredGeneration(request)"'))
   assert.ok(!workflowView.includes('capability_snapshot'))
 })

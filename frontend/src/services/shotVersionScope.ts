@@ -8,14 +8,3 @@ export const normalizeShotVersionScopeKey = (
   value: string | undefined,
   episodeId: string,
 ): string => String(value || '').trim() || legacyShotVersionKey(episodeId)
-
-export const wholeEpisodeRetryStoragePrefix = (episodeId: string): string =>
-  `cineforge_whole_episode_idempotency_${String(episodeId || '').trim()}`
-
-export const wholeEpisodeRetryStorageKey = (
-  episodeId: string,
-  shotVersionKey: string | undefined,
-): string => {
-  const normalized = normalizeShotVersionScopeKey(shotVersionKey, episodeId)
-  return `${wholeEpisodeRetryStoragePrefix(episodeId)}_${encodeURIComponent(normalized)}`
-}

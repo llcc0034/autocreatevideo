@@ -17,7 +17,20 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
 
 DEPLOYMENT_PROFILE = os.getenv("AUTOPROMPT_DEPLOYMENT_PROFILE", "development").strip().casefold()
+# A restart-required revision may only be activated by a process from a later
+# application boot.  Local restart.ps1 supplies one UUID for migrations, API,
+# and workers.  Other launchers intentionally leave this empty until they can
+# provide an equally reliable per-boot identity.
+AUTOPROMPT_BOOT_ID = os.getenv("AUTOPROMPT_BOOT_ID", "").strip()
 SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-change-me-autoprompt-studio")
+JWT_SIGNING_KEY = os.getenv(
+    "AUTOPROMPT_JWT_SIGNING_KEY",
+    "dev-only-independent-jwt-signing-key-2026-change-me",
+)
+if len(JWT_SIGNING_KEY.encode("utf-8")) < 32:
+    raise ImproperlyConfigured("AUTOPROMPT_JWT_SIGNING_KEY must contain at least 32 UTF-8 bytes")
+if JWT_SIGNING_KEY == SECRET_KEY:
+    raise ImproperlyConfigured("AUTOPROMPT_JWT_SIGNING_KEY must differ from DJANGO_SECRET_KEY")
 DEBUG = os.getenv("DJANGO_DEBUG", "true").lower() in {"1", "true", "yes", "on"}
 ALLOWED_HOSTS = [x.strip() for x in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1,testserver").split(",") if x.strip()]
 
@@ -114,16 +127,6 @@ ASSET_LIBRARY_URL = "/assets/"
 ASSET_LIBRARY_ROOT = BASE_DIR.parent / "assets"
 SERVE_ASSETS_WITH_DJANGO = os.getenv("SERVE_ASSETS_WITH_DJANGO", "false").lower() in {"1", "true", "yes", "on"}
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
-ALLOW_PUBLIC_REGISTRATION = os.getenv("ALLOW_PUBLIC_REGISTRATION", "false").lower() in {"1", "true", "yes", "on"}
-ASSET_UPLOAD_MAX_BYTES = int(os.getenv("ASSET_UPLOAD_MAX_BYTES", str(10 * 1024 * 1024)))
-ASSET_VIDEO_MAX_BYTES = int(os.getenv("ASSET_VIDEO_MAX_BYTES", str(250 * 1024 * 1024)))
-ASSET_AUDIO_MAX_BYTES = int(os.getenv("ASSET_AUDIO_MAX_BYTES", str(50 * 1024 * 1024)))
-ASSET_TENANT_QUOTA_BYTES = int(os.getenv("ASSET_TENANT_QUOTA_BYTES", str(2 * 1024 * 1024 * 1024)))
-ASSET_IMAGE_MAX_WIDTH = int(os.getenv("ASSET_IMAGE_MAX_WIDTH", "8192"))
-ASSET_IMAGE_MAX_HEIGHT = int(os.getenv("ASSET_IMAGE_MAX_HEIGHT", "8192"))
-ASSET_IMAGE_MAX_PIXELS = int(os.getenv("ASSET_IMAGE_MAX_PIXELS", "40000000"))
-MEDIA_SIGNED_URL_MAX_AGE_SECONDS = int(os.getenv("MEDIA_SIGNED_URL_MAX_AGE_SECONDS", "900"))
-
 CORS_ALLOWED_ORIGINS = [x.strip() for x in os.getenv(
     "CORS_ALLOWED_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
 ).split(",") if x.strip()]
@@ -132,7 +135,7 @@ CSRF_TRUSTED_ORIGINS = [x.strip() for x in os.getenv("CSRF_TRUSTED_ORIGINS", "")
 X_FRAME_OPTIONS = "DENY"
 
 REST_FRAMEWORK = {
-    "DEFAULT_AUTHENTICATION_CLASSES": ("rest_framework_simplejwt.authentication.JWTAuthentication",),
+    "DEFAULT_AUTHENTICATION_CLASSES": ("studio.authentication.StudioJWTAuthentication",),
     "DEFAULT_PERMISSION_CLASSES": ("rest_framework.permissions.IsAuthenticated",),
     "DEFAULT_SCHEMA_CLASS": "drf_spectacular.openapi.AutoSchema",
     "DEFAULT_FILTER_BACKENDS": (
@@ -142,15 +145,10 @@ REST_FRAMEWORK = {
     ),
     "DEFAULT_PAGINATION_CLASS": "studio.pagination.StandardPageNumberPagination",
     "DEFAULT_THROTTLE_CLASSES": (
-        "rest_framework.throttling.AnonRateThrottle",
-        "rest_framework.throttling.UserRateThrottle",
+        "studio.throttling.DatabaseAnonRateThrottle",
+        "studio.throttling.DatabaseUserRateThrottle",
+        "studio.throttling.DatabaseScopedRateThrottle",
     ),
-    "DEFAULT_THROTTLE_RATES": {
-        "anon": os.getenv("THROTTLE_ANON_RATE", "60/minute"),
-        "user": os.getenv("THROTTLE_USER_RATE", "600/minute"),
-        "registration": os.getenv("THROTTLE_REGISTRATION_RATE", "5/hour"),
-        "asset_upload": os.getenv("THROTTLE_ASSET_UPLOAD_RATE", "30/hour"),
-    },
     # Production traffic traverses the external TLS terminator and the bundled
     # Nginx container.  The terminator must overwrite X-Forwarded-For; DRF then
     # selects the address before those two trusted hops for anonymous limits.
@@ -162,6 +160,8 @@ REST_FRAMEWORK = {
 }
 
 SIMPLE_JWT = {
+    "ALGORITHM": "HS256",
+    "SIGNING_KEY": JWT_SIGNING_KEY,
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=30),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=14),
     "ROTATE_REFRESH_TOKENS": True,
@@ -175,7 +175,6 @@ SPECTACULAR_SETTINGS = {
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,
     "COMPONENT_SPLIT_REQUEST": True,
-    "SECURITY": [{"jwtAuth": []}],
     "ENUM_NAME_OVERRIDES": {
         "AssetKindEnum": "studio.models.Asset.Kind",
         "MediaKindEnum": "studio.models.Shot.MediaType",
@@ -211,58 +210,75 @@ SPECTACULAR_SETTINGS = {
         "CreativeDraftStatusEnum": "studio.models.EpisodeCreativeDraft.Status",
         "DeferredGenerationStatusEnum": "studio.models.DeferredGenerationRequest.Status",
         "DeferredFrameSlotEnum": "studio.models.DeferredGenerationRequest.FrameSlot",
+        "ProviderDriverTypeEnum": "studio.models.ProviderProfile.DriverType",
+        "ModelProfileModalityEnum": "studio.models.ModelProfileVersion.Modality",
+        "PublishedVersionStatusEnum": "studio.models.ModelProfileVersion.Status",
+        "ModelDeploymentStatusEnum": "studio.models.ModelDeployment.Status",
+        "ModelArtifactRoleEnum": "studio.models.ModelArtifact.Role",
+        "AccessRoleEnum": ("member", "platform_admin", "super_admin"),
+        "ModelArtifactStatusEnum": "studio.models.ModelArtifact.Status",
+        "PromptFieldValueTypeEnum": "studio.models.PromptFieldDefinition.ValueType",
+        "PromptProfileReviewStateEnum": "studio.models.PromptProfileVersion.ReviewState",
+        "PromptProfileSourceSelectorEnum": "studio.models.PromptProfileFieldRule.SourceSelector",
+        "PromptProfileChannelEnum": "studio.models.PromptProfileFieldRule.Channel",
+        "PromptProfileLabelStyleEnum": "studio.models.PromptProfileFieldRule.LabelStyle",
+        "PromptProfileSeparatorEnum": "studio.models.PromptProfileFieldRule.Separator",
+        "WorkflowVersionStatusEnum": "studio.models.WorkflowTemplateVersion.Status",
+        "WorkflowValidationStateEnum": "studio.models.WorkflowTemplateVersion.ValidationState",
+        "ConfigValueTypeEnum": "studio.models.ConfigDefinition.ValueType",
+        "ConfigScopeTypeEnum": "studio.models.ConfigRevision.ScopeType",
+        "ConfigRevisionStatusEnum": "studio.models.ConfigRevision.Status",
+        "RuntimeHostStatusEnum": "studio.models.RuntimeHost.Status",
+        "HostProbeStatusEnum": "studio.models.HostCapabilitySnapshot.ProbeStatus",
+        "RuntimeModelAvailabilityStatusEnum": "studio.models.RuntimeModelAvailability.Status",
+        "RecommendationStatusEnum": "studio.models.RecommendationSnapshot.Status",
+        "ScriptSourceTypeEnum": "studio.models.ScriptSource.SourceType",
+        "ScriptSourceFormatEnum": "studio.models.ScriptSource.SourceFormat",
+        "ScriptSourceStatusEnum": "studio.models.ScriptSource.Status",
+        "ScriptRevisionStatusEnum": "studio.models.ScriptRevision.Status",
+        "ProductionRunStatusEnum": "studio.models.ProductionRun.Status",
+        "ProductionStageStatusEnum": "studio.models.StageRun.Status",
+        "ApprovalDecisionEnum": "studio.models.ApprovalDecision.Decision",
+        "RecommendationDecisionEnum": "studio.models.RecommendationDecision.Decision",
+        "GenerationAttemptStatusEnum": "studio.models.GenerationAttempt.Status",
+        "GenerationAttemptResolutionOutcomeEnum": "studio.models.GenerationAttemptResolution.Outcome",
+        "SmokeAttemptResolutionOutcomeEnum": "studio.models.ModelDeploymentSmokeAttemptResolution.Outcome",
+        "GeneratedArtifactKindEnum": "studio.models.GeneratedArtifact.Kind",
+        "GeneratedArtifactStatusEnum": "studio.models.GeneratedArtifact.Status",
+        "ModelTransportEnum": ("local_process", "remote_api"),
+        "BibleImageTransportEnum": ("local",),
     },
 }
 
-COMFYUI_BASE_URL = os.getenv("COMFYUI_BASE_URL", "http://127.0.0.1:8188").rstrip("/")
-COMFYUI_CLIENT_ID = os.getenv("COMFYUI_CLIENT_ID", "autoprompt-studio")
-COMFYUI_TIMEOUT_SECONDS = float(os.getenv("COMFYUI_TIMEOUT_SECONDS", "30"))
 COMFYUI_OUTPUT_DIR = os.getenv("COMFYUI_OUTPUT_DIR", "")
 COMFYUI_ALLOW_NON_LOOPBACK = os.getenv("COMFYUI_ALLOW_NON_LOOPBACK", "false").lower() in {"1", "true", "yes", "on"}
+AI_PROVIDER_ALLOWED_HOSTS = tuple(
+    item.strip().casefold()
+    for item in os.getenv(
+        "AI_PROVIDER_ALLOWED_HOSTS",
+        "localhost,127.0.0.1,::1",
+    ).split(",")
+    if item.strip()
+)
 COMFYUI_EXTRA_ALLOWED_NODE_TYPES = tuple(
     item.strip() for item in os.getenv("COMFYUI_EXTRA_ALLOWED_NODE_TYPES", "").split(",") if item.strip()
 )
-MINIMAX_H3_MODEL = os.getenv("MINIMAX_H3_MODEL", "minimax-h3")
-VIDEO_SHOT_MIN_DURATION_MS = int(os.getenv("VIDEO_SHOT_MIN_DURATION_MS", "5000"))
-VIDEO_SHOT_MAX_DURATION_MS = int(os.getenv("VIDEO_SHOT_MAX_DURATION_MS", "15000"))
-H3_MIN_ALIGNED_FRAMES = int(os.getenv("H3_MIN_ALIGNED_FRAMES", "124"))
-H3_MAX_ALIGNED_FRAMES = int(os.getenv("H3_MAX_ALIGNED_FRAMES", "362"))
-if not 1 <= VIDEO_SHOT_MIN_DURATION_MS <= VIDEO_SHOT_MAX_DURATION_MS:
-    raise ImproperlyConfigured(
-        "VIDEO_SHOT_MIN_DURATION_MS and VIDEO_SHOT_MAX_DURATION_MS must define "
-        "a positive ordered range"
-    )
+# Retired draft-only services still need a fixed parser envelope while their
+# historical records remain readable. Active request validation and workflow
+# compilation resolve the versioned database configuration instead.
+LEGACY_VIDEO_SHOT_MIN_DURATION_MS = 5000
+LEGACY_VIDEO_SHOT_MAX_DURATION_MS = 15000
 SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS = int(
     os.getenv("SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS", "60")
 )
 if (
     SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS < 1
     or SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS * 1000
-    < VIDEO_SHOT_MIN_DURATION_MS
+    < LEGACY_VIDEO_SHOT_MIN_DURATION_MS
 ):
     raise ImproperlyConfigured(
         "SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS must be positive and "
-        "long enough for one configured minimum-duration video shot"
-    )
-if not 1 <= H3_MIN_ALIGNED_FRAMES <= H3_MAX_ALIGNED_FRAMES:
-    raise ImproperlyConfigured(
-        "H3_MIN_ALIGNED_FRAMES and H3_MAX_ALIGNED_FRAMES must define a positive "
-        "ordered range"
-    )
-
-
-def _configured_h3_aligned_frames(duration_ms: int) -> int:
-    requested = max(5, round(duration_ms * 24 / 1000))
-    return requested + (5 - requested % 17) % 17
-
-
-if (
-    _configured_h3_aligned_frames(VIDEO_SHOT_MIN_DURATION_MS) < H3_MIN_ALIGNED_FRAMES
-    or _configured_h3_aligned_frames(VIDEO_SHOT_MAX_DURATION_MS) > H3_MAX_ALIGNED_FRAMES
-):
-    raise ImproperlyConfigured(
-        "VIDEO_SHOT duration bounds must align inside H3_MIN_ALIGNED_FRAMES and "
-        "H3_MAX_ALIGNED_FRAMES"
+        "long enough for one legacy minimum-duration video shot"
     )
 
 
@@ -277,102 +293,20 @@ def _strict_environment_boolean(name: str, default: str) -> bool:
     )
 
 
-SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS = int(
-    os.getenv("SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS", "5000")
-)
-SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY = _strict_environment_boolean(
-    "SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY", "false",
-)
-SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY = _strict_environment_boolean(
-    "SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY", "false",
-)
-SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS = int(
-    os.getenv("SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS", "320")
-)
-SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS = int(
-    os.getenv("SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS", "220")
-)
-if not (
-    VIDEO_SHOT_MIN_DURATION_MS
-    <= SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS
-    <= VIDEO_SHOT_MAX_DURATION_MS
-):
-    raise ImproperlyConfigured(
-        "SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS must stay inside the configured "
-        "VIDEO_SHOT duration range"
-    )
-if not (
-    1
-    <= SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS
-    <= SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS
-):
-    raise ImproperlyConfigured(
-        "SCRIPT_BREAKDOWN_AUTO_SPLIT_TARGET_CHARS and "
-        "SCRIPT_BREAKDOWN_AUTO_SPLIT_TRIGGER_CHARS must define a positive ordered range"
-    )
-H3_PROMPT_OPTIMIZER = {
-    # Privacy-first default: no prompt leaves this process until an operator
-    # explicitly enables and configures an OpenAI-compatible endpoint.
-    "enabled": os.getenv("H3_PROMPT_OPTIMIZER_ENABLED", "false").lower() in {"1", "true", "yes", "on"},
-    "base_url": os.getenv("H3_PROMPT_OPTIMIZER_BASE_URL", "").strip(),
-    "api_key": os.getenv("H3_PROMPT_OPTIMIZER_API_KEY", "").strip(),
-    "model": os.getenv("H3_PROMPT_OPTIMIZER_MODEL", "MiniMax-M2.7").strip(),
-    "allow_non_loopback": os.getenv("H3_PROMPT_OPTIMIZER_ALLOW_NON_LOOPBACK", "false").lower()
-    in {"1", "true", "yes", "on"},
-    "timeout_seconds": float(os.getenv("H3_PROMPT_OPTIMIZER_TIMEOUT_SECONDS", "60")),
-    "failure_mode": os.getenv("H3_PROMPT_OPTIMIZER_FAILURE_MODE", "warn").strip().lower(),
-}
-H3_PROMPT_LANGUAGE_GATE = os.getenv("H3_PROMPT_LANGUAGE_GATE", "block").strip().lower()
-if H3_PROMPT_LANGUAGE_GATE not in {"block", "warn"}:
-    raise ImproperlyConfigured("H3_PROMPT_LANGUAGE_GATE must be either 'block' or 'warn'")
-
-# Optional remote prompt translation/expansion provider.  The API key stays in
-# the backend process environment and must never be returned by capability APIs
-# or sent to the browser.  Selecting this provider explicitly allows the
-# relevant prompt and project context to leave the local deployment.
+# Retired creative-draft compatibility constants. New text execution is
+# represented by ProviderProfile/ModelProfileVersion/ModelDeployment and an
+# encrypted SecretBinding. No credential or endpoint is read from settings.
 DEEPSEEK_API = {
-    "enabled": os.getenv("DEEPSEEK_ENABLED", "false").lower()
-    in {"1", "true", "yes", "on"},
-    "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com").strip(),
-    "api_key": os.getenv("DEEPSEEK_API_KEY", "").strip(),
-    "model": os.getenv("DEEPSEEK_MODEL", "deepseek-v4-flash").strip(),
-    "timeout_seconds": float(os.getenv("DEEPSEEK_TIMEOUT_SECONDS", "180")),
-    "series_concept_timeout_seconds": float(
-        os.getenv("DEEPSEEK_SERIES_CONCEPT_TIMEOUT_SECONDS", "900")
-    ),
-    "max_retries": int(os.getenv("DEEPSEEK_MAX_RETRIES", "1")),
-    "max_tokens": int(os.getenv("DEEPSEEK_MAX_TOKENS", "16384")),
-    # DeepSeek V4 exposes a much larger model output capability than the
-    # legacy creative/translation budget above. Series concept generation
-    # sends this provider capability verbatim; it is not derived from episode
-    # or shot counts and therefore is not a product-volume gate.
-    "series_concept_max_tokens": int(
-        os.getenv("DEEPSEEK_SERIES_CONCEPT_MAX_TOKENS", "384000")
-    ),
+    "enabled": False,
+    "base_url": "",
+    "api_key": "",
+    "model": "",
+    "timeout_seconds": 180.0,
+    "series_concept_timeout_seconds": 600.0,
+    "max_retries": 0,
+    "max_tokens": 16384,
+    "series_concept_max_tokens": 16384,
 }
-if DEEPSEEK_API["timeout_seconds"] <= 0:
-    raise ImproperlyConfigured("DEEPSEEK_TIMEOUT_SECONDS must be greater than zero")
-if not 0 < DEEPSEEK_API["series_concept_timeout_seconds"] <= 3600:
-    raise ImproperlyConfigured(
-        "DEEPSEEK_SERIES_CONCEPT_TIMEOUT_SECONDS must be greater than zero "
-        "and no more than 3600"
-    )
-if not 0 <= DEEPSEEK_API["max_retries"] <= 3:
-    raise ImproperlyConfigured("DEEPSEEK_MAX_RETRIES must be between 0 and 3")
-if DEEPSEEK_API["max_tokens"] < 1:
-    raise ImproperlyConfigured("DEEPSEEK_MAX_TOKENS must be greater than zero")
-if DEEPSEEK_API["series_concept_max_tokens"] < 1:
-    raise ImproperlyConfigured(
-        "DEEPSEEK_SERIES_CONCEPT_MAX_TOKENS must be greater than zero"
-    )
-if not DEEPSEEK_API["base_url"]:
-    raise ImproperlyConfigured("DEEPSEEK_BASE_URL must not be empty")
-if not DEEPSEEK_API["model"]:
-    raise ImproperlyConfigured("DEEPSEEK_MODEL must not be empty")
-if DEEPSEEK_API["enabled"] and not DEEPSEEK_API["api_key"]:
-    raise ImproperlyConfigured(
-        "DEEPSEEK_API_KEY must be set when DEEPSEEK_ENABLED is true"
-    )
 
 
 # Human-review guidance is deliberately separate from model transport/schema
@@ -492,15 +426,15 @@ def _validate_creative_provider_policy(config: dict, prefix: str) -> None:
             f"{prefix}_MIN_SHOT_DURATION_MS must not exceed "
             f"{prefix}_MAX_SHOT_DURATION_MS"
         )
-    if config["min_shot_duration_ms"] < VIDEO_SHOT_MIN_DURATION_MS:
+    if config["min_shot_duration_ms"] < LEGACY_VIDEO_SHOT_MIN_DURATION_MS:
         raise ImproperlyConfigured(
             f"{prefix}_MIN_SHOT_DURATION_MS must not be less than "
-            "VIDEO_SHOT_MIN_DURATION_MS"
+            "LEGACY_VIDEO_SHOT_MIN_DURATION_MS"
         )
-    if config["max_shot_duration_ms"] > VIDEO_SHOT_MAX_DURATION_MS:
+    if config["max_shot_duration_ms"] > LEGACY_VIDEO_SHOT_MAX_DURATION_MS:
         raise ImproperlyConfigured(
             f"{prefix}_MAX_SHOT_DURATION_MS must not exceed "
-            "VIDEO_SHOT_MAX_DURATION_MS"
+            "LEGACY_VIDEO_SHOT_MAX_DURATION_MS"
         )
     if int(config["output_dialogue_char_threshold"]) < 0:
         raise ImproperlyConfigured(
@@ -518,7 +452,7 @@ DEEPSEEK_CREATIVE = {
     "recommended_max_shots": int(
         os.getenv("DEEPSEEK_CREATIVE_RECOMMENDED_MAX_SHOTS", "4")
     ),
-    "batch_shots": int(os.getenv("DEEPSEEK_CREATIVE_BATCH_SHOTS", "1")),
+    "batch_shots": 1,
     "max_dialogue_per_shot": int(
         os.getenv("DEEPSEEK_CREATIVE_MAX_DIALOGUE_PER_SHOT", "2")
     ),
@@ -537,13 +471,13 @@ DEEPSEEK_CREATIVE = {
     "min_shot_duration_ms": int(
         os.getenv(
             "DEEPSEEK_CREATIVE_MIN_SHOT_DURATION_MS",
-            str(VIDEO_SHOT_MIN_DURATION_MS),
+            str(LEGACY_VIDEO_SHOT_MIN_DURATION_MS),
         )
     ),
     "max_shot_duration_ms": int(
         os.getenv(
             "DEEPSEEK_CREATIVE_MAX_SHOT_DURATION_MS",
-            str(VIDEO_SHOT_MAX_DURATION_MS),
+            str(LEGACY_VIDEO_SHOT_MAX_DURATION_MS),
         )
     ),
     "output_min_tokens": int(
@@ -587,10 +521,6 @@ def _validate_prompt_provider(value: str, setting_name: str) -> str:
     return provider
 
 
-PROMPT_TRANSLATION_DEFAULT_PROVIDER = _validate_prompt_provider(
-    os.getenv("PROMPT_TRANSLATION_DEFAULT_PROVIDER", "local_qwen"),
-    "PROMPT_TRANSLATION_DEFAULT_PROVIDER",
-)
 PROMPT_CREATIVE_DEFAULT_PROVIDER = _validate_prompt_provider(
     os.getenv("PROMPT_CREATIVE_DEFAULT_PROVIDER", "local_qwen"),
     "PROMPT_CREATIVE_DEFAULT_PROVIDER",
@@ -627,35 +557,14 @@ SERIES_CONCEPT_DRAFT_PROVIDER_SUITABILITY = {
     ),
 }
 
-# Human-reviewed local translation.  The model is loaded in a disposable child
-# process only for a translation request and exits before any ComfyUI task is
-# submitted.  CPU remains the safe default for the 8 GB GTX 1070 workstation.
-# CUDA is opt-in and must point at a separately installed CUDA llama.cpp
-# runtime; the request runtime verifies GPU offload and never falls back to CPU.
-_QWEN_GPU_LAYERS_RAW = os.getenv("QWEN_GPU_LAYERS", "-1").strip()
-try:
-    QWEN_GPU_LAYERS = int(_QWEN_GPU_LAYERS_RAW)
-except ValueError as exc:
-    raise ImproperlyConfigured("QWEN_GPU_LAYERS must be an integer; use -1 for all layers") from exc
-if QWEN_GPU_LAYERS < -1:
-    raise ImproperlyConfigured("QWEN_GPU_LAYERS must be -1 or a non-negative integer")
-
-
-def _validate_qwen_device(value: str, setting_name: str) -> str:
-    device = str(value or "cpu").strip().lower()
-    if device not in {"cpu", "cuda"}:
-        raise ImproperlyConfigured(f"{setting_name} must be either 'cpu' or 'cuda'")
-    if device == "cuda" and QWEN_GPU_LAYERS == 0:
-        raise ImproperlyConfigured(
-            "QWEN_GPU_LAYERS must be -1 or greater than zero when Qwen CUDA is enabled; "
-            "zero would silently disable GPU offload"
-        )
-    return device
+# The disposable Qwen process bridge is retired. Keep its in-memory policy
+# shape only so historical validators can load; it is deliberately disabled
+# and no longer consumes the former local-process environment variables.
+LEGACY_QWEN_GPU_LAYERS = 0
 
 
 LOCAL_PROMPT_TRANSLATION = {
-    "enabled": os.getenv("QWEN_TRANSLATION_ENABLED", os.getenv("LOCAL_PROMPT_TRANSLATION_ENABLED", "true")).lower()
-    in {"1", "true", "yes", "on"},
+    "enabled": False,
     "model_id": os.getenv(
         "QWEN_TRANSLATION_MODEL_ID",
         os.getenv("LOCAL_PROMPT_TRANSLATION_MODEL_ID", "Qwen/Qwen3-4B-GGUF"),
@@ -668,15 +577,9 @@ LOCAL_PROMPT_TRANSLATION = {
         "QWEN_TRANSLATION_RUNTIME_SCRIPT",
         os.getenv("LOCAL_PROMPT_TRANSLATION_RUNTIME_SCRIPT", str(BASE_DIR.parent / "scripts" / "qwen_translate_once.py")),
     ).strip(),
-    "runtime_python": os.getenv(
-        "QWEN_TRANSLATION_RUNTIME_PYTHON",
-        os.getenv("LOCAL_PROMPT_TRANSLATION_RUNTIME_PYTHON", str(BASE_DIR.parent / ".runtime" / "qwen-python" / "Scripts" / "python.exe")),
-    ).strip(),
-    "device": _validate_qwen_device(
-        os.getenv("QWEN_TRANSLATION_DEVICE", os.getenv("LOCAL_PROMPT_TRANSLATION_DEVICE", "cpu")),
-        "QWEN_TRANSLATION_DEVICE",
-    ),
-    "gpu_layers": QWEN_GPU_LAYERS,
+    "runtime_python": "",
+    "device": "cpu",
+    "gpu_layers": LEGACY_QWEN_GPU_LAYERS,
     "timeout_seconds": float(os.getenv("QWEN_TRANSLATION_TIMEOUT_SECONDS", os.getenv("LOCAL_PROMPT_TRANSLATION_TIMEOUT_SECONDS", "300"))),
     "max_new_tokens": int(os.getenv("QWEN_TRANSLATION_MAX_NEW_TOKENS", os.getenv("LOCAL_PROMPT_TRANSLATION_MAX_NEW_TOKENS", "768"))),
 }
@@ -686,8 +589,7 @@ LOCAL_PROMPT_TRANSLATION = {
 # prevents a 768-token translation limit from silently truncating storyboards.
 LOCAL_QWEN_CREATIVE = {
     **CREATIVE_DRAFT_REVIEW,
-    "enabled": os.getenv("QWEN_CREATIVE_ENABLED", "true").lower()
-    in {"1", "true", "yes", "on"},
+    "enabled": False,
     "model_id": os.getenv(
         "QWEN_CREATIVE_MODEL_ID", LOCAL_PROMPT_TRANSLATION["model_id"],
     ).strip(),
@@ -697,13 +599,9 @@ LOCAL_QWEN_CREATIVE = {
     "runtime_script": os.getenv(
         "QWEN_CREATIVE_RUNTIME_SCRIPT", LOCAL_PROMPT_TRANSLATION["runtime_script"],
     ).strip(),
-    "runtime_python": os.getenv(
-        "QWEN_CREATIVE_RUNTIME_PYTHON", LOCAL_PROMPT_TRANSLATION["runtime_python"],
-    ).strip(),
-    "device": _validate_qwen_device(
-        os.getenv("QWEN_CREATIVE_DEVICE", "cpu"), "QWEN_CREATIVE_DEVICE",
-    ),
-    "gpu_layers": QWEN_GPU_LAYERS,
+    "runtime_python": "",
+    "device": "cpu",
+    "gpu_layers": LEGACY_QWEN_GPU_LAYERS,
     # Child inference deadline and parent cleanup grace are independently
     # configurable so operators can size them for the selected runtime.
     "timeout_seconds": float(os.getenv("QWEN_CREATIVE_TIMEOUT_SECONDS", "900")),
@@ -740,13 +638,13 @@ LOCAL_QWEN_CREATIVE = {
     "min_shot_duration_ms": int(
         os.getenv(
             "QWEN_CREATIVE_MIN_SHOT_DURATION_MS",
-            str(VIDEO_SHOT_MIN_DURATION_MS),
+            str(LEGACY_VIDEO_SHOT_MIN_DURATION_MS),
         )
     ),
     "max_shot_duration_ms": int(
         os.getenv(
             "QWEN_CREATIVE_MAX_SHOT_DURATION_MS",
-            str(VIDEO_SHOT_MAX_DURATION_MS),
+            str(LEGACY_VIDEO_SHOT_MAX_DURATION_MS),
         )
     ),
     "output_min_tokens": int(os.getenv("QWEN_CREATIVE_OUTPUT_MIN_TOKENS", "1024")),
@@ -886,8 +784,8 @@ SHOT_DETAIL_POLICY = {
     "maximum_generation_number": int(
         os.getenv("SHOT_DETAIL_MAX_GENERATION_NUMBER", "1000000")
     ),
-    "minimum_duration_ms": VIDEO_SHOT_MIN_DURATION_MS,
-    "maximum_duration_ms": VIDEO_SHOT_MAX_DURATION_MS,
+    "minimum_duration_ms": LEGACY_VIDEO_SHOT_MIN_DURATION_MS,
+    "maximum_duration_ms": LEGACY_VIDEO_SHOT_MAX_DURATION_MS,
     "max_attempts": int(os.getenv("SHOT_DETAIL_MAX_ATTEMPTS", "3")),
     "retry_seconds": float(os.getenv("SHOT_DETAIL_RETRY_SECONDS", "5")),
     "stale_minutes": int(os.getenv("SHOT_DETAIL_STALE_MINUTES", "30")),
@@ -1009,57 +907,35 @@ if (
 LOCAL_QWEN_LOCK_PATH = os.getenv(
     "LOCAL_QWEN_LOCK_PATH", str(BASE_DIR.parent / ".runtime" / "locks" / "local-qwen.lock"),
 ).strip()
-TASK_WORKER_POLL_SECONDS = float(os.getenv("TASK_WORKER_POLL_SECONDS", "2"))
+# Hard deployment ceiling for the local worker pool. Product defaults and
+# recommended concurrency come from versioned configuration and host evidence.
 TASK_MAX_CONCURRENT = int(os.getenv("TASK_MAX_CONCURRENT", "1"))
-TASK_RECOMMENDED_MAX_PENDING = int(os.getenv("TASK_RECOMMENDED_MAX_PENDING", "20"))
-TASK_RECOMMENDED_MAX_ACTIVE_PER_USER = int(
-    os.getenv("TASK_RECOMMENDED_MAX_ACTIVE_PER_USER", "5")
-)
-for _task_limit_name, _task_limit in (
-    ("TASK_MAX_CONCURRENT", TASK_MAX_CONCURRENT),
-    ("TASK_RECOMMENDED_MAX_PENDING", TASK_RECOMMENDED_MAX_PENDING),
-    ("TASK_RECOMMENDED_MAX_ACTIVE_PER_USER", TASK_RECOMMENDED_MAX_ACTIVE_PER_USER),
-):
-    if _task_limit < 1:
-        raise ImproperlyConfigured(f"{_task_limit_name} must be greater than zero")
-if TASK_RECOMMENDED_MAX_ACTIVE_PER_USER > TASK_RECOMMENDED_MAX_PENDING:
-    raise ImproperlyConfigured(
-        "TASK_RECOMMENDED_MAX_ACTIVE_PER_USER must not exceed "
-        "TASK_RECOMMENDED_MAX_PENDING"
-    )
+if TASK_MAX_CONCURRENT < 1:
+    raise ImproperlyConfigured("TASK_MAX_CONCURRENT must be greater than zero")
 SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS = int(
     os.getenv("SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS", "1000000")
 )
 if SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS < 1:
     raise ImproperlyConfigured("SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS must be greater than zero")
-TASK_GENERATION_TIMEOUT_SECONDS = float(os.getenv("TASK_GENERATION_TIMEOUT_SECONDS", "21600"))
-TASK_REMOTE_POLL_SECONDS = float(os.getenv("TASK_REMOTE_POLL_SECONDS", "1"))
-TASK_HEARTBEAT_SECONDS = float(os.getenv("TASK_HEARTBEAT_SECONDS", "5"))
 TASK_PROGRESS_WEBSOCKET_ENABLED = os.getenv(
     "TASK_PROGRESS_WEBSOCKET_ENABLED", "true",
 ).lower() in {"1", "true", "yes", "on"}
-TASK_HEALTH_CHECK_INTERVAL_SECONDS = float(os.getenv("TASK_HEALTH_CHECK_INTERVAL_SECONDS", "5"))
-TASK_HEALTH_FAILURE_LIMIT = int(os.getenv("TASK_HEALTH_FAILURE_LIMIT", "3"))
-TASK_REMOTE_MISSING_GRACE_SECONDS = float(os.getenv("TASK_REMOTE_MISSING_GRACE_SECONDS", "5"))
-TASK_CANCEL_GRACE_SECONDS = float(os.getenv("TASK_CANCEL_GRACE_SECONDS", "30"))
-TASK_STALL_THRESHOLD_SECONDS = float(os.getenv("TASK_STALL_THRESHOLD_SECONDS", "30"))
-TASK_STALE_RECOVERY_INTERVAL_SECONDS = float(os.getenv("TASK_STALE_RECOVERY_INTERVAL_SECONDS", "5"))
 READINESS_WORKER_MAX_AGE_SECONDS = int(os.getenv("READINESS_WORKER_MAX_AGE_SECONDS", "30"))
 READINESS_MIN_DISK_FREE_BYTES = int(os.getenv("READINESS_MIN_DISK_FREE_BYTES", str(512 * 1024 * 1024)))
 READINESS_COMFYUI_REQUIRED = os.getenv("READINESS_COMFYUI_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
 READINESS_COMFYUI_TIMEOUT_SECONDS = float(os.getenv("READINESS_COMFYUI_TIMEOUT_SECONDS", "2"))
 READINESS_GENERATION_WORKER_REQUIRED = os.getenv("READINESS_GENERATION_WORKER_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
+READINESS_TEXT_GENERATION_WORKER_REQUIRED = os.getenv(
+    "READINESS_TEXT_GENERATION_WORKER_REQUIRED", "true",
+).lower() in {"1", "true", "yes", "on"}
 READINESS_ASSEMBLY_WORKER_REQUIRED = os.getenv("READINESS_ASSEMBLY_WORKER_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
 WORKER_HEARTBEAT_INTERVAL_SECONDS = float(os.getenv("WORKER_HEARTBEAT_INTERVAL_SECONDS", "5"))
 FFMPEG_BINARY = os.getenv("FFMPEG_BINARY", "ffmpeg")
 FFPROBE_BINARY = os.getenv("FFPROBE_BINARY", "ffprobe")
-ASSEMBLY_TIMEOUT_SECONDS = float(os.getenv("ASSEMBLY_TIMEOUT_SECONDS", "7200"))
 ASSEMBLY_WORKER_POLL_SECONDS = float(os.getenv("ASSEMBLY_WORKER_POLL_SECONDS", "1"))
 ASSEMBLY_HEARTBEAT_SECONDS = float(os.getenv("ASSEMBLY_HEARTBEAT_SECONDS", "5"))
 ASSEMBLY_STALE_MINUTES = float(os.getenv("ASSEMBLY_STALE_MINUTES", "30"))
 ASSEMBLY_RECOVERY_INTERVAL_SECONDS = float(os.getenv("ASSEMBLY_RECOVERY_INTERVAL_SECONDS", "60"))
-ASSEMBLY_AI_LABEL_ENABLED = os.getenv("ASSEMBLY_AI_LABEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-ASSEMBLY_AI_LABEL_TEXT = os.getenv("ASSEMBLY_AI_LABEL_TEXT", "AI-generated · MiniMax H3")[:120]
 ASSEMBLY_AI_LABEL_FONTFILE = os.getenv("ASSEMBLY_AI_LABEL_FONTFILE", "")
 # A task output is a private production master.  Public downloads are separate,
 # content-addressed distribution copies with a visible disclosure and embedded
@@ -1097,6 +973,7 @@ validate_production_configuration(
     profile=DEPLOYMENT_PROFILE,
     debug=DEBUG,
     secret_key=SECRET_KEY,
+    jwt_signing_key=JWT_SIGNING_KEY,
     database_engine=DATABASES["default"]["ENGINE"],
     database_password=DATABASES["default"].get("PASSWORD") or "",
     allowed_hosts=ALLOWED_HOSTS,

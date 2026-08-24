@@ -6,10 +6,12 @@ from django.test import TestCase
 
 from studio.models import (
     CharacterBible,
+    ConfigRevision,
     PromptFieldTranslation,
     PropBible,
     SceneBible,
 )
+from studio.services.configuration import create_config_revision, publish_config_revision
 from studio.services.canonical_glossary import validate_canonical_english
 from studio.services.prompt_translation import (
     build_translation_context,
@@ -21,13 +23,16 @@ from studio.services.prompt_translation import (
     TranslationValidationError,
     translation_context_hash,
 )
-from studio.tests.factories import build_story
+from studio.tests.factories import (
+    build_story,
+    create_ready_prompt_normalization_test_deployment,
+)
 
 
 def translated(value: str) -> TranslationResult:
     return TranslationResult(
-        text=value, provider="local_qwen", model="Qwen/Qwen3-4B-GGUF",
-        metadata={"elapsed_ms": 10, "unloaded_after_request": True},
+        text=value, provider="third-local-normalizer", model="third-local-model",
+        metadata={"elapsed_ms": 10},
     )
 
 
@@ -42,6 +47,16 @@ class CanonicalGlossaryApiTests(TestCase):
         )
         self.client = APIClient()
         self.client.force_authenticate(self.user)
+        self.deployment_id = create_ready_prompt_normalization_test_deployment().id
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.PROJECT,
+            project=self.project,
+            values={
+                "production.prompt_normalization_deployment_id": str(self.deployment_id),
+            },
+            created_by=self.user,
+        )
+        publish_config_revision(revision, published_by=self.user)
         self.url = reverse("project-ensure-canonical-glossary", args=[self.project.pk])
 
     def selectors(self, *entities):
@@ -84,6 +99,14 @@ class CanonicalGlossaryApiTests(TestCase):
             {"林默": "Lin Mo", "玄纹剑": "Xuanwen Sword"},
         )
         self.assertEqual(translate.call_count, 1)
+        self.assertTrue(response.data["runtime"]["invocation_attempted"])
+        self.assertFalse(response.data["runtime"]["submission_uncertain"])
+        self.assertEqual(
+            response.data["runtime"]["model_deployment_id"],
+            str(self.deployment_id),
+        )
+        self.assertEqual(response.data["runtime"]["provider"], "third-local-normalizer")
+        self.assertFalse(response.data["runtime"]["data_egress"])
         call = translate.call_args
         self.assertEqual(call.args[0], ["林默", "玄纹剑"])
         self.assertEqual(call.kwargs["field_keys"], [
@@ -95,9 +118,15 @@ class CanonicalGlossaryApiTests(TestCase):
         )
         self.assertEqual(rows.count(), 2)
         self.assertTrue(all(row.status == "confirmed" for row in rows))
-        self.assertTrue(all(row.provider == "local_qwen_auto_glossary" for row in rows))
+        self.assertTrue(all(row.provider == "third-local-normalizer" for row in rows))
         self.assertTrue(all(row.confirmed_by_id == self.user.id for row in rows))
         self.assertTrue(all(row.runtime_metadata["auto_glossary"] for row in rows))
+        self.assertTrue(all(row.runtime_metadata["inference_context_hash"] for row in rows))
+        self.assertTrue(all(
+            row.runtime_metadata["inference_context_hash"]
+            != row.runtime_metadata["translation_context_hash"]
+            for row in rows
+        ))
         listed = self.client.get(reverse("project-translations", args=[self.project.pk]))
         name_rows = [row for row in listed.data if row["field_key"].endswith(".name")]
         self.assertEqual(len(name_rows), 2)
@@ -194,22 +223,6 @@ class CanonicalGlossaryApiTests(TestCase):
         self.project.refresh_from_db()
         self.assertEqual(self.project.production_settings["translation_glossary"], {"林默": "Lin Mo"})
 
-    @patch("studio.services.canonical_glossary.GenerationTask.objects.filter")
-    @patch("studio.services.canonical_glossary.translate_texts_once")
-    def test_active_video_task_returns_retryable_failure_without_loading_qwen(
-        self, translate, task_filter,
-    ):
-        task_filter.return_value.exists.return_value = True
-
-        response = self.client.post(self.url, self.selectors(self.prop), format="json")
-
-        self.assertEqual(response.status_code, 200, response.data)
-        translate.assert_not_called()
-        self.assertEqual(response.data["entries"][0]["status"], "failed")
-        self.assertEqual(response.data["entries"][0]["error_code"], "translation_resource_busy")
-        self.assertTrue(response.data["entries"][0]["retryable"])
-        self.assertTrue(PropBible.objects.filter(pk=self.prop.pk).exists())
-
     @patch("studio.services.canonical_glossary.translate_texts_once")
     def test_qwen_lease_busy_is_a_retryable_row_not_an_http_failure(self, translate):
         translate.side_effect = PromptTranslationResourceBusy(
@@ -272,6 +285,7 @@ class CanonicalGlossaryApiTests(TestCase):
             field_key="prop.name", source_text="玄纹剑",
             source_hash="old", translated_text="Xuanwen Sword", status="confirmed",
             provider="local_qwen_auto_glossary",
+            runtime_metadata={"auto_glossary": True},
         )
         self.prop.name = "听雨剑"
         self.prop.save(update_fields=("name", "updated_at"))
@@ -638,27 +652,6 @@ class CanonicalGlossaryApiTests(TestCase):
             field_key="prop.visual_identity",
         )
         self.assertEqual(failed.status, PromptFieldTranslation.Status.FAILED)
-
-    @patch("studio.services.canonical_glossary.GenerationTask.objects.filter")
-    @patch("studio.services.canonical_glossary.translate_texts_once")
-    def test_visual_busy_is_safe_and_retryable(self, translate, task_filter):
-        task_filter.return_value.exists.return_value = True
-        payload = self.selectors(self.prop)
-        payload["ensure_visual_identity_translation"] = True
-
-        response = self.client.post(self.url, payload, format="json")
-
-        self.assertEqual(response.status_code, 200, response.data)
-        translate.assert_not_called()
-        self.assertEqual(response.data["summary"]["failed"], 1)
-        self.assertEqual(response.data["visual_summary"]["failed"], 1)
-        self.assertTrue(response.data["visual_translations"][0]["retryable"])
-        self.assertEqual(
-            response.data["visual_translations"][0]["error_code"],
-            "translation_resource_busy",
-        )
-        self.prop.refresh_from_db()
-        self.assertEqual(self.prop.visual_identity, "银灰剑身带有暗纹")
 
     @patch("studio.services.canonical_glossary.translate_texts_once")
     def test_visual_changed_during_inference_returns_conflict(self, translate):

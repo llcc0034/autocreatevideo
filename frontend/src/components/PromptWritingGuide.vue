@@ -112,8 +112,8 @@ const copyText = async (key: string, value: string) => {
         <nav class="official-links" aria-label="MiniMax H3 官方资料"><span>官方资料</span><a href="https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/base-en.txt" target="_blank" rel="noreferrer">Base 提示词指南</a><a href="https://github.com/MiniMax-AI/MiniMax-H3/blob/main/skills/h3-prompt-writing/references/ref-en.txt" target="_blank" rel="noreferrer">Ref2VA 提示词指南</a><a href="https://docs.comfy.org/tutorials/video/minimax/minimax-h3" target="_blank" rel="noreferrer">ComfyUI H3 工作流</a></nav>
       </article>
       <article class="translation-rule">
-        <header><div><span>LOCAL QWEN REVIEW</span><strong>中文源文 → 英文候选 → 人工确认</strong></div></header>
-        <ul><li>本地 ModelScope <code>Qwen/Qwen3-4B-GGUF</code> 只生成英文候选译文，不覆盖中文原文；它不是 DashScope 的 Qwen-MT API。本地 4B 候选不可直接生产，未确认、失败或源文已变更的译文绝不会进入正式 prompt。</li><li>确认前重点核对专名、人物性别、左/右手、道具部位、数值与比例、动作先后、镜头运动、光线方向和最终状态；可直接编辑英文译文再确认。</li><li>在连续剧工作室按“中文术语 = Canonical English”配置术语表，例如 <code>玄纹剑 = Xuanwen Sword</code>。未配置的实体名称会使用 S1、scene:slug、prop:slug 等稳定技术标识，系统不会自由猜译专名。</li><li>对白、歌词和真实屏显文字保持原语言；只翻译人物动作、构图、运镜、delivery、连续性、声景和配乐等导演字段。</li><li>项目名、镜头标题和实体名称主要用于标识；母稿与基础描述用于拆解或创作管理。以字段旁的“进入提示词 / 连续性参考”徽标判断是否需要翻译审核。</li></ul>
+        <header><div><span>MODEL REVIEW</span><strong>中文源文 → 英文候选 → 人工确认</strong></div></header>
+        <ul><li>系统只使用项目明确选择、已通过真实烟测的本地 <code>prompt.normalize</code> 模型部署生成英文候选，不会把未知模型映射为内置模型，也不会覆盖中文原文。未确认、失败或源文已变化的译文绝不会进入正式 prompt。</li><li>确认前重点核对专名、人物性别、左/右手、道具部位、数值与比例、动作先后、镜头运动、光线方向和最终状态；可直接编辑英文译文再确认。</li><li>在连续剧工作室按“中文术语 = Canonical English”配置术语表，例如 <code>玄纹剑 = Xuanwen Sword</code>。未配置的实体名称会使用 S1、scene:slug、prop:slug 等稳定技术标识，系统不会自由猜译专名。</li><li>对白、歌词和真实屏显文字保持原语言；只翻译人物动作、构图、运镜、delivery、连续性、声景和配乐等导演字段。</li><li>项目名、镜头标题和实体名称主要用于标识；母稿与基础描述用于拆解或创作管理。以字段旁的“进入提示词 / 连续性参考”徽标判断是否需要翻译审核。</li></ul>
       </article>
     </div>
   </details>

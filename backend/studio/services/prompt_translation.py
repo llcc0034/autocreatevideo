@@ -20,9 +20,13 @@ from typing import Iterable
 import unicodedata
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.utils import timezone
 
 from studio.models import (
     CharacterBible,
+    GenerationAttempt,
     PromptFieldTranslation,
     PropBible,
     SceneBible,
@@ -33,45 +37,11 @@ from studio.services.local_qwen_lock import (
     LocalQwenResourceBusy,
     local_qwen_runtime_lock,
 )
-try:
-    from studio.services.deepseek_api import (
-        DeepSeekAPIError,
-        DeepSeekConfigurationError,
-        get_deepseek_capability,
-        run_translation as run_deepseek_translation,
-    )
-except ModuleNotFoundError as exc:
-    # Keep the local-Qwen application available while the optional remote
-    # provider is not installed.  This is deliberately fail-closed: the
-    # capability is advertised as unavailable and selecting it raises instead
-    # of silently falling back or pretending that a translation succeeded.
-    if exc.name != "studio.services.deepseek_api":
-        raise
-
-    class DeepSeekConfigurationError(RuntimeError):
-        code = "deepseek_provider_unavailable"
-
-        def __init__(self, message: str = "DeepSeek API provider is not installed"):
-            super().__init__(message)
-            self.runtime_metadata = {"provider": "deepseek_api", "configured": False}
-
-    class DeepSeekAPIError(DeepSeekConfigurationError):
-        pass
-
-    def get_deepseek_capability() -> dict:
-        return {
-            "id": "deepseek_api",
-            "provider": "deepseek_api",
-            "label": "DeepSeek API",
-            "enabled": False,
-            "configured": False,
-            "ready": False,
-            "error_code": "deepseek_provider_unavailable",
-            "notice": "DeepSeek API 提供方尚未安装；本地 Qwen 不受影响。",
-        }
-
-    def run_deepseek_translation(_request: dict) -> dict:
-        raise DeepSeekConfigurationError()
+from studio.services.prompt_normalization_contract import (
+    PROMPT_NORMALIZE_OPERATION,
+    PromptNormalizationContractError,
+    validate_director_text_characters,
+)
 
 
 _PROTECTED_BLOCK_RE = re.compile(
@@ -86,8 +56,6 @@ PINNED_MODEL_SIZE = 2_497_280_256
 PINNED_MODEL_SHA256 = "7485fe6f11af29433bc51cab58009521f205840f5b4ae3a32fa7f92e8534fdf5"
 TRANSLATION_CONTEXT_VERSION = 2
 LOCAL_QWEN_PROVIDER = "local_qwen"
-DEEPSEEK_API_PROVIDER = "deepseek_api"
-SUPPORTED_MODEL_PROVIDERS = {LOCAL_QWEN_PROVIDER, DEEPSEEK_API_PROVIDER}
 
 
 class CanonicalTargetCollisionError(ValueError):
@@ -102,7 +70,9 @@ class CanonicalTargetCollisionError(ValueError):
 ALLOWED_FIELD_KEYS = {
     PromptFieldTranslation.ScopeType.PROJECT: {
         "style.visual_prompt",
+        "style.negative_prompt",
         "project.production_settings.color_script",
+        "project.production_settings.negative_prompt",
         "project.continuity_summary",
     },
     PromptFieldTranslation.ScopeType.CHARACTER: {
@@ -113,6 +83,7 @@ ALLOWED_FIELD_KEYS = {
         "character.wardrobe",
         "character.voice_profile",
         "character.personality",
+        "character.negative_constraints",
     },
     PromptFieldTranslation.ScopeType.SCENE: {
         "scene.name",
@@ -122,6 +93,7 @@ ALLOWED_FIELD_KEYS = {
         "scene.lighting",
         "scene.color_palette",
         "scene.ambient_sound",
+        "scene.negative_constraints",
     },
     PromptFieldTranslation.ScopeType.PROP: {
         "prop.name",
@@ -129,6 +101,7 @@ ALLOWED_FIELD_KEYS = {
         "prop.material",
         "prop.distinctive_marks",
         "prop.continuity_state",
+        "prop.negative_constraints",
     },
     PromptFieldTranslation.ScopeType.SHOT: {
         "shot.narrative",
@@ -138,6 +111,7 @@ ALLOWED_FIELD_KEYS = {
         "shot.continuity_notes",
         "shot.sound_effects",
         "shot.music",
+        "shot.negative_prompt",
     },
 }
 _DIALOGUE_DELIVERY_FIELD_RE = re.compile(r"^shot\.dialogue\.([0-9]+)\.delivery$")
@@ -505,9 +479,12 @@ def resolve_current_source(
             raise TranslationValidationError("project scope_id 与当前项目不一致")
         if field_key == "style.visual_prompt":
             return str(project.style.visual_prompt if project.style else "")
+        if field_key == "style.negative_prompt":
+            return str(project.style.negative_prompt if project.style else "")
         if field_key == "project.continuity_summary":
             return str(project.continuity_summary or "")
-        return str((project.production_settings or {}).get("color_script", ""))
+        setting_key = field_key.rsplit(".", 1)[-1]
+        return str((project.production_settings or {}).get(setting_key, ""))
 
     models = {
         PromptFieldTranslation.ScopeType.CHARACTER: CharacterBible,
@@ -531,6 +508,8 @@ def resolve_current_source(
         if index >= len(dialogue) or not isinstance(dialogue[index], dict):
             raise TranslationValidationError("对白 delivery 索引已失效")
         return str(dialogue[index].get("delivery", "") or "")
+    if isinstance(obj, Shot) and field_key == "shot.negative_prompt":
+        return str((obj.metadata or {}).get("negative_prompt", "") or "")
     attribute = field_key.split(".", 1)[1]
     return str(getattr(obj, attribute, "") or "")
 
@@ -641,6 +620,7 @@ def qwen_runtime_device_state(config: dict) -> dict:
         # wheel that crashes during context construction must never be called
         # "ready", and the probe must not contend with video VRAM.
         with local_qwen_runtime_lock():
+            _assert_no_active_generation_tasks()
             completed = subprocess.run(
                 [str(runtime_python), str(runtime_script)],
                 input=json.dumps({
@@ -707,118 +687,6 @@ def qwen_runtime_device_state(config: dict) -> dict:
         "runtime_probe_error_code": "" if ready else probe_error_code or "runtime_probe_failed",
     })
     return state
-
-
-def get_translation_capability() -> dict:
-    config = _config()
-    model_dir = config["model_dir"]
-    runtime_script = config["runtime_script"]
-    installation = _model_installation(model_dir)
-    runtime_state = qwen_runtime_device_state(config)
-    local_capability = {
-        "id": LOCAL_QWEN_PROVIDER,
-        "label": "本地 Qwen",
-        "enabled": config["enabled"],
-        "configured": bool(
-            config["enabled"] and model_dir.is_dir() and runtime_script.is_file()
-            and config["runtime_python"].is_file()
-            and installation["verified"] and runtime_state["runtime_ready"]
-        ),
-        "provider": "local_qwen",
-        "model": config["model_id"],
-        "model_downloaded": installation["downloaded"],
-        "model_verified": installation["verified"],
-        "model_size_bytes": installation["size"],
-        "model_sha256": installation["sha256"],
-        "verified_at": installation["verified_at"],
-        "device": config["device"],
-        "gpu_layers": config.get("gpu_layers", -1),
-        **runtime_state,
-        "timeout_seconds": config["timeout_seconds"],
-        "loaded_on_demand": True,
-        "unloaded_after_request": True,
-        "review_required": True,
-        "official_qwen_mt_checkpoint": False,
-        "estimated_download_gb": 2.5,
-        "install_command": (
-            "powershell -ExecutionPolicy Bypass -File "
-            ".\\scripts\\download_local_translation_model.ps1"
-        ),
-        "notice": (
-            "官方 Qwen-MT 当前为云 API 模型；本地运行使用 ModelScope 可下载的开源 Qwen "
-            "模型完成翻译，必须人工确认后才会进入正式提示词。"
-        ),
-    }
-    local_capability["ready"] = local_capability["configured"]
-    local_capability["transport"] = "local_process"
-    local_capability["data_egress"] = False
-
-    deepseek_capability = dict(get_deepseek_capability())
-    deepseek_capability.setdefault("id", DEEPSEEK_API_PROVIDER)
-    deepseek_capability.setdefault("provider", DEEPSEEK_API_PROVIDER)
-    deepseek_capability.setdefault("label", "DeepSeek API")
-    deepseek_capability.setdefault("transport", "remote_api")
-    deepseek_capability.setdefault("data_egress", True)
-    deepseek_capability.setdefault(
-        "data_egress_notice",
-        "选择 DeepSeek API 会把本次待翻译文本和相关提示上下文发送到外部服务。",
-    )
-    deepseek_capability["ready"] = bool(
-        deepseek_capability.get("enabled") and deepseek_capability.get("configured")
-    )
-    default_provider = str(
-        getattr(settings, "PROMPT_TRANSLATION_DEFAULT_PROVIDER", LOCAL_QWEN_PROVIDER)
-        or LOCAL_QWEN_PROVIDER
-    )
-    if default_provider not in SUPPORTED_MODEL_PROVIDERS:
-        default_provider = LOCAL_QWEN_PROVIDER
-    return {
-        # Preserve the original top-level local-Qwen fields for older clients.
-        **local_capability,
-        "default_provider": default_provider,
-        "providers": [local_capability, deepseek_capability],
-    }
-
-
-def normalise_model_provider(value: str | None, *, default: str | None = None) -> str:
-    """Return a server-supported provider id without accepting arbitrary transports."""
-    provider = str(value or default or LOCAL_QWEN_PROVIDER).strip().casefold()
-    if provider not in SUPPORTED_MODEL_PROVIDERS:
-        raise TranslationValidationError(
-            "不支持的模型通道",
-            code="unsupported_model_provider",
-        )
-    return provider
-
-
-def _run_translation_provider(request: dict, config: dict, provider: str) -> dict:
-    if provider == LOCAL_QWEN_PROVIDER:
-        _require_runtime(config)
-        local_request = {
-            **request,
-            "model_dir": str(config["model_dir"]),
-            "model_id": config["model_id"],
-            "device": config["device"],
-            "gpu_layers": config.get("gpu_layers", -1),
-            "max_new_tokens": config["max_new_tokens"],
-        }
-        return _run_runtime(local_request, config)
-    try:
-        remote_request = dict(request)
-        if "items" in remote_request:
-            remote_request["items"] = [
-                {**item, "max_new_tokens": config["max_new_tokens"]}
-                for item in remote_request["items"]
-            ]
-        else:
-            remote_request["max_new_tokens"] = config["max_new_tokens"]
-        return run_deepseek_translation(remote_request)
-    except (DeepSeekConfigurationError, DeepSeekAPIError) as exc:
-        raise PromptTranslationError(
-            str(exc),
-            code=str(getattr(exc, "code", "deepseek_api_failed")),
-            metadata=dict(getattr(exc, "runtime_metadata", {}) or {}),
-        ) from exc
 
 
 def _protect_authored_blocks(text: str) -> tuple[str, dict[str, str]]:
@@ -917,10 +785,327 @@ def _restore_authored_blocks(candidate: str, blocks: dict[str, str]) -> str:
     return restored.strip()
 
 
+def prepare_prompt_normalization_item(
+    *,
+    project: SeriesProject,
+    scope_type: str,
+    scope_id,
+    field_key: str,
+    source_text: str,
+    label: str,
+    request_id: str,
+) -> tuple[dict, dict]:
+    """Build one provider item and its server-only approval materialization."""
+
+    source = str(source_text or "")
+    if not source.strip():
+        raise TranslationValidationError("source_text 不能为空")
+    current = resolve_current_source(
+        project=project,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        field_key=field_key,
+    )
+    if current != source:
+        raise TranslationValidationError("prompt.normalize source 已发生漂移")
+    context = build_translation_context(
+        project,
+        scope_type=scope_type,
+        scope_id=scope_id,
+        field_key=field_key,
+        source_text=source,
+    )
+    protected, blocks = _protect_translation_contract(source, context)
+    item = {
+        "request_id": str(request_id),
+        "text": protected,
+        "source_lang": "Chinese",
+        "target_lang": "English",
+        "field_key": field_key,
+        "label": str(label or "")[:240],
+        "context": context,
+        "protected_tokens": list(blocks),
+    }
+    target = {
+        "request_id": str(request_id),
+        "scope_type": str(scope_type),
+        "scope_id": str(scope_id),
+        "field_key": str(field_key),
+        "label": str(label or "")[:240],
+        "source_text": source,
+        "source_hash": source_text_hash(source),
+        "context": context,
+        "context_hash": translation_context_hash(context),
+        # Kept only inside GenerationAttempt.request_snapshot. API serializers
+        # never expose that snapshot or these authored literal replacements.
+        "protected_blocks": blocks,
+    }
+    return item, target
+
+
+def restore_prompt_normalization_candidate(
+    *,
+    target: dict,
+    translated_text: str,
+) -> str:
+    blocks = target.get("protected_blocks")
+    if not isinstance(blocks, dict) or any(
+        not isinstance(token, str) or not isinstance(value, str)
+        for token, value in blocks.items()
+    ):
+        raise TranslationValidationError("prompt.normalize 受保护原文快照无效")
+    restored = _restore_authored_blocks(str(translated_text or ""), blocks)
+    return validate_manual_translation(str(target.get("source_text") or ""), restored)
+
+
+def _translation_history_item(entry: PromptFieldTranslation) -> dict:
+    return {
+        "revision": entry.revision,
+        "source_text": entry.source_text,
+        "translated_text": entry.translated_text,
+        "status": entry.status,
+        "provider": entry.provider,
+        "model": entry.model,
+        "error_message": entry.error_message,
+        "runtime_metadata": entry.runtime_metadata or {},
+        "origin_generation_attempt_id": (
+            str(entry.origin_generation_attempt_id)
+            if entry.origin_generation_attempt_id else None
+        ),
+        "confirmed_at": entry.confirmed_at.isoformat() if entry.confirmed_at else None,
+        "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
+    }
+
+
+@transaction.atomic
+def confirm_prompt_normalization_candidates(
+    *,
+    project: SeriesProject,
+    attempt: GenerationAttempt,
+    candidates: list[dict],
+    user,
+    provider: str,
+    model: str,
+    result_sha256: str,
+    submission_semantics: str,
+) -> list[PromptFieldTranslation]:
+    """Atomically materialize approved candidates as confirmed overlays."""
+
+    project = SeriesProject.objects.select_for_update().select_related("style").get(
+        pk=project.pk,
+    )
+    locked_attempt = GenerationAttempt.objects.select_for_update().select_related(
+        "stage_run__production_run",
+    ).get(pk=attempt.pk)
+    if (
+        locked_attempt.status != GenerationAttempt.Status.SUCCEEDED
+        or locked_attempt.operation != PROMPT_NORMALIZE_OPERATION
+        or locked_attempt.stage_run.production_run.project_id != project.id
+    ):
+        raise ValidationError("prompt.normalize GenerationAttempt 尚未成功")
+    if locked_attempt.result_sha256 != str(result_sha256 or ""):
+        raise ValidationError("prompt.normalize candidate result checksum 已漂移")
+    if not isinstance(candidates, list) or len(candidates) > 100:
+        raise ValidationError("prompt.normalize candidates 数量无效")
+    # Freeze every source/context owner before checking hashes and writing any
+    # overlay. This prevents a concurrent Bible/glossary/source edit from
+    # landing between approval validation and the confirmed rows.
+    list(CharacterBible.objects.select_for_update().filter(project=project).order_by("id"))
+    list(SceneBible.objects.select_for_update().filter(project=project).order_by("id"))
+    list(PropBible.objects.select_for_update().filter(project=project).order_by("id"))
+    shot_ids = sorted({
+        str(item.get("scope_id"))
+        for item in candidates
+        if isinstance(item, dict)
+        and item.get("scope_type") == PromptFieldTranslation.ScopeType.SHOT
+        and item.get("scope_id")
+    })
+    if shot_ids:
+        list(Shot.objects.select_for_update().filter(
+            pk__in=shot_ids,
+            episode__project=project,
+        ).order_by("id"))
+    if project.style_id:
+        type(project.style).objects.select_for_update().get(pk=project.style_id)
+    seen: set[tuple[str, str, str]] = set()
+    # Imported lazily because canonical_glossary itself reuses this module's
+    # translation primitives.  There must still be one canonical-name
+    # validator for both the standalone glossary flow and run review.
+    from studio.services.canonical_glossary import validate_canonical_english
+
+    reviewed: list[dict] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise ValidationError("prompt.normalize candidate 必须是对象")
+        scope_type = str(candidate.get("scope_type") or "")
+        scope_id = candidate.get("scope_id")
+        field_key = str(candidate.get("field_key") or "")
+        request_id = str(candidate.get("request_id") or "")
+        identity = (scope_type, str(scope_id), field_key)
+        if identity in seen:
+            raise ValidationError("prompt.normalize candidate 目标重复")
+        seen.add(identity)
+        source = resolve_current_source(
+            project=project,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            field_key=field_key,
+        )
+        if source_text_hash(source) != str(candidate.get("source_hash") or ""):
+            raise ValidationError("prompt.normalize 审批时 source 已漂移")
+        context = build_translation_context(
+            project,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            field_key=field_key,
+            source_text=source,
+        )
+        context_hash = translation_context_hash(context)
+        if context_hash != str(candidate.get("context_hash") or ""):
+            raise ValidationError("prompt.normalize 审批时术语上下文已漂移")
+        try:
+            translated = validate_manual_translation(
+                source,
+                str(candidate.get("translated_text") or ""),
+            )
+            if field_key.endswith(".name"):
+                translated = validate_canonical_english(translated)
+        except TranslationValidationError as exc:
+            raise ValidationError({
+                "candidate_overrides": {
+                    "request_id": request_id,
+                    "detail": str(exc),
+                },
+            }) from exc
+        reviewed.append({
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+            "field_key": field_key,
+            "source": source,
+            "translated": translated,
+            "review_context_hash": context_hash,
+        })
+
+    # A generated batch without an explicit project glossary uses internal
+    # stable identities (S1 / scene:<slug> / prop:<slug>).  The review UI must
+    # let an operator replace those placeholders with human-readable canonical
+    # English names.  Derive the authoritative glossary from the reviewed name
+    # rows and persist it in the same transaction as every confirmed overlay.
+    # If any later candidate fails, both the glossary and all overlays roll
+    # back together.
+    glossary_updates: dict[str, str] = {}
+    identity_scopes = {
+        PromptFieldTranslation.ScopeType.CHARACTER,
+        PromptFieldTranslation.ScopeType.SCENE,
+        PromptFieldTranslation.ScopeType.PROP,
+    }
+    for item in reviewed:
+        if item["scope_type"] not in identity_scopes or not item["field_key"].endswith(".name"):
+            continue
+        source_name = str(item["source"] or "").strip()
+        target_name = str(item["translated"] or "").strip()
+        previous = glossary_updates.get(source_name)
+        if previous is not None and previous != target_name:
+            raise ValidationError("prompt.normalize 同一实体名称存在冲突的人工英文候选")
+        glossary_updates[source_name] = target_name
+
+    if glossary_updates:
+        production_settings = dict(project.production_settings or {})
+        raw_glossary = production_settings.get("translation_glossary", {})
+        if not isinstance(raw_glossary, dict):
+            raise ValidationError(
+                "项目 translation_glossary 结构无效；为避免覆盖历史术语，审批已中止"
+            )
+        glossary = dict(raw_glossary)
+        glossary.update(glossary_updates)
+        production_settings["translation_glossary"] = glossary
+        try:
+            ensure_no_canonical_target_collisions(
+                project,
+                production_settings=production_settings,
+            )
+        except CanonicalTargetCollisionError as exc:
+            raise ValidationError({
+                "candidate_overrides": {
+                    "code": exc.code,
+                    "collisions": exc.collisions,
+                },
+            }) from exc
+        if production_settings != (project.production_settings or {}):
+            project.production_settings = production_settings
+            project.save(update_fields=("production_settings", "updated_at"))
+
+    materialized: list[PromptFieldTranslation] = []
+    for item in reviewed:
+        scope_type = item["scope_type"]
+        scope_id = item["scope_id"]
+        field_key = item["field_key"]
+        source = item["source"]
+        translated = item["translated"]
+        missing = missing_relevant_canonical_identity_mappings(
+            project, source, translated,
+        )
+        if missing:
+            raise ValidationError("prompt.normalize 候选缺少当前 canonical identity")
+        context_hash = translation_context_hash(build_translation_context(
+            project,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            field_key=field_key,
+            source_text=source,
+        ))
+        entry = PromptFieldTranslation.objects.select_for_update().filter(
+            project=project,
+            scope_type=scope_type,
+            scope_id=scope_id,
+            field_key=field_key,
+        ).first()
+        if entry is None:
+            entry = PromptFieldTranslation(
+                project=project,
+                scope_type=scope_type,
+                scope_id=scope_id,
+                field_key=field_key,
+                revision=1,
+            )
+        else:
+            entry.revision_history = [
+                *(entry.revision_history or []),
+                _translation_history_item(entry),
+            ]
+            entry.revision += 1
+        entry.source_text = source
+        entry.source_hash = source_text_hash(source)
+        entry.translated_text = translated
+        entry.status = PromptFieldTranslation.Status.CONFIRMED
+        entry.provider = str(provider or "")[:80]
+        entry.model = str(model or "")[:200]
+        entry.error_message = ""
+        entry.runtime_metadata = {
+            "schema_version": 1,
+            "translation_context_hash": context_hash,
+            "translation_context_version": TRANSLATION_CONTEXT_VERSION,
+            "review_context_hash": item["review_context_hash"],
+            "generation_attempt_id": str(locked_attempt.id),
+            "result_sha256": locked_attempt.result_sha256,
+            "submission_semantics": str(submission_semantics or ""),
+        }
+        entry.origin_generation_attempt = locked_attempt
+        entry.confirmed_by = user
+        entry.confirmed_at = timezone.now()
+        entry.save()
+        materialized.append(entry)
+    return materialized
+
+
 def _run_runtime(request: dict, config: dict) -> dict:
     """Execute one disposable local-model process and parse its JSON result."""
     try:
         with local_qwen_runtime_lock():
+            # Media workers claim under this same short gate, then release it
+            # while waiting remotely. The durable-state check closes the race
+            # without serialising independent media workers for the full task.
+            _assert_no_active_generation_tasks()
             completed = subprocess.run(
                 [str(config["runtime_python"]), str(config["runtime_script"])],
                 input=json.dumps(request, ensure_ascii=False),
@@ -956,6 +1141,20 @@ def _run_runtime(request: dict, config: dict) -> dict:
     return payload
 
 
+def _assert_no_active_generation_tasks() -> None:
+    from studio.models import GenerationTask
+
+    if GenerationTask.objects.filter(status__in=(
+        GenerationTask.Status.QUEUED,
+        GenerationTask.Status.RUNNING,
+        GenerationTask.Status.CANCEL_REQUESTED,
+    )).exists():
+        raise PromptTranslationResourceBusy(
+            "视频生成任务正在排队或执行；本地 Qwen 未启动，请稍后重试。",
+            code="translation_resource_busy",
+        )
+
+
 def _require_runtime(config: dict) -> None:
     if not config["enabled"]:
         raise TranslationRuntimeUnavailable("本地翻译功能未启用")
@@ -986,64 +1185,64 @@ def translate_text_once(
     label: str = "",
     context: str = "",
     attempt: int = 1,
-    provider: str | None = None,
+    model_deployment_id=None,
 ) -> TranslationResult:
-    """Translate one field in a disposable child process.
+    """Translate one field through one explicitly selected deployment."""
+    from studio.services.prompt_normalization import invoke_prompt_normalization
+    from studio.services.provider_registry import ProviderDriverError
 
-    stdout is a single JSON object. stderr is never returned to API clients
-    because third-party model loaders may print local paths and diagnostics.
-    """
     source = str(text or "")
     if not source.strip():
         raise TranslationValidationError("source_text 不能为空")
-    provider = normalise_model_provider(
-        provider,
-        default=getattr(settings, "PROMPT_TRANSLATION_DEFAULT_PROVIDER", LOCAL_QWEN_PROVIDER),
-    )
-    config = _config()
+    if not model_deployment_id:
+        raise TranslationValidationError(
+            "model_deployment_id 不能为空",
+            code="model_deployment_required",
+        )
 
     protected_text, blocks = _protect_translation_contract(source, context)
-    request = {
-        "request_id": source_text_hash(source)[:24],
-        "text": protected_text,
-        "source_lang": source_lang,
-        "target_lang": target_lang,
-        "field_key": field_key,
-        "label": label,
-        "context": context,
-        "protected_tokens": list(blocks),
-        "attempt": max(1, min(int(attempt), 100)),
-    }
-    payload = _run_translation_provider(request, config, provider)
-    candidate = payload.get("translation")
+    try:
+        payload = invoke_prompt_normalization(
+            deployment_id=model_deployment_id,
+            payload={
+                "schema_version": 1,
+                "items": [{
+                    "request_id": source_text_hash(source)[:24],
+                    "text": protected_text,
+                    "source_lang": source_lang,
+                    "target_lang": target_lang,
+                    "field_key": field_key,
+                    "label": label,
+                    "context": context,
+                    "protected_tokens": list(blocks),
+                }],
+            },
+        )
+    except ProviderDriverError as exc:
+        raise PromptTranslationError(
+            str(exc),
+            code=exc.code,
+            metadata={
+                **(getattr(exc, "metadata", {}) or {}),
+                "model_deployment_id": str(model_deployment_id),
+                "submission_uncertain": bool(exc.submission_uncertain),
+            },
+        ) from exc
+    rows = payload.get("items")
+    row = rows[0] if isinstance(rows, list) and rows else {}
+    candidate = row.get("translation") if isinstance(row, dict) else None
     if not isinstance(candidate, str) or not candidate.strip():
         raise PromptTranslationError("所选模型通道没有返回有效译文")
     restored = _restore_authored_blocks(candidate, blocks)
     restored = validate_manual_translation(source, restored)
     payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-    is_local = provider == LOCAL_QWEN_PROVIDER
     return TranslationResult(
         text=restored,
-        provider=provider,
-        model=str(payload.get("model") or payload_metadata.get("model") or (
-            config["model_id"] if is_local else ""
-        )),
+        provider=str(payload_metadata.get("provider") or payload.get("provider") or ""),
+        model=str(payload.get("model") or payload_metadata.get("model") or ""),
         metadata={
-            "elapsed_ms": payload.get("elapsed_ms"),
-            "provider": provider,
-            "transport": "local_process" if is_local else "remote_api",
-            "device": config["device"] if is_local else "remote",
-            "gpu_layers": payload_metadata.get(
-                "n_gpu_layers",
-                config.get("gpu_layers", -1) if is_local and config["device"] == "cuda" else 0,
-            ),
-            "loaded_on_demand": is_local,
-            "unloaded_after_request": is_local,
-            "repair_attempted": bool(payload_metadata.get("repair_attempted")),
-            "repair_reason_code": str(
-                payload_metadata.get("repair_reason_code") or ""
-            ),
-            "usage": payload_metadata.get("usage", {}),
+            **payload_metadata,
+            "attempt": max(1, min(int(attempt), 100)),
             "protected_block_count": len(blocks),
             "translation_context_hash": translation_context_hash(context),
             "translation_context_version": TRANSLATION_CONTEXT_VERSION,
@@ -1056,16 +1255,19 @@ def translate_texts_once(
     field_keys: list[str] | None = None,
     labels: list[str] | None = None,
     contexts: list[str] | None = None,
-    provider: str | None = None,
+    model_deployment_id=None,
 ) -> list[TranslationResult | PromptTranslationError]:
-    """Translate multiple fields with one model load and one process exit."""
+    """Translate multiple fields through one explicitly selected deployment."""
+    from studio.services.prompt_normalization import invoke_prompt_normalization
+    from studio.services.provider_registry import ProviderDriverError
+
     if not texts:
         return []
-    provider = normalise_model_provider(
-        provider,
-        default=getattr(settings, "PROMPT_TRANSLATION_DEFAULT_PROVIDER", LOCAL_QWEN_PROVIDER),
-    )
-    config = _config()
+    if not model_deployment_id:
+        raise TranslationValidationError(
+            "model_deployment_id 不能为空",
+            code="model_deployment_required",
+        )
     prepared = []
     blocks_by_id: dict[str, dict[str, str]] = {}
     sources_by_id: dict[str, str] = {}
@@ -1096,9 +1298,21 @@ def translate_texts_once(
     runtime_items = [item for item in prepared if item is not None]
     if not runtime_items:
         return [TranslationValidationError("source_text 不能为空") for _ in texts]
-    payload = _run_translation_provider({
-        "items": runtime_items,
-    }, config, provider)
+    try:
+        payload = invoke_prompt_normalization(
+            deployment_id=model_deployment_id,
+            payload={"schema_version": 1, "items": runtime_items},
+        )
+    except ProviderDriverError as exc:
+        raise PromptTranslationError(
+            str(exc),
+            code=exc.code,
+            metadata={
+                **(getattr(exc, "metadata", {}) or {}),
+                "model_deployment_id": str(model_deployment_id),
+                "submission_uncertain": bool(exc.submission_uncertain),
+            },
+        ) from exc
     rows = payload.get("items")
     if not isinstance(rows, list):
         raise PromptTranslationError("批量翻译进程没有返回 items")
@@ -1129,28 +1343,12 @@ def translate_texts_once(
             results.append(exc)
             continue
         payload_metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
-        is_local = provider == LOCAL_QWEN_PROVIDER
         results.append(TranslationResult(
             text=restored,
-            provider=provider,
-            model=str(payload.get("model") or payload_metadata.get("model") or (
-                config["model_id"] if is_local else ""
-            )),
+            provider=str(payload_metadata.get("provider") or payload.get("provider") or ""),
+            model=str(payload.get("model") or payload_metadata.get("model") or ""),
             metadata={
-                "elapsed_ms": row.get("elapsed_ms"),
-                "batch_elapsed_ms": payload.get("elapsed_ms"),
-                "provider": provider,
-                "transport": "local_process" if is_local else "remote_api",
-                "device": config["device"] if is_local else "remote",
-                "gpu_layers": (payload_metadata.get(
-                    "n_gpu_layers",
-                    config.get("gpu_layers", -1) if is_local and config["device"] == "cuda" else 0,
-                )),
-                "loaded_on_demand": is_local,
-                "unloaded_after_request": is_local,
-                "repair_attempted": bool(row.get("repair_attempted")),
-                "repair_reason_code": str(row.get("repair_reason_code") or ""),
-                "usage": payload_metadata.get("usage", {}),
+                **payload_metadata,
                 "protected_block_count": len(blocks_by_id[item["request_id"]]),
                 "translation_context_hash": translation_context_hash(
                     contexts[int(item["request_id"].split("-", 1)[0])]
@@ -1171,6 +1369,10 @@ def validate_manual_translation(source: str, translated: str) -> str:
     # exact originals above makes the same fail-closed validator reusable.
     restored = _restore_authored_blocks(candidate, blocks)
     director_text = _PROTECTED_BLOCK_RE.sub("", restored)
+    try:
+        validate_director_text_characters(director_text)
+    except PromptNormalizationContractError as exc:
+        raise TranslationValidationError(str(exc)) from exc
     non_latin = [
         character for character in director_text
         if character.isalpha() and "LATIN" not in unicodedata.name(character, "")

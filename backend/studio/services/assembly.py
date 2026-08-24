@@ -15,13 +15,20 @@ from django.utils import timezone
 
 from studio.models import (
     AssemblyJob,
+    AssemblySourceItem,
     Episode,
+    GeneratedArtifact,
+    GenerationAttempt,
     GenerationTask,
+    PromptArtifact,
     SeriesProject,
     Shot,
     WorkerLease,
 )
+from studio.services.generated_artifacts import verified_local_media_facts
+from studio.services.json_contracts import verify_json_contract
 from studio.services.provenance import ProvenanceError, sha256_file, verified_assembly_manifest
+from studio.services.configuration import resolve_configuration
 
 
 class AssemblyError(ValueError):
@@ -30,23 +37,33 @@ class AssemblyError(ValueError):
         self.job = job
 
 
+def _delivery_disclosure() -> tuple[bool, str]:
+    values = resolve_configuration(required_keys=(
+        "delivery.ai_label_enabled", "delivery.ai_label_text",
+    )).values
+    return bool(values["delivery.ai_label_enabled"]), str(values["delivery.ai_label_text"])
+
+
 @dataclass(frozen=True)
 class TaskSelection:
-    task: GenerationTask
     shot: Shot
+    task: GenerationTask | None = None
+    artifact: GeneratedArtifact | None = None
 
 
 @dataclass(frozen=True)
 class Clip:
-    task: GenerationTask
+    task: GenerationTask | None
     path: Path
     has_audio: bool
     duration_seconds: float
     start_seconds: float = 0
     trim_to_shot: bool = False
+    artifact: GeneratedArtifact | None = None
+    media_kind: str = Shot.MediaType.VIDEO
 
 
-_ASSEMBLY_SIGNATURE_VERSION = 2
+_ASSEMBLY_SIGNATURE_VERSION = 3
 _ASSEMBLY_SIGNATURE_RE = re.compile(r"\.source-([0-9a-f]{64})\.ffconcat$")
 
 
@@ -56,7 +73,7 @@ def _eligible_tasks(episode: Episode):
     return list(
         GenerationTask.objects.filter(
             episode=episode,
-            kind=GenerationTask.Kind.VIDEO,
+            kind__in=(GenerationTask.Kind.IMAGE, GenerationTask.Kind.VIDEO),
             status__in=(
                 GenerationTask.Status.QUEUED,
                 GenerationTask.Status.RUNNING,
@@ -80,7 +97,7 @@ def _task_shot_ids(task: GenerationTask) -> tuple[str, ...]:
 
 
 def _ordered_tasks_for_episode(episode: Episode) -> list[TaskSelection]:
-    """Select the newest successful source independently for every video shot.
+    """Select the newest successful source independently for every shot.
 
     A multi-shot task is intentionally represented once per covered shot.  The
     resolver below cuts the persisted multi-shot video at its prompt-time shot
@@ -88,22 +105,200 @@ def _ordered_tasks_for_episode(episode: Episode) -> list[TaskSelection]:
     segment without silently retaining or duplicating the old segment.
     """
 
-    shots = list(episode.shots.filter(media_type=Shot.MediaType.VIDEO).order_by("number"))
+    shots = list(episode.shots.order_by("number", "id"))
     if not shots:
-        raise AssemblyError(f"第 {episode.number} 集没有可组装的视频分镜")
+        raise AssemblyError(f"第 {episode.number} 集没有可组装的分镜")
     tasks = _eligible_tasks(episode)
     coverage = {task.id: set(_task_shot_ids(task)) for task in tasks}
     selected: list[TaskSelection] = []
     for shot in shots:
-        task = next((item for item in tasks if str(shot.id) in coverage[item.id]), None)
+        task = next((
+            item for item in tasks
+            if item.kind == shot.media_type and str(shot.id) in coverage[item.id]
+        ), None)
         if task and task.status != GenerationTask.Status.SUCCEEDED:
             raise AssemblyError(
-                f"第 {episode.number} 集分镜 {shot.number} 的最新视频仍生成中，完成后再组装"
+                f"第 {episode.number} 集分镜 {shot.number} 的最新{shot.get_media_type_display()}仍生成中，完成后再组装"
             )
         if not task:
-            raise AssemblyError(f"第 {episode.number} 集分镜 {shot.number} 缺少成功的视频任务")
-        selected.append(TaskSelection(task=task, shot=shot))
+            raise AssemblyError(
+                f"第 {episode.number} 集分镜 {shot.number} 缺少成功的{shot.get_media_type_display()}任务"
+            )
+        selected.append(TaskSelection(shot=shot, task=task))
     return selected
+
+
+def _artifact_prompt(artifact: GeneratedArtifact) -> PromptArtifact:
+    attempt = artifact.generation_attempt
+    if attempt is None or attempt.status != GenerationAttempt.Status.SUCCEEDED:
+        raise AssemblyError("受管产物没有成功的 GenerationAttempt")
+    if attempt.request_sha256 != attempt.request_snapshot_sha256:
+        raise AssemblyError("受管产物的请求 identity 已漂移")
+    verify_json_contract(
+        attempt.request_snapshot,
+        schema_version=attempt.request_snapshot_schema_version,
+        size_bytes=attempt.request_snapshot_size_bytes,
+        sha256=attempt.request_snapshot_sha256,
+    )
+    prompt_id = (
+        attempt.request_snapshot.get("prompt_artifact_id")
+        if isinstance(attempt.request_snapshot, dict) else None
+    )
+    prompt = PromptArtifact.objects.select_related("shot__episode", "project").filter(
+        pk=prompt_id,
+    ).first()
+    if prompt is None or prompt.shot_id is None:
+        raise AssemblyError("受管产物缺少可验证的逐镜 PromptArtifact")
+    return prompt
+
+
+def _managed_artifact_path(artifact: GeneratedArtifact) -> tuple[Path, dict]:
+    if artifact.kind not in {GeneratedArtifact.Kind.IMAGE, GeneratedArtifact.Kind.VIDEO}:
+        raise AssemblyError("组装只接受图片或视频媒体产物")
+    if artifact.storage_backend not in {"managed_local", "local_media"}:
+        raise AssemblyError("组装只接受已经归档到受管存储的媒体产物")
+    root = Path(settings.MEDIA_ROOT).resolve()
+    path = (root / artifact.object_key).resolve()
+    if not path.is_relative_to(root):
+        raise AssemblyError("受管产物路径越过 MEDIA_ROOT")
+    try:
+        facts = verified_local_media_facts(
+            path,
+            expected_kind=artifact.kind,
+            max_bytes=int(artifact.size_bytes or 0),
+        )
+    except (OSError, ProvenanceError, ValueError) as exc:
+        raise AssemblyError(f"受管{artifact.get_kind_display()}产物校验失败: {exc}") from exc
+    if (
+        artifact.status != GeneratedArtifact.Status.SELECTED
+        or facts["sha256"] != artifact.sha256
+        or facts["size_bytes"] != artifact.size_bytes
+        or facts["mime_type"] != artifact.mime_type
+    ):
+        raise AssemblyError("受管媒体产物 manifest 与真实字节不一致")
+    return path, facts
+
+
+def verify_assembly_sources(job: AssemblyJob) -> None:
+    """Revalidate the immutable input manifest immediately before FFmpeg."""
+
+    items = list(job.source_items.select_related(
+        "shot__episode", "generation_task", "generated_artifact__generation_attempt",
+    ).order_by("ordinal"))
+    if not items:
+        raise AssemblyError("组装任务缺少冻结的逐镜媒体来源", job=job)
+    expected_shots = list(Shot.objects.filter(
+        episode=job.episode,
+    ).order_by("number", "id")) if job.episode_id else list(Shot.objects.filter(
+        episode__project=job.project,
+    ).order_by("episode__number", "episode_id", "number", "id"))
+    if job.source_contract_version < 3:
+        expected_shots = [shot for shot in expected_shots if shot.media_type == Shot.MediaType.VIDEO]
+    if [item.shot_id for item in items] != [shot.id for shot in expected_shots]:
+        raise AssemblyError("冻结媒体来源未完整覆盖组装合同中的分镜顺序", job=job)
+    expected_episode_ids = {job.episode_id} if job.episode_id else set(
+        job.project.episodes.values_list("id", flat=True)
+    )
+    seen_shots: set[str] = set()
+    for item in items:
+        if item.shot.episode.project_id != job.project_id or item.shot.episode_id not in expected_episode_ids:
+            raise AssemblyError("冻结媒体来源的分镜归属已漂移", job=job)
+        if str(item.shot_id) in seen_shots:
+            raise AssemblyError("冻结媒体来源重复覆盖同一分镜", job=job)
+        seen_shots.add(str(item.shot_id))
+        if item.media_kind != item.shot.media_type:
+            raise AssemblyError("冻结媒体来源类型与分镜类型不一致", job=job)
+        if item.generated_artifact_id:
+            artifact = item.generated_artifact
+            if artifact is None or artifact.generation_attempt is None:
+                raise AssemblyError("冻结受管产物来源已经失效", job=job)
+            root = Path(settings.MEDIA_ROOT).resolve()
+            path = (root / item.object_key).resolve()
+            if (
+                artifact.generation_attempt.status != GenerationAttempt.Status.SUCCEEDED
+                or artifact.kind != item.media_kind
+                or artifact.object_key != item.object_key
+                or artifact.sha256 != item.sha256
+                or artifact.size_bytes != item.size_bytes
+                or artifact.mime_type != item.mime_type
+            ):
+                raise AssemblyError("冻结受管产物事实已漂移", job=job)
+        else:
+            task = item.generation_task
+            if (
+                task is None
+                or task.status != GenerationTask.Status.SUCCEEDED
+                or task.kind != item.media_kind
+            ):
+                raise AssemblyError("冻结 GenerationTask 来源已经失效", job=job)
+            root = Path(settings.COMFYUI_OUTPUT_DIR).resolve()
+            path = (root / item.object_key).resolve()
+        if not path.is_relative_to(root):
+            raise AssemblyError("冻结媒体来源路径越界", job=job)
+        try:
+            facts = verified_local_media_facts(
+                path,
+                expected_kind=item.media_kind,
+                max_bytes=item.size_bytes,
+            )
+        except (OSError, ProvenanceError, ValueError) as exc:
+            raise AssemblyError(f"冻结媒体来源无法重新校验: {exc}", job=job) from exc
+        if (
+            facts["sha256"] != item.sha256
+            or facts["size_bytes"] != item.size_bytes
+            or facts["mime_type"] != item.mime_type
+        ):
+            raise AssemblyError("冻结媒体来源字节事实已漂移", job=job)
+
+
+def _ordered_frozen_sources_for_episode(
+    episode: Episode,
+    source_refs_by_shot: dict[str, dict[str, str]],
+) -> list[TaskSelection]:
+    """Resolve a complete per-shot source map through one validation path."""
+
+    shots = list(episode.shots.order_by("number", "id"))
+    if not shots:
+        raise AssemblyError(f"第 {episode.number} 集没有可组装的分镜")
+    expected = {str(shot.id) for shot in shots}
+    if set(source_refs_by_shot) != expected:
+        raise AssemblyError(f"第 {episode.number} 集冻结的逐镜媒体来源不完整")
+    selections: list[TaskSelection] = []
+    for shot in shots:
+        reference = source_refs_by_shot[str(shot.id)]
+        if not isinstance(reference, dict) or set(reference) not in (
+            {"generation_task_id"}, {"generated_artifact_id"},
+        ):
+            raise AssemblyError("冻结媒体来源必须且只能引用 task 或 artifact")
+        if "generation_task_id" in reference:
+            task = GenerationTask.objects.select_related(
+                "generated_workflow__prompt_artifact",
+            ).filter(
+                pk=reference["generation_task_id"], owner=episode.project.owner,
+                project=episode.project, episode=episode, kind=shot.media_type,
+                status=GenerationTask.Status.SUCCEEDED,
+            ).first()
+            if task is None or str(shot.id) not in set(_task_shot_ids(task)):
+                raise AssemblyError(f"分镜 {shot.number} 的冻结 GenerationTask 无效")
+            selections.append(TaskSelection(shot=shot, task=task))
+            continue
+        artifact = GeneratedArtifact.objects.select_related(
+            "production_run", "generation_attempt",
+        ).filter(pk=reference["generated_artifact_id"]).first()
+        if (
+            artifact is None
+            or artifact.kind != shot.media_type
+            or artifact.production_run is None
+            or artifact.production_run.owner_id != episode.project.owner_id
+            or artifact.production_run.project_id != episode.project_id
+        ):
+            raise AssemblyError(f"分镜 {shot.number} 的冻结 GeneratedArtifact 不属于当前项目")
+        prompt = _artifact_prompt(artifact)
+        if prompt.project_id != episode.project_id or prompt.episode_id != episode.id or prompt.shot_id != shot.id:
+            raise AssemblyError(f"分镜 {shot.number} 的冻结 GeneratedArtifact 归属不一致")
+        _managed_artifact_path(artifact)
+        selections.append(TaskSelection(shot=shot, artifact=artifact))
+    return selections
 
 
 def _multi_shot_window(selection: TaskSelection) -> tuple[float, float]:
@@ -180,22 +375,55 @@ def _resolve_output(
     stream_cache: dict[Path, frozenset[str]] | None = None,
 ) -> Clip:
     task = selection.task
+    if selection.artifact is not None:
+        artifact = selection.artifact
+        candidate, _facts = _managed_artifact_path(artifact)
+        prompt = _artifact_prompt(artifact)
+        duration_seconds = max(0.1, selection.shot.duration_ms / 1000)
+        if artifact.kind == GeneratedArtifact.Kind.IMAGE:
+            return Clip(
+                None, candidate, False, duration_seconds,
+                artifact=artifact, media_kind=Shot.MediaType.IMAGE,
+            )
+        streams = stream_cache.get(candidate) if stream_cache is not None else None
+        if streams is None:
+            streams = _probe_media_streams(candidate)
+            if stream_cache is not None:
+                stream_cache[candidate] = streams
+        if "video" not in streams:
+            raise AssemblyError(f"受管产物 {artifact.id} 没有视频流")
+        return Clip(
+            None, candidate, "audio" in streams,
+            duration_seconds, artifact=artifact, media_kind=Shot.MediaType.VIDEO,
+        )
+    if task is None:
+        raise AssemblyError("组装来源没有 task 或 artifact")
     if not settings.COMFYUI_OUTPUT_DIR:
         raise AssemblyError("COMFYUI_OUTPUT_DIR 未配置")
     output_root = Path(settings.COMFYUI_OUTPUT_DIR).resolve()
-    video = next((item for item in task.outputs if (
-        item.get("kind") in {"videos", "gifs"}
-        or str(item.get("filename", "")).lower().endswith((".mp4", ".mov", ".mkv", ".webm"))
+    is_image = selection.shot.media_type == Shot.MediaType.IMAGE
+    output = next((item for item in task.outputs if (
+        item.get("kind") in ({"images"} if is_image else {"videos", "gifs"})
+        or str(item.get("filename", "")).lower().endswith(
+            (".png", ".jpg", ".jpeg", ".webp") if is_image
+            else (".mp4", ".mov", ".mkv", ".webm")
+        )
     )), None)
-    if not video or not video.get("filename"):
-        raise AssemblyError(f"任务 {task.id} 没有可组装的视频输出")
-    candidate = (output_root / str(video.get("subfolder", "")) / str(video["filename"])).resolve()
+    if not output or not output.get("filename"):
+        raise AssemblyError(f"任务 {task.id} 没有可组装的{selection.shot.get_media_type_display()}输出")
+    candidate = (output_root / str(output.get("subfolder", "")) / str(output["filename"])).resolve()
     try:
         candidate.relative_to(output_root)
     except ValueError as exc:
         raise AssemblyError(f"任务 {task.id} 输出路径越过 ComfyUI 输出目录") from exc
     if not candidate.is_file():
         raise AssemblyError(f"任务 {task.id} 输出文件不存在: {candidate}")
+    if is_image:
+        return Clip(
+            task, candidate, False,
+            max(0.1, selection.shot.duration_ms / 1000),
+            media_kind=Shot.MediaType.IMAGE,
+        )
     streams = stream_cache.get(candidate) if stream_cache is not None else None
     if streams is None:
         streams = _probe_media_streams(candidate)
@@ -206,13 +434,17 @@ def _resolve_output(
     has_audio = "audio" in streams
     prompt = task.generated_workflow.prompt_artifact
     if prompt.is_multi_shot:
-        start_seconds, duration_seconds = _multi_shot_window(selection)
+        start_seconds, _source_window_seconds = _multi_shot_window(selection)
         return Clip(
-            task, candidate, has_audio, max(0.1, duration_seconds),
-            max(0, start_seconds), True,
+            task, candidate, has_audio,
+            max(0.1, selection.shot.duration_ms / 1000),
+            max(0, start_seconds), True, media_kind=Shot.MediaType.VIDEO,
         )
-    duration_ms = task.effective_duration_ms or prompt.total_duration_ms
-    return Clip(task, candidate, has_audio, max(0.1, duration_ms / 1000))
+    return Clip(
+        task, candidate, has_audio,
+        max(0.1, selection.shot.duration_ms / 1000),
+        media_kind=Shot.MediaType.VIDEO,
+    )
 
 
 def _safe_output_name(raw: str, default: str) -> str:
@@ -260,16 +492,19 @@ def _resolve_ai_label_fontfile() -> str:
 def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) -> list[str]:
     command = [settings.FFMPEG_BINARY, "-hide_banner", "-loglevel", "error", "-y"]
     for clip in clips:
+        if clip.media_kind == Shot.MediaType.IMAGE:
+            command.extend(("-loop", "1", "-framerate", "24"))
         command.extend(("-i", str(clip.path)))
     filters = []
     concat_inputs = []
     for index, clip in enumerate(clips):
         video_trim = (
-            f"trim=start={clip.start_seconds:.3f}:duration={clip.duration_seconds:.3f},"
-            if clip.trim_to_shot else ""
+            f"trim=start={clip.start_seconds:.3f}:duration={clip.duration_seconds:.3f},setpts=PTS-STARTPTS,"
+            if clip.trim_to_shot else "setpts=PTS-STARTPTS,"
         )
         filters.append(
-            f"[{index}:v:0]{video_trim}scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"[{index}:v:0]{video_trim}tpad=stop_mode=clone:stop_duration={clip.duration_seconds:.3f},"
+            f"trim=duration={clip.duration_seconds:.3f},scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps=24,format=yuv420p,"
             f"setpts=PTS-STARTPTS[v{index}]"
         )
@@ -282,6 +517,7 @@ def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) ->
             filters.append(
                 f"[{index}:a:0]{audio_trim}aresample=48000,"
                 f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
+                f"apad=pad_dur={clip.duration_seconds:.3f},atrim=duration={clip.duration_seconds:.3f},"
                 f"asetpts=PTS-STARTPTS[a{index}]"
             )
         else:
@@ -290,10 +526,11 @@ def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) ->
                 f"asetpts=PTS-STARTPTS[a{index}]"
             )
         concat_inputs.append(f"[a{index}]")
-    label_text = str(settings.ASSEMBLY_AI_LABEL_TEXT or "").strip()
-    concat_video_label = "vconcat" if settings.ASSEMBLY_AI_LABEL_ENABLED else "vout"
+    label_enabled, label_text = _delivery_disclosure()
+    label_text = label_text.strip()
+    concat_video_label = "vconcat" if label_enabled else "vout"
     filters.append("".join(concat_inputs) + f"concat=n={len(clips)}:v=1:a=1[{concat_video_label}][aout]")
-    if settings.ASSEMBLY_AI_LABEL_ENABLED:
+    if label_enabled:
         fontfile = _resolve_ai_label_fontfile()
         drawtext = (
             f"drawtext=text='{_drawtext_value(label_text)}':"
@@ -337,19 +574,25 @@ def _assembly_source_signature(
     *, owner, project: SeriesProject, episode: Episode | None,
     selections: list[TaskSelection], clips: list[Clip], output_name: str,
 ) -> str:
-    output_root = Path(settings.COMFYUI_OUTPUT_DIR).resolve()
     sources = []
     for selection, clip in zip(selections, clips, strict=True):
+        root = (
+            Path(settings.MEDIA_ROOT).resolve()
+            if clip.artifact is not None else Path(settings.COMFYUI_OUTPUT_DIR).resolve()
+        )
         sources.append({
-            "task_id": str(clip.task.id),
+            "source_kind": "artifact" if clip.artifact is not None else "task",
+            "media_kind": clip.media_kind,
+            "source_id": str(clip.artifact.id if clip.artifact is not None else clip.task.id),
             "shot_id": str(selection.shot.id),
-            "source": clip.path.relative_to(output_root).as_posix(),
+            "source": clip.path.relative_to(root).as_posix(),
             "start_ms": round(clip.start_seconds * 1000),
             "duration_ms": round(clip.duration_seconds * 1000),
             "trim_to_shot": clip.trim_to_shot,
             "has_audio_stream": clip.has_audio,
             "sha256": sha256_file(clip.path),
         })
+    label_enabled, label_text = _delivery_disclosure()
     payload = {
         "version": _ASSEMBLY_SIGNATURE_VERSION,
         "owner_id": str(owner.id),
@@ -365,10 +608,10 @@ def _assembly_source_signature(
             "video_codec": "libx264",
             "crf": 18,
             "audio_codec": "aac",
-            "ai_label_enabled": bool(settings.ASSEMBLY_AI_LABEL_ENABLED),
-            "ai_label_text": str(settings.ASSEMBLY_AI_LABEL_TEXT),
+            "ai_label_enabled": label_enabled,
+            "ai_label_text": label_text,
             "ai_label_fontfile": str(settings.ASSEMBLY_AI_LABEL_FONTFILE or ""),
-            "mp4_metadata": bool(str(settings.ASSEMBLY_AI_LABEL_TEXT or "").strip()),
+            "mp4_metadata": bool(label_text.strip()),
         },
     }
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -411,6 +654,7 @@ def _find_reusable_assembly(
         project=project,
         episode=episode,
         scope=scope,
+        source_contract_version=_ASSEMBLY_SIGNATURE_VERSION,
         dry_run=False,
         status__in=(
             AssemblyJob.Status.QUEUED,
@@ -444,7 +688,14 @@ def _mark_scope_complete(project: SeriesProject, episode: Episode | None) -> Non
 
 
 def create_assembly(
-    *, owner, project: SeriesProject, episode: Episode | None, dry_run: bool, output_name: str = "",
+    *,
+    owner,
+    project: SeriesProject,
+    episode: Episode | None,
+    dry_run: bool,
+    output_name: str = "",
+    task_ids_by_shot: dict[str, str] | None = None,
+    source_refs_by_shot: dict[str, dict[str, str]] | None = None,
 ) -> AssemblyJob:
     scope = AssemblyJob.Scope.EPISODE if episode else AssemblyJob.Scope.SERIES
     episodes = [episode] if episode else list(project.episodes.order_by("number"))
@@ -452,7 +703,22 @@ def create_assembly(
         raise AssemblyError("项目没有可组装的剧集")
     selections = []
     for item in episodes:
-        selections.extend(_ordered_tasks_for_episode(item))
+        if source_refs_by_shot is not None:
+            episode_mapping = {
+                str(shot.id): source_refs_by_shot[str(shot.id)]
+                for shot in item.shots.all()
+                if str(shot.id) in source_refs_by_shot
+            }
+            selections.extend(_ordered_frozen_sources_for_episode(item, episode_mapping))
+        elif task_ids_by_shot is None:
+            selections.extend(_ordered_tasks_for_episode(item))
+        else:
+            episode_mapping = {
+                str(shot.id): {"generation_task_id": str(task_ids_by_shot[str(shot.id)])}
+                for shot in item.shots.all()
+                if str(shot.id) in task_ids_by_shot
+            }
+            selections.extend(_ordered_frozen_sources_for_episode(item, episode_mapping))
     stream_cache: dict[Path, frozenset[str]] = {}
     clips = [_resolve_output(selection, stream_cache) for selection in selections]
     normalized_output_name = _normalized_requested_output_name(output_name)
@@ -466,7 +732,9 @@ def create_assembly(
     )
     # Source tasks are an audit set; clips intentionally keep repeated multi-shot
     # tasks because each occurrence is trimmed to a different shot boundary.
-    tasks = list(dict.fromkeys(selection.task for selection in selections))
+    tasks = list(dict.fromkeys(
+        selection.task for selection in selections if selection.task is not None
+    ))
 
     # Serialize idempotency lookup + durable enqueue.  The expensive media probe
     # happens before this short transaction, while the mutex prevents two API
@@ -496,11 +764,43 @@ def create_assembly(
             owner=owner, project=project, episode=episode, scope=scope,
             status=AssemblyJob.Status.PLANNED, dry_run=dry_run,
             source_signature=source_signature,
+            source_contract_version=_ASSEMBLY_SIGNATURE_VERSION,
             # Every assembled MP4 has an AAC track.  Source clips without an audio
             # stream receive duration-matched silence in ``_ffmpeg_command``.
             has_audio=True,
         )
         job.source_tasks.set(tasks)
+        source_items = []
+        for index, (selection, clip) in enumerate(zip(selections, clips, strict=True), start=1):
+            facts = verified_local_media_facts(
+                clip.path,
+                expected_kind=clip.media_kind,
+                max_bytes=clip.path.stat().st_size,
+            )
+            source_items.append(AssemblySourceItem(
+                assembly_job=job,
+                ordinal=index,
+                shot=selection.shot,
+                generation_task=selection.task,
+                generated_artifact=selection.artifact,
+                storage_backend=(
+                    selection.artifact.storage_backend if selection.artifact is not None
+                    else "comfyui_output"
+                ),
+                object_key=(
+                    selection.artifact.object_key if selection.artifact is not None
+                    else clip.path.relative_to(Path(settings.COMFYUI_OUTPUT_DIR).resolve()).as_posix()
+                ),
+                mime_type=facts["mime_type"],
+                size_bytes=facts["size_bytes"],
+                sha256=facts["sha256"],
+                media_kind=clip.media_kind,
+                start_ms=round(clip.start_seconds * 1000),
+                duration_ms=max(1, round(clip.duration_seconds * 1000)),
+                trim_to_shot=clip.trim_to_shot,
+                has_audio_stream=clip.has_audio,
+            ))
+        AssemblySourceItem.objects.bulk_create(source_items)
         try:
             output_dir = Path(settings.MEDIA_ROOT).resolve() / "assemblies" / str(owner.id) / str(project.id)
             output_dir.mkdir(parents=True, exist_ok=True)

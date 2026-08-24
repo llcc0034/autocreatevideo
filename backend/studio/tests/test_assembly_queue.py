@@ -10,7 +10,15 @@ from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.utils import timezone
 
-from studio.models import AssemblyJob, Episode, WorkerLease
+from studio.models import (
+    AssemblyJob,
+    Episode,
+    ProductionAssemblyLink,
+    ProductionRecipeVersion,
+    ProductionRun,
+    StageRun,
+    WorkerLease,
+)
 from studio.services.assembly_queue import (
     ASSEMBLY_WORKER_HEARTBEAT_KEY,
     claim_next_assembly,
@@ -18,6 +26,8 @@ from studio.services.assembly_queue import (
     recover_stale_assemblies,
 )
 from studio.services.provenance import persist_assembly_provenance
+from studio.services.json_contracts import assign_json_contract, json_contract
+from studio.services.production_runs import retry_production_run
 from studio.tests.factories import build_story
 
 
@@ -34,6 +44,12 @@ class AssemblyQueueTests(TestCase):
         )
         self.override.enable()
         self.addCleanup(self.override.disable)
+        self.source_verification_patcher = patch(
+            "studio.services.assembly_queue.verify_assembly_sources",
+            return_value=None,
+        )
+        self.source_verification_patcher.start()
+        self.addCleanup(self.source_verification_patcher.stop)
         self.user, self.project, _, _, self.episode, _, _ = build_story()
 
     def _queued_job(self, *, max_attempts=3, filename="assembled.mp4"):
@@ -53,6 +69,81 @@ class AssemblyQueueTests(TestCase):
             source_signature="a" * 64,
             max_attempts=max_attempts,
         )
+
+    def _link_assembly_run_with_delivery_gate(self, job):
+        recipe_contract = json_contract({"schema_version": 1, "stages": []})
+        recipe = ProductionRecipeVersion.objects.create(
+            recipe_key=f"assembly-auto-{job.id}",
+            version=1,
+            name="Assembly auto advance fixture",
+            definition=recipe_contract.value,
+            definition_schema_version=recipe_contract.schema_version,
+            definition_size_bytes=recipe_contract.size_bytes,
+            definition_sha256=recipe_contract.sha256,
+        )
+        config = json_contract({"schema_version": 1})
+        run_input = json_contract({
+            "schema_version": 1,
+            "episode_ids": [str(self.episode.id)],
+        })
+        run = ProductionRun.objects.create(
+            owner=self.user,
+            project=self.project,
+            recipe_version=recipe,
+            idempotency_key=f"assembly-auto-{job.id}",
+            request_sha256="e" * 64,
+            status=ProductionRun.Status.RUNNING,
+            current_stage_key="assembly",
+            config_snapshot=config.value,
+            config_snapshot_schema_version=config.schema_version,
+            config_snapshot_size_bytes=config.size_bytes,
+            config_snapshot_sha256=config.sha256,
+            input_snapshot=run_input.value,
+            input_snapshot_schema_version=run_input.schema_version,
+            input_snapshot_size_bytes=run_input.size_bytes,
+            input_snapshot_sha256=run_input.sha256,
+        )
+
+        def stage_row(*, key, ordinal, mode, status, approval_required=False):
+            stage = StageRun(
+                production_run=run,
+                stage_key=key,
+                ordinal=ordinal,
+                mode=mode,
+                status=status,
+                approval_required=approval_required,
+                idempotency_key=f"{run.id}:{ordinal}:{key}",
+            )
+            for field, payload in (
+                ("routing", {"schema_version": 1}),
+                ("routing_decision", {"schema_version": 1}),
+                ("config_snapshot", {"schema_version": 1}),
+                ("input_snapshot", {"schema_version": 1, "stage_key": key}),
+            ):
+                assign_json_contract(stage, field, payload)
+            stage.save()
+            return stage
+
+        assembly_stage = stage_row(
+            key="assembly",
+            ordinal=1,
+            mode="existing_pipeline",
+            status=StageRun.Status.RUNNING,
+        )
+        delivery_gate = stage_row(
+            key="delivery",
+            ordinal=2,
+            mode="manual",
+            status=StageRun.Status.PENDING,
+            approval_required=True,
+        )
+        ProductionAssemblyLink.objects.create(
+            production_run=run,
+            stage_run=assembly_stage,
+            episode=self.episode,
+            assembly_job=job,
+        )
+        return run, assembly_stage, delivery_gate
 
     @staticmethod
     def _successful_ffmpeg(command, **kwargs):
@@ -92,6 +183,90 @@ class AssemblyQueueTests(TestCase):
         self.assertEqual(Path(result.output_path).read_bytes(), b"complete-video")
         self.episode.refresh_from_db()
         self.assertEqual(self.episode.status, Episode.Status.COMPLETED)
+
+    def test_terminal_assembly_auto_advances_run_into_delivery_gate(self):
+        queued = self._queued_job(filename="auto-advance-episode.mp4")
+        run, assembly_stage, delivery_gate = self._link_assembly_run_with_delivery_gate(queued)
+        claimed = claim_next_assembly(worker_id="worker-auto-advance")
+
+        with patch(
+            "studio.services.assembly_queue._run_ffmpeg",
+            side_effect=self._successful_ffmpeg,
+        ), self.captureOnCommitCallbacks(execute=True):
+            result = process_assembly_job(claimed)
+
+        self.assertEqual(result.status, AssemblyJob.Status.SUCCEEDED)
+        run.refresh_from_db()
+        assembly_stage.refresh_from_db()
+        delivery_gate.refresh_from_db()
+        self.assertEqual(assembly_stage.status, StageRun.Status.SUCCEEDED)
+        self.assertEqual(delivery_gate.status, StageRun.Status.AWAITING_APPROVAL)
+        self.assertEqual(run.status, ProductionRun.Status.AWAITING_APPROVAL)
+        self.assertEqual(run.current_stage_key, "delivery")
+
+    def test_known_assembly_failure_auto_blocks_without_implicit_retry(self):
+        queued = self._queued_job(
+            max_attempts=1,
+            filename="auto-block-assembly.mp4",
+        )
+        run, assembly_stage, delivery_gate = self._link_assembly_run_with_delivery_gate(queued)
+        claimed = claim_next_assembly(worker_id="worker-auto-block")
+        failure = subprocess.CompletedProcess(
+            ["ffmpeg-test"],
+            1,
+            stdout="",
+            stderr="codec initialization failed",
+        )
+
+        with patch(
+            "studio.services.assembly_queue._run_ffmpeg",
+            return_value=failure,
+        ), self.captureOnCommitCallbacks(execute=True):
+            result = process_assembly_job(claimed)
+
+        self.assertEqual(result.status, AssemblyJob.Status.FAILED)
+        run.refresh_from_db()
+        assembly_stage.refresh_from_db()
+        delivery_gate.refresh_from_db()
+        self.assertEqual(assembly_stage.status, StageRun.Status.BLOCKED)
+        self.assertEqual(assembly_stage.reason_code, "assembly_failed")
+        self.assertEqual(delivery_gate.status, StageRun.Status.PENDING)
+        self.assertEqual(run.status, ProductionRun.Status.BLOCKED)
+        self.assertEqual(run.current_stage_key, "assembly")
+        link = ProductionAssemblyLink.objects.get(production_run=run)
+        self.assertEqual(link.assembly_job_id, queued.id)
+
+    def test_explicit_run_retry_replaces_failed_assembly_job(self):
+        queued = self._queued_job(max_attempts=1, filename="failed-before-retry.mp4")
+        run, assembly_stage, _delivery_gate = self._link_assembly_run_with_delivery_gate(queued)
+        claimed = claim_next_assembly(worker_id="worker-before-explicit-retry")
+        failure = subprocess.CompletedProcess(
+            ["ffmpeg-test"],
+            1,
+            stdout="",
+            stderr="codec initialization failed",
+        )
+        with patch(
+            "studio.services.assembly_queue._run_ffmpeg",
+            return_value=failure,
+        ), self.captureOnCommitCallbacks(execute=True):
+            process_assembly_job(claimed)
+        replacement = self._queued_job(filename="explicit-retry.mp4")
+
+        with patch(
+            "studio.services.production_runs.create_assembly",
+            return_value=replacement,
+        ):
+            retried = retry_production_run(run, user=self.user)
+
+        link = ProductionAssemblyLink.objects.get(production_run=run)
+        assembly_stage.refresh_from_db()
+        self.assertEqual(link.assembly_job_id, replacement.id)
+        self.assertEqual(retried.status, ProductionRun.Status.RUNNING)
+        self.assertEqual(assembly_stage.status, StageRun.Status.RUNNING)
+        self.assertEqual(assembly_stage.reason_code, "waiting_external_task")
+        queued.refresh_from_db()
+        self.assertEqual(queued.status, AssemblyJob.Status.FAILED)
 
     def test_failures_retry_then_persist_terminal_reason(self):
         queued = self._queued_job(max_attempts=2)

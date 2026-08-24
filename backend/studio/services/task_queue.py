@@ -2,17 +2,31 @@ from __future__ import annotations
 
 from datetime import timedelta
 from copy import deepcopy
+import hashlib
+import logging
+import math
 from pathlib import Path
 import tempfile
 import time
 import uuid
+from urllib.parse import urlparse
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 
-from studio.models import Asset, GenerationTask, WorkerLease
+from studio.models import (
+    Asset,
+    GenerationTask,
+    HostCapabilitySnapshot,
+    ModelDeployment,
+    RuntimeHost,
+    WorkflowSmokeAttempt,
+    WorkerLease,
+)
 from studio.services.comfyui import ComfyUIClient, ComfyUIError, ComfyUIExecutionError
 from studio.services.comfyui_contract import (
     ComfyUIContractError,
@@ -28,7 +42,291 @@ from studio.services.reference_media import (
 )
 from studio.services.provenance import ProvenanceError, persist_task_provenance, sha256_file
 from studio.services.distribution import prepare_all_task_distributions
+from studio.services.generated_artifacts import (
+    inspect_task_output_media,
+    record_generation_task_artifacts,
+)
+from studio.services.json_contracts import canonical_json_bytes, json_contract
+from studio.services.provider_registry import credential_binding_sha256, validate_endpoint
+from studio.services.runtime_platform import verify_host_snapshot
+from studio.services.configuration import resolve_configuration
+from studio.services.execution_deadlines import (
+    expired_kind,
+    initial_deadlines,
+    meaningful_deadline_updates,
+)
+from studio.services.production_run_auto_advance import schedule_generation_task_run_advance
 from studio.services.workflow import WorkflowBuildError, validate_comfy_graph
+
+
+logger = logging.getLogger(__name__)
+
+
+def _execution_capacity(task: GenerationTask) -> dict:
+    """Return the verified frozen pool policy for a platform task.
+
+    Historical non-ProductionRun tasks remain governed only by the current
+    deployment ceiling. New platform tasks must carry an integrity-protected
+    snapshot; a missing or altered snapshot is never treated as a default.
+    """
+
+    snapshot = task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
+    has_platform_relation = task.platform_attempts.exists()
+    has_platform_marker = bool(str(snapshot.get("production_run_id") or "").strip())
+    if not has_platform_relation and not has_platform_marker:
+        runtime = resolve_configuration(required_keys=(
+            "production.task_timeout_seconds",
+            "runtime.task_idle_timeout_seconds",
+        )).values
+        return {
+            "legacy": True,
+            "effective_concurrency": int(settings.TASK_MAX_CONCURRENT),
+            "effective_task_timeout_seconds": float(runtime["production.task_timeout_seconds"]),
+            "task_idle_timeout_seconds": float(runtime["runtime.task_idle_timeout_seconds"]),
+        }
+    capacity = snapshot.get("execution_capacity")
+    digest = str(snapshot.get("execution_capacity_sha256") or "")
+    try:
+        actual_digest = (
+            hashlib.sha256(canonical_json_bytes(capacity)).hexdigest()
+            if isinstance(capacity, dict)
+            else ""
+        )
+    except (TypeError, ValueError):
+        actual_digest = ""
+    if len(digest) != 64 or actual_digest != digest:
+        raise ComfyUIError("ProductionRun 任务的冻结 execution capacity 校验失败")
+    try:
+        configured_raw = capacity["configured_concurrency"]
+        effective_raw = capacity["effective_concurrency"]
+        hard_ceiling_raw = capacity["hard_concurrency_ceiling_at_freeze"]
+        if any(type(value) is not int for value in (
+            configured_raw, effective_raw, hard_ceiling_raw,
+        )):
+            raise TypeError("并发字段必须是整数")
+        configured = configured_raw
+        effective = effective_raw
+        hard_ceiling = hard_ceiling_raw
+        configured_timeout = float(capacity["configured_task_timeout_seconds"])
+        effective_timeout = float(capacity["effective_task_timeout_seconds"])
+        idle_timeout = float(capacity["task_idle_timeout_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ComfyUIError("ProductionRun 任务的冻结 execution capacity 字段无效") from exc
+    config_sha256 = str(capacity.get("config_snapshot_sha256") or "")
+    if (
+        capacity.get("schema_version") != 3
+        or not 1 <= configured
+        or not 1 <= hard_ceiling
+        or not 1 <= effective <= min(configured, hard_ceiling)
+        or effective_timeout <= 0
+        or not all(math.isfinite(item) for item in (
+            configured_timeout, effective_timeout, idle_timeout,
+        ))
+        or effective_timeout != configured_timeout
+        or idle_timeout <= 0
+        or idle_timeout > effective_timeout
+        or len(config_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in config_sha256)
+        or config_sha256 != snapshot.get("config_snapshot_sha256")
+    ):
+        raise ComfyUIError("ProductionRun 任务的冻结 execution capacity 约束无效")
+
+    deployment_id = str(snapshot.get("model_deployment_id") or "").strip()
+    try:
+        uuid.UUID(deployment_id)
+    except (ValueError, AttributeError) as exc:
+        raise ComfyUIError("ProductionRun 任务缺少有效的冻结 ModelDeployment") from exc
+    deployment = ModelDeployment.objects.select_related("runtime_host").filter(
+        pk=deployment_id,
+    ).first()
+    if deployment is None:
+        raise ComfyUIError("ProductionRun 任务绑定的 ModelDeployment 已不存在")
+
+    if deployment.runtime_host_id is None:
+        expected_empty = {
+            "runtime_host_id": None,
+            "host_capability_snapshot_id": None,
+            "host_capability_snapshot_revision": None,
+            "host_capability_snapshot_probe_status": None,
+            "host_capability_snapshot_sha256": "",
+            "host_capability_snapshot_captured_at": None,
+            "host_capability_snapshot_expires_at": None,
+            "host_compatible_concurrency": None,
+        }
+        if any(capacity.get(key) != value for key, value in expected_empty.items()):
+            raise ComfyUIError("远程媒体任务携带了不一致的本地主机容量证据")
+        if effective != min(configured, hard_ceiling):
+            raise ComfyUIError("远程媒体任务的冻结并发上限无效")
+        return capacity
+
+    if deployment.runtime_host.status != RuntimeHost.Status.ACTIVE:
+        raise ComfyUIError("ProductionRun 任务绑定的运行主机当前不可用")
+    if capacity.get("runtime_host_id") != str(deployment.runtime_host_id):
+        raise ComfyUIError("ProductionRun 任务冻结的运行主机绑定已漂移")
+    try:
+        snapshot_id = str(capacity["host_capability_snapshot_id"])
+        uuid.UUID(snapshot_id)
+        snapshot_revision = capacity["host_capability_snapshot_revision"]
+        host_cap = capacity["host_compatible_concurrency"]
+        if type(snapshot_revision) is not int or type(host_cap) is not int:
+            raise TypeError("主机能力字段必须是整数")
+        frozen_at = parse_datetime(str(capacity["frozen_at"]))
+        captured_at = parse_datetime(str(capacity["host_capability_snapshot_captured_at"]))
+        expires_at = parse_datetime(str(capacity["host_capability_snapshot_expires_at"]))
+    except (KeyError, TypeError, ValueError, AttributeError) as exc:
+        raise ComfyUIError("ProductionRun 任务的冻结主机容量字段无效") from exc
+    host_snapshot = HostCapabilitySnapshot.objects.filter(
+        pk=snapshot_id,
+        host_id=deployment.runtime_host_id,
+    ).first()
+    if host_snapshot is None:
+        raise ComfyUIError("ProductionRun 任务冻结的主机能力快照已不存在")
+    try:
+        verify_host_snapshot(host_snapshot)
+    except ValidationError as exc:
+        raise ComfyUIError("ProductionRun 任务冻结的主机能力快照校验失败") from exc
+    host_sha256 = str(capacity.get("host_capability_snapshot_sha256") or "")
+    if (
+        host_cap < 1
+        or effective != min(configured, hard_ceiling, host_cap)
+        or snapshot_revision != host_snapshot.revision
+        or capacity.get("host_capability_snapshot_probe_status")
+        != host_snapshot.probe_status
+        or host_snapshot.probe_status not in {
+            HostCapabilitySnapshot.ProbeStatus.SUCCEEDED,
+            HostCapabilitySnapshot.ProbeStatus.PARTIAL,
+        }
+        or len(host_sha256) != 64
+        or host_sha256 != host_snapshot.details_sha256
+        or captured_at is None
+        or expires_at is None
+        or frozen_at is None
+        or captured_at != host_snapshot.captured_at
+        or expires_at != host_snapshot.expires_at
+        or expires_at <= frozen_at
+    ):
+        raise ComfyUIError("ProductionRun 任务的冻结主机容量证据无效")
+    return capacity
+
+
+def task_wait_timeout(task: GenerationTask, requested_timeout: float | None = None) -> float:
+    """Return remaining persisted hard time; caller input cannot alter it."""
+    capacity = _execution_capacity(task)
+    if task.hard_deadline_at is None:
+        return float(capacity["effective_task_timeout_seconds"])
+    return max(0.0, (task.hard_deadline_at - timezone.now()).total_seconds())
+
+
+def _task_idle_seconds(task: GenerationTask) -> float:
+    return float(_execution_capacity(task)["task_idle_timeout_seconds"])
+
+
+def _mark_task_meaningful_progress(task: GenerationTask, marker: str, *, now=None) -> bool:
+    observed = now or timezone.now()
+    updates = meaningful_deadline_updates(
+        task,
+        marker=marker,
+        idle_seconds=_task_idle_seconds(task),
+        now=observed,
+    )
+    if not updates:
+        return False
+    GenerationTask.objects.filter(pk=task.pk).update(**updates, updated_at=observed)
+    for field, value in updates.items():
+        setattr(task, field, value)
+    return True
+
+
+def _ensure_task_deadlines(task: GenerationTask) -> GenerationTask:
+    if task.deadline_started_at is not None:
+        return task
+    capacity = _execution_capacity(task)
+    observed = timezone.now()
+    deadlines = initial_deadlines(
+        idle_seconds=capacity["task_idle_timeout_seconds"],
+        hard_seconds=capacity["effective_task_timeout_seconds"],
+        now=observed,
+        marker="phase:claimed",
+    )
+    GenerationTask.objects.filter(pk=task.pk, deadline_started_at__isnull=True).update(
+        deadline_started_at=deadlines.started_at,
+        hard_deadline_at=deadlines.hard_deadline_at,
+        idle_deadline_at=deadlines.idle_deadline_at,
+        last_meaningful_progress_at=deadlines.last_meaningful_progress_at,
+        progress_marker=deadlines.progress_marker,
+        updated_at=observed,
+    )
+    task.refresh_from_db()
+    return task
+
+
+def comfy_client_for_task(
+    task: GenerationTask,
+    *,
+    fallback: ComfyUIClient | None = None,
+) -> ComfyUIClient:
+    """Resolve a task's immutable platform deployment, or use the legacy client."""
+
+    raw_snapshot = getattr(task, "capability_snapshot", {})
+    snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
+    deployment_id = str(snapshot.get("model_deployment_id") or "").strip()
+    if not deployment_id:
+        return fallback or ComfyUIClient()
+    deployment = ModelDeployment.objects.select_related(
+        "profile_version__provider",
+    ).filter(
+        pk=deployment_id,
+        status=ModelDeployment.Status.ACTIVE,
+    ).first()
+    if deployment is None:
+        raise ComfyUIError("任务绑定的 ModelDeployment 不存在或已停用")
+    provider = deployment.profile_version.provider
+    if not provider.is_active:
+        raise ComfyUIError("任务绑定的 ProviderProfile 已停用")
+    if deployment.profile_version.status == "retired":
+        raise ComfyUIError("任务绑定的 ModelProfileVersion 已退役")
+    if provider.driver_type != provider.DriverType.COMFYUI:
+        raise ComfyUIError("媒体任务绑定的 provider 不是 ComfyUI")
+    try:
+        provider_config = snapshot.get("provider_config")
+        deployment_config = snapshot.get("deployment_config")
+        if not isinstance(provider_config, dict) or not isinstance(deployment_config, dict):
+            raise ComfyUIError("任务缺少冻结的非密钥执行配置")
+        frozen_digest = hashlib.sha256(canonical_json_bytes({
+            "provider_config": provider_config,
+            "deployment_config": deployment_config,
+        })).hexdigest()
+        if frozen_digest != snapshot.get("frozen_execution_config_sha256"):
+            raise ComfyUIError("任务冻结执行配置 checksum 无效")
+        config = {**provider_config, **deployment_config}
+        endpoint = validate_endpoint(str(config.get("base_url") or ""), resolve_dns=True)
+        endpoint_host = (urlparse(endpoint).hostname or "").casefold()
+        endpoint_is_external = endpoint_host not in {"localhost", "127.0.0.1", "::1"}
+        frozen = {
+            "model_profile_version_id": str(deployment.profile_version_id),
+            "provider_profile_id": str(provider.id),
+            "credential_binding_sha256": credential_binding_sha256(deployment),
+            "endpoint_is_external": endpoint_is_external,
+        }
+        missing = [key for key in frozen if key not in snapshot]
+        drifted = [key for key, value in frozen.items() if snapshot.get(key) != value]
+        if missing or drifted:
+            raise ComfyUIError(
+                "任务缺少冻结 deployment 摘要或配置已漂移；为防止未授权外发，已停止提交"
+            )
+        timeout = snapshot.get("effective_timeout_seconds")
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.5 <= float(timeout) <= 3600:
+            raise ComfyUIError("任务缺少冻结的有效 ComfyUI timeout")
+        configured_timeout = float(config.get("timeout_seconds", 60))
+        if float(timeout) != configured_timeout:
+            raise ComfyUIError("任务冻结 timeout 与执行配置不一致")
+    except Exception as exc:
+        raise ComfyUIError("任务绑定的 ModelDeployment 配置无效") from exc
+    return ComfyUIClient(
+        base_url=endpoint,
+        timeout=timeout,
+        endpoint_prevalidated=True,
+    )
 
 
 def claim_next_task() -> GenerationTask | None:
@@ -38,6 +336,15 @@ def claim_next_task() -> GenerationTask | None:
         # A single durable mutex row serializes count + claim across every
         # PostgreSQL worker, so TASK_MAX_CONCURRENT=1 cannot be raced.
         WorkerLease.objects.select_for_update().get(key="generation-claim")
+        if WorkflowSmokeAttempt.objects.filter(
+            status__in=(
+                WorkflowSmokeAttempt.Status.QUEUED,
+                WorkflowSmokeAttempt.Status.SUBMITTING,
+                WorkflowSmokeAttempt.Status.RUNNING,
+                WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
+            ),
+        ).exists():
+            return None
         # A failed/cancelled task with a persisted but non-terminal remote token
         # is a circuit breaker.  Claiming another task could duplicate GPU work
         # while the previous ComfyUI prompt is still alive but unobservable.
@@ -55,8 +362,6 @@ def claim_next_task() -> GenerationTask | None:
         ).exists()
         if unresolved_remote:
             return None
-        if GenerationTask.objects.filter(status=GenerationTask.Status.RUNNING).count() >= settings.TASK_MAX_CONCURRENT:
-            return None
         # A queued task with a non-terminal token is a reattachment to an
         # already submitted remote prompt, not a fresh generation attempt. It
         # must be claimed ahead of every unsubmitted task regardless of normal
@@ -73,20 +378,105 @@ def claim_next_task() -> GenerationTask | None:
             .order_by("queued_at")
             .first()
         )
+        if candidate is not None:
+            try:
+                _execution_capacity(candidate)
+            except ComfyUIError as exc:
+                # A recovered token is never converted into a fresh POST. Mark
+                # the corrupt frozen execution fact failed while preserving its
+                # remote identity for explicit reconciliation.
+                now = timezone.now()
+                GenerationTask.objects.filter(
+                    pk=candidate.pk,
+                    status=GenerationTask.Status.QUEUED,
+                ).update(
+                    status=GenerationTask.Status.FAILED,
+                    finished_at=now,
+                    heartbeat_at=now,
+                    error_message=str(exc),
+                    remote_state=GenerationTask.RemoteState.FAILED,
+                    remote_error=str(exc),
+                    updated_at=now,
+                )
+                schedule_generation_task_run_advance(candidate.pk)
+                return None
         if candidate is None:
-            candidate = (
+            running_tasks = list(
+                GenerationTask.objects.filter(status=GenerationTask.Status.RUNNING)
+                .only("id", "capability_snapshot", "created_at")
+            )
+            running_count = len(running_tasks)
+            hard_ceiling = int(settings.TASK_MAX_CONCURRENT)
+            if running_count >= hard_ceiling:
+                return None
+            running_limits = [hard_ceiling]
+            for running_task in running_tasks:
+                try:
+                    running_limits.append(int(
+                        _execution_capacity(running_task)["effective_concurrency"]
+                    ))
+                except ComfyUIError:
+                    # Do not enlarge a pool while an active platform task has
+                    # lost its authoritative capacity evidence.
+                    logger.error(
+                        "Running task %s has invalid frozen execution capacity",
+                        running_task.id,
+                    )
+                    return None
+            active_pool_limit = min(running_limits)
+            candidates = list(
                 GenerationTask.objects.select_for_update()
                 .filter(status=GenerationTask.Status.QUEUED, attempts__lt=models_f_max_attempts())
-                .order_by("-priority", "queued_at")
-                .first()
+                .order_by("-priority", "queued_at")[:256]
             )
+            for queued in candidates:
+                try:
+                    candidate_limit = min(
+                        hard_ceiling,
+                        active_pool_limit,
+                        int(_execution_capacity(queued)["effective_concurrency"]),
+                    )
+                except ComfyUIError as exc:
+                    GenerationTask.objects.filter(
+                        pk=queued.pk,
+                        status=GenerationTask.Status.QUEUED,
+                        submission_token="",
+                    ).update(
+                        status=GenerationTask.Status.FAILED,
+                        finished_at=timezone.now(),
+                        error_message=str(exc),
+                        remote_state=GenerationTask.RemoteState.FAILED,
+                        updated_at=timezone.now(),
+                    )
+                    schedule_generation_task_run_advance(queued.pk)
+                    continue
+                if running_count < candidate_limit:
+                    candidate = queued
+                    break
         if not candidate:
             return None
+        claim_time = timezone.now()
+        capacity = _execution_capacity(candidate)
+        deadline_updates = {}
+        if candidate.deadline_started_at is None:
+            deadlines = initial_deadlines(
+                idle_seconds=capacity["task_idle_timeout_seconds"],
+                hard_seconds=capacity["effective_task_timeout_seconds"],
+                now=claim_time,
+                marker="phase:claimed",
+            )
+            deadline_updates = {
+                "deadline_started_at": deadlines.started_at,
+                "hard_deadline_at": deadlines.hard_deadline_at,
+                "idle_deadline_at": deadlines.idle_deadline_at,
+                "last_meaningful_progress_at": deadlines.last_meaningful_progress_at,
+                "progress_marker": deadlines.progress_marker,
+            }
         changed = GenerationTask.objects.filter(
             pk=candidate.pk, status=GenerationTask.Status.QUEUED
         ).update(
             status=GenerationTask.Status.RUNNING,
-            started_at=timezone.now(),
+            started_at=claim_time,
             finished_at=None,
             progress=1,
             progress_source=GenerationTask.ProgressSource.NONE,
@@ -97,15 +487,43 @@ def claim_next_task() -> GenerationTask | None:
             progress_telemetry_error="",
             attempts=candidate.attempts + 1,
             error_message="",
-            heartbeat_at=timezone.now(),
+            heartbeat_at=claim_time,
             stalled_at=None,
             remote_state=GenerationTask.RemoteState.CLAIMED,
             remote_error="",
+            **deadline_updates,
+            updated_at=claim_time,
         )
         if not changed:
             return None
         candidate.refresh_from_db()
         return candidate
+
+
+def fail_claimed_task_preflight(
+    task: GenerationTask,
+    exc: Exception,
+) -> GenerationTask:
+    """Persist a claim-time validation failure before any remote submission."""
+
+    message = str(exc).strip() or "媒体任务执行前校验失败"
+    now = timezone.now()
+    with transaction.atomic():
+        locked = GenerationTask.objects.select_for_update().get(pk=task.pk)
+        if locked.status == GenerationTask.Status.RUNNING:
+            locked.status = GenerationTask.Status.FAILED
+            locked.finished_at = now
+            locked.heartbeat_at = now
+            locked.progress = 0
+            locked.error_message = message
+            locked.remote_state = GenerationTask.RemoteState.FAILED
+            locked.remote_error = message
+            locked.save(update_fields=(
+                "status", "finished_at", "heartbeat_at", "progress",
+                "error_message", "remote_state", "remote_error", "updated_at",
+            ))
+            schedule_generation_task_run_advance(locked.pk)
+        return locked
 
 
 def models_f_max_attempts():
@@ -237,6 +655,7 @@ def _finalize_cancelled(
         updates["submission_state"] = GenerationTask.SubmissionState.TERMINAL_CANCELLED
     GenerationTask.objects.filter(pk=task.pk).update(**updates)
     task.refresh_from_db()
+    schedule_generation_task_run_advance(task.pk)
 
 
 def _wait_for_task_completion(
@@ -244,7 +663,7 @@ def _wait_for_task_completion(
     client: ComfyUIClient,
     prompt_id: str,
     *,
-    timeout: float,
+    timeout: float | None = None,
     progress_socket=None,
 ) -> dict:
     """Poll ComfyUI while persisting heartbeats and honoring durable cancellation.
@@ -257,15 +676,29 @@ def _wait_for_task_completion(
     queued_method = getattr(client, "is_queued", None)
     if not callable(history_method) or not callable(queued_method):
         _record_runtime_state(task, GenerationTask.RemoteState.RUNNING, remote_error="")
-        return client.wait_for_completion(prompt_id, timeout=timeout)
+        task.refresh_from_db(fields=("hard_deadline_at", "idle_deadline_at"))
+        now = timezone.now()
+        limits = [
+            (value - now).total_seconds()
+            for value in (task.hard_deadline_at, task.idle_deadline_at)
+            if value is not None
+        ]
+        return client.wait_for_completion(prompt_id, timeout=max(0.0, min(limits)))
 
-    poll_seconds = max(0.05, float(getattr(settings, "TASK_REMOTE_POLL_SECONDS", 1)))
-    heartbeat_seconds = max(0.05, float(getattr(settings, "TASK_HEARTBEAT_SECONDS", 5)))
-    health_interval = max(0.0, float(getattr(settings, "TASK_HEALTH_CHECK_INTERVAL_SECONDS", 5)))
-    health_failure_limit = max(1, int(getattr(settings, "TASK_HEALTH_FAILURE_LIMIT", 3)))
-    missing_grace = max(0.0, float(getattr(settings, "TASK_REMOTE_MISSING_GRACE_SECONDS", 5)))
-    cancel_grace = max(0.0, float(getattr(settings, "TASK_CANCEL_GRACE_SECONDS", 30)))
-    deadline = time.monotonic() + max(0.0, timeout)
+    runtime = resolve_configuration(required_keys=(
+        "runtime.task_remote_poll_seconds",
+        "runtime.task_heartbeat_seconds",
+        "runtime.task_health_check_interval_seconds",
+        "runtime.task_health_failure_limit",
+        "runtime.task_remote_missing_grace_seconds",
+        "runtime.task_cancel_grace_seconds",
+    )).values
+    poll_seconds = max(0.05, float(runtime["runtime.task_remote_poll_seconds"]))
+    heartbeat_seconds = max(0.05, float(runtime["runtime.task_heartbeat_seconds"]))
+    health_interval = max(0.0, float(runtime["runtime.task_health_check_interval_seconds"]))
+    health_failure_limit = max(1, int(runtime["runtime.task_health_failure_limit"]))
+    missing_grace = max(0.0, float(runtime["runtime.task_remote_missing_grace_seconds"]))
+    cancel_grace = max(0.0, float(runtime["runtime.task_cancel_grace_seconds"]))
     next_heartbeat = 0.0
     next_health_check = 0.0
     consecutive_health_failures = 0
@@ -290,7 +723,6 @@ def _wait_for_task_completion(
                     task,
                     GenerationTask.ProgressTelemetryState.UNAVAILABLE,
                     error=f"ComfyUI progress WebSocket read failed: {exc}",
-                    observed_at=timezone.now(),
                 )
                 _close_task_progress_socket(progress_socket)
                 progress_socket = None
@@ -309,7 +741,6 @@ def _wait_for_task_completion(
                     GenerationTask.ProgressTelemetryState.UNAVAILABLE,
                     error=telemetry_error or "ComfyUI progress WebSocket became unavailable",
                     node_id=node_id or None,
-                    observed_at=observed_at,
                 )
                 _close_task_progress_socket(progress_socket)
                 progress_socket = None
@@ -318,6 +749,7 @@ def _wait_for_task_completion(
                 invalidates_quantitative_progress = event_type in {
                     "executing", "progress", "progress_state",
                 }
+                meaningful = bool(node_id and node_id != task.progress_node_id)
                 _record_progress_telemetry(
                     task,
                     GenerationTask.ProgressTelemetryState.CONNECTED,
@@ -327,8 +759,10 @@ def _wait_for_task_completion(
                     ),
                     clear_comfy_progress=invalidates_quantitative_progress,
                     node_id=node_id or None,
-                    observed_at=observed_at,
+                    observed_at=observed_at if meaningful else None,
                 )
+                if meaningful:
+                    _mark_task_meaningful_progress(task, f"node:{node_id}", now=observed_at)
                 return
         else:
             # Compatibility with small third-party/test clients that still
@@ -343,7 +777,6 @@ def _wait_for_task_completion(
                     task,
                     GenerationTask.ProgressTelemetryState.UNAVAILABLE,
                     error=f"ComfyUI progress WebSocket read failed: {exc}",
-                    observed_at=timezone.now(),
                 )
                 _close_task_progress_socket(progress_socket)
                 progress_socket = None
@@ -354,14 +787,27 @@ def _wait_for_task_completion(
             observed_at = timezone.now()
 
         raw_percent = max(0, min(100, int(round(float(fraction) * 100))))
+        previous_percent = task.comfy_progress
+        previous_node = task.progress_node_id
+        meaningful = (
+            (node_id and node_id != previous_node)
+            or previous_percent is None
+            or raw_percent > previous_percent
+        )
         _record_progress_telemetry(
             task,
             GenerationTask.ProgressTelemetryState.RECEIVING,
             source=GenerationTask.ProgressSource.COMFYUI,
             comfy_progress=raw_percent,
             node_id=node_id or None,
-            observed_at=observed_at,
+            observed_at=observed_at if meaningful else None,
         )
+        if meaningful:
+            _mark_task_meaningful_progress(
+                task,
+                f"node:{node_id or '-'}:progress:{raw_percent}",
+                now=observed_at,
+            )
         # 0-10% covers validation/upload/queue submission; keep 96-99% for
         # decode, mux, provenance and final output verification after sampling.
         value = min(95, max(10, 10 + int(round(float(fraction) * 85))))
@@ -382,9 +828,13 @@ def _wait_for_task_completion(
 
     heartbeat(GenerationTask.RemoteState.RUNNING, error="", force=True)
 
-    while time.monotonic() < deadline:
+    deadline_kind = "hard"
+    while True:
         task.refresh_from_db()
         current = time.monotonic()
+        deadline_kind = expired_kind(task) or ""
+        if deadline_kind:
+            break
         sampler_progress()
 
         if task.status in {
@@ -515,14 +965,17 @@ def _wait_for_task_completion(
             terminal_confirmed = not bool(queued_method(prompt_id))
         except ComfyUIError as cancel_check_exc:
             cancel_error = cancel_error or str(cancel_check_exc)
-    reason = f"等待 ComfyUI 任务 {prompt_id} 超时，已尝试终止远端执行"
+    reason = (
+        f"等待 ComfyUI 任务 {prompt_id} 达到 {deadline_kind or 'hard'} deadline，"
+        "已尝试终止远端执行"
+    )
     if cancel_error:
         reason = f"{reason}；终止失败: {cancel_error}"
     heartbeat(GenerationTask.RemoteState.DEGRADED, error=reason, stalled=True, force=True)
     raise RemoteExecutionStalled(
         reason,
         remote_status={
-            "reason": "timeout",
+            "reason": f"{deadline_kind or 'hard'}_timeout",
             "cancel_requested": cancel_ok,
             "terminal_confirmed": terminal_confirmed,
         },
@@ -544,14 +997,12 @@ def _open_task_progress_socket(task: GenerationTask, client: ComfyUIClient):
             task,
             GenerationTask.ProgressTelemetryState.UNAVAILABLE,
             error=str(exc),
-            observed_at=timezone.now(),
         )
         return None
     _record_progress_telemetry(
         task,
         GenerationTask.ProgressTelemetryState.CONNECTED,
         error="",
-        observed_at=timezone.now(),
     )
     return progress_socket
 
@@ -656,6 +1107,7 @@ def _staged_record_is_safe(
 
 def _verify_reusable_staged_input(
     task: GenerationTask, client: ComfyUIClient, record: dict, asset_id: str,
+    reference: dict,
 ) -> None:
     """Re-authorize the source before reusing a prior ComfyUI input mapping.
 
@@ -670,6 +1122,16 @@ def _verify_reusable_staged_input(
     asset, _path = _authorized_asset_source(task, asset_id)
     recorded_source_sha256 = str(record.get("source_sha256") or "").casefold()
     current_source_sha256 = str(asset.checksum or "").casefold()
+    frozen_source_sha256 = str(
+        reference.get("audio_checksum")
+        if str(reference.get("audio_asset_id") or "") == asset_id
+        else reference.get("checksum")
+        or ""
+    ).casefold()
+    if frozen_source_sha256 and frozen_source_sha256 != current_source_sha256:
+        raise ComfyUIError(
+            f"参考素材已偏离任务冻结 checksum，不能复用旧的 ComfyUI 输入: {asset_id}"
+        )
     if recorded_source_sha256 != current_source_sha256:
         raise ComfyUIError(
             f"参考素材已在暂存后变更，不能复用旧的 ComfyUI 输入: {asset_id}"
@@ -704,9 +1166,22 @@ def _safe_normalization_error(exc: Exception, *paths: Path) -> str:
 def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
     workflow = deepcopy(task.generated_workflow.workflow_json)
     template = task.generated_workflow.template
-    if not template.is_active or (
+    semantic_compiled = bool(
+        task.generated_workflow.workflow_template_version_id
+        and task.generated_workflow.compiler_id
+        and (task.capability_snapshot or {}).get("workflow_contract_sha256")
+    )
+    if semantic_compiled:
+        snapshot = task.capability_snapshot or {}
+        if json_contract(workflow).sha256 != task.generated_workflow.content_hash:
+            raise ComfyUIError("冻结 compiled workflow hash 不一致")
+        if snapshot.get("workflow_hash") != task.generated_workflow.content_hash:
+            raise ComfyUIError("任务 workflow hash 与 GeneratedWorkflow 不一致")
+        if snapshot.get("workflow_contract_sha256") != task.generated_workflow.workflow_contract_sha256:
+            raise ComfyUIError("任务 workflow execution contract hash 不一致")
+    if not semantic_compiled and (not template.is_active or (
         not task.owner.is_staff and (template.owner_id is not None or not template.is_system)
-    ):
+    )):
         raise ComfyUIError("任务引用的 WorkflowTemplate 不再允许该用户执行")
     try:
         validate_comfy_graph(workflow)
@@ -716,10 +1191,20 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
     if not required_tokens:
         return workflow
     prompt_assets = {}
-    reference_records = task.generated_workflow.prompt_artifact.structured_payload.get(
-        "reference_bindings",
-        task.generated_workflow.prompt_artifact.structured_payload.get("reference_assets", []),
-    )
+    frozen_asset_bindings = (task.capability_snapshot or {}).get("asset_bindings")
+    if frozen_asset_bindings is not None:
+        if not isinstance(frozen_asset_bindings, list):
+            raise ComfyUIError("任务冻结的 asset_bindings manifest 无效")
+        if json_contract(frozen_asset_bindings).sha256 != (
+            task.capability_snapshot or {}
+        ).get("asset_bindings_sha256"):
+            raise ComfyUIError("任务冻结的 asset_bindings hash 不一致")
+        reference_records = frozen_asset_bindings
+    else:
+        reference_records = task.generated_workflow.prompt_artifact.structured_payload.get(
+            "reference_bindings",
+            task.generated_workflow.prompt_artifact.structured_payload.get("reference_assets", []),
+        )
     for item in reference_records:
         if not isinstance(item, dict):
             continue
@@ -739,7 +1224,7 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
         if reference and _staged_record_is_safe(
             staged, reference, asset_id, staged_records,
         ):
-            _verify_reusable_staged_input(task, client, staged, asset_id)
+            _verify_reusable_staged_input(task, client, staged, asset_id, reference)
             mapping[token] = staged["comfy_path"]
     video_plans = {}
     changed = False
@@ -751,6 +1236,16 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
         if not item:
             raise ComfyUIError(f"参考素材 {asset_id} 不在提示词授权快照中")
         asset, path = _authorized_asset_source(task, asset_id)
+        frozen_checksum = str(
+            item.get("audio_checksum")
+            if str(item.get("audio_asset_id") or "") == asset_id
+            else item.get("checksum")
+            or ""
+        ).casefold()
+        if frozen_checksum and frozen_checksum != str(asset.checksum or "").casefold():
+            raise ComfyUIError(
+                f"参考素材已偏离任务冻结 checksum，已在上传前阻断: {asset_id}"
+            )
         source_sha256 = sha256_file(path)
         staged_path = path
         staged_metadata = {
@@ -828,9 +1323,14 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
     return _replace_staged_tokens(workflow, mapping)
 
 
-def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait_timeout: float = 900) -> GenerationTask:
+def process_task(
+    task: GenerationTask,
+    client: ComfyUIClient | None = None,
+    wait_timeout: float | None = None,
+) -> GenerationTask:
     client = client or ComfyUIClient()
     task.refresh_from_db()
+    task = _ensure_task_deadlines(task)
     if task.status in {GenerationTask.Status.CANCEL_REQUESTED, GenerationTask.Status.CANCELLED}:
         prompt_id = task.submission_token or task.comfy_prompt_id
         cancel_ok, cancel_error = _best_effort_cancel(client, prompt_id) if prompt_id else (True, "")
@@ -924,7 +1424,7 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
             prompt_id = str(uuid.uuid4())
             task.submission_token = prompt_id
             task.comfy_prompt_id = prompt_id
-            task.client_id = task.client_id or f"{settings.COMFYUI_CLIENT_ID}-{task.id}"
+            task.client_id = task.client_id or f"autoprompt-studio-{task.id}"
             task.submission_state = GenerationTask.SubmissionState.PREPARED
             task.submission_prepared_at = timezone.now()
             task.save(update_fields=(
@@ -959,6 +1459,9 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
                     "submission_state", "submission_submitted_at", "progress", "progress_source",
                     "comfy_progress", "progress_updated_at", "updated_at",
                 ))
+                _mark_task_meaningful_progress(
+                    task, "phase:submitted", now=task.submission_submitted_at,
+                )
                 _record_runtime_state(task, GenerationTask.RemoteState.SUBMITTED, remote_error="")
                 history = _wait_for_task_completion(
                     task, client, prompt_id, timeout=wait_timeout,
@@ -979,32 +1482,75 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
             return task
         generated_at = timezone.now()
         try:
+            observed_outputs = inspect_task_output_media(
+                task, client.extract_outputs(history),
+            )
             task.outputs = persist_task_provenance(
-                task, client.extract_outputs(history), generated_at=generated_at,
+                task, observed_outputs, generated_at=generated_at,
             )
         except (OSError, ProvenanceError, ValueError) as exc:
+            logger.exception(
+                "Generated output inspection/provenance sealing failed for task %s",
+                task.pk,
+            )
             raise ComfyUIError(
-                "生成文件已返回，但 AI 来源清单无法安全封存；任务不会标记成功: "
+                "生成文件已返回，但正式 GeneratedArtifact manifest 的媒体探测或 "
+                "AI 来源清单无法安全封存；任务不会标记成功: "
                 f"{exc}"
             ) from exc
-        task.status = GenerationTask.Status.SUCCEEDED
-        task.progress = 100
-        task.progress_source = GenerationTask.ProgressSource.TERMINAL
-        task.progress_updated_at = generated_at
-        task.finished_at = generated_at
-        task.heartbeat_at = task.finished_at
-        task.remote_state = GenerationTask.RemoteState.SUCCEEDED
-        task.remote_error = ""
-        task.save(update_fields=(
-            "outputs", "status", "progress", "progress_source",
-            "progress_updated_at", "finished_at", "heartbeat_at",
-            "remote_state", "remote_error", "updated_at",
-        ))
-        # Publication is intentionally a second, managed artifact. A valid
-        # ComfyUI master remains a successful generation even when disclosure
-        # rendering is unavailable; the per-output persisted state then makes
-        # public download fail closed and exposes an explicit retry action.
-        prepare_all_task_distributions(task)
+        cancellation_observed = False
+        try:
+            # The terminal task state and its required managed artifact
+            # manifests are one database fact.  Holding the task row lock until
+            # both are ready prevents readers from observing a successful task
+            # whose required artifacts have not been archived.
+            with transaction.atomic():
+                locked_task = GenerationTask.objects.select_for_update().get(pk=task.pk)
+                if locked_task.status in {
+                    GenerationTask.Status.CANCEL_REQUESTED,
+                    GenerationTask.Status.CANCELLED,
+                }:
+                    cancellation_observed = True
+                else:
+                    locked_task.status = GenerationTask.Status.SUCCEEDED
+                    locked_task.progress = 100
+                    locked_task.progress_source = GenerationTask.ProgressSource.TERMINAL
+                    locked_task.progress_updated_at = generated_at
+                    locked_task.finished_at = generated_at
+                    locked_task.heartbeat_at = generated_at
+                    locked_task.remote_state = GenerationTask.RemoteState.SUCCEEDED
+                    locked_task.remote_error = ""
+                    locked_task.save(update_fields=(
+                        "outputs", "status", "progress", "progress_source",
+                        "progress_updated_at", "finished_at", "heartbeat_at",
+                        "remote_state", "remote_error", "updated_at",
+                    ))
+                    record_generation_task_artifacts(locked_task)
+                    schedule_generation_task_run_advance(locked_task.pk)
+                    task = locked_task
+        except Exception as exc:
+            logger.exception("GeneratedArtifact archival failed for task %s", task.pk)
+            raise ComfyUIError(
+                "生成文件已完成，但正式 GeneratedArtifact manifest 写入失败；"
+                "任务不会保留成功状态"
+            ) from exc
+        if cancellation_observed:
+            task.refresh_from_db()
+            cancel_ok, cancel_error = _best_effort_cancel(client, prompt_id)
+            _finalize_cancelled(
+                task,
+                remote_confirmed=cancel_ok,
+                remote_error=cancel_error,
+            )
+            return task
+
+        # Disclosure publication is intentionally secondary to the immutable
+        # managed master.  It runs only after the success+archive transaction
+        # commits and can never downgrade a valid generation task.
+        try:
+            prepare_all_task_distributions(task)
+        except Exception:
+            logger.exception("Managed distribution preparation failed for task %s", task.pk)
         task.refresh_from_db(fields=("outputs",))
     except TaskCancellationFinalized:
         task.refresh_from_db()
@@ -1100,7 +1646,7 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
         task.progress = 0
         if task.status in {GenerationTask.Status.CANCEL_REQUESTED, GenerationTask.Status.CANCELLED}:
             task.status = GenerationTask.Status.CANCELLED
-        elif task.submission_token:
+        elif task.submission_token or task.comfy_prompt_id:
             # A persisted token whose remote outcome is not definitive must
             # never be cleared or automatically posted a second time.
             task.status = GenerationTask.Status.FAILED
@@ -1116,6 +1662,11 @@ def process_task(task: GenerationTask, client: ComfyUIClient | None = None, wait
             "error_message", "finished_at", "heartbeat_at", "progress", "status",
             "remote_state", "remote_error", "updated_at",
         ))
+    if task.status in {
+        GenerationTask.Status.FAILED,
+        GenerationTask.Status.CANCELLED,
+    }:
+        schedule_generation_task_run_advance(task.pk)
     return task
 
 
@@ -1131,9 +1682,10 @@ def recover_stale_tasks(
     """
     current_time = timezone.now()
     threshold = current_time - timedelta(minutes=older_than_minutes)
-    cancel_threshold = current_time - timedelta(
-        seconds=max(0.0, float(getattr(settings, "TASK_CANCEL_GRACE_SECONDS", 30))),
-    )
+    cancel_grace = float(resolve_configuration(
+        required_keys=("runtime.task_cancel_grace_seconds",),
+    ).values["runtime.task_cancel_grace_seconds"])
+    cancel_threshold = current_time - timedelta(seconds=max(0.0, cancel_grace))
     client = client or ComfyUIClient()
     reconcilable_submission_states = (
         GenerationTask.SubmissionState.PREPARED,
@@ -1167,10 +1719,26 @@ def recover_stale_tasks(
     candidates = running_candidates + cancel_candidates + unresolved_failed_candidates
     recovered = 0
     for task in candidates:
+        try:
+            task_client = comfy_client_for_task(task, fallback=client)
+        except ComfyUIError as exc:
+            changed = GenerationTask.objects.filter(pk=task.pk).update(
+                status=GenerationTask.Status.FAILED,
+                heartbeat_at=timezone.now(),
+                finished_at=task.finished_at or timezone.now(),
+                remote_state=GenerationTask.RemoteState.FAILED,
+                remote_error=str(exc),
+                error_message=str(exc),
+                updated_at=timezone.now(),
+            )
+            recovered += changed
+            if changed:
+                schedule_generation_task_run_advance(task.pk)
+            continue
         now = timezone.now()
         prompt_id = task.submission_token or task.comfy_prompt_id
         if task.status == GenerationTask.Status.CANCEL_REQUESTED:
-            cancel_ok, cancel_error = _best_effort_cancel(client, prompt_id) if prompt_id else (True, "")
+            cancel_ok, cancel_error = _best_effort_cancel(task_client, prompt_id) if prompt_id else (True, "")
             remote_confirmed = not bool(prompt_id)
             remote_history = None
             history_checked = False
@@ -1178,12 +1746,12 @@ def recover_stale_tasks(
             still_queued = True
             if prompt_id:
                 try:
-                    remote_history = client.history(prompt_id)
+                    remote_history = task_client.history(prompt_id)
                     history_checked = True
                 except ComfyUIError as exc:
                     cancel_error = cancel_error or str(exc)
                 try:
-                    still_queued = client.is_queued(prompt_id)
+                    still_queued = task_client.is_queued(prompt_id)
                     queue_checked = True
                 except ComfyUIError as exc:
                     cancel_error = cancel_error or str(exc)
@@ -1233,8 +1801,8 @@ def recover_stale_tasks(
             continue
 
         try:
-            history = client.history(prompt_id)
-            remote_present = history is not None or client.is_queued(prompt_id)
+            history = task_client.history(prompt_id)
+            remote_present = history is not None or task_client.is_queued(prompt_id)
         except ComfyUIError as exc:
             changed = GenerationTask.objects.filter(
                 pk=task.pk,
@@ -1259,6 +1827,8 @@ def recover_stale_tasks(
                 updated_at=now,
             )
             recovered += changed
+            if changed:
+                schedule_generation_task_run_advance(task.pk)
             continue
 
         if remote_present:
@@ -1309,6 +1879,8 @@ def recover_stale_tasks(
                 updated_at=now,
             )
             recovered += changed
+            if changed:
+                schedule_generation_task_run_advance(task.pk)
         else:
             changed = GenerationTask.objects.filter(
                 pk=task.pk, status=GenerationTask.Status.RUNNING,
@@ -1327,4 +1899,6 @@ def recover_stale_tasks(
                 updated_at=now,
             )
             recovered += changed
+            if changed:
+                schedule_generation_task_run_advance(task.pk)
     return recovered

@@ -1,6 +1,6 @@
 from unittest.mock import patch
 
-from django.test import TestCase, override_settings
+from django.test import TestCase
 
 from studio.models import Asset, PropBible, Shot
 from studio.services.h3_prompts import (
@@ -21,8 +21,20 @@ class H3PromptTests(TestCase):
         self.user, self.project, self.character, _, self.episode, self.shot1, self.shot2 = build_story()
         self.shots = [self.shot1, self.shot2]
 
+    @staticmethod
+    def _options(**kwargs):
+        # These unit tests inspect deterministic prompt composition. Production
+        # resolves the block/warn policy from the frozen stage configuration.
+        kwargs.setdefault("language_gate_mode", "warn")
+        return H3PromptOptions(**kwargs)
+
+    @staticmethod
+    def _image(*args, **kwargs):
+        kwargs.setdefault("language_gate_mode", "warn")
+        return build_consistent_image_prompt(*args, **kwargs)
+
     def test_base_h3_field_order_timestamps_and_dialogue(self):
-        result = build_h3_video_prompt(self.project, self.shots, H3PromptOptions(mode=Shot.H3Mode.T2VA))
+        result = build_h3_video_prompt(self.project, self.shots, self._options(mode=Shot.H3Mode.T2VA))
         text = result.text
         self.assertLess(text.index("integrated_multimodal_description:"), text.index("overall_soundscape:"))
         self.assertLess(text.index("overall_soundscape:"), text.index("non_diegetic_music:"))
@@ -38,7 +50,7 @@ class H3PromptTests(TestCase):
         self.assertEqual(result.payload["model"], "minimax-h3")
 
     def test_image_prompt_uses_sdxl_identity_and_keeps_library_assets_as_text_anchors(self):
-        result = build_consistent_image_prompt(self.project, self.shot1)
+        result = self._image(self.project, self.shot1)
 
         self.assertEqual(result.payload["model"], SDXL_BASE_MODEL_ID)
         self.assertEqual(result.payload["effective_conditioning_mode"], "TEXT_ONLY")
@@ -63,7 +75,7 @@ class H3PromptTests(TestCase):
         sentinel = (
             "A rain-lit detective pauses at the archive desk, then turns toward the door."
         )
-        options = H3PromptOptions(mode=Shot.H3Mode.T2VA)
+        options = self._options(mode=Shot.H3Mode.T2VA)
         before = prompt_input_fingerprint(
             self.project, [self.shot1], options,
             prompt_type="video", consistency_snapshot={}, reference_bindings=[],
@@ -76,7 +88,7 @@ class H3PromptTests(TestCase):
         )
 
         video = build_h3_video_prompt(self.project, [self.shot1], options)
-        image = build_consistent_image_prompt(self.project, self.shot1)
+        image = self._image(self.project, self.shot1)
         self.assertNotEqual(before, after)
         self.assertEqual(video.text.count(sentinel), 1)
         self.assertNotIn(sentinel, build_negative_prompt(self.project, [self.shot1]))
@@ -86,7 +98,7 @@ class H3PromptTests(TestCase):
         self.shot2.characters.clear()
         self.shot2.props.clear()
 
-        result = build_consistent_image_prompt(self.project, self.shot2)
+        result = self._image(self.project, self.shot2)
 
         self.assertEqual(result.payload["fields"]["subjects"], [])
         self.assertEqual(result.payload["fields"]["props"], [])
@@ -99,7 +111,7 @@ class H3PromptTests(TestCase):
         self.shot1.continuity_notes = "the same charcoal coat and one sheathed sword"
         self.shot1.save(update_fields=("metadata", "continuity_notes", "updated_at"))
 
-        result = build_consistent_image_prompt(self.project, self.shot1)
+        result = self._image(self.project, self.shot1)
 
         self.assertLess(
             result.text.index("the same charcoal coat and one sheathed sword"),
@@ -114,7 +126,7 @@ class H3PromptTests(TestCase):
         self.shot1.camera = "缓慢推近她的面部"
         self.shot1.save(update_fields=("narrative", "camera", "updated_at"))
 
-        result = build_consistent_image_prompt(self.project, self.shot1)
+        result = self._image(self.project, self.shot1)
         fields = result.payload["quality"]["fields_requiring_english_rewrite"]
 
         self.assertIn("<screen_text>雨夜客栈</screen_text>", result.text)
@@ -125,13 +137,13 @@ class H3PromptTests(TestCase):
         self.shot1.h3_mode = Shot.H3Mode.FL2VA
         self.shot1.reference_bindings = {}
         self.shot1.save(update_fields=("h3_mode", "reference_bindings", "updated_at"))
-        result = build_h3_video_prompt(self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.FL2VA))
+        result = build_h3_video_prompt(self.project, [self.shot1], self._options(mode=Shot.H3Mode.FL2VA))
         self.assertEqual(result.payload["effective_conditioning_mode"], Shot.H3Mode.T2VA)
         self.assertEqual(result.payload["prompt_template_key"], "h3_i2v_zero_frame_v1")
         self.assertNotIn("<Picture", result.text)
 
     def test_ref2va_field_order(self):
-        result = build_h3_video_prompt(self.project, self.shots, H3PromptOptions(mode=Shot.H3Mode.REF2VA))
+        result = build_h3_video_prompt(self.project, self.shots, self._options(mode=Shot.H3Mode.REF2VA))
         field_names = [
             "subject_definitions:", "summary:", "retention_analysis:",
             "detailed_description:", "overall_soundscape:", "non_diegetic_music:",
@@ -144,7 +156,7 @@ class H3PromptTests(TestCase):
         self.episode.save(update_fields=("synopsis", "updated_at"))
 
         result = build_h3_video_prompt(
-            self.project, [self.shot2], H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+            self.project, [self.shot2], self._options(mode=Shot.H3Mode.REF2VA),
         )
 
         self.assertTrue(result.payload["fields"]["summary"].startswith("[reference generation]"))
@@ -165,13 +177,13 @@ class H3PromptTests(TestCase):
         )
 
     def test_duration_override_drives_timestamp(self):
-        result = build_h3_video_prompt(self.project, self.shots, H3PromptOptions(
+        result = build_h3_video_prompt(self.project, self.shots, self._options(
             duration_overrides={str(self.shot1.id): 1250}
         ))
         self.assertIn("[Shot 2] At 00:01.250,", result.text)
 
     def test_t2va_prompt_keeps_official_three_sections_and_no_picture_labels(self):
-        result = build_h3_video_prompt(self.project, self.shots, H3PromptOptions(mode=Shot.H3Mode.T2VA))
+        result = build_h3_video_prompt(self.project, self.shots, self._options(mode=Shot.H3Mode.T2VA))
         self.assertEqual(
             [line.split(":", 1)[0] for line in result.text.splitlines() if line.endswith(":")],
             ["integrated_multimodal_description"],
@@ -181,7 +193,7 @@ class H3PromptTests(TestCase):
         self.assertNotIn("<Picture", result.text)
 
     def test_audio_disabled_uses_na_fields(self):
-        result = build_h3_video_prompt(self.project, [self.shot1], H3PromptOptions(include_audio=False))
+        result = build_h3_video_prompt(self.project, [self.shot1], self._options(include_audio=False))
         self.assertIn("overall_soundscape: N/A", result.text)
         self.assertIn("non_diegetic_music: N/A", result.text)
 
@@ -208,7 +220,7 @@ class H3PromptTests(TestCase):
         self.shot1.props.add(prop)
 
         sync_consistency_locks(self.project)
-        first = build_h3_video_prompt(self.project, self.shots, H3PromptOptions(mode=Shot.H3Mode.REF2VA))
+        first = build_h3_video_prompt(self.project, self.shots, self._options(mode=Shot.H3Mode.REF2VA))
         self.assertEqual(first.payload["reference_bindings"], [])
         self.assertEqual(first.payload["prompt_template_key"], "h3_r2v_zero_reference_v1")
         self.assertTrue(any("text-defined from the continuity Bible" in line for line in first.payload["fields"]["character_definitions"]))
@@ -224,7 +236,7 @@ class H3PromptTests(TestCase):
         )
         prop.reference_assets.add(late_reference)
         sync_consistency_locks(self.project)
-        second = build_h3_video_prompt(self.project, self.shots, H3PromptOptions(mode=Shot.H3Mode.REF2VA))
+        second = build_h3_video_prompt(self.project, self.shots, self._options(mode=Shot.H3Mode.REF2VA))
         self.assertEqual(second.payload["reference_bindings"], [])
 
     def test_negative_prompt_includes_project_setting_and_continuity_notes(self):
@@ -247,7 +259,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(
+            self._options(
                 mode=Shot.H3Mode.T2VA,
                 extra_direction=f"{direction.upper()}.",
             ),
@@ -269,7 +281,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self._options(mode=Shot.H3Mode.T2VA),
         )
         negative = build_negative_prompt(self.project, [self.shot1])
 
@@ -286,7 +298,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             self.shots,
-            H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self._options(mode=Shot.H3Mode.T2VA),
         )
 
         self.assertEqual(result.text.count(style_direction), 1)
@@ -302,7 +314,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self._options(mode=Shot.H3Mode.T2VA),
         )
 
         first_shot = result.payload["fields"]["integrated_multimodal_description"][0]
@@ -326,12 +338,12 @@ class H3PromptTests(TestCase):
         ))
 
         video = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1], self._options(mode=Shot.H3Mode.T2VA),
         )
         reference_video = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+            self.project, [self.shot1], self._options(mode=Shot.H3Mode.REF2VA),
         )
-        image = build_consistent_image_prompt(self.project, self.shot1)
+        image = self._image(self.project, self.shot1)
 
         for result in (video, reference_video, image):
             with self.subTest(mode=result.payload["mode"]):
@@ -341,8 +353,6 @@ class H3PromptTests(TestCase):
         self.assertNotIn(continuity_summary, reference_video.text)
         self.assertIn(continuity_summary, image.text)
         self.assertIn(negative_prompt, build_negative_prompt(self.project, [self.shot1]))
-
-    @override_settings(H3_PROMPT_LANGUAGE_GATE="warn")
     def test_positive_story_in_shot_negative_hard_blocks_video_and_image_in_warn_mode(self):
         narrative = (
             "The detective unfolds the sealed letter beneath the green desk lamp "
@@ -359,9 +369,9 @@ class H3PromptTests(TestCase):
         ))
 
         video = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1], self._options(mode=Shot.H3Mode.T2VA),
         )
-        image = build_consistent_image_prompt(self.project, self.shot1)
+        image = self._image(self.project, self.shot1)
 
         for result in (video, image):
             with self.subTest(mode=result.payload["mode"]):
@@ -374,8 +384,6 @@ class H3PromptTests(TestCase):
                     "疑似混入正向" in field
                     for field in quality["fields_requiring_english_rewrite"]
                 ))
-
-    @override_settings(H3_PROMPT_LANGUAGE_GATE="warn")
     def test_legitimate_english_negative_does_not_hard_block_warn_mode(self):
         self.shot1.metadata = {
             "prompt_field_version": 2,
@@ -384,18 +392,18 @@ class H3PromptTests(TestCase):
         self.shot1.save(update_fields=("metadata", "updated_at"))
 
         video = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1], self._options(mode=Shot.H3Mode.T2VA),
         )
-        image = build_consistent_image_prompt(self.project, self.shot1)
+        image = self._image(self.project, self.shot1)
 
         self.assertFalse(
-            video.payload["quality"]["production_language_gate"]["would_block_enqueue"]
+            video.payload["quality"]["production_language_gate"]["would_block_enqueue"],
+            video.payload["quality"],
         )
         self.assertFalse(
-            image.payload["quality"]["production_language_gate"]["would_block_enqueue"]
+            image.payload["quality"]["production_language_gate"]["would_block_enqueue"],
+            image.payload["quality"],
         )
-
-    @override_settings(H3_PROMPT_LANGUAGE_GATE="warn")
     def test_chinese_shot_negative_hard_blocks_video_and_image_in_warn_mode(self):
         self.shot1.metadata = {
             "prompt_field_version": 2,
@@ -404,9 +412,9 @@ class H3PromptTests(TestCase):
         self.shot1.save(update_fields=("metadata", "updated_at"))
 
         video = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1], self._options(mode=Shot.H3Mode.T2VA),
         )
-        image = build_consistent_image_prompt(self.project, self.shot1)
+        image = self._image(self.project, self.shot1)
 
         self.assertTrue(
             video.payload["quality"]["production_language_gate"]["would_block_enqueue"]
@@ -414,8 +422,6 @@ class H3PromptTests(TestCase):
         self.assertTrue(
             image.payload["quality"]["production_language_gate"]["would_block_enqueue"]
         )
-
-    @override_settings(H3_PROMPT_LANGUAGE_GATE="warn")
     def test_canonical_target_collision_hard_blocks_video_and_image(self):
         prop = PropBible.objects.create(
             project=self.project, slug="xuanwen-sword", name="玄纹剑",
@@ -431,9 +437,9 @@ class H3PromptTests(TestCase):
         self.project.save(update_fields=("production_settings", "updated_at"))
 
         video = build_h3_video_prompt(
-            self.project, [self.shot1], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot1], self._options(mode=Shot.H3Mode.T2VA),
         )
-        image = build_consistent_image_prompt(self.project, self.shot1)
+        image = self._image(self.project, self.shot1)
 
         for result in (video, image):
             with self.subTest(mode=result.payload["mode"]):
@@ -481,7 +487,7 @@ class H3PromptTests(TestCase):
         dialogue_only = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA, language="Chinese"),
+            self._options(mode=Shot.H3Mode.T2VA, language="Chinese"),
         )
         self.assertIn("<d>[Chinese] 这封信不是昨晚烧的。</d>", dialogue_only.text)
         self.assertEqual(dialogue_only.payload["quality"]["status"], "ready")
@@ -497,7 +503,7 @@ class H3PromptTests(TestCase):
         chinese_direction = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA, language="Chinese"),
+            self._options(mode=Shot.H3Mode.T2VA, language="Chinese"),
         )
         quality = chinese_direction.payload["quality"]
         self.assertEqual(quality["status"], "needs_attention")
@@ -512,7 +518,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(
+            self._options(
                 mode=Shot.H3Mode.T2VA,
                 language="Chinese",
                 overall_soundscape=self.shot1.sound_effects.rstrip("。"),
@@ -534,7 +540,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA, language="Chinese"),
+            self._options(mode=Shot.H3Mode.T2VA, language="Chinese"),
         )
 
         fields = result.payload["quality"]["fields_requiring_english_rewrite"]
@@ -550,7 +556,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(
+            self._options(
                 mode=Shot.H3Mode.T2VA,
                 include_audio=False,
                 overall_soundscape="雷声贴近屋檐",
@@ -609,7 +615,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         quality = result.payload["quality"]
@@ -617,8 +623,21 @@ class H3PromptTests(TestCase):
             quality["fields_requiring_english_rewrite"],
             ["未归类导演描述（参考素材职责或绑定说明）"],
         )
-        self.assertTrue(quality["production_language_gate"]["would_block_enqueue"])
+        self.assertFalse(quality["production_language_gate"]["would_block_enqueue"])
         self.assertFalse(any("对白" in item for item in quality["fields_requiring_english_rewrite"]))
+
+        with patch(
+            "studio.services.h3_prompts.resolve_group_reference_bindings",
+            return_value=[binding],
+        ), self.assertRaisesRegex(PromptBuildError, "prompt.normalize"):
+            build_h3_video_prompt(
+                self.project,
+                [self.shot1],
+                self._options(
+                    mode=Shot.H3Mode.REF2VA,
+                    language_gate_mode="block",
+                ),
+            )
 
     def test_prompt_over_official_7000_character_limit_is_rejected(self):
         self.shot1.narrative = "A" * 7_100
@@ -627,7 +646,7 @@ class H3PromptTests(TestCase):
             build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.T2VA),
+                self._options(mode=Shot.H3Mode.T2VA),
             )
 
     def test_keyframe_modes_use_actual_17k_plus_5_aligned_duration(self):
@@ -659,7 +678,7 @@ class H3PromptTests(TestCase):
                 result = build_h3_video_prompt(
                     self.project,
                     [self.shot1],
-                    H3PromptOptions(
+                    self._options(
                         mode=mode,
                         duration_overrides={str(self.shot1.id): 5_000},
                     ),
@@ -684,7 +703,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         headers = [
@@ -725,7 +744,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         summary = result.payload["fields"]["summary"]
@@ -754,7 +773,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         summary = result.payload["fields"]["summary"]
@@ -797,7 +816,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         definitions = result.payload["fields"]["media_definitions"]
@@ -829,7 +848,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         summary = result.payload["fields"]["summary"]
@@ -860,7 +879,7 @@ class H3PromptTests(TestCase):
             build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
     def test_ref2va_rejects_ambiguous_editing_and_continuation_mix(self):
@@ -892,7 +911,7 @@ class H3PromptTests(TestCase):
             build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
     def test_ref2va_style_precedes_first_shot_and_first_appearance_is_explicit(self):
@@ -911,7 +930,7 @@ class H3PromptTests(TestCase):
             result = build_h3_video_prompt(
                 self.project,
                 [self.shot1],
-                H3PromptOptions(mode=Shot.H3Mode.REF2VA),
+                self._options(mode=Shot.H3Mode.REF2VA),
             )
 
         detail = result.payload["fields"]["detailed_description"]
@@ -927,7 +946,7 @@ class H3PromptTests(TestCase):
         result = build_h3_video_prompt(
             self.project,
             [self.shot1],
-            H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self._options(mode=Shot.H3Mode.T2VA),
         )
 
         timeline = result.payload["fields"]["integrated_multimodal_description"][0]

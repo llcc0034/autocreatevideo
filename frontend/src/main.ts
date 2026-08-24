@@ -10,5 +10,6 @@ import './workflow-export.css'
 import './script-workbench.css'
 import './production-manual.css'
 import './responsive.css'
+import './platform.css'
 
 createApp(App).use(createPinia()).use(router).mount('#app')

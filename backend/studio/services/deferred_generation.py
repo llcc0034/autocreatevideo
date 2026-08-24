@@ -23,6 +23,7 @@ from studio.models import (
     Asset,
     DeferredGenerationRequest,
     GenerationTask,
+    ModelProfileVersion,
     PromptArtifact,
     SeriesProject,
     Shot,
@@ -51,6 +52,7 @@ from studio.services.provenance import (
     resolve_declared_task_output,
     sha256_file,
 )
+from studio.services.prompt_profiles import PromptProfileResolutionError
 from studio.services.workflow import WorkflowBuildError
 
 
@@ -239,9 +241,38 @@ def _source_task_has_primary_video_contract(source_task: GenerationTask) -> bool
     )
 
 
+def _compile_deferred_target_model_profile(
+    source_task: GenerationTask,
+) -> ModelProfileVersion:
+    source_prompt = source_task.generated_workflow.prompt_artifact
+    request_options = (
+        source_prompt.request_options
+        if isinstance(source_prompt.request_options, dict) else {}
+    )
+    model_profile_id = str(request_options.get("model_profile_version_id") or "").strip()
+    if not model_profile_id:
+        raise DeferredGenerationUnavailable(
+            code="deferred_prompt_profile_route_missing",
+            detail=(
+                "上游任务没有冻结 model_profile_version，不能通过未版本化提示词路径创建延迟生产任务。"
+            ),
+        )
+    try:
+        model_profile = ModelProfileVersion.objects.select_related("provider").get(
+            pk=model_profile_id,
+        )
+    except (ModelProfileVersion.DoesNotExist, ValueError) as exc:
+        raise DeferredGenerationUnavailable(
+            code="deferred_prompt_profile_route_missing",
+            detail="上游任务冻结的 model_profile_version 不存在，不能创建延迟生产任务。",
+        ) from exc
+    return model_profile
+
+
 def _compile_deferred_target(
-    *, project: SeriesProject, target_shot: Shot,
+    *, project: SeriesProject, target_shot: Shot, source_task: GenerationTask,
 ):
+    model_profile = _compile_deferred_target_model_profile(source_task)
     snapshot = capture_consistency_snapshot(project)
     provisional_mode = (
         Shot.H3Mode.FL2VA
@@ -256,6 +287,7 @@ def _compile_deferred_target(
         include_audio=target_shot.include_audio,
         duration_overrides={str(target_shot.id): target_shot.duration_ms},
         consistency_snapshot=snapshot,
+        model_profile_version=model_profile,
     )
 
 
@@ -367,9 +399,9 @@ def create_deferred_generation_request(
         )
         try:
             compiled = _compile_deferred_target(
-                project=project, target_shot=target_shot,
+                project=project, target_shot=target_shot, source_task=source_task,
             )
-        except PromptBuildError as exc:
+        except (PromptBuildError, PromptProfileResolutionError) as exc:
             raise ValidationError({"target_shot_id": str(exc)}) from exc
         if len(compiled.prompt_text) > DEFERRED_PROVISIONAL_PROMPT_MAX_CHARS:
             raise ValidationError({
@@ -1214,6 +1246,7 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
             compiled_without_frame = _compile_deferred_target(
                 project=project,
                 target_shot=target_shot,
+                source_task=source_task,
             )
             if compiled_without_frame.input_fingerprint != locked.target_input_fingerprint:
                 locked.status = DeferredGenerationRequest.Status.STALE
@@ -1247,6 +1280,7 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
                 duration_overrides={str(target_shot.id): target_shot.duration_ms},
                 single_shot_reference_bindings=bindings,
                 single_shot_reference_assets=asset_pool,
+                model_profile_version=_compile_deferred_target_model_profile(source_task),
             )
             target_workflow_overrides = _deferred_target_workflow_overrides(
                 source_task=source_task,
@@ -1285,6 +1319,7 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
             assert_queue_capacity(
                 locked.owner,
                 additional=1,
+                project=project,
                 extended_generation_confirmed=locked.extended_generation_confirmed,
             )
             batch_overrides = _deferred_batch_capability_overrides(
@@ -1358,7 +1393,13 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
             code="deferred_frame_extract_failed",
             message=str(exc),
         )
-    except (PromptBuildError, WorkflowBuildError, ValueError) as exc:
+    except (
+        DeferredGenerationUnavailable,
+        PromptBuildError,
+        PromptProfileResolutionError,
+        WorkflowBuildError,
+        ValueError,
+    ) as exc:
         return _finalize_deferred(
             request,
             status_value=DeferredGenerationRequest.Status.FAILED,

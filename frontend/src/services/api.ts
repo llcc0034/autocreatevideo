@@ -1,4 +1,5 @@
 import axios, { type AxiosError } from 'axios'
+import { apiErrorPresentation } from './apiErrorPresentation'
 
 export const api = axios.create({
   baseURL: import.meta.env.VITE_API_BASE_URL || '/api/v1',
@@ -28,18 +29,50 @@ const errorText = (value: unknown): string[] => {
   return []
 }
 
+export const safeApiErrorMessage = (
+  value: unknown,
+  status?: number,
+  contentType = '',
+): string => {
+  const presentation = apiErrorPresentation({
+    response: {
+      status,
+      headers: { 'content-type': contentType },
+      data: typeof value === 'string' ? { detail: value } : value,
+    },
+  }, '')
+  if (presentation.message) return presentation.message
+  const message = errorText(value).slice(0, 20).join('；').trim()
+  return message.length <= 500 ? message : `${message.slice(0, 499)}…`
+}
+
 const normalizeApiError = (error: AxiosError) => {
-  const data = error.response?.data as { error?: { details?: unknown; message?: unknown } | string; detail?: unknown } | undefined
-  const source = typeof data?.error === 'object' ? (data.error.details ?? data.error.message) : (data?.error ?? data?.detail ?? data)
-  const messages = errorText(source)
-  if (messages.length) error.message = messages.join('；')
+  const message = apiErrorPresentation(error, '').message
+  if (message) error.message = message
   return error
+}
+
+const responseErrorCodes = (value: unknown): string[] => {
+  if (!value || typeof value !== 'object') return []
+  const row = value as Record<string, unknown>
+  const nested = row.error && typeof row.error === 'object' ? row.error as Record<string, unknown> : {}
+  const details = nested.details && typeof nested.details === 'object' ? nested.details as Record<string, unknown> : {}
+  return [row.code, nested.code, details.code].filter((item): item is string => typeof item === 'string')
 }
 
 api.interceptors.response.use((response) => response, async (error: AxiosError) => {
   const config = error.config as RetryConfig | undefined
-  const isAuthRequest = String(config?.url || '').includes('/auth/')
-  if (error.response?.status === 401 && config && !isAuthRequest && !config._cineforgeRetry) {
+  const requestUrl = String(config?.url || '')
+  const isCredentialExchange = [
+    '/auth/token/', '/auth/token/refresh/', '/auth/register/',
+  ].some((path) => requestUrl.includes(path))
+  if (
+    error.response?.status === 403
+    && responseErrorCodes(error.response.data).includes('password_change_required')
+  ) {
+    window.dispatchEvent(new CustomEvent('cineforge:password-change-required'))
+  }
+  if (error.response?.status === 401 && config && !isCredentialExchange && !config._cineforgeRetry) {
     const requestAccess = config._cineforgeRequestToken || ''
     if (requestAccess !== (localStorage.getItem('cineforge_token') || '')) {
       return Promise.reject(normalizeApiError(error))

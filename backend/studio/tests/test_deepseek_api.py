@@ -2,11 +2,9 @@ import json
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import SimpleTestCase, override_settings
 import requests
-from rest_framework.test import APIClient
 
-from studio.models import EpisodeCreativeDraft
 from studio.services.deepseek_api import (
     DeepSeekAPIError,
     DeepSeekConfigurationError,
@@ -14,8 +12,6 @@ from studio.services.deepseek_api import (
     run_structured_operation,
     run_translation,
 )
-from studio.services.prompt_translation import TranslationResult
-from studio.tests.factories import build_story
 
 
 CONFIG = {
@@ -878,88 +874,3 @@ class DeepSeekStructuredTests(SimpleTestCase):
         self.assertNotIn(secret_prose, serialized)
         self.assertNotIn(CONFIG["api_key"], serialized)
         self.assertNotIn(CONFIG["base_url"], serialized)
-
-
-@override_settings(DEEPSEEK_API=CONFIG)
-class DeepSeekProviderRoutingTests(TestCase):
-    def setUp(self):
-        (
-            self.user, self.project, _character, _scene, self.episode,
-            self.shot, _next_shot,
-        ) = build_story(username="deepseek-routing")
-        self.client = APIClient()
-        self.client.force_authenticate(self.user)
-
-    @patch("studio.views._ensure_translation_resources_available")
-    @patch("studio.views.translate_texts_once")
-    def test_remote_translation_skips_local_resource_gate_and_persists_provider(
-        self, translate, local_gate,
-    ):
-        translate.return_value = [TranslationResult(
-            text="A slow push-in ends on the letter.",
-            provider="deepseek_api", model="deepseek-v4-flash",
-            metadata={"transport": "remote_api"},
-        )]
-
-        response = self.client.post(
-            f"/api/v1/projects/{self.project.id}/translations/translate/",
-            {
-                "provider": "deepseek_api",
-                "entries": [{
-                    "scope_type": "shot", "scope_id": str(self.shot.id),
-                    "field_key": "shot.camera", "source_text": self.shot.camera,
-                }],
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, 200, response.data)
-        local_gate.assert_not_called()
-        self.assertEqual(translate.call_args.kwargs["provider"], "deepseek_api")
-        self.assertEqual(response.data["entries"][0]["provider"], "deepseek_api")
-
-    @patch("studio.services.creative_drafts.ensure_creative_resources_available")
-    @patch("studio.services.creative_drafts._require_runtime")
-    @patch("studio.services.creative_drafts.run_deepseek_structured_operation")
-    def test_remote_creative_skips_local_qwen_checks_even_with_active_generation(
-        self, remote, local_runtime, local_resources,
-    ):
-        candidate = {
-            "schema_version": 1,
-            "shots": [{
-                "client_key": "shot-001", "order": 1,
-                "title_zh": "证物", "title_en": "Evidence",
-                "narrative_zh": "林默站在旧档案室内。", "narrative_en": "Lin Mo stands in the old archive.",
-                "camera_zh": "中景平视，镜头缓慢推近。", "camera_en": "Eye-level medium shot with a slow push-in.",
-                "action_zh": "林默展开信纸后静止。", "action_en": "Lin Mo unfolds the letter and then holds still.",
-                "continuity_zh": "炭灰风衣保持不变。", "continuity_en": "The charcoal-gray coat remains unchanged.",
-                "soundscape_zh": "", "soundscape_en": "", "music_zh": "", "music_en": "",
-                "duration_ms": 5000, "media_type": "video", "h3_mode": "T2VA",
-                "include_audio": False, "scene_id": None, "character_ids": [], "prop_ids": [],
-                "dialogue": [],
-            }],
-        }
-
-        def remote_response(request):
-            return {
-                "ok": True, "result": {**candidate, "source_fingerprint": request["context_hash"]},
-                "model": "deepseek-v4-flash",
-                "metadata": {"provider": "deepseek_api", "transport": "remote_api"},
-            }
-
-        remote.side_effect = remote_response
-        response = self.client.post(
-            f"/api/v1/projects/{self.project.id}/creative-drafts/generate/",
-            {
-                "episode_id": str(self.episode.id), "provider": "deepseek_api",
-                "target_shot_count": 1, "creativity": "balanced", "variation_note": "",
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, 201, response.data)
-        local_resources.assert_not_called()
-        local_runtime.assert_not_called()
-        self.assertEqual(response.data["provider"], "deepseek_api")
-        self.assertEqual(response.data["model"], "deepseek-v4-flash")
-        self.assertEqual(EpisodeCreativeDraft.objects.get(pk=response.data["id"]).provider, "deepseek_api")

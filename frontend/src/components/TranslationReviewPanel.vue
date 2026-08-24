@@ -2,7 +2,6 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { AlertTriangle, Check, ChevronDown, Languages, LoaderCircle, RotateCcw, ShieldCheck, Undo2 } from 'lucide-vue-next'
 import { repository } from '@/services/repository'
-import { promptProvider, REMOTE_PROMPT_EGRESS_NOTICE } from '@/services/providerCapabilities'
 import {
   createTranslationLoadGate,
   reconcileTranslationDrafts,
@@ -18,7 +17,6 @@ import type {
   ShotTranslationPromotionResult,
   TranslationCapability,
   TranslationReviewStatus,
-  PromptProviderId,
 } from '@/types'
 
 const props = withDefaults(defineProps<{
@@ -31,7 +29,7 @@ const props = withDefaults(defineProps<{
   refreshKey?: number
   repairLegacyNegativePrompt?: boolean
   blockedReason?: string
-}>(), { episodeId: '', shotId: '', compact: false, title: '本地 Qwen 英文译文人工审核', refreshKey: 0, repairLegacyNegativePrompt: false, blockedReason: '' })
+}>(), { episodeId: '', shotId: '', compact: false, title: '英文提示词标准化 · 人工审核', refreshKey: 0, repairLegacyNegativePrompt: false, blockedReason: '' })
 
 const emit = defineEmits<{
   changed: []
@@ -44,7 +42,7 @@ const promotingShot = ref(false)
 const error = ref('')
 const entries = ref<PromptTranslationEntry[]>([])
 const capability = ref<TranslationCapability | null>(null)
-const selectedProvider = ref<PromptProviderId>('local_qwen')
+const selectedDeploymentId = ref('')
 const busy = ref<Record<string, boolean>>({})
 const drafts = ref<Record<string, string>>({})
 const promotedFieldKeys = ref<Record<string, boolean>>({})
@@ -110,15 +108,10 @@ const promotableEntries = computed(() => translatableFields.value.flatMap((field
     && isPromotableShotFieldKey(field.fieldKey)
   return promotable && entry ? [entry] : []
 }))
-const selectedProviderCapability = computed(() => promptProvider(capability.value?.providers, selectedProvider.value))
-const capabilityReady = computed(() => selectedProviderCapability.value?.ready ?? (
-  selectedProvider.value === 'local_qwen'
-    && capability.value?.enabled === true && capability.value?.configured === true
-    && capability.value?.modelDownloaded === true && capability.value?.modelVerified === true
+const selectedDeployment = computed(() => capability.value?.deployments.find(
+  (item) => item.modelDeploymentId === selectedDeploymentId.value,
 ))
-const providerEgressNotice = computed(() => selectedProvider.value === 'deepseek_api'
-  ? selectedProviderCapability.value?.dataEgressNotice || REMOTE_PROMPT_EGRESS_NOTICE
-  : '')
+const capabilityReady = computed(() => selectedDeployment.value?.ready === true)
 const reviewMutationBlocked = computed(() => Boolean(props.blockedReason))
 const includesProjectFields = computed(() => translatableFields.value.some((field) => field.scopeType === 'project'))
 const entryError = (field: PromptTranslationField) => {
@@ -138,13 +131,16 @@ const load = async () => {
   loading.value = true; error.value = ''
   try {
     const [nextCapability, nextEntries] = await Promise.all([
-      repository.getTranslationCapability(),
+      repository.getTranslationCapability(props.projectId),
       repository.getProjectTranslations(props.projectId, { episodeId: props.episodeId, shotId: props.shotId }),
     ])
     if (!loadGate.isCurrent(requestSequence)) return
     capability.value = nextCapability
-    if (!nextCapability.providers?.some((provider) => provider.id === selectedProvider.value)) {
-      selectedProvider.value = nextCapability.defaultProvider || 'local_qwen'
+    if (!nextCapability.deployments.some((item) => item.modelDeploymentId === selectedDeploymentId.value)) {
+      const configuredDefault = nextCapability.defaultModelDeploymentId
+      selectedDeploymentId.value = configuredDefault && nextCapability.deployments.some(
+        (item) => item.modelDeploymentId === configuredDefault,
+      ) ? configuredDefault : ''
     }
     const previousEntries = entries.value
     entries.value = nextEntries
@@ -218,7 +214,9 @@ const translateAll = async () => {
   bulkTranslating.value = true; error.value = ''
   busy.value = { ...busy.value, ...Object.fromEntries(fields.map((field) => [translationFieldIdentity(field), true])) }
   try {
-    const rows = await repository.translateProjectFields(props.projectId, fields, selectedProvider.value)
+    const rows = await repository.translateProjectFields(props.projectId, fields, {
+      modelDeploymentId: selectedDeploymentId.value,
+    })
     if (requestContext === `${props.projectId}:${props.episodeId}:${props.shotId}`) upsertEntries(rows)
   }
   catch (cause) { error.value = cause instanceof Error ? cause.message : '批量翻译失败，中文原文未被修改' }
@@ -236,11 +234,30 @@ const translateOne = async (field: PromptTranslationField) => {
   try {
     const current = entryFor(field)
     const row = current
-      ? await repository.retranslateProjectField(current.id, field.sourceText, selectedProvider.value)
-      : (await repository.translateProjectFields(props.projectId, [field], selectedProvider.value))[0]
+      ? await repository.retranslateProjectField(current.id, field.sourceText, {
+        modelDeploymentId: selectedDeploymentId.value,
+      })
+      : (await repository.translateProjectFields(props.projectId, [field], {
+        modelDeploymentId: selectedDeploymentId.value,
+      }))[0]
     if (row && requestContext === `${props.projectId}:${props.episodeId}:${props.shotId}`) upsertEntries([row])
   } catch (cause) { error.value = translationReviewRequestError(cause, `${field.label}翻译失败，中文原文未被修改。`) }
-  finally { const next = { ...busy.value }; delete next[key]; busy.value = next }
+  finally {
+    const next = { ...busy.value }; delete next[key]; busy.value = next
+  }
+}
+
+const startManual = async (field: PromptTranslationField) => {
+  if (reviewMutationBlocked.value) { error.value = props.blockedReason; return }
+  const requestContext = `${props.projectId}:${props.episodeId}:${props.shotId}`
+  const key = translationFieldIdentity(field); busy.value = { ...busy.value, [key]: true }; error.value = ''
+  try {
+    const row = await repository.createManualProjectTranslation(props.projectId, field)
+    if (requestContext === `${props.projectId}:${props.episodeId}:${props.shotId}`) upsertEntries([row])
+  } catch (cause) { error.value = translationReviewRequestError(cause, `${field.label}手工候选创建失败。`) }
+  finally {
+    const next = { ...busy.value }; delete next[key]; busy.value = next
+  }
 }
 
 const confirm = async (field: PromptTranslationField) => {
@@ -322,7 +339,7 @@ onMounted(load)
     <header>
       <div class="translation-heading"><div><Languages :size="18"/></div><span><strong>{{ title }}</strong><small>中文原文永久保留；只有人工确认且源文未变化的英文译文才可进入正式 prompt。<template v-if="shotId"> 本面板审核英文候选；确认镜头导演字段后会原子同步到下方正式表单，镜头标题和对白正文仍保留中文，两处不是重复输入区。</template><template v-if="includesProjectFields"> 当前面板只审核项目级全剧字段；人物、场景和道具字段请在各自 Bible 面板审核。</template></small></span></div>
       <div class="translation-header-actions">
-        <label v-if="capability?.providers?.length" class="translation-provider"><span>处理通道</span><select v-model="selectedProvider" :disabled="bulkTranslating||Object.keys(busy).length>0"><option v-for="provider in capability.providers" :key="provider.id" :value="provider.id" :disabled="!provider.ready">{{ provider.label }}{{ provider.ready ? '' : '（未就绪）' }}</option></select></label>
+        <label v-if="capability?.deployments.length" class="translation-provider"><span>模型部署</span><select v-model="selectedDeploymentId" :disabled="bulkTranslating||Object.keys(busy).length>0"><option value="" disabled>请选择已烟测部署</option><option v-for="deployment in capability.deployments" :key="deployment.modelDeploymentId" :value="deployment.modelDeploymentId" :disabled="!deployment.ready">{{ deployment.label }} · {{ deployment.modelIdentifier }}{{ deployment.ready ? '' : `（${deployment.reasonCode}）` }}</option></select></label>
         <button v-if="shotId&&(promotableEntries.length||repairLegacyNegativePrompt)" type="button" class="secondary" :disabled="loading||promotingShot||bulkTranslating||reviewMutationBlocked" :title="blockedReason||''" @click="promoteConfirmedShot">
           <LoaderCircle v-if="promotingShot" class="spin" :size="13"/><Check v-else :size="13"/>
           {{ promotingShot?'正在同步与审计…':repairLegacyNegativePrompt?(promotableEntries.length?'同步英文并审计负面约束':'审计并恢复负面约束'):'一键同步已确认英文到正式字段' }}
@@ -333,28 +350,35 @@ onMounted(load)
         </button>
       </div>
     </header>
-    <div v-if="providerEgressNotice" class="translation-egress"><AlertTriangle :size="14"/><span><strong>外部 API 数据发送提示：</strong>{{ providerEgressNotice }}</span></div>
     <div v-if="blockedReason" class="translation-error"><AlertTriangle :size="14"/><span><strong>canonical 术语碰撞 · 翻译确认与正式字段同步已暂停：</strong> {{ blockedReason }} 请先回到“项目总览 → 全剧视觉规则”修正并保存；系统不会自动猜译名。</span></div>
     <div v-if="repairLegacyNegativePrompt" class="translation-recovery"><AlertTriangle :size="14"/><span><strong>来源匹配的创作草稿负面约束待审计：</strong>保存和生成已暂停。点击上方按钮后，服务端只会在 applied CreativeDraft 来源和值逐字匹配时清除；若这是您手工填写的真实缺陷词，请直接改写为英文负面约束后保存。</span></div>
-    <div class="translation-safety"><ShieldCheck :size="14"/><span><strong>本地 4B 候选不可直接生产：</strong>必须逐项核对专名、人物性别、左/右手、道具部位、数值与比例、景别与运镜、动作先后和镜头终态，确认无误后再点“确认译文”。对白、歌词和真实屏显文字保留原文，只翻译对白括号中的 delivery 与导演字段。新建 Bible 时会自动补写英文 canonical glossary；缺失项可在“项目总览 → 全剧视觉规则”一键补全，译法不满意时再人工修改（如“玄纹剑 = Xuanwen Sword”）。未配置时人物、场景和道具名会使用 S1、scene:slug、prop:slug 等稳定技术标识，而不会自由翻译。默认本地模型是 ModelScope <code>Qwen/Qwen3-4B-GGUF</code>，并非 DashScope Qwen-MT API。</span></div>
-    <div v-if="capability&&!capabilityReady" class="translation-error"><AlertTriangle :size="14"/>{{ selectedProviderCapability?.notice || capability.message || '所选处理通道尚未配置，当前只能查看原文和审核历史。' }}</div>
+    <div class="translation-safety"><ShieldCheck :size="14"/><span><strong>模型候选不可直接生产：</strong>必须逐项核对专名、人物性别、左右方位、道具部位、数值与比例、景别与运镜、动作先后和镜头终态，确认无误后再点“确认译文”。对白、歌词和真实屏显文字保留原文，只翻译 delivery 与导演字段。部署列表完全来自服务端 <code>prompt.normalize</code> 注册表；不会把未知模型偷偷映射为内置模型。</span></div>
+    <div v-if="capability&&!capabilityReady" class="translation-error"><AlertTriangle :size="14"/>{{ selectedDeployment ? `所选部署不可用：${selectedDeployment.reasonCode}` : '未选择 prompt.normalize 部署；系统不会自动采用列表第一项。' }}</div>
     <div v-if="error" class="translation-error"><AlertTriangle :size="14"/>{{ error }}</div>
     <div v-if="loading" class="translation-loading"><LoaderCircle class="spin" :size="16"/>读取翻译审核状态…</div>
     <template v-else>
-      <div v-if="translatableFields.length" class="translation-summary"><span :class="{ attention: attentionCount }">待处理 <b>{{ attentionCount }}</b></span><span v-if="pendingCount">待审核 <b>{{ pendingCount }}</b></span><span>已确认 <b>{{ confirmedCount }}</b></span><span v-if="failedCount" class="changed">失败 <b>{{ failedCount }}</b></span><span v-if="sourceChangedCount" class="changed">源文已变更 <b>{{ sourceChangedCount }}</b></span><small>待处理始终展开 · 已确认默认折叠 · {{ selectedProviderCapability?.label || capability?.provider || '本地 Qwen' }}</small></div>
+      <div v-if="translatableFields.length" class="translation-summary"><span :class="{ attention: attentionCount }">待处理 <b>{{ attentionCount }}</b></span><span v-if="pendingCount">待审核 <b>{{ pendingCount }}</b></span><span>已确认 <b>{{ confirmedCount }}</b></span><span v-if="failedCount" class="changed">失败 <b>{{ failedCount }}</b></span><span v-if="sourceChangedCount" class="changed">源文已变更 <b>{{ sourceChangedCount }}</b></span><small>待处理始终展开 · 已确认默认折叠 · {{ selectedDeployment?.label || '尚未选择模型部署' }}</small></div>
       <div v-if="translatableFields.length" class="translation-list">
         <component :is="collapseConfirmed(field)?'details':'article'" v-for="field in orderedFields" :key="translationFieldIdentity(field)" :class="[`state-${statusFor(field).tone}`,{ 'confirmed-collapsed': collapseConfirmed(field) }]">
           <component :is="collapseConfirmed(field)?'summary':'header'"><div><span>{{ scopeLabels[field.scopeType] }}</span><strong>{{ field.label }}</strong><small>{{ field.help || (field.impact==='continuity'?'影响跨镜头一致性':'直接影响生成提示词') }}</small></div><div class="translation-entry-state"><b class="translation-status" :class="statusFor(field).tone"><LoaderCircle v-if="stateFor(field)==='translating'" class="spin" :size="11"/>{{ statusFor(field).label }}</b><em v-if="collapseConfirmed(field)">展开核对 <ChevronDown :size="12"/></em></div></component>
           <div class="translation-columns">
             <label><span>中文原文 · 只读</span><textarea :value="field.sourceText" rows="4" readonly/></label>
-            <label :class="{ stale: stateFor(field)==='source_changed' }"><span>{{ stateFor(field)==='source_changed'?'旧英文译文 · 已失效（只读）':'英文译文 · 人工可编辑' }}</span><textarea v-if="entryFor(field)" v-model="drafts[entryFor(field)!.id]" rows="4" :disabled="stateFor(field)==='translating'" :readonly="stateFor(field)==='source_changed'" placeholder="本地 Qwen 英文候选将在这里显示；请核对人物、服装、方位、动作和镜头语言。"/><textarea v-else rows="4" disabled placeholder="尚未翻译"/></label>
+            <label :class="{ stale: stateFor(field)==='source_changed' }"><span>{{ stateFor(field)==='source_changed'?'旧英文译文 · 已失效（只读）':'英文译文 · 人工可编辑' }}</span><textarea v-if="entryFor(field)" v-model="drafts[entryFor(field)!.id]" rows="4" :disabled="stateFor(field)==='translating'" :readonly="stateFor(field)==='source_changed'" placeholder="模型候选将在这里显示；请核对人物、服装、方位、动作和镜头语言。"/><textarea v-else rows="4" disabled placeholder="尚未翻译"/></label>
           </div>
           <p v-if="stateFor(field)==='source_changed'" class="source-warning"><AlertTriangle :size="12"/>中文源文、canonical 术语表或身份上下文已变化。旧译文仅供对照，不能确认也不会进入正式 prompt；请点击“重新翻译生成候选”，核对新候选后再确认。</p>
           <p v-if="entryError(field)" class="source-warning"><AlertTriangle :size="12"/>{{ entryError(field) }}</p>
-          <footer><span v-if="entryFor(field)">修订 {{ entryFor(field)?.revision }}<template v-if="entryFor(field)?.confirmedAt"> · 确认于 {{ new Date(entryFor(field)!.confirmedAt!).toLocaleString('zh-CN') }}</template><template v-if="fieldWasPromoted(field)"> · 已同步到下方正式英文分镜字段</template></span><span v-else>尚无译文记录</span><div><button type="button" class="secondary" :disabled="Boolean(busy[translationFieldIdentity(field)])||!capabilityReady||fieldWasPromoted(field)||reviewMutationBlocked" :title="blockedReason||''" @click="translateOne(field)"><RotateCcw :size="12"/>{{ translateActionLabel(field) }}</button><button v-if="entryFor(field)&&stateFor(field)!=='source_changed'&&(stateFor(field)!=='confirmed'||draftChanged(field))" type="button" :disabled="Boolean(busy[translationFieldIdentity(field)])||reviewMutationBlocked" :title="blockedReason||''" @click="confirm(field)"><Check :size="12"/>{{ stateFor(field)==='confirmed'?'保存修改并确认':'确认译文并同步正式字段' }}</button><button v-if="stateFor(field)==='confirmed'" type="button" class="secondary" :title="blockedReason||(fieldWasPromoted(field)?'撤销只改变译文审核状态，不会回滚已经同步的正式英文；如需修改请直接编辑下方正式字段。':'撤销译文确认不会改动正式分镜字段。')" :disabled="Boolean(busy[translationFieldIdentity(field)])||reviewMutationBlocked" @click="revoke(field)"><Undo2 :size="12"/>撤销译文确认（不回滚正式英文）</button></div></footer>
+          <footer>
+            <span v-if="entryFor(field)">修订 {{ entryFor(field)?.revision }}<template v-if="entryFor(field)?.confirmedAt"> · 确认于 {{ new Date(entryFor(field)!.confirmedAt!).toLocaleString('zh-CN') }}</template><template v-if="fieldWasPromoted(field)"> · 已同步到下方正式英文分镜字段</template></span><span v-else>尚无译文记录</span>
+            <div>
+              <button v-if="!entryFor(field)" type="button" class="secondary" :disabled="Boolean(busy[translationFieldIdentity(field)])||fieldWasPromoted(field)||reviewMutationBlocked" :title="blockedReason||'不调用模型，创建空白英文候选供人工填写'" @click="startManual(field)"><Languages :size="12"/>手工填写英文</button>
+              <button type="button" class="secondary" :disabled="Boolean(busy[translationFieldIdentity(field)])||!capabilityReady||fieldWasPromoted(field)||reviewMutationBlocked" :title="blockedReason||''" @click="translateOne(field)"><RotateCcw :size="12"/>{{ translateActionLabel(field) }}</button>
+              <button v-if="entryFor(field)&&stateFor(field)!=='source_changed'&&(stateFor(field)!=='confirmed'||draftChanged(field))" type="button" :disabled="Boolean(busy[translationFieldIdentity(field)])||reviewMutationBlocked" :title="blockedReason||''" @click="confirm(field)"><Check :size="12"/>{{ stateFor(field)==='confirmed'?'保存修改并确认':'确认译文并同步正式字段' }}</button>
+              <button v-if="stateFor(field)==='confirmed'" type="button" class="secondary" :title="blockedReason||(fieldWasPromoted(field)?'撤销只改变译文审核状态，不会回滚已经同步的正式英文；如需修改请直接编辑下方正式字段。':'撤销译文确认不会改动正式分镜字段。')" :disabled="Boolean(busy[translationFieldIdentity(field)])||reviewMutationBlocked" @click="revoke(field)"><Undo2 :size="12"/>撤销译文确认（不回滚正式英文）</button>
+            </div>
+          </footer>
         </component>
       </div>
-      <div v-else class="translation-empty"><Check :size="15"/>当前范围没有需要本地 Qwen 翻译的中文高影响导演字段。名称、标题和管理描述只用于标识或创作管理，不会因此创建翻译任务。</div>
+      <div v-else class="translation-empty"><Check :size="15"/>当前范围没有需要标准化的中文高影响导演字段。名称、标题和管理描述只用于标识或创作管理，不会因此创建翻译任务。</div>
     </template>
   </section>
 </template>
@@ -365,6 +389,6 @@ onMounted(load)
 .translation-summary .attention{color:#d9a45f}.translation-entry-state{display:flex!important;align-items:center!important;justify-content:flex-end;gap:7px;grid-template-columns:none!important}.translation-entry-state em{display:inline-flex;align-items:center;gap:3px;color:#73818c;font-size:9px;font-style:normal;font-weight:500}.translation-list>details{padding:11px;border:1px solid rgba(104,197,167,.22);border-radius:7px;background:#0b1015}.translation-list>details>summary{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;cursor:pointer;list-style:none}.translation-list>details>summary::-webkit-details-marker{display:none}.translation-list>details>summary>div:first-child{display:grid;grid-template-columns:auto 1fr;gap:2px 7px}.translation-list>details>summary span{grid-row:1/3;padding:3px 5px;border-radius:3px;background:#151e26;color:#6f8799;font:8px Consolas,monospace}.translation-list>details>summary strong{font-size:11px}.translation-list>details>summary small{color:#6e7a84;font-size:9px}.translation-list>details[open]>summary .translation-entry-state em svg{transform:rotate(180deg)}.translation-list>details>footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:#65727d;font-size:9px}.translation-columns label.stale>span{color:#d18b80}.translation-columns label.stale textarea{border-color:rgba(229,112,99,.22);color:#8d979f;background:#090d11}
 @media(max-width:800px){.translation-list>details>summary,.translation-list>details>footer{align-items:stretch;flex-direction:column}.translation-entry-state{justify-content:flex-start}}
 .translation-header-actions{display:flex;align-items:center;justify-content:flex-end;gap:7px;flex-wrap:wrap}
-.translation-provider{display:grid;gap:3px}.translation-provider span{font-size:8px;color:#73818c}.translation-provider select{min-height:31px;padding:5px 8px;border:1px solid #2a3741;border-radius:6px;background:#0b1015;color:#b9c6cf;font-size:10px}.translation-egress{display:flex;align-items:flex-start;gap:7px;padding:9px 10px;border:1px solid rgba(217,164,95,.24);border-radius:6px;background:rgba(217,164,95,.07);color:#d1ad74;font-size:10px;line-height:1.55}
+.translation-provider{display:grid;gap:3px}.translation-provider span{font-size:8px;color:#73818c}.translation-provider select{min-height:31px;padding:5px 8px;border:1px solid #2a3741;border-radius:6px;background:#0b1015;color:#b9c6cf;font-size:10px}
 @media(max-width:800px){.translation-header-actions{align-items:stretch;flex-direction:column}.translation-header-actions button{width:100%}}
 </style>

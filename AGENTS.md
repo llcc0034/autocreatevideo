@@ -4,13 +4,13 @@
 
 - 项目场景：媒体资产与内容生产平台（`media-asset-production`）。
 - 规范版本：`1.3.0`。
-- 技术栈：首次涉及依赖、框架或源码实现时根据仓库证据补充；当前待确认。
-- 项目类型与目录档案：初始化、结构调整或首次涉及目录职责时自动识别；当前待确认。
-- 主要目录：首次涉及对应模块或结构任务时根据真实目录补充；当前待确认。
-- 权威启动、服务管理或使用入口：首次涉及运行、构建、发布或使用方式时根据脚本和配置补充；当前待确认。
-- 权威 Schema、迁移或数据模型入口：首次涉及持久化或数据结构时核对；不涉及时明确写“不适用”。
-- 测试、构建和验证命令：首次涉及对应改动时根据项目声明补充；当前待确认。
-- 正式 API、数据模型和运维文档位置：首次涉及接口或正式文档时核对；不存在时明确写“不适用”。
+- 技术栈：Django 5.2 + Django REST Framework；Vue 3 + TypeScript + Vite + Pinia + Vue Flow；生产数据库为 PostgreSQL、开发默认 SQLite；媒体执行器为 ComfyUI 与受限 async REST，FFmpeg/FFprobe 负责媒体探测与装配。
+- 项目类型与目录档案：前后端分离的单仓库应用；业务队列、运行状态和审计事实持久化在 Django 数据库，不依赖外部消息队列作为事实源。
+- 主要目录：`backend/` 为 API、模型、迁移、worker 与服务；`frontend/` 为运营 UI；`scripts/` 为 Windows 安装/检查/服务管理；`docs/` 为正式架构、API 与运维文档；根 `openapi.yaml` 为唯一机器 API 契约。
+- 权威启动、服务管理或使用入口：首次安装 `scripts/setup.ps1`；日常启动/重启 `scripts/restart.ps1`；业务生产唯一入口为前端项目工作台创建 `ProductionRun`。仓库当前没有独立的本地停止脚本，不得在文档中虚构入口。
+- 权威 Schema、迁移或数据模型入口：`backend/studio/models.py` 与 `backend/studio/migrations/`；只通过 Django migration 变更 Schema。
+- 测试、构建和验证命令：统一入口 `scripts/check.ps1`；后端 `backend/.venv/Scripts/python.exe manage.py test studio.tests`、`manage.py check`、`manage.py makemigrations --check --dry-run`；前端在 `frontend/` 运行 Node tests、`vue-tsc -b` 与 Vite build。
+- 正式 API、数据模型和运维文档位置：根 `openapi.yaml`、`docs/api.md`、`docs/architecture.md`、`docs/operations.md`、`docs/production-deployment.md` 与 `docs/backup-restore.md`。
 
 ## 规则职责与加载原则
 

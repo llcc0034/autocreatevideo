@@ -87,7 +87,7 @@ test('redo payload is an independent draft with an explicit field allowlist', ()
     coverAssetId: 'cover-asset-1',
     coverUrl: '/api/v1/media/cover-token/',
     episodes: [{
-      id: 'episode-1', number: 1, title: '雨夜', synopsis: '开场', status: 'completed', multiShot: true,
+      id: 'episode-1', number: 1, title: '雨夜', synopsis: '开场', status: 'completed',
       audioEnabled: true, shots: [], createdAt: '2026-08-01T00:00:00Z',
     }],
   })
@@ -219,7 +219,6 @@ test('studio store rejects stale session results without disturbing new requests
       return [makeProject({ id: 'fresh-project', title: 'fresh initialize' })]
     }
     repository.getWorkflows = async () => []
-    repository.getSettings = async () => ({})
 
     const staleInitialize = store.initialize()
     assert.equal(styleRequests, 1)
@@ -242,6 +241,28 @@ test('studio store rejects stale session results without disturbing new requests
     assert.equal(store.styles[0]?.id, 'fresh-style')
     assert.equal(store.projects[0]?.title, 'fresh initialize')
     assert.equal(projectRequests, 1)
+  })
+
+  await context.test('workflow diagnostics failure does not erase successfully loaded projects', async () => {
+    setActivePinia(createPinia())
+    const store = useStudioStore()
+
+    repository.getStyles = async () => [{ id: 'style-before-diagnostics-failure' }]
+    repository.getProjects = async () => [makeProject({
+      id: 'preserved-project',
+      title: '已保存项目',
+    })]
+    repository.getWorkflows = async () => {
+      throw new Error('任务诊断加载失败')
+    }
+
+    await store.initialize()
+
+    assert.equal(store.ready, false)
+    assert.equal(store.styles[0]?.id, 'style-before-diagnostics-failure')
+    assert.equal(store.projects.length, 1)
+    assert.equal(store.projects[0]?.title, '已保存项目')
+    assert.match(store.error, /任务诊断加载失败/)
   })
 
   await context.test('stale same-project detail is cancelled and cannot delete the fresh pending request', async () => {
@@ -310,9 +331,9 @@ test('date and completion helpers safely expose honest list metadata', () => {
   const empty = makeProject()
   assert.deepEqual(projectCompletion(empty), { completed: 0, total: 0, percent: 0 })
   const mixed = makeProject({ episodes: [
-    { id: '1', number: 1, title: '一', synopsis: '', status: 'completed', multiShot: true, audioEnabled: true, shots: [], createdAt: '' },
-    { id: '2', number: 2, title: '二', synopsis: '', status: 'draft', multiShot: true, audioEnabled: true, shots: [], createdAt: '' },
-    { id: '3', number: 3, title: '三', synopsis: '', status: 'completed', multiShot: true, audioEnabled: true, shots: [], createdAt: '' },
+    { id: '1', number: 1, title: '一', synopsis: '', status: 'completed', audioEnabled: true, shots: [], createdAt: '' },
+    { id: '2', number: 2, title: '二', synopsis: '', status: 'draft', audioEnabled: true, shots: [], createdAt: '' },
+    { id: '3', number: 3, title: '三', synopsis: '', status: 'completed', audioEnabled: true, shots: [], createdAt: '' },
   ] })
   assert.deepEqual(projectCompletion(mixed), { completed: 2, total: 3, percent: 67 })
   assert.deepEqual(projectCompletion(makeProject({
@@ -373,7 +394,8 @@ test('management view keeps card navigation separate from destructive controls',
   assert.ok(repositorySource.includes("fetchAllPages<Record<string, unknown>>('/projects/', { page_size: 200 })"))
   assert.ok(!repositorySource.includes('Promise.all(raw.map(adaptProject))'))
   assert.ok(repositorySource.includes('adaptProjectSummary(unwrap<Record<string, unknown>>((await api.post'))
-  assert.ok(repositorySource.includes("saveLocal('cineforge_workflows', workflows.filter((workflow) => workflow.projectId !== projectId))"))
+  assert.ok(repositorySource.includes('await api.delete(`/projects/${projectId}/`)'))
+  assert.equal(repositorySource.includes('saveLocal('), false)
   assert.ok(repositorySource.includes("metadata', JSON.stringify({ usage: 'project_cover', project_id: project.id })"))
   assert.ok(repositorySource.includes("await api.delete(`/assets/${uploadedAssetId}/`)"))
   assert.ok(repositorySource.includes("cover_asset: uploadedAssetId"))

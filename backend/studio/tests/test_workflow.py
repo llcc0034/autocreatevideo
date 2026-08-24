@@ -10,7 +10,11 @@ class WorkflowTests(TestCase):
     def test_injection_preserves_number_bool_and_list_types(self):
         user, project, _, _, episode, shot1, _ = build_story()
         result = build_h3_video_prompt(
-            project, [shot1], H3PromptOptions(duration_overrides={str(shot1.id): 5000})
+            project,
+            [shot1],
+            H3PromptOptions(
+                duration_overrides={str(shot1.id): 5000}, language_gate_mode="warn",
+            ),
         )
         prompt = PromptArtifact.objects.create(
             project=project, episode=episode, shot=shot1, created_by=user,

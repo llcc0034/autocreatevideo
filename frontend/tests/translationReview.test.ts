@@ -22,33 +22,109 @@ import {
   translationReviewStatus,
 } from '../src/services/translationReview.ts'
 import { promptArtifactNeedsRegeneration, translationAppliesToShot } from '../src/services/promptArtifactFreshness.ts'
-import { adaptPromptProviders } from '../src/services/providerCapabilities.ts'
+import { adaptPromptNormalizationCapability } from '../src/services/promptNormalization.ts'
 import type { H3PromptPayload, PromptTranslationEntry, PromptTranslationField, Shot } from '../src/types/index.ts'
 
-test('provider capability adapter keeps local model checks separate from remote API readiness', () => {
-  const capability = adaptPromptProviders({
-    default_provider: 'local_qwen',
-    providers: [
-      { id: 'local_qwen', label: '本地 Qwen', enabled: true, configured: true, model_downloaded: true, model_verified: true },
-      { provider: 'deepseek_api', label: 'DeepSeek API', enabled: true, configured: true, transport: 'remote', data_egress_notice: '发送上下文' },
-    ],
+test('prompt normalization adapter preserves an arbitrary ready local deployment id', () => {
+  const capability = adaptPromptNormalizationCapability({
+    schema_version: 2,
+    capability_key: 'prompt.normalize',
+    review_required: true,
+    default_model_deployment_id: '11111111-1111-4111-8111-111111111111',
+    configuration_public_sha256: 'a'.repeat(64),
+    deployments: [{
+      model_deployment_id: '11111111-1111-4111-8111-111111111111',
+      deployment_key: 'third-party-normalizer',
+      label: '第三方标准化模型',
+      provider_key: 'third-local-compatible',
+      provider_label: 'Third Local Compatible',
+      provider_driver: 'openai_compatible',
+      model_profile_version_id: '22222222-2222-4222-8222-222222222222',
+      model_identifier: 'vendor/prompt-normalizer-v3',
+      capability: 'prompt.normalize',
+      state: 'ready',
+      ready: true,
+      reason_code: 'ready',
+      transport: 'local_endpoint',
+      data_egress: false,
+      data_egress_notice: '',
+      estimated_cost: '0.03',
+      cost_currency: 'USD',
+      cost_basis: 'fixed_request',
+      smoke_snapshot_id: '33333333-3333-4333-8333-333333333333',
+      smoke_expires_at: '2026-08-24T00:00:00Z',
+    }],
   })
-  assert.equal(capability.defaultProvider, 'local_qwen')
-  assert.equal(capability.providers[0].ready, true)
-  assert.equal(capability.providers[1].ready, true)
-  assert.equal(capability.providers[1].transport, 'remote')
-  assert.equal(capability.providers[1].dataEgressNotice, '发送上下文')
+  assert.equal(capability.defaultModelDeploymentId, '11111111-1111-4111-8111-111111111111')
+  assert.equal(capability.deployments[0].modelDeploymentId, '11111111-1111-4111-8111-111111111111')
+  assert.equal(capability.deployments[0].ready, true)
+  assert.equal(capability.deployments[0].transport, 'local_endpoint')
+  assert.equal(capability.deployments[0].dataEgress, false)
 })
 
-test('provider capability adapter accepts camelCase and leaves an unverified local model unavailable', () => {
-  const capability = adaptPromptProviders({
-    defaultProvider: 'deepseek_api',
-    providers: [{ id: 'deepseek_api', configured: true, enabled: true, dataEgressNotice: 'external' },
-      { id: 'local_qwen', configured: true, enabled: true, modelDownloaded: true, modelVerified: false }],
+test('prompt normalization adapter exposes external deployments only as unavailable', () => {
+  const capability = adaptPromptNormalizationCapability({
+    schema_version: 2,
+    capability_key: 'prompt.normalize',
+    review_required: true,
+    default_model_deployment_id: null,
+    configuration_public_sha256: 'c'.repeat(64),
+    deployments: [{
+      model_deployment_id: '66666666-6666-4666-8666-666666666666',
+      deployment_key: 'external-normalizer',
+      label: 'External normalizer',
+      provider_key: 'external-compatible',
+      provider_label: 'External Compatible',
+      provider_driver: 'openai_compatible',
+      model_profile_version_id: '77777777-7777-4777-8777-777777777777',
+      model_identifier: 'vendor/external',
+      capability: 'prompt.normalize',
+      state: 'unavailable',
+      ready: false,
+      reason_code: 'external_idempotency_unimplemented',
+      transport: 'remote_api',
+      data_egress: true,
+      data_egress_notice: '该部署不可提交',
+      estimated_cost: null,
+      cost_currency: '',
+      cost_basis: 'unknown',
+    }],
   })
-  assert.equal(capability.defaultProvider, 'deepseek_api')
-  assert.equal(capability.providers[0].ready, true)
-  assert.equal(capability.providers[1].ready, false)
+  assert.equal(capability.deployments[0].ready, false)
+  assert.equal(capability.deployments[0].reasonCode, 'external_idempotency_unimplemented')
+})
+
+test('prompt normalization adapter keeps an absent default empty and unavailable models disabled', () => {
+  const capability = adaptPromptNormalizationCapability({
+    schema_version: 2,
+    capability_key: 'prompt.normalize',
+    review_required: true,
+    default_model_deployment_id: null,
+    configuration_public_sha256: 'b'.repeat(64),
+    deployments: [{
+      model_deployment_id: '44444444-4444-4444-8444-444444444444',
+      deployment_key: 'not-smoked',
+      label: '尚未烟测模型',
+      provider_key: 'local-compatible',
+      provider_label: 'Local Compatible',
+      provider_driver: 'openai_compatible',
+      model_profile_version_id: '55555555-5555-4555-8555-555555555555',
+      model_identifier: 'local/model',
+      capability: 'prompt.normalize',
+      state: 'smoke_test_required',
+      ready: false,
+      reason_code: 'smoke_test_required',
+      transport: 'local_endpoint',
+      data_egress: false,
+      data_egress_notice: '',
+      estimated_cost: '0',
+      cost_currency: 'USD',
+      cost_basis: 'fixed_request',
+    }],
+  })
+  assert.equal(capability.defaultModelDeploymentId, undefined)
+  assert.equal(capability.deployments[0].ready, false)
+  assert.equal(capability.deployments[0].reasonCode, 'smoke_test_required')
 })
 
 test('translation confirmation conflicts explain canonical recovery without exposing internal ids', () => {
@@ -193,7 +269,7 @@ test('canonical ensure adapter follows the project endpoint contract', () => {
     summary: { requested: 1, generated: 1, reused: 0, conflict: 0, failed: 0 },
     entries: [{
       scope_type: 'character', scope_id: 'character-1', name: '沈砚', canonical_english: 'Shen Yan',
-      status: 'generated', origin: 'local_qwen', retryable: false, error_code: '', message: '',
+      status: 'generated', origin: 'model', retryable: false, error_code: '', message: '',
     }],
   } })
   assert.equal(result.projectId, 'project-1')
@@ -202,7 +278,7 @@ test('canonical ensure adapter follows the project endpoint contract', () => {
   assert.equal(result.summary.generated, 1)
   assert.deepEqual(result.entries[0], {
     scopeType: 'character', scopeId: 'character-1', name: '沈砚', canonicalEnglish: 'Shen Yan',
-    status: 'generated', origin: 'local_qwen', retryable: false, errorCode: undefined, message: undefined,
+    status: 'generated', origin: 'model', retryable: false, errorCode: undefined, message: undefined,
   })
 })
 
@@ -212,7 +288,7 @@ test('canonical ensure adapter keeps visual translation candidate separate for m
     summary: { requested: 1, generated: 1, reused: 0, conflict: 0, failed: 0 },
     entries: [{
       scope_type: 'character', scope_id: 'character-1', name: '沈砚',
-      canonical_english: 'Shen Yan', status: 'generated', origin: 'local_qwen', retryable: false,
+      canonical_english: 'Shen Yan', status: 'generated', origin: 'model', retryable: false,
     }],
     visual_summary: { requested: 1, generated: 1, reused: 0, not_required: 0, conflict: 0, failed: 0 },
     visual_translations: [{
@@ -220,9 +296,15 @@ test('canonical ensure adapter keeps visual translation candidate separate for m
       source_text: '清瘦青年剑客，右眉尾浅疤。',
       translated_text: 'A slim young swordsman with a shallow scar at the tail of his right eyebrow.',
       translation_id: 'translation-visual-1', translation_status: 'draft_translation', revision: 1,
-      status: 'generated', origin: 'local_qwen', context_current: true, retryable: false,
+      status: 'generated', origin: 'model', context_current: true, retryable: false,
     }],
-    runtime: { loaded_on_demand: true, unloaded_after_request: true },
+    runtime: {
+      invocation_attempted: true,
+      submission_uncertain: false,
+      model_deployment_id: '11111111-1111-4111-8111-111111111111',
+      provider: 'third-local-compatible',
+      data_egress: false,
+    },
   })
 
   assert.equal(result.visualSummary.generated, 1)
@@ -231,7 +313,38 @@ test('canonical ensure adapter keeps visual translation candidate separate for m
   assert.equal(result.visualTranslations[0].translation?.status, 'draft_translation')
   assert.equal(result.visualTranslations[0].translation?.sourceText, '清瘦青年剑客，右眉尾浅疤。')
   assert.equal(result.visualTranslations[0].translation?.translatedText.startsWith('A slim'), true)
-  assert.equal(result.runtime?.unloadedAfterRequest, true)
+  assert.equal(result.runtime?.invocationAttempted, true)
+  assert.equal(result.runtime?.submissionUncertain, false)
+  assert.equal(result.runtime?.modelDeploymentId, '11111111-1111-4111-8111-111111111111')
+  assert.equal(result.runtime?.dataEgress, false)
+})
+
+test('standalone translation UI has no external authorization or budget submission controls', () => {
+  const panel = readFileSync(new URL('../src/components/TranslationReviewPanel.vue', import.meta.url), 'utf8')
+  const repository = readFileSync(new URL('../src/services/repository.ts', import.meta.url), 'utf8')
+  assert.doesNotMatch(panel, /externalAuthorized|budgetLimit|外部 API 数据发送提示|单次预算上限/)
+  assert.doesNotMatch(repository, /allow_external_calls|budget_limit/)
+})
+
+test('manual English review and every negative prompt source are first-class recovery inputs', () => {
+  const panel = readFileSync(new URL('../src/components/TranslationReviewPanel.vue', import.meta.url), 'utf8')
+  const repository = readFileSync(new URL('../src/services/repository.ts', import.meta.url), 'utf8')
+  const storyboard = readFileSync(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8')
+  const studio = readFileSync(new URL('../src/views/SeriesStudioView.vue', import.meta.url), 'utf8')
+
+  assert.ok(panel.includes('手工填写英文'))
+  assert.ok(panel.includes('createManualProjectTranslation'))
+  assert.ok(repository.includes('/translations/manual/'))
+  for (const fieldKey of [
+    'style.negative_prompt',
+    'project.production_settings.negative_prompt',
+    'character.negative_constraints',
+    'scene.negative_constraints',
+    'prop.negative_constraints',
+    'shot.negative_prompt',
+  ]) assert.ok(storyboard.includes(fieldKey), fieldKey)
+  assert.ok(studio.includes('style.negative_prompt'))
+  assert.ok(studio.includes('project.production_settings.negative_prompt'))
 })
 
 test('visual ensure adapter preserves bypass and retry states without inventing a candidate', () => {
@@ -248,7 +361,7 @@ test('visual ensure adapter preserves bypass and retry states without inventing 
     }, {
       scope_type: 'prop', scope_id: 'prop-1', field_key: 'prop.visual_identity',
       source_text: '乌黑旧剑鞘，银色回纹。', translated_text: '', translation_id: 'translation-failed',
-      translation_status: 'failed', revision: 1, status: 'failed', origin: 'local_qwen',
+      translation_status: 'failed', revision: 1, status: 'failed', origin: 'model',
       context_current: false, retryable: true, error_code: 'translation_resource_busy',
       message: '视频生成正在执行，请稍后重试。',
     }],
@@ -411,14 +524,14 @@ test('authoritative promotion patches only director fields and preserves Chinese
   assert.equal(shot.legacyNegativePromptRepairEligible, false)
 })
 
-test('storyboard hides stale artifacts and offers one-click prompt regeneration', () => {
+test('storyboard hides stale artifacts and routes prompt recompilation through ProductionRun', () => {
   const source = readFileSync(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8')
   assert.ok(source.includes("fieldKey:'shot.narrative', label:'动作与画面描述', sourceText:shot.action"))
   assert.ok(!source.includes("fieldKey:'shot.action', label:'动作与画面描述', sourceText:shot.action"))
   assert.ok(source.includes('promptArtifactNeedsRegeneration'))
   assert.ok(source.includes("invalidatePrompt(selectedShot,'translations_changed')"))
   assert.ok(source.includes('旧 Prompt Artifact 已失效'))
-  assert.ok(source.includes('一键重新生成当前'))
+  assert.ok(source.includes('进入 ProductionRun 重新编译并复检'))
   assert.ok(source.includes('@promoted="applyShotTranslationPromotion"'))
   assert.ok(source.includes('@promotion-busy="translationPromotionBusy=$event"'))
   assert.ok(source.includes('applyPromotedFieldsToShot(target, result.promotedFields'))
@@ -429,14 +542,15 @@ test('storyboard hides stale artifacts and offers one-click prompt regeneration'
   assert.doesNotMatch(source, /applyShotTranslationPromotion[\s\S]{0,1200}refreshProjects/)
 })
 
-test('canonical target collisions visibly block save translation sync and generation', () => {
+test('canonical target collisions visibly block save and translation sync before ProductionRun', () => {
   const studio = readFileSync(new URL('../src/views/SeriesStudioView.vue', import.meta.url), 'utf8')
   const storyboard = readFileSync(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8')
   const panel = readFileSync(new URL('../src/components/TranslationReviewPanel.vue', import.meta.url), 'utf8')
-  const visualRules = readFileSync(new URL('../src/components/GlobalVisualRulesDraft.vue', import.meta.url), 'utf8')
   assert.ok(studio.includes('bibleCanonicalTargetCollisions(allBibleNames.value'))
   assert.ok(studio.includes('canonicalTargetCollisionError'))
   assert.ok(studio.includes(':blocked-reason="canonicalGlossaryBlockedReason"'))
+  assert.ok(studio.includes(':disabled="saving||Boolean(canonicalGlossaryBlockedReason)"'))
+  assert.ok(studio.includes(':title="canonicalGlossaryBlockedReason||\'\'"'))
   assert.ok(studio.includes('if (glossaryChanged) translationReviewRefreshKey.value += 1'))
   const canonicalBackfill = studio.slice(
     studio.indexOf('const backfillMissingCanonicalGlossary = async'),
@@ -445,14 +559,12 @@ test('canonical target collisions visibly block save translation sync and genera
   assert.ok(canonicalBackfill.includes('studio.ensureCanonicalGlossary(project.value, { includeAllMissing: true })'))
   assert.ok(canonicalBackfill.includes('检测到术语表有未保存的人工修改'))
   assert.ok(!canonicalBackfill.includes('await save('))
-  assert.ok(studio.includes('episode.shots.length||Boolean(canonicalGlossaryBlockedReason)'))
+  assert.ok(studio.includes(':blocked-reason="canonicalGlossaryBlockedReason"'))
   assert.ok(storyboard.includes('canonicalTargetCollisionError'))
   assert.ok(storyboard.includes('canonical 术语碰撞 · 保存、翻译同步和生成已暂停'))
   assert.ok(storyboard.includes('if (canonicalTargetCollisionError.value) throw new Error'))
   assert.ok(panel.includes('canonical 术语碰撞 · 翻译确认与正式字段同步已暂停'))
   assert.ok(panel.includes('reviewMutationBlocked'))
-  assert.ok(visualRules.includes('canonical 术语碰撞 · 已暂停生成与采用'))
-  assert.ok(visualRules.includes('Boolean(blockedReason)'))
 })
 
 test('review panel uses the router endpoint, expected revision, one promotion event per batch, and repair-only action', () => {

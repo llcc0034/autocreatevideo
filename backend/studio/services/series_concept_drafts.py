@@ -51,8 +51,8 @@ def series_concept_draft_limits() -> dict[str, int]:
         "default_episode_duration_seconds": int(
             settings.SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS
         ),
-        "minimum_shot_duration_ms": int(settings.VIDEO_SHOT_MIN_DURATION_MS),
-        "maximum_shot_duration_ms": int(settings.VIDEO_SHOT_MAX_DURATION_MS),
+        "minimum_shot_duration_ms": int(settings.LEGACY_VIDEO_SHOT_MIN_DURATION_MS),
+        "maximum_shot_duration_ms": int(settings.LEGACY_VIDEO_SHOT_MAX_DURATION_MS),
     }
 
 
@@ -134,9 +134,9 @@ def _validated_candidate(
     minimum_shot_duration_ms: int,
     maximum_shot_duration_ms: int,
 ) -> dict[str, Any]:
-    def invalid_candidate() -> None:
+    def invalid_candidate(path: str = "result") -> None:
         raise CreativeDraftError(
-            "模型候选缺少项目名、梗概或请求数量的剧集分镜。",
+            f"模型候选字段 {path} 不符合已发布的剧本结构合同。",
             code="series_concept_invalid_candidate",
         )
 
@@ -145,9 +145,10 @@ def _validated_candidate(
         *,
         maximum: int,
         required: bool = False,
+        path: str,
     ) -> str:
         if not isinstance(value, str):
-            invalid_candidate()
+            invalid_candidate(path)
         normalized = value.strip()
         if (
             (required and not normalized)
@@ -158,7 +159,7 @@ def _validated_candidate(
                 for character in normalized
             )
         ):
-            invalid_candidate()
+            invalid_candidate(path)
         return normalized
 
     echoed = str(payload.get("source_fingerprint") or "")
@@ -177,38 +178,41 @@ def _validated_candidate(
             "模型候选的结构版本无效。",
             code="series_concept_invalid_candidate",
         )
-    title = safe_line(result.get("title"), maximum=60, required=True)
-    logline = safe_line(result.get("logline"), maximum=500, required=True)
+    title = safe_line(result.get("title"), maximum=60, required=True, path="result.title")
+    logline = safe_line(result.get("logline"), maximum=500, required=True, path="result.logline")
     try:
         bible = validate_script_bible_ir(result.get("bible"))
     except ScriptBibleParseError:
-        invalid_candidate()
+        invalid_candidate("result.bible")
     episodes = result.get("episodes")
     if (
         not isinstance(episodes, list)
         or len(episodes) != episode_count
     ):
-        invalid_candidate()
+        invalid_candidate("result.episodes")
 
     validated_episodes: list[dict[str, Any]] = []
-    for episode in episodes:
+    for episode_index, episode in enumerate(episodes):
+        episode_path = f"result.episodes[{episode_index}]"
         if not isinstance(episode, dict) or set(episode) != {"title", "shots"}:
-            invalid_candidate()
+            invalid_candidate(episode_path)
         episode_title = safe_line(
             episode.get("title"), maximum=80, required=True,
+            path=f"{episode_path}.title",
         )
         shots = episode.get("shots")
         if not isinstance(shots, list) or len(shots) != shots_per_episode:
-            invalid_candidate()
+            invalid_candidate(f"{episode_path}.shots")
         validated_shots: list[dict[str, Any]] = []
-        for shot in shots:
+        for shot_index, shot in enumerate(shots):
+            shot_path = f"{episode_path}.shots[{shot_index}]"
             if (
                 not isinstance(shot, dict)
                 or set(shot) != {
                     "setting", "action", "dialogue", "duration_ms",
                 }
             ):
-                invalid_candidate()
+                invalid_candidate(shot_path)
             duration_ms = shot.get("duration_ms")
             if (
                 type(duration_ms) is not int
@@ -216,18 +220,18 @@ def _validated_candidate(
                 <= duration_ms
                 <= maximum_shot_duration_ms
             ):
-                invalid_candidate()
+                invalid_candidate(f"{shot_path}.duration_ms")
             dialogue = shot.get("dialogue")
             if (
                 not isinstance(dialogue, dict)
                 or set(dialogue) != {"speaker", "delivery", "text"}
             ):
-                invalid_candidate()
-            setting = safe_line(shot.get("setting"), maximum=200, required=True)
-            action = safe_line(shot.get("action"), maximum=500, required=True)
-            speaker = safe_line(dialogue.get("speaker"), maximum=80)
-            delivery = safe_line(dialogue.get("delivery"), maximum=120)
-            dialogue_text = safe_line(dialogue.get("text"), maximum=240)
+                invalid_candidate(f"{shot_path}.dialogue")
+            setting = safe_line(shot.get("setting"), maximum=200, required=True, path=f"{shot_path}.setting")
+            action = safe_line(shot.get("action"), maximum=500, required=True, path=f"{shot_path}.action")
+            speaker = safe_line(dialogue.get("speaker"), maximum=80, path=f"{shot_path}.dialogue.speaker")
+            delivery = safe_line(dialogue.get("delivery"), maximum=120, path=f"{shot_path}.dialogue.delivery")
+            dialogue_text = safe_line(dialogue.get("text"), maximum=240, path=f"{shot_path}.dialogue.text")
             if (
                 any(character in speaker for character in "()（）[]【】<>:：")
                 or bool(speaker) != bool(dialogue_text)
@@ -239,7 +243,7 @@ def _validated_candidate(
                 or "(" in delivery
                 or ")" in delivery
             ):
-                invalid_candidate()
+                invalid_candidate(f"{shot_path}.dialogue")
             validated_shots.append({
                 "setting": setting,
                 "action": action,
@@ -460,6 +464,175 @@ def _candidate_quality_warnings(
     return list(dict.fromkeys(warnings))
 
 
+def build_series_concept_plan(
+    *,
+    idea: str,
+    style_hint: str,
+    episode_count: int,
+    shots_per_episode: int,
+    episode_duration_seconds: int,
+    minimum_shot_duration_ms: int,
+    maximum_shot_duration_ms: int,
+    model_identifier: str,
+    timeout_seconds: float,
+    configured_output_token_hint: int,
+    attempt: int = 1,
+) -> dict[str, Any]:
+    """Build the deterministic series protocol without selecting a runtime.
+
+    ProductionRun uses this function with a frozen ModelDeployment.  It must
+    remain free of provider settings, credentials, network calls and database
+    writes so the exact request can be persisted before a worker submits it.
+    """
+
+    idea = str(idea or "").strip()
+    style_hint = str(style_hint or "").strip()
+    if not idea:
+        raise CreativeValidationError("请先输入创作想法", code="series_concept_idea_required")
+    if len(idea) > SERIES_CONCEPT_MAX_IDEA_CHARS:
+        raise CreativeValidationError(
+            f"创作想法不能超过 {SERIES_CONCEPT_MAX_IDEA_CHARS} 字符",
+            code="series_concept_idea_too_long",
+        )
+    if len(style_hint) > SERIES_CONCEPT_MAX_STYLE_HINT_CHARS:
+        raise CreativeValidationError(
+            f"风格提示不能超过 {SERIES_CONCEPT_MAX_STYLE_HINT_CHARS} 字符",
+            code="series_concept_style_hint_too_long",
+        )
+    for value, label, code in (
+        (episode_count, "计划集数", "series_concept_episode_count_invalid"),
+        (shots_per_episode, "每集镜数", "series_concept_shots_per_episode_invalid"),
+        (episode_duration_seconds, "单集时长", "series_concept_episode_duration_invalid"),
+    ):
+        if type(value) is not int or value < 1:
+            raise CreativeValidationError(f"{label}必须是正整数。", code=code)
+    if not (1 <= minimum_shot_duration_ms <= maximum_shot_duration_ms):
+        raise CreativeValidationError(
+            "冻结的镜头时长范围无效。", code="series_concept_duration_policy_invalid",
+        )
+    total_shots = episode_count * shots_per_episode
+    episode_duration_ms = episode_duration_seconds * 1_000
+    minimum_episode_duration_ms = shots_per_episode * minimum_shot_duration_ms
+    if minimum_episode_duration_ms > episode_duration_ms:
+        raise CreativeValidationError(
+            "单集时长不足以容纳请求的镜头数；请增加单集时长或减少每集镜头数。",
+            code="series_concept_episode_duration_infeasible",
+            public_context={
+                "episode_count": episode_count,
+                "shots_per_episode": shots_per_episode,
+                "total_shots": total_shots,
+                "episode_duration_seconds": episode_duration_seconds,
+                "minimum_episode_duration_seconds": (minimum_episode_duration_ms + 999) // 1_000,
+            },
+        )
+    fingerprint = _source_fingerprint(
+        idea=idea,
+        style_hint=style_hint,
+        episode_count=episode_count,
+        shots_per_episode=shots_per_episode,
+        episode_duration_seconds=episode_duration_seconds,
+        minimum_shot_duration_ms=minimum_shot_duration_ms,
+        maximum_shot_duration_ms=maximum_shot_duration_ms,
+    )
+    normalized_attempt = max(1, min(int(attempt), 100))
+    resource_estimate = _resource_estimate(
+        idea=idea,
+        style_hint=style_hint,
+        total_shots=total_shots,
+        configured_output_token_hint=max(1, int(configured_output_token_hint)),
+    )
+    request = {
+        "operation": SERIES_CONCEPT_DRAFT_OPERATION,
+        "request_id": f"{fingerprint[:20]}-{normalized_attempt}",
+        "source_fingerprint": fingerprint,
+        "idea": idea,
+        "style_hint": style_hint,
+        "options": {
+            "episode_count": episode_count,
+            "shots_per_episode": shots_per_episode,
+            "minimum_duration_ms": minimum_shot_duration_ms,
+            "maximum_duration_ms": maximum_shot_duration_ms,
+            "episode_duration_ms": episode_duration_ms,
+        },
+        "attempt": normalized_attempt,
+        "seed": int(fingerprint[:8], 16) + normalized_attempt,
+        "model_id": str(model_identifier),
+        "timeout_seconds": float(timeout_seconds),
+    }
+    return {
+        "schema_version": 1,
+        "source_fingerprint": fingerprint,
+        "request": request,
+        "episode_count": episode_count,
+        "shots_per_episode": shots_per_episode,
+        "episode_duration_seconds": episode_duration_seconds,
+        "minimum_shot_duration_ms": minimum_shot_duration_ms,
+        "maximum_shot_duration_ms": maximum_shot_duration_ms,
+        "resource_estimate": resource_estimate,
+    }
+
+
+def finalize_series_concept_draft(
+    *, plan: dict[str, Any], runtime_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Strictly validate one provider result and deterministically render it."""
+
+    fingerprint = str(plan["source_fingerprint"])
+    candidate = _validated_candidate(
+        runtime_payload,
+        fingerprint=fingerprint,
+        episode_count=int(plan["episode_count"]),
+        shots_per_episode=int(plan["shots_per_episode"]),
+        minimum_shot_duration_ms=int(plan["minimum_shot_duration_ms"]),
+        maximum_shot_duration_ms=int(plan["maximum_shot_duration_ms"]),
+    )
+    episode_duration_ms = int(plan["episode_duration_seconds"]) * 1_000
+    episode_totals, adjusted_episode_count = _fit_episode_duration_budgets(
+        candidate["episodes"],
+        episode_duration_ms=episode_duration_ms,
+        minimum_shot_duration_ms=int(plan["minimum_shot_duration_ms"]),
+    )
+    master_script = render_compatible_master_script(candidate["bible"], candidate["episodes"])
+    candidate_warnings = _candidate_quality_warnings(candidate, master_script=master_script)
+    has_dialogue = any(
+        bool(shot["dialogue"]["text"])
+        for episode in candidate["episodes"] for shot in episode["shots"]
+    )
+    warnings = _runtime_warnings(
+        runtime_payload,
+        has_dialogue=has_dialogue,
+        adjusted_episode_count=adjusted_episode_count,
+        resource_estimate=dict(plan["resource_estimate"]),
+        script_char_count=len(master_script),
+        candidate_warnings=candidate_warnings,
+    )
+    return {
+        "schema_version": 1,
+        "source_fingerprint": fingerprint,
+        "candidate": {
+            "title": candidate["title"],
+            "logline": candidate["logline"],
+            "master_script": master_script,
+            "bible": candidate["bible"],
+        },
+        "format": {
+            "schema_version": SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+            "template_id": SERIES_CONCEPT_TEMPLATE_ID,
+            "compatible": True,
+            "episode_count": int(plan["episode_count"]),
+            "shot_count": int(plan["episode_count"]) * int(plan["shots_per_episode"]),
+            "episode_duration_seconds": int(plan["episode_duration_seconds"]),
+            "total_duration_ms": sum(episode_totals),
+            "shot_durations_ms": [
+                [shot["duration_ms"] for shot in episode["shots"]]
+                for episode in candidate["episodes"]
+            ],
+        },
+        "resource_estimate": dict(plan["resource_estimate"]),
+        "warnings": warnings,
+    }
+
+
 def generate_series_concept_draft(
     *,
     idea: str,
@@ -506,8 +679,8 @@ def generate_series_concept_draft(
             code="series_concept_episode_duration_invalid",
         )
 
-    minimum_shot_duration_ms = int(settings.VIDEO_SHOT_MIN_DURATION_MS)
-    maximum_shot_duration_ms = int(settings.VIDEO_SHOT_MAX_DURATION_MS)
+    minimum_shot_duration_ms = int(settings.LEGACY_VIDEO_SHOT_MIN_DURATION_MS)
+    maximum_shot_duration_ms = int(settings.LEGACY_VIDEO_SHOT_MAX_DURATION_MS)
     episode_duration_ms = episode_duration_seconds * 1_000
     total_shots = episode_count * shots_per_episode
     minimum_episode_duration_ms = shots_per_episode * minimum_shot_duration_ms

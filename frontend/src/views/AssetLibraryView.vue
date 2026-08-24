@@ -80,7 +80,7 @@ const confirmDeleteAsset=async()=>{
 
     <section v-if="style" class="style-feature" :style="{background:style.gradient}">
       <div class="style-feature-pattern"></div><div><span class="eyebrow">{{ style.englishName }}</span><h3>{{ style.name }}</h3><p>{{ style.description }}</p><div class="tag-row"><span v-for="tag in style.tags" :key="tag">{{ tag }}</span></div></div>
-      <div class="style-feature-counts"><div><UserRound :size="18"/><strong>{{ style.assetCounts.character }}</strong><span>人物</span></div><div><Image :size="18"/><strong>{{ style.assetCounts.scene }}</strong><span>场景</span></div><div><Box :size="18"/><strong>{{ style.assetCounts.prop }}</strong><span>道具</span></div></div>
+      <div class="style-feature-counts"><div><Layers3 :size="18"/><strong>{{ style.assetCount ?? '—' }}</strong><span>素材总数</span></div></div>
     </section>
 
     <section class="asset-toolbar panel">

@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 import hashlib
+import subprocess
 from datetime import timedelta
 
 from django.conf import settings
@@ -11,16 +12,25 @@ from django.db import transaction
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.exceptions import ValidationError
+from PIL import Image
 
 from studio.models import (
     Asset,
+    ConfigRevision,
     GeneratedWorkflow,
+    GenerationAttempt,
     GenerationTask,
+    ModelDeployment,
+    ModelProfileVersion,
+    ProductionRecipeVersion,
+    ProductionRun,
     PromptArtifact,
     Shot,
+    StageRun,
     WorkerLease,
     WorkflowTemplate,
 )
+from studio.services.configuration import create_config_revision, publish_config_revision
 from studio.services.comfyui import (
     ComfyUIClient,
     ComfyUIError,
@@ -37,13 +47,16 @@ from studio.services.production_pipeline import (
     ProductionQueueConfirmationRequired,
     assert_queue_capacity,
 )
+from studio.services.provenance import verified_task_manifest
 from studio.serializers import GenerationTaskSerializer
 from studio.services.task_queue import (
     _authorized_asset_source,
     claim_next_task,
     process_task,
     recover_stale_tasks,
+    task_wait_timeout,
 )
+from studio.services.json_contracts import assign_json_contract, canonical_json_bytes, json_contract
 from studio.services.workflow import build_workflow
 from studio.tests.factories import build_story
 
@@ -66,7 +79,15 @@ class FakeClient:
     def extract_outputs(self, history):
         path = Path(settings.COMFYUI_OUTPUT_DIR) / "show" / "episode.mp4"
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"fake-generated-video")
+        subprocess.run(
+            [
+                str(settings.FFMPEG_BINARY), "-hide_banner", "-loglevel", "error",
+                "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:d=0.2",
+                "-an", "-c:v", "libx264", "-pix_fmt", "yuv420p", str(path),
+            ],
+            check=True,
+            timeout=30,
+        )
         return [{"node_id": "9", "kind": "videos", "filename": "episode.mp4", "subfolder": "show"}]
 
 
@@ -79,6 +100,19 @@ class ExistingHistoryClient(FakeClient):
     def queue_prompt(self, workflow, client_id=None, prompt_id=None):
         self.queued = True
         return super().queue_prompt(workflow, client_id, prompt_id)
+
+
+class InvalidMediaClient(FakeClient):
+    def extract_outputs(self, history):
+        path = Path(settings.COMFYUI_OUTPUT_DIR) / "show" / "episode.mp4"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"not-a-video")
+        return [{"node_id": "9", "kind": "videos", "filename": "episode.mp4", "subfolder": "show"}]
+
+
+class InvalidExistingHistoryClient(ExistingHistoryClient, InvalidMediaClient):
+    def extract_outputs(self, history):
+        return InvalidMediaClient.extract_outputs(self, history)
 
 
 class SDXLImageClient(FakeClient):
@@ -102,7 +136,7 @@ class SDXLImageClient(FakeClient):
             / "shot-01_00001_.png"
         )
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"fake-generated-image")
+        Image.new("RGB", (64, 64), color=(20, 40, 60)).save(path, format="PNG")
         return {"outputs": {"7": {"images": [{
             "filename": "shot-01_00001_.png",
             "subfolder": "autoprompt/image-test",
@@ -414,7 +448,9 @@ class TaskQueueTests(TestCase):
 
     def _task(self):
         user, project, _, _, episode, shot1, _ = build_story()
-        result = build_h3_video_prompt(project, [shot1], H3PromptOptions())
+        result = build_h3_video_prompt(
+            project, [shot1], H3PromptOptions(language_gate_mode="warn"),
+        )
         prompt = PromptArtifact.objects.create(
             project=project, episode=episode, shot=shot1, created_by=user,
             prompt_type="video", prompt_text=result.text, structured_payload=result.payload,
@@ -431,6 +467,16 @@ class TaskQueueTests(TestCase):
         return GenerationTask.objects.create(
             owner=user, project=project, episode=episode, generated_workflow=workflow, kind="video",
         )
+
+    def _publish_runtime(self, values: dict) -> None:
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values=values,
+            created_by=None,
+            change_summary="task queue runtime test",
+            clone_published=True,
+        )
+        publish_config_revision(revision, published_by=None)
 
     def _image_task(self):
         call_command("seed_data", verbosity=0)
@@ -450,6 +496,31 @@ class TaskQueueTests(TestCase):
         template = WorkflowTemplate.objects.get(
             owner=None, slug="minimax-reference-image",
         )
+        # Fresh installs intentionally bootstrap unreviewed workflows paused.
+        # This worker contract test explicitly supplies its reviewed fixture.
+        template.is_active = True
+        template.model = "sd_xl_base_1.0.safetensors"
+        template.input_schema = {
+            **(template.input_schema or {}),
+            "workflow_mode": "text_to_image",
+            "fixed_model": True,
+            "required_dimension_multiple": 8,
+            "user_parameters": {
+                "RESOLUTION_PROFILE": {
+                    "type": "select", "default": "0.98", "options": ["0.98"],
+                },
+                "RESOLUTION_MULTIPLE": {
+                    "type": "integer", "default": 32, "min": 8, "max": 128, "step": 4,
+                },
+                "WIDTH": {
+                    "type": "integer", "default": 768, "min": 32, "max": 2048, "step": 8,
+                },
+                "HEIGHT": {
+                    "type": "integer", "default": 1344, "min": 32, "max": 2048, "step": 8,
+                },
+            },
+        }
+        template.save(update_fields=("is_active", "model", "input_schema", "updated_at"))
         workflow_json, injected, content_hash = build_workflow(
             template, prompt, project, {
                 "RESOLUTION_PROFILE": "0.98",
@@ -468,15 +539,170 @@ class TaskQueueTests(TestCase):
             generated_workflow=workflow, kind=GenerationTask.Kind.IMAGE,
         )
 
+    def _freeze_capacity(self, task, *, configured=2, effective=2, timeout=120):
+        config_sha = "c" * 64
+        deployment = ModelDeployment.objects.filter(
+            key="queue-capacity-deployment",
+        ).first()
+        if deployment is None:
+            deployment = ModelDeployment(
+                key="queue-capacity-deployment",
+                name="Queue capacity deployment",
+                profile_version=ModelProfileVersion.objects.get(
+                    profile_key="sdxl-image",
+                    version=1,
+                ),
+                status=ModelDeployment.Status.ACTIVE,
+            )
+            assign_json_contract(deployment, "runtime_config", {})
+            deployment.save()
+        capacity = {
+            "schema_version": 3,
+            "frozen_at": timezone.now().isoformat(),
+            "configured_concurrency": configured,
+            "effective_concurrency": effective,
+            "host_compatible_concurrency": None,
+            "hard_concurrency_ceiling_at_freeze": 4,
+            "runtime_host_id": None,
+            "host_capability_snapshot_id": None,
+            "host_capability_snapshot_revision": None,
+            "host_capability_snapshot_probe_status": None,
+            "host_capability_snapshot_sha256": "",
+            "host_capability_snapshot_captured_at": None,
+            "host_capability_snapshot_expires_at": None,
+            "configured_task_timeout_seconds": timeout,
+            "effective_task_timeout_seconds": timeout,
+            "task_idle_timeout_seconds": min(60, timeout),
+            "config_snapshot_sha256": config_sha,
+        }
+        task.capability_snapshot = {
+            **(task.capability_snapshot or {}),
+            "production_run_id": "00000000-0000-0000-0000-000000000001",
+            "model_deployment_id": str(deployment.id),
+            "config_snapshot_sha256": config_sha,
+            "execution_capacity": capacity,
+            "execution_capacity_sha256": hashlib.sha256(
+                canonical_json_bytes(capacity)
+            ).hexdigest(),
+        }
+        task.save(update_fields=("capability_snapshot", "updated_at"))
+        return task
+
+    def _link_media_run_with_review_gate(self, task):
+        recipe_contract = json_contract({"schema_version": 1, "stages": []})
+        recipe = ProductionRecipeVersion.objects.create(
+            recipe_key=f"task-auto-advance-{task.id}",
+            version=1,
+            name="Task auto advance fixture",
+            definition=recipe_contract.value,
+            definition_schema_version=recipe_contract.schema_version,
+            definition_size_bytes=recipe_contract.size_bytes,
+            definition_sha256=recipe_contract.sha256,
+        )
+        run_input = json_contract({
+            "schema_version": 1,
+            "episode_ids": [str(task.episode_id)],
+        })
+        config = json_contract({
+            "schema_version": 1,
+            "values": {"artifact.max_bytes": 10 * 1024 * 1024},
+        })
+        run = ProductionRun.objects.create(
+            owner=task.owner,
+            project=task.project,
+            recipe_version=recipe,
+            idempotency_key=f"task-auto-advance-{task.id}",
+            request_sha256="d" * 64,
+            status=ProductionRun.Status.RUNNING,
+            current_stage_key="media_generation",
+            max_generation_tasks=1,
+            generation_task_count=1,
+            config_snapshot=config.value,
+            config_snapshot_schema_version=config.schema_version,
+            config_snapshot_size_bytes=config.size_bytes,
+            config_snapshot_sha256=config.sha256,
+            input_snapshot=run_input.value,
+            input_snapshot_schema_version=run_input.schema_version,
+            input_snapshot_size_bytes=run_input.size_bytes,
+            input_snapshot_sha256=run_input.sha256,
+        )
+
+        def stage_row(*, key, ordinal, mode, status, approval_required=False):
+            stage = StageRun(
+                production_run=run,
+                stage_key=key,
+                ordinal=ordinal,
+                mode=mode,
+                status=status,
+                approval_required=approval_required,
+                idempotency_key=f"{run.id}:{ordinal}:{key}",
+            )
+            for field, payload in (
+                ("routing", {"schema_version": 1}),
+                ("routing_decision", {"schema_version": 1}),
+                ("config_snapshot", {"schema_version": 1}),
+                ("input_snapshot", {"schema_version": 1, "stage_key": key}),
+            ):
+                assign_json_contract(stage, field, payload)
+            stage.save()
+            return stage
+
+        media_stage = stage_row(
+            key="media_generation",
+            ordinal=1,
+            mode="existing_pipeline",
+            status=StageRun.Status.RUNNING,
+        )
+        review_gate = stage_row(
+            key="artifact_selection",
+            ordinal=2,
+            mode="review",
+            status=StageRun.Status.PENDING,
+            approval_required=True,
+        )
+        request = json_contract({"schema_version": 1})
+        GenerationAttempt.objects.create(
+            stage_run=media_stage,
+            unit_key=f"task:{task.id}",
+            attempt_number=1,
+            generation_task=task,
+            operation="media.generate",
+            status=GenerationAttempt.Status.QUEUED,
+            request_sha256=request.sha256,
+            request_snapshot=request.value,
+            request_snapshot_schema_version=request.schema_version,
+            request_snapshot_size_bytes=request.size_bytes,
+            request_snapshot_sha256=request.sha256,
+        )
+        return run, media_stage, review_gate
+
     def test_claim_and_complete(self):
-        self._task()
+        pending = self._task()
+        # These are immutable execution-plan facts.  The encoder is allowed to
+        # return a container whose observed duration/frame count differs.
+        pending.effective_frames = 120
+        pending.effective_duration_ms = 5000
+        pending.save(update_fields=(
+            "effective_frames", "effective_duration_ms", "updated_at",
+        ))
         task = claim_next_task()
         self.assertIsNotNone(task)
         self.assertEqual(task.status, GenerationTask.Status.RUNNING)
         result_task = process_task(task, FakeClient())
-        self.assertEqual(result_task.status, GenerationTask.Status.SUCCEEDED)
+        self.assertEqual(
+            result_task.status, GenerationTask.Status.SUCCEEDED, result_task.error_message,
+        )
         self.assertEqual(result_task.progress, 100)
         self.assertEqual(result_task.outputs[0]["filename"], "episode.mp4")
+        self.assertEqual(result_task.effective_frames, 120)
+        self.assertEqual(result_task.effective_duration_ms, 5000)
+        observed = result_task.outputs[0]["observed_media"]
+        self.assertEqual(observed["observation_source"], "ffprobe")
+        self.assertEqual(observed["width"], 64)
+        self.assertEqual(observed["height"], 64)
+        self.assertGreater(observed["frames"], 0)
+        self.assertGreater(observed["duration_ms"], 0)
+        self.assertNotEqual(observed["frames"], result_task.effective_frames)
         self.assertEqual(result_task.submission_state, GenerationTask.SubmissionState.SUBMITTED)
         self.assertEqual(result_task.comfy_prompt_id, result_task.submission_token)
         preflight = result_task.capability_snapshot["comfyui_contract_preflight"]
@@ -484,14 +710,94 @@ class TaskQueueTests(TestCase):
         self.assertEqual(preflight["node_count"], 1)
         self.assertEqual(preflight["class_types"], ["SaveImage"])
         self.assertEqual(len(preflight["schema_sha256"]), 64)
+        artifact = result_task.generated_artifacts.get()
+        self.assertEqual(artifact.mime_type, "video/mp4")
+        self.assertEqual(
+            artifact.sha256,
+            result_task.outputs[0]["provenance"]["artifact_sha256"],
+        )
+        self.assertTrue((Path(settings.MEDIA_ROOT) / artifact.object_key).is_file())
+        self.assertEqual(artifact.manifest_metadata["observed_media"], observed)
+        self.assertEqual(
+            verified_task_manifest(result_task, 0)["artifact"]["observed_media"],
+            observed,
+        )
+        serialized = GenerationTaskSerializer(result_task).data
+        self.assertEqual(serialized["input_parameters"]["effective_frames"], 120)
+        self.assertEqual(serialized["input_parameters"]["effective_duration_ms"], 5000)
+        self.assertEqual(serialized["output_media"][0]["observed_media"], observed)
 
-    @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_PROGRESS_WEBSOCKET_ENABLED=True,
-    )
+    def test_terminal_comfy_task_auto_advances_run_into_artifact_review_gate(self):
+        pending = self._task()
+        run, media_stage, review_gate = self._link_media_run_with_review_gate(pending)
+        self._freeze_capacity(pending)
+        pending.capability_snapshot = {
+            **pending.capability_snapshot,
+            "production_run_id": str(run.id),
+        }
+        pending.save(update_fields=("capability_snapshot", "updated_at"))
+        task = claim_next_task()
+        self.assertEqual(task.id, pending.id)
+
+        with self.captureOnCommitCallbacks(execute=True):
+            result = process_task(task, FakeClient())
+
+        self.assertEqual(
+            result.status,
+            GenerationTask.Status.SUCCEEDED,
+            result.error_message,
+        )
+        run.refresh_from_db()
+        media_stage.refresh_from_db()
+        review_gate.refresh_from_db()
+        self.assertEqual(media_stage.status, StageRun.Status.SUCCEEDED)
+        self.assertEqual(review_gate.status, StageRun.Status.AWAITING_APPROVAL)
+        self.assertEqual(run.status, ProductionRun.Status.AWAITING_APPROVAL)
+        self.assertEqual(run.current_stage_key, "artifact_selection")
+
+    def test_known_comfy_failure_auto_blocks_linked_media_stage(self):
+        pending = self._task()
+        run, media_stage, review_gate = self._link_media_run_with_review_gate(pending)
+        self._freeze_capacity(pending)
+        pending.capability_snapshot = {
+            **pending.capability_snapshot,
+            "production_run_id": str(run.id),
+        }
+        pending.save(update_fields=("capability_snapshot", "updated_at"))
+        task = claim_next_task()
+
+        with self.captureOnCommitCallbacks(execute=True):
+            result = process_task(task, TerminalFailureClient())
+
+        self.assertEqual(result.status, GenerationTask.Status.FAILED)
+        run.refresh_from_db()
+        media_stage.refresh_from_db()
+        review_gate.refresh_from_db()
+        self.assertEqual(media_stage.status, StageRun.Status.BLOCKED)
+        self.assertEqual(media_stage.reason_code, "generation_tasks_failed")
+        self.assertEqual(review_gate.status, StageRun.Status.PENDING)
+        self.assertEqual(run.status, ProductionRun.Status.BLOCKED)
+        self.assertEqual(run.current_stage_key, "media_generation")
+
+    def test_invalid_media_archive_rolls_back_success_and_fails_task(self):
+        self._task()
+        task = claim_next_task()
+
+        with self.assertLogs("studio.services.task_queue", level="ERROR"):
+            result = process_task(task, InvalidMediaClient())
+
+        self.assertEqual(result.status, GenerationTask.Status.FAILED)
+        self.assertEqual(result.progress, 0)
+        self.assertIn("GeneratedArtifact manifest", result.error_message)
+        self.assertFalse(result.generated_artifacts.exists())
+
+    @override_settings(TASK_PROGRESS_WEBSOCKET_ENABLED=True)
     def test_websocket_sampler_progress_is_persisted_before_completion(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+        })
         pending = self._task()
         task = claim_next_task()
         client = ProgressReportingClient(pending.id)
@@ -513,13 +819,13 @@ class TaskQueueTests(TestCase):
         self.assertEqual(result.comfy_progress, 50)
         self.assertTrue(client.socket.closed)
 
-    @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_PROGRESS_WEBSOCKET_ENABLED=True,
-    )
+    @override_settings(TASK_PROGRESS_WEBSOCKET_ENABLED=True)
     def test_websocket_read_failure_is_persisted_without_failing_task(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+        })
         pending = self._task()
         task = claim_next_task()
         client = ProgressReadFailureClient(pending.id)
@@ -534,33 +840,33 @@ class TaskQueueTests(TestCase):
         self.assertIn("socket reset", result.progress_telemetry_error)
         self.assertTrue(client.socket.closed)
 
-    @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_PROGRESS_WEBSOCKET_ENABLED=True,
-    )
+    @override_settings(TASK_PROGRESS_WEBSOCKET_ENABLED=True)
     def test_websocket_open_failure_is_persisted_without_failing_task(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+        })
         pending = self._task()
         task = claim_next_task()
         client = ProgressOpenFailureClient(pending.id)
 
         result = process_task(task, client, wait_timeout=5)
 
-        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED)
+        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
         self.assertEqual(
             result.progress_telemetry_state,
             GenerationTask.ProgressTelemetryState.UNAVAILABLE,
         )
         self.assertIn("handshake refused", result.progress_telemetry_error)
 
-    @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_PROGRESS_WEBSOCKET_ENABLED=False,
-    )
+    @override_settings(TASK_PROGRESS_WEBSOCKET_ENABLED=False)
     def test_transient_history_and_queue_timeouts_keep_tracking_persisted_prompt(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+        })
         task = self._task()
         task.status = GenerationTask.Status.RUNNING
         task.attempts = 1
@@ -583,13 +889,15 @@ class TaskQueueTests(TestCase):
         self.assertFalse(client.queued)
 
     @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_HEALTH_FAILURE_LIMIT=2,
         TASK_PROGRESS_WEBSOCKET_ENABLED=False,
     )
     def test_poll_timeouts_still_run_bounded_health_failure_detection(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+            "runtime.task_health_failure_limit": 2,
+        })
         task = self._task()
         token = "b6eb2d85-da37-4542-ad45-6a5f63cf12eb"
         GenerationTask.objects.filter(pk=task.pk).update(
@@ -614,13 +922,35 @@ class TaskQueueTests(TestCase):
         self.assertFalse(client.queued)
 
     def test_sdxl_image_task_preflights_submits_and_persists_png_output(self):
-        self._image_task()
+        pending = self._image_task()
+        pending.seed = 4242
+        pending.workflow_version = 7
+        pending.capability_snapshot = {
+            "model": "sd_xl_base_1.0.safetensors",
+            "template_slug": "minimax-reference-image",
+            "workflow_mode": "text_to_image",
+            "workflow_parameters": {
+                "sampling.seed": 4242,
+                "sampling.steps": 28,
+                "sampling.sampler": "euler_ancestral",
+                "sampling.scheduler": "normal",
+                "sampling.cfg_scale": 6.5,
+                "sampling.denoise": 1.0,
+                "credential_ref": "must-not-leak",
+                "output_path": "C:\\private\\result.png",
+            },
+            "width": 768,
+            "height": 1344,
+        }
+        pending.save(update_fields=(
+            "seed", "workflow_version", "capability_snapshot", "updated_at",
+        ))
         task = claim_next_task()
         client = SDXLImageClient()
 
         result = process_task(task, client)
 
-        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED)
+        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
         self.assertEqual(result.kind, GenerationTask.Kind.IMAGE)
         self.assertEqual(result.outputs[0]["node_id"], "7")
         self.assertEqual(result.outputs[0]["kind"], "images")
@@ -639,6 +969,34 @@ class TaskQueueTests(TestCase):
         preflight = result.capability_snapshot["comfyui_contract_preflight"]
         self.assertEqual(preflight["status"], "passed")
         self.assertEqual(preflight["node_count"], 7)
+        artifact = result.generated_artifacts.get()
+        self.assertEqual(artifact.mime_type, "image/png")
+        self.assertEqual(
+            artifact.sha256,
+            result.outputs[0]["provenance"]["artifact_sha256"],
+        )
+        self.assertTrue((Path(settings.MEDIA_ROOT) / artifact.object_key).is_file())
+        self.assertEqual(artifact.comparison_parameters, {
+            "schema_version": 1,
+            "model": "sd_xl_base_1.0.safetensors",
+            "workflow": {
+                "template": "minimax-reference-image",
+                "version": 7,
+                "mode": "text_to_image",
+            },
+            "generation": {"seed": 4242, "width": 768, "height": 1344},
+            "sampling": {
+                "seed": 4242,
+                "steps": 28,
+                "sampler": "euler_ancestral",
+                "scheduler": "normal",
+                "cfg_scale": 6.5,
+                "denoise": 1.0,
+            },
+        })
+        frozen_comparison = str(artifact.comparison_parameters)
+        self.assertNotIn("credential", frozen_comparison)
+        self.assertNotIn("private", frozen_comparison)
 
     def test_live_contract_mismatch_blocks_before_token_and_prompt_post(self):
         self._task()
@@ -701,18 +1059,66 @@ class TaskQueueTests(TestCase):
             GenerationTask.objects.filter(status=GenerationTask.Status.RUNNING).count(), 1,
         )
 
-    @override_settings(
-        TASK_RECOMMENDED_MAX_PENDING=100,
-        TASK_RECOMMENDED_MAX_ACTIVE_PER_USER=1,
-    )
+    @override_settings(TASK_MAX_CONCURRENT=4)
+    def test_frozen_business_concurrency_limits_claims_below_deployment_ceiling(self):
+        first = self._freeze_capacity(self._task(), configured=2, effective=2)
+        second = self._freeze_capacity(GenerationTask.objects.create(
+            owner=first.owner, project=first.project, episode=first.episode,
+            generated_workflow=first.generated_workflow, kind="video",
+        ), configured=2, effective=2)
+        self._freeze_capacity(GenerationTask.objects.create(
+            owner=first.owner, project=first.project, episode=first.episode,
+            generated_workflow=first.generated_workflow, kind="video",
+        ), configured=2, effective=2)
+
+        self.assertEqual(claim_next_task().id, first.id)
+        self.assertEqual(claim_next_task().id, second.id)
+        self.assertIsNone(claim_next_task())
+
+    @override_settings(TASK_MAX_CONCURRENT=1)
+    def test_database_frozen_hard_timeout_cannot_be_overridden_by_caller(self):
+        first = self._freeze_capacity(self._task(), configured=3, effective=3, timeout=120)
+        self._freeze_capacity(GenerationTask.objects.create(
+            owner=first.owner, project=first.project, episode=first.episode,
+            generated_workflow=first.generated_workflow, kind="video",
+        ), configured=3, effective=3, timeout=120)
+
+        claimed = claim_next_task()
+        self.assertEqual(claimed.id, first.id)
+        self.assertLessEqual(task_wait_timeout(claimed, 300), 120)
+        self.assertGreater(task_wait_timeout(claimed, 1), 100)
+        self.assertIsNone(claim_next_task())
+
+    @override_settings(TASK_MAX_CONCURRENT=4)
+    def test_corrupt_platform_capacity_fails_closed_before_claim(self):
+        task = self._freeze_capacity(self._task())
+        task.capability_snapshot["execution_capacity_sha256"] = "0" * 64
+        task.save(update_fields=("capability_snapshot", "updated_at"))
+
+        self.assertIsNone(claim_next_task())
+        task.refresh_from_db()
+        self.assertEqual(task.status, GenerationTask.Status.FAILED)
+        self.assertIn("execution capacity", task.error_message)
+
     def test_per_user_queue_guidance_requires_confirmation_but_does_not_cap_volume(self):
         task = self._task()
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.PROJECT,
+            project=task.project,
+            values={
+                "production.recommended_max_pending": 100,
+                "production.recommended_max_active_per_user": 1,
+            },
+            created_by=task.owner,
+        )
+        publish_config_revision(revision, published_by=task.owner)
         with self.assertRaises(ProductionQueueConfirmationRequired):
             with transaction.atomic():
-                assert_queue_capacity(task.owner)
+                assert_queue_capacity(task.owner, project=task.project)
         with transaction.atomic():
             snapshot = assert_queue_capacity(
                 task.owner,
+                project=task.project,
                 extended_generation_confirmed=True,
             )
         self.assertEqual(snapshot["recommended_max_active_per_user"], 1)
@@ -726,6 +1132,23 @@ class TaskQueueTests(TestCase):
         client = ExistingHistoryClient()
         result = process_task(task, client)
         self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED)
+        self.assertFalse(client.queued)
+
+    def test_legacy_prompt_id_only_archive_failure_is_not_requeued(self):
+        task = self._task()
+        task.status = GenerationTask.Status.RUNNING
+        task.comfy_prompt_id = "legacy-submitted"
+        task.attempts = 1
+        task.save(update_fields=("status", "comfy_prompt_id", "attempts", "updated_at"))
+        client = InvalidExistingHistoryClient()
+
+        with self.assertLogs("studio.services.task_queue", level="ERROR"):
+            result = process_task(task, client)
+
+        self.assertEqual(result.status, GenerationTask.Status.FAILED)
+        self.assertEqual(result.comfy_prompt_id, "legacy-submitted")
+        self.assertEqual(result.submission_token, "")
+        self.assertFalse(result.generated_artifacts.exists())
         self.assertFalse(client.queued)
 
     def test_prepared_submission_missing_remotely_fails_without_second_post(self):
@@ -756,13 +1179,13 @@ class TaskQueueTests(TestCase):
         self.assertTrue(result.submission_token)
         self.assertIn("CUDA out of memory", result.error_message)
 
-    @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_HEALTH_FAILURE_LIMIT=2,
-    )
     def test_consecutive_health_failures_end_sticky_oom_without_waiting_for_timeout(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+            "runtime.task_health_failure_limit": 2,
+        })
         self._task()
         task = claim_next_task()
         client = StickyHealthFailureClient()
@@ -787,13 +1210,13 @@ class TaskQueueTests(TestCase):
         )
         self.assertIsNone(claim_next_task())
 
-    @override_settings(
-        TASK_REMOTE_POLL_SECONDS=0.01,
-        TASK_HEARTBEAT_SECONDS=0.01,
-        TASK_HEALTH_CHECK_INTERVAL_SECONDS=0,
-        TASK_HEALTH_FAILURE_LIMIT=3,
-    )
     def test_database_cancel_is_observed_during_remote_polling(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+            "runtime.task_health_failure_limit": 3,
+        })
         self._task()
         task = claim_next_task()
         client = CancellationDuringPollClient(task.id)
@@ -1037,6 +1460,31 @@ class TaskQueueTests(TestCase):
         self.assertFalse(client.queued)
         self.assertFalse(completion_client.queued)
 
+    @override_settings(TASK_MAX_CONCURRENT=1)
+    def test_persisted_submission_reattaches_while_fresh_pool_is_full(self):
+        task = self._freeze_capacity(self._task(), configured=1, effective=1)
+        token = "914e12c3-6b5e-4c97-a482-c83105a6467e"
+        GenerationTask.objects.filter(pk=task.pk).update(
+            submission_token=token,
+            comfy_prompt_id=token,
+            submission_state=GenerationTask.SubmissionState.SUBMITTED,
+        )
+        GenerationTask.objects.create(
+            owner=task.owner,
+            project=task.project,
+            episode=task.episode,
+            generated_workflow=task.generated_workflow,
+            kind=task.kind,
+            status=GenerationTask.Status.RUNNING,
+            attempts=1,
+        )
+
+        claimed = claim_next_task()
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, task.id)
+        self.assertEqual(claimed.submission_token, token)
+
     def test_stale_submitted_task_missing_remotely_fails_without_repost(self):
         task = self._task()
         old = timezone.now() - timedelta(hours=1)
@@ -1063,8 +1511,8 @@ class TaskQueueTests(TestCase):
         self.assertIn("automatic resubmission is blocked", task.error_message)
         self.assertFalse(client.queued)
 
-    @override_settings(TASK_CANCEL_GRACE_SECONDS=1)
     def test_cancel_requested_reconciles_after_cancel_grace_without_waiting_for_stale_threshold(self):
+        self._publish_runtime({"runtime.task_cancel_grace_seconds": 1})
         task = self._task()
         requested_at = timezone.now() - timedelta(seconds=2)
         token = "5f0ab055-d52a-4f19-8eea-b7b57a6da712"
@@ -1101,8 +1549,8 @@ class TaskQueueTests(TestCase):
         self.assertEqual(task.remote_state, GenerationTask.RemoteState.CANCELLED)
         self.assertIsNotNone(task.finished_at)
 
-    @override_settings(TASK_CANCEL_GRACE_SECONDS=1)
     def test_cancel_requested_stays_unresolved_while_remote_prompt_is_still_queued(self):
+        self._publish_runtime({"runtime.task_cancel_grace_seconds": 1})
         task = self._task()
         requested_at = timezone.now() - timedelta(seconds=2)
         token = "3d26f312-0b98-4b3c-ab75-471838208818"
@@ -1127,7 +1575,6 @@ class TaskQueueTests(TestCase):
         self.assertEqual(task.remote_state, GenerationTask.RemoteState.CANCELLING)
         self.assertIsNone(task.finished_at)
 
-    @override_settings(TASK_CANCEL_GRACE_SECONDS=30)
     def test_recent_cancel_request_is_not_reconciled_before_grace_period(self):
         task = self._task()
         token = "e3a41ec3-9bd2-43e4-b81f-bda4b69035b4"

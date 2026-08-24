@@ -76,6 +76,13 @@ from studio.services.prompt_translation import (
     resolve_current_source,
     translation_entry_context_current,
 )
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    redact_sensitive_bindings,
+    resolve_configuration,
+    video_shot_duration_policy,
+)
+from studio.services.access_control import role_for_user, security_profile_for
 from studio.services.production_pipeline import (
     BIBLE_IMAGE_CANDIDATE_PURPOSE,
     BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
@@ -90,20 +97,20 @@ from studio.services.script_bible import (
     ScriptBibleProvenanceProtectedError,
     validate_untrusted_script_bible_metadata,
 )
-from studio.services.resolution import (
-    H3_RESOLUTION_MULTIPLE_DEFAULT,
-    H3_RESOLUTION_MULTIPLE_MAX,
-    H3_RESOLUTION_MULTIPLE_MIN,
-    H3_RESOLUTION_PROFILES,
-    ResolutionProfileError,
-    validate_image_resolution_multiple,
-    validate_resolution_multiple as validate_h3_resolution_multiple,
-)
+from studio.services.resolution import H3_RESOLUTION_MULTIPLE_DEFAULT
 
 User = get_user_model()
 
-VIDEO_SHOT_MIN_DURATION_MS = settings.VIDEO_SHOT_MIN_DURATION_MS
-VIDEO_SHOT_MAX_DURATION_MS = settings.VIDEO_SHOT_MAX_DURATION_MS
+
+def _asset_runtime_limits() -> dict[str, int]:
+    keys = (
+        "artifact.upload_max_bytes", "artifact.video_upload_max_bytes",
+        "artifact.audio_upload_max_bytes", "artifact.tenant_quota_bytes",
+        "artifact.image_max_width", "artifact.image_max_height",
+        "artifact.image_max_pixels", "runtime.task_stall_threshold_seconds",
+    )
+    return resolve_configuration(required_keys=keys).values
+
 SCRIPT_BIBLE_METADATA_HELP = (
     "扩展元数据对象。script_bible_v1 是完整剧本候选 apply 专属保留成员；"
     "通用创建、更新和 sync-bibles 不得注入、替换或删除。"
@@ -115,24 +122,59 @@ def _is_project_cover_asset(asset: Asset) -> bool:
     return metadata.get("usage") == "project_cover"
 
 
-def _validate_video_shot_duration(media_type: str, duration_ms: int) -> None:
+def _resolved_video_shot_duration_policy(
+    project: SeriesProject | None = None,
+) -> dict[str, int]:
+    try:
+        return video_shot_duration_policy(project=project)
+    except ConfigurationResolutionError as exc:
+        raise serializers.ValidationError({
+            "configuration": {
+                "code": exc.code,
+                "detail": str(exc),
+                "missing_keys": list(exc.missing_keys),
+            },
+        }) from exc
+
+
+def _validate_video_shot_duration(
+    media_type: str,
+    duration_ms: int,
+    *,
+    policy: dict[str, int],
+) -> None:
+    minimum = policy["minimum_duration_ms"]
+    maximum = policy["maximum_duration_ms"]
     if (
         media_type == Shot.MediaType.VIDEO
-        and not VIDEO_SHOT_MIN_DURATION_MS <= duration_ms <= VIDEO_SHOT_MAX_DURATION_MS
+        and not minimum <= duration_ms <= maximum
     ):
         raise serializers.ValidationError({
             "duration_ms": (
-                f"视频分镜时长必须在 {VIDEO_SHOT_MIN_DURATION_MS}–"
-                f"{VIDEO_SHOT_MAX_DURATION_MS}ms"
+                f"视频分镜时长必须在 {minimum}–{maximum}ms"
             ),
         })
 
 
 class UserSerializer(serializers.ModelSerializer):
+    role = serializers.SerializerMethodField()
+    must_change_password = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ("id", "username", "email", "first_name", "last_name", "is_staff", "date_joined")
-        read_only_fields = ("id", "is_staff", "date_joined")
+        fields = (
+            "id", "username", "email", "first_name", "last_name", "is_staff",
+            "is_superuser", "role", "must_change_password", "date_joined",
+        )
+        read_only_fields = (
+            "id", "is_staff", "is_superuser", "role", "must_change_password", "date_joined",
+        )
+
+    def get_role(self, obj) -> str:
+        return role_for_user(obj)
+
+    def get_must_change_password(self, obj) -> bool:
+        return security_profile_for(obj).must_change_password
 
 
 class RegisterSerializer(serializers.ModelSerializer):
@@ -144,7 +186,9 @@ class RegisterSerializer(serializers.ModelSerializer):
         read_only_fields = ("id",)
 
     def create(self, validated_data):
-        return User.objects.create_user(**validated_data)
+        user = User.objects.create_user(**validated_data)
+        security_profile_for(user)
+        return user
 
 
 class StyleSerializer(serializers.ModelSerializer):
@@ -336,9 +380,10 @@ class AssetSerializer(serializers.ModelSerializer):
             mime_type, verified_metadata = self._validate_upload(uploaded, kind)
             if isinstance(metadata, dict) and metadata.get("usage") == "project_cover":
                 uploaded = self._sanitize_project_cover_upload(uploaded, mime_type)
-                if uploaded.size > settings.ASSET_UPLOAD_MAX_BYTES:
+                limits = _asset_runtime_limits()
+                if uploaded.size > limits["artifact.upload_max_bytes"]:
                     raise serializers.ValidationError({
-                        "file": f"处理后的封面不能超过 {settings.ASSET_UPLOAD_MAX_BYTES} bytes",
+                        "file": f"处理后的封面不能超过 {limits['artifact.upload_max_bytes']} bytes",
                     })
                 attrs["file"] = uploaded
                 verified_metadata = {
@@ -430,9 +475,10 @@ class AssetSerializer(serializers.ModelSerializer):
                     "生成产物类型不能通过该入口上传"
                 ),
             })
-        if uploaded.size > settings.ASSET_UPLOAD_MAX_BYTES:
+        limits = _asset_runtime_limits()
+        if uploaded.size > limits["artifact.upload_max_bytes"]:
             raise serializers.ValidationError({
-                "file": f"单文件不能超过 {settings.ASSET_UPLOAD_MAX_BYTES} bytes",
+                "file": f"单文件不能超过 {limits['artifact.upload_max_bytes']} bytes",
             })
         extension = Path(uploaded.name).suffix.lower()
         allowed_extensions = {
@@ -451,14 +497,14 @@ class AssetSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({"file": "上传 MIME 与实际图片格式不匹配"})
                 if (
                     width <= 0 or height <= 0
-                    or width > settings.ASSET_IMAGE_MAX_WIDTH
-                    or height > settings.ASSET_IMAGE_MAX_HEIGHT
-                    or width * height > settings.ASSET_IMAGE_MAX_PIXELS
+                    or width > limits["artifact.image_max_width"]
+                    or height > limits["artifact.image_max_height"]
+                    or width * height > limits["artifact.image_max_pixels"]
                 ):
                     raise serializers.ValidationError({
                         "file": (
-                            f"图片尺寸超限；最大 {settings.ASSET_IMAGE_MAX_WIDTH}x"
-                            f"{settings.ASSET_IMAGE_MAX_HEIGHT} / {settings.ASSET_IMAGE_MAX_PIXELS} pixels"
+                            f"图片尺寸超限；最大 {limits['artifact.image_max_width']}x"
+                            f"{limits['artifact.image_max_height']} / {limits['artifact.image_max_pixels']} pixels"
                         ),
                     })
                 image.verify()
@@ -472,9 +518,10 @@ class AssetSerializer(serializers.ModelSerializer):
 
     def _validate_reference_media_upload(self, uploaded, *, media_type: str) -> tuple[str, dict]:
         media_label = {"video": "视频", "audio": "音频"}[media_type]
+        limits = _asset_runtime_limits()
         specs = {
             "video": {
-                "max_bytes": settings.ASSET_VIDEO_MAX_BYTES,
+                "max_bytes": limits["artifact.video_upload_max_bytes"],
                 "extensions": {
                     ".mp4": {"video/mp4"}, ".mov": {"video/quicktime"},
                     ".webm": {"video/webm"},
@@ -482,7 +529,7 @@ class AssetSerializer(serializers.ModelSerializer):
                 "min_seconds": 2.0, "max_seconds": 15.0,
             },
             "audio": {
-                "max_bytes": settings.ASSET_AUDIO_MAX_BYTES,
+                "max_bytes": limits["artifact.audio_upload_max_bytes"],
                 "extensions": {
                     ".wav": {"audio/wav", "audio/x-wav"}, ".mp3": {"audio/mpeg"},
                     ".flac": {"audio/flac", "audio/x-flac"},
@@ -599,11 +646,12 @@ class AssetSerializer(serializers.ModelSerializer):
                 used += asset.file.size
             except (OSError, ValueError, FileNotFoundError):
                 continue
-        if used + uploaded.size > settings.ASSET_TENANT_QUOTA_BYTES:
+        limits = _asset_runtime_limits()
+        if used + uploaded.size > limits["artifact.tenant_quota_bytes"]:
             raise serializers.ValidationError({
                 "file": (
                     f"租户素材配额不足：已使用 {used} bytes，"
-                    f"上限 {settings.ASSET_TENANT_QUOTA_BYTES} bytes"
+                    f"上限 {limits['artifact.tenant_quota_bytes']} bytes"
                 ),
             })
 
@@ -652,7 +700,7 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
     expected_updated_at = serializers.DateTimeField(required=False, write_only=True)
     default_shot_duration_ms = serializers.IntegerField(
         min_value=1,
-        default=VIDEO_SHOT_MIN_DURATION_MS,
+        required=False,
     )
     cover_asset = serializers.PrimaryKeyRelatedField(
         queryset=Asset.objects.all(), allow_null=True, required=False,
@@ -749,14 +797,21 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
         return value
 
     def validate(self, attrs):
+        duration_policy = _resolved_video_shot_duration_policy(self.instance)
         width = attrs.get("width", getattr(self.instance, "width", 768))
         height = attrs.get("height", getattr(self.instance, "height", 1344))
         model = attrs.get("target_model", getattr(self.instance, "target_model", "minimax-h3"))
         fps = attrs.get("fps", getattr(self.instance, "fps", 24))
         default_duration = attrs.get(
             "default_shot_duration_ms",
-            getattr(self.instance, "default_shot_duration_ms", VIDEO_SHOT_MIN_DURATION_MS),
+            getattr(
+                self.instance,
+                "default_shot_duration_ms",
+                duration_policy["default_duration_ms"],
+            ),
         )
+        if self.instance is None and "default_shot_duration_ms" not in attrs:
+            attrs["default_shot_duration_ms"] = default_duration
         multiple = 32 if "minimax-h3" in model.lower() else 8
         if width % multiple or height % multiple:
             raise serializers.ValidationError(f"width 和 height 必须是 {multiple} 的倍数")
@@ -766,14 +821,15 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("当前 MiniMax H3 profile 限制短边不超过 768、长边不超过 1344；未配置 1080p/4K 放大流程")
         if (
             "minimax-h3" in model.lower()
-            and not VIDEO_SHOT_MIN_DURATION_MS
+            and not duration_policy["minimum_duration_ms"]
             <= default_duration
-            <= VIDEO_SHOT_MAX_DURATION_MS
+            <= duration_policy["maximum_duration_ms"]
         ):
             raise serializers.ValidationError({
                 "default_shot_duration_ms": (
                     "MiniMax H3 默认分镜时长必须在 "
-                    f"{VIDEO_SHOT_MIN_DURATION_MS}–{VIDEO_SHOT_MAX_DURATION_MS}ms"
+                    f"{duration_policy['minimum_duration_ms']}–"
+                    f"{duration_policy['maximum_duration_ms']}ms"
                 ),
             })
         requested_status = attrs.get("status", getattr(self.instance, "status", SeriesProject.Status.DRAFT))
@@ -1095,7 +1151,7 @@ class H3ReferenceBindingsJSONField(serializers.JSONField):
 class ShotSerializer(serializers.ModelSerializer):
     reference_bindings = H3ReferenceBindingsJSONField(required=False)
     duration_ms = serializers.IntegerField(
-        min_value=100, default=VIDEO_SHOT_MIN_DURATION_MS,
+        min_value=100, required=False,
     )
     legacy_negative_prompt_repair_eligible = serializers.SerializerMethodField()
 
@@ -1125,6 +1181,9 @@ class ShotSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         episode = self._episode(attrs)
+        duration_policy = _resolved_video_shot_duration_policy(
+            episode.project if episode is not None else None,
+        )
         if self.instance is not None and "metadata" in attrs:
             current_metadata = (
                 self.instance.metadata
@@ -1150,9 +1209,20 @@ class ShotSerializer(serializers.ModelSerializer):
             "media_type", getattr(self.instance, "media_type", Shot.MediaType.VIDEO),
         )
         duration_ms = attrs.get(
-            "duration_ms", getattr(self.instance, "duration_ms", VIDEO_SHOT_MIN_DURATION_MS),
+            "duration_ms",
+            getattr(
+                self.instance,
+                "duration_ms",
+                duration_policy["default_duration_ms"],
+            ),
         )
-        _validate_video_shot_duration(media_type, duration_ms)
+        if self.instance is None and "duration_ms" not in attrs:
+            attrs["duration_ms"] = duration_ms
+        _validate_video_shot_duration(
+            media_type,
+            duration_ms,
+            policy=duration_policy,
+        )
         if not episode:
             return attrs
         project_id = episode.project_id
@@ -1277,10 +1347,18 @@ class ShotSyncItemSerializer(serializers.Serializer):
         media_type = attrs.get(
             "media_type", getattr(current, "media_type", Shot.MediaType.VIDEO),
         )
-        duration_ms = attrs.get(
-            "duration_ms", getattr(current, "duration_ms", VIDEO_SHOT_MIN_DURATION_MS),
+        duration_policy = _resolved_video_shot_duration_policy(
+            episode.project if episode is not None else None,
         )
-        _validate_video_shot_duration(media_type, duration_ms)
+        duration_ms = attrs.get(
+            "duration_ms",
+            getattr(current, "duration_ms", duration_policy["default_duration_ms"]),
+        )
+        _validate_video_shot_duration(
+            media_type,
+            duration_ms,
+            policy=duration_policy,
+        )
         dialogue = attrs.get(
             "dialogue", getattr(current, "dialogue", []) if current else [],
         )
@@ -1293,21 +1371,6 @@ class ShotSyncItemSerializer(serializers.Serializer):
         return attrs
 
 
-class EpisodeShotSyncSerializer(serializers.Serializer):
-    shot_version_key = serializers.CharField(max_length=191)
-    shots = ShotSyncItemSerializer(many=True, allow_empty=True)
-
-    def validate_shots(self, shots):
-        ids = [str(item["id"]) for item in shots if item.get("id")]
-        numbers = [item["number"] for item in shots]
-        if len(ids) != len(set(ids)):
-            raise serializers.ValidationError("id 不能重复")
-        if len(numbers) != len(set(numbers)):
-            raise serializers.ValidationError("number 不能重复")
-        for index, item in enumerate(shots):
-            if not item.get("id") and not item.get("narrative", "").strip():
-                raise serializers.ValidationError(f"第 {index + 1} 项新分镜必须提供 narrative")
-        return shots
 
 
 class BibleSyncBaseSerializer(serializers.Serializer):
@@ -1358,47 +1421,6 @@ class PropBibleSyncItemSerializer(BibleSyncBaseSerializer):
     continuity_state = serializers.CharField(required=False, allow_blank=True)
 
 
-class ProjectBibleSyncSerializer(serializers.Serializer):
-    expected_updated_at = serializers.DateTimeField(required=False, write_only=True)
-    characters = CharacterBibleSyncItemSerializer(many=True, required=False, allow_empty=True)
-    scenes = SceneBibleSyncItemSerializer(many=True, required=False, allow_empty=True)
-    props = PropBibleSyncItemSerializer(many=True, required=False, allow_empty=True)
-
-    def validate(self, attrs):
-        if not any(key in attrs for key in ("characters", "scenes", "props")):
-            raise serializers.ValidationError("characters、scenes、props 至少提供一个完整列表")
-        for key in ("characters", "scenes", "props"):
-            if key not in attrs:
-                continue
-            items = attrs[key]
-            ids = [str(item["id"]) for item in items if item.get("id")]
-            slugs = [item["slug"] for item in items]
-            if len(ids) != len(set(ids)):
-                raise serializers.ValidationError({key: "id 不能重复"})
-            if len(slugs) != len(set(slugs)):
-                raise serializers.ValidationError({key: "slug 不能重复"})
-        characters = attrs.get("characters")
-        if characters is not None:
-            speaker_ids = [item["stable_speaker_id"] for item in characters]
-            if len(speaker_ids) != len(set(speaker_ids)):
-                raise serializers.ValidationError({"characters": "stable_speaker_id 不能重复"})
-        normalized_names: dict[str, str] = {}
-        for key in ("characters", "scenes", "props"):
-            for item in attrs.get(key, []):
-                normalized = unicodedata.normalize(
-                    "NFKC", str(item.get("name") or ""),
-                ).strip().casefold()
-                previous = normalized_names.get(normalized)
-                if normalized and previous is not None:
-                    raise serializers.ValidationError({
-                        key: (
-                            f"名称“{item['name']}”与 {previous} 重复；"
-                            "项目内人物、场景和道具名称必须唯一。"
-                        ),
-                    })
-                if normalized:
-                    normalized_names[normalized] = f"{key}/{item['name']}"
-        return attrs
 
 
 class PromptArtifactSerializer(serializers.ModelSerializer):
@@ -1423,47 +1445,6 @@ class DurationOverrideSerializer(serializers.Serializer):
     duration_ms = serializers.IntegerField(min_value=100)
 
 
-class PromptGenerateSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    episode_id = serializers.UUIDField(required=False)
-    shot_ids = serializers.ListField(child=serializers.UUIDField(), required=False, allow_empty=False)
-    prompt_type = serializers.ChoiceField(choices=PromptArtifact.PromptType.choices, default=PromptArtifact.PromptType.VIDEO)
-    h3_mode = serializers.ChoiceField(
-        choices=Shot.H3Mode.choices, default=Shot.H3Mode.T2VA,
-        help_text=(
-            "用户工作流为 T2VA、FL2VA（首尾帧槽位可为 0/1/2）和 Ref2VA；"
-            "I2VA/L2VA 是首尾帧工作流按显式槽位得到的有效模式及历史兼容值。"
-        ),
-    )
-    multi_shot = serializers.BooleanField(default=False)
-    include_audio = serializers.BooleanField(default=True)
-    total_duration_ms = serializers.IntegerField(min_value=100, required=False)
-    shot_durations = DurationOverrideSerializer(many=True, required=False, default=list)
-    overall_soundscape = serializers.CharField(required=False, allow_blank=True, default="")
-    non_diegetic_music = serializers.CharField(required=False, allow_blank=True, default="")
-    extra_direction = serializers.CharField(required=False, allow_blank=True, default="")
-    reference_bindings = H3ReferenceBindingsJSONField(required=False)
-    reference_asset_ids = serializers.ListField(
-        child=serializers.UUIDField(), required=False, allow_empty=True,
-    )
-
-    def validate(self, attrs):
-        if not attrs.get("episode_id") and not attrs.get("shot_ids"):
-            raise serializers.ValidationError("episode_id 和 shot_ids 至少提供一个")
-        if attrs["prompt_type"] == PromptArtifact.PromptType.IMAGE and attrs["multi_shot"]:
-            raise serializers.ValidationError("图片提示词不支持 multi_shot")
-        ids = [str(item) for item in attrs.get("shot_ids", [])]
-        if len(ids) != len(set(ids)):
-            raise serializers.ValidationError("shot_ids 不能重复")
-        override_ids = [str(item["shot_id"]) for item in attrs.get("shot_durations", [])]
-        if len(override_ids) != len(set(override_ids)):
-            raise serializers.ValidationError("shot_durations 中 shot_id 不能重复")
-        reference_asset_ids = [str(value) for value in attrs.get("reference_asset_ids", [])]
-        if len(reference_asset_ids) != len(set(reference_asset_ids)):
-            raise serializers.ValidationError("reference_asset_ids 不能重复")
-        if "reference_bindings" in attrs and not isinstance(attrs["reference_bindings"], dict):
-            raise serializers.ValidationError({"reference_bindings": "必须是 JSON 对象"})
-        return attrs
 
 
 class WorkflowTemplateSerializer(serializers.ModelSerializer):
@@ -1480,36 +1461,6 @@ class WorkflowTemplateSerializer(serializers.ModelSerializer):
         return value
 
 
-class ProductionWorkflowTemplateSerializer(serializers.ModelSerializer):
-    """Path-free, non-executable template metadata for production selectors."""
-
-    class Meta:
-        model = WorkflowTemplate
-        fields = (
-            "id", "name", "slug", "version", "output_kind", "description",
-            "input_schema", "is_system", "is_active",
-        )
-        read_only_fields = fields
-
-    def to_representation(self, instance):
-        representation = super().to_representation(instance)
-        schema = instance.input_schema if isinstance(instance.input_schema, dict) else {}
-        representation["input_schema"] = {
-            key: schema[key]
-            for key in (
-                "h3_modes", "is_default", "maturity", "user_parameters",
-                "model_profile", "source_workflow", "required_custom_nodes",
-            )
-            if key in schema
-        }
-        source_workflow = representation["input_schema"].get("source_workflow")
-        if isinstance(source_workflow, str):
-            representation["input_schema"]["source_workflow"] = min(
-                PurePosixPath(source_workflow).name,
-                PureWindowsPath(source_workflow).name,
-                key=len,
-            )
-        return representation
 
 
 class GeneratedWorkflowSerializer(serializers.ModelSerializer):
@@ -1519,15 +1470,6 @@ class GeneratedWorkflowSerializer(serializers.ModelSerializer):
         read_only_fields = tuple(field.name for field in GeneratedWorkflow._meta.fields)
 
 
-class WorkflowGenerateSerializer(serializers.Serializer):
-    prompt_artifact_id = serializers.UUIDField()
-    template_id = serializers.UUIDField()
-    overrides = serializers.JSONField(required=False, default=dict)
-
-    def validate_overrides(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("overrides must be a JSON object")
-        return value
 
 
 class GenerationTaskTimelineEventSerializer(serializers.Serializer):
@@ -1787,7 +1729,7 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = GenerationTask
-        exclude = ("capability_snapshot",)
+        exclude = ("capability_snapshot", "progress_marker")
         read_only_fields = (
             "id", "owner", "project", "episode", "kind", "status", "progress", "attempts",
             "comfy_prompt_id", "client_id", "outputs", "error_message", "queued_at", "started_at",
@@ -1798,6 +1740,8 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
             "heartbeat_at", "stalled_at", "remote_state", "remote_error",
             "progress_source", "comfy_progress", "progress_node_id", "progress_updated_at",
             "progress_telemetry_state", "progress_telemetry_error",
+            "deadline_started_at", "hard_deadline_at", "idle_deadline_at",
+            "last_meaningful_progress_at",
         )
 
     @staticmethod
@@ -2343,7 +2287,7 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         last_activity = obj.heartbeat_at or obj.updated_at or obj.started_at
         if last_activity is None:
             return False
-        threshold = float(getattr(settings, "TASK_STALL_THRESHOLD_SECONDS", 30))
+        threshold = float(_asset_runtime_limits()["runtime.task_stall_threshold_seconds"])
         return (timezone.now() - last_activity).total_seconds() > threshold
 
     def get_can_retry(self, obj) -> bool:
@@ -2397,6 +2341,9 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
                 preview_url = reverse("signed-media", kwargs={"token": token})
                 provenance = item.get("provenance") if isinstance(item, dict) else None
                 distribution = item.get("distribution") if isinstance(item, dict) else None
+                observed_media = (
+                    item.get("observed_media") if isinstance(item, dict) else None
+                )
                 provenance_url = ""
                 if (
                     isinstance(provenance, dict)
@@ -2458,6 +2405,9 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
                         self._task_public_text(provenance.get("manifest_sha256"))
                         if isinstance(provenance, dict) else ""
                     ),
+                    "observed_media": (
+                        observed_media if isinstance(observed_media, dict) else {}
+                    ),
                     "distribution_status": (
                         self._task_public_text(distribution.get("status"))
                         if isinstance(distribution, dict) else "not_prepared"
@@ -2483,14 +2433,9 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
                         self._task_public_text(distribution.get("version"))
                         if isinstance(distribution, dict) else ""
                     ),
-                    "publish_url": reverse("task-publish-output", kwargs={"pk": obj.id}),
                     "promoted_asset_id": (
                         self._task_public_text(item.get("promoted_asset_id"))
                         if kind == "image" and isinstance(item, dict) else ""
-                    ),
-                    "promote_to_asset_url": (
-                        reverse("task-promote-output-to-asset", kwargs={"pk": obj.id})
-                        if kind == "image" else ""
                     ),
                 })
         media.extend(self._derived_frame_output_media(obj, len(media)))
@@ -2543,9 +2488,7 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
                 "public_manifest_sha256": "",
                 "public_label": public_label,
                 "public_version": "deferred-frame-v1",
-                "publish_url": "",
                 "promoted_asset_id": str(asset.id),
-                "promote_to_asset_url": "",
             })
         return result
 
@@ -2850,73 +2793,12 @@ class ComfyUIWorkflowExportSerializer(serializers.Serializer):
     ui_download_url = serializers.URLField(read_only=True)
 
 
-class ComfyUIWorkflowSyncSerializer(serializers.Serializer):
-    """Result of explicitly saving a task canvas to ComfyUI user data."""
-
-    task_id = serializers.UUIDField(read_only=True)
-    generated_workflow_id = serializers.UUIDField(read_only=True)
-    synced = serializers.BooleanField(read_only=True)
-    workflow_path = serializers.CharField(read_only=True)
-    filename = serializers.CharField(read_only=True)
-    comfyui_url = serializers.URLField(read_only=True)
-    open_reason = serializers.CharField(read_only=True)
 
 
-class TaskOutputPromoteSerializer(serializers.Serializer):
-    output_index = serializers.IntegerField(min_value=0)
-    name = serializers.CharField(max_length=160, required=False, allow_blank=True)
-    accept_stale_bible_image_candidate = serializers.BooleanField(
-        required=False,
-        default=False,
-    )
-    reference_category = serializers.ChoiceField(
-        choices=(Asset.Kind.CHARACTER, Asset.Kind.SCENE, Asset.Kind.PROP),
-        required=False,
-        allow_null=True,
-        default=None,
-    )
-    entity_id = serializers.UUIDField(required=False, allow_null=True, default=None)
-
-    def to_internal_value(self, data):
-        if not isinstance(data, dict):
-            raise serializers.ValidationError("请求体必须是 JSON 对象。")
-        unknown = sorted(set(data) - set(self.fields))
-        if unknown:
-            raise serializers.ValidationError({
-                key: "不支持的字段。" for key in unknown
-            })
-        return super().to_internal_value(data)
-
-    def validate(self, attrs):
-        category = attrs.get("reference_category")
-        entity_id = attrs.get("entity_id")
-        if bool(category) != bool(entity_id):
-            raise serializers.ValidationError({
-                "reference_category": "分类参考必须同时选择人物、场景或道具实体",
-                "entity_id": "分类参考必须同时选择人物、场景或道具实体",
-            })
-        return attrs
 
 
-class TaskOutputPromoteRequestSchemaExtension(OpenApiSerializerExtension):
-    target_class = TaskOutputPromoteSerializer
-
-    def map_serializer(self, auto_schema, direction):
-        schema = auto_schema._map_serializer(
-            self.target, direction, bypass_extensions=True,
-        )
-        schema["additionalProperties"] = False
-        return schema
 
 
-class GenerationTaskCreateSerializer(serializers.Serializer):
-    generated_workflow_id = serializers.UUIDField()
-    priority = serializers.IntegerField(min_value=-100, max_value=100, default=0)
-    max_attempts = serializers.IntegerField(min_value=1, max_value=10, default=3)
-    extended_generation_confirmed = serializers.BooleanField(
-        default=False,
-        help_text="当前队列超过推荐值时的显式继续确认；不会提高 worker 并发。",
-    )
 
 
 class GenerationTaskRetrySerializer(serializers.Serializer):
@@ -2926,42 +2808,12 @@ class GenerationTaskRetrySerializer(serializers.Serializer):
     )
 
 
-class ProductionBatchResumeSkippedTaskSerializer(serializers.Serializer):
-    task_id = serializers.UUIDField()
-    batch_index = serializers.IntegerField(min_value=0, required=False, allow_null=True)
-    status = serializers.CharField()
-    reason = serializers.CharField()
 
 
-class ProductionBatchResumeResponseSerializer(serializers.Serializer):
-    batch_id = serializers.CharField()
-    batch_kind = serializers.CharField(required=False, allow_blank=True)
-    scanned_task_count = serializers.IntegerField(min_value=0)
-    retried_task_ids = serializers.ListField(child=serializers.UUIDField())
-    skipped = ProductionBatchResumeSkippedTaskSerializer(many=True)
-    tasks = GenerationTaskSerializer(many=True)
 
 
-class ProductionBatchCancelResponseSerializer(serializers.Serializer):
-    batch_id = serializers.CharField()
-    batch_kind = serializers.CharField(required=False, allow_blank=True)
-    scanned_task_count = serializers.IntegerField(min_value=0)
-    cancelled_task_ids = serializers.ListField(child=serializers.UUIDField())
-    cancel_requested_task_ids = serializers.ListField(child=serializers.UUIDField())
-    skipped = ProductionBatchResumeSkippedTaskSerializer(many=True)
-    downstream_cancellations = serializers.DictField()
-    tasks = GenerationTaskSerializer(many=True)
 
 
-class ProductionBatchDeleteResponseSerializer(serializers.Serializer):
-    batch_id = serializers.CharField()
-    batch_kind = serializers.CharField(required=False, allow_blank=True)
-    scanned_task_count = serializers.IntegerField(min_value=0)
-    deleted_task_ids = serializers.ListField(child=serializers.UUIDField())
-    deleted_deferred_generation_request_ids = serializers.ListField(
-        child=serializers.UUIDField(),
-        required=False,
-    )
 
 
 class NextEpisodeSerializer(serializers.Serializer):
@@ -2970,62 +2822,12 @@ class NextEpisodeSerializer(serializers.Serializer):
     script = serializers.CharField(required=False, allow_blank=True, default="")
 
 
-class ProductionWorkflowSelectionSerializer(serializers.Serializer):
-    output_kind = serializers.CharField(help_text="当前固定为 video")
-    h3_mode = serializers.ChoiceField(choices=Shot.H3Mode.choices)
-    template_id = serializers.UUIDField()
-    parameters = serializers.DictField(
-        child=serializers.FloatField(), required=False, default=dict,
-    )
 
 
-@extend_schema_field(ProductionWorkflowSelectionSerializer(many=True))
-class ProductionWorkflowSelectionsField(serializers.JSONField):
-    pass
 
 
-class ProductionBuildCountsSerializer(serializers.Serializer):
-    prompts = serializers.IntegerField(min_value=0)
-    workflows = serializers.IntegerField(min_value=0)
-    tasks = serializers.IntegerField(min_value=0)
-    deferred_generation_requests = serializers.IntegerField(min_value=0, required=False)
 
 
-class ProductionBuildResponseSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    whole_episode = serializers.BooleanField(required=False)
-    shot_version_key = serializers.CharField(required=False, allow_blank=True)
-    shot_version_label = serializers.CharField(required=False, allow_blank=True)
-    batch_shot_ids = serializers.ListField(
-        child=serializers.UUIDField(), required=False,
-    )
-    episode_ids = serializers.ListField(child=serializers.UUIDField())
-    episode_number = serializers.IntegerField(min_value=1, required=False, allow_null=True)
-    episode_title = serializers.CharField(required=False, allow_blank=True)
-    prompt_artifact_ids = serializers.ListField(child=serializers.UUIDField())
-    workflow_ids = serializers.ListField(child=serializers.UUIDField())
-    task_ids = serializers.ListField(child=serializers.UUIDField())
-    deferred_generation_request_ids = serializers.ListField(
-        child=serializers.UUIDField(),
-        required=False,
-    )
-    batch_id = serializers.UUIDField(required=False, allow_null=True)
-    batch_kind = serializers.ChoiceField(
-        choices=("episode", "selection", "series"),
-        required=False,
-        allow_null=True,
-    )
-    batch_size = serializers.IntegerField(min_value=0)
-    extended_generation_confirmed = serializers.BooleanField(required=False)
-    idempotency_key = serializers.CharField(required=False, allow_blank=True)
-    idempotent_replay = serializers.BooleanField(required=False)
-    counts = ProductionBuildCountsSerializer()
-    production_units = serializers.ListField(child=serializers.DictField())
-    batch_slots = GenerationTaskBatchSlotSerializer(many=True, required=False)
-    tasks = serializers.ListField(child=serializers.DictField(), required=False)
-    prompt_language_gate = serializers.ListField(
-        child=serializers.DictField(), required=False,
-    )
 
 
 class ProductionQueueConfirmationErrorDetailsSerializer(serializers.Serializer):
@@ -3048,331 +2850,28 @@ class ProductionQueueConfirmationErrorResponseSerializer(serializers.Serializer)
     error = ProductionQueueConfirmationErrorEnvelopeSerializer()
 
 
-class ProductionIdempotencyConflictErrorDetailsSerializer(serializers.Serializer):
-    detail = serializers.CharField()
-    idempotency_key = serializers.CharField()
 
 
-class ProductionIdempotencyConflictErrorEnvelopeSerializer(serializers.Serializer):
-    status_code = serializers.IntegerField()
-    code = serializers.ChoiceField(choices=("production_idempotency_conflict",))
-    details = ProductionIdempotencyConflictErrorDetailsSerializer()
 
 
-class ProductionIdempotencyConflictErrorResponseSerializer(serializers.Serializer):
-    error = ProductionIdempotencyConflictErrorEnvelopeSerializer()
 
 
-class ProductionBuildSerializer(serializers.Serializer):
-    template_id = serializers.UUIDField(required=False, allow_null=True, default=None)
-    workflow_selections = ProductionWorkflowSelectionsField(
-        required=False, default=list,
-    )
-    episode_ids = serializers.ListField(
-        child=serializers.UUIDField(), required=False, allow_empty=True, default=list,
-    )
-    shot_ids = serializers.ListField(
-        child=serializers.UUIDField(), required=False, allow_empty=True, default=list,
-    )
-    multi_shot = serializers.BooleanField(default=True)
-    # Retained for backward-compatible clients. Production now always respects
-    # each Shot's own include_audio and h3_mode values.
-    include_audio = serializers.BooleanField(
-        default=True, help_text="兼容旧客户端；生产任务实际使用每个已保存 Shot 的 include_audio。",
-    )
-    h3_mode = serializers.ChoiceField(
-        choices=Shot.H3Mode.choices, default=Shot.H3Mode.T2VA,
-        help_text="兼容旧客户端；生产任务实际使用每个已保存 Shot 的 h3_mode。",
-    )
-    enqueue = serializers.BooleanField(default=True)
-    whole_episode = serializers.BooleanField(default=False)
-    shot_version_key = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        default="",
-        max_length=191,
-        trim_whitespace=True,
-        help_text=(
-            "whole_episode=true 时必填；服务端只为该分镜版本冻结并创建整集任务，"
-            "不会合并同一剧集的其他历史分镜版本。"
-        ),
-    )
-    extended_generation_confirmed = serializers.BooleanField(
-        default=False,
-        help_text=(
-            "超过当前任务队列推荐阈值时的显式确认。确认只允许继续排队，"
-            "不会提高 worker 并发，也不会改变单镜生成参数。"
-        ),
-    )
-    idempotency_key = serializers.CharField(
-        required=False, allow_blank=True, default="", max_length=120, trim_whitespace=True,
-        help_text=(
-            "排队生成多个生产任务时必填；相同键与相同请求会安全重放，"
-            "不同请求会返回 409 冲突。单任务可省略。"
-        ),
-    )
-    priority = serializers.IntegerField(min_value=-100, max_value=100, default=0)
-    max_attempts = serializers.IntegerField(min_value=1, max_value=10, default=3)
-    resolution_profile = serializers.ChoiceField(
-        choices=[(value, value) for value in H3_RESOLUTION_PROFILES], default="project",
-    )
-    resolution_multiple = serializers.IntegerField(
-        min_value=H3_RESOLUTION_MULTIPLE_MIN,
-        max_value=H3_RESOLUTION_MULTIPLE_MAX,
-        default=H3_RESOLUTION_MULTIPLE_DEFAULT,
-        help_text="ComfyUI 官方 ResolutionSelector 倍数，范围 8–128，且必须为 4 的倍数。",
-    )
-    image_resolution_profile = serializers.ChoiceField(
-        choices=[(value, value) for value in H3_RESOLUTION_PROFILES],
-        required=False,
-        default="0.98",
-        help_text=(
-            "图片任务独立使用的分辨率档位；默认 0.98 MP 以匹配 SDXL 的高分辨率工作区，"
-            "不会被视频烟测档位 0.1/0.2/0.3 降质。"
-        ),
-    )
-    image_resolution_multiple = serializers.IntegerField(
-        min_value=H3_RESOLUTION_MULTIPLE_MIN,
-        max_value=H3_RESOLUTION_MULTIPLE_MAX,
-        required=False,
-        allow_null=True,
-        default=None,
-        help_text="图片尺寸取整倍数，范围 8–128 且必须为 8 的倍数；不填写时默认 32。",
-    )
-    workflow_overrides = serializers.JSONField(required=False, default=dict)
-    def validate_episode_ids(self, value):
-        if len(value) != len(set(value)):
-            raise serializers.ValidationError("episode_ids 不能重复")
-        return value
-
-    def validate_shot_ids(self, value):
-        if len(value) != len(set(value)):
-            raise serializers.ValidationError("shot_ids 不能重复")
-        return value
-
-    def validate_workflow_overrides(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("workflow_overrides must be a JSON object")
-        return value
-
-    def validate_workflow_selections(self, value):
-        if not isinstance(value, list):
-            raise serializers.ValidationError("workflow_selections 必须是数组")
-        if len(value) > len(Shot.H3Mode.values):
-            raise serializers.ValidationError("workflow_selections 数量超出 H3 模式上限")
-        normalized = []
-        seen = set()
-        allowed_modes = set(Shot.H3Mode.values)
-        for index, item in enumerate(value):
-            if not isinstance(item, dict):
-                raise serializers.ValidationError(f"第 {index + 1} 项必须是对象")
-            unknown = set(item) - {"output_kind", "h3_mode", "template_id", "parameters"}
-            if unknown:
-                raise serializers.ValidationError(
-                    f"第 {index + 1} 项包含不支持字段: {', '.join(sorted(unknown))}"
-                )
-            output_kind = item.get("output_kind")
-            mode = item.get("h3_mode")
-            if output_kind != WorkflowTemplate.OutputKind.VIDEO:
-                raise serializers.ValidationError("当前仅支持按 H3 模式选择视频工作流")
-            if mode not in allowed_modes:
-                raise serializers.ValidationError(f"不支持的 H3 模式: {mode!r}")
-            try:
-                template_id = UUID(str(item.get("template_id")))
-            except (TypeError, ValueError, AttributeError):
-                raise serializers.ValidationError(f"第 {index + 1} 项 template_id 无效")
-            parameters = item.get("parameters", {})
-            if not isinstance(parameters, dict):
-                raise serializers.ValidationError(f"第 {index + 1} 项 parameters 必须是对象")
-            if any(not isinstance(key, str) for key in parameters):
-                raise serializers.ValidationError("工作流参数名必须是字符串")
-            match_key = (output_kind, mode)
-            if match_key in seen:
-                raise serializers.ValidationError(f"{output_kind}/{mode} 只能选择一个工作流")
-            seen.add(match_key)
-            normalized.append({
-                "output_kind": output_kind,
-                "h3_mode": mode,
-                "template_id": template_id,
-                "parameters": parameters,
-            })
-        return normalized
-
-    def validate_resolution_multiple(self, value):
-        try:
-            return validate_h3_resolution_multiple(value)
-        except ResolutionProfileError as exc:
-            raise serializers.ValidationError(str(exc)) from exc
-
-    def validate(self, attrs):
-        profile = attrs.get("resolution_profile", "project")
-        image_profile = attrs.get("image_resolution_profile", "0.98")
-        image_multiple = attrs.get("image_resolution_multiple")
-        if image_multiple is None:
-            image_multiple = H3_RESOLUTION_MULTIPLE_DEFAULT
-        try:
-            attrs["image_resolution_multiple"] = validate_image_resolution_multiple(
-                image_multiple,
-            )
-        except ResolutionProfileError as exc:
-            raise serializers.ValidationError({
-                "image_resolution_multiple": str(exc),
-            }) from exc
-        overrides = attrs.get("workflow_overrides", {})
-        if attrs.get("template_id") and attrs.get("workflow_selections"):
-            raise serializers.ValidationError({
-                "workflow_selections": (
-                    "旧版 template_id 与按模式 workflow_selections 不能同时使用"
-                ),
-            })
-        controlled_override_keys = {"RESOLUTION_PROFILE", "RESOLUTION_MULTIPLE"} & set(overrides)
-        if controlled_override_keys:
-            raise serializers.ValidationError({
-                "workflow_overrides": (
-                    "RESOLUTION_PROFILE/RESOLUTION_MULTIPLE must be supplied through their "
-                    "top-level controlled fields"
-                ),
-            })
-        if (
-            profile != "project" or image_profile != "project"
-        ) and ({"WIDTH", "HEIGHT"} & set(overrides)):
-            raise serializers.ValidationError({
-                "workflow_overrides": (
-                    "WIDTH/HEIGHT cannot be supplied together with a controlled video or image "
-                    "resolution profile; select project for both profiles to use custom dimensions"
-                ),
-            })
-        if attrs.get("whole_episode"):
-            if len(attrs.get("episode_ids", [])) != 1:
-                raise serializers.ValidationError({
-                    "episode_ids": "whole_episode=true 时必须且只能选择一个剧集",
-                })
-            if attrs.get("shot_ids"):
-                raise serializers.ValidationError({
-                    "shot_ids": "whole_episode=true 时会选择指定分镜版本的完整镜头，不能再传 shot_ids",
-                })
-            if not attrs.get("shot_version_key"):
-                raise serializers.ValidationError({
-                    "shot_version_key": "整集生成必须明确选择一个分镜版本",
-                })
-            if not attrs.get("enqueue", True):
-                raise serializers.ValidationError({
-                    "enqueue": "whole_episode=true 会创建可独立追踪的分镜任务，enqueue 必须为 true",
-                })
-            if not attrs.get("idempotency_key"):
-                raise serializers.ValidationError({
-                    "idempotency_key": "整集生成必须提供非空 idempotency_key",
-                })
-            # A whole-episode request is always independently retryable per
-            # shot, even if an older client still sends multi_shot=true.
-            attrs["multi_shot"] = False
-        else:
-            if attrs.get("shot_version_key"):
-                raise serializers.ValidationError({
-                    "shot_version_key": "shot_version_key 只用于 whole_episode=true 的整集生产",
-                })
-            if attrs.get("idempotency_key") and not attrs.get("enqueue", True):
-                raise serializers.ValidationError({
-                    "enqueue": (
-                        "提供 idempotency_key 时必须创建可追踪的生产任务，enqueue 必须为 true"
-                    ),
-                })
-        return attrs
 
 
-class ScriptBreakdownSerializer(serializers.Serializer):
-    script = serializers.CharField(
-        required=False,
-        allow_blank=True,
-        default="",
-        max_length=settings.SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS,
-        trim_whitespace=False,
-    )
-    # This is a business target, not a model/runtime batch size. The actual
-    # number remains bounded naturally by explicit headings or source blocks.
-    episode_count_hint = serializers.IntegerField(min_value=1, default=1)
-    default_shot_duration_ms = serializers.IntegerField(
-        min_value=VIDEO_SHOT_MIN_DURATION_MS,
-        max_value=VIDEO_SHOT_MAX_DURATION_MS,
-        default=settings.SCRIPT_BREAKDOWN_DEFAULT_SHOT_DURATION_MS,
-    )
-    default_first_frame_continuity = serializers.BooleanField(
-        default=settings.SCRIPT_BREAKDOWN_DEFAULT_FIRST_FRAME_CONTINUITY,
-    )
-    default_last_frame_continuity = serializers.BooleanField(
-        default=settings.SCRIPT_BREAKDOWN_DEFAULT_LAST_FRAME_CONTINUITY,
-    )
-    multi_shot = serializers.BooleanField(default=True)
-    include_audio = serializers.BooleanField(default=True)
-    replace_existing = serializers.BooleanField(default=False)
-    discard_existing_production = serializers.BooleanField(default=False)
-    continue_without_script_bible = serializers.BooleanField(default=False)
-
-    def validate(self, attrs):
-        if attrs["discard_existing_production"] and not attrs["replace_existing"]:
-            raise serializers.ValidationError({
-                "discard_existing_production": "只有重建现有剧集时才能清理旧生产数据。",
-            })
-        return attrs
 
 
-class ScriptBreakdownCountsSerializer(serializers.Serializer):
-    episodes = serializers.IntegerField(min_value=0)
-    shots = serializers.IntegerField(min_value=0)
 
 
-class ScriptBreakdownClearedSerializer(serializers.Serializer):
-    episodes = serializers.IntegerField(min_value=0)
-    shots = serializers.IntegerField(min_value=0)
-    generation_tasks = serializers.IntegerField(min_value=0)
-    assembly_jobs = serializers.IntegerField(min_value=0)
-    prompt_artifacts = serializers.IntegerField(min_value=0)
-    generated_workflows = serializers.IntegerField(min_value=0)
-    creative_drafts = serializers.IntegerField(min_value=0)
-    shot_detail_drafts = serializers.IntegerField(min_value=0)
-    shot_detail_batches = serializers.IntegerField(min_value=0)
-    shot_detail_batch_items = serializers.IntegerField(min_value=0)
-    prompt_field_translations = serializers.IntegerField(min_value=0)
-    draft_release_bundles = serializers.IntegerField(min_value=0)
-    physical_outputs_retained = serializers.BooleanField()
 
 
-class ScriptBreakdownEpisodeResultSerializer(serializers.Serializer):
-    episode = EpisodeSerializer()
-    shots = ShotSerializer(many=True)
 
 
-class ScriptBreakdownResponseSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    method = serializers.CharField()
-    warnings = serializers.ListField(child=serializers.CharField())
-    episodes = ScriptBreakdownEpisodeResultSerializer(many=True)
-    counts = ScriptBreakdownCountsSerializer()
-    cleared = ScriptBreakdownClearedSerializer()
 
 
-class ScriptRebuildConflictDetailsSerializer(serializers.Serializer):
-    detail = serializers.CharField()
-    active_generation_tasks = serializers.IntegerField(required=False, min_value=0)
-    unresolved_remote_tasks = serializers.IntegerField(required=False, min_value=0)
-    active_assembly_jobs = serializers.IntegerField(required=False, min_value=0)
-    active_shot_detail_batches = serializers.IntegerField(required=False, min_value=0)
-    active_shot_detail_items = serializers.IntegerField(required=False, min_value=0)
-    protected_release_bundles = serializers.IntegerField(required=False, min_value=0)
-    clearable = ScriptBreakdownClearedSerializer(required=False)
 
 
-class ScriptRebuildConflictSerializer(serializers.Serializer):
-    status_code = serializers.IntegerField()
-    code = serializers.ChoiceField(choices=(
-        "script_rebuild_confirmation_required",
-        "script_rebuild_blocked",
-    ))
-    details = ScriptRebuildConflictDetailsSerializer()
 
 
-class ScriptRebuildConflictResponseSerializer(serializers.Serializer):
-    error = ScriptRebuildConflictSerializer()
 
 
 class APIValidationErrorSerializer(serializers.Serializer):
@@ -3477,37 +2976,12 @@ class ScriptBibleReviewedSelectionSerializer(StrictSerializer):
         return value
 
 
-class ScriptBibleApplyRequestSerializer(StrictSerializer):
-    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
-    selections = ScriptBibleReviewedSelectionSerializer(many=True, allow_empty=False)
-
-    def validate_selections(self, value):
-        candidate_ids = [item["candidate_id"] for item in value]
-        if len(candidate_ids) != len(set(candidate_ids)):
-            raise serializers.ValidationError("candidate_id 不能重复。")
-        return value
 
 
-class ScriptBibleApplyCountsSerializer(serializers.Serializer):
-    requested = serializers.IntegerField(min_value=1)
-    created = serializers.IntegerField(min_value=0)
-    already_exists = serializers.IntegerField(min_value=0)
 
 
-class ScriptBibleApplyCollectionsSerializer(serializers.Serializer):
-    characters = CharacterBibleSerializer(many=True)
-    scenes = SceneBibleSerializer(many=True)
-    props = PropBibleSerializer(many=True)
 
 
-class ScriptBibleApplyResponseSerializer(serializers.Serializer):
-    schema_version = serializers.IntegerField(min_value=1, max_value=1)
-    project_id = serializers.UUIDField()
-    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
-    updated_at = serializers.DateTimeField()
-    created = ScriptBibleApplyCollectionsSerializer()
-    already_exists = ScriptBibleApplyCollectionsSerializer()
-    counts = ScriptBibleApplyCountsSerializer()
 
 
 class ScriptBibleErrorDetailsSerializer(serializers.Serializer):
@@ -3531,40 +3005,6 @@ class ScriptBibleErrorSerializer(serializers.Serializer):
 
 class ScriptBibleErrorEnvelopeSerializer(serializers.Serializer):
     error = ScriptBibleErrorSerializer()
-
-
-_CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
-_ENGLISH_DIRECTOR_FORBIDDEN_RE = re.compile(
-    r"[\u3040-\u30ff\u31f0-\u31ff\uac00-\ud7af\u0400-\u052f"
-    r"\u200b-\u200f\u202a-\u202e\u2060\ufeff]"
-)
-
-
-def _english_director_text(value: str) -> str:
-    value = str(value or "")
-    if (
-        _CJK_RE.search(value)
-        or _ENGLISH_DIRECTOR_FORBIDDEN_RE.search(value)
-        or any(
-            (character.isalpha() and "LATIN" not in unicodedata.name(character, ""))
-            or (
-                character not in "\n\r\t"
-                and unicodedata.category(character) in {"Cc", "Cf"}
-            )
-            for character in value
-        )
-    ):
-        raise serializers.ValidationError(
-            "英文导演字段只能包含安全的拉丁英文文字，"
-            "不能含中文、日文、韩文、西里尔文或不可见控制字符"
-        )
-    return value
-
-
-def _chinese_detail_text(value: str) -> str:
-    if not _CJK_RE.search(str(value or "")):
-        raise serializers.ValidationError("高细节中文草稿必须包含中文正文")
-    return value
 
 
 class CreativeDialogueDraftSerializer(StrictSerializer):
@@ -3781,70 +3221,17 @@ class CreativeDraftApplySerializer(StrictSerializer):
 
 
 class EpisodeCreativeDraftSerializer(serializers.ModelSerializer):
-    context_current = serializers.SerializerMethodField()
-    can_edit = serializers.SerializerMethodField()
-    can_regenerate = serializers.SerializerMethodField()
-    can_confirm = serializers.SerializerMethodField()
-    can_apply = serializers.SerializerMethodField()
-
     class Meta:
         model = EpisodeCreativeDraft
         fields = (
             "id", "project", "episode", "status", "revision", "generation_no",
-            "parent_draft", "context_hash", "context_current", "input_settings",
+            "parent_draft", "context_hash", "input_settings",
             "creativity", "variation_note", "draft_data", "validation", "warnings",
             "error_message", "provider", "model", "runtime_metadata",
             "revision_history", "confirmed_by", "confirmed_at", "applied_by",
-            "applied_at", "applied_shot_ids", "can_edit", "can_regenerate",
-            "can_confirm", "can_apply", "created_at", "updated_at",
+            "applied_at", "applied_shot_ids", "created_at", "updated_at",
         )
         read_only_fields = fields
-
-    def get_context_current(self, obj) -> bool:
-        from studio.services.creative_drafts import creative_context_hash
-
-        return obj.context_hash == creative_context_hash(obj.project, obj.episode)
-
-    def get_can_edit(self, obj) -> bool:
-        return obj.status in {
-            EpisodeCreativeDraft.Status.DRAFT,
-            EpisodeCreativeDraft.Status.FAILED,
-        }
-
-    def get_can_regenerate(self, obj) -> bool:
-        return obj.status in {
-            EpisodeCreativeDraft.Status.DRAFT,
-            EpisodeCreativeDraft.Status.CONFIRMED,
-            EpisodeCreativeDraft.Status.FAILED,
-        }
-
-    def get_can_confirm(self, obj) -> bool:
-        return bool(
-            obj.status == EpisodeCreativeDraft.Status.DRAFT
-            and (obj.validation or {}).get("status") in {
-                "passed", "ready", "needs_review",
-            }
-            and self.get_context_current(obj)
-        )
-
-    def get_can_apply(self, obj) -> bool:
-        review_issues = (obj.validation or {}).get("review_issues", [])
-        requires_edit = bool(
-            isinstance(review_issues, list)
-            and any(
-                isinstance(item, dict) and item.get("severity") == "requires_edit"
-                for item in review_issues
-            )
-        )
-        return bool(
-            obj.status == EpisodeCreativeDraft.Status.CONFIRMED
-            and (obj.validation or {}).get("status") in {
-                "passed", "ready", "needs_review",
-            }
-            and not requires_edit
-            and self.get_context_current(obj)
-        )
-
 
 class ShotDetailDraftDataSerializer(StrictSerializer):
     schema_version = serializers.IntegerField(min_value=1, max_value=1)
@@ -3906,116 +3293,23 @@ class ShotDetailDraftApplySerializer(StrictSerializer):
         return attrs
 
 
-class ShotDetailDraftBatchCreateSerializer(StrictSerializer):
-    episode_id = serializers.UUIDField()
-    shot_version_key = serializers.CharField(min_length=1, max_length=191)
-    request_id = serializers.UUIDField()
-    provider = serializers.ChoiceField(
-        choices=MODEL_PROVIDER_CHOICES,
-        default=settings.PROMPT_CREATIVE_DEFAULT_PROVIDER,
-    )
-    variation_note = serializers.CharField(
-        max_length=2_000, required=False, allow_blank=True,
-        default="", trim_whitespace=False,
-    )
-    confirmation_acknowledged = serializers.BooleanField(default=False)
 
 
-class ShotDetailDraftBatchApplyItemSerializer(StrictSerializer):
-    item_id = serializers.UUIDField()
-    draft_id = serializers.UUIDField()
-    expected_revision = serializers.IntegerField(min_value=1)
 
 
-class ShotDetailDraftBatchApplySerializer(StrictSerializer):
-    expected_batch_revision = serializers.IntegerField(min_value=1)
-    items = ShotDetailDraftBatchApplyItemSerializer(many=True, allow_empty=False)
-    review_acknowledged = serializers.BooleanField(default=False)
-    language_mode = serializers.ChoiceField(
-        choices=("chinese_only", "bilingual_confirmed"),
-        default="bilingual_confirmed",
-    )
-    english_review_acknowledged = serializers.BooleanField(default=False)
-
-    def validate(self, attrs):
-        ids = [str(item["item_id"]) for item in attrs["items"]]
-        if len(ids) != len(set(ids)):
-            raise serializers.ValidationError({"items": "item_id 不能重复"})
-        if (
-            attrs["language_mode"] == "bilingual_confirmed"
-            and not attrs["english_review_acknowledged"]
-        ):
-            raise serializers.ValidationError({
-                "english_review_acknowledged": "应用英文高细节前必须确认已人工审核译文",
-            })
-        return attrs
 
 
 class ShotDetailDraftSerializer(serializers.ModelSerializer):
-    context_current = serializers.SerializerMethodField()
-    can_edit = serializers.SerializerMethodField()
-    can_regenerate = serializers.SerializerMethodField()
-    can_confirm = serializers.SerializerMethodField()
-    can_apply = serializers.SerializerMethodField()
-
     class Meta:
         model = ShotDetailDraft
         fields = (
             "id", "project", "episode", "shot", "status", "revision", "generation_no",
-            "parent_draft", "context_hash", "context_current", "context_snapshot", "input_settings",
+            "parent_draft", "context_hash", "context_snapshot", "input_settings",
             "variation_note", "draft_data", "validation", "warnings", "error_message",
             "provider", "model", "runtime_metadata", "revision_history", "confirmed_by",
-            "confirmed_at", "applied_by", "applied_at", "can_edit", "can_regenerate",
-            "can_confirm", "can_apply", "created_at", "updated_at",
+            "confirmed_at", "applied_by", "applied_at", "created_at", "updated_at",
         )
         read_only_fields = fields
-
-    def get_context_current(self, obj) -> bool:
-        from studio.services.shot_detail_drafts import (
-            shot_detail_context_hash,
-            shot_detail_draft_policy,
-        )
-
-        try:
-            return obj.context_hash == shot_detail_context_hash(
-                obj.project, obj.episode, obj.shot,
-                policy=shot_detail_draft_policy(obj),
-            )
-        except Exception:
-            return False
-
-    def get_can_edit(self, obj) -> bool:
-        return obj.status in {ShotDetailDraft.Status.DRAFT, ShotDetailDraft.Status.FAILED}
-
-    def get_can_regenerate(self, obj) -> bool:
-        return obj.status in {
-            ShotDetailDraft.Status.DRAFT, ShotDetailDraft.Status.CONFIRMED,
-            ShotDetailDraft.Status.FAILED,
-        }
-
-    def get_can_confirm(self, obj) -> bool:
-        return bool(
-            obj.status == ShotDetailDraft.Status.DRAFT
-            and (obj.validation or {}).get("status") in {"passed", "ready", "needs_review"}
-            and self.get_context_current(obj)
-        )
-
-    def get_can_apply(self, obj) -> bool:
-        review_issues = (obj.validation or {}).get("review_issues", [])
-        requires_edit = bool(
-            isinstance(review_issues, list)
-            and any(
-                isinstance(item, dict) and item.get("severity") == "requires_edit"
-                for item in review_issues
-            )
-        )
-        return bool(
-            obj.status == ShotDetailDraft.Status.CONFIRMED
-            and (obj.validation or {}).get("status") in {"passed", "ready", "needs_review"}
-            and not requires_edit
-            and self.get_context_current(obj)
-        )
-
 
 class ShotDetailDraftBatchSerializer(serializers.ModelSerializer):
     class Meta:
@@ -4059,8 +3353,19 @@ class ShotDetailDraftBatchItemSerializer(serializers.ModelSerializer):
 
 
 class PromptFieldTranslationSerializer(serializers.ModelSerializer):
+    runtime_metadata = serializers.SerializerMethodField()
+    revision_history = serializers.SerializerMethodField()
     context_current = serializers.SerializerMethodField()
     promoted_fields = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.DictField())
+    def get_runtime_metadata(self, obj: PromptFieldTranslation) -> dict:
+        return redact_sensitive_bindings(obj.runtime_metadata or {})
+
+    @extend_schema_field(serializers.ListField(child=serializers.DictField()))
+    def get_revision_history(self, obj: PromptFieldTranslation) -> list:
+        value = obj.revision_history if isinstance(obj.revision_history, list) else []
+        return redact_sensitive_bindings(value)
 
     @extend_schema_field(serializers.BooleanField())
     def get_context_current(self, obj: PromptFieldTranslation) -> bool:
@@ -4133,15 +3438,28 @@ class PromptTranslationEntryRequestSerializer(serializers.Serializer):
 
 class PromptTranslationBatchRequestSerializer(serializers.Serializer):
     entries = PromptTranslationEntryRequestSerializer(many=True, allow_empty=False)
-    provider = serializers.ChoiceField(
-        choices=MODEL_PROVIDER_CHOICES, default="local_qwen",
-    )
+    model_deployment_id = serializers.UUIDField()
     source_lang = serializers.ChoiceField(choices=("Chinese",), default="Chinese")
     target_lang = serializers.ChoiceField(choices=("English",), default="English")
 
     def validate_entries(self, entries):
         if len(entries) > 100:
             raise serializers.ValidationError("单次最多翻译 100 个字段")
+        seen = set()
+        for item in entries:
+            key = (item["scope_type"], item.get("scope_id"), item["field_key"])
+            if key in seen:
+                raise serializers.ValidationError("同一批次不能重复提交同一字段")
+            seen.add(key)
+        return entries
+
+
+class PromptTranslationManualBatchRequestSerializer(serializers.Serializer):
+    entries = PromptTranslationEntryRequestSerializer(many=True, allow_empty=False)
+
+    def validate_entries(self, entries):
+        if len(entries) > 100:
+            raise serializers.ValidationError("单次最多创建 100 个手工英文候选")
         seen = set()
         for item in entries:
             key = (item["scope_type"], item.get("scope_id"), item["field_key"])
@@ -4189,7 +3507,7 @@ class CanonicalGlossaryResultEntrySerializer(serializers.Serializer):
     name = serializers.CharField(allow_blank=True)
     canonical_english = serializers.CharField(allow_blank=True)
     status = serializers.ChoiceField(choices=("generated", "reused", "conflict", "failed"))
-    origin = serializers.ChoiceField(choices=("local_qwen", "existing", "source_english", "none"))
+    origin = serializers.ChoiceField(choices=("model", "existing", "source_english", "none"))
     retryable = serializers.BooleanField()
     error_code = serializers.CharField(allow_blank=True)
     message = serializers.CharField(allow_blank=True)
@@ -4225,7 +3543,7 @@ class CanonicalGlossaryVisualTranslationSerializer(serializers.Serializer):
         "generated", "reused", "not_required", "conflict", "failed",
     ))
     origin = serializers.ChoiceField(choices=(
-        "local_qwen", "existing", "source_english", "none",
+        "model", "existing", "source_english", "none",
     ))
     context_current = serializers.BooleanField()
     retryable = serializers.BooleanField()
@@ -4245,9 +3563,7 @@ class CanonicalGlossaryEnsureResponseSerializer(serializers.Serializer):
 
 
 class PromptTranslationRetranslateSerializer(serializers.Serializer):
-    provider = serializers.ChoiceField(
-        choices=MODEL_PROVIDER_CHOICES, default="local_qwen",
-    )
+    model_deployment_id = serializers.UUIDField()
     source_text = serializers.CharField(
         max_length=30_000, trim_whitespace=False, required=False,
     )
@@ -4347,16 +3663,8 @@ class AssemblyJobSerializer(serializers.ModelSerializer):
         )
         return reverse("signed-media", kwargs={"token": token})
 
-class AssembleEpisodeSerializer(serializers.Serializer):
-    episode_id = serializers.UUIDField()
-    dry_run = serializers.BooleanField(default=True)
-    output_name = serializers.CharField(max_length=160, required=False, allow_blank=True, default="")
 
 
-class AssembleSeriesSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    dry_run = serializers.BooleanField(default=True)
-    output_name = serializers.CharField(max_length=160, required=False, allow_blank=True, default="")
 
 
 class ReleaseBundleSerializer(serializers.ModelSerializer):
@@ -4386,14 +3694,3 @@ class ReleaseBundleSerializer(serializers.ModelSerializer):
             return "verified"
         except (ValueError, TypeError):
             return "invalid"
-
-
-class ReleaseBundleCreateSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    title = serializers.CharField(max_length=200, required=False, allow_blank=True, default="")
-    notes = serializers.CharField(required=False, allow_blank=True, default="", max_length=10_000)
-    selection = serializers.JSONField(required=False)
-
-
-class ReleaseBundleProposeSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()

@@ -12,6 +12,10 @@ class ReadinessView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowAny]
+    # Probes must remain reachable while the database/configuration layer is
+    # unhealthy. Database-backed throttles would otherwise fail before this
+    # view can return its structured 503 payload.
+    throttle_classes = []
 
     @extend_schema(responses=dict)
     def get(self, request):

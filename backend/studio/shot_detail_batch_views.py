@@ -3,8 +3,8 @@ from __future__ import annotations
 from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
-from rest_framework import serializers, status
-from rest_framework.exceptions import APIException, ValidationError
+from rest_framework import serializers
+from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -14,23 +14,8 @@ from studio.models import Episode, SeriesProject, Shot, ShotDetailDraftBatch
 from studio.serializers import (
     APIValidationErrorEnvelopeSerializer,
     ShotSerializer,
-    ShotDetailDraftBatchApplySerializer,
-    ShotDetailDraftBatchCreateSerializer,
     ShotDetailDraftBatchItemSerializer,
     ShotDetailDraftBatchSerializer,
-)
-from studio.services.creative_drafts import (
-    CreativeContextConflict,
-    CreativeDraftError,
-    CreativeRevisionConflict,
-    CreativeRuntimeUnavailable,
-    CreativeValidationError,
-)
-from studio.services.shot_detail_batches import (
-    ShotDetailBatchConfirmationRequired,
-    ShotDetailBatchConflict,
-    apply_shot_detail_batch,
-    create_shot_detail_batch,
 )
 from studio.services.shot_versions import (
     ShotVersionResolutionError,
@@ -70,15 +55,6 @@ ShotDetailBatchListResponse = inline_serializer(
         "results": ShotDetailDraftBatchSerializer(many=True),
     },
 )
-ShotDetailBatchApplyResponse = inline_serializer(
-    name="ShotDetailBatchApplyResponse",
-    fields={
-        "batch": ShotDetailDraftBatchSerializer(),
-        "items": ShotDetailDraftBatchItemSerializer(many=True),
-        "applied_shots": ShotSerializer(many=True),
-        "translation_written": serializers.BooleanField(),
-    },
-)
 
 
 def _owned_project(user, project_id) -> SeriesProject:
@@ -97,29 +73,11 @@ def _owned_batch(user, batch_id) -> ShotDetailDraftBatch:
     return get_object_or_404(queryset, pk=batch_id)
 
 
-def _raise_batch_error(exc: CreativeDraftError):
-    if isinstance(exc, ShotDetailBatchConfirmationRequired):
-        return Response({
-            "code": exc.code,
-            "detail": str(exc),
-            "confirmation": exc.details,
-        }, status=status.HTTP_409_CONFLICT)
-    if isinstance(exc, ShotDetailBatchConflict):
-        return Response({"code": exc.code, "detail": str(exc)}, status=409)
-    if isinstance(exc, (CreativeContextConflict, CreativeRevisionConflict)):
-        return Response({"code": exc.code, "detail": str(exc)}, status=409)
-    if isinstance(exc, CreativeRuntimeUnavailable):
-        return Response({"code": exc.code, "detail": str(exc)}, status=503)
-    if isinstance(exc, CreativeValidationError):
-        return Response({"code": exc.code, "detail": str(exc)}, status=400)
-    error = APIException("整集高细节扩写请求失败")
-    error.status_code = status.HTTP_502_BAD_GATEWAY
-    error.default_code = getattr(exc, "code", "shot_detail_batch_failed")
-    raise error from exc
 
 
-class ProjectShotDetailDraftBatchListCreateView(APIView):
+class ProjectShotDetailDraftBatchListView(APIView):
     permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "head", "options"]
 
     @extend_schema(
         parameters=[
@@ -177,42 +135,10 @@ class ProjectShotDetailDraftBatchListCreateView(APIView):
             ShotDetailDraftBatchSerializer(page, many=True).data,
         )
 
-    @extend_schema(
-        request=ShotDetailDraftBatchCreateSerializer,
-        responses={
-            200: ShotDetailDraftBatchSerializer,
-            202: ShotDetailDraftBatchSerializer,
-            409: dict,
-            503: dict,
-        },
-    )
-    def post(self, request, project_id):
-        project = _owned_project(request.user, project_id)
-        serializer = ShotDetailDraftBatchCreateSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        episode = get_object_or_404(Episode, pk=data["episode_id"], project=project)
-        try:
-            batch, created = create_shot_detail_batch(
-                project=project,
-                episode=episode,
-                user=request.user,
-                request_id=data["request_id"],
-                shot_version_key=data["shot_version_key"],
-                provider=data["provider"],
-                variation_note=data["variation_note"],
-                confirmation_acknowledged=data["confirmation_acknowledged"],
-            )
-        except CreativeDraftError as exc:
-            return _raise_batch_error(exc)
-        return Response(
-            ShotDetailDraftBatchSerializer(batch).data,
-            status=status.HTTP_202_ACCEPTED if created else status.HTTP_200_OK,
-        )
-
 
 class ShotDetailDraftBatchDetailView(APIView):
     permission_classes = [IsAuthenticated]
+    http_method_names = ["get", "head", "options"]
 
     @extend_schema(responses=ShotDetailBatchDetailResponse)
     def get(self, request, batch_id):
@@ -252,42 +178,4 @@ class ShotDetailDraftBatchDetailView(APIView):
                 "next": paginator.get_next_link(),
                 "previous": paginator.get_previous_link(),
             },
-        })
-
-
-class ShotDetailDraftBatchApplyView(APIView):
-    permission_classes = [IsAuthenticated]
-
-    @extend_schema(
-        request=ShotDetailDraftBatchApplySerializer,
-        responses={200: ShotDetailBatchApplyResponse, 400: dict, 409: dict},
-    )
-    def post(self, request, batch_id):
-        batch = _owned_batch(request.user, batch_id)
-        serializer = ShotDetailDraftBatchApplySerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        data = serializer.validated_data
-        try:
-            applied_batch, plans = apply_shot_detail_batch(
-                batch=batch,
-                user=request.user,
-                expected_batch_revision=data["expected_batch_revision"],
-                items=data["items"],
-                language_mode=data["language_mode"],
-                review_acknowledged=data["review_acknowledged"],
-            )
-        except CreativeDraftError as exc:
-            return _raise_batch_error(exc)
-        items = applied_batch.items.select_related(
-            "shot", "draft", "draft__project", "draft__episode", "draft__shot",
-        ).order_by("ordinal")
-        return Response({
-            "batch": ShotDetailDraftBatchSerializer(applied_batch).data,
-            "items": ShotDetailDraftBatchItemSerializer(items, many=True).data,
-            # Return the committed database-backed shot values.  The client
-            # must not reconstruct formal state from a proposal after apply.
-            "applied_shots": ShotSerializer(
-                [plan.shot for plan in plans], many=True, context={"request": request},
-            ).data,
-            "translation_written": data["language_mode"] == "bilingual_confirmed",
         })

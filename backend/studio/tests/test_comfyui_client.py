@@ -122,14 +122,12 @@ class ComfyUIProgressSocketTests(SimpleTestCase):
 
 
 @override_settings(
-    COMFYUI_BASE_URL="http://127.0.0.1:8188",
     COMFYUI_ALLOW_NON_LOOPBACK=False,
-    COMFYUI_TIMEOUT_SECONDS=5,
 )
 class ComfyUIClientWorkflowLibraryTests(SimpleTestCase):
     def test_save_workflow_uses_fixed_encoded_autoprompt_path(self):
         session = _Session()
-        client = ComfyUIClient(session=session)
+        client = ComfyUIClient(base_url="http://127.0.0.1:8188", session=session)
         filename = "autoprompt-task-11111111-1111-1111-1111-111111111111-comfyui-ui.json"
 
         result = client.save_autoprompt_workflow({"version": 0.4, "nodes": []}, filename=filename)
@@ -142,6 +140,6 @@ class ComfyUIClientWorkflowLibraryTests(SimpleTestCase):
         self.assertEqual(json.loads(kwargs["data"].decode("utf-8"))["version"], 0.4)
 
     def test_save_workflow_rejects_caller_controlled_path(self):
-        client = ComfyUIClient(session=_Session())
+        client = ComfyUIClient(base_url="http://127.0.0.1:8188", session=_Session())
         with self.assertRaises(ComfyUIError):
             client.save_autoprompt_workflow({"version": 0.4}, filename="../outside.json")

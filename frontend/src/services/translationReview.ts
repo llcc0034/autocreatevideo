@@ -132,8 +132,11 @@ export const adaptCanonicalGlossaryEnsureResult = (payload: unknown): CanonicalG
     }) : [],
     ...(raw.runtime && typeof raw.runtime === 'object' ? {
       runtime: {
-        loadedOnDemand: (raw.runtime as Raw).loaded_on_demand === true,
-        unloadedAfterRequest: (raw.runtime as Raw).unloaded_after_request === true,
+        invocationAttempted: (raw.runtime as Raw).invocation_attempted === true,
+        submissionUncertain: (raw.runtime as Raw).submission_uncertain === true,
+        modelDeploymentId: String((raw.runtime as Raw).model_deployment_id || '') || undefined,
+        provider: String((raw.runtime as Raw).provider || '') || undefined,
+        dataEgress: (raw.runtime as Raw).data_egress === true,
       },
     } : {}),
   }

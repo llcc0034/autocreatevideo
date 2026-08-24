@@ -1,11 +1,11 @@
 import { api, fetchAllPages, unwrap } from './api'
-import { stylePresets } from '@/data/mock'
 import { formatDialogueLines, parseDialogueText } from './dialogue'
 import { adaptPromptArtifact } from './promptArtifactAdapter'
 import { adaptShotDetailedDescription, shotDetailedDescriptionPayload } from './shotDetailSync'
 import { visualRulesProjectPersistenceFields } from './visualRulesDraft'
 import { adaptTaskProgressTelemetry } from './taskProgress'
 import { legacyShotVersionKey, normalizeShotVersionScopeKey } from './shotVersionScope'
+import { projectDefaultH3Mode } from './projectProductionDefaults'
 import type { Asset, AssetType, BibleImageEntityType, BibleImagePromptConfig, BibleItem, Episode, EpisodeShotVersion, H3PromptPayload, H3ReferenceAudioPurpose, H3ReferenceBindings, H3ReferenceEntityBinding, H3ReferenceVideoPurpose, SeriesProject, Shot, StylePreset, TaskOutputMedia, TaskReferenceAssetSummary, Workflow, WorkflowBatchSlot, WorkflowNode } from '@/types'
 
 export { adaptPromptArtifact } from './promptArtifactAdapter'
@@ -14,6 +14,7 @@ type Raw = Record<string, any>
 
 const styleIdBySlug = new Map<string, string>()
 const styleSlugById = new Map<string, string>()
+const styleBySlug = new Map<string, StylePreset>()
 const projectTitleById = new Map<string, string>()
 const episodeContextById = new Map<string, { projectId: string; number: number; title: string }>()
 const shotContextById = new Map<string, { episodeId: string; number: number; title: string }>()
@@ -161,15 +162,43 @@ const taskAssetSummaries = (
   })
 }
 
-export const adaptStyles = (payload: unknown): StylePreset[] => asList(payload).map((raw: Raw) => {
-  styleIdBySlug.set(raw.slug, String(raw.id)); styleSlugById.set(String(raw.id), raw.slug)
-  const preset = stylePresets.find((item) => item.slug === raw.slug)
-  if (preset) return { ...preset, backendId: String(raw.id), name: raw.name || preset.name, description: raw.description || preset.description, promptPrefix: raw.visual_prompt || preset.promptPrefix }
-  return { id: raw.slug, backendId: String(raw.id), slug: raw.slug, name: raw.name, englishName: raw.slug.replaceAll('-', ' '), category: raw.category || '其他', description: raw.description || '', accent: '#d9a15d', gradient: 'linear-gradient(145deg,#463322,#111419 62%,#313b42)', tags: [raw.category || '自定义'], assetCounts: { character: 0, scene: 0, prop: 0 }, promptPrefix: raw.visual_prompt || '' }
-})
+export const adaptStyles = (payload: unknown): StylePreset[] => {
+  styleIdBySlug.clear()
+  styleSlugById.clear()
+  styleBySlug.clear()
+  return asList(payload).map((raw: Raw) => {
+    const slug = String(raw.slug || '')
+    const backendId = String(raw.id || '')
+    const category = String(raw.category || '')
+    const rawAssetCount = raw.asset_count === null || raw.asset_count === undefined
+      ? Number.NaN
+      : Number(raw.asset_count)
+    const style: StylePreset = {
+      id: slug,
+      backendId,
+      slug,
+      name: String(raw.name || ''),
+      englishName: slug.replace(/-/g, ' '),
+      category,
+      description: String(raw.description || ''),
+      accent: '#d9a15d',
+      gradient: 'linear-gradient(145deg,#463322,#111419 62%,#313b42)',
+      tags: category ? [category] : [],
+      assetCount: Number.isFinite(rawAssetCount) && rawAssetCount >= 0 ? rawAssetCount : null,
+      promptPrefix: String(raw.visual_prompt || ''),
+      negativePrompt: String(raw.negative_prompt || ''),
+    }
+    if (slug && backendId) {
+      styleIdBySlug.set(slug, backendId)
+      styleSlugById.set(backendId, slug)
+    }
+    if (slug) styleBySlug.set(slug, style)
+    return style
+  })
+}
 
-export const backendStyleId = (slug?: string) => slug ? styleIdBySlug.get(slug) : undefined
-export const styleSlug = (id?: string) => (id && (styleSlugById.get(id) || stylePresets.find((item) => item.slug === id)?.slug)) || 'wuxia'
+export const backendStyleId = (slug?: string) => slug ? styleIdBySlug.get(slug) || (isBackendId(slug) ? slug : undefined) : undefined
+export const styleSlug = (id?: string) => id ? styleSlugById.get(id) || id : ''
 
 const assetType = (raw: Raw):AssetType|undefined => {
   if (['character','scene','prop'].includes(raw.kind)) return raw.kind
@@ -186,7 +215,7 @@ export const adaptAssets = (payload: unknown): Asset[] => asList(payload).map((r
 
 export const adaptBibleItem = (raw: Raw): BibleItem => ({
   id: String(raw.id), slug: raw.slug, name: raw.name, description: raw.description || '', visualPrompt: raw.visual_identity || '', anchorAssetId: relationId(raw.anchor_asset) || null, referenceAssetIds: [...new Set<string>((Array.isArray(raw.reference_assets) ? raw.reference_assets : []).map((value: unknown) => relationId(value)).filter((value: string) => Boolean(value)))], locked: raw.is_locked !== false, seed: Number(raw.metadata?.seed || 0) || undefined, metadata:raw.metadata&&typeof raw.metadata==='object'?raw.metadata:{}, stableSpeakerId: raw.stable_speaker_id,
-  ageAppearance: raw.age_appearance || '', faceIdentity: raw.face_identity || '', wardrobe: raw.wardrobe || '', voiceProfile: raw.voice_profile || '', personality: raw.personality || '',
+  ageAppearance: raw.age_appearance || '', faceIdentity: raw.face_identity || '', wardrobe: raw.wardrobe || '', voiceProfile: raw.voice_profile || '', personality: raw.personality || '', negativeConstraints: raw.negative_constraints || '',
   location: raw.location || '', timeOfDay: raw.time_of_day || '', lighting: raw.lighting || '', colorPalette: raw.color_palette || '', ambientSound: raw.ambient_sound || '',
   material: raw.material || '', distinctiveMarks: raw.distinctive_marks || '', continuityState: raw.continuity_state || ''
 })
@@ -366,7 +395,7 @@ const adaptEpisode = (raw: Raw, shotRows: Raw[], promptRows: Raw[]): Episode => 
     return { ...shot, prompt: generatedPrompt.integrated_multimodal_description, generatedPrompt, status: 'ready' as const }
   })
   const grouped = groupEpisodeShotVersions(String(raw.id), allShots)
-  return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, multiShot: raw.prompt_settings?.multi_shot !== false, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: grouped.shots, shotVersions: grouped.shotVersions, activeShotVersionKey: grouped.activeShotVersionKey, createdAt: raw.created_at }
+  return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: grouped.shots, shotVersions: grouped.shotVersions, activeShotVersionKey: grouped.activeShotVersionKey, createdAt: raw.created_at }
 }
 
 export const projectStatus = (status: string): SeriesProject['status'] => {
@@ -387,9 +416,9 @@ const emptyProjectBible = () => ({ characters: [], scenes: [], props: [], negati
 export const adaptProjectSummary = (raw: Raw, detailLoaded = false): SeriesProject => {
   projectTitleById.set(String(raw.id), raw.title)
   const projectStyleId = styleSlug(String(raw.style || ''))
-  const style = stylePresets.find((item) => item.id === projectStyleId || item.slug === projectStyleId)
+  const style = styleBySlug.get(projectStyleId)
   return {
-    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, bibleImagePromptConfig: adaptBibleImagePromptConfig(raw.production_settings?.bible_image_prompt_config, style), styleId: projectStyleId, status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: raw.production_settings?.default_h3_mode || 'Ref2VA',
+    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, bibleImagePromptConfig: adaptBibleImagePromptConfig(raw.production_settings?.bible_image_prompt_config, style), styleId: projectStyleId, status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: projectDefaultH3Mode(raw.production_settings?.default_h3_mode),
     bible: emptyProjectBible(), episodes: [], episodeCount: Number(raw.episode_count || 0), completedEpisodeCount: Number(raw.completed_episode_count || 0), totalDurationSeconds: Number(raw.total_duration_ms || 0) / 1000, detailLoaded, createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''),
   }
 }
@@ -444,19 +473,19 @@ const dimensions = (ratio: SeriesProject['aspectRatio'], resolution: SeriesProje
 
 export const projectPayload = (project: Partial<SeriesProject>) => {
   const visualRules = visualRulesProjectPersistenceFields(project)
-  const style = stylePresets.find((item) => item.id === project.styleId || item.slug === project.styleId)
+  const style = project.styleId ? styleBySlug.get(styleSlug(project.styleId)) : undefined
   const bibleImagePromptConfig = bibleImagePromptConfigPayload(
     project.bibleImagePromptConfig || defaultBibleImagePromptConfig(style),
   )
   return {
     title: project.title, logline: project.logline || '', master_script: project.masterScript || '', status: backendStatus(project.status || 'draft'), style: backendStyleId(project.styleId), target_model: 'minimax-h3', language: 'Chinese', aspect_ratio: project.aspectRatio || '9:16', ...(project.width && project.height ? { width: project.width, height: project.height } : dimensions(project.aspectRatio || '9:16', project.resolution || '720p')), fps: 24,
-    production_settings: { default_h3_mode: project.defaultMode || 'Ref2VA', negative_prompt: visualRules.negativePrompt, color_script: visualRules.colorScript, translation_glossary: project.translationGlossary || {}, bible_image_prompt_config: bibleImagePromptConfig }, continuity_summary: visualRules.continuitySummary,
+    production_settings: { default_h3_mode: projectDefaultH3Mode(project.defaultMode), negative_prompt: visualRules.negativePrompt, color_script: visualRules.colorScript, translation_glossary: project.translationGlossary || {}, bible_image_prompt_config: bibleImagePromptConfig }, continuity_summary: visualRules.continuitySummary,
     ...(project.id && project.updatedAt ? { expected_updated_at: project.updatedAt } : {}),
   }
 }
 
 const slugValue = (item: BibleItem, index: number, prefix: string) => isBackendId(item.id) ? `${prefix}-${index + 1}` : item.id.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 70) || `${prefix}-${Date.now()}-${index}`
-export const syncBible = async (project: SeriesProject) => {
+export const persistBibleEntities = async (project: SeriesProject) => {
   const usedSpeakers = new Set(project.bible.characters.map((item) => item.stableSpeakerId).filter((value): value is string => Boolean(value)))
   for (const item of project.bible.characters) if (!item.stableSpeakerId) {
     let speakerNumber = 1
@@ -464,7 +493,7 @@ export const syncBible = async (project: SeriesProject) => {
     item.stableSpeakerId = `S${speakerNumber}`; usedSpeakers.add(item.stableSpeakerId)
   }
   const serialize = (items: BibleItem[], prefix: string, characters = false) => items.map((item, index) => ({
-    ...(isBackendId(item.id) ? { id: item.id } : {}), slug: item.slug || slugValue(item, index, prefix), name: item.name,
+    id: isBackendId(item.id) ? item.id : '', slug: item.slug || slugValue(item, index, prefix), name: item.name,
     description: item.description, visual_identity: item.visualPrompt,
     anchor_asset: isBackendId(item.anchorAssetId || '') ? item.anchorAssetId : null,
     reference_assets: item.referenceAssetIds.filter(isBackendId),
@@ -478,17 +507,38 @@ export const syncBible = async (project: SeriesProject) => {
       material: item.material || '', distinctive_marks: item.distinctiveMarks || '', continuity_state: item.continuityState || '',
     })
   }))
-  const result = unwrap<Raw>((await api.post(`/projects/${project.id}/sync-bibles/`, {
-    expected_updated_at: project.updatedAt,
-    characters: serialize(project.bible.characters, 'character', true), scenes: serialize(project.bible.scenes, 'scene'), props: serialize(project.bible.props, 'prop')
-  })).data)
-  project.bible.characters = (result.characters || []).map(adaptBibleItem)
-  project.bible.scenes = (result.scenes || []).map(adaptBibleItem)
-  project.bible.props = (result.props || []).map(adaptBibleItem)
-  project.updatedAt = String(result.updated_at || project.updatedAt)
+  const persistCollection = async (
+    endpoint: '/characters/' | '/scenes/' | '/props/',
+    rows: Array<Raw & { id: string }>,
+  ): Promise<BibleItem[]> => {
+    const current = await fetchAllPages<Raw>(endpoint, { project: project.id, page_size: 500 })
+    const retainedIds = new Set(rows.map((row) => row.id).filter(Boolean))
+    for (const row of current) {
+      const id = String(row.id || '')
+      if (id && !retainedIds.has(id)) await api.delete(`${endpoint}${id}/`)
+    }
+    const saved: BibleItem[] = []
+    for (const row of rows) {
+      const { id, ...payload } = row
+      const response = id
+        ? await api.patch(`${endpoint}${id}/`, { project: project.id, ...payload })
+        : await api.post(endpoint, { project: project.id, ...payload })
+      saved.push(adaptBibleItem(unwrap<Raw>(response.data)))
+    }
+    return saved
+  }
+  project.bible.characters = await persistCollection(
+    '/characters/', serialize(project.bible.characters, 'character', true),
+  )
+  project.bible.scenes = await persistCollection(
+    '/scenes/', serialize(project.bible.scenes, 'scene'),
+  )
+  project.bible.props = await persistCollection(
+    '/props/', serialize(project.bible.props, 'prop'),
+  )
 }
 
-export const adaptCreatedEpisode = (raw: Raw): Episode => ({ id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status, multiShot: raw.prompt_settings?.multi_shot !== false, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: [], createdAt: raw.created_at })
+export const adaptCreatedEpisode = (raw: Raw): Episode => ({ id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: [], createdAt: raw.created_at })
 
 export const dialoguePayload = (value: string, project: SeriesProject): Raw[] | undefined => (
   parseDialogueText(value, project.bible.characters)
@@ -580,39 +630,6 @@ export const syncShot = async (project: SeriesProject, episode: Episode, shot: S
   return saved
 }
 
-export const syncEpisode = async (project: SeriesProject, episode: Episode): Promise<Episode> => {
-  const shotPayload = episode.shots.map((shot) => shotPersistencePayload(project, shot))
-  const shotVersionKey = normalizeShotVersionScopeKey(episode.activeShotVersionKey, episode.id)
-  const result = unwrap<Raw>((await api.post(`/episodes/${episode.id}/sync-shots/`, {
-    shot_version_key: shotVersionKey,
-    shots: shotPayload,
-  })).data)
-  await api.patch(`/episodes/${episode.id}/`, { project: project.id, number: episode.number, title: episode.title, synopsis: episode.synopsis, script: episode.script || '', status: episode.status === 'rendering' ? 'generating' : episode.status, prompt_settings: { multi_shot: episode.multiShot, include_audio: episode.audioEnabled } })
-  const previousById = new Map(episode.shots.map((shot) => [shot.id, shot]))
-  episode.shots = (result.shots || []).map(adaptShot).map((shot: Shot) => {
-    const previous = previousById.get(shot.id)
-    return previous ? {
-      ...shot,
-      prompt: previous.prompt,
-      generatedPrompt: previous.generatedPrompt,
-      status: previous.status,
-      promptRefreshReason: previous.promptRefreshReason,
-      legacyNegativePromptRepairEligible: previous.legacyNegativePromptRepairEligible,
-    } : shot
-  })
-  if (episode.shotVersions?.length) {
-    episode.shotVersions = episode.shotVersions.map((version) => version.key === shotVersionKey
-      ? {
-          ...version,
-          active: true,
-          shotCount: episode.shots.length,
-          shots: episode.shots.map((shot) => ({ ...shot, metadata: { ...(shot.metadata || {}) } })),
-        }
-      : { ...version, active: false })
-  }
-  episode.activeShotVersionKey = shotVersionKey
-  return episode
-}
 
 const taskNode = (kind: string, status: Workflow['status'], progress: number): WorkflowNode[] => {
   const nodeStatus: WorkflowNode['status'] = status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : status === 'running' ? 'running' : 'pending'
@@ -640,9 +657,7 @@ export const adaptTaskOutputMedia = (value: unknown, position = 0): TaskOutputMe
     publicManifestSha256: String(media.public_manifest_sha256 || '') || undefined,
     publicLabel: String(media.public_label || '') || undefined,
     publicVersion: String(media.public_version || '') || undefined,
-    publishUrl: String(media.publish_url || '') || undefined,
     promotedAssetId: String(media.promoted_asset_id || '') || undefined,
-    promoteToAssetUrl: String(media.promote_to_asset_url || '') || undefined,
   }
 }
 
@@ -777,20 +792,8 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
     lastHeartbeatAt: String(raw.last_heartbeat_at || raw.heartbeat_at || raw.updated_at || '') || undefined,
     timeoutAt: String(raw.timeout_at || raw.deadline_at || '') || undefined,
     isStalled, stallReason,
-    retryAllowed: typeof raw.retry_allowed === 'boolean'
-      ? raw.retry_allowed
-      : typeof raw.can_retry === 'boolean'
-        ? raw.can_retry
-        : undefined,
-    retryRequiresReconciliation: raw.retry_requires_reconciliation === true,
-    retryBlockReason: String(raw.retry_block_reason || (raw.can_retry === false ? raw.remote_error || '' : '') || '') || undefined,
-    cancelAllowed: typeof raw.cancel_allowed === 'boolean'
-      ? raw.cancel_allowed
-      : typeof raw.can_cancel === 'boolean'
-        ? raw.can_cancel
-        : undefined,
     projectId, projectTitle, status, progress, ...progressTelemetry,
-    progressNote: isStalled ? stallReason || '任务长时间没有新的执行心跳，请检查 ComfyUI 状态或取消任务。' : progressTelemetry.progressSource === 'comfyui' && progressTelemetry.comfyProgress !== undefined ? '来自 ComfyUI 当前节点的量化采样进度，不等于整项任务完成度。' : progressIndeterminate ? '任务已提交或正在初始化，尚未收到 ComfyUI 量化进度。' : undefined,
+    progressNote: isStalled ? stallReason || '任务长时间没有新的执行心跳，请检查 ComfyUI 状态并打开所属 ProductionRun 处理。' : progressTelemetry.progressSource === 'comfyui' && progressTelemetry.comfyProgress !== undefined ? '来自 ComfyUI 当前节点的量化采样进度，不等于整项任务完成度。' : progressIndeterminate ? '任务已提交或正在初始化，尚未收到 ComfyUI 量化进度。' : undefined,
     currentStep, nodes: taskNode(raw.kind, status, progress), createdAt,
     eta: status === 'running' ? '计算中' : undefined, attempts: Number(raw.attempts || 0), maxAttempts: Number(raw.max_attempts || 0),
     batchId, batchIndex, batchSize, batchKind,

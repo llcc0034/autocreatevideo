@@ -1,4 +1,4 @@
-import type { DeferredFrameSlot, DeferredGenerationCreateInput, DeferredGenerationRequest, DeferredGenerationStatus } from '@/types'
+import type { DeferredFrameSlot, DeferredGenerationRequest, DeferredGenerationStatus } from '@/types'
 
 const statuses: DeferredGenerationStatus[] = [
   'preparing_prompt',
@@ -82,8 +82,6 @@ export const adaptDeferredGenerationRequest = (value: unknown): DeferredGenerati
     maxAttempts: requiredNumber(raw, 'max_attempts'),
     nextAttemptAt: optionalString(raw, 'next_attempt_at'),
     extendedGenerationConfirmed: booleanField(raw, 'extended_generation_confirmed'),
-    cancelAllowed: booleanField(raw, 'cancel_allowed'),
-    retryAllowed: booleanField(raw, 'retry_allowed'),
     errorCode: String(raw.error_code || ''),
     errorMessage: String(raw.error_message || ''),
     startedAt: optionalString(raw, 'started_at'),
@@ -95,17 +93,6 @@ export const adaptDeferredGenerationRequest = (value: unknown): DeferredGenerati
     provisionalPromptSha256: typeof raw.provisional_prompt_sha256 === 'string' ? raw.provisional_prompt_sha256 : undefined,
   }
 }
-
-export const deferredGenerationCreatePayload = (input: DeferredGenerationCreateInput) => ({
-  project_id: input.projectId,
-  source_task_id: input.sourceTaskId,
-  target_shot_id: input.targetShotId,
-  frame_slot: input.frameSlot,
-  idempotency_key: input.idempotencyKey,
-  priority: input.priority ?? 0,
-  max_attempts: input.maxAttempts ?? 3,
-  extended_generation_confirmed: input.extendedGenerationConfirmed === true,
-})
 
 export const deferredGenerationStatusLabel = (status: DeferredGenerationStatus): string => ({
   preparing_prompt: '准备临时提示词',

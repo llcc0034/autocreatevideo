@@ -109,13 +109,13 @@ if (-not $SkipComfyUIOutput) {
 Add-PlanItem -Key 'comfyui_output' -Source $comfy -Included (-not $SkipComfyUIOutput -and $comfyExists) -Reason $(if ($SkipComfyUIOutput) { 'explicitly_skipped' } elseif ([string]::IsNullOrWhiteSpace($comfy) -or -not $comfyExists) { 'source_missing_or_unconfigured' } else { '' })
 
 $resolvedConfigPaths = New-Object 'System.Collections.Generic.List[string]'
+$resolvedConfigFiles = New-Object 'System.Collections.Generic.List[string]'
 if ($IncludeConfig) {
     if ($ConfigPath.Count -eq 0) {
-        $ConfigPath = @(
-            (Join-Path $project '.env'),
-            (Join-Path $settings.BackendRoot '.env'),
-            (Join-Path $project 'config')
-        )
+        # Deployment .env files contain bootstrap credentials and the database
+        # encryption keyring. Only the dedicated non-secret config directory is
+        # selected implicitly; any other source requires an explicit ConfigPath.
+        $ConfigPath = @((Join-Path $project 'config'))
     }
     foreach ($candidate in $ConfigPath) {
         $full = [System.IO.Path]::GetFullPath($candidate)
@@ -132,8 +132,38 @@ if ($IncludeConfig) {
         Assert-AutoPromptNoReparsePoint -Path $full -StopRoot $project -Purpose 'Config source'
         $resolvedConfigPaths.Add($full)
     }
+
+    $seenConfigFiles = @{}
+    foreach ($configSource in $resolvedConfigPaths) {
+        $configFiles = if (Test-Path -LiteralPath $configSource -PathType Container) {
+            @(Get-ChildItem -LiteralPath $configSource -File -Force -Recurse | Sort-Object FullName)
+        } else {
+            @(Get-Item -LiteralPath $configSource -Force)
+        }
+        foreach ($configFile in $configFiles) {
+            Assert-AutoPromptNoReparsePoint -Path $configFile.FullName -StopRoot $project -Purpose 'Config source file'
+            if ($configFile.Name -match '^\.env(?:\.|$)') {
+                throw 'Deployment .env files must be backed up through a separate protected process; they cannot be packaged with the encrypted database.'
+            }
+            $restoreRelative = Get-AutoPromptRelativePath -Path $configFile.FullName -Root $project
+            $key = $restoreRelative.ToLowerInvariant()
+            if ($seenConfigFiles.ContainsKey($key)) { continue }
+            $seenConfigFiles[$key] = $true
+
+            # Select-String scans without returning the matching line, so a
+            # rejected keyring assignment can never be echoed to the operator.
+            $containsDatabaseKeyring = Select-String `
+                -LiteralPath $configFile.FullName `
+                -Pattern '(?im)^\s*["'']?(?:AUTOPROMPT_CONFIG_MASTER_KEYS|AUTOPROMPT_CONFIG_ACTIVE_KEY_ID)["'']?\s*(?:=|:)' `
+                -Quiet
+            if ($containsDatabaseKeyring) {
+                throw 'Database encryption keyring files must be backed up through a separate offline secret escrow; they cannot be packaged with the encrypted database.'
+            }
+            $resolvedConfigFiles.Add($configFile.FullName)
+        }
+    }
 }
-Add-PlanItem -Key 'config' -Source $project -Included ($IncludeConfig -and $resolvedConfigPaths.Count -gt 0) -Reason $(if (-not $IncludeConfig) { 'opt_in_not_requested' } elseif ($resolvedConfigPaths.Count -eq 0) { 'no_existing_items' } else { 'contains_secrets_review_access_controls' })
+Add-PlanItem -Key 'config' -Source $project -Included ($IncludeConfig -and $resolvedConfigFiles.Count -gt 0) -Reason $(if (-not $IncludeConfig) { 'opt_in_not_requested' } elseif ($resolvedConfigFiles.Count -eq 0) { 'no_existing_items' } else { 'contains_secrets_review_access_controls' })
 
 foreach ($source in $sourceDirectories) {
     if (Test-AutoPromptPathWithin -Candidate $destination -Root $source -AllowEqual) {
@@ -247,26 +277,14 @@ try {
     }
 
     if ($IncludeConfig) {
-        $seenConfigFiles = @{}
-        foreach ($configSource in $resolvedConfigPaths) {
-            $configFiles = if (Test-Path -LiteralPath $configSource -PathType Container) {
-                @(Get-ChildItem -LiteralPath $configSource -File -Force -Recurse | Sort-Object FullName)
-            } else {
-                @(Get-Item -LiteralPath $configSource -Force)
-            }
-            foreach ($configFile in $configFiles) {
-                Assert-AutoPromptNoReparsePoint -Path $configFile.FullName -StopRoot $project -Purpose 'Config source file'
-                $restoreRelative = Get-AutoPromptRelativePath -Path $configFile.FullName -Root $project
-                $key = $restoreRelative.ToLowerInvariant()
-                if ($seenConfigFiles.ContainsKey($key)) { continue }
-                $seenConfigFiles[$key] = $true
-                $backupRelative = 'data/config/' + $restoreRelative
-                Copy-SourceFileIntoBackup -SourceFile $configFile.FullName -BackupRelativePath $backupRelative -Category 'config'
-                $configEntries.Add([pscustomobject]@{
-                    backup_relative_path = $backupRelative
-                    restore_relative_path = $restoreRelative
-                })
-            }
+        foreach ($configFile in $resolvedConfigFiles) {
+            $restoreRelative = Get-AutoPromptRelativePath -Path $configFile -Root $project
+            $backupRelative = 'data/config/' + $restoreRelative
+            Copy-SourceFileIntoBackup -SourceFile $configFile -BackupRelativePath $backupRelative -Category 'config'
+            $configEntries.Add([pscustomobject]@{
+                backup_relative_path = $backupRelative
+                restore_relative_path = $restoreRelative
+            })
         }
     }
 
@@ -299,6 +317,7 @@ try {
         warnings = @($warnings | ForEach-Object { $_ })
         restore_requirements = @(
             'Verify manifest.sha256 and every file SHA-256 before restore.',
+            'Restore the required database encryption keyring from a separate offline secret escrow; it is never included with this database backup.',
             'Stop Django workers and ComfyUI before a real restore.',
             'Use restore.ps1 -ConfirmRestore; the script creates a pre-restore backup and preserves displaced paths.'
         )

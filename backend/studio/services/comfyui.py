@@ -55,15 +55,61 @@ class ProgressSocketEvent:
     error: str = ""
 
 
+def default_comfyui_runtime_config() -> dict:
+    """Read the single default ComfyUI endpoint from the database catalog."""
+
+    from studio.models import ModelDeployment, ModelProfileVersion, ProviderProfile
+    from studio.services.json_contracts import verify_json_contract
+
+    deployment = ModelDeployment.objects.select_related(
+        "profile_version__provider",
+    ).filter(
+        status=ModelDeployment.Status.ACTIVE,
+        profile_version__status=ModelProfileVersion.Status.PUBLISHED,
+        profile_version__provider__driver_type=ProviderProfile.DriverType.COMFYUI,
+        profile_version__provider__is_active=True,
+    ).order_by("-is_default", "-priority", "key").first()
+    if deployment is None:
+        raise ComfyUIError("数据库中没有可用的 ComfyUI ModelDeployment")
+    provider = deployment.profile_version.provider
+    try:
+        provider_config = verify_json_contract(
+            provider.driver_config,
+            schema_version=provider.driver_config_schema_version,
+            size_bytes=provider.driver_config_size_bytes,
+            sha256=provider.driver_config_sha256,
+        ).value
+        deployment_config = verify_json_contract(
+            deployment.runtime_config,
+            schema_version=deployment.runtime_config_schema_version,
+            size_bytes=deployment.runtime_config_size_bytes,
+            sha256=deployment.runtime_config_sha256,
+        ).value
+    except Exception as exc:
+        raise ComfyUIError("默认 ComfyUI deployment 配置合同无效") from exc
+    config = {**(provider_config or {}), **(deployment_config or {})}
+    if not str(config.get("base_url") or "").strip():
+        raise ComfyUIError("默认 ComfyUI deployment 缺少 base_url")
+    return config
+
+
 class ComfyUIClient:
     """Small API abstraction compatible with a local or remote ComfyUI server."""
 
-    def __init__(self, base_url: str | None = None, timeout: float | None = None, session=None):
-        self.base_url = (base_url or settings.COMFYUI_BASE_URL).rstrip("/")
+    def __init__(
+        self,
+        base_url: str | None = None,
+        timeout: float | None = None,
+        session=None,
+        *,
+        endpoint_prevalidated: bool = False,
+    ):
+        database_config = default_comfyui_runtime_config() if base_url is None else {}
+        self.base_url = str(base_url or database_config.get("base_url") or "").rstrip("/")
         parsed = urlparse(self.base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ComfyUIError("COMFYUI_BASE_URL 必须是有效的 http(s) URL")
-        if not settings.COMFYUI_ALLOW_NON_LOOPBACK:
+        if not settings.COMFYUI_ALLOW_NON_LOOPBACK and not endpoint_prevalidated:
             is_loopback = parsed.hostname.lower() == "localhost"
             try:
                 is_loopback = is_loopback or ipaddress.ip_address(parsed.hostname).is_loopback
@@ -71,11 +117,12 @@ class ComfyUIClient:
                 pass
             if not is_loopback:
                 raise ComfyUIError("出于 SSRF 安全考虑，默认只允许 loopback ComfyUI；远程地址需显式授权")
-        self.timeout = timeout or settings.COMFYUI_TIMEOUT_SECONDS
+        self.timeout = timeout or float(database_config.get("timeout_seconds") or 30)
         self.session = session or requests.Session()
 
     def _request(self, method: str, path: str, **kwargs):
         try:
+            kwargs.setdefault("allow_redirects", False)
             response = self.session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
             response.raise_for_status()
             return response
@@ -331,7 +378,7 @@ class ComfyUIClient:
     def queue_prompt(
         self, workflow: dict, client_id: str | None = None, prompt_id: str | None = None,
     ) -> QueueResult:
-        client_id = client_id or f"{settings.COMFYUI_CLIENT_ID}-{uuid.uuid4()}"
+        client_id = client_id or f"autoprompt-studio-{uuid.uuid4()}"
         payload = {"prompt": workflow, "client_id": client_id}
         if prompt_id is not None:
             try:

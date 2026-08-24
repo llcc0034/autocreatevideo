@@ -3,8 +3,7 @@ import { defineStore } from 'pinia'
 import { repository } from '@/services/repository'
 import { applyProjectEpisodeSummary, buildProjectRedoPayload, createSessionEpoch, SessionInvalidatedError } from '@/services/projectManagement'
 import { acceptAuthoritativeCanonicalGlossary } from '@/services/translationReview'
-import { DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE } from '@/constants/productionResolution'
-import type { AssemblyResult, Asset, BibleAssetDraftResult, BibleDraftEntityType, BibleDraftLanguage, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, ComfySettings, Episode, H3PromptPayload, ProductionResolutionProfile, ProductionWorkflowSelection, ReleaseBundle, ReleaseSelection, ScriptBreakdownOptions, SeriesProject, Shot, StylePreset, Workflow, WorkflowBatchSlot } from '@/types'
+import type { AssemblyResult, Asset, BibleDraftEntityType, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, Episode, ReleaseBundle, SeriesProject, Shot, StylePreset, Workflow, WorkflowBatchSlot } from '@/types'
 
 const preserveWorkflowMedia = (next: Workflow, previous?: Workflow, preserveSignedUrls = true): Workflow => {
   if (!previous) return next
@@ -265,7 +264,6 @@ export const useStudioStore = defineStore('studio', () => {
   const assets = ref<Asset[]>([])
   const projects = ref<SeriesProject[]>([])
   const workflows = ref<Workflow[]>([])
-  const settings = ref<ComfySettings | null>(null)
   const loading = ref(false)
   const error = ref('')
   const toast = ref<{ message: string; type: 'success' | 'error' | 'info' } | null>(null)
@@ -291,7 +289,7 @@ export const useStudioStore = defineStore('studio', () => {
   const resetSessionState = () => {
     sessionEpoch.invalidate()
     toastSequence += 1
-    styles.value = []; assets.value = []; projects.value = []; workflows.value = []; settings.value = null
+    styles.value = []; assets.value = []; projects.value = []; workflows.value = []
     loading.value = false; error.value = ''; toast.value = null; ready.value = false
     initializeRequest = null
     projectDetailRequests.clear()
@@ -307,14 +305,13 @@ export const useStudioStore = defineStore('studio', () => {
         // Project summaries are loaded once; full Bible/episode data is hydrated on demand.
         const nextStyles = await repository.getStyles()
         assertCurrentSession(requestEpoch)
+        styles.value = nextStyles
         const nextProjects = await repository.getProjects()
         assertCurrentSession(requestEpoch)
-        const [nextWorkflows, nextSettings] = await Promise.all([repository.getWorkflows(), repository.getSettings()])
-        assertCurrentSession(requestEpoch)
-        styles.value = nextStyles
         projects.value = nextProjects
+        const nextWorkflows = await repository.getWorkflows()
+        assertCurrentSession(requestEpoch)
         workflows.value = mergePolledWorkflows(nextWorkflows, [], false, projects.value)
-        settings.value = nextSettings
         ready.value = true
       } catch (e) {
         assertCurrentSession(requestEpoch)
@@ -339,7 +336,6 @@ export const useStudioStore = defineStore('studio', () => {
   const createImageAsset = async (payload: { file: File; kind: BibleDraftEntityType|'reference'; name: string; description: string; promptHint: string; styleId?: string }) => { const requestEpoch=sessionEpoch.capture();const item=await repository.createImageAsset(payload);assertCurrentSession(requestEpoch);assets.value=[item,...assets.value.filter((asset)=>asset.id!==item.id)];notify('图片素材已入库');return item }
   const updateAssetMetadata = async (assetId:string,payload:{name:string;description:string;promptHint:string;kind:BibleDraftEntityType|'reference';styleId?:string}) => {const requestEpoch=sessionEpoch.capture();const item=await repository.updateAssetMetadata(assetId,payload);assertCurrentSession(requestEpoch);const index=assets.value.findIndex((asset)=>asset.id===assetId);if(index>=0)assets.value[index]=item;else assets.value.unshift(item);notify('素材说明已保存');return item}
   const deleteAsset = async (assetId:string) => {const requestEpoch=sessionEpoch.capture();await repository.deleteAsset(assetId);assertCurrentSession(requestEpoch);assets.value=assets.value.filter((asset)=>asset.id!==assetId);notify('素材已删除')}
-  const generateBibleDraftFromAssets = (projectId:string,payload:{entityType:BibleDraftEntityType;outputLanguage:BibleDraftLanguage;asset:Asset;attempt?:number}):Promise<BibleAssetDraftResult> => repository.generateBibleDraftFromAssets(projectId,payload)
   const refreshProjects = async () => {
     const requestEpoch = sessionEpoch.capture()
     try {
@@ -426,37 +422,6 @@ export const useStudioStore = defineStore('studio', () => {
     notify(`镜头 ${String(saved.order).padStart(2, '0')} 已保存`)
     return saved
   }
-  const generatePrompt = async (project: SeriesProject, episode: Episode, shot: Shot): Promise<H3PromptPayload> => {const requestEpoch=sessionEpoch.capture();const payload=await repository.generatePrompt(project,episode,shot);assertCurrentSession(requestEpoch);const apply=(target:Shot)=>{target.generatedPrompt=payload;target.prompt=payload.integrated_multimodal_description;target.promptRefreshReason=undefined;target.status='ready'};apply(shot);const storedShot=projects.value.find((item)=>item.id===project.id)?.episodes.find((item)=>item.id===episode.id)?.shots.find((item)=>item.id===shot.id);if(storedShot&&storedShot!==shot)apply(storedShot);return payload}
-  const breakdownScript = async (
-    project: SeriesProject,
-    options: ScriptBreakdownOptions,
-    continueWithoutScriptBible = false,
-  ) => {
-    const requestEpoch = sessionEpoch.capture()
-    const result = await repository.breakdownScript(project, options, continueWithoutScriptBible)
-    assertCurrentSession(requestEpoch)
-    const saved = result.project
-    const index = projects.value.findIndex((item) => item.id === saved.id)
-    if (index >= 0) projects.value[index] = saved
-    const clearedProductionRows = result.cleared.generationTasks
-      + result.cleared.assemblyJobs
-      + result.cleared.promptArtifacts
-      + result.cleared.generatedWorkflows
-      + result.cleared.creativeDrafts
-      + result.cleared.shotDetailDrafts
-      + result.cleared.shotDetailBatches
-      + result.cleared.shotDetailBatchItems
-      + result.cleared.promptFieldTranslations
-      + result.cleared.draftReleaseBundles
-    notify(result.cleared.episodes
-      ? `已清理旧 ${result.cleared.episodes} 集、${result.cleared.shots} 镜及 ${clearedProductionRows} 条派生记录，并重建为 ${result.counts.episodes} 集、${result.counts.shots} 镜`
-      : `已拆解为 ${result.counts.episodes} 集、${result.counts.shots} 个分镜`)
-    if (result.warnings.length) {
-      const preview = result.warnings.slice(0, 3).join('；')
-      notify(`拆解完成，${result.warnings.length} 项已按默认值处理：${preview}${result.warnings.length > 3 ? '……' : ''}`, 'info')
-    }
-    return saved
-  }
   const refreshWorkflows = async (preserveMediaUrls = false) => {
     const requestEpoch = sessionEpoch.capture()
     const fresh = await repository.getWorkflows()
@@ -472,85 +437,10 @@ export const useStudioStore = defineStore('studio', () => {
     workflows.value[index] = merged
     return merged
   }
-  const createWorkflow = async (project: SeriesProject, episodeIds: string[], resolutionProfile: ProductionResolutionProfile = 'project', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false, idempotencyKey = '') => {
-    const requestEpoch = sessionEpoch.capture()
-    const item = await repository.createWorkflow(project, episodeIds, resolutionProfile, resolutionMultiple, imageResolutionProfile, imageResolutionMultiple, workflowSelections, extendedGenerationConfirmed, idempotencyKey)
-    assertCurrentSession(requestEpoch)
-    workflows.value.unshift(item); notify('整剧工作流已创建'); return item
-  }
-  const generateWholeEpisode = async (project: SeriesProject, episode: Episode, idempotencyKey: string, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, imageResolutionProfile: ProductionResolutionProfile = '0.98', imageResolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false) => {
-    const requestEpoch = sessionEpoch.capture()
-    const item = await repository.generateWholeEpisode(project, episode, idempotencyKey, resolutionProfile, resolutionMultiple, imageResolutionProfile, imageResolutionMultiple, workflowSelections, extendedGenerationConfirmed)
-    assertCurrentSession(requestEpoch)
-    project.status = 'producing'; episode.status = 'rendering'
-    for (const shot of episode.shots) shot.status = 'rendering'
-    const storedProject = projects.value.find((value) => value.id === project.id)
-    if (storedProject) storedProject.status = 'producing'
-    const storedEpisode = storedProject?.episodes.find((value) => value.id === episode.id)
-    if (storedEpisode) {
-      storedEpisode.status = 'rendering'
-      for (const shot of storedEpisode.shots) shot.status = 'rendering'
-    }
-    applyProjectEpisodeSummary(project)
-    if (storedProject && storedProject !== project) applyProjectEpisodeSummary(storedProject)
-    const submitted = item.batchWorkflows?.length ? item.batchWorkflows : [item]
-    const submittedIds = new Set(submitted.map((value) => value.id))
-    workflows.value = [
-      ...submitted,
-      ...workflows.value.filter((value) => !submittedIds.has(value.id)),
-    ]
-    await refreshWorkflows(true).catch(() => undefined)
-    assertCurrentSession(requestEpoch)
-    notify(`第 ${episode.number} 集已提交 ${item.batchSize || submitted.length || episode.shots.length} 个分镜任务`)
-    return item
-  }
-  const regenerateShot = async (project: SeriesProject, episode: Episode, shot: Shot, resolutionProfile: ProductionResolutionProfile = '0.3', resolutionMultiple = DEFAULT_PRODUCTION_RESOLUTION_MULTIPLE, workflowSelections: ProductionWorkflowSelection[] = [], extendedGenerationConfirmed = false) => {
-    const requestEpoch = sessionEpoch.capture()
-    const result = await repository.regenerateShot(project, episode, shot, resolutionProfile, resolutionMultiple, workflowSelections, extendedGenerationConfirmed)
-    assertCurrentSession(requestEpoch)
-    project.status = 'producing'
-    shot.status = 'rendering'
-    if (shot.mediaType === 'video') episode.status = 'rendering'
-    const storedProject = projects.value.find((item) => item.id === project.id)
-    if (storedProject) storedProject.status = 'producing'
-    const storedEpisode = storedProject?.episodes.find((item) => item.id === episode.id)
-    if (storedEpisode) {
-      if (shot.mediaType === 'video') storedEpisode.status = 'rendering'
-      const storedShot = storedEpisode.shots.find((item) => item.id === shot.id)
-      if (storedShot) storedShot.status = 'rendering'
-    }
-    applyProjectEpisodeSummary(project)
-    if (storedProject && storedProject !== project) applyProjectEpisodeSummary(storedProject)
-    // The task has already been created at this point. A transient list-refresh
-    // failure must not turn a successful submission into a false error message.
-    await refreshWorkflows().catch(() => undefined)
-    assertCurrentSession(requestEpoch)
-    return result
-  }
   const getEpisodeAssemblies = async (projectId: string): Promise<AssemblyResult[]> => repository.getEpisodeAssemblies(projectId)
   const getAssembly = async (assemblyId: string): Promise<AssemblyResult> => repository.getAssembly(assemblyId)
-  const assembleEpisode = async (projectId: string, episodeId: string): Promise<AssemblyResult> => {
-    const requestEpoch = sessionEpoch.capture()
-    const result = await repository.assembleEpisode(projectId, episodeId)
-    assertCurrentSession(requestEpoch)
-    if (result.status === 'succeeded') {
-      const storedProject = projects.value.find((item) => item.id === projectId)
-      const storedEpisode = storedProject?.episodes.find((item) => item.id === episodeId)
-      if (storedEpisode) {
-        storedEpisode.status = 'completed'
-        if (storedProject) applyProjectEpisodeSummary(storedProject)
-      }
-    }
-    return result
-  }
   const getReleaseBundles = (projectId: string): Promise<ReleaseBundle[]> => repository.getReleaseBundles(projectId)
-  const createReleaseBundle = (projectId: string, payload: { title?: string; notes?: string } = {}) => repository.createReleaseBundle(projectId, payload)
-  const proposeReleaseSelection = (projectId: string): Promise<ReleaseSelection> => repository.proposeReleaseSelection(projectId)
-  const updateReleaseBundle = (bundleId: string, payload: { title?: string; notes?: string; selection?: ReleaseSelection }) => repository.updateReleaseBundle(bundleId, payload)
-  const sealReleaseBundle = (bundleId: string) => repository.sealReleaseBundle(bundleId)
-  const releaseReleaseBundle = (bundleId: string) => repository.releaseReleaseBundle(bundleId)
   const verifyReleaseBundle = (bundleId: string) => repository.verifyReleaseBundle(bundleId)
-  const saveSettings = async (value: ComfySettings) => { const requestEpoch=sessionEpoch.capture();const saved=await repository.saveSettings(value);assertCurrentSession(requestEpoch);settings.value=saved;notify('ComfyUI 设置已保存') }
   const projectById = computed(() => (id: string) => projects.value.find((item) => item.id === id))
-  return { styles, assets, projects, workflows, settings, loading, error, toast, ready, projectById, captureSessionEpoch, initialize, loadProject, resetSessionState, refreshAssets, refreshProjects, createImageAsset, updateAssetMetadata, deleteAsset, generateBibleDraftFromAssets, uploadReferenceAsset, createProject, saveProject, setProjectCover, setProjectFavorite, duplicateProject, deleteProject, ensureCanonicalGlossary, addEpisode, deleteEpisode, saveEpisode, saveShot, breakdownScript, generatePrompt, refreshWorkflows, mergeWorkflowDetail, createWorkflow, generateWholeEpisode, regenerateShot, getEpisodeAssemblies, getAssembly, assembleEpisode, getReleaseBundles, createReleaseBundle, proposeReleaseSelection, updateReleaseBundle, sealReleaseBundle, releaseReleaseBundle, verifyReleaseBundle, saveSettings, notify }
+  return { styles, assets, projects, workflows, loading, error, toast, ready, projectById, captureSessionEpoch, initialize, loadProject, resetSessionState, refreshAssets, refreshProjects, createImageAsset, updateAssetMetadata, deleteAsset, uploadReferenceAsset, createProject, saveProject, setProjectCover, setProjectFavorite, duplicateProject, deleteProject, ensureCanonicalGlossary, addEpisode, deleteEpisode, saveEpisode, saveShot, refreshWorkflows, mergeWorkflowDetail, getEpisodeAssemblies, getAssembly, getReleaseBundles, verifyReleaseBundle, notify }
 })

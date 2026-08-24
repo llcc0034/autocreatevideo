@@ -40,7 +40,11 @@ def main() -> None:
     checks = Checks()
     compose = yaml.safe_load(_read("docker-compose.yml"))
     services = compose.get("services") or {}
-    expected_services = {"db", "backend", "worker", "assembly-worker", "readiness", "frontend"}
+    expected_services = {
+        "db", "backend", "worker", "text-generation-worker",
+        "async-media-worker", "assembly-worker", "platform-maintenance",
+        "readiness", "frontend",
+    }
     checks.require(expected_services <= set(services), "compose is missing a required production service")
 
     shared_environment = compose.get("x-backend-environment") or {}
@@ -51,23 +55,26 @@ def main() -> None:
     checks.require(shared_environment.get("DJANGO_DEBUG") == "false", "compose must force DJANGO_DEBUG=false")
     for setting in (
         "SECURE_SSL_REDIRECT", "SESSION_COOKIE_SECURE", "CSRF_COOKIE_SECURE",
-        "READINESS_COMFYUI_REQUIRED", "READINESS_GENERATION_WORKER_REQUIRED",
-        "READINESS_ASSEMBLY_WORKER_REQUIRED",
     ):
         checks.require(shared_environment.get(setting) == "true", f"compose must force {setting}=true")
     for setting in (
-        "DJANGO_SECRET_KEY", "DJANGO_ALLOWED_HOSTS", "CORS_ALLOWED_ORIGINS",
+        "DJANGO_SECRET_KEY", "AUTOPROMPT_JWT_SIGNING_KEY", "DJANGO_ALLOWED_HOSTS", "CORS_ALLOWED_ORIGINS",
         "CSRF_TRUSTED_ORIGINS", "DATABASE_URL",
+        "AUTOPROMPT_CONFIG_MASTER_KEYS", "AUTOPROMPT_CONFIG_ACTIVE_KEY_ID",
+        "AI_PROVIDER_ALLOWED_HOSTS",
     ):
         checks.require(bool(shared_environment.get(setting)), f"compose must pass {setting} to every backend process")
     operational_passthrough_settings = (
-        "ASSET_IMAGE_MAX_WIDTH", "ASSET_IMAGE_MAX_HEIGHT", "ASSET_IMAGE_MAX_PIXELS",
-        "COMFYUI_CLIENT_ID", "DRF_NUM_PROXIES",
-        "COMFYUI_TIMEOUT_SECONDS", "MINIMAX_H3_MODEL",
-        "TASK_DISTRIBUTION_LABEL_TEXT", "TASK_IMAGE_DISTRIBUTION_LABEL_TEXT",
-        "TASK_DISTRIBUTION_FONTFILE",
-        "TASK_DISTRIBUTION_VERSION", "TASK_DISTRIBUTION_TIMEOUT_SECONDS",
-        "TASK_DISTRIBUTION_LOCK_STALE_SECONDS",
+        "AUTOPROMPT_CONFIG_MASTER_KEYS", "AUTOPROMPT_CONFIG_ACTIVE_KEY_ID",
+        "AI_PROVIDER_ALLOWED_HOSTS", "DRF_NUM_PROXIES",
+        "COMFYUI_OUTPUT_DIR", "COMFYUI_EXTRA_ALLOWED_NODE_TYPES",
+        "TASK_MAX_CONCURRENT",
+        "FFMPEG_BINARY", "FFPROBE_BINARY",
+    )
+    documented_passthrough_settings = (
+        "AUTOPROMPT_CONFIG_MASTER_KEYS", "AUTOPROMPT_CONFIG_ACTIVE_KEY_ID",
+        "AI_PROVIDER_ALLOWED_HOSTS", "DRF_NUM_PROXIES",
+        "COMFYUI_EXTRA_ALLOWED_NODE_TYPES", "TASK_MAX_CONCURRENT",
     )
     for setting in operational_passthrough_settings:
         checks.require(
@@ -75,7 +82,10 @@ def main() -> None:
             f"compose must propagate production setting {setting}",
         )
 
-    for service_name in ("backend", "worker", "assembly-worker"):
+    for service_name in (
+        "backend", "worker", "text-generation-worker", "async-media-worker",
+        "assembly-worker", "platform-maintenance",
+    ):
         service = services.get(service_name) or {}
         environment = service.get("environment") or {}
         missing = sorted(set(shared_environment) - set(environment))
@@ -154,6 +164,10 @@ def main() -> None:
         "check --deploy --fail-level ERROR" in entrypoint,
         "backend bootstrap must run Django deployment checks before migration",
     )
+    checks.require(
+        "bootstrap_superadmin" not in entrypoint,
+        "long-running backend bootstrap must not print a temporary superadministrator password into container logs",
+    )
 
     nginx = _read("docker/nginx.conf")
     nginx_main = _read("docker/nginx-main.conf")
@@ -195,6 +209,7 @@ def main() -> None:
 
     root_env = _read(".env.example")
     local_env = _read("backend/.env.example")
+    frontend_env = _read("frontend/.env.example")
     local_restart = _read("scripts/restart.ps1")
     checks.require(
         "AUTOPROMPT_DEPLOYMENT_PROFILE=production" in root_env,
@@ -218,10 +233,60 @@ def main() -> None:
         "CORS_ALLOWED_ORIGINS=https://",
     ):
         checks.require(setting in root_env, f"Docker environment example is missing {setting}")
-    for setting in operational_passthrough_settings:
+    for setting in documented_passthrough_settings:
         checks.require(
             re.search(rf"(?m)^{re.escape(setting)}=", root_env) is not None,
             f"Docker environment example must document production setting {setting}",
+        )
+    checks.require(
+        "COMFYUI_OUTPUT_HOST_DIR=" in root_env,
+        "Docker environment example must document the host ComfyUI output mount",
+    )
+    frontend_env_assignments = {
+        match.group(1)
+        for match in re.finditer(r"(?m)^\s*([A-Z][A-Z0-9_]*)\s*=", frontend_env)
+    }
+    frontend_env_content_lines = [
+        line for line in frontend_env.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    checks.require(
+        all(re.match(r"^\s*[A-Z][A-Z0-9_]*\s*=", line) for line in frontend_env_content_lines),
+        "frontend environment example may contain only comments and KEY=value assignments",
+    )
+    checks.require(
+        frontend_env_assignments == {"VITE_API_BASE_URL"},
+        "frontend environment example may expose only VITE_API_BASE_URL",
+    )
+    checks.require(
+        re.search(r"(?mi)^\s*VITE_(?:USE_)?MOCK", frontend_env) is None,
+        "frontend environment example must not expose mock controls",
+    )
+    retired_local_process_env = (
+        "QWEN_TRANSLATION_RUNTIME_PYTHON", "QWEN_TRANSLATION_DEVICE",
+        "QWEN_CREATIVE_RUNTIME_PYTHON", "QWEN_CREATIVE_DEVICE",
+        "QWEN_GPU_LAYERS",
+    )
+    for setting in retired_local_process_env:
+        checks.require(
+            re.search(rf"(?m)^\s*{re.escape(setting)}\s*=", local_env) is None,
+            f"retired local-process setting {setting} must not remain in the backend environment example",
+        )
+    forbidden_business_env = (
+        "ALLOW_PUBLIC_REGISTRATION", "ASSET_UPLOAD_MAX_BYTES",
+        "COMFYUI_BASE_URL", "COMFYUI_TIMEOUT_SECONDS", "COMFYUI_CLIENT_ID",
+        "MINIMAX_H3_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+        "H3_PROMPT_OPTIMIZER_ENABLED", "TASK_MAX_PENDING",
+        "TASK_RECOMMENDED_MAX_PENDING", "ASSEMBLY_TIMEOUT_SECONDS",
+    )
+    for setting in forbidden_business_env:
+        checks.require(
+            setting not in shared_environment,
+            f"business setting {setting} must come from the database, not compose",
+        )
+        checks.require(
+            re.search(rf"(?m)^{re.escape(setting)}=", root_env) is None,
+            f"business setting {setting} must not be documented as a deployment environment value",
         )
 
     checks.finish()

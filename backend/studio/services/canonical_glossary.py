@@ -1,6 +1,6 @@
 """Idempotently seed project canonical-English names from current Bible entities.
 
-Bible persistence and local-Qwen inference deliberately live in two HTTP
+Bible persistence and model inference deliberately live in two HTTP
 transactions.  The caller first saves the authoritative Bible snapshot, then
 invokes :func:`ensure_canonical_glossary`.  Model loading therefore cannot roll
 back or delay the entity-creation transaction.  A final project row lock uses
@@ -18,16 +18,16 @@ from django.utils import timezone
 
 from studio.models import (
     CharacterBible,
-    GenerationTask,
     PromptFieldTranslation,
     PropBible,
     SceneBible,
     SeriesProject,
 )
+from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
+from studio.services.prompt_normalization import DEFAULT_DEPLOYMENT_CONFIG_KEY
 from studio.services.prompt_translation import (
     CanonicalTargetCollisionError,
     PromptTranslationError,
-    PromptTranslationResourceBusy,
     TranslationResult,
     TranslationValidationError,
     TRANSLATION_CONTEXT_VERSION,
@@ -344,7 +344,27 @@ def _translation_failure(error: PromptTranslationError) -> tuple[str, str, bool]
     code = str(getattr(error, "code", "translation_failed") or "translation_failed")
     if not re.fullmatch(r"[a-z0-9_]{1,64}", code):
         code = "translation_failed"
-    retryable = code not in {"invalid_source", "invalid_request"}
+    metadata = getattr(error, "metadata", {}) or {}
+    retryable = (
+        not bool(metadata.get("submission_uncertain"))
+        and code not in {
+            "invalid_source",
+            "invalid_request",
+            "model_deployment_required",
+            "model_deployment_not_found",
+            "deployment_inactive",
+            "model_version_not_published",
+            "provider_inactive",
+            "text_modality_required",
+            "capability_not_declared",
+            "driver_capability_missing",
+            "controlled_chat_transport_missing",
+            "external_idempotency_unimplemented",
+            "credential_unavailable",
+            "deployment_configuration_invalid",
+            "prompt_normalize_smoke_required",
+        }
+    )
     return code, str(error)[:500], retryable
 
 
@@ -368,7 +388,7 @@ def _cleanup_replaced_auto_mapping(
     ).first()
     if (
         entry is not None
-        and entry.provider == "local_qwen_auto_glossary"
+        and bool((entry.runtime_metadata or {}).get("auto_glossary"))
         and entry.source_text != target.name
         and not _name_is_used(project, entry.source_text, exclude=target)
         and glossary.get(entry.source_text) == entry.translated_text
@@ -387,6 +407,7 @@ def _append_history(entry: PromptFieldTranslation) -> list[dict]:
         "provider": entry.provider,
         "model": entry.model,
         "error_message": entry.error_message,
+        "runtime_metadata": entry.runtime_metadata or {},
         "confirmed_at": entry.confirmed_at.isoformat() if entry.confirmed_at else None,
         "updated_at": entry.updated_at.isoformat() if entry.updated_at else None,
     }]
@@ -394,7 +415,7 @@ def _append_history(entry: PromptFieldTranslation) -> list[dict]:
 
 def _record_generated_mapping(
     *, project: SeriesProject, target: CanonicalTarget, canonical: str,
-    result: TranslationResult, user,
+    result: TranslationResult, inference_context_hash: str, user,
 ) -> None:
     field_key = _NAME_FIELD_KEYS[target.scope_type]
     entry = PromptFieldTranslation.objects.select_for_update().filter(
@@ -413,12 +434,15 @@ def _record_generated_mapping(
     entry.source_hash = source_text_hash(target.name)
     entry.translated_text = canonical
     entry.status = PromptFieldTranslation.Status.CONFIRMED
-    entry.provider = "local_qwen_auto_glossary"
+    entry.provider = result.provider
     entry.model = result.model
     entry.error_message = ""
     entry.runtime_metadata = {
         **(result.metadata or {}),
         "auto_glossary": True,
+        # Preserve the exact bounded context shown to the model separately
+        # from the final compiler/review context written below.
+        "inference_context_hash": inference_context_hash,
         "translation_context_hash": translation_context_hash(
             build_translation_context(
                 project, scope_type=target.scope_type,
@@ -508,15 +532,13 @@ def _record_visual_failure(
     error_metadata = {
         **(getattr(error, "metadata", {}) or {}),
         "error_code": getattr(error, "code", "translation_failed"),
-        "loaded_on_demand": True,
-        "unloaded_after_request": True,
     }
     if is_new or source_changed:
         entry.source_text = target.visual_identity
         entry.source_hash = source_hash
         entry.translated_text = ""
         entry.status = PromptFieldTranslation.Status.FAILED
-        entry.provider = "local_qwen"
+        entry.provider = str(error_metadata.get("provider") or "")[:80]
         entry.model = ""
         entry.error_message = str(error)
         entry.runtime_metadata = {
@@ -643,7 +665,7 @@ def ensure_canonical_glossary(
                 project=project, scope_type=target.scope_type,
                 scope_id=target.scope_id,
                 field_key=_NAME_FIELD_KEYS[target.scope_type],
-                provider="local_qwen_auto_glossary",
+                runtime_metadata__auto_glossary=True,
             ).first()
             if name_entry is not None and name_entry.source_text != target.name:
                 canonical_context_may_change = True
@@ -679,62 +701,93 @@ def ensure_canonical_glossary(
     visual_results: dict[
         tuple[str, object], TranslationResult | PromptTranslationError
     ] = {}
-    runtime_invoked = False
+    runtime = {
+        "invocation_attempted": False,
+        "submission_uncertain": False,
+        "model_deployment_id": None,
+        "provider": "",
+        "data_egress": False,
+    }
     if names_to_translate or visual_runtime_items:
-        active_generation = GenerationTask.objects.filter(status__in=(
-            GenerationTask.Status.QUEUED,
-            GenerationTask.Status.RUNNING,
-            GenerationTask.Status.CANCEL_REQUESTED,
-        )).exists()
-        if active_generation:
-            busy = PromptTranslationResourceBusy(
-                "视频生成正在排队或执行；已保留 Bible，请稍后重试英文名称/视觉锚点生成。",
-                code="translation_resource_busy",
+        translation_targets = [target_by_name[name] for name in names_to_translate]
+        texts = [*names_to_translate, *(
+            item.inference_source for item in visual_runtime_items
+        )]
+        field_keys = [
+            f"canonical_glossary.{target.scope_type}_name"
+            for target in translation_targets
+        ] + [
+            _VISUAL_FIELD_KEYS[item.target.scope_type]
+            for item in visual_runtime_items
+        ]
+        labels = [
+            f"{target.scope_type} canonical proper name"
+            for target in translation_targets
+        ] + [
+            f"{item.target.scope_type} invariant visual identity"
+            for item in visual_runtime_items
+        ]
+        contexts = [
+            _proper_name_context(target, initial_glossary)
+            for target in translation_targets
+        ] + [item.inference_context for item in visual_runtime_items]
+        try:
+            resolved = resolve_configuration(
+                project=project,
+                required_keys=(DEFAULT_DEPLOYMENT_CONFIG_KEY,),
             )
-            results_by_name = {name: busy for name in names_to_translate}
-            visual_results = {item.target.key: busy for item in visual_runtime_items}
-        else:
-            translation_targets = [target_by_name[name] for name in names_to_translate]
-            texts = [*names_to_translate, *(
-                item.inference_source for item in visual_runtime_items
-            )]
-            field_keys = [
-                f"canonical_glossary.{target.scope_type}_name"
-                for target in translation_targets
-            ] + [
-                _VISUAL_FIELD_KEYS[item.target.scope_type]
-                for item in visual_runtime_items
-            ]
-            labels = [
-                f"{target.scope_type} canonical proper name"
-                for target in translation_targets
-            ] + [
-                f"{item.target.scope_type} invariant visual identity"
-                for item in visual_runtime_items
-            ]
-            contexts = [
-                _proper_name_context(target, initial_glossary)
-                for target in translation_targets
-            ] + [item.inference_context for item in visual_runtime_items]
-            try:
-                runtime_invoked = True
-                translated = translate_texts_once(
-                    texts, field_keys=field_keys, labels=labels, contexts=contexts,
+            deployment_id = str(
+                resolved.values[DEFAULT_DEPLOYMENT_CONFIG_KEY] or ""
+            ).strip()
+            if not deployment_id:
+                raise PromptTranslationError(
+                    "未配置默认 prompt.normalize deployment",
+                    code="model_deployment_required",
                 )
-            except PromptTranslationError as error:
-                translated = [error for _ in texts]
-            name_result_count = len(names_to_translate)
-            results_by_name = dict(zip(
-                names_to_translate, translated[:name_result_count], strict=True,
-            ))
-            visual_results = {
-                item.target.key: result
-                for item, result in zip(
-                    visual_runtime_items,
-                    translated[name_result_count:],
-                    strict=True,
-                )
-            }
+            runtime["model_deployment_id"] = deployment_id
+            runtime["invocation_attempted"] = True
+            translated = translate_texts_once(
+                texts,
+                field_keys=field_keys,
+                labels=labels,
+                contexts=contexts,
+                model_deployment_id=deployment_id,
+            )
+        except ConfigurationResolutionError as exc:
+            error = PromptTranslationError(str(exc), code=exc.code)
+            translated = [error for _ in texts]
+        except PromptTranslationError as error:
+            translated = [error for _ in texts]
+        for result in translated:
+            metadata = getattr(result, "metadata", {}) or {}
+            if metadata.get("model_deployment_id"):
+                runtime["model_deployment_id"] = str(metadata["model_deployment_id"])
+            result_provider = str(
+                metadata.get("provider")
+                or getattr(result, "provider", "")
+                or ""
+            )
+            if result_provider:
+                runtime["provider"] = result_provider
+            runtime["data_egress"] = bool(
+                runtime["data_egress"] or metadata.get("data_egress")
+            )
+            runtime["submission_uncertain"] = bool(
+                runtime["submission_uncertain"]
+                or metadata.get("submission_uncertain")
+            )
+        name_result_count = len(names_to_translate)
+        results_by_name = dict(zip(
+            names_to_translate, translated[:name_result_count], strict=True,
+        ))
+        visual_results = {
+            item.target.key: result
+            for item, result in zip(
+                visual_runtime_items,
+                translated[name_result_count:],
+                strict=True,
+            )
+        }
 
     visual_rows: list[dict] = []
     with transaction.atomic():
@@ -742,7 +795,7 @@ def ensure_canonical_glossary(
         settings_value = dict(locked.production_settings or {})
         glossary = _glossary(locked)
         glossary_changed = False
-        generated_records: list[tuple[CanonicalTarget, str, TranslationResult]] = []
+        generated_records: list[tuple[CanonicalTarget, str, TranslationResult, str]] = []
         current_entities: dict[tuple[str, object], object | None] = {}
         for target in targets:
             current = _SCOPE_MODELS[target.scope_type].objects.select_for_update().filter(
@@ -794,7 +847,7 @@ def ensure_canonical_glossary(
                 code, message, retryable = _translation_failure(error)
                 rows.append(_result_row(
                     scope_type=target.scope_type, scope_id=target.scope_id,
-                    name=target.name, status="failed", origin="local_qwen",
+                    name=target.name, status="failed", origin="model",
                     retryable=retryable, error_code=code, message=message,
                 ))
                 continue
@@ -804,7 +857,7 @@ def ensure_canonical_glossary(
                 code, message, retryable = _translation_failure(error)
                 rows.append(_result_row(
                     scope_type=target.scope_type, scope_id=target.scope_id,
-                    name=target.name, status="failed", origin="local_qwen",
+                    name=target.name, status="failed", origin="model",
                     retryable=retryable, error_code=code, message=message,
                 ))
                 continue
@@ -827,9 +880,18 @@ def ensure_canonical_glossary(
             rows.append(_result_row(
                 scope_type=target.scope_type, scope_id=target.scope_id,
                 name=target.name, canonical_english=canonical,
-                status="generated", origin="local_qwen",
+                status="generated", origin="model",
             ))
-            generated_records.append((target, canonical, result))
+            generated_records.append((
+                target,
+                canonical,
+                result,
+                str((result.metadata or {}).get("translation_context_hash") or (
+                    translation_context_hash(
+                        _proper_name_context(target, initial_glossary),
+                    )
+                )),
+            ))
 
         if glossary_changed:
             settings_value["translation_glossary"] = glossary
@@ -841,10 +903,11 @@ def ensure_canonical_glossary(
         # Hash every auto-confirmed name against the same final glossary. A
         # batch must not make its earlier provenance rows stale when a later
         # name in that same batch is appended.
-        for target, canonical, result in generated_records:
+        for target, canonical, result, inference_context_hash in generated_records:
             _record_generated_mapping(
                 project=locked, target=target, canonical=canonical,
-                result=result, user=user,
+                result=result, inference_context_hash=inference_context_hash,
+                user=user,
             )
 
         if ensure_visual_identity_translation:
@@ -922,7 +985,7 @@ def ensure_canonical_glossary(
                     )
                     code, message, retryable = _translation_failure(error)
                     visual_rows.append(_visual_result_row(
-                        target=target, status="failed", origin="local_qwen",
+                        target=target, status="failed", origin="model",
                         entry=saved,
                         context_current=_visual_entry_is_current(
                             saved, project=locked, target=target,
@@ -942,7 +1005,7 @@ def ensure_canonical_glossary(
                     )
                     code, message, retryable = _translation_failure(error)
                     visual_rows.append(_visual_result_row(
-                        target=target, status="failed", origin="local_qwen",
+                        target=target, status="failed", origin="model",
                         entry=saved,
                         context_current=_visual_entry_is_current(
                             saved, project=locked, target=target,
@@ -954,7 +1017,7 @@ def ensure_canonical_glossary(
                     project=locked, target=target, result=result,
                 )
                 visual_rows.append(_visual_result_row(
-                    target=target, status="generated", origin="local_qwen",
+                    target=target, status="generated", origin="model",
                     entry=saved, context_current=_visual_entry_is_current(
                         saved, project=locked, target=target,
                     ),
@@ -985,8 +1048,5 @@ def ensure_canonical_glossary(
         "entries": rows,
         "visual_summary": visual_summary,
         "visual_translations": visual_rows,
-        "runtime": {
-            "loaded_on_demand": runtime_invoked,
-            "unloaded_after_request": runtime_invoked,
-        },
+        "runtime": runtime,
     }

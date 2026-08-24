@@ -2,7 +2,7 @@ import json
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
-from django.test import TestCase, override_settings
+from django.test import TestCase
 from rest_framework.test import APIClient
 
 from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
@@ -43,7 +43,9 @@ class GenerationTaskWorkflowExportAPITests(TestCase):
 
     def setUp(self):
         user, project, _, _, episode, shot, _ = build_story()
-        prompt_result = build_h3_video_prompt(project, [shot], H3PromptOptions())
+        prompt_result = build_h3_video_prompt(
+            project, [shot], H3PromptOptions(language_gate_mode="warn"),
+        )
         prompt = PromptArtifact.objects.create(
             project=project,
             episode=episode,
@@ -111,7 +113,13 @@ class GenerationTaskWorkflowExportAPITests(TestCase):
             "updated_at": self.task.updated_at,
         }
 
-        with patch("studio.views.ComfyUIClient") as comfyui_client:
+        with (
+            patch("studio.views.ComfyUIClient") as comfyui_client,
+            patch(
+                "studio.services.comfyui.default_comfyui_runtime_config",
+                return_value={"base_url": "http://127.0.0.1:8188"},
+            ),
+        ):
             response = self.client.get(self.url)
 
         self.assertEqual(response.status_code, 200, response.data)
@@ -211,43 +219,6 @@ class GenerationTaskWorkflowExportAPITests(TestCase):
             f'attachment; filename="autoprompt-task-{self.task.id}-comfyui-ui.json"',
         )
 
-    def test_owner_can_explicitly_sync_canvas_to_comfyui_library_without_execution(self):
-        self.task.staged_inputs = [{
-            "token": "__AUTOPROMPT_ASSET__:fixture-asset-id",
-            "comfy_path": "autoprompt/user/task/reference.png",
-        }]
-        self.task.save(update_fields=("staged_inputs", "updated_at"))
-        sync_url = f"/api/v1/tasks/{self.task.id}/sync-comfyui-workflow/"
-
-        with patch("studio.views.ComfyUIClient") as comfyui_client:
-            client = comfyui_client.return_value
-            client.object_info.return_value = self.object_info()
-            client.save_autoprompt_workflow.return_value = {
-                "workflow_path": (
-                    f"workflows/autoprompt/autoprompt-task-{self.task.id}-comfyui-ui.json"
-                ),
-            }
-            response = self.client.post(sync_url, {}, format="json")
-
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertTrue(response.data["synced"])
-        self.assertIn("workflows/autoprompt/", response.data["workflow_path"])
-        self.assertEqual(response.data["comfyui_url"], "http://127.0.0.1:8188/")
-        client.object_info.assert_called_once_with()
-        client.save_autoprompt_workflow.assert_called_once()
-        canvas = client.save_autoprompt_workflow.call_args.args[0]
-        self.assertEqual(canvas["version"], 0.4)
-        self.assertEqual([node["type"] for node in canvas["nodes"]], ["LoadImage", "SaveImage"])
-        client.queue_prompt.assert_not_called()
-
-    def test_sync_refuses_unstaged_inputs_without_contacting_comfyui(self):
-        sync_url = f"/api/v1/tasks/{self.task.id}/sync-comfyui-workflow/"
-        with patch("studio.views.ComfyUIClient") as comfyui_client:
-            response = self.client.post(sync_url, {}, format="json")
-        self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("尚未暂存", str(response.data))
-        comfyui_client.assert_not_called()
-
     def test_unknown_export_format_is_rejected_without_contacting_comfyui(self):
         with patch("studio.views.ComfyUIClient") as comfyui_client:
             response = self.client.get(f"{self.url}?workflow_format=arbitrary")
@@ -289,9 +260,12 @@ class GenerationTaskWorkflowExportAPITests(TestCase):
         self.assertEqual(visible.status_code, 200, visible.data)
         self.assertEqual(visible.data["workflow"], self.graph)
 
-    @override_settings(COMFYUI_BASE_URL="file:///unsafe/local/path")
     def test_non_http_comfyui_url_is_never_exposed_as_openable(self):
-        response = self.client.get(self.url)
+        with patch(
+            "studio.services.comfyui.default_comfyui_runtime_config",
+            return_value={"base_url": "file:///unsafe/local/path"},
+        ):
+            response = self.client.get(self.url)
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["comfyui_url"], "")
         self.assertFalse(response.data["safe_to_open"])

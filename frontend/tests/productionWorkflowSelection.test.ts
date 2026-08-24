@@ -2,333 +2,211 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { normalizeWorkflowParameterValue } from '../src/services/workflowParameters.ts'
-
 const source = (relativePath: string) => readFileSync(new URL(relativePath, import.meta.url), 'utf8')
-const occurrences = (value: string, fragment: string) => value.split(fragment).length - 1
 
 const workflowView = source('../src/views/WorkflowView.vue')
 const storyboardView = source('../src/views/StoryboardView.vue')
 const seriesStudioView = source('../src/views/SeriesStudioView.vue')
+const productionRunView = source('../src/views/ProductionRunView.vue')
+const artifactCompare = source('../src/components/GeneratedArtifactCompare.vue')
+const artifactComparison = source('../src/services/artifactComparison.ts')
+const workflowEditor = source('../src/views/WorkflowVersionEditorView.vue')
+const settingsView = source('../src/views/SettingsView.vue')
+const platformApi = source('../src/services/platformApi.ts')
 const repository = source('../src/services/repository.ts')
-const backendAdapters = source('../src/services/backendAdapters.ts')
 const studioStore = source('../src/stores/studio.ts')
-const picker = source('../src/components/ProductionWorkflowPicker.vue')
+const productionManual = source('../src/content/productionManual.ts')
+const platformCss = source('../src/platform.css')
 
-test('all four active video production entries expose Ref2VA workflow selection', () => {
-  assert.ok(workflowView.includes('v-if="selectedProductionHasRef2VA"'))
-  assert.ok(storyboardView.includes('v-if="selectedShot.mediaType===\'video\'&&selectedShot.mode===\'Ref2VA\'"'))
-  assert.ok(storyboardView.includes('v-if="episodeHasRef2VA"'))
-  assert.ok(seriesStudioView.includes('v-if="wholeEpisodeHasRef2VA"'))
+const retiredRuntimeFragments = [
+  'generatePrompt',
+  'generateWholeEpisode',
+  'regenerateShot',
+  'createWorkflow',
+  'build-production',
+  '/prompts/generate',
+  '/workflows/generate',
+]
 
-  assert.match(workflowView, /studio\.createWorkflow\([^)]*productionWorkflowSelections\.value,extendedProductionConfirmed\.value,idempotencyKey\)/s)
-  assert.match(storyboardView, /studio\.regenerateShot\([^)]*shotWorkflowSelections\.value, extendedGenerationConfirmed\)/s)
-  assert.match(storyboardView, /studio\.generateWholeEpisode\([^)]*wholeEpisodeWorkflowSelections\.value,wholeEpisodeExtendedConfirmed\.value\)/s)
-  assert.match(seriesStudioView, /studio\.generateWholeEpisode\([^)]*wholeEpisodeWorkflowSelections\.value, wholeEpisodeExtendedConfirmed\.value\)/s)
-})
-
-test('the three production repository methods conditionally send workflow selections', () => {
-  assert.equal(occurrences(repository, 'workflow_selections: workflowSelectionsPayload(workflowSelections)'), 3)
-  assert.equal(occurrences(repository, 'api.post(`/projects/${project.id}/build-production/`, payload, { timeout: 0 })'), 3)
-  assert.equal(occurrences(studioStore, 'workflowSelections: ProductionWorkflowSelection[] = []'), 3)
-  assert.equal(occurrences(studioStore, ', workflowSelections, extendedGenerationConfirmed)'), 2)
-  assert.equal(occurrences(studioStore, ', workflowSelections, extendedGenerationConfirmed, idempotencyKey)'), 1)
-  assert.equal(occurrences(studioStore, ', workflowSelections)'), 0)
-})
-
-test('whole-episode queue confirmation is explicit and never hard-coded', () => {
-  assert.equal(occurrences(repository, 'extended_generation_confirmed: extendedGenerationConfirmed'), 5)
-  assert.ok(!repository.includes('extended_generation_confirmed: true'))
-  assert.ok(storyboardView.includes("productionErrorCode(error)==='production_queue_confirmation_required'"))
-  assert.ok(seriesStudioView.includes("productionErrorCode(error) === 'production_queue_confirmation_required'"))
-  assert.ok(storyboardView.includes('wholeEpisodeExtendedConfirmed.value=true'))
-  assert.ok(seriesStudioView.includes('wholeEpisodeExtendedConfirmed.value = true'))
-  assert.ok(storyboardView.includes('不会截断镜数'))
-  assert.ok(seriesStudioView.includes('不会截断镜数'))
-  assert.ok(storyboardView.includes("productionErrorCode(error)==='production_idempotency_conflict'"))
-  assert.ok(seriesStudioView.includes("productionErrorCode(error) === 'production_idempotency_conflict'"))
-  assert.ok(storyboardView.includes('wholeEpisodeIdempotencyConflict.value='))
-  assert.ok(seriesStudioView.includes('wholeEpisodeIdempotencyConflict.value ='))
-  assert.ok(storyboardView.includes('核对任务后放弃旧尝试'))
-  assert.ok(seriesStudioView.includes('核对任务后放弃旧尝试'))
-  assert.ok(!storyboardView.includes("clearWholeEpisodeRetryState(storageKey)\n    }"))
-  assert.ok(repository.includes('shot_version_key: shotVersionKey'))
-  assert.ok(repository.includes('normalizeShotVersionScopeKey(episode.activeShotVersionKey, episode.id)'))
-  assert.ok(!repository.includes('episode.shots.find((item) => shotIds.includes(item.id)) || episode.shots[index]'))
-  assert.ok(storyboardView.includes('wholeEpisodeRetryStorageKey(episode.value.id,selectedShotVersionScopeKey.value)'))
-  assert.ok(seriesStudioView.includes('wholeEpisodeRetryStorageKey(episode.id, episode.activeShotVersionKey)'))
-})
-
-test('single-shot regeneration confirms queue guidance only after the server asks', () => {
-  const methodStart = repository.indexOf('async regenerateShot(')
-  const methodEnd = repository.indexOf('\n  async ', methodStart + 1)
-  const method = repository.slice(methodStart, methodEnd)
-  assert.ok(method.includes('extendedGenerationConfirmed = false'))
-  assert.ok(method.includes('extended_generation_confirmed: extendedGenerationConfirmed'))
-  assert.ok(studioStore.includes('workflowSelections, extendedGenerationConfirmed)'))
-  assert.ok(storyboardView.includes('@click="saveAndRegenerateShot(false)"'))
-  assert.ok(storyboardView.includes("!extendedGenerationConfirmed && productionErrorCode(e) === 'production_queue_confirmation_required'"))
-  assert.ok(storyboardView.includes('pendingShotRegenerationConfirmation.value'))
-  assert.ok(storyboardView.includes('@click="confirmShotRegeneration"'))
-  assert.ok(storyboardView.includes('await saveAndRegenerateShot(true)'))
-  assert.ok(storyboardView.includes('取消，不提交'))
-  assert.ok(storyboardView.includes('选择取消不会创建新的生产任务'))
-})
-
-test('current-shot prompt and production persist only the selected shot', () => {
-  const syncShotStart = backendAdapters.indexOf('export const syncShot = async')
-  const syncShotEnd = backendAdapters.indexOf('\nexport const syncEpisode = async', syncShotStart)
-  const syncShotMethod = backendAdapters.slice(syncShotStart, syncShotEnd)
-  assert.ok(syncShotStart >= 0 && syncShotEnd > syncShotStart)
-  assert.ok(syncShotMethod.includes('shotPersistencePayload(project, shot)'))
-  assert.ok(syncShotMethod.includes('api.patch(`/shots/${shot.id}/`'))
-  assert.ok(syncShotMethod.includes("api.post('/shots/'"))
-  assert.ok(!syncShotMethod.includes('sync-shots'))
-
-  const syncEpisodeStart = backendAdapters.indexOf('export const syncEpisode = async')
-  const syncEpisodeEnd = backendAdapters.indexOf('\nconst taskNode', syncEpisodeStart)
-  const syncEpisodeMethod = backendAdapters.slice(syncEpisodeStart, syncEpisodeEnd)
-  assert.ok(syncEpisodeMethod.includes('episode.shots.map((shot) => shotPersistencePayload(project, shot))'))
-  assert.ok(syncEpisodeMethod.includes('`/episodes/${episode.id}/sync-shots/`'))
-
-  assert.ok(repository.includes('async saveShot(project: SeriesProject, episode: Episode, shot: Shot)'))
-  assert.ok(repository.includes('syncShot(project, episode, shot)'))
-  assert.ok(studioStore.includes('const previousId = shot.id'))
-  assert.ok(studioStore.includes('item.id === previousId || item.id === saved.id'))
-  assert.ok(studioStore.includes('saveEpisode, saveShot, breakdownScript'))
-  assert.ok(storyboardView.includes('const selectionStillTargetsSavedShot = selectedShotId.value === previousId || selectedShotId.value === saved.id'))
-  assert.ok(storyboardView.includes('delete prompts[previousId]'))
-  assert.ok(storyboardView.includes('if (selectionStillTargetsSavedShot) selectedShotId.value = saved.id'))
-
-  const currentPromptStart = storyboardView.indexOf('const generate=async')
-  const currentPromptEnd = storyboardView.indexOf('\nconst generateAll=async', currentPromptStart)
-  const currentPromptMethod = storyboardView.slice(currentPromptStart, currentPromptEnd)
-  assert.ok(currentPromptMethod.includes('persistCurrentShotKeepingSelection()'))
-  assert.ok(!currentPromptMethod.includes('persistEpisodeKeepingSelection()'))
-
-  const allPromptStart = currentPromptEnd
-  const allPromptEnd = storyboardView.indexOf('\nconst restoreWorkflowSelection', allPromptStart)
-  assert.ok(storyboardView.slice(allPromptStart, allPromptEnd).includes('persistEpisodeKeepingSelection()'))
-  const wholeEpisodeStart = storyboardView.indexOf('const submitWholeEpisode=async')
-  const wholeEpisodeEnd = storyboardView.indexOf('\nconst saveAndRegenerateShot', wholeEpisodeStart)
-  assert.ok(storyboardView.slice(wholeEpisodeStart, wholeEpisodeEnd).includes('persistEpisodeKeepingSelection()'))
-  const currentProductionStart = wholeEpisodeEnd
-  const currentProductionEnd = storyboardView.indexOf('\nconst closeShotRegenerationConfirmation', currentProductionStart)
-  assert.ok(storyboardView.slice(currentProductionStart, currentProductionEnd).includes('persistCurrentShotKeepingSelection()'))
-
-  assert.ok(storyboardView.includes("if (selectedShot.value?.legacyNegativePromptRepairEligible) return '当前镜头的来源匹配负面约束待服务端审计恢复。'"))
-  assert.ok(storyboardView.includes(':disabled="generating||referenceValidationErrors.length>0||currentShotPersistenceBlocked"'))
-  assert.ok(storyboardView.includes(':disabled="generating||currentShotPersistenceBlocked"'))
-  assert.ok(storyboardView.includes(':disabled="regeneratingShot||saving||generating||currentShotPersistenceBlocked||referenceValidationErrors.length>0||selectedPromptProductionBlocked"'))
-})
-
-test('Bible replacement refreshes authoritative ids and script rebuild is explicitly confirmed', () => {
-  const updateStart = repository.indexOf('async updateProject(project: SeriesProject)')
-  const updateEnd = repository.indexOf('\n  async ', updateStart + 1)
-  const updateMethod = repository.slice(updateStart, updateEnd)
-  assert.ok(updateMethod.includes('const patched = unwrap<Record<string, unknown>>((await api.patch'))
-  assert.ok(updateMethod.includes('const bibleSyncProject = { ...project, updatedAt: String(patched.updated_at || project.updatedAt) }'))
-  assert.ok(updateMethod.includes('await syncBible(bibleSyncProject)'))
-  assert.ok(updateMethod.includes('api.get(`/projects/${project.id}/`)'))
-  assert.ok(updateMethod.includes('adaptProject('))
-  assert.ok(backendAdapters.includes('仍引用已删除或已重建的 Bible 对象'))
-  assert.ok(backendAdapters.includes('对白说话人 ${line.speaker_id} · ${character.name} 尚未绑定到本镜头'))
-  assert.ok(backendAdapters.includes('参考素材绑定仍指向已删除的 Bible 对象'))
-
-  assert.ok(repository.includes('discard_existing_production: options.discardExistingProduction'))
-  assert.ok(seriesStudioView.includes(':open="rebuildConfirmOpen"'))
-  assert.ok(seriesStudioView.includes('确认清理并重建'))
-  assert.ok(seriesStudioView.includes('const continueWithoutScriptBible = rebuildContinueWithoutScriptBible.value'))
-  assert.ok(seriesStudioView.includes('closeRebuildConfirmation()\n  await runBreakdown(true, continueWithoutScriptBible)'))
-  assert.ok(seriesStudioView.includes('clearReplacedEpisodeRetryState(replacedEpisodeIds)'))
-  assert.ok(seriesStudioView.includes('studio.refreshWorkflows()'))
-  assert.ok(seriesStudioView.includes('运行中/远端未终结任务'))
-  assert.ok(seriesStudioView.includes('封存/发行版本'))
-  assert.ok(!seriesStudioView.includes('已有生成或组装审计记录时，后端会拒绝删除'))
-})
-
-test('failed-task retry uses the same explicit queue confirmation handshake', () => {
-  assert.ok(repository.includes('async retryGenerationTask(taskId: string, extendedGenerationConfirmed = false)'))
-  assert.ok(repository.includes('extended_generation_confirmed: extendedGenerationConfirmed'))
-  assert.ok(workflowView.includes("productionErrorCode(error)==='production_queue_confirmation_required'"))
-  assert.ok(workflowView.includes("repository.retryGenerationTask(taskId,retryExtendedConfirmedTaskId.value===taskId)"))
-  assert.ok(workflowView.includes('确认并重试失败任务'))
-})
-
-test('whole-episode batch can resume only failed items without creating a new batch', () => {
-  assert.ok(repository.includes('async resumeGenerationBatch(taskId: string, extendedGenerationConfirmed = false)'))
-  assert.ok(repository.includes('api.post(`/tasks/${taskId}/resume-batch/`, {'))
-  assert.ok(repository.includes('async cancelGenerationBatch(taskId: string)'))
-  assert.ok(repository.includes('api.post(`/tasks/${taskId}/cancel-batch/`, {})'))
-  assert.ok(repository.includes('async deleteGenerationBatch(taskId: string)'))
-  assert.ok(repository.includes('api.delete(`/tasks/${taskId}/delete-batch/`)'))
-  assert.ok(repository.includes('retriedTaskIds'))
-  assert.ok(repository.includes('cancelledTaskIds'))
-  assert.ok(repository.includes('cancelRequestedTaskIds'))
-  assert.ok(repository.includes('deletedTaskIds'))
-  assert.ok(workflowView.includes('const selectedBatchCanResume = computed'))
-  assert.ok(workflowView.includes('const selectedBatchCanCancel = computed'))
-  assert.ok(workflowView.includes('const selectedBatchCanDelete = computed'))
-  assert.ok(workflowView.includes('const batchCanDelete = (workflow?: Workflow | null)'))
-  assert.ok(workflowView.includes('repository.resumeGenerationBatch(taskId,batchResumeConfirmationBatchId.value===workflow.batchId)'))
-  assert.ok(workflowView.includes('repository.cancelGenerationBatch(taskId)'))
-  assert.ok(workflowView.includes('repository.deleteGenerationBatch(workflowTaskId(source))'))
-  assert.ok(workflowView.includes('openBatchDeleteConfirm(flow)'))
-  assert.ok(workflowView.includes('继续失败任务'))
-  assert.ok(workflowView.includes('取消当前批次'))
-  assert.ok(workflowView.includes('删除整集任务'))
-  assert.ok(workflowView.includes('只重试同一整集批次中最新失败或取消、且尚未产生后续重试的任务'))
-  assert.ok(workflowView.includes('只取消当前批次 ID 下仍在运行或排队的任务；不会取消同一剧集的其他历史整集批次。'))
-  assert.ok(workflowView.includes('删除当前整集批次的终态历史任务；不会影响其他整集批次。'))
-  assert.ok(workflowView.includes("taskFilter.value='active'"))
-  assert.ok(workflowView.includes('当前批次没有可新建的失败重试任务；已刷新最新状态'))
-  assert.ok(workflowView.includes("batchResumeConfirmationBatchId.value=workflow.batchId"))
-})
-
-test('production volume and concurrency remain capability-driven', () => {
-  assert.ok(!workflowView.includes('LIMIT 1'))
-  assert.ok(!workflowView.includes('maxConcurrent || 1'))
-  assert.ok(workflowView.includes('productionCapability.maxConcurrent'))
-  assert.ok(repository.includes("throw new Error(`生产策略缺少有效字段 ${key}`)"))
-  assert.ok(!seriesStudioView.includes('maxlength="1000000"'))
-  assert.ok(!seriesStudioView.includes('最大 1,000,000 字符'))
-})
-
-test('formal video duration is capability-driven without browser-side fixed clamping', () => {
-  assert.ok(repository.includes("positiveInteger('video_shot_min_duration_ms')"))
-  assert.ok(repository.includes("positiveInteger('video_shot_max_duration_ms')"))
-  assert.ok(storyboardView.includes(':min="videoShotMinDurationSeconds"'))
-  assert.ok(storyboardView.includes(':max="videoShotMaxDurationSeconds"'))
-  assert.ok(seriesStudioView.includes(':min="videoShotMinDurationSeconds"'))
-  assert.ok(seriesStudioView.includes(':max="videoShotMaxDurationSeconds"'))
-  assert.ok(!backendAdapters.includes('Math.min(15, Math.max(5'))
-  assert.ok(!repository.includes('Math.min(15, Math.max(5'))
-})
-
-test('official default stays empty and each create button resets stale selection', () => {
-  assert.ok(picker.includes(':aria-pressed="!templateId"'))
-  assert.ok(picker.includes('@click="selectTemplate(\'\')"'))
-  assert.match(workflowView, /const openCreateWizard=async\(\)=>\{\s*restoringSeriesProductionRetryState=true;ref2vaTemplateId\.value='';ref2vaWorkflowParameters\.value=\{\}/u)
-  assert.ok(workflowView.includes('if(project&&!project.detailLoaded)await studio.loadProject(project.id)'))
-  assert.ok(workflowView.includes('createOpen.value=true'))
-  assert.equal(occurrences(workflowView, '@click="openCreateWizard"'), 2)
-})
-
-test('whole-series submission has visible server confirmation and retry-safe idempotency', () => {
-  assert.ok(workflowView.includes('serverProductionConfirmationRequired.value=true;extendedProductionConfirmed.value=true'))
-  assert.ok(workflowView.includes('if (serverProductionConfirmationRequired.value) return true'))
-  assert.ok(workflowView.includes('seriesProductionIdempotencyKey.value=idempotencyKey;persistSeriesProductionRetryState'))
-  assert.ok(workflowView.includes('上次整剧提交的响应尚未确认'))
-  assert.ok(workflowView.includes('已创建的完整批次将直接返回，不会重复创建任务'))
-  assert.ok(!workflowView.includes('if(project?.detailLoaded)return'))
-  assert.ok(workflowView.includes('restoreSeriesProductionRetryState(id)'))
-  assert.ok(workflowView.includes("productionErrorCode(e)==='production_idempotency_conflict'"))
-  assert.ok(workflowView.includes('已保留幂等键并停止新建'))
-  assert.ok(workflowView.includes('核对任务后放弃旧尝试'))
-  assert.ok(workflowView.includes('if(seriesProductionIdempotencyKey.value&&selectedProjectId.value)'))
-  assert.ok(workflowView.includes('范围和参数已恢复为原请求'))
-  assert.ok(workflowView.includes('restoreSeriesProductionRetryState(selectedProjectId.value)'))
-  assert.ok(!workflowView.includes('修改范围或参数会开始一笔新提交'))
-  assert.ok(repository.includes('idempotency_key: idempotencyKey'))
-  assert.ok(studioStore.includes('extendedGenerationConfirmed = false, idempotencyKey = \'\''))
-})
-
-test('whole-episode deferred continuity units remain visible before materialization', () => {
-  assert.ok(repository.includes('batchWorkflows: flows'))
-  assert.ok(repository.includes('isVirtualProductionUnit: isVirtual || undefined'))
-  assert.ok(repository.includes('adaptTaskBatchSlots(result.batch_slots)'))
-  assert.ok(backendAdapters.includes('export const adaptTaskBatchSlots'))
-  assert.ok(repository.includes('等待上一镜视频完成后抽取尾帧并创建本镜任务'))
-  assert.ok(studioStore.includes('const mergePolledWorkflows = (fresh: Workflow[], previous: Workflow[], preserveMediaUrls: boolean, projects: SeriesProject[]): Workflow[]'))
-  assert.ok(studioStore.includes('restoreVirtualBatchPlaceholders'))
-  assert.ok(studioStore.includes('const batchSlotVirtualState = (slot: WorkflowBatchSlot)'))
-  assert.ok(studioStore.includes('slotFacts'))
-  assert.ok(studioStore.includes('没有 active deferred，也没有真实 GenerationTask'))
-  assert.ok(studioStore.includes("status: 'paused'"))
-  assert.ok(!studioStore.includes("backendStatus: 'not_created',\n    step: slot.message || '没有 active deferred，也没有真实 GenerationTask；后续链路已中断，等待重试恢复',\n    nodeStatus: 'failed'"))
-  assert.ok(!studioStore.includes('const restoredVirtualBatchState'))
-  assert.ok(studioStore.includes('latestBySlot'))
-  assert.ok(studioStore.includes('refreshedBatchIds'))
-  assert.ok(studioStore.includes('restoredVirtualBatchId'))
-  assert.ok(studioStore.includes('item.isVirtualProductionUnit'))
-  assert.ok(studioStore.includes('materializedBatchSlots.has(key)'))
-  assert.ok(workflowView.includes('const taskBatchIndex = (workflow: Workflow)'))
-  assert.ok(workflowView.includes('const batchSubmittedTimes = computed(() =>'))
-  assert.ok(workflowView.includes('const workflowGroupKey = (workflow: Workflow)'))
-  assert.ok(workflowView.includes('const workflowGroupTime = (workflow: Workflow)'))
-  assert.ok(workflowView.includes('const isBatchListStart = (workflow: Workflow, index: number)'))
-  assert.ok(workflowView.includes('const isBatchExpanded = (batchId?: string)'))
-  assert.ok(workflowView.includes('const toggleBatchExpansion = (batchId?: string)'))
-  assert.ok(workflowView.includes('const observedBatchIds = new Set<string>()'))
-  assert.ok(workflowView.includes('const syncDefaultCollapsedBatches = () =>'))
-  assert.ok(workflowView.includes('nextCollapsed.add(batchId)'))
-  assert.ok(workflowView.includes('watch(()=>studio.workflows.map((workflow)=>workflow.batchId||\'\').filter(Boolean).sort().join(\'|\'),syncDefaultCollapsedBatches,{immediate:true})'))
-  assert.ok(workflowView.includes('class="workflow-batch-divider"'))
-  assert.ok(workflowView.includes('class="workflow-batch-toggle"'))
-  assert.ok(workflowView.includes(':aria-expanded="isBatchExpanded(flow.batchId)"'))
-  assert.ok(workflowView.includes("v-if=\"!flow.batchId||isBatchExpanded(flow.batchId)\""))
-  assert.ok(workflowView.includes('整集任务'))
-  assert.ok(workflowView.includes('下发 {{ workflowBatchSubmittedLabel(flow) }}'))
-  assert.ok(workflowView.includes('sameBatchOrder'))
-  assert.ok(!workflowView.includes('const activeOrder = Number(!isActiveTask(left)) - Number(!isActiveTask(right))'))
-  assert.ok(workflowView.includes('workflow?.isVirtualProductionUnit ? \'\' : workflow?.taskId || workflow?.id || \'\''))
-  assert.ok(workflowView.includes('if (workflow.isVirtualProductionUnit) return false'))
-  assert.ok(workflowView.includes("workflow.isVirtualProductionUnit && workflow.status === 'paused'"))
-  assert.ok(workflowView.includes("'等待恢复'"))
-  assert.ok(workflowView.includes('整集镜头 {{ flow.batchIndex || \'?\' }}/{{ flow.batchSize || \'?\' }}'))
-})
-
-test('task cancellation exposes downstream continuity cancellation summary', () => {
-  assert.ok(repository.includes('downstreamCancellations'))
-  assert.ok(repository.includes('deferred_requests_cancelled'))
-  assert.ok(repository.includes('tasks_cancel_requested'))
-  assert.ok(workflowView.includes('同时取消 ${downstreamCount} 个后续请求/任务'))
-})
-
-test('deferred frame extraction is represented as a task node in WorkflowView', () => {
-  assert.ok(workflowView.includes('const selectedDisplayNodes=computed<WorkflowNode[]>(()=>'))
-  assert.ok(workflowView.includes('尾帧抽取任务'))
-  assert.ok(workflowView.includes('首帧抽取任务'))
-  assert.ok(workflowView.includes('deferredExtractionNodeStatus'))
-  assert.ok(workflowView.includes('nodeStatusCount=(status:WorkflowNode[\'status\'])=>selectedDisplayNodes.value'))
-  assert.ok(workflowView.includes('v-for="(node,index) in selectedDisplayNodes"'))
-  assert.ok(workflowView.includes('index<selectedDisplayNodes.length-1'))
-})
-
-test('workflow parameters come from the selected template schema', () => {
-  assert.ok(picker.includes('template.h3Modes.includes(props.h3Mode)'))
-  assert.ok(picker.includes('Object.entries(selectedTemplate.value?.userParameters || {})'))
-  assert.ok(picker.includes(':min="definition.min"'))
-  assert.ok(picker.includes(':max="definition.max"'))
-  assert.ok(picker.includes('normalizeWorkflowParameterValue(parameters.value[key], definition)'))
-})
-
-test('workflow parameter normalization follows decimal and integer schema steps', () => {
-  const lora = {
-    label: 'LoRA 模型强度', type: 'number' as const, default: 1,
-    min: 0, max: 2.2, step: 0.05,
+test('daily production creation has one ProductionRun entry and no retired low-level runtime calls', () => {
+  for (const value of [workflowView, storyboardView, seriesStudioView, repository, studioStore]) {
+    for (const fragment of retiredRuntimeFragments) assert.equal(value.includes(fragment), false, fragment)
   }
-  assert.equal(normalizeWorkflowParameterValue(0.03, lora), 0.05)
-  assert.equal(normalizeWorkflowParameterValue(-0.01, lora), 0)
-  assert.equal(normalizeWorkflowParameterValue(2.23, lora), 2.2)
-  assert.equal(normalizeWorkflowParameterValue(0.15, lora), 0.15)
-
-  const steps = {
-    label: '采样步数', type: 'integer' as const, default: 4,
-    min: 1, max: 20, step: 1,
-  }
-  assert.equal(normalizeWorkflowParameterValue(4.6, steps), 5)
-  assert.equal(normalizeWorkflowParameterValue(20.8, steps), 20)
+  assert.ok(workflowView.includes('/production`'))
+  assert.ok(storyboardView.includes('/production`'))
+  assert.ok(seriesStudioView.includes('/production`'))
+  assert.ok(productionRunView.includes('platformApi.createProductionRun'))
+  assert.ok(productionRunView.includes('创建 ProductionRun'))
 })
 
-test('failed-task retry deliberately reuses the materialized workflow', () => {
-  const start = repository.indexOf('async retryGenerationTask(')
-  const end = repository.indexOf('\n  async ', start + 1)
-  assert.ok(start >= 0 && end > start)
-  const retryMethod = repository.slice(start, end)
-  assert.ok(retryMethod.includes('api.post(`/tasks/${taskId}/retry/`, {'))
-  assert.ok(retryMethod.includes('extended_generation_confirmed: extendedGenerationConfirmed'))
-  assert.ok(!retryMethod.includes('workflow_selections'))
-  assert.ok(workflowView.includes('重试会复用原任务的实际工作流与参数'))
-  assert.ok(workflowView.includes('修改并重新生成此镜头'))
+test('new-series onboarding supports manual, reviewed import, and durable AI ProductionRun paths', () => {
+  for (const label of ['手工设定', '导入剧本', 'AI 描述创建']) assert.ok(seriesStudioView.includes(label), label)
+  assert.ok(seriesStudioView.includes('platformApi.uploadScript'))
+  assert.ok(seriesStudioView.includes('platformApi.createPastedScript'))
+  assert.ok(seriesStudioView.includes('platformApi.getScriptRevision'))
+  assert.ok(seriesStudioView.includes('platformApi.confirmScriptRevision'))
+  assert.ok(seriesStudioView.includes('platformApi.createProductionRun'))
+  assert.ok(seriesStudioView.includes('服务端提取正文（只读）'))
+  assert.ok(seriesStudioView.includes('项目已创建，但后续步骤尚未完成'))
+  assert.ok(seriesStudioView.includes("scriptMode: 'ai'" ) || seriesStudioView.includes("createRunFromOnboarding(created, 'ai')"))
+  assert.ok(seriesStudioView.includes("createRunFromOnboarding(createdProjectForOnboarding.value, 'confirmed_revision'"))
+  for (const fragment of [
+    'platformApi.getRecipeMediaRouteOptions',
+    'creationMediaRouteIndex',
+    'creationWorkflowSelectionError',
+    '先按“视频输出 + 项目默认模式”核验整集统一 route',
+    "mode: 'uniform'",
+    'workflowSelection: selectedCreationRecipeSummary.value.hasMediaGeneration',
+    '查看 route 依赖或模式缺口',
+    'creationMediaRouteSupportsInitialShots',
+    '输出 ${routeOption.outputKinds.join',
+  ]) assert.ok(seriesStudioView.includes(fragment), fragment)
+  assert.ok(seriesStudioView.includes('手工模式只建立空项目'))
+  assert.ok(seriesStudioView.includes('有剧本请使用“导入剧本”'))
+  assert.equal(seriesStudioView.includes('v-model="newProject.masterScript"'), false)
+  assert.equal(seriesStudioView.includes('/series-concept-drafts/generate/'), false)
+})
+
+test('storyboard keeps manual editing and prompt audit without direct generation controls', () => {
+  assert.ok(storyboardView.includes('persistCurrentShotKeepingSelection'))
+  assert.ok(storyboardView.includes('studio.saveShot'))
+  assert.ok(storyboardView.includes('提示词审计'))
+  assert.equal(storyboardView.includes('ResolutionProfilePicker'), false)
+  assert.equal(storyboardView.includes('ProductionWorkflowPicker'), false)
+  assert.equal(storyboardView.includes('episode.multiShot'), false)
+  assert.equal(repository.includes('multi_shot:'), false)
+})
+
+test('task page is a read-only diagnostic surface without direct task mutation controls', () => {
+  assert.ok(workflowView.includes('PRODUCTION TASK DIAGNOSTICS'))
+  assert.ok(workflowView.includes('只读诊断'))
+  for (const handler of ['@click="retry"', '@click="cancelTask"', '@click="deleteTask"', '@click="resumeSelectedBatch"', '@click="cancelSelectedBatch"', '@click="createDeferredGeneration"', '@click="syncWorkflowToComfy"']) {
+    assert.equal(workflowView.includes(handler), false, handler)
+  }
+  for (const implementation of ['const toggleRun=', 'const simulate=', '重新确认取消', '再取消当前任务']) {
+    assert.equal(workflowView.includes(implementation), false, implementation)
+  }
+})
+
+test('project master script import stays explicit and confirmed revision remains usable with existing Episodes', () => {
+  assert.ok(productionRunView.includes('const projectMasterScript = computed'))
+  assert.ok(productionRunView.includes("platformApi.createPastedScript(projectId.value, projectMasterScript.value, 'plain')"))
+  assert.ok(productionRunView.includes('导入当前项目母稿'))
+  assert.ok(productionRunView.includes('不是新的 AI 生成结果'))
+  assert.ok(productionRunView.includes("? selectedRevision.value?.status === 'confirmed'"))
+  assert.ok(productionRunView.includes('仍可从已确认 revision 创建新运行'))
+  assert.ok(productionRunView.includes('现有正式对象不会被页面静默覆盖'))
+  assert.equal(productionRunView.includes("projectEpisodes.value.length === 0 && selectedRevision.value?.status === 'confirmed'"), false)
+})
+
+test('ProductionRun exposes every exceptional gate through its dedicated action', () => {
+  assert.ok(productionRunView.includes("'cost_currency_missing'"))
+  assert.ok(productionRunView.includes('routeOptions'))
+  for (const field of ['driverType', 'providerId', 'modelProfileVersionId', 'modelDeploymentId', 'workflowVersionId', 'workflowOutputKind', 'isExternal']) {
+    assert.ok(productionRunView.includes(field), field)
+  }
+  assert.equal(productionRunView.includes('type="number" min="0" max="15" aria-label="route index"'), false)
+})
+
+test('ProductionRun creation supports frozen uniform and complete per-shot workflow selection', () => {
+  for (const fragment of [
+    "workflowSelectionMode = ref<'uniform' | 'per_shot'>('uniform')",
+    'workflowSelectionError',
+    'recipeHasMediaGeneration',
+    'shotWorkflowRouteIndexes',
+    'episodeWorkflowRouteIndexes',
+    'applyEpisodeWorkflow',
+    'getRecipeMediaRouteOptions',
+    'routeSupportsShot',
+    'recipeMediaRoutesError',
+    '整集统一工作流',
+    '逐镜头',
+    '应用到本集',
+    '查看 route 依赖缺口',
+    '发布/current、smoke 与部署绑定',
+    'workflowSelection:',
+  ]) assert.ok(productionRunView.includes(fragment), fragment)
+  assert.ok(productionRunView.includes('v-if="recipeHasMediaGeneration"'))
+  assert.ok(platformCss.includes('.workflow-selection-panel'))
+  assert.ok(platformCss.includes('.workflow-shot-row'))
+  assert.ok(platformCss.includes('.workflow-route-gaps'))
+  assert.ok(platformApi.includes('/media-route-options/'))
+})
+
+test('artifact comparison can choose any server candidate while keeping a 2-4 viewport', () => {
+  assert.ok(artifactCompare.includes('artifact-candidate-picker'))
+  assert.ok(artifactCompare.includes('toggleCandidate'))
+  assert.ok(artifactCompare.includes('reconcileArtifactSelection'))
+  assert.ok(artifactComparison.includes('selectedIds.length >= 4'))
+  assert.ok(artifactComparison.includes('selectedIds.length <= Math.min(2'))
+  assert.equal(artifactCompare.includes('props.artifacts.slice(0, 4)'), false)
+  assert.ok(artifactComparison.includes("item.status === 'selected'"))
+  assert.ok(artifactCompare.includes('platformApi.selectArtifact'))
+  assert.ok(artifactCompare.includes("@play=\"synchronize(artifact.id,'play')\""))
+  assert.ok(artifactCompare.includes('comparisonParameterRows'))
+  assert.equal(artifactComparison.includes('.slice(0, 30)'), false)
+})
+
+test('stage disclosure, confirmations, and narrow layouts preserve the single-scroll control plane', () => {
+  assert.ok(productionRunView.includes(':aria-expanded="expandedStageId===stage.id"'))
+  assert.ok(productionRunView.includes('toggleStageDisclosure(stage.id)'))
+  assert.ok(productionRunView.includes('<BaseModal :open="Boolean(pendingRunConfirmation)"'))
+  assert.ok(productionRunView.includes('run.status !== pending.runStatus'))
+  assert.ok(platformCss.includes('.page-content{min-height:0;flex:1;overflow:auto'))
+  assert.ok(platformCss.includes('.app-frame{height:100vh;min-height:0;overflow:hidden}'))
+  for (const width of ['1280', '980', '720', '390']) assert.ok(platformCss.includes(`@media(max-width:${width}px)`), width)
+  assert.ok(platformCss.includes('.run-stage-toggle:focus-visible'))
+  assert.ok(platformCss.includes('.artifact-compare-grid>article{min-width:88vw'))
+})
+
+test('SeriesStudio candidate history has no dead generation form or mutation state', () => {
+  for (const fragment of [
+    'submitBibleImageCandidate', 'generateBibleImageCandidate', 'generateAllUnconfirmedBibleImageCandidates',
+    'bibleImageDirections', 'bibleImagePromptOverrides', 'bibleImageQueueConfirmOpen', 'bibleImageActionErrors',
+    '手工调整提示词 / 补充创作要求',
+  ]) assert.equal(seriesStudioView.includes(fragment), false, fragment)
+  assert.ok(seriesStudioView.includes('尚无由 ProductionRun 归档的历史候选'))
+})
+
+test('workflow editor describes real smoke execution and does not promise UI graph preservation', () => {
+  for (const fragment of ['worker submit / poll / collect', '可能消耗算力和费用', '创建烟测任务', 'cancelWorkflowSmokeAttempt', 'listWorkflowSmokeAttempts']) assert.ok(workflowEditor.includes(fragment), fragment)
+  assert.ok(workflowEditor.includes('当前后端没有 UI 图双快照'))
+  assert.equal(workflowEditor.includes('复杂控件和子图完整保留'), false)
+  assert.equal(workflowEditor.includes('不执行生成'), false)
+})
+
+test('settings can update existing providers, deployments, and draft recipes without echoing credentials', () => {
+  assert.ok(settingsView.includes("platformApi.updateProvider(editorId.value"))
+  assert.ok(settingsView.includes("platformApi.updateDeployment(editorId.value"))
+  assert.ok(settingsView.includes("platformApi.updateRecipe(editorId.value"))
+  assert.ok(settingsView.includes('delete parsed.credential_id'))
+  assert.ok(settingsView.includes("editorCredentialId.value === '__clear__'"))
+  assert.ok(settingsView.includes('保持现有绑定'))
+  assert.ok(!settingsView.includes('credential_ref'))
+  assert.ok(platformApi.includes("api.patch(`/production-recipes/${id}/`"))
+  assert.ok(settingsView.includes('v-model="selectedHostId" type="radio"'))
+  assert.ok(settingsView.includes('watch(selectedHostId'))
+  assert.ok(settingsView.includes('clearRuntimeEvidence()'))
+  assert.ok(settingsView.includes('loadSelectedHostSnapshot()'))
+  assert.ok(settingsView.includes(':disabled="!canDecide'))
+  assert.ok(settingsView.includes('runtimeEvidenceState(selectedHostId.value'))
+})
+
+test('assembly and release are read-only projections of ProductionRun', () => {
+  for (const fragment of ['assembleEpisode', 'createReleaseBundle', 'proposeReleaseSelection', 'updateReleaseBundle', 'sealReleaseBundle', 'releaseReleaseBundle']) {
+    assert.equal(studioStore.includes(fragment), false, fragment)
+    assert.equal(repository.includes(fragment), false, fragment)
+  }
+  assert.equal(seriesStudioView.includes('assembleEpisode(episode)'), false)
+  assert.ok(seriesStudioView.includes('productionRunForAssembly'))
+  assert.ok(seriesStudioView.includes('ProductionRun 归档的分集母版'))
+  assert.ok(seriesStudioView.includes("tab==='release'"))
+})
+
+test('operator manual describes ProductionRun instead of retired submission paths', () => {
+  assert.ok(productionManual.includes('ProductionRun'))
+  for (const fragment of retiredRuntimeFragments) assert.equal(productionManual.includes(fragment), false, fragment)
+  for (const label of ['生成全部提示词', '保存并重新生成', '重新生成本镜头']) {
+    assert.equal(productionManual.includes(label), false, label)
+  }
 })

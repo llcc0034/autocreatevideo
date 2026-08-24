@@ -2,14 +2,20 @@ from unittest.mock import patch
 import json
 from pathlib import Path
 import tempfile
+import uuid
 
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import reverse
 from rest_framework.test import APIClient
 
-from studio.models import EpisodeCreativeDraft, PromptFieldTranslation, PropBible, Shot
-from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
-from studio.services.local_qwen_lock import local_qwen_runtime_lock
+from studio.models import ConfigRevision, EpisodeCreativeDraft, PromptFieldTranslation, PropBible, Shot
+from studio.services.configuration import create_config_revision, publish_config_revision
+from studio.services.h3_prompts import (
+    PromptBuildError,
+    H3PromptOptions,
+    build_h3_video_prompt,
+    build_negative_prompt,
+)
 from studio.services.prompt_translation import (
     build_translation_context,
     confirmed_translation,
@@ -30,7 +36,10 @@ from studio.services.prompt_translation import (
     _model_installation,
 )
 from studio.services.shot_prompt_recovery import normalize_legacy_negative_prompt
-from studio.tests.factories import build_story
+from studio.tests.factories import (
+    build_story,
+    create_ready_prompt_normalization_test_deployment,
+)
 
 
 class PromptTranslationProtectionTests(SimpleTestCase):
@@ -61,6 +70,15 @@ class PromptTranslationProtectionTests(SimpleTestCase):
             validate_manual_translation(source, valid + " 中文")
         with self.assertRaises(TranslationValidationError):
             validate_manual_translation("缓慢推近。", "カメラがゆっくり前進します。")
+        for deceptive in (
+            "Slow push \u202e hidden.",
+            "Slow\u200b push.",
+            "Slow push.\u0007",
+        ):
+            with self.subTest(deceptive=deceptive), self.assertRaises(
+                TranslationValidationError,
+            ):
+                validate_manual_translation("缓慢推近。", deceptive)
 
     def test_installation_rejects_missing_or_truncated_pinned_model(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -77,25 +95,18 @@ class PromptTranslationProtectionTests(SimpleTestCase):
             self.assertTrue(state["downloaded"])
             self.assertFalse(state["verified"])
 
-    @patch("studio.services.prompt_translation._require_runtime")
-    @patch("studio.services.prompt_translation._run_runtime")
-    @patch("studio.services.prompt_translation._config")
+    @patch("studio.services.prompt_normalization.invoke_prompt_normalization")
     def test_batch_loads_runtime_once_and_restores_protected_blocks(
-        self, config, run_runtime, require_runtime,
+        self, invoke,
     ):
-        config.return_value = {
-            "enabled": True, "model_id": "Qwen/Qwen3-4B-GGUF",
-            "model_dir": None, "runtime_script": None, "runtime_python": None,
-            "device": "cpu", "timeout_seconds": 300, "max_new_tokens": 768,
-        }
-
-        def response(request, _config):
+        def response(*, deployment_id, payload):
+            request = payload
             self.assertEqual(len(request["items"]), 2)
             protected = request["items"][1]["text"]
             token = next(part for part in protected.split() if part.startswith("__AUTOPROMPT_"))
             self.assertEqual(request["items"][1]["protected_tokens"], [token])
             return {
-                "ok": True, "model": "Qwen/Qwen3-4B-GGUF", "elapsed_ms": 20,
+                "schema_version": 1,
                 "items": [
                     {
                         "request_id": request["items"][0]["request_id"],
@@ -106,52 +117,60 @@ class PromptTranslationProtectionTests(SimpleTestCase):
                         "ok": True, "translation": f"The subject speaks {token}.",
                     },
                 ],
+                "metadata": {
+                    "provider": "third-local",
+                    "model": "third-local-model",
+                    "model_deployment_id": str(deployment_id),
+                },
             }
 
-        run_runtime.side_effect = response
+        invoke.side_effect = response
         results = translate_texts_once(
             ["缓慢推近，停在剑锋。", "她说 <d>[Chinese] 别动。</d>"],
             field_keys=["shot.camera", "shot.action"],
             labels=["镜头", "动作"], contexts=["{}", "{}"],
+            model_deployment_id=uuid.uuid4(),
         )
-        self.assertEqual(run_runtime.call_count, 1)
+        self.assertEqual(invoke.call_count, 1)
         self.assertEqual(results[0].text, "A slow push-in ends on the blade.")
         self.assertIn("<d>[Chinese] 别动。</d>", results[1].text)
 
-    @patch("studio.services.prompt_translation._require_runtime")
-    @patch("studio.services.prompt_translation._run_runtime")
-    @patch("studio.services.prompt_translation._config")
+    @patch("studio.services.prompt_normalization.invoke_prompt_normalization")
     def test_single_translation_deterministically_preserves_canonical_target(
-        self, config, run_runtime, require_runtime,
+        self, invoke,
     ):
-        config.return_value = {
-            "enabled": True, "model_id": "Qwen/Qwen3-4B-GGUF",
-            "model_dir": None, "runtime_script": None, "runtime_python": None,
-            "device": "cpu", "timeout_seconds": 300, "max_new_tokens": 768,
-        }
         context = json.dumps({
             "canonical_identity_mappings": {
                 "断刃": "prop:broken-blade",
             },
         }, ensure_ascii=False)
 
-        def response(request, _config):
-            self.assertNotIn("断刃", request["text"])
-            token = request["protected_tokens"][0]
-            self.assertEqual(request["text"].count(token), 1)
+        def response(*, deployment_id, payload):
+            item = payload["items"][0]
+            self.assertNotIn("断刃", item["text"])
+            token = item["protected_tokens"][0]
+            self.assertEqual(item["text"].count(token), 1)
             return {
-                "ok": True,
-                "model": "Qwen/Qwen3-4B-GGUF",
-                "elapsed_ms": 20,
-                "translation": f"The left hand always holds {token}.",
+                "schema_version": 1,
+                "items": [{
+                    "request_id": item["request_id"],
+                    "ok": True,
+                    "translation": f"The left hand always holds {token}.",
+                }],
+                "metadata": {
+                    "provider": "third-local",
+                    "model": "third-local-model",
+                    "model_deployment_id": str(deployment_id),
+                },
             }
 
-        run_runtime.side_effect = response
+        invoke.side_effect = response
         result = translate_text_once(
             "左手始终持有断刃。",
             field_key="character.visual_identity",
             label="人物视觉锚点",
             context=context,
+            model_deployment_id=uuid.uuid4(),
         )
 
         self.assertEqual(
@@ -168,6 +187,16 @@ class PromptTranslationApiTests(TestCase):
         ) = build_story()
         self.client = APIClient()
         self.client.force_authenticate(self.user)
+        self.deployment_id = create_ready_prompt_normalization_test_deployment().id
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.PROJECT,
+            project=self.project,
+            values={
+                "production.prompt_normalization_deployment_id": str(self.deployment_id),
+            },
+            created_by=self.user,
+        )
+        publish_config_revision(revision, published_by=self.user)
         self.shot.action = "她拔剑挡在门前，雨水沿剑锋滴落。"
         self.shot.camera = "低机位缓慢推近，停在剑锋特写。"
         self.shot.save(update_fields=("action", "camera", "updated_at"))
@@ -199,6 +228,60 @@ class PromptTranslationApiTests(TestCase):
                 PromptFieldTranslation.ScopeType.SHOT, self.shot.id, field_key,
             ),
         )
+
+    @patch("studio.views.translate_texts_once")
+    def test_manual_negative_prompt_candidate_uses_no_model_and_unblocks_overlay(
+        self, translate,
+    ):
+        source = "人物身份漂移；多余肢体；文字水印；低清晰度"
+        translated = "identity drift; extra limbs; text watermark; low resolution"
+        self.shot.metadata = {
+            **(self.shot.metadata or {}),
+            "prompt_field_version": 2,
+            "negative_prompt": source,
+        }
+        self.shot.save(update_fields=("metadata", "updated_at"))
+
+        created = self.client.post(
+            reverse("project-create-manual-prompt-fields", args=[self.project.id]),
+            {"entries": [{
+                "scope_type": "shot",
+                "scope_id": str(self.shot.id),
+                "field_key": "shot.negative_prompt",
+                "source_text": source,
+            }]},
+            format="json",
+        )
+
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["summary"], {
+            "requested": 1, "created": 1, "external_calls": 0,
+        })
+        translate.assert_not_called()
+        entry = PromptFieldTranslation.objects.get(
+            project=self.project,
+            scope_type=PromptFieldTranslation.ScopeType.SHOT,
+            scope_id=self.shot.id,
+            field_key="shot.negative_prompt",
+        )
+        self.assertEqual(entry.translated_text, "")
+        self.assertEqual(entry.provider, "manual_review")
+        self.assertTrue(entry.runtime_metadata["manual_candidate"])
+
+        confirmed = self.client.post(
+            reverse("translation-confirm", args=[entry.id]),
+            {"expected_revision": entry.revision, "translation": translated},
+            format="json",
+        )
+
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        entry.refresh_from_db()
+        self.assertEqual(entry.status, PromptFieldTranslation.Status.CONFIRMED)
+        self.assertTrue(confirmed.data["context_current"])
+        self.assertEqual(confirmed.data["promoted_fields"], [])
+        negative_prompt = build_negative_prompt(self.project, [self.shot])
+        self.assertIn(translated, negative_prompt)
+        self.assertNotIn("人物身份漂移", negative_prompt)
 
     def test_confirm_promotes_canonical_narrative_and_transport_retry_is_idempotent(self):
         original = "她推开院门走入雨中。"
@@ -476,7 +559,7 @@ class PromptTranslationApiTests(TestCase):
 
         response = self.client.post(
             reverse("project-translate-prompt-fields", args=[self.project.id]),
-            {"entries": [
+            {"model_deployment_id": str(self.deployment_id), "entries": [
                 {"scope_type": "project", "scope_id": str(self.project.id),
                  "field_key": "project.continuity_summary", "source_text": sources[0]},
                 {"scope_type": "character", "scope_id": str(self.character.id),
@@ -521,7 +604,7 @@ class PromptTranslationApiTests(TestCase):
         ]
         response = self.client.post(
             reverse("project-translate-prompt-fields", args=[self.project.id]),
-            {"entries": [
+            {"model_deployment_id": str(self.deployment_id), "entries": [
                 {"scope_type": "character", "scope_id": str(self.character.id),
                  "field_key": "character.visual_identity",
                  "source_text": self.character.visual_identity},
@@ -551,6 +634,7 @@ class PromptTranslationApiTests(TestCase):
         response = self.client.post(
             reverse("project-translate-prompt-fields", args=[self.project.id]),
             {
+                "model_deployment_id": str(self.deployment_id),
                 "entries": [{
                     "scope_type": "shot",
                     "scope_id": str(self.shot.id),
@@ -567,7 +651,8 @@ class PromptTranslationApiTests(TestCase):
         self.assertEqual(entry.status, PromptFieldTranslation.Status.DRAFT_TRANSLATION)
 
         preview = build_h3_video_prompt(
-            self.project, [self.shot], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot],
+            H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="warn"),
         )
         self.assertIn(self.shot.action.rstrip("。"), preview.text)
         self.assertNotIn(translated, preview.text)
@@ -578,7 +663,8 @@ class PromptTranslationApiTests(TestCase):
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.data)
         compiled = build_h3_video_prompt(
-            self.project, [self.shot], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot],
+            H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="warn"),
         )
         self.assertIn(translated, compiled.text)
         self.assertNotIn(self.shot.action.rstrip("。"), compiled.text)
@@ -589,6 +675,7 @@ class PromptTranslationApiTests(TestCase):
         response = self.client.post(
             reverse("project-translate-prompt-fields", args=[self.project.id]),
             {
+                "model_deployment_id": str(self.deployment_id),
                 "entries": [{
                     "scope_type": "shot", "scope_id": str(self.shot.id),
                     "field_key": "shot.action", "source_text": self.shot.action,
@@ -598,44 +685,6 @@ class PromptTranslationApiTests(TestCase):
         )
         self.assertEqual(response.status_code, 400)
         translate.assert_not_called()
-
-    @patch("studio.views.GenerationTask.objects.filter")
-    @patch("studio.views.translate_texts_once")
-    def test_batch_returns_409_before_model_load_when_generation_is_active(
-        self, translate, task_filter,
-    ):
-        task_filter.return_value.exists.return_value = True
-        response = self.client.post(
-            reverse("project-translate-prompt-fields", args=[self.project.id]),
-            {"entries": [{
-                "scope_type": "shot", "scope_id": str(self.shot.id),
-                "field_key": "shot.action", "source_text": self.shot.action,
-            }]}, format="json",
-        )
-        self.assertEqual(response.status_code, 409, response.data)
-        translate.assert_not_called()
-        self.shot.refresh_from_db()
-        self.assertEqual(self.shot.action, "她拔剑挡在门前，雨水沿剑锋滴落。")
-
-    def test_worker_resource_lease_maps_translation_to_409(self):
-        with tempfile.TemporaryDirectory() as temp, override_settings(
-            LOCAL_QWEN_LOCK_PATH=str(Path(temp) / "shared-local-ai.lock"),
-        ), patch("studio.services.prompt_translation._require_runtime"):
-            with local_qwen_runtime_lock():
-                response = self.client.post(
-                    reverse("project-translate-prompt-fields", args=[self.project.id]),
-                    {"entries": [{
-                        "scope_type": "shot",
-                        "scope_id": str(self.shot.id),
-                        "field_key": "shot.action",
-                        "source_text": self.shot.action,
-                    }]},
-                    format="json",
-                )
-
-        self.assertEqual(response.status_code, 409, response.data)
-        self.shot.refresh_from_db()
-        self.assertEqual(self.shot.action, "她拔剑挡在门前，雨水沿剑锋滴落。")
 
     @patch("studio.views.translate_text_once")
     def test_failed_retranslation_preserves_confirmed_candidate_and_revision(self, translate):
@@ -656,7 +705,8 @@ class PromptTranslationApiTests(TestCase):
         )
         translate.side_effect = PromptTranslationError("runtime stopped")
         response = self.client.post(
-            reverse("translation-retranslate", args=[entry.id]), {}, format="json",
+            reverse("translation-retranslate", args=[entry.id]),
+            {"model_deployment_id": str(self.deployment_id)}, format="json",
         )
         self.assertEqual(response.status_code, 200, response.data)
         entry.refresh_from_db()
@@ -680,6 +730,12 @@ class PromptTranslationApiTests(TestCase):
             "shot.narrative", source, "She keeps hold of a broken blade.",
             status=PromptFieldTranslation.Status.CONFIRMED,
         )
+        entry.runtime_metadata = {
+            **(entry.runtime_metadata or {}),
+            "model_deployment_id": "previous-deployment",
+            "provider": "previous-provider",
+        }
+        entry.save(update_fields=("runtime_metadata", "updated_at"))
         translate.return_value = TranslationResult(
             text=f"She keeps her left hand on the {canonical_target}.",
             provider="local_qwen",
@@ -688,7 +744,8 @@ class PromptTranslationApiTests(TestCase):
         )
 
         response = self.client.post(
-            reverse("translation-retranslate", args=[entry.id]), {}, format="json",
+            reverse("translation-retranslate", args=[entry.id]),
+            {"model_deployment_id": str(self.deployment_id)}, format="json",
         )
 
         self.assertEqual(response.status_code, 200, response.data)
@@ -699,6 +756,14 @@ class PromptTranslationApiTests(TestCase):
         self.assertEqual(response.data["error_message"], "")
         entry.refresh_from_db()
         self.assertEqual(entry.translated_text, response.data["translated_text"])
+        self.assertEqual(
+            entry.revision_history[-1]["runtime_metadata"]["model_deployment_id"],
+            "previous-deployment",
+        )
+        self.assertEqual(
+            entry.revision_history[-1]["runtime_metadata"]["provider"],
+            "previous-provider",
+        )
 
     def test_confirmation_rejects_stale_source(self):
         entry = PromptFieldTranslation.objects.create(
@@ -742,7 +807,8 @@ class PromptTranslationApiTests(TestCase):
             ),
         )
         compiled = build_h3_video_prompt(
-            self.project, [self.shot], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot],
+            H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="warn"),
         )
         self.assertIn("in a hushed, urgent voice", compiled.text)
         self.assertIn("<d>[Chinese] 他们追上来了。</d>", compiled.text)
@@ -827,6 +893,7 @@ class PromptTranslationApiTests(TestCase):
             [self.shot],
             H3PromptOptions(
                 mode=Shot.H3Mode.T2VA,
+                language_gate_mode="block",
                 # The editor transports the saved values again.  Confirmed
                 # English overlays must replace, not append to, these sources.
                 overall_soundscape=self.shot.sound_effects,
@@ -850,12 +917,11 @@ class PromptTranslationApiTests(TestCase):
 
         self.shot.action = "她收剑后转身看向窗外。"
         self.shot.save(update_fields=("action", "updated_at"))
-        changed = build_h3_video_prompt(
-            self.project, [self.shot], H3PromptOptions(mode=Shot.H3Mode.T2VA),
-        )
-        self.assertTrue(
-            changed.payload["quality"]["production_language_gate"]["would_block_enqueue"]
-        )
+        with self.assertRaisesRegex(PromptBuildError, "prompt.normalize"):
+            build_h3_video_prompt(
+                self.project, [self.shot],
+                H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="block"),
+            )
 
     @override_settings(H3_PROMPT_OPTIMIZER={
         "enabled": False, "base_url": "", "api_key": "", "model": "",
@@ -922,14 +988,11 @@ class PromptTranslationApiTests(TestCase):
         self.assertEqual(entry.status, PromptFieldTranslation.Status.DRAFT_TRANSLATION)
         self.character.refresh_from_db()
         self.assertEqual(self.character.visual_identity, original_visual)
-        draft_compiled = build_h3_video_prompt(
-            self.project, [self.shot], H3PromptOptions(mode=Shot.H3Mode.T2VA),
-        )
-        self.assertIn(original_visual, draft_compiled.text)
-        self.assertNotIn(translated_visual, draft_compiled.text)
-        self.assertTrue(
-            draft_compiled.payload["quality"]["production_language_gate"]["would_block_enqueue"]
-        )
+        with self.assertRaisesRegex(PromptBuildError, "prompt.normalize"):
+            build_h3_video_prompt(
+                self.project, [self.shot],
+                H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="block"),
+            )
 
         confirmed = self.client.post(
             reverse("translation-confirm", args=[entry.id]),
@@ -937,7 +1000,8 @@ class PromptTranslationApiTests(TestCase):
         )
         self.assertEqual(confirmed.status_code, 200, confirmed.data)
         confirmed_compiled = build_h3_video_prompt(
-            self.project, [self.shot], H3PromptOptions(mode=Shot.H3Mode.T2VA),
+            self.project, [self.shot],
+            H3PromptOptions(mode=Shot.H3Mode.T2VA, language_gate_mode="block"),
         )
         self.assertIn(translated_visual, confirmed_compiled.text)
         self.assertNotIn(original_visual, confirmed_compiled.text)

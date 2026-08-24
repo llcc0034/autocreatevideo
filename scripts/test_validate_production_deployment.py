@@ -16,6 +16,7 @@ REQUIRED_FILES = (
     ".env.example",
     ".dockerignore",
     "backend/.env.example",
+    "frontend/.env.example",
     "docker/backend.Dockerfile",
     "docker/frontend.Dockerfile",
     "docker/backend-entrypoint.sh",
@@ -112,13 +113,49 @@ class ProductionDeploymentValidatorTamperTests(unittest.TestCase):
         with self.assertRaisesRegex(deployment.DeploymentValidationError, "loopback-only"):
             deployment.main()
 
-    def test_missing_comfyui_timeout_passthrough_is_rejected(self):
+    def test_missing_database_encryption_keyring_passthrough_is_rejected(self):
         self._replace(
             "docker-compose.yml",
-            '  COMFYUI_TIMEOUT_SECONDS: "${COMFYUI_TIMEOUT_SECONDS:-30}"\n',
+            '  AUTOPROMPT_CONFIG_MASTER_KEYS: "${AUTOPROMPT_CONFIG_MASTER_KEYS:?set the database credential encryption keyring in the deployment secret manager}"\n',
             "",
         )
-        with self.assertRaisesRegex(deployment.DeploymentValidationError, "COMFYUI_TIMEOUT_SECONDS"):
+        with self.assertRaisesRegex(deployment.DeploymentValidationError, "AUTOPROMPT_CONFIG_MASTER_KEYS"):
+            deployment.main()
+
+    def test_long_running_entrypoint_must_not_log_temporary_password(self):
+        self._replace(
+            "docker/backend-entrypoint.sh",
+            "  python manage.py migrate --noinput\n",
+            "  python manage.py migrate --noinput\n  python manage.py bootstrap_superadmin --if-missing\n",
+        )
+        with self.assertRaisesRegex(deployment.DeploymentValidationError, "temporary superadministrator password"):
+            deployment.main()
+
+    def test_frontend_mock_environment_key_is_rejected(self):
+        self._replace(
+            "frontend/.env.example",
+            "VITE_API_BASE_URL=/api/v1\n",
+            "VITE_API_BASE_URL=/api/v1\nVITE_MOCK_PRODUCTION_MAX_CONCURRENT=1\n",
+        )
+        with self.assertRaisesRegex(deployment.DeploymentValidationError, "mock controls"):
+            deployment.main()
+
+    def test_frontend_unapproved_environment_key_is_rejected(self):
+        self._replace(
+            "frontend/.env.example",
+            "VITE_API_BASE_URL=/api/v1\n",
+            "VITE_API_BASE_URL=/api/v1\nVITE_FEATURE_FLAG=true\n",
+        )
+        with self.assertRaisesRegex(deployment.DeploymentValidationError, "only VITE_API_BASE_URL"):
+            deployment.main()
+
+    def test_retired_qwen_environment_key_is_rejected(self):
+        self._replace(
+            "backend/.env.example",
+            "TASK_MAX_CONCURRENT=1\n",
+            "TASK_MAX_CONCURRENT=1\nQWEN_GPU_LAYERS=0\n",
+        )
+        with self.assertRaisesRegex(deployment.DeploymentValidationError, "retired local-process setting QWEN_GPU_LAYERS"):
             deployment.main()
 
     def test_backup_archives_entering_build_context_are_rejected(self):

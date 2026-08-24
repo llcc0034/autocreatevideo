@@ -57,6 +57,7 @@ def validate_production_configuration(
     profile: str,
     debug: bool,
     secret_key: str,
+    jwt_signing_key: str,
     database_engine: str,
     database_password: str,
     allowed_hosts: list[str],
@@ -84,6 +85,17 @@ def validate_production_configuration(
     key = str(secret_key or "")
     if len(key) < 50 or len(set(key)) < 8 or _contains_placeholder(key):
         errors.append("DJANGO_SECRET_KEY must be a non-placeholder value with at least 50 characters")
+    jwt_key = str(jwt_signing_key or "")
+    if (
+        len(jwt_key.encode("utf-8")) < 32
+        or len(set(jwt_key)) < 8
+        or _contains_placeholder(jwt_key)
+    ):
+        errors.append(
+            "AUTOPROMPT_JWT_SIGNING_KEY must be a non-placeholder value with at least 32 UTF-8 bytes"
+        )
+    if jwt_key and jwt_key == key:
+        errors.append("AUTOPROMPT_JWT_SIGNING_KEY must differ from DJANGO_SECRET_KEY")
 
     if database_engine != "django.db.backends.postgresql":
         errors.append("DATABASE_URL must select PostgreSQL; SQLite is development-only")

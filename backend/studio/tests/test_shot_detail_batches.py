@@ -10,7 +10,7 @@ from django.apps import apps
 from django.test import SimpleTestCase, TestCase, override_settings
 from rest_framework.test import APIClient
 
-from studio.models import Shot, ShotDetailDraft, ShotDetailDraftBatch, ShotDetailDraftBatchItem
+from studio.models import Shot, ShotDetailDraftBatch, ShotDetailDraftBatchItem
 from studio.services.creative_drafts import CreativeDraftError
 from studio.services.shot_detail_batches import (
     _finish_item,
@@ -20,8 +20,8 @@ from studio.services.shot_detail_batches import (
     process_shot_detail_item,
     ShotDetailBatchConflict,
 )
-from studio.services.shot_detail_drafts import shot_detail_context_hash
 from studio.tests.factories import build_story
+from studio.management.commands import run_generation_worker
 from studio.management.commands.run_generation_worker import Command
 
 
@@ -59,12 +59,19 @@ TEST_PROVIDER_POLICIES = {
 
 
 class ShotDetailGenerationWorkerPriorityTests(SimpleTestCase):
-    def test_comfy_task_is_claimed_before_shot_detail_item(self):
+    def test_comfy_worker_does_not_expose_retired_shot_detail_queue(self):
+        task_id = uuid.uuid4()
         task = SimpleNamespace(
-            id="comfy-1", kind="video", attempts=1, max_attempts=3,
+            id=task_id,
+            pk=task_id,
+            kind="video",
+            attempts=1,
+            max_attempts=3,
+            capability_snapshot={},
+            platform_attempts=SimpleNamespace(exists=lambda: False),
         )
         result = SimpleNamespace(
-            id="comfy-1", kind="video", status="succeeded",
+            id=task_id, kind="video", status="succeeded",
             Status=SimpleNamespace(SUCCEEDED="succeeded"),
         )
         options = {
@@ -81,11 +88,14 @@ class ShotDetailGenerationWorkerPriorityTests(SimpleTestCase):
             "studio.management.commands.run_generation_worker.recover_stale_tasks",
             return_value=0,
         ), patch(
-            "studio.management.commands.run_generation_worker.recover_stale_shot_detail_items",
-            return_value=0,
-        ), patch(
             "studio.management.commands.run_generation_worker.recover_stale_deferred_requests",
             return_value=0,
+        ), patch(
+            "studio.management.commands.run_generation_worker.recover_stale_workflow_smokes",
+            return_value=0,
+        ), patch(
+            "studio.management.commands.run_generation_worker.claim_next_workflow_smoke",
+            return_value=None,
         ), patch(
             "studio.management.commands.run_generation_worker.local_qwen_runtime_lock",
             return_value=nullcontext(),
@@ -98,13 +108,13 @@ class ShotDetailGenerationWorkerPriorityTests(SimpleTestCase):
         ) as process_task_mock, patch(
             "studio.management.commands.run_generation_worker.ensure_next_first_frame_deferred_for_task",
             return_value=None,
-        ), patch(
-            "studio.management.commands.run_generation_worker.claim_next_shot_detail_item",
-        ) as detail_claim:
+        ):
             Command()._run_worker(options)
 
         process_task_mock.assert_called_once()
-        detail_claim.assert_not_called()
+        self.assertFalse(hasattr(run_generation_worker, "claim_next_shot_detail_item"))
+        self.assertFalse(hasattr(run_generation_worker, "process_shot_detail_item"))
+        self.assertFalse(hasattr(run_generation_worker, "recover_stale_shot_detail_items"))
 
 
 @override_settings(
@@ -196,35 +206,6 @@ class ShotDetailBatchTests(TestCase):
         ):
             return process_shot_detail_item(item)
 
-    def test_api_recommended_count_requires_confirmation_but_never_caps_business_volume(self):
-        request_id = uuid.uuid4()
-        url = f"/api/v1/projects/{self.project.pk}/shot-detail-draft-batches/"
-        payload = {
-            "episode_id": str(self.episode.pk),
-            "shot_version_key": self.version_key,
-            "request_id": str(request_id),
-            "provider": "local_qwen",
-        }
-        with patch(
-            "studio.services.shot_detail_batches._provider_queue_available",
-            return_value=True,
-        ):
-            warning = self.client.post(url, payload, format="json")
-            self.assertEqual(warning.status_code, 409, warning.data)
-            self.assertEqual(
-                warning.data["code"], "shot_detail_batch_confirmation_required",
-            )
-            self.assertFalse(warning.data["confirmation"]["business_volume_limited"])
-
-            payload["confirmation_acknowledged"] = True
-            created = self.client.post(url, payload, format="json")
-            self.assertEqual(created.status_code, 202, created.data)
-            repeated = self.client.post(url, payload, format="json")
-            self.assertEqual(repeated.status_code, 200, repeated.data)
-        self.assertEqual(created.data["id"], repeated.data["id"])
-        self.assertEqual(created.data["total_count"], 2)
-        self.assertEqual(created.data["pending_count"], 2)
-
     def test_same_request_id_replays_after_server_policy_changes(self):
         request_id = uuid.uuid4()
         with patch(
@@ -304,69 +285,6 @@ class ShotDetailBatchTests(TestCase):
             "episode": str(self.episode.pk), "shot_version_key": "creative-draft:missing",
         })
         self.assertEqual(invalid.status_code, 400, invalid.data)
-
-    def test_version_scoped_save_preserves_other_storyboard_versions(self):
-        new_key, new_shots = self._create_version_shots()
-        url = f"/api/v1/episodes/{self.episode.pk}/sync-shots/"
-        response = self.client.post(url, {
-            "shot_version_key": new_key,
-            "shots": [{
-                "id": str(new_shots[0].pk),
-                "number": 1,
-                "title": "新版第一镜已编辑",
-                "narrative": new_shots[0].narrative,
-                "camera": new_shots[0].camera,
-                "dialogue": new_shots[0].dialogue,
-                "duration_ms": new_shots[0].duration_ms,
-                "media_type": new_shots[0].media_type,
-                "h3_mode": new_shots[0].h3_mode,
-                "include_audio": new_shots[0].include_audio,
-                "scene": str(self.scene.pk),
-                "characters": [str(self.character.pk)],
-                "props": [],
-                "reference_assets": [],
-                "reference_bindings": {},
-                "metadata": new_shots[0].metadata,
-            }],
-        }, format="json")
-
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["counts"]["deleted"], 1)
-        self.assertEqual(
-            Shot.objects.filter(episode=self.episode).count(),
-            3,
-        )
-        self.assertTrue(Shot.objects.filter(pk=self.shot.pk).exists())
-        self.assertTrue(Shot.objects.filter(pk=self.next_shot.pk).exists())
-        self.assertFalse(Shot.objects.filter(pk=new_shots[1].pk).exists())
-
-    def test_version_scoped_save_cannot_delete_batch_history(self):
-        batch = self._create_batch()
-        url = f"/api/v1/episodes/{self.episode.pk}/sync-shots/"
-        response = self.client.post(url, {
-            "shot_version_key": self.version_key,
-            "shots": [{
-                "id": str(self.shot.pk),
-                "number": 1,
-                "narrative": self.shot.narrative,
-                "dialogue": self.shot.dialogue,
-                "duration_ms": 5000,
-                "media_type": self.shot.media_type,
-                "h3_mode": self.shot.h3_mode,
-                "include_audio": self.shot.include_audio,
-                "scene": str(self.scene.pk),
-                "characters": [str(self.character.pk)],
-                "props": [],
-                "reference_assets": [],
-                "reference_bindings": {},
-                "metadata": self.shot.metadata,
-            }],
-        }, format="json")
-
-        self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("高细节扩写历史", str(response.data))
-        self.assertEqual(Shot.objects.filter(episode=self.episode).count(), 2)
-        self.assertEqual(batch.items.count(), 2)
 
     def test_regular_shot_update_cannot_move_it_to_another_version(self):
         response = self.client.patch(
@@ -609,170 +527,18 @@ class ShotDetailBatchTests(TestCase):
         self.assertIsNotNone(items[0].draft_id)
         self.assertIsNotNone(items[1].draft_id)
 
-    def test_batch_apply_preflights_all_then_atomically_applies_draft_candidates(self):
+    def test_batch_detail_is_available_as_read_only_historical_evidence(self):
         batch = self._create_batch()
-        while True:
-            item = claim_next_shot_detail_item("test-worker")
-            if item is None:
-                break
-            self._process_success(item)
-        batch.refresh_from_db()
-        items = list(batch.items.select_related("draft").order_by("ordinal"))
-        payload = {
-            "expected_batch_revision": batch.revision,
-            "items": [{
-                "item_id": str(item.pk),
-                "draft_id": str(item.draft_id),
-                "expected_revision": item.draft.revision,
-            } for item in items],
-            "language_mode": "bilingual_confirmed",
-            "english_review_acknowledged": True,
-            "review_acknowledged": True,
-        }
-        response = self.client.post(
-            f"/api/v1/shot-detail-draft-batches/{batch.pk}/apply/",
-            payload,
-            format="json",
-        )
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["batch"]["apply_status"], "complete")
-        self.assertTrue(response.data["translation_written"])
-        self.assertEqual(len(response.data["applied_shots"]), len(items))
-        self.assertEqual(
-            {row["detailed_description"] for row in response.data["applied_shots"]},
-            {self.candidate()["detail_en"]},
-        )
-        for item in items:
-            item.draft.refresh_from_db()
-            item.shot.refresh_from_db()
-            self.assertEqual(item.draft.status, ShotDetailDraft.Status.APPLIED)
-            self.assertIsNotNone(item.draft.confirmed_at)
-            self.assertEqual(item.shot.detailed_description, self.candidate()["detail_en"])
-            self.assertEqual(
-                item.draft.context_hash,
-                shot_detail_context_hash(self.project, self.episode, item.shot),
-            )
-
-    def test_batch_apply_rejects_storyboard_version_membership_drift_without_writes(self):
-        batch = self._create_batch()
-        while True:
-            item = claim_next_shot_detail_item("test-worker")
-            if item is None:
-                break
-            self._process_success(item)
-        batch.refresh_from_db()
-        items = list(batch.items.select_related("draft", "shot").order_by("ordinal"))
-        original_values = {
-            item.shot_id: item.shot.detailed_description for item in items
-        }
-        Shot.objects.create(
-            episode=self.episode,
-            number=3,
-            title="版本成员变化后的第三镜",
-            narrative="这条正式镜头在批次冻结后才加入。",
-            camera="locked-off medium shot",
-            scene=self.scene,
-            duration_ms=5000,
-        )
-
-        response = self.client.post(
-            f"/api/v1/shot-detail-draft-batches/{batch.pk}/apply/",
-            {
-                "expected_batch_revision": batch.revision,
-                "items": [{
-                    "item_id": str(item.pk),
-                    "draft_id": str(item.draft_id),
-                    "expected_revision": item.draft.revision,
-                } for item in items],
-                "language_mode": "bilingual_confirmed",
-                "english_review_acknowledged": True,
-                "review_acknowledged": True,
-            },
-            format="json",
-        )
-
-        self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(response.data["code"], "shot_detail_batch_version_stale")
-        for item in items:
-            item.shot.refresh_from_db()
-            self.assertEqual(
-                item.shot.detailed_description, original_values[item.shot_id],
-            )
-            item.draft.refresh_from_db()
-            self.assertEqual(item.draft.status, ShotDetailDraft.Status.DRAFT)
-
-    def test_batch_detail_recovers_committed_apply_result_after_response_loss(self):
-        batch = self._create_batch()
-        while True:
-            item = claim_next_shot_detail_item("test-worker")
-            if item is None:
-                break
-            self._process_success(item)
-        batch.refresh_from_db()
-        items = list(batch.items.select_related("draft").order_by("ordinal"))
-        applied = self.client.post(
-            f"/api/v1/shot-detail-draft-batches/{batch.pk}/apply/",
-            {
-                "expected_batch_revision": batch.revision,
-                "items": [{
-                    "item_id": str(item.pk),
-                    "draft_id": str(item.draft_id),
-                    "expected_revision": item.draft.revision,
-                } for item in items],
-                "language_mode": "bilingual_confirmed",
-                "english_review_acknowledged": True,
-                "review_acknowledged": True,
-            },
-            format="json",
-        )
-        self.assertEqual(applied.status_code, 200, applied.data)
-
-        recovered = self.client.get(
+        before = batch.updated_at
+        response = self.client.get(
             f"/api/v1/shot-detail-draft-batches/{batch.pk}/",
         )
-        self.assertEqual(recovered.status_code, 200, recovered.data)
-        self.assertEqual(recovered.data["batch"]["apply_status"], "complete")
-        self.assertTrue(recovered.data["translation_written"])
-        self.assertEqual(
-            {row["id"] for row in recovered.data["applied_shots"]},
-            {str(item.shot_id) for item in items},
-        )
-        self.assertTrue(all(row["applied_at"] for row in recovered.data["items"]))
 
-    def test_batch_apply_revision_failure_writes_no_shot(self):
-        batch = self._create_batch()
-        while True:
-            item = claim_next_shot_detail_item("test-worker")
-            if item is None:
-                break
-            self._process_success(item)
-        batch.refresh_from_db()
-        items = list(batch.items.select_related("draft").order_by("ordinal"))
-        before = {
-            item.shot_id: Shot.objects.get(pk=item.shot_id).detailed_description
-            for item in items
-        }
-        submitted = [{
-            "item_id": str(item.pk),
-            "draft_id": str(item.draft_id),
-            "expected_revision": item.draft.revision,
-        } for item in items]
-        submitted[-1]["expected_revision"] += 1
-        response = self.client.post(
-            f"/api/v1/shot-detail-draft-batches/{batch.pk}/apply/",
-            {
-                "expected_batch_revision": batch.revision,
-                "items": submitted,
-                "language_mode": "chinese_only",
-                "review_acknowledged": True,
-            },
-            format="json",
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["batch"]["id"], str(batch.pk))
+        self.assertEqual(
+            {str(row["shot"]) for row in response.data["items"]},
+            {str(self.shot.pk), str(self.next_shot.pk)},
         )
-        self.assertEqual(response.status_code, 409, response.data)
-        for shot_id, original in before.items():
-            self.assertEqual(
-                Shot.objects.get(pk=shot_id).detailed_description, original,
-            )
-        self.assertFalse(ShotDetailDraft.objects.filter(
-            batch_item__batch=batch, status=ShotDetailDraft.Status.APPLIED,
-        ).exists())
+        batch.refresh_from_db()
+        self.assertEqual(batch.updated_at, before)

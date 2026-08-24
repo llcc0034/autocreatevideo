@@ -35,9 +35,9 @@ const refreshProjectCover = async (projectId: string) => {
   <div class="dashboard page-stack">
     <section class="hero-banner">
       <div class="hero-copy">
-        <span class="eyebrow"><Sparkles :size="13"/> MINI​MAX H3 PRODUCTION READY</span>
+        <span class="eyebrow"><Sparkles :size="13"/> REVIEWED PRODUCTION PIPELINE</span>
         <h2>{{ greeting }}，导演。</h2>
-        <p>今天继续把故事变成镜头。你的角色、场景和声音连续性已由制作圣经锁定。</p>
+        <p>今天继续把故事变成镜头。实际模型、工作流与执行能力以 ProductionRun 的已审核路由和运行快照为准。</p>
         <div class="hero-actions"><RouterLink to="/projects/new" class="button primary"><Plus :size="17"/>创建连续剧</RouterLink><RouterLink to="/workflows" class="button ghost"><Workflow :size="17"/>查看生产队列</RouterLink></div>
       </div>
       <div class="hero-reel" aria-hidden="true"><div class="reel-ring outer"><i v-for="n in 12" :key="n"></i></div><div class="reel-ring inner"><span></span><span></span><span></span><span></span></div><div class="reel-core"><Play fill="currentColor" :size="18"/></div></div>
@@ -82,7 +82,7 @@ const refreshProjectCover = async (projectId: string) => {
       <header class="panel-header"><div><span class="eyebrow">CURATED VISUAL WORLDS</span><h3>10 种热门视觉风格</h3></div><RouterLink to="/assets" class="text-link">浏览全部素材 <ArrowRight :size="14"/></RouterLink></header>
       <div class="style-strip">
         <RouterLink v-for="style in studio.styles" :key="style.id" :to="`/assets?style=${style.id}`" class="style-mini-card" :style="{background:style.gradient}">
-          <div class="style-pattern"></div><span class="style-count">{{ style.assetCounts.character + style.assetCounts.scene + style.assetCounts.prop }} ITEMS</span><div><small>{{ style.englishName }}</small><strong>{{ style.name }}</strong><p>{{ style.tags.join(' · ') }}</p></div>
+          <div class="style-pattern"></div><span class="style-count">{{ style.assetCount ?? '—' }} ITEMS</span><div><small>{{ style.englishName }}</small><strong>{{ style.name }}</strong><p>{{ style.tags.join(' · ') }}</p></div>
         </RouterLink>
       </div>
     </section>

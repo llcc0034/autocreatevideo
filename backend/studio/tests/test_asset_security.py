@@ -9,7 +9,8 @@ from django.urls import Resolver404, resolve
 from PIL import Image
 from rest_framework.test import APIClient
 
-from studio.models import Asset
+from studio.models import Asset, ConfigRevision
+from studio.services.configuration import create_config_revision, publish_config_revision
 from studio.tests.factories import build_story
 
 
@@ -30,17 +31,22 @@ class AssetSecurityTests(TestCase):
         self.override = override_settings(
             MEDIA_ROOT=self.media_root,
             ASSET_LIBRARY_ROOT=self.asset_root,
-            ASSET_UPLOAD_MAX_BYTES=1024 * 1024,
-            ASSET_TENANT_QUOTA_BYTES=10 * 1024 * 1024,
-            ASSET_IMAGE_MAX_WIDTH=1024,
-            ASSET_IMAGE_MAX_HEIGHT=1024,
-            ASSET_IMAGE_MAX_PIXELS=1024 * 1024,
         )
         self.override.enable()
         self.addCleanup(self.override.disable)
         self.user, self.project, *_ = build_story()
         self.client = APIClient()
         self.client.force_authenticate(self.user)
+
+    def _publish_limits(self, values: dict) -> None:
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values=values,
+            created_by=self.user,
+            change_summary="asset security test",
+            clone_published=True,
+        )
+        publish_config_revision(revision, published_by=self.user)
 
     def test_non_staff_cannot_claim_server_local_path(self):
         candidate = self.asset_root / "global.png"
@@ -83,16 +89,16 @@ class AssetSecurityTests(TestCase):
         }, format="multipart")
         self.assertEqual(mismatch.status_code, 400, mismatch.data)
 
-    @override_settings(ASSET_IMAGE_MAX_WIDTH=4)
     def test_image_dimensions_are_limited(self):
+        self._publish_limits({"artifact.image_max_width": 32})
         response = self.client.post("/api/v1/assets/", {
-            "kind": "reference", "name": "尺寸超限", "file": png_upload(size=(8, 8)),
+            "kind": "reference", "name": "尺寸超限", "file": png_upload(size=(64, 8)),
         }, format="multipart")
         self.assertEqual(response.status_code, 400, response.data)
         self.assertIn("图片尺寸超限", str(response.data))
 
-    @override_settings(ASSET_TENANT_QUOTA_BYTES=1)
     def test_tenant_upload_quota_is_enforced(self):
+        self._publish_limits({"artifact.tenant_quota_bytes": 1})
         response = self.client.post("/api/v1/assets/", {
             "kind": "reference", "name": "配额超限", "file": png_upload(),
         }, format="multipart")

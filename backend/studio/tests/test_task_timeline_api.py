@@ -1,10 +1,17 @@
 from datetime import datetime, timedelta, timezone as datetime_timezone
 
-from django.test import TestCase, override_settings
+from django.test import TestCase
 from django.utils import timezone
 from rest_framework.test import APIClient
 
-from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
+from studio.models import (
+    ConfigRevision,
+    GeneratedWorkflow,
+    GenerationTask,
+    PromptArtifact,
+    WorkflowTemplate,
+)
+from studio.services.configuration import create_config_revision, publish_config_revision
 from studio.tests.factories import build_story
 
 
@@ -127,10 +134,14 @@ class GenerationTaskTimelineAPITests(TestCase):
             submission_state=GenerationTask.SubmissionState.TERMINAL_FAILED,
             error_message="verified remote failure",
         )
+        retry = self.create_task(
+            status=GenerationTask.Status.QUEUED,
+            capability_snapshot={"retry_of": str(source.id)},
+        )
 
-        response = self.client.post(f"/api/v1/tasks/{source.id}/retry/", {}, format="json")
+        response = self.client.get(f"/api/v1/tasks/{retry.id}/")
 
-        self.assertEqual(response.status_code, 201, response.data)
+        self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["retry_of"], str(source.id))
         self.assertEqual(
             [item["event"] for item in response.data["timeline"]],
@@ -160,8 +171,15 @@ class GenerationTaskTimelineAPITests(TestCase):
         self.assertEqual(response.data["timeline"][-1]["event"], "attempt_failed_requeued")
         self.assertEqual(response.data["timeline"][-1]["status"], GenerationTask.Status.QUEUED)
 
-    @override_settings(TASK_STALL_THRESHOLD_SECONDS=1)
     def test_runtime_capabilities_expose_heartbeat_stall_cancel_and_reconciliation(self):
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={"runtime.task_stall_threshold_seconds": 1},
+            created_by=None,
+            change_summary="task timeline stall threshold test",
+            clone_published=True,
+        )
+        publish_config_revision(revision, published_by=None)
         task = self.create_task(
             status=GenerationTask.Status.RUNNING,
             submission_token="active-token",

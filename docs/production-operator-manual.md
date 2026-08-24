@@ -1,70 +1,64 @@
-# 视频制作操作手册
+# Production Operator Manual
 
-页面顶部显示当前手册版本与更新日期，内容结构由 `schemaVersion` 标识。
+操作员的权威逐步手册位于前端“生产手册”页面；其结构化源文件是 [frontend/src/content/productionManual.ts](../frontend/src/content/productionManual.ts)。本文只说明入口、范围和维护规则，避免形成第二套会漂移的步骤正文。
 
-启动系统并登录后，点击左侧 **操作手册**，或直接访问：
+## 使用入口
 
-```text
-http://127.0.0.1:5173/manual
-```
+1. 使用 `scripts/restart.ps1` 启动服务。
+2. 打开前端并进入“生产手册”。
+3. 按手册先完成 migrations、provider/deployment、PromptProfile 字段目录/策略/binding、workflow validation/real smoke、配置 activation 和 host readiness。
+4. 在“新建连续剧”选择空项目、导入脚本或 AI 创建。导入模式必须先核对 `ScriptSource` 预览并确认 revision；AI 模式必须显式选择外发授权、币种和预算。
+5. 有媒体阶段的运行选择整集统一 workflow 或逐镜 workflow；AI/导入时 Shot 尚未建立，先选统一 route。需要在 ComfyUI 核对工作流时，下载 `download_import` JSON 并手动导入，不期待浏览器直接打开。
+6. 在 ProductionRun 内处理 AI/结构化脚本与 Bible 审核、route、cost、候选、重试、不确定响应和交付 gate。worker 会自动继续非人工阶段，required review 必然暂停。
+7. Tasks、Deferred requests、Assemblies、ReleaseBundles 页面完全只读；所有创建、重试、取消和有序 fallback 都回到所属 ProductionRun。
+8. 最终交付检查每集 episode master 和 ReleaseBundle，不寻找整季单条长视频。
 
-页面提供：
+## 当前能力边界
 
-- 从项目创建、剧集与剧本、Bible、本地 Qwen / DeepSeek API 创作与本地翻译审核，到分镜、三类 H3 输入模式、单镜/整集生产、任务预览下载、安全重试和按集组装的完整操作；
-- Ref2VA 官方默认与两个实验执行工作流的选择、模板限定的 steps / LoRA 强度、能力预检、GPU 端到端验收边界与任务实际参数核对；
-- T8 Dual-Clock 4-Step 与 Turbo LoRA 均保持实验状态；操作页明确要求在目标环境完成 GPU 全链、稳定性、容量与画质验收；
-- 每一步的输入示例、需要点击的按钮、成功标志和下一步；
-- 可搜索的异常处理矩阵；
-- 从服务端能力接口实时读取本地 Qwen 与 DeepSeek API 的就绪状态及各自镜数策略。推荐值只触发耗时/API 用量确认；`batch_shots` 是初次生成与整稿重生成的单批规划值，不是单集或整剧总镜数上限。用户确认后仍保留原业务镜数，不会静默压缩。初次整稿和整稿重生成可沿剧本连续原文边界自动分批；对白差异按剧本原文回填，批次少返回或后续失败时保留已有可解析镜头并标为待审核。只有选镜重生成仍为携带完整旧草稿的单次协议。
-- 创作输出容量由镜数、权威对白和所选 provider 配置动态计算；相关镜数、对白、源上下文和 token 阈值均来自环境配置。超过推荐镜数只要求本次确认；预算不足时显示准确容量，并由管理员调整 provider 配置或改用具备足够能力的通道，不会伪装为模型运行失败或要求减少业务总镜数。
-- Qwen 子进程、服务端父进程与浏览器等待时长从能力接口和环境配置读取，不在手册中写死。CUDA 模式仍与 ComfyUI 共享同一把资源锁，视频任务运行时不会并发占用 GPU。
-- 整集、整剧、单任务创建与任务重试都从生产能力接口读取队列推荐值；超过推荐值只要求用户确认。取消时零写入，确认后完整创建逐镜任务；推荐值不是项目集数、镜头数或任务总量上限，也不会提高真实 worker 并发。
-- 翻译审核面板默认展开待处理、失效和失败条目，已确认译文折叠为可展开摘要；源文变更后，失效译文只读且不能确认，只能重新翻译生成候选。
-- canonical 术语表会对当前 Bible 实体按 NFKC、空白和大小写归一检查英文目标碰撞；发现 `canonical_target_collision` 时暂停保存、译文同步和生成，必须人工指定唯一英文，相关译文失效后重新翻译、确认并同步正式字段。
-- 分镜导演译文确认后会原子同步到下方正式字段；已确认但未同步的条目可一键同步。镜头标题与对白正文保持中文，撤销译文确认不会回滚正式英文。同步前的 Prompt Artifact 退出当前预览，操作员一键重新生成并复检。
-- 已应用的正式视频镜头支持独立的“逐镜高细节扩写”：只读取当前镜头、前后连续性、相关 Bible、锁定对白和全剧规则，生成最多 **500 中文字 / 750 英文字符**的双语候选。操作员须保存校验、确认候选，并明确选择“采用已审中英”或“采用中文，转上方翻译审核”。采用后扩写面板只显示摘要，避免与翻译审核重复；重新生成提示词后以右侧实际 Ref2VA detailed_description 词数复检（项目质量检查建议约 350–500 个英文词）。候选生成后的源数据变化、Qwen 资源忙、英文未核对和长度超限，均在手册异常矩阵提供恢复路径。
-- 当服务端能用 applied 草稿来源、client key 和原值逐字匹配证明 negative prompt 可安全恢复时，分镜页提供“审计并恢复负面约束”；恢复完成前保存与生产保持禁用，人工负面词不会被猜测或静默清空。
-- “全剧视觉规则”支持根据已保存故事信息生成隔离候选。三段英文文本只读；Qwen 只提出结构化色彩设计，用户通过受限枚举调整，服务端在采用时复核故事与生成指纹、渲染最终英文色彩脚本并原子保存三项规则。色彩脚本与连续性摘要始终独立。
+页面手册必须清楚区分：
 
-## 手册内容的唯一来源
+- 已实现：空项目、导入脚本与 AI 创建三种新建入口；
+- 已实现：`ScriptSource` 安全 preview → confirmed revision，以及确定性 `script.structure` no-op/文本模型结构化 preview → required review；
+- 已实现：AI script → review → deterministic Bible → review；
+- 已实现：PromptProfile 字段目录、多策略 Profile/binding 与缺少/歧义 fail-closed；
+- 已实现：Settings 类型化参数与经服务端核验的 `resource_ref` 依赖下拉；
+- 已实现：`script.generate`、`script.structure`、`prompt.normalize` 与媒体 deployment smoke 统一返回持久 `202` task，Settings 恢复/轮询终态，单提交不确定状态只允许追加管理员消歧证据；
+- 已实现：semantic Comfy workflow；
+- 已实现：ComfyUI 安全 `download_import` 导出，精确绑定 validated deployment，不伪造 direct-open；
+- 已实现：整集统一或逐镜 workflow selection；
+- 已实现：worker 终态事实提交后幂等 auto-advance，required review/成本/选择 gate 暂停；
+- 已实现：外部调用显式授权、币种/预算门禁与运行审计链；
+- 已实现：async REST T2I/T2V；
+- 已实现：managed artifact、逐集 master、ReleaseBundle；
+- 已实现：归档时从冻结事实白名单生成 GeneratedArtifact `comparison_parameters`，候选参数差异不使用 manifest 身份/hash；
+- 已实现：ProductionRecipe 发布要求完整 content → storyboard → prompt → media → selection → assembly → delivery 闭包；
+- 已实现：五层配置、new-boot activation、host probe/recommend draft；
+- 已实现：recommendation decide 由服务端复验陈旧快照、目录、配置和候选兼容性；
+- 阻断：I2V/reference upload 尚无统一 provider contract；
+- 未实现：跨节点/多 GPU scheduler；
+- 不会执行：自动下载模型、自动发布 workflow/推荐、自动激活配置；
+- 初始状态：bootstrap workflow catalog 是 `needs_review` 草案；
+- 尚无仓库证据：真实外部 provider/GPU 完整 E2E。
 
-所有面向操作员的步骤和异常恢复内容只维护在：
+catalog 或 adapter 中出现 H3/SDXL 等词不代表它是固定生产后端、已经启用或已经通过许可审查。
 
-[`frontend/src/content/productionManual.ts`](../frontend/src/content/productionManual.ts)
+## 维护
 
-本文件只提供入口和维护规则，不复制操作正文，避免页面与文档产生两个不一致版本。
+更新生产流程时，应在同一改动中同步：
 
-## 一致性规则
+- `frontend/src/content/productionManual.ts`；
+- `frontend/tests/productionManual.test.ts`；
+- 根 `openapi.yaml`（仅当 API 契约实际改变）；
+- 本页和受影响的正式文档。
 
-以下任一内容变化时，功能提交必须同步更新手册：
-
-- 页面入口、标签或按钮名称；
-- 必填字段、字段含义或推荐填写格式；
-- H3/SDXL 模式、参考输入槽位或参数范围；
-- Qwen 创作、翻译、人工确认或语言门禁状态机；
-- 单镜/整集任务、重试、取消、预览、下载或组装逻辑；
-- 错误码、失败原因或恢复路径的定义。
-
-相关功能调整时必须：
-
-1. 修改唯一内容源中的步骤或异常项；
-2. 更新当前版本标识与日期；
-3. 如有新的能力参数或推荐阈值，优先从能力 API 动态显示，不在正文重复硬编码；
-4. 执行：
+验证：
 
 ```powershell
-Set-Location .\frontend
+Push-Location frontend
 npm run test:manual
+npm run typecheck
 npm run build
+Pop-Location
 ```
 
-手册测试会检查版本、锚点、完整制作路径、三类 H3 模式、每步输入/按钮/成功标志/下一步，以及异常恢复闭环，防止功能改动遗漏操作说明。
-
-## 翻译审核范围说明
-
-项目级字段与 Bible 实体字段使用两个明确分开的审核入口：
-
-- `PROJECT`：人工填写中文时，进入 **项目总览 → 全剧视觉规则 → 项目级手工中文字段 · 本地 Qwen 译文人工审核**。先保存所有更改，再审核全剧风格视觉提示、`project.production_settings.color_script` 和 `project.continuity_summary`；“根据故事信息生成”的视觉规则候选是纯英文，只需在候选对比区人工核对并显式采用，不重复进入翻译审核；
-- `CHARACTER` / `SCENE` / `PROP`：进入 **一致性 Bible**，在对应角色、场景或道具标签页审核当前实体字段。
-
-Bible 审核列表只包含 Bible 实体条目，因此错误归属可直接按所在入口判断。失败译文不会覆盖中文原文；状态为“源文已变更”时，失效译文不会进入正式提示词。
+不得在 Markdown 中复制整份页面手册，也不得把旧路由或历史操作按钮保留为“备用入口”。

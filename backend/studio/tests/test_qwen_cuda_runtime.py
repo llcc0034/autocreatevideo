@@ -128,6 +128,9 @@ class QwenCudaCapabilityTests(SimpleTestCase):
                 "studio.services.prompt_translation.local_qwen_runtime_lock",
                 return_value=nullcontext(),
             ), patch(
+                "studio.services.prompt_translation._assert_no_active_generation_tasks",
+                return_value=None,
+            ), patch(
                 "studio.services.prompt_translation.subprocess.run", return_value=completed,
             ) as run:
                 state = qwen_runtime_device_state(config)
@@ -157,6 +160,9 @@ class QwenCudaCapabilityTests(SimpleTestCase):
             with patch(
                 "studio.services.prompt_translation.local_qwen_runtime_lock",
                 return_value=nullcontext(),
+            ), patch(
+                "studio.services.prompt_translation._assert_no_active_generation_tasks",
+                return_value=None,
             ), patch(
                 "studio.services.prompt_translation.subprocess.run", return_value=completed,
             ):

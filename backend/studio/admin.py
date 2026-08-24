@@ -1,26 +1,60 @@
 from django import forms
 from django.contrib import admin
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
+from django.contrib.admin.sites import NotRegistered
 from django.db import transaction
 
 from studio.models import (
     Asset,
+    ApprovalDecision,
+    ArtifactSelectionDecision,
     AssemblyJob,
     CharacterBible,
+    ConfigDefinition,
+    ConfigRevision,
     ConsistencyLock,
     DeferredGenerationRequest,
     Episode,
     EpisodeCreativeDraft,
+    GeneratedArtifact,
     GeneratedWorkflow,
+    GenerationAttempt,
+    GenerationAttemptResolution,
     GenerationTask,
+    HostCapabilitySnapshot,
+    ModelArtifact,
+    ModelDeployment,
+    ModelProfileVersion,
+    PlatformLifecycleAuditEvent,
     PromptArtifact,
     PromptFieldTranslation,
     PropBible,
+    ProductionAssemblyLink,
+    ProductionRecipeVersion,
+    ProductionRun,
+    ProviderProfile,
+    RecommendationCandidate,
+    RecommendationDecision,
+    RecommendationSnapshot,
+    RuntimeHost,
+    RuntimeHostProbeAttempt,
     ReleaseBundle,
     SceneBible,
+    ScriptRevision,
+    ScriptSource,
     SeriesProject,
     Shot,
+    StageRun,
+    StageRouteEvent,
     Style,
     WorkflowTemplate,
+    WorkflowTemplateVersion,
+    AccessControlAuditEvent,
+    SecretAuditEvent,
+    SecretBinding,
+    SecretVersion,
+    UserSecurityProfile,
 )
 from studio.services.script_bible import (
     ScriptBibleProvenanceProtectedError,
@@ -42,6 +76,25 @@ class ImmutableProductionAuditAdmin(admin.ModelAdmin):
 
     def has_change_permission(self, request, obj=None):
         return False
+
+
+for _auth_model in (get_user_model(), Group):
+    try:
+        admin.site.unregister(_auth_model)
+    except NotRegistered:
+        pass
+
+
+@admin.register(
+    UserSecurityProfile,
+    AccessControlAuditEvent,
+    SecretBinding,
+    SecretVersion,
+    SecretAuditEvent,
+    PlatformLifecycleAuditEvent,
+)
+class SecurityAuditAdmin(ImmutableProductionAuditAdmin):
+    pass
 
 
 class BibleAdminForm(forms.ModelForm):
@@ -152,7 +205,7 @@ class EpisodeAdmin(admin.ModelAdmin):
 
 
 @admin.register(EpisodeCreativeDraft)
-class EpisodeCreativeDraftAdmin(admin.ModelAdmin):
+class EpisodeCreativeDraftAdmin(ImmutableProductionAuditAdmin):
     list_display = (
         "episode", "generation_no", "status", "revision", "creativity", "updated_at",
     )
@@ -179,7 +232,7 @@ class PromptArtifactAdmin(ImmutableProductionAuditAdmin):
 
 
 @admin.register(PromptFieldTranslation)
-class PromptFieldTranslationAdmin(admin.ModelAdmin):
+class PromptFieldTranslationAdmin(ImmutableProductionAuditAdmin):
     list_display = (
         "project", "scope_type", "field_key", "status", "revision", "updated_at",
     )
@@ -191,7 +244,7 @@ class PromptFieldTranslationAdmin(admin.ModelAdmin):
 
 
 @admin.register(WorkflowTemplate)
-class WorkflowTemplateAdmin(admin.ModelAdmin):
+class WorkflowTemplateAdmin(ImmutableProductionAuditAdmin):
     list_display = ("name", "provider", "output_kind", "model", "version", "is_system", "is_active")
     list_filter = ("provider", "output_kind", "is_system", "is_active")
     search_fields = ("name", "slug", "description")
@@ -224,7 +277,7 @@ class DeferredGenerationRequestAdmin(ImmutableProductionAuditAdmin):
 
 
 @admin.register(AssemblyJob)
-class AssemblyJobAdmin(admin.ModelAdmin):
+class AssemblyJobAdmin(ImmutableProductionAuditAdmin):
     list_display = (
         "id", "project", "episode", "scope", "status", "attempts",
         "worker_id", "dry_run", "has_audio", "queued_at",
@@ -238,16 +291,164 @@ class AssemblyJobAdmin(admin.ModelAdmin):
 
 
 @admin.register(ReleaseBundle)
-class ReleaseBundleAdmin(admin.ModelAdmin):
+class ReleaseBundleAdmin(ImmutableProductionAuditAdmin):
     list_display = (
         "id", "project", "version", "status", "owner", "sealed_at", "released_at",
     )
     list_filter = ("status",)
     search_fields = ("project__title", "title", "manifest_sha256")
-    readonly_fields = tuple(field.name for field in ReleaseBundle._meta.fields)
+@admin.register(ProviderProfile)
+class ProviderProfileAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("key", "name", "driver_type", "is_active", "is_system", "updated_at")
+    list_filter = ("driver_type", "is_active", "is_system")
+    search_fields = ("key", "name")
 
-    def has_add_permission(self, request):
-        return False
 
-    def has_delete_permission(self, request, obj=None):
-        return False
+@admin.register(ModelProfileVersion)
+class ModelProfileVersionAdmin(ImmutableProductionAuditAdmin):
+    list_display = (
+        "profile_key", "version", "model_identifier", "modality", "provider", "status",
+    )
+    list_filter = ("modality", "status", "provider")
+    search_fields = ("profile_key", "model_identifier", "display_name")
+
+
+@admin.register(ModelDeployment)
+class ModelDeploymentAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("key", "name", "profile_version", "runtime_host", "status", "is_default")
+    list_filter = ("status", "is_default", "runtime_host")
+    search_fields = ("key", "name")
+
+
+@admin.register(ModelArtifact)
+class ModelArtifactAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("logical_name", "profile_version", "role", "filename", "status")
+    list_filter = ("role", "status")
+    search_fields = ("logical_name", "filename", "sha256")
+
+
+@admin.register(WorkflowTemplateVersion)
+class WorkflowTemplateVersionAdmin(ImmutableProductionAuditAdmin):
+    list_display = (
+        "template", "version", "provider", "status", "validation_state",
+        "smoke_test_state", "is_current",
+    )
+    list_filter = ("status", "validation_state", "smoke_test_state", "is_current")
+    search_fields = ("template__slug", "template__name")
+
+
+@admin.register(ConfigDefinition)
+class ConfigDefinitionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("key", "domain", "value_type", "is_required", "is_secret", "is_active")
+    list_filter = ("domain", "value_type", "is_required", "is_secret", "is_active")
+    search_fields = ("key", "description")
+
+
+@admin.register(ConfigRevision)
+class ConfigRevisionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("scope_type", "revision", "status", "project", "run", "published_at")
+    list_filter = ("scope_type", "status")
+
+
+@admin.register(ScriptSource)
+class ScriptSourceAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("project", "source_type", "source_format", "status", "owner", "updated_at")
+    list_filter = ("source_type", "source_format", "status")
+    search_fields = ("project__title", "original_name", "original_sha256")
+
+
+@admin.register(ScriptRevision)
+class ScriptRevisionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("source", "revision", "status", "created_by", "confirmed_at")
+    list_filter = ("status",)
+    search_fields = ("source__project__title", "content_sha256")
+
+
+@admin.register(ProductionRecipeVersion)
+class ProductionRecipeVersionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("recipe_key", "version", "name", "status", "published_at")
+    list_filter = ("status",)
+    search_fields = ("recipe_key", "name")
+
+
+@admin.register(ProductionRun)
+class ProductionRunAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("id", "project", "status", "current_stage_key", "owner", "created_at")
+    list_filter = ("status", "recipe_version")
+    search_fields = ("project__title", "idempotency_key", "blocked_code")
+
+
+@admin.register(StageRun)
+class StageRunAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("production_run", "ordinal", "stage_key", "mode", "status", "attempt_count")
+    list_filter = ("status", "mode")
+    search_fields = ("production_run__idempotency_key", "stage_key", "reason_code")
+
+
+@admin.register(ApprovalDecision)
+class ApprovalDecisionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("stage_run", "revision", "decision", "decided_by", "created_at")
+    list_filter = ("decision",)
+
+
+@admin.register(GenerationAttempt)
+class GenerationAttemptAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("stage_run", "unit_key", "attempt_number", "status", "generation_task")
+    list_filter = ("status",)
+    search_fields = ("unit_key", "provider_request_id", "request_sha256", "error_code")
+
+
+@admin.register(GenerationAttemptResolution)
+class GenerationAttemptResolutionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("attempt", "revision", "outcome", "decided_by", "created_at")
+    list_filter = ("outcome",)
+    search_fields = ("attempt__unit_key", "provider_request_id", "evidence_sha256")
+
+
+@admin.register(ArtifactSelectionDecision)
+class ArtifactSelectionDecisionAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("stage_run", "variant_group", "revision", "artifact", "selected_by")
+    search_fields = ("variant_group", "stage_run__production_run__idempotency_key")
+
+
+@admin.register(StageRouteEvent)
+class StageRouteEventAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("stage_run", "sequence", "unit_key", "route_index", "event_type", "code")
+    search_fields = ("unit_key", "code", "stage_run__production_run__idempotency_key")
+
+
+@admin.register(ProductionAssemblyLink)
+class ProductionAssemblyLinkAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("production_run", "episode", "assembly_job", "created_at")
+    search_fields = ("production_run__idempotency_key", "episode__title")
+
+
+@admin.register(GeneratedArtifact)
+class GeneratedArtifactAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("manifest_key", "production_run", "kind", "role", "status", "variant_index")
+    list_filter = ("kind", "status", "storage_backend")
+    search_fields = ("manifest_key", "object_key", "sha256")
+
+
+@admin.register(HostCapabilitySnapshot, RecommendationSnapshot)
+class PlatformSnapshotAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("id", "created_at")
+
+
+@admin.register(RecommendationCandidate, RecommendationDecision)
+class RecommendationAuditAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("id", "created_at")
+
+
+@admin.register(RuntimeHost)
+class RuntimeHostAdmin(admin.ModelAdmin):
+    list_display = ("key", "name", "status", "last_seen_at", "updated_at")
+    list_filter = ("status",)
+    search_fields = ("key", "name", "fingerprint_sha256")
+
+
+@admin.register(RuntimeHostProbeAttempt)
+class RuntimeHostProbeAttemptAdmin(ImmutableProductionAuditAdmin):
+    list_display = ("id", "host", "trigger", "status", "created_at", "finished_at")
+    list_filter = ("trigger", "status")
+    search_fields = ("id", "host__key", "worker_id", "error_code")

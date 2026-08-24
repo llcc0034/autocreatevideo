@@ -1,165 +1,103 @@
-# MVP 业务需求
+# MVP Requirements
 
-## 1. 产品目标
+## 产品目标
 
-AutoPrompt Studio 是面向 MiniMax H3 的连续短剧制作台。产品把项目策划、连续性设定、分镜、提示词、ComfyUI 工作流、GPU 任务、镜头产物和 FFmpeg 成片连接为可审核、可恢复的生产链路。
+MVP 为单人或早期团队提供一条可追踪、可审核、失败可恢复的逐集媒体生产链路。验收对象是 ProductionRun、受管产物、逐集母版和 ReleaseBundle，不是某个固定模型、固定节点 ID 或单台 GPU。
 
-MVP 面向在自有工作站或受控服务器上制作连续短剧的创作者与制作人员，重点解决：
+## 角色
 
-- 以项目、剧集和镜头组织长期内容；
-- 用人物、场景、道具 Bible 保持跨镜头连续性；
-- 对模型生成的创意、翻译和扩写候选实施人工确认；
-- 生成 MiniMax H3 视频和 SDXL 图片，跟踪真实任务状态；
-- 按镜头顺序装配单集或整剧 MP4；
-- 在多用户环境中隔离业务数据、上传素材和产物访问。
+- 内容操作员：维护脚本、Bible、镜头并完成内容审核。
+- 生产操作员：创建 ProductionRun，处理路由、成本、候选和异常 gate。
+- 平台操作员：维护 provider、deployment、workflow、configuration 和 runtime host。
+- 审核/交付角色：验证逐集母版与 ReleaseBundle。
 
-## 2. 用户与租户
+同一人可承担多个角色，但状态和审计边界仍需保留。
 
-- 一个 Django 用户账号是一个业务租户边界。Project、用户素材、候选、提示词、工作流、任务、装配和发行清单均通过 `owner` 或所属 Project 归属用户。
-- 普通用户只能访问自己的业务对象，以及只读的全局 Style、Asset 和已启用系统 WorkflowTemplate；不能执行用户自定义 ComfyUI 图。
-- staff 可管理全局资源并执行管理职责。MVP 不定义组织、团队、项目成员或细粒度岗位角色。
-- API 默认要求 JWT；访问令牌有效期 30 分钟，刷新令牌有效期 14 天并轮换。
-- 公开注册默认关闭，账号由管理员创建；显式启用注册时仍受限流控制。
-- 上传素材使用用户隔离目录，并受文件类型、实际解码、尺寸、时长、单文件大小、请求频率和租户总配额约束。
+## 必须实现的生产链路
 
-## 3. 业务对象
+1. 项目拥有已确认脚本，或由 ProductionRun 进入 AI 脚本路径。
+2. AI 脚本必须先审核；Bible 由确认脚本确定性生成后单独审核。
+3. storyboard、route、cost、recipe、workflow 和 config snapshot 在生产前锁定。
+4. 所有新生产从 ProductionRun 创建并按 gate 推进。
+5. 媒体输出归档为 managed artifact 并记录 attempt/provenance。
+6. 每个 episode 生成独立 master。
+7. ReleaseBundle 聚合并验证逐集母版。
 
-### 3.1 Project
+Task、DeferredGenerationRequest、Assembly、ReleaseBundle 只用于完全只读诊断。创建、重试、取消与有序 fallback 只允许通过所属 ProductionRun，不存在任务级例外。
 
-`SeriesProject` 是生产根对象，保存标题、梗概、总剧本、语言、画幅、宽高、帧率、默认镜头时长、连续性种子、风格、可选封面素材和生产设置。项目包含任意数量的 Episode、Bible、ConsistencyLock、PromptArtifact、GeneratedWorkflow、GenerationTask 和 AssemblyJob。
+可发布 ProductionRecipe 必须包含唯一正式 content 入口，以及完整有序的 content → storyboard → prompt → media → selection → assembly → delivery 闭包。
 
-项目入口先展示当前用户的连续剧列表与简介，并提供收藏、删除和“基于此项目重做”管理操作。收藏是用户账号下的持久属性；删除会级联移除数据库内的项目从属记录，任务与装配指向的物理产物按存储保留和清理策略另行处置；活动生成/装配任务、未终结远端提交或受保护发行证据存在时必须拒绝。“基于此项目重做”创建新的独立草稿，仅复制故事基础与生产规格，不复制 Bible、剧集、任务或产物，也不自动提交 GPU 任务。
+## 工作流与执行器
 
-用户可在新建页或项目工作室上传、替换和移除项目封面。封面仅接受经服务端实际解码验证的 JPEG、PNG 或静态 WebP，沿用素材单文件/尺寸/像素/租户配额限制；入库前按 EXIF 方向归一化并重新编码以剥离 EXIF/GPS 等原始元数据，再通过短期签名 URL 展示在项目列表、制作总览和项目详情。专用封面按项目与租户绑定，不出现在通用素材库，也不能作为 Bible、分镜或生成输入；替换、移除或删除项目后，仅在无其他受保护引用时清理其数据库记录与物理文件。“基于此项目重做”不继承封面。
+MVP 必须支持：
 
-用户可在素材详情中更正自有分类图片的人物、场景或道具类别，并经名称确认后删除未使用素材。已被连续剧封面、Bible、分镜、活动生成任务或发行记录引用的素材必须先解除引用或等待任务终结，系统不得静默解绑或删除审计证据。
+- 以 semantic inputs/outputs 绑定 Comfy workflow；
+- workflow graph validation；
+- real smoke evidence 后显式 publish；
+- async REST T2I；
+- async REST T2V；
+- 外部结果归档与媒体校验。
 
-### 3.2 Episode
+bootstrap workflow catalog 必须保持 inactive draft、\`needs_review\`，直到操作员完成绑定、验证和真实 smoke。
 
-`Episode` 按项目内唯一集号排序，保存标题、梗概、剧本、跨集连续性说明和提示词设置。状态覆盖草稿、待生成、生成中、待审核和完成；只有成功的单集装配才能把剧集标记为完成。
+I2V/reference image 不得假装支持。没有 provider-specific upload contract 时必须以 \`provider_upload_contract_missing\` 阻断。当前不要求跨节点或多 GPU scheduler。
 
-### 3.3 Shot
+## 配置与运行主机
 
-`Shot` 按剧集内唯一镜号排序，可为视频或图片，保存叙事、逐镜高细节描述、动作、运镜、对白、音效、音乐、时长、音频开关、H3 模式、关联 Bible 和显式参考素材绑定。
+MVP 的有效配置由五层组成：model version default、workflow version default、active system revision、active project revision、active run override。ProductionRun 冻结最终 snapshot；restart-required revision 需要 pending 状态、新 boot identity 和显式 activation。
 
-- 图片镜头进入本地 SDXL 文生图链路；Bible 只提供文字连续性锚点，不冒充像素参考输入。
-- 视频镜头进入 MiniMax H3 链路；首帧、尾帧、人物、场景、道具、参考视频和参考音频的语义必须由 `reference_bindings` 明确表达，不能从素材列表猜测。
+RuntimeHost 必须能 probe 实际能力并生成 recommendation draft。decide 必须由服务端复验 host snapshot、catalog/config hash 与候选当前兼容性并拒绝陈旧推荐。推荐不能自动下载模型、伪造 deployment、发布 workflow 或激活配置。
 
-### 3.4 Bible 与连续性锁
+## 数据与产物
 
-- CharacterBible 保存稳定 speaker ID、身份、外观、服装、声线和性格；项目内 slug 与 speaker ID 唯一。
-- SceneBible 保存地点、时段、光线、色彩和环境声；项目内 slug 唯一。
-- PropBible 保存材质、识别特征和连续性状态；项目内 slug 唯一。
-- Bible 可绑定锚点素材与参考素材。锁定状态下必须先解锁才能修改影响连续性的字段。
-- `ConsistencyLock` 固化生产规格、视觉风格、人物/场景/道具身份及版本号。
-- 项目级 `<Picture N>` 与 `<Subject N>` 槽位保持稳定；已分配槽位不因后续素材增加而重排。
+- PostgreSQL 是结构化事实源，Django migration 是唯一 Schema 历史。
+- generation、text、async-media 与 assembly 队列状态均持久化在数据库；worker 通过 claim/lease 领取，不能另建第二套消息队列事实。
+- 原始输入、生成输出和 master 使用受管存储。
+- 远端 URL 必须归档后才能成为 production artifact。
+- \`comparison_parameters\` 必须在归档时从冻结运行事实白名单生成；参数差异不得使用 manifest 身份、对象键或 hash。
+- episode master 必须记录 source items 与 provenance。
+- ReleaseBundle 不把整季拼成单条长视频。
 
-## 4. 创意候选与人工确认
+## 安全与审计
 
-模型输出只能作为候选，不能绕过人工操作直接成为正式生产数据。
+- credential 由 SecretBinding 关联不可变 SecretVersion；原值以 AES-256-GCM 加密入库，普通读取只返回 configured/usable state。
+- API、前端、日志、文档和审计正文不得回显秘密。
+- 超级管理员独占用户角色、状态、临时密码、权限审计和 SecretBinding 写入；临时密码首次登录必须修改并使旧 token 失效。
+- workflow JSON、远端地址、文件类型和大小必须校验。
+- 状态变更必须可审计，并对重复提交、lease 过期和外部不确定响应提供显式处理。
+- 失败、部分成功、等待审核和阻断不得降级为成功。
 
-- 新建项目前可根据用户的故事想法，通过本地 Qwen 或 DeepSeek 生成项目名、梗概和兼容母稿的瞬态候选。生成接口不得预建 Project 或写任何正式数据；模型只返回结构化 IR，服务端按权威拆解语法确定性渲染母稿。计划集数和每集镜数不设任意产品上限，页面在提交前展示非精确资源估算；当前模型配置的 context/output 建议值只用于提示，不阻断、截断或自动分批本次业务请求。用户可配置单集时长，默认 60 秒；模型逐镜建议当前生产范围内的时长，服务端保证每集镜头总时长不超过该预算。候选可编辑，用户显式填入表单后，仍只有既有项目创建接口可以正式写入。
-- 剧集创意草稿根据现有 Project、Episode、剧本、Bible 和术语表生成隔离的分镜候选。生成和确认不写入正式 Shot；只有上下文指纹仍匹配、校验通过且人工确认后的显式应用，才事务性写入正式分镜。
-- 逐镜高细节扩写只针对一个正式视频 Shot。候选可编辑，确认后仍需显式应用，且只写入该镜头的 `detailed_description` 及对应确认记录。
-- 整集高细节扩写为上述单镜服务的持久编排：按镜冻结源指纹、串行生成并保留逐镜成功/失败；推荐镜数只触发时间/成本确认，不限制单集或整剧镜数。整集应用可从 draft/confirmed 一键确认应用，但必须全部预检通过并原子写入，任一镜头失败或陈旧时零写。
-- 翻译候选按字段保存源文哈希、上下文哈希、修订和状态。只有人工确认且源文、术语表和身份上下文仍匹配的译文可以进入提示词编译器；源数据不匹配时生产门禁重新阻止入队。
-- 全剧视觉规则候选生成时不改 Project；显式应用会锁定项目、复核上下文指纹，并只更新允许的视觉规则字段。
-- 素材 Bible 候选只读取已保存的文字元数据，不读取图片像素，也不创建 Bible 记录；用户审核后通过正式表单保存。
-- 翻译与既有剧集创作草稿的全局默认候选通道仍是本地 Qwen；新建连续剧的故事基础候选使用独立的模型适用性配置，当前默认优先展示 DeepSeek，并把本地 4B 标为实验级。页面在提交前明确展示实际所选通道及外部数据发送提示；用户可显式改选，失败不切换到其他通道。
+## 操作入口
 
-## 5. H3 输入模式与视频模板
+- 页面：项目内容、ProductionRun、平台设置、工作流版本、生产手册。
+- API：根 \`openapi.yaml\` 声明的 \`/api/v1/\` 路由。
+- 服务管理：首次安装使用 \`scripts/setup.ps1\`，日常启动/重启使用 \`scripts/restart.ps1\`；当前没有独立的本地停止脚本。
+- Schema：Django migrations。
+- 机器 API 契约：根 \`openapi.yaml\`，动态 \`/api/schema/\` 同源。
+- demo：仅显式 \`seed_data --with-demo-project\`。
 
-系统支持五种有效视频输入模式：
+## MVP 非目标
 
-| 模式 | 输入约束 | 有效行为 |
-| --- | --- | --- |
-| T2VA | 不连接参考素材 | 纯文本生成带可选原生音频的视频 |
-| I2VA | 只绑定首帧 | 以首帧约束视频起点 |
-| L2VA | 只绑定尾帧 | 以尾帧约束视频终点 |
-| FL2VA | 同时绑定不同的首帧和尾帧 | 同时约束起点与终点 |
-| Ref2VA | 0–9 张分类图片、0–3 个参考视频、0–3 个独立音频；每个视频可使用内嵌音轨或一条外部配对音轨 | 按实际选择动态连接图片、视频和音频输入 |
+- 自动下载或安装任意模型；
+- 自动发布 workflow 或自动激活推荐；
+- provider 通用 reference upload 猜测；
+- 跨节点、多 GPU、抢占式 scheduler；
+- 整季单条长视频；
+- 用 catalog 条目声称模型已部署或许可已确认；
+- 用 mocked test 代替真实 provider/GPU E2E。
 
-制作界面提供文生视频、首尾帧生视频和参考生视频三个入口。首尾帧入口根据实际 0/1/2 个槽位得到 T2VA、I2VA/L2VA 或 FL2VA；未选择的槽位不得生成空节点或空连接。
+## 验收标准
 
-系统启用五份 H3 视频模板：
+代码级验收应覆盖 ProductionRun 状态机、AI script/Bible 审核、semantic compiler、async T2I/T2V、上传契约阻断、managed artifact、逐集 master、ReleaseBundle、五层配置、boot activation、host probe/recommend 和旧写入口拒绝。
 
-| 模板 slug | 覆盖模式 | 定位与验收边界 |
-| --- | --- | --- |
-| `minimax-h3-base-video` | T2VA | 官方 I2V 图的安全审核 API 等价图，以零帧方式执行纯文生视频；默认模板 |
-| `minimax-h3-first-last-video` | I2VA、L2VA、FL2VA，并按空槽得到 T2VA | 首尾帧模板；只连接实际绑定的首帧和尾帧；默认模板 |
-| `minimax-h3-reference-video` | Ref2VA | 官方 Ref2VA 安全审核 API 等价图，固定 20 steps；默认模板 |
-| `minimax-h3-r2v-t8-dual-clock-4step` | Ref2VA | 实验模板；默认 4 steps，可配置 1–20 steps 与 0–2.2 LoRA 强度；具备静态图、实时节点/模型可见性和参数契约验证；需在目标环境完成 GPU 端到端、稳定性、容量与画质验收 |
-| `minimax-h3-r2v-turbo-lora` | Ref2VA | 实验模板；默认 10 steps，可配置 1–20 steps 与 0–2.2 LoRA 强度；具备静态图、实时节点/模型可见性和参数契约验证；需在目标环境完成 GPU 端到端、稳定性、容量与画质验收 |
+环境级验收还必须在目标机器补齐：
 
-模板选择必须与媒体类型和 H3 模式兼容；显式选择不兼容模板、缺少节点/模型或参数越界时直接拒绝，不得静默切换模板。两个实验模板不得显示为稳定生产能力，也不得用能力预检代替 GPU 产物验收。
+- migrations/check 通过；
+- provider 授权真实可用；
+- deployment probe 与 real smoke 通过；
+- T2I/T2V submit/poll/archive 完成；
+- artifact 校验与逐集装配完成；
+- ReleaseBundle verify 通过；
+- 备份恢复演练成功。
 
-## 6. 生产链路
-
-生产记录按以下链路建立：
-
-`Shot/Bible → PromptArtifact → GeneratedWorkflow → GenerationTask → Output`
-
-1. `PromptArtifact` 保存实际提示词、结构化负载、连续性快照、输入指纹、内容哈希和修订号。视频使用 H3 官方结构，图片使用 SDXL 提示词结构。
-2. `GeneratedWorkflow` 绑定一个 PromptArtifact 和一个版本化 WorkflowTemplate，保存已注入变量、可执行 API 图和内容哈希。
-3. `GenerationTask` 冻结工作流、模板版本、种子、分辨率、有效帧数/时长、实际条件模式、参考输入摘要和能力快照，并进入持久队列。
-4. worker 在提交前安全暂存已授权素材，使用实时 `/object_info` 验证节点、输入、输出槽、连接类型、数值范围和模型枚举，再向 ComfyUI `/prompt` 提交。
-5. 成功任务保存 ComfyUI 返回的输出列表，并为每个可用产物封存来源清单与 SHA-256。图片产物可显式复制为当前用户的可复用素材；视频产物可进入装配。
-
-含待处理中文导演字段且语言门禁为 `block` 时，PromptArtifact 可以预览，GeneratedWorkflow 可以规划，但 GenerationTask 不得入队。对白、歌词和屏显文字按受保护块保留创作者指定语言。
-
-## 7. 队列、Worker、ComfyUI 与 FFmpeg
-
-- 生成队列由数据库持久化，使用数据库互斥记录完成容量检查和领取；同一 GPU 默认只允许一个运行中的生成任务。
-- 生成 worker 独立于 API 和浏览器运行。关闭或刷新页面不影响已入队任务。
-- 生成 worker 与本地 Qwen 使用同一跨进程资源锁，避免同时占用受限工作站内存/GPU 资源。
-- 任务支持排队、运行、成功、失败、取消中和已取消状态，并保存心跳、远端状态、进度来源、尝试次数和错误。
-- 装配使用独立的持久 AssemblyJob 与 assembly worker。FFmpeg 按镜头顺序统一画幅和 24 fps，为无音轨镜头补等长静音，输出 H.264/AAC MP4，并可写入 AI 生成标识和元数据。
-- 单集和整剧装配只能选择覆盖全部目标视频镜头的成功任务。输出文件写入用户/项目隔离目录，并生成可验证的来源清单。
-
-## 8. 幂等、不可变与恢复
-
-- PromptArtifact 和 GeneratedWorkflow 通过只读 API 暴露；输入变化产生新的提示词修订和工作流记录，不在后台改写已生成记录。
-- 复用 PromptArtifact 时必须同时匹配输入指纹版本、编译器版本、分镜集合、连续性快照、参考绑定、负面提示词和提示词内容哈希。
-- 整集、单集选区和整剧生产使用 `idempotency_key` 保护完整批次；`enqueue=true` 且解析后包含多个生产单元时 API 必填，单生产单元可省略，正式批量页面始终提供。相同键与相同请求指纹返回同一批子任务；相同键对应不同输入时拒绝请求。
-- 每个 ComfyUI 提交 ID 在调用 `/prompt` 前持久化，并与服务端返回 ID 核对。提交结果不确定时保留该 ID、阻止自动重复提交，并暂停领取可能造成重复 GPU 工作的后续任务，直到完成远端核对。
-- worker 恢复时：无提交 ID 的失联领取可重新排队；远端队列或记录中仍存在同一 ID 时重新接续；无法确认远端结果时标记失败并禁止自动重投；健康的 ComfyUI 明确报告 ID 不存在时终结该 ID，并仅允许显式创建重试任务。
-- 手工重试只针对失败或取消且没有成功输出的任务，创建一条引用来源任务的新任务；远端仍在运行或已有成功结果时拒绝重试。
-- 装配使用源任务、镜头顺序、输入文件哈希和输出参数形成 `source_signature`，复用相同的排队、运行或有效成功作业。FFmpeg 写入领取令牌专属临时文件，成功后原子替换目标；失联作业依据最终文件和来源清单决定完成、重排或失败。
-- 终态任务记录只有在不属于成功装配、封存发行证据且目标镜头存在其他成功产物时才允许删除；物理产物和上游审计对象不随该操作删除。
-
-## 9. 安全与外部网络边界
-
-- 普通 API 使用 JWT 和租户过滤；跨租户对象不得通过 ID 直接访问。
-- 浏览器媒体通过短期签名 `/api/v1/media/{token}/` 获取。令牌绑定用途、对象和 owner 并设有效期；服务端仍需核对对象状态、允许根目录、来源清单和文件哈希。裸 `/media/` 与 ComfyUI 输出目录不是公开入口。
-- 非 staff 不能提交服务端 `local_path`。所有路径在访问前解析并验证位于素材库、用户上传目录、ComfyUI 输出目录或用户/项目装配目录；装配文件名不能包含路径。
-- 普通用户只能执行已启用的全局系统模板。执行图必须通过节点白名单、图结构校验和实时 ComfyUI 契约预检。
-- ComfyUI 默认只允许 loopback 地址；使用远端地址必须显式授权并在网络层限制访问。
-- H3 提示词优化器默认关闭。远端优化器只允许 HTTPS，且必须同时配置 API key 和非 loopback 授权；人物、场景、动作、镜头和声音描述会发送给所选服务，受保护的对白、歌词和屏显文字以不可读占位符传输。
-- DeepSeek API 只接受显式按次选择，会发送完成候选所需的提示词和项目上下文；密钥只存在于后端环境，失败不切换通道。
-- 系统不在本地失败时静默调用收费 Partner API。生产 Web 入口由可信 TLS 反向代理提供，应用与 Nginx 只暴露受控端口。
-
-## 10. 非目标
-
-- 不提供组织/团队成员管理、审批流或项目级角色矩阵。
-- 不提供多 GPU 调度、跨节点集群编排、弹性扩缩容或吞吐承诺。
-- 不提供模型训练、LoRA 训练、模型权重分发或第三方许可证授权。
-- 不提供完整非线性剪辑、专业调色、混音或人工质检替代能力。
-- 不自动采用模型创意、翻译、视觉规则、Bible 候选或发行选择。
-- 不把静态节点/模型探测视为内容质量、长期稳定性或 GPU 端到端验收。
-- 不为两个实验 Ref2VA 模板声明稳定生产可用性。
-- 不在外部服务失败时执行未授权的数据外发、模板降级或付费 API 回退。
-
-## 11. MVP 验收条件
-
-1. 用户可登录并从连续剧列表查看简介和封面，进入、新建、上传/替换/移除封面、收藏、重做或安全删除自己的 Project，并完整操作自己的 Episode、Shot、Bible、素材、提示词、任务和装配；普通用户不能读取或修改其他用户对象。
-2. 用户可锁定 Bible 并生成稳定的 speaker ID、Picture/Subject 槽位和版本化连续性快照；锁定字段不能被直接改写。
-3. 剧集创意、逐镜扩写、翻译、视觉规则和素材 Bible 候选在人工操作前不写入对应正式字段；上下文不匹配的候选不能确认或应用。
-4. 五种有效 H3 输入模式均执行严格的参考绑定规则；未选输入不接线，重复素材、冲突槽位、超限或跨租户素材被拒绝。
-5. 五份视频模板可被正确枚举和匹配；官方默认模板接受对应模式，两个实验模板明确显示实验状态与目标环境 GPU 验收边界。
-6. 提示词、工作流和任务保存内容哈希与输入快照；不新鲜 PromptArtifact、语言门禁失败、模板不兼容和实时 ComfyUI 契约失败均在 GPU 提交前阻止生产。
-7. 整集、单集选区和整剧相同幂等键重放不创建重复任务；ComfyUI 提交不确定时不重复 POST；失败任务重试保留来源任务并创建独立任务。
-8. worker 重启能够接续可确认的远端任务，无法确认时停止自动重投；配置的全局待处理数与单用户活动数是推荐阈值，超过时要求用户二次确认后仍完整创建业务任务，实际并发继续按 worker 与队列配置执行，不裁剪任务。
-9. 成功产物具备可验证 SHA-256 与来源清单，签名链接过期、篡改、owner 不匹配、文件越界或文件内容不匹配时拒绝访问。
-10. FFmpeg 可按镜头顺序完成单集和整剧装配；相同来源签名不重复执行，失联作业可安全恢复且不覆盖既有文件。
-11. 标准检查覆盖数据库迁移、后端测试、前端测试与构建、OpenAPI、素材哈希、部署安全不变量和依赖审计。目标环境还需完成真实 TLS、PostgreSQL、备份恢复、ComfyUI、GPU 和 FFmpeg 验收。
-12. T8 Dual-Clock 4-Step 与 Turbo LoRA 的 MVP 接受条件是保持实验标识和生产声明限制；每个目标环境必须独立完成 GPU 全链、稳定性、容量与画质验收。
+没有这些证据时，只能声明“实现了契约与流程”，不能声明真实外部 provider/GPU 生产就绪。

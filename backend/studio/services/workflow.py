@@ -7,9 +7,11 @@ import math
 import os
 import re
 
-from django.conf import settings
-
 from studio.models import PromptArtifact, SeriesProject, WorkflowTemplate
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    video_shot_duration_policy,
+)
 from studio.services.resolution import (
     H3_RESOLUTION_MULTIPLE_DEFAULT,
     H3_RESOLUTION_PROFILES,
@@ -20,10 +22,6 @@ from studio.services.resolution import (
 
 
 PLACEHOLDER = re.compile(r"\$\{([A-Z0-9_]+)\}")
-H3_MIN_REQUEST_DURATION_MS = settings.VIDEO_SHOT_MIN_DURATION_MS
-H3_MAX_REQUEST_DURATION_MS = settings.VIDEO_SHOT_MAX_DURATION_MS
-H3_MIN_ALIGNED_FRAMES = settings.H3_MIN_ALIGNED_FRAMES
-H3_MAX_ALIGNED_FRAMES = settings.H3_MAX_ALIGNED_FRAMES
 
 # The API prompt is data, but a Comfy workflow is executable configuration.
 # Keep the approved surface deliberately small and review additions here before
@@ -439,6 +437,8 @@ def build_workflow(
     prompt: PromptArtifact,
     project: SeriesProject,
     overrides: dict | None = None,
+    *,
+    video_duration_policy: dict[str, int] | None = None,
 ) -> tuple[dict, dict, str]:
     if not template.is_active:
         raise WorkflowBuildError("工作流模板已停用")
@@ -483,10 +483,23 @@ def build_workflow(
     fps = 24 if is_h3 else int(overrides.get("FPS", project.fps))
     duration_ms = int(overrides.get("DURATION_MS", prompt.total_duration_ms))
     is_h3_video = is_h3 and prompt.prompt_type == "video"
-    if is_h3_video and not H3_MIN_REQUEST_DURATION_MS <= duration_ms <= H3_MAX_REQUEST_DURATION_MS:
+    if is_h3_video and video_duration_policy is None:
+        try:
+            video_duration_policy = video_shot_duration_policy(project=project)
+        except ConfigurationResolutionError as exc:
+            raise WorkflowBuildError(str(exc)) from exc
+    minimum_duration_ms = (
+        int(video_duration_policy["minimum_duration_ms"])
+        if video_duration_policy is not None else 0
+    )
+    maximum_duration_ms = (
+        int(video_duration_policy["maximum_duration_ms"])
+        if video_duration_policy is not None else 0
+    )
+    if is_h3_video and not minimum_duration_ms <= duration_ms <= maximum_duration_ms:
         raise WorkflowBuildError(
             "MiniMax H3 单次工作流请求时长必须在 "
-            f"{H3_MIN_REQUEST_DURATION_MS}–{H3_MAX_REQUEST_DURATION_MS}ms。"
+            f"{minimum_duration_ms}–{maximum_duration_ms}ms。"
         )
     resolution_profile = str(overrides.get("RESOLUTION_PROFILE", "project"))
     if resolution_profile not in H3_RESOLUTION_PROFILES:
@@ -526,10 +539,12 @@ def build_workflow(
         else 1
     )
     effective_duration_ms = round(frames * 1000 / fps) if prompt.prompt_type == "video" else 0
-    if is_h3_video and not H3_MIN_ALIGNED_FRAMES <= frames <= H3_MAX_ALIGNED_FRAMES:
+    minimum_aligned_frames = h3_aligned_frames(minimum_duration_ms) if is_h3_video else 0
+    maximum_aligned_frames = h3_aligned_frames(maximum_duration_ms) if is_h3_video else 0
+    if is_h3_video and not minimum_aligned_frames <= frames <= maximum_aligned_frames:
         raise WorkflowBuildError(
             "MiniMax H3 帧数对齐结果超出 "
-            f"{H3_MIN_ALIGNED_FRAMES}–{H3_MAX_ALIGNED_FRAMES} 帧安全范围"
+            f"{minimum_aligned_frames}–{maximum_aligned_frames} 帧范围"
         )
     required_dimension_multiple = schema.get("required_dimension_multiple")
     if required_dimension_multiple is not None:
@@ -574,7 +589,7 @@ def build_workflow(
         ),
         "H3_SAFE_DURATION": (
             not is_h3
-            or H3_MIN_REQUEST_DURATION_MS <= duration_ms <= H3_MAX_REQUEST_DURATION_MS
+            or minimum_duration_ms <= duration_ms <= maximum_duration_ms
         ),
         # Backward-compatible fallback for older reviewed H3 definitions. New
         # system templates declare and validate this through user_parameters.

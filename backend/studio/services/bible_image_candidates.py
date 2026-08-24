@@ -400,6 +400,7 @@ def create_bible_image_candidate(
         task_owner = project.owner
         assert_queue_capacity(
             task_owner,
+            project=project,
             extended_generation_confirmed=extended_generation_confirmed,
         )
         quality = result.payload.get("quality") or {}

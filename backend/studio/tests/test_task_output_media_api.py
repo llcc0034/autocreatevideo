@@ -9,15 +9,7 @@ from django.utils import timezone
 from rest_framework.test import APIClient
 
 from studio.media_signing import signed_media_token
-from studio.models import (
-    Asset,
-    CharacterBible,
-    GeneratedWorkflow,
-    GenerationTask,
-    PromptArtifact,
-    SeriesProject,
-    WorkflowTemplate,
-)
+from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
 from studio.services.h3_prompts import (
     H3PromptOptions,
     build_consistent_image_prompt,
@@ -54,7 +46,9 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         result = (
             build_consistent_image_prompt(self.project, self.shot)
             if kind == "image"
-            else build_h3_video_prompt(self.project, [self.shot], H3PromptOptions())
+            else build_h3_video_prompt(
+                self.project, [self.shot], H3PromptOptions(language_gate_mode="warn"),
+            )
         )
         prompt = PromptArtifact.objects.create(
             project=self.project, episode=self.episode, shot=self.shot, created_by=self.user,
@@ -134,138 +128,6 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(download.status_code, 200)
         self.assertTrue(download["Content-Disposition"].startswith("attachment;"))
         download.close()
-
-    def test_generated_image_can_be_idempotently_saved_to_reusable_asset_library(self):
-        path = self.output_root / "episode-1" / "continuity-frame.png"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"generated-image-bytes")
-        task = self._task([{
-            "kind": "images", "filename": path.name,
-            "subfolder": "episode-1", "type": "output",
-        }], kind="image")
-        url = f"/api/v1/tasks/{task.id}/promote-output-to-asset/"
-        asset_count_before = Asset.objects.filter(owner=self.user).count()
-
-        created = self.client.post(url, {"output_index": 0, "name": "凌霜连续性定帧"}, format="json")
-
-        self.assertEqual(created.status_code, 201, created.data)
-        self.assertEqual(created.data["kind"], Asset.Kind.OUTPUT_IMAGE)
-        self.assertEqual(created.data["name"], "凌霜连续性定帧")
-        asset = Asset.objects.get(pk=created.data["id"])
-        self.assertEqual(asset.owner, self.user)
-        self.assertTrue(Path(asset.file.path).is_file())
-        self.assertEqual(Path(asset.file.path).read_bytes(), path.read_bytes())
-        task.refresh_from_db()
-        self.assertEqual(task.outputs[0]["promoted_asset_id"], str(asset.id))
-
-        repeated = self.client.post(url, {"output_index": 0}, format="json")
-        self.assertEqual(repeated.status_code, 200, repeated.data)
-        self.assertEqual(repeated.data["id"], str(asset.id))
-        self.assertEqual(
-            Asset.objects.filter(owner=self.user).count(), asset_count_before + 1,
-        )
-
-    def test_generated_image_can_be_saved_as_classified_ref2va_entity_reference(self):
-        path = self.output_root / "episode-1" / "character-reference.png"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"generated-character-reference")
-        task = self._task([{
-            "kind": "images", "filename": path.name,
-            "subfolder": "episode-1", "type": "output",
-        }], kind="image")
-        character = self.project.characters.get()
-        original_anchor_id = character.anchor_asset_id
-        url = f"/api/v1/tasks/{task.id}/promote-output-to-asset/"
-        payload = {
-            "output_index": 0,
-            "name": "林默新定妆",
-            "reference_category": Asset.Kind.CHARACTER,
-            "entity_id": str(character.id),
-        }
-
-        created = self.client.post(url, payload, format="json")
-
-        self.assertEqual(created.status_code, 201, created.data)
-        self.assertEqual(created.data["kind"], Asset.Kind.CHARACTER)
-        asset = Asset.objects.get(pk=created.data["id"])
-        character.refresh_from_db()
-        self.assertEqual(character.anchor_asset_id, original_anchor_id)
-        self.assertTrue(character.reference_assets.filter(pk=asset.id).exists())
-        self.assertEqual(asset.metadata["reference_category"], Asset.Kind.CHARACTER)
-        self.assertEqual(asset.metadata["reference_entity_id"], str(character.id))
-        self.assertEqual(
-            asset.metadata["generated_from"]["reference_category"],
-            Asset.Kind.CHARACTER,
-        )
-        self.assertEqual(
-            asset.metadata["generated_from"]["entity_id"], str(character.id),
-        )
-        task.refresh_from_db()
-        self.assertEqual(task.outputs[0]["promoted_asset_target"], {
-            "reference_category": Asset.Kind.CHARACTER,
-            "entity_id": str(character.id),
-        })
-
-        repeated = self.client.post(url, payload, format="json")
-        self.assertEqual(repeated.status_code, 200, repeated.data)
-        self.assertEqual(repeated.data["id"], str(asset.id))
-
-        changed_target = self.client.post(url, {
-            "output_index": 0,
-            "reference_category": Asset.Kind.SCENE,
-            "entity_id": str(self.project.scenes.get().id),
-        }, format="json")
-        self.assertEqual(changed_target.status_code, 400, changed_target.data)
-        self.assertIn("不能把同一次保存", str(changed_target.data))
-
-    def test_classified_output_promotion_rejects_incomplete_or_foreign_entity_target(self):
-        path = self.output_root / "classified-invalid.png"
-        path.write_bytes(b"classified-invalid")
-        task = self._task([{
-            "kind": "images", "filename": path.name, "subfolder": "", "type": "output",
-        }], kind="image")
-        url = f"/api/v1/tasks/{task.id}/promote-output-to-asset/"
-
-        incomplete = self.client.post(url, {
-            "output_index": 0,
-            "reference_category": Asset.Kind.CHARACTER,
-        }, format="json")
-        self.assertEqual(incomplete.status_code, 400, incomplete.data)
-        self.assertIn("必须同时选择", str(incomplete.data))
-
-        other_project = SeriesProject.objects.create(
-            owner=self.user,
-            title="另一个项目",
-            style=self.project.style,
-        )
-        foreign_character = CharacterBible.objects.create(
-            project=other_project,
-            slug="foreign-character",
-            name="外部人物",
-            stable_speaker_id="S1",
-        )
-        foreign = self.client.post(url, {
-            "output_index": 0,
-            "reference_category": Asset.Kind.CHARACTER,
-            "entity_id": str(foreign_character.id),
-        }, format="json")
-        self.assertEqual(foreign.status_code, 400, foreign.data)
-        self.assertIn("不属于当前任务项目", str(foreign.data))
-        task.refresh_from_db()
-        self.assertNotIn("promoted_asset_id", task.outputs[0])
-
-    def test_video_output_cannot_be_saved_as_image_asset(self):
-        path = self.output_root / "not-an-image.mp4"
-        path.write_bytes(b"video")
-        task = self._task([{
-            "kind": "videos", "filename": path.name, "subfolder": "", "type": "output",
-        }])
-        response = self.client.post(
-            f"/api/v1/tasks/{task.id}/promote-output-to-asset/",
-            {"output_index": 0}, format="json",
-        )
-        self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("不是图片", str(response.data))
 
     @override_settings(DEPLOYMENT_PROFILE="production")
     def test_production_master_remains_preview_only_until_distribution_is_ready(self):

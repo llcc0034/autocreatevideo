@@ -20,10 +20,14 @@
     "test:workflow-selection": "node --test tests/productionWorkflowSelection.test.ts",
     "test:projects": "node --test tests/projectManagement.test.ts",
     "test:assets": "node --test tests/assetManagement.test.ts",
+    "test:platform": "node --test tests/platformFoundation.test.ts",
     "preview": "vite preview --host 127.0.0.1",
     "typecheck": "vue-tsc -b"
   },
   "dependencies": {
+    "@vue-flow/background": "^1.3.2",
+    "@vue-flow/controls": "^1.1.3",
+    "@vue-flow/core": "^1.48.2",
     "axios": "^1.7.9",
     "lucide-vue-next": "^0.468.0",
     "pinia": "^2.3.0",

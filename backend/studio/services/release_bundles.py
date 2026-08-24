@@ -5,15 +5,28 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 import json
+from pathlib import Path
 from uuid import UUID
 
+from django.conf import settings
 from django.core import signing
+from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
 from django.db.models import Max
 from django.utils import timezone
 
-from studio.media_signing import classify_task_output
-from studio.models import AssemblyJob, GenerationTask, ReleaseBundle, SeriesProject, Shot
+from studio.models import (
+    AssemblyJob,
+    GeneratedArtifact,
+    GenerationAttempt,
+    GenerationTask,
+    PromptArtifact,
+    ReleaseBundle,
+    SeriesProject,
+    Shot,
+)
+from studio.services.generated_artifacts import verified_local_media_facts
+from studio.services.json_contracts import verify_json_contract
 from studio.services.provenance import (
     ProvenanceError,
     verified_assembly_manifest,
@@ -23,6 +36,7 @@ from studio.services.distribution import DistributionError, verified_distributio
 
 
 RELEASE_BUNDLE_SCHEMA = "autoprompt-release-bundle-v1"
+PRODUCTION_RELEASE_BUNDLE_SCHEMA = "autoprompt-production-release-bundle-v2"
 RELEASE_BUNDLE_SIGNING_SALT = "autoprompt.release-bundle.v1"
 MAX_RELEASE_SHOTS = 10_000
 
@@ -73,7 +87,7 @@ def _task_manifest_binds_shot(
 def _ordered_assembly_source_pairs(
     document: dict,
 ) -> tuple[list[tuple[str, str, int]] | None, str | None]:
-    """Return exact shot/task/output order with an actionable failure code."""
+    """Parse historical task-based provenance for diagnostics only."""
 
     rows = document.get("source_outputs") if isinstance(document, dict) else None
     if not isinstance(rows, list):
@@ -105,7 +119,7 @@ def _ordered_assembly_source_pairs(
 def normalize_release_selection(value: object) -> dict:
     if not isinstance(value, dict):
         raise ReleaseBundleError("发行选择必须是对象")
-    unknown = set(value) - {"shots", "episodes", "series_assembly_id"}
+    unknown = set(value) - {"shots", "episodes", "series_artifact_id"}
     if unknown:
         raise ReleaseBundleError("发行选择包含未知字段", details={"unknown": sorted(unknown)})
     shot_rows = value.get("shots") or []
@@ -118,126 +132,177 @@ def normalize_release_selection(value: object) -> dict:
     shots: list[dict] = []
     seen_shots: set[str] = set()
     for index, row in enumerate(shot_rows):
-        if not isinstance(row, dict) or set(row) != {"shot_id", "task_id", "output_index"}:
+        if not isinstance(row, dict) or set(row) != {"shot_id", "artifact_id"}:
             raise ReleaseBundleError(f"shots[{index}] 字段不完整")
         shot_id = _uuid(row.get("shot_id"), f"shots[{index}].shot_id")
-        task_id = _uuid(row.get("task_id"), f"shots[{index}].task_id")
-        output_index = row.get("output_index")
-        if isinstance(output_index, bool) or not isinstance(output_index, int) or output_index < 0:
-            raise ReleaseBundleError(f"shots[{index}].output_index 必须是非负整数")
+        artifact_id = _uuid(row.get("artifact_id"), f"shots[{index}].artifact_id")
         if shot_id in seen_shots:
             raise ReleaseBundleError("同一分镜不能重复选择")
         seen_shots.add(shot_id)
-        shots.append({"shot_id": shot_id, "task_id": task_id, "output_index": output_index})
+        shots.append({"shot_id": shot_id, "artifact_id": artifact_id})
 
     episodes: list[dict] = []
     seen_episodes: set[str] = set()
     for index, row in enumerate(episode_rows):
-        if not isinstance(row, dict) or set(row) != {"episode_id", "assembly_id"}:
+        if not isinstance(row, dict) or set(row) != {"episode_id", "artifact_id"}:
             raise ReleaseBundleError(f"episodes[{index}] 字段不完整")
         episode_id = _uuid(row.get("episode_id"), f"episodes[{index}].episode_id")
-        assembly_id = _uuid(row.get("assembly_id"), f"episodes[{index}].assembly_id")
+        artifact_id = _uuid(row.get("artifact_id"), f"episodes[{index}].artifact_id")
         if episode_id in seen_episodes:
             raise ReleaseBundleError("同一集不能重复选择成片")
         seen_episodes.add(episode_id)
-        episodes.append({"episode_id": episode_id, "assembly_id": assembly_id})
+        episodes.append({"episode_id": episode_id, "artifact_id": artifact_id})
 
-    series_assembly_id = value.get("series_assembly_id")
+    series_artifact_id = value.get("series_artifact_id")
     return {
         "shots": sorted(shots, key=lambda row: row["shot_id"]),
         "episodes": sorted(episodes, key=lambda row: row["episode_id"]),
-        "series_assembly_id": (
-            _uuid(series_assembly_id, "series_assembly_id") if series_assembly_id else None
+        "series_artifact_id": (
+            _uuid(series_artifact_id, "series_artifact_id") if series_artifact_id else None
         ),
     }
+
+
+def _managed_generated_artifact_facts(artifact: GeneratedArtifact) -> dict:
+    if artifact.storage_backend not in {"managed_local", "local_media"}:
+        raise ReleaseBundleError("发行产物尚未进入受管存储")
+    root = Path(settings.MEDIA_ROOT).resolve()
+    path = (root / artifact.object_key).resolve()
+    if not path.is_relative_to(root):
+        raise ReleaseBundleError("发行产物路径越过 MEDIA_ROOT")
+    expected_kind = "video" if artifact.kind == GeneratedArtifact.Kind.ASSEMBLY else artifact.kind
+    try:
+        facts = verified_local_media_facts(
+            path,
+            expected_kind=expected_kind,
+            max_bytes=int(artifact.size_bytes or 0),
+        )
+    except (ProvenanceError, OSError, ValueError) as exc:
+        raise ReleaseBundleError("发行产物真实字节校验失败") from exc
+    if (
+        facts["sha256"] != artifact.sha256
+        or facts["size_bytes"] != artifact.size_bytes
+        or facts["mime_type"] != artifact.mime_type
+    ):
+        raise ReleaseBundleError("发行产物 object key/MIME/size/hash 与清单不一致")
+    return facts
+
+
+def _artifact_task_output_index(artifact: GeneratedArtifact) -> int:
+    verify_json_contract(
+        artifact.manifest_metadata,
+        schema_version=artifact.manifest_schema_version,
+        size_bytes=artifact.manifest_metadata_size_bytes,
+        sha256=artifact.manifest_metadata_sha256,
+    )
+    output_index = artifact.manifest_metadata.get("output_index")
+    if isinstance(output_index, bool) or not isinstance(output_index, int) or output_index < 0:
+        raise ReleaseBundleError("Comfy GeneratedArtifact 缺少冻结 output_index")
+    return output_index
+
+
+def _artifact_binds_shot(artifact: GeneratedArtifact, shot: Shot) -> tuple[dict | None, int | None]:
+    attempt = artifact.generation_attempt
+    if attempt is None or attempt.status != GenerationAttempt.Status.SUCCEEDED:
+        raise ReleaseBundleError("逐镜发行产物没有成功 GenerationAttempt")
+    if artifact.kind != shot.media_type:
+        raise ReleaseBundleError("逐镜发行产物类型与 Shot 不一致")
+    task = artifact.generation_task
+    if task is not None:
+        if (
+            task.status != GenerationTask.Status.SUCCEEDED
+            or task.owner_id != shot.episode.project.owner_id
+            or task.project_id != shot.episode.project_id
+        ):
+            raise ReleaseBundleError("Comfy GeneratedArtifact 任务归属或状态无效")
+        output_index = _artifact_task_output_index(artifact)
+        document = verified_task_manifest(task, output_index)
+        if not _task_manifest_binds_shot(
+            document, task=task, shot=shot, output_index=output_index,
+        ):
+            raise ReleaseBundleError("Comfy GeneratedArtifact 与 Shot 的签名来源不一致")
+        return document, output_index
+    if attempt.request_sha256 != attempt.request_snapshot_sha256:
+        raise ReleaseBundleError("云端 GeneratedArtifact 请求 identity 已漂移")
+    verify_json_contract(
+        attempt.request_snapshot,
+        schema_version=attempt.request_snapshot_schema_version,
+        size_bytes=attempt.request_snapshot_size_bytes,
+        sha256=attempt.request_snapshot_sha256,
+    )
+    prompt_id = (
+        attempt.request_snapshot.get("prompt_artifact_id")
+        if isinstance(attempt.request_snapshot, dict) else None
+    )
+    prompt = PromptArtifact.objects.filter(pk=prompt_id).first()
+    if (
+        prompt is None
+        or prompt.project_id != shot.episode.project_id
+        or prompt.episode_id != shot.episode_id
+        or prompt.shot_id != shot.id
+    ):
+        raise ReleaseBundleError("云端 GeneratedArtifact 与 Shot 的冻结 PromptArtifact 不一致")
+    return None, None
 
 
 def propose_release_selection(project: SeriesProject) -> dict:
     shots = list(
         Shot.objects.filter(episode__project=project)
-        .select_related("episode")
+        .select_related("episode__project")
         .order_by("episode__number", "number", "id")
     )
-    tasks = list(
-        GenerationTask.objects.filter(
-            owner=project.owner, project=project,
-            status=GenerationTask.Status.SUCCEEDED,
-        )
-        .select_related(
-            "episode", "generated_workflow__prompt_artifact",
-            "generated_workflow__template",
-        )
-        .order_by("-finished_at", "-created_at")
-    )
-    verified_outputs: dict[tuple[object, int], dict] = {}
-    for task in tasks:
-        for output_index, item in enumerate(task.outputs or []):
-            if classify_task_output(item) != task.kind:
-                continue
-            try:
-                verified_outputs[(task.id, output_index)] = verified_task_manifest(
-                    task, output_index,
-                )
-            except (ProvenanceError, OSError, ValueError, TypeError, IndexError):
-                continue
-    selected_shots: list[dict] = []
+    artifacts = list(GeneratedArtifact.objects.filter(
+        production_run__project=project,
+        production_run__owner=project.owner,
+        status=GeneratedArtifact.Status.SELECTED,
+    ).select_related(
+        "generation_attempt", "generation_task", "production_run",
+    ).order_by("-created_at"))
+    shot_rows = []
     for shot in shots:
         match = None
-        for task in tasks:
-            if task.kind != shot.media_type:
+        for artifact in artifacts:
+            if artifact.kind != shot.media_type:
                 continue
-            for output_index, item in enumerate(task.outputs or []):
-                document = verified_outputs.get((task.id, output_index))
-                if (
-                    classify_task_output(item) == shot.media_type
-                    and document is not None
-                    and _task_manifest_binds_shot(
-                        document, task=task, shot=shot, output_index=output_index,
-                    )
-                ):
-                    match = {
-                        "shot_id": str(shot.id),
-                        "task_id": str(task.id),
-                        "output_index": output_index,
-                    }
-                    break
-            if match:
-                break
-        if match:
-            selected_shots.append(match)
-
+            try:
+                _artifact_binds_shot(artifact, shot)
+                _managed_generated_artifact_facts(artifact)
+            except (ReleaseBundleError, ProvenanceError, ValidationError, OSError, ValueError):
+                continue
+            match = artifact
+            break
+        if match is not None:
+            shot_rows.append({"shot_id": str(shot.id), "artifact_id": str(match.id)})
     episode_rows = []
-    video_episode_ids = {
-        str(shot.episode_id) for shot in shots if shot.media_type == Shot.MediaType.VIDEO
-    }
-    assemblies = list(
-        AssemblyJob.objects.filter(
-            project=project, status=AssemblyJob.Status.SUCCEEDED, dry_run=False,
-        ).order_by("-finished_at", "-created_at")
-    )
-    for episode_id in sorted(video_episode_ids):
-        match = next(
-            (
-                job for job in assemblies
-                if job.scope == AssemblyJob.Scope.EPISODE and str(job.episode_id) == episode_id
-            ),
-            None,
-        )
-        if match:
-            episode_rows.append({"episode_id": episode_id, "assembly_id": str(match.id)})
-    series = next((job for job in assemblies if job.scope == AssemblyJob.Scope.SERIES), None)
+    for artifact in artifacts:
+        if artifact.kind != GeneratedArtifact.Kind.ASSEMBLY or artifact.role != "episode_master":
+            continue
+        episode_id = str((artifact.manifest_metadata or {}).get("episode_id") or "")
+        if episode_id:
+            episode_rows.append({"episode_id": episode_id, "artifact_id": str(artifact.id)})
+    series = next((
+        item for item in artifacts
+        if item.kind == GeneratedArtifact.Kind.ASSEMBLY and item.role == "series_master"
+    ), None)
     return normalize_release_selection({
-        "shots": selected_shots,
+        "shots": shot_rows,
         "episodes": episode_rows,
-        "series_assembly_id": str(series.id) if series else None,
+        "series_artifact_id": str(series.id) if series else None,
     })
 
 
-def validate_release_selection(*, project: SeriesProject, owner, selection: object) -> dict:
+def validate_release_selection(
+    *,
+    project: SeriesProject,
+    owner,
+    selection: object,
+    require_series_assembly: bool | None = None,
+    production_run=None,
+) -> dict:
     normalized = normalize_release_selection(selection)
     shot_rows = list(
         Shot.objects.filter(episode__project=project)
-        .select_related("episode")
+        .select_related("episode__project")
         .order_by("episode__number", "number", "id")
     )
     shots_by_id = {str(shot.id): shot for shot in shot_rows}
@@ -250,62 +315,55 @@ def validate_release_selection(*, project: SeriesProject, owner, selection: obje
             details={"missing_shot_ids": missing, "unknown_shot_ids": extra},
         )
 
-    task_ids = {row["task_id"] for row in normalized["shots"]}
-    tasks = {
-        str(task.id): task
-        for task in GenerationTask.objects.filter(
-            id__in=task_ids, owner=owner, project=project,
-        )
-        .select_related(
-            "episode", "generated_workflow__prompt_artifact",
-            "generated_workflow__template",
+    all_artifact_ids = {row["artifact_id"] for row in normalized["shots"]}
+    all_artifact_ids.update(row["artifact_id"] for row in normalized["episodes"])
+    if normalized["series_artifact_id"]:
+        all_artifact_ids.add(normalized["series_artifact_id"])
+    artifact_objects = {
+        str(artifact.id): artifact
+        for artifact in GeneratedArtifact.objects.filter(id__in=all_artifact_ids).select_related(
+            "production_run", "generation_attempt__stage_run__production_run",
+            "generation_attempt__model_deployment", "generation_task",
         )
     }
     artifacts: list[dict] = []
-    expected_episode_sources: dict[str, list[tuple[str, str, int]]] = {}
+    selected_artifacts_by_shot: dict[str, GeneratedArtifact] = {}
     errors: dict[str, list[str]] = {}
     for shot in shot_rows:
         shot_id = str(shot.id)
         row = selected_by_shot[shot_id]
-        task = tasks.get(row["task_id"])
+        artifact = artifact_objects.get(row["artifact_id"])
         reasons: list[str] = []
-        if task is None:
-            # The query is tenant/project scoped.  Do not reveal whether a
-            # caller-supplied UUID exists in another tenant.
-            reasons.append("task_unavailable")
-        elif task.status != GenerationTask.Status.SUCCEEDED:
-            reasons.append("task_not_succeeded")
-        elif task.kind != shot.media_type:
-            reasons.append("task_kind")
-        elif row["output_index"] >= len(task.outputs or []):
-            reasons.append("output_index")
-        elif classify_task_output(task.outputs[row["output_index"]]) != shot.media_type:
-            reasons.append("output_kind")
+        if artifact is None:
+            reasons.append("artifact_unavailable")
+        elif artifact.status != GeneratedArtifact.Status.SELECTED:
+            reasons.append("artifact_not_selected")
+        elif (
+            artifact.production_run is None
+            or artifact.production_run.owner_id != owner.id
+            or artifact.production_run.project_id != project.id
+            or (production_run is not None and artifact.production_run_id != production_run.id)
+        ):
+            reasons.append("artifact_unavailable")
+        elif artifact.kind != shot.media_type:
+            reasons.append("artifact_kind")
         else:
             try:
-                source_document = verified_task_manifest(task, row["output_index"])
-                if not _task_manifest_binds_shot(
-                    source_document, task=task, shot=shot,
-                    output_index=row["output_index"],
-                ):
-                    reasons.append("task_provenance_binding")
-                else:
+                source_document, output_index = _artifact_binds_shot(artifact, shot)
+                _managed_generated_artifact_facts(artifact)
+                selected_artifacts_by_shot[shot_id] = artifact
+                if artifact.generation_task_id:
                     distribution_document = verified_distribution_manifest(
-                        task, row["output_index"],
+                        artifact.generation_task, output_index,
                     )
                     source_artifact = source_document.get("artifact") or {}
                     source_integrity = source_document.get("integrity") or {}
-                    artifact = distribution_document.get("artifact") or {}
+                    published = distribution_document.get("artifact") or {}
                     integrity = distribution_document.get("integrity") or {}
                     disclosure = distribution_document.get("disclosure") or {}
                     release = distribution_document.get("release") or {}
-                    artifacts.append({
-                        "shot_id": shot_id,
-                        "episode_id": str(shot.episode_id),
-                        "media_kind": shot.media_type,
-                        "task_id": str(task.id),
-                        "output_index": row["output_index"],
-                        "artifact_sha256": str(artifact.get("sha256") or ""),
+                    artifact_row = {
+                        "artifact_sha256": str(published.get("sha256") or ""),
                         "provenance_sha256": str(integrity.get("payload_sha256") or ""),
                         "source_artifact_sha256": str(source_artifact.get("sha256") or ""),
                         "source_provenance_sha256": str(source_integrity.get("payload_sha256") or ""),
@@ -324,14 +382,33 @@ def validate_release_selection(*, project: SeriesProject, owner, selection: obje
                             for source in (source_document.get("source_media") or [])
                             if isinstance(source, dict)
                         ],
-                    })
-                    if shot.media_type == Shot.MediaType.VIDEO:
-                        expected_episode_sources.setdefault(str(shot.episode_id), []).append(
-                            (shot_id, str(task.id), row["output_index"]),
-                        )
+                    }
+                else:
+                    artifact_row = {
+                        "artifact_sha256": artifact.sha256,
+                        "provenance_sha256": artifact.manifest_metadata_sha256,
+                        "source_artifact_sha256": artifact.sha256,
+                        "source_provenance_sha256": artifact.manifest_metadata_sha256,
+                        "distribution_release_id": "",
+                        "distribution_model_key": "restricted_async_rest",
+                        "distribution_model": artifact.generation_attempt.model_deployment.key,
+                        "distribution_label": "AI-generated",
+                        "distribution_version": "managed-original-v1",
+                        "source_media": [],
+                    }
+                artifacts.append({
+                    "shot_id": shot_id,
+                    "episode_id": str(shot.episode_id),
+                    "media_kind": shot.media_type,
+                    "generated_artifact_id": str(artifact.id),
+                    **artifact_row,
+                })
             except DistributionError:
                 reasons.append("managed_distribution_invalid")
-            except (ProvenanceError, OSError, ValueError):
+            except (
+                ReleaseBundleError, ProvenanceError, ValidationError,
+                OSError, ValueError, TypeError, IndexError,
+            ):
                 reasons.append("provenance_invalid")
         if reasons:
             errors[shot_id] = reasons
@@ -345,10 +422,7 @@ def validate_release_selection(*, project: SeriesProject, owner, selection: obje
             details["managed_distribution_actions"] = [
                 {
                     "shot_id": row["shot_id"],
-                    "task_id": row["task_id"],
-                    "output_index": row["output_index"],
-                    "task_page_url": f"/workflows?task={row['task_id']}",
-                    "publish_url": f"/api/v1/tasks/{row['task_id']}/publish-output/",
+                    "artifact_id": row["artifact_id"],
                 }
                 for row in missing_distributions
             ]
@@ -359,58 +433,111 @@ def validate_release_selection(*, project: SeriesProject, owner, selection: obje
             )
         raise ReleaseBundleError("发行候选包含无效分镜产物", details=details)
 
-    episode_ids = set(expected_episode_sources)
+    episode_ids = {str(shot.episode_id) for shot in shot_rows}
     selected_episodes = {row["episode_id"]: row for row in normalized["episodes"]}
     missing_episodes = sorted(episode_ids - set(selected_episodes))
     extra_episodes = sorted(set(selected_episodes) - episode_ids)
     if missing_episodes or extra_episodes:
         raise ReleaseBundleError(
-            "每个含视频分镜的剧集都必须选择对应成片",
+            "每个含分镜的剧集都必须选择对应成片",
             details={"missing_episode_ids": missing_episodes, "unknown_episode_ids": extra_episodes},
         )
 
-    assembly_ids = {row["assembly_id"] for row in normalized["episodes"]}
-    if normalized["series_assembly_id"]:
-        assembly_ids.add(normalized["series_assembly_id"])
-    assemblies = {
-        str(job.id): job
-        for job in AssemblyJob.objects.filter(
-            id__in=assembly_ids, owner=owner, project=project,
-        ).select_related("episode")
-    }
     assembly_artifacts: list[dict] = []
 
-    def verify_assembly(job_id: str, *, scope: str, episode_id: str | None) -> None:
-        job = assemblies.get(job_id)
+    def verify_assembly(master_artifact_id: str, *, scope: str, episode_id: str | None) -> None:
+        master = artifact_objects.get(master_artifact_id)
+        job = None
+        if master is not None:
+            try:
+                verify_json_contract(
+                    master.manifest_metadata,
+                    schema_version=master.manifest_schema_version,
+                    size_bytes=master.manifest_metadata_size_bytes,
+                    sha256=master.manifest_metadata_sha256,
+                )
+                job = AssemblyJob.objects.select_related("episode").filter(
+                    pk=master.manifest_metadata.get("assembly_job_id"),
+                    owner=owner,
+                    project=project,
+                ).first()
+            except (ValidationError, TypeError, ValueError):
+                job = None
         reasons: list[str] = []
-        if job is None:
-            # Tenant/project-scoped lookup deliberately collapses missing and
-            # foreign identifiers into one non-oracular result.
-            reasons.append("assembly_unavailable")
+        if master is None or job is None:
+            reasons.append("assembly_artifact_unavailable")
+        elif (
+            master.status != GeneratedArtifact.Status.SELECTED
+            or master.kind != GeneratedArtifact.Kind.ASSEMBLY
+            or master.production_run is None
+            or master.production_run.owner_id != owner.id
+            or master.production_run.project_id != project.id
+            or (production_run is not None and master.production_run_id != production_run.id)
+        ):
+            reasons.append("assembly_artifact_unavailable")
         elif job.status != AssemblyJob.Status.SUCCEEDED or job.dry_run:
             reasons.append("assembly_not_succeeded")
         elif job.scope != scope or str(job.episode_id or "") != str(episode_id or ""):
             reasons.append("assembly_context")
         else:
             try:
+                master_facts = _managed_generated_artifact_facts(master)
                 document = verified_assembly_manifest(job)
-                actual, source_error = _ordered_assembly_source_pairs(document)
-                if scope == AssemblyJob.Scope.EPISODE:
-                    expected = expected_episode_sources.get(str(episode_id), [])
-                else:
-                    expected = [
-                        pair
-                        for episode_sources in expected_episode_sources.values()
-                        for pair in episode_sources
-                    ]
-                if source_error:
-                    reasons.append(source_error)
-                elif actual != expected:
+                if (document.get("artifact") or {}).get("sha256") != master_facts["sha256"]:
+                    reasons.append("assembly_artifact_hash")
+                source_items = list(job.source_items.select_related(
+                    "shot", "generation_task", "generated_artifact",
+                ).order_by("ordinal"))
+                expected_shots = [
+                    shot for shot in shot_rows
+                    if (
+                        job.source_contract_version >= 3
+                        or shot.media_type == Shot.MediaType.VIDEO
+                    )
+                    and (scope == AssemblyJob.Scope.SERIES or str(shot.episode_id) == str(episode_id))
+                ]
+                if [str(item.shot_id) for item in source_items] != [str(shot.id) for shot in expected_shots]:
                     reasons.append("stale_source_outputs")
+                provenance_rows = document.get("source_outputs")
+                if not isinstance(provenance_rows, list) or len(provenance_rows) != len(source_items):
+                    reasons.append("stale_source_outputs")
+                    provenance_rows = []
+                for index, (source, shot) in enumerate(zip(source_items, expected_shots, strict=True)):
+                    selected = selected_artifacts_by_shot.get(str(shot.id))
+                    row = provenance_rows[index] if index < len(provenance_rows) else {}
+                    if (
+                        selected is None
+                        or source.sha256 != selected.sha256
+                        or source.size_bytes != selected.size_bytes
+                        or source.mime_type != selected.mime_type
+                        or str(row.get("shot_id") or "") != str(shot.id)
+                        or str(row.get("artifact_sha256") or "") != source.sha256
+                        or (
+                            job.source_contract_version >= 3
+                            and (
+                                source.media_kind != shot.media_type
+                                or str(row.get("media_kind") or "") != shot.media_type
+                            )
+                        )
+                    ):
+                        reasons.append("assembly_source_artifact_drift")
+                        continue
+                    if source.generated_artifact_id:
+                        if (
+                            source.generated_artifact_id != selected.id
+                            or str(row.get("generated_artifact_id") or "") != str(selected.id)
+                        ):
+                            reasons.append("assembly_source_artifact_drift")
+                    elif (
+                        source.generation_task_id != selected.generation_task_id
+                        or str(row.get("task_id") or "") != str(selected.generation_task_id)
+                    ):
+                        reasons.append("assembly_source_artifact_drift")
                 artifact = document.get("artifact") or {}
                 integrity = document.get("integrity") or {}
                 assembly_artifacts.append({
                     "assembly_id": str(job.id),
+                    "generated_artifact_id": str(master.id),
                     "scope": scope,
                     "episode_id": str(job.episode_id) if job.episode_id else None,
                     "artifact_sha256": str(artifact.get("sha256") or ""),
@@ -421,18 +548,20 @@ def validate_release_selection(*, project: SeriesProject, owner, selection: obje
         if reasons:
             raise ReleaseBundleError(
                 "发行候选包含无效或过期成片",
-                details={"assembly_id": job_id, "reasons": reasons},
+                details={"artifact_id": master_artifact_id, "reasons": sorted(set(reasons))},
             )
 
     for episode_id, row in selected_episodes.items():
         verify_assembly(
-            row["assembly_id"], scope=AssemblyJob.Scope.EPISODE, episode_id=episode_id,
+            row["artifact_id"], scope=AssemblyJob.Scope.EPISODE, episode_id=episode_id,
         )
-    if project.status == SeriesProject.Status.COMPLETED and not normalized["series_assembly_id"]:
+    if require_series_assembly is None:
+        require_series_assembly = project.status == SeriesProject.Status.COMPLETED
+    if require_series_assembly and not normalized["series_artifact_id"]:
         raise ReleaseBundleError("已完结项目必须选择整剧成片")
-    if normalized["series_assembly_id"]:
+    if normalized["series_artifact_id"]:
         verify_assembly(
-            normalized["series_assembly_id"], scope=AssemblyJob.Scope.SERIES, episode_id=None,
+            normalized["series_artifact_id"], scope=AssemblyJob.Scope.SERIES, episode_id=None,
         )
 
     return {
@@ -472,17 +601,28 @@ def seal_release_bundle(bundle: ReleaseBundle) -> ReleaseBundle:
         if locked.status != ReleaseBundle.Status.DRAFT:
             raise ReleaseBundleError("只有草稿发行候选可以封存")
         verified = validate_release_selection(
-            project=locked.project, owner=locked.owner, selection=locked.selection,
+            project=locked.project,
+            owner=locked.owner,
+            selection=locked.selection,
+            require_series_assembly=False if locked.production_run_id else None,
+            production_run=locked.production_run,
         )
         sealed_at = timezone.now()
         body = {
-            "schema": RELEASE_BUNDLE_SCHEMA,
+            "schema": (
+                PRODUCTION_RELEASE_BUNDLE_SCHEMA
+                if locked.production_run_id else RELEASE_BUNDLE_SCHEMA
+            ),
             "bundle_id": str(locked.id),
             "project_id": str(locked.project_id),
             "owner_id": str(locked.owner_id),
             "version": locked.version,
             "title": locked.title,
             "sealed_at": sealed_at.isoformat(),
+            **({
+                "production_run_id": str(locked.production_run_id),
+                "delivery_scope": "episode_masters",
+            } if locked.production_run_id else {}),
             **verified,
         }
         payload_sha256 = _canonical_sha256(body)
@@ -506,7 +646,10 @@ def seal_release_bundle(bundle: ReleaseBundle) -> ReleaseBundle:
 
 def verified_release_bundle(bundle: ReleaseBundle) -> dict:
     document = deepcopy(bundle.manifest)
-    if not isinstance(document, dict) or document.get("schema") != RELEASE_BUNDLE_SCHEMA:
+    if (
+        not isinstance(document, dict)
+        or document.get("schema") not in {RELEASE_BUNDLE_SCHEMA, PRODUCTION_RELEASE_BUNDLE_SCHEMA}
+    ):
         raise ReleaseBundleError("发行清单不存在或版本无效")
     integrity = document.pop("integrity", None)
     if not isinstance(integrity, dict):
@@ -528,6 +671,13 @@ def verified_release_bundle(bundle: ReleaseBundle) -> dict:
         or int(document.get("version") or 0) != bundle.version
     ):
         raise ReleaseBundleError("发行清单与数据库对象不匹配")
+    if bundle.production_run_id and (
+        document.get("schema") != PRODUCTION_RELEASE_BUNDLE_SCHEMA
+        or str(document.get("production_run_id") or "") != str(bundle.production_run_id)
+        or document.get("delivery_scope") != "episode_masters"
+        or document.get("selection", {}).get("series_artifact_id") is not None
+    ):
+        raise ReleaseBundleError("ProductionRun 发行清单绑定无效")
     return {**document, "integrity": integrity, "verification": {"status": "verified"}}
 
 
@@ -542,7 +692,11 @@ def live_verified_release_bundle(bundle: ReleaseBundle) -> dict:
 
     sealed_document = verified_release_bundle(bundle)
     live = validate_release_selection(
-        project=bundle.project, owner=bundle.owner, selection=bundle.selection,
+        project=bundle.project,
+        owner=bundle.owner,
+        selection=bundle.selection,
+        require_series_assembly=False if bundle.production_run_id else None,
+        production_run=bundle.production_run,
     )
     if (
         live["selection"] != sealed_document.get("selection")
@@ -614,10 +768,15 @@ def task_is_release_evidence(task: GenerationTask) -> bool:
         ),
     ).only("manifest").iterator():
         manifest = bundle.manifest if isinstance(bundle.manifest, dict) else {}
-        if any(
-            isinstance(row, dict) and str(row.get("task_id")) == str(task.id)
+        artifact_ids = [
+            row.get("generated_artifact_id")
             for row in (manifest.get("artifacts") or [])
-        ):
+            if isinstance(row, dict) and row.get("generated_artifact_id")
+        ]
+        if GeneratedArtifact.objects.filter(
+            id__in=artifact_ids,
+            generation_task=task,
+        ).exists():
             return True
     return False
 

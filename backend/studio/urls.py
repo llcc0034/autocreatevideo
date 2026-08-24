@@ -1,37 +1,54 @@
 from django.urls import include, path
 from rest_framework.routers import DefaultRouter
-from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView, TokenVerifyView
+from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
+
+from studio.authentication import StudioTokenObtainPairSerializer, StudioTokenRefreshSerializer
+from studio.access_views import AccessAuditEventViewSet, AccessUserViewSet, PasswordChangeView
 
 from studio.capability_views import (
-    CreativeDraftCapabilityView,
-    H3PromptOptimizerCapabilityView,
     ProductionCapabilityView,
-    PromptTranslationCapabilityView,
+    PromptNormalizationCapabilityView,
 )
-from studio.creative_views import (
-    EpisodeCreativeDraftViewSet,
-    ProjectCreativeDraftGenerateView,
-    ProjectCreativeDraftListView,
-)
+from studio.creative_views import ProjectCreativeDraftListView
 from studio.shot_detail_draft_views import (
-    ProjectShotDetailDraftGenerateView,
     ProjectShotDetailDraftListView,
-    ShotDetailDraftViewSet,
 )
 from studio.shot_detail_batch_views import (
-    ProjectShotDetailDraftBatchListCreateView,
-    ShotDetailDraftBatchApplyView,
+    ProjectShotDetailDraftBatchListView,
     ShotDetailDraftBatchDetailView,
 )
 from studio.health_views import ReadinessView
-from studio.series_concept_draft_views import SeriesConceptDraftGenerateView
-from studio.asset_draft_views import ProjectAssetBibleDraftGenerateView
+from studio.platform_views import (
+    ConfigDefinitionViewSet,
+    ConfigRevisionViewSet,
+    GeneratedArtifactViewSet,
+    GenerationAttemptViewSet,
+    ModelArtifactViewSet,
+    ModelDeploymentViewSet,
+    ModelDeploymentSmokeAttemptViewSet,
+    ModelProfileVersionViewSet,
+    PlatformLifecycleAuditEventViewSet,
+    PromptFieldDefinitionViewSet,
+    PromptProfileBindingViewSet,
+    PromptProfileFieldRuleViewSet,
+    PromptProfileVersionViewSet,
+    ProductionReadinessView,
+    ProductionRecipeVersionViewSet,
+    ProductionRunViewSet,
+    ProjectConfigView,
+    ProviderProfileViewSet,
+    RecommendationSnapshotViewSet,
+    RuntimeHostProbeAttemptViewSet,
+    RuntimeHostViewSet,
+    ScriptRevisionViewSet,
+    ScriptSourceViewSet,
+    SecretAuditEventViewSet,
+    SecretBindingViewSet,
+    WorkflowTemplateVersionViewSet,
+    WorkflowSmokeAttemptViewSet,
+)
 from studio.bible_image_candidate_views import ProjectBibleImageCandidatesView
 from studio.deferred_generation_views import DeferredGenerationRequestViewSet
-from studio.visual_rule_draft_views import (
-    ProjectVisualRuleDraftApplyView,
-    ProjectVisualRuleDraftGenerateView,
-)
 from studio.views import (
     AssetViewSet,
     AssemblyJobViewSet,
@@ -68,8 +85,6 @@ router.register("episodes", EpisodeViewSet, basename="episode")
 router.register("shots", ShotViewSet, basename="shot")
 router.register("prompts", PromptArtifactViewSet, basename="prompt")
 router.register("translations", PromptFieldTranslationViewSet, basename="translation")
-router.register("creative-drafts", EpisodeCreativeDraftViewSet, basename="creative-draft")
-router.register("shot-detail-drafts", ShotDetailDraftViewSet, basename="shot-detail-draft")
 router.register("workflow-templates", WorkflowTemplateViewSet, basename="workflow-template")
 router.register("workflows", GeneratedWorkflowViewSet, basename="workflow")
 router.register("tasks", GenerationTaskViewSet, basename="task")
@@ -80,25 +95,96 @@ router.register(
 )
 router.register("assemblies", AssemblyJobViewSet, basename="assembly")
 router.register("release-bundles", ReleaseBundleViewSet, basename="release-bundle")
+router.register("provider-profiles", ProviderProfileViewSet, basename="provider-profile")
+router.register(
+    "model-profile-versions",
+    ModelProfileVersionViewSet,
+    basename="model-profile-version",
+)
+router.register(
+    "prompt-field-definitions",
+    PromptFieldDefinitionViewSet,
+    basename="prompt-field-definition",
+)
+router.register(
+    "prompt-profile-versions",
+    PromptProfileVersionViewSet,
+    basename="prompt-profile-version",
+)
+router.register(
+    "prompt-profile-field-rules",
+    PromptProfileFieldRuleViewSet,
+    basename="prompt-profile-field-rule",
+)
+router.register(
+    "prompt-profile-bindings",
+    PromptProfileBindingViewSet,
+    basename="prompt-profile-binding",
+)
+router.register("model-deployments", ModelDeploymentViewSet, basename="model-deployment")
+router.register(
+    "model-deployment-smoke-attempts",
+    ModelDeploymentSmokeAttemptViewSet,
+    basename="model-deployment-smoke-attempt",
+)
+router.register("model-artifacts", ModelArtifactViewSet, basename="model-artifact")
+router.register(
+    "workflow-template-versions",
+    WorkflowTemplateVersionViewSet,
+    basename="workflow-template-version",
+)
+router.register(
+    "workflow-smoke-attempts",
+    WorkflowSmokeAttemptViewSet,
+    basename="workflow-smoke-attempt",
+)
+router.register("config-definitions", ConfigDefinitionViewSet, basename="config-definition")
+router.register("config-revisions", ConfigRevisionViewSet, basename="config-revision")
+router.register("runtime-hosts", RuntimeHostViewSet, basename="runtime-host")
+router.register(
+    "runtime-host-probe-attempts",
+    RuntimeHostProbeAttemptViewSet,
+    basename="runtime-host-probe-attempt",
+)
+router.register("recommendations", RecommendationSnapshotViewSet, basename="recommendation")
+router.register("script-sources", ScriptSourceViewSet, basename="script-source")
+router.register("script-revisions", ScriptRevisionViewSet, basename="script-revision")
+router.register(
+    "production-recipes",
+    ProductionRecipeVersionViewSet,
+    basename="production-recipe",
+)
+router.register("production-runs", ProductionRunViewSet, basename="production-run")
+router.register("generation-attempts", GenerationAttemptViewSet, basename="generation-attempt")
+router.register("generated-artifacts", GeneratedArtifactViewSet, basename="generated-artifact")
+router.register("secret-bindings", SecretBindingViewSet, basename="secret-binding")
+router.register("secret-audit-events", SecretAuditEventViewSet, basename="secret-audit-event")
+router.register(
+    "platform-lifecycle-audit-events",
+    PlatformLifecycleAuditEventViewSet,
+    basename="platform-lifecycle-audit-event",
+)
+router.register("access/users", AccessUserViewSet, basename="access-user")
+router.register("access/audit-events", AccessAuditEventViewSet, basename="access-audit-event")
 
 urlpatterns = [
     path("health/", HealthView.as_view(), name="health"),
     path("health/live/", HealthView.as_view(), name="health-live"),
     path("health/ready/", ReadinessView.as_view(), name="health-ready"),
     path(
-        "capabilities/h3-prompt-optimizer/",
-        H3PromptOptimizerCapabilityView.as_view(),
-        name="h3-prompt-optimizer-capability",
+        "production-readiness/",
+        ProductionReadinessView.as_view(),
+        name="production-readiness",
     ),
     path(
-        "capabilities/prompt-translation/",
-        PromptTranslationCapabilityView.as_view(),
-        name="prompt-translation-capability",
+        "projects/<uuid:project_id>/config/",
+        ProjectConfigView.as_view(),
+        name="project-config",
     ),
     path(
-        "capabilities/creative-drafts/",
-        CreativeDraftCapabilityView.as_view(),
-        name="creative-draft-capability",
+        "projects/<uuid:project_id>/capabilities/prompt-normalization/",
+        PromptNormalizationCapabilityView.as_view(),
+        name="project-prompt-normalization-capability",
     ),
     path(
         "capabilities/production/",
@@ -106,24 +192,9 @@ urlpatterns = [
         name="production-capability",
     ),
     path(
-        "series-concept-drafts/generate/",
-        SeriesConceptDraftGenerateView.as_view(),
-        name="series-concept-draft-generate",
-    ),
-    path(
-        "projects/<uuid:project_id>/creative-drafts/generate/",
-        ProjectCreativeDraftGenerateView.as_view(),
-        name="project-creative-draft-generate",
-    ),
-    path(
         "projects/<uuid:project_id>/creative-drafts/",
         ProjectCreativeDraftListView.as_view(),
         name="project-creative-draft-list",
-    ),
-    path(
-        "projects/<uuid:project_id>/shot-detail-drafts/generate/",
-        ProjectShotDetailDraftGenerateView.as_view(),
-        name="project-shot-detail-draft-generate",
     ),
     path(
         "projects/<uuid:project_id>/shot-detail-drafts/",
@@ -132,8 +203,8 @@ urlpatterns = [
     ),
     path(
         "projects/<uuid:project_id>/shot-detail-draft-batches/",
-        ProjectShotDetailDraftBatchListCreateView.as_view(),
-        name="project-shot-detail-draft-batch-list-create",
+        ProjectShotDetailDraftBatchListView.as_view(),
+        name="project-shot-detail-draft-batch-list",
     ),
     path(
         "shot-detail-draft-batches/<uuid:batch_id>/",
@@ -141,35 +212,23 @@ urlpatterns = [
         name="shot-detail-draft-batch-detail",
     ),
     path(
-        "shot-detail-draft-batches/<uuid:batch_id>/apply/",
-        ShotDetailDraftBatchApplyView.as_view(),
-        name="shot-detail-draft-batch-apply",
-    ),
-    path(
-        "projects/<uuid:project_id>/bible-drafts/from-assets/",
-        ProjectAssetBibleDraftGenerateView.as_view(),
-        name="project-asset-bible-draft-generate",
-    ),
-    path(
         "projects/<uuid:id>/bible-image-candidates/",
         ProjectBibleImageCandidatesView.as_view(),
         name="project-bible-image-candidates",
     ),
-    path(
-        "projects/<uuid:project_id>/visual-rules-drafts/generate/",
-        ProjectVisualRuleDraftGenerateView.as_view(),
-        name="project-visual-rule-draft-generate",
-    ),
-    path(
-        "projects/<uuid:project_id>/visual-rules-drafts/apply/",
-        ProjectVisualRuleDraftApplyView.as_view(),
-        name="project-visual-rule-draft-apply",
-    ),
     path("auth/register/", RegisterView.as_view(), name="register"),
-    path("auth/token/", TokenObtainPairView.as_view(), name="token_obtain_pair"),
-    path("auth/token/refresh/", TokenRefreshView.as_view(), name="token_refresh"),
-    path("auth/token/verify/", TokenVerifyView.as_view(), name="token_verify"),
+    path(
+        "auth/token/",
+        TokenObtainPairView.as_view(serializer_class=StudioTokenObtainPairSerializer),
+        name="token_obtain_pair",
+    ),
+    path(
+        "auth/token/refresh/",
+        TokenRefreshView.as_view(serializer_class=StudioTokenRefreshSerializer),
+        name="token_refresh",
+    ),
     path("auth/me/", MeView.as_view(), name="me"),
+    path("auth/password/change/", PasswordChangeView.as_view(), name="password-change"),
     path("media/<str:token>/", SignedMediaView.as_view(), name="signed-media"),
     path("comfyui/health/", ComfyUIHealthView.as_view(), name="comfyui-health"),
     path("", include(router.urls)),

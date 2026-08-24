@@ -194,9 +194,7 @@ class BibleImageOutputMediaSerializer(serializers.Serializer):
     public_manifest_sha256 = serializers.CharField(allow_blank=True)
     public_label = serializers.CharField(allow_blank=True)
     public_version = serializers.CharField(allow_blank=True)
-    publish_url = serializers.CharField(allow_blank=True)
     promoted_asset_id = serializers.CharField(allow_blank=True)
-    promote_to_asset_url = serializers.CharField(allow_blank=True)
 
 
 class BibleImageLatestCandidateSerializer(serializers.Serializer):

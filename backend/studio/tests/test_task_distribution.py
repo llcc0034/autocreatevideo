@@ -68,7 +68,9 @@ class ManagedTaskDistributionTests(TestCase):
         result = (
             build_consistent_image_prompt(self.project, self.shot)
             if kind == "image"
-            else build_h3_video_prompt(self.project, [self.shot], H3PromptOptions())
+            else build_h3_video_prompt(
+                self.project, [self.shot], H3PromptOptions(language_gate_mode="warn"),
+            )
         )
         prompt = PromptArtifact.objects.create(
             project=self.project,
@@ -309,23 +311,6 @@ class ManagedTaskDistributionTests(TestCase):
         with override_settings(TASK_IMAGE_DISTRIBUTION_LABEL_TEXT="SDXL 1.0"):
             with self.assertRaisesRegex(DistributionError, "explicitly identify"):
                 prepare_task_distribution(task, 0)
-
-    def test_publish_endpoint_is_owner_scoped_and_returns_verified_copy(self):
-        task, _ = self._image_task("endpoint-master.png")
-        response = self.client.post(
-            f"/api/v1/tasks/{task.id}/publish-output/", {"output_index": 0}, format="json",
-        )
-        self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["output_media"][0]["distribution_status"], "ready")
-        self.assertTrue(response.data["output_media"][0]["download_url"])
-
-        other = APIClient()
-        self.assertEqual(
-            other.post(
-                f"/api/v1/tasks/{task.id}/publish-output/", {"output_index": 0}, format="json",
-            ).status_code,
-            401,
-        )
 
     def test_video_distribution_has_visible_filter_and_verified_container_metadata(self):
         ffmpeg = shutil.which("ffmpeg")

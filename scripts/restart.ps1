@@ -6,7 +6,6 @@ param(
     [switch]$ForcePortTakeover,
     [switch]$OpenBrowser,
     [switch]$SkipMigrate,
-    [switch]$SkipSeedData,
     [int]$StartupTimeoutSeconds = 180,
     [string]$ComfyUIRoot = $env:AUTOPROMPT_COMFYUI_ROOT
 )
@@ -133,6 +132,33 @@ function Write-Step([string]$Message) {
 function Assert-LastExitCode([string]$Step) {
     if ($LASTEXITCODE -ne 0) {
         throw "$Step failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Assert-JwtSigningKeyConfiguration(
+    [string]$PythonPath,
+    [string]$WorkingDirectory
+) {
+    $hadSettingsModule = Test-Path Env:DJANGO_SETTINGS_MODULE
+    $previousSettingsModule = $env:DJANGO_SETTINGS_MODULE
+    Push-Location $WorkingDirectory
+    try {
+        # A raw python -c invocation does not inherit manage.py's settings
+        # bootstrap. Set only the module selector for this child preflight; the
+        # signing-key material remains inside Django settings and is never
+        # interpolated into the command or written to restart output.
+        $env:DJANGO_SETTINGS_MODULE = 'autoprompt_backend.settings'
+        & $PythonPath -c "from django.conf import settings; import sys; key = settings.JWT_SIGNING_KEY; sys.exit(0 if len(key.encode('utf-8')) >= 32 and key != settings.SECRET_KEY else 2)"
+        if ($LASTEXITCODE -ne 0) {
+            throw "JWT signing-key preflight failed with exit code $LASTEXITCODE."
+        }
+    } finally {
+        if ($hadSettingsModule) {
+            $env:DJANGO_SETTINGS_MODULE = $previousSettingsModule
+        } else {
+            Remove-Item Env:DJANGO_SETTINGS_MODULE -ErrorAction SilentlyContinue
+        }
+        Pop-Location
     }
 }
 
@@ -269,7 +295,7 @@ function Stop-ProjectPythonProcesses {
     foreach ($process in @(Get-Process python, pythonw -ErrorAction SilentlyContinue)) {
         try {
             $commandLine = (Get-CimInstance Win32_Process -Filter "ProcessId=$($process.Id)" -ErrorAction SilentlyContinue).CommandLine
-            $isAutoPromptService = $commandLine -match 'manage\.py\s+(runserver|run_generation_worker|run_assembly_worker)(?:\s|$)'
+            $isAutoPromptService = $commandLine -match 'manage\.py\s+(runserver|run_generation_worker|run_text_generation_worker|run_async_media_worker|run_assembly_worker|run_platform_maintenance)(?:\s|$)'
             if ($process.Path -and [System.IO.Path]::GetFullPath($process.Path) -ieq $expectedPath -and $isAutoPromptService) {
                 $KnownProjectProcessIds.Add([int]$process.Id) | Out-Null
                 foreach ($childId in @(Get-DescendantProcessIds $process.Id)) {
@@ -437,12 +463,20 @@ if (-not $SkipComfyUI -and $RestartComfyUI -and @(Get-PortOwners 8188).Count -gt
     }
 }
 
+Write-Step 'Validating JWT signing-key separation before stopping services'
+Assert-JwtSigningKeyConfiguration -PythonPath $BackendPython -WorkingDirectory $BackendRoot
+
 Write-Step 'Stopping previous AutoPrompt application services'
 Stop-RecordedServices
 Stop-ProjectPythonProcesses
 Stop-PortListener 8000 @('python', 'pythonw') 'Django'
 Stop-PortListener 5173 @('node', 'npm', 'cmd') 'Vite'
 $PreviousServicesStopped = $true
+
+# Every process launched by this invocation inherits the same boot identity.
+# Pending restart-required configuration records require a distinct boot
+# identity and an explicit activation action; restart does not activate them.
+$env:AUTOPROMPT_BOOT_ID = [Guid]::NewGuid().ToString('N')
 
 if (-not $SkipComfyUI -and $RestartComfyUI) {
     Write-Warning 'RestartComfyUI explicitly replaces the current GPU process after the queue safety check.'
@@ -455,17 +489,6 @@ if (-not $SkipMigrate) {
     try {
         & $BackendPython manage.py migrate --noinput
         Assert-LastExitCode 'Database migration'
-    } finally {
-        Pop-Location
-    }
-}
-
-if (-not $SkipSeedData) {
-    Write-Step 'Synchronizing reviewed styles and workflow templates'
-    Push-Location $BackendRoot
-    try {
-        & $BackendPython manage.py seed_data
-        Assert-LastExitCode 'Base data synchronization'
     } finally {
         Pop-Location
     }
@@ -503,11 +526,14 @@ if (-not $SkipComfyUI) {
 Start-ServiceProcess 'Django API' $BackendPython @('-u', 'manage.py', 'runserver', '127.0.0.1:8000', '--noreload') $BackendRoot | Out-Null
 Wait-Http 'Django API' 'http://127.0.0.1:8000/api/v1/health/' $StartupTimeoutSeconds
 
-# Workers only start after migrations, seed synchronization, assembly recovery,
-# ComfyUI readiness and API liveness. Generation is started before assembly so
+# Workers only start after migrations, assembly recovery, ComfyUI readiness
+# and API liveness. Generation is started before assembly so
 # the readiness endpoint observes the same deterministic order on every run.
 Start-ServiceProcess 'Generation worker' $BackendPython @('-u', 'manage.py', 'run_generation_worker', '--startup-recover-minutes', '0') $BackendRoot | Out-Null
+Start-ServiceProcess 'Text generation worker' $BackendPython @('-u', 'manage.py', 'run_text_generation_worker', '--startup-recover-minutes', '0') $BackendRoot | Out-Null
+Start-ServiceProcess 'Async media worker' $BackendPython @('-u', 'manage.py', 'run_async_media_worker', '--recover-minutes', '1') $BackendRoot | Out-Null
 Start-ServiceProcess 'Assembly worker' $BackendPython @('-u', 'manage.py', 'run_assembly_worker') $BackendRoot | Out-Null
+Start-ServiceProcess 'Platform maintenance' $BackendPython @('-u', 'manage.py', 'run_platform_maintenance') $BackendRoot | Out-Null
 Start-ServiceProcess 'Vue frontend' $nodeRuntime.NpmPath @('run', 'dev', '--', '--host', '127.0.0.1', '--port', '5173', '--strictPort') $FrontendRoot | Out-Null
 
 $stateTempPath = "$StatePath.$PID.tmp"
@@ -526,13 +552,25 @@ $workerRecord = $ServiceRecords | Where-Object { $_.name -eq 'Generation worker'
 if (-not $workerRecord -or -not (Get-Process -Id $workerRecord.pid -ErrorAction SilentlyContinue)) {
     throw "Generation worker exited during startup. Check $($workerRecord.stderr)."
 }
+$textWorkerRecord = $ServiceRecords | Where-Object { $_.name -eq 'Text generation worker' } | Select-Object -First 1
+if (-not $textWorkerRecord -or -not (Get-Process -Id $textWorkerRecord.pid -ErrorAction SilentlyContinue)) {
+    throw "Text generation worker exited during startup. Check $($textWorkerRecord.stderr)."
+}
+$asyncMediaWorkerRecord = $ServiceRecords | Where-Object { $_.name -eq 'Async media worker' } | Select-Object -First 1
+if (-not $asyncMediaWorkerRecord -or -not (Get-Process -Id $asyncMediaWorkerRecord.pid -ErrorAction SilentlyContinue)) {
+    throw "Async media worker exited during startup. Check $($asyncMediaWorkerRecord.stderr)."
+}
 $assemblyWorkerRecord = $ServiceRecords | Where-Object { $_.name -eq 'Assembly worker' } | Select-Object -First 1
 if (-not $assemblyWorkerRecord -or -not (Get-Process -Id $assemblyWorkerRecord.pid -ErrorAction SilentlyContinue)) {
     throw "Assembly worker exited during startup. Check $($assemblyWorkerRecord.stderr)."
 }
+$maintenanceRecord = $ServiceRecords | Where-Object { $_.name -eq 'Platform maintenance' } | Select-Object -First 1
+if (-not $maintenanceRecord -or -not (Get-Process -Id $maintenanceRecord.pid -ErrorAction SilentlyContinue)) {
+    throw "Platform maintenance exited during startup. Check $($maintenanceRecord.stderr)."
+}
 
-# Liveness proves that Django accepted requests; readiness additionally proves
-# database/migrations, storage, ComfyUI and both durable workers are healthy.
+# Liveness proves that Django accepted requests; readiness admits traffic based
+# on API infrastructure while capability-specific blockers remain in the payload.
 Wait-Http 'AutoPrompt readiness' 'http://127.0.0.1:8000/api/v1/health/ready/' $StartupTimeoutSeconds
 
 Write-Host "`nAutoPrompt Studio restarted successfully." -ForegroundColor Green

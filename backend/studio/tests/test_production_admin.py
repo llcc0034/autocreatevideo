@@ -1,14 +1,46 @@
 from django.contrib import admin
 from django.test import RequestFactory, SimpleTestCase
 
-from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact
+from studio.models import (
+    AssemblyJob,
+    ConfigDefinition,
+    DeferredGenerationRequest,
+    EpisodeCreativeDraft,
+    GeneratedWorkflow,
+    GenerationTask,
+    ModelArtifact,
+    ModelDeployment,
+    ModelProfileVersion,
+    PromptArtifact,
+    PromptFieldTranslation,
+    ProviderProfile,
+    ReleaseBundle,
+    WorkflowTemplate,
+    WorkflowTemplateVersion,
+)
 
 
 class ImmutableProductionAuditAdminTests(SimpleTestCase):
     def test_production_evidence_models_are_view_only_in_admin(self):
         request = RequestFactory().get("/admin/")
 
-        for model in (PromptArtifact, GeneratedWorkflow, GenerationTask):
+        for model in (
+            PromptArtifact,
+            GeneratedWorkflow,
+            GenerationTask,
+            AssemblyJob,
+            ReleaseBundle,
+            EpisodeCreativeDraft,
+            PromptFieldTranslation,
+            ModelProfileVersion,
+            ModelArtifact,
+            WorkflowTemplate,
+            WorkflowTemplateVersion,
+            ProviderProfile,
+            ModelDeployment,
+            ConfigDefinition,
+            DeferredGenerationRequest,
+        ):
             with self.subTest(model=model.__name__):
                 model_admin = admin.site._registry[model]
                 self.assertFalse(model_admin.has_add_permission(request))

@@ -1,8 +1,5 @@
 import type {
-  Asset,
   BibleImageAssetSummary,
-  BibleImageCandidateCreateOptions,
-  BibleImageCandidateCreateResult,
   BibleImageCandidateProjection,
   BibleImageCandidateQuality,
   BibleImageCandidatesResult,
@@ -13,24 +10,10 @@ import type {
   BibleImagePromptInputs,
   BibleImageQualityIssue,
   BibleImageTaskStatus,
-  BibleItem,
 } from '@/types'
 import { adaptTaskOutputMedia } from './backendAdapters'
 
 type Raw = Record<string, unknown>
-
-export interface BibleImageCandidateRetryState {
-  projectId: string
-  entityType: BibleImageEntityType
-  entityId: string
-  idempotencyKey: string
-  extraDirection: string
-  promptOverrides: Record<string, string>
-  seed: number | null
-  priority: number
-  maxAttempts: number
-  queueConfirmationRequired: boolean
-}
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const SHA256_RE = /^[0-9a-f]{64}$/
@@ -220,170 +203,18 @@ export const adaptBibleImageCandidates = (value: unknown): BibleImageCandidatesR
   return result
 }
 
-export const adaptBibleImageCandidateCreateResult = (value: unknown): BibleImageCandidateCreateResult => {
-  const raw = objectValue(value)
-  const candidate = adaptBibleImageCandidateProjection(raw.candidate)
-  return {
-    projectId: uuidValue(raw.project_id),
-    promptArtifactId: uuidValue(raw.prompt_artifact_id),
-    generatedWorkflowId: uuidValue(raw.generated_workflow_id),
-    generationTaskId: uuidValue(raw.generation_task_id),
-    idempotentReplay: booleanValue(raw.idempotent_replay),
-    reviewRequired: booleanValue(raw.review_required),
-    persistedAsAsset: booleanValue(raw.persisted_as_asset),
-    candidate,
-  }
-}
-
-const characterLength = (value: string): number => Array.from(value).length
-
-export const bibleImageCandidateCreatePayload = (options: BibleImageCandidateCreateOptions) => {
-  if (!entityTypes.includes(options.entityType) || !UUID_RE.test(options.entityId)) throw new Error('实体图片候选目标无效。')
-  if (!options.idempotencyKey || characterLength(options.idempotencyKey) > 120) throw new Error('实体图片候选幂等键无效。')
-  if (characterLength(options.extraDirection) > 2_000) throw new Error('补充创作要求不能超过 2,000 个字符。')
-  if (options.seed !== undefined && options.seed !== null && (!Number.isSafeInteger(options.seed) || options.seed < 0)) throw new Error('实体图片候选 Seed 无效。')
-  if (!Number.isInteger(options.priority) || options.priority < -100 || options.priority > 100) throw new Error('实体图片候选优先级无效。')
-  if (!Number.isInteger(options.maxAttempts) || options.maxAttempts < 1 || options.maxAttempts > 10) throw new Error('实体图片候选最大尝试次数无效。')
-  const promptOverrides = Object.fromEntries(
-    Object.entries(options.promptOverrides || {})
-      .filter(([key, value]) => key.trim() && typeof value === 'string')
-      .map(([key, value]) => {
-        if (characterLength(key) > 120 || !/^[A-Za-z0-9_.-]+$/.test(key)) throw new Error(`提示词字段名无效：${key}`)
-        if (characterLength(value) > 4_000) throw new Error(`提示词字段“${key}”不能超过 4,000 个字符。`)
-        return [key, value]
-      }),
-  )
-  return {
-    entity_type: options.entityType,
-    entity_id: options.entityId,
-    idempotency_key: options.idempotencyKey,
-    extra_direction: options.extraDirection,
-    prompt_overrides: promptOverrides,
-    ...(options.seed === undefined || options.seed === null ? {} : { seed: options.seed }),
-    priority: options.priority,
-    max_attempts: options.maxAttempts,
-    extended_generation_confirmed: options.extendedGenerationConfirmed === true,
-  }
-}
-
-export const bibleImageCandidateRetryStorageKey = (
-  projectId: string,
-  entityType: BibleImageEntityType,
-  entityId: string,
-): string => `cineforge_bible_image_candidate_${projectId}_${entityType}_${entityId}`
-
-export const createBibleImageCandidateRetryState = (
-  projectId: string,
-  entityType: BibleImageEntityType,
-  entityId: string,
-  extraDirection: string,
-  promptOverrides: Record<string, string>,
-  randomId: string,
-): BibleImageCandidateRetryState => ({
-  projectId,
-  entityType,
-  entityId,
-  idempotencyKey: `bible-image-${randomId}`.slice(0, 120),
-  extraDirection,
-  promptOverrides: { ...promptOverrides },
-  seed: null,
-  priority: 0,
-  maxAttempts: 3,
-  queueConfirmationRequired: false,
-})
-
-export const parseBibleImageCandidateRetryState = (value: string | null): BibleImageCandidateRetryState | null => {
-  if (!value) return null
-  try {
-    const raw = objectValue(JSON.parse(value))
-    const entityType = stringValue(raw.entityType)
-    const state: BibleImageCandidateRetryState = {
-      projectId: uuidValue(raw.projectId),
-      entityType: entityType as BibleImageEntityType,
-      entityId: uuidValue(raw.entityId),
-      idempotencyKey: stringValue(raw.idempotencyKey),
-      extraDirection: stringValue(raw.extraDirection),
-      promptOverrides: raw.promptOverrides && typeof raw.promptOverrides === 'object' && !Array.isArray(raw.promptOverrides)
-        ? Object.fromEntries(Object.entries(raw.promptOverrides as Raw).filter(([key, value]) => typeof key === 'string' && typeof value === 'string')) as Record<string, string>
-        : {},
-      seed: raw.seed === null ? null : integerValue(raw.seed),
-      priority: integerValue(raw.priority, -100, 100),
-      maxAttempts: integerValue(raw.maxAttempts, 1, 10),
-      queueConfirmationRequired: booleanValue(raw.queueConfirmationRequired),
-    }
-    bibleImageCandidateCreatePayload({ ...state, extendedGenerationConfirmed: false })
-    return entityTypes.includes(state.entityType) ? state : null
-  } catch {
-    return null
-  }
-}
-
-export const mergeBibleImagePromotion = (
-  projection: BibleImageCandidateProjection,
-  bibleItem: BibleItem,
-  asset: Asset,
-  outputIndex: number,
-  targetCandidate: BibleImageLatestCandidate | null = projection.latestCandidate,
-): BibleImageCandidateProjection => {
-  if (!bibleItem.referenceAssetIds.includes(asset.id)) bibleItem.referenceAssetIds.push(asset.id)
-  const summary: BibleImageAssetSummary = {
-    id: asset.id,
-    kind: asset.backendKind || asset.type,
-    name: asset.name,
-    checksum: asset.checksum || '',
-    previewUrl: asset.thumbnail || asset.mediaUrl || '',
-  }
-  const referenceAssets = projection.referenceAssets.some((item) => item.id === summary.id)
-    ? projection.referenceAssets
-    : [...projection.referenceAssets, summary]
-  const latest = targetCandidate
-  if (!latest) return { ...projection, referenceAssets }
-  const promotedAssets = latest.promotedAssets.some((item) => item.id === summary.id)
-    ? latest.promotedAssets
-    : [...latest.promotedAssets, summary]
-  const outputMedia = latest.outputMedia.map((media, index) => (
-    (media.index ?? index) === outputIndex ? { ...media, promotedAssetId: asset.id } : media
-  ))
-  const updatedCandidate = {
-    ...latest,
-    outputMedia,
-    promotedAssets,
-    reviewRequired: false,
-    persistedAsAsset: true,
-  }
-  const sameCandidate = (candidate: BibleImageLatestCandidate | null) => (
-    candidate?.promptArtifactId === latest.promptArtifactId
-    && candidate?.generationTaskId === latest.generationTaskId
-  )
-  return {
-    ...projection,
-    referenceAssets,
-    latestCandidate: sameCandidate(projection.latestCandidate)
-      ? updatedCandidate
-      : projection.latestCandidate,
-    candidateHistory: projection.candidateHistory.map((candidate) => (
-      sameCandidate(candidate) ? updatedCandidate : candidate
-    )),
-  }
-}
-
-export const bibleImageCandidateErrorCode = (error: unknown): string => {
+const bibleImageCandidateErrorCode = (error: unknown): string => {
   const response = error as { response?: { data?: { error?: { code?: unknown } } } }
   const code = String(response.response?.data?.error?.code ?? '').trim().toLowerCase()
   return SAFE_CODE_RE.test(code) ? code : ''
 }
 
 const errorMessages: Record<string, string> = {
-  production_queue_confirmation_required: '当前生产队列超过建议值。确认后仍会使用同一请求和幂等键完整排队，不会提高 worker 并发。',
-  bible_image_candidate_idempotency_conflict: '该安全重试键已用于不同请求。请先到任务中心核对已有任务，不要直接换键重复提交。',
-  bible_image_candidate_incomplete_chain: '该请求的持久化候选链不完整，系统没有静默补写。请到任务中心核对后再处理。',
-  bible_image_candidate_template_unavailable: '实体参考图系统模板当前不可用，请联系管理员检查固定模板。',
-  bible_image_candidate_prompt_invalid: '当前 Bible 字段无法构建实体参考图提示，请检查已保存的视觉字段。',
-  bible_image_candidate_target_invalid: '实体图片候选的冻结目标校验失败。',
-  bible_image_candidate_target_conflict: '图片产物与冻结的 Bible 目标不一致，未加入参考图。',
-  bible_image_candidate_provenance_mismatch: '图片产物来源与冻结任务不一致，未加入参考图。',
-  bible_image_candidate_source_stale: 'Bible、已确认译文或全局视觉规则已变化；旧候选需要人工确认后才能作为历史参考图入库。',
-  bible_image_candidate_source_invalid: '当前 Bible 或已确认译文无法重建原候选输入；请修正后重新生成。',
+  bible_image_candidate_incomplete_chain: '实体参考图候选历史链不完整，页面不会推断或补写。',
+  bible_image_candidate_target_invalid: '实体参考图候选历史的冻结目标校验失败。',
+  bible_image_candidate_target_conflict: '实体参考图候选历史与冻结目标不一致。',
+  bible_image_candidate_provenance_mismatch: '实体参考图候选历史的来源校验失败。',
+  bible_image_candidate_source_invalid: '实体参考图候选历史无法重建原始来源。',
 }
 
 export const bibleImageCandidateErrorMessage = (error: unknown, fallback: string): string => {

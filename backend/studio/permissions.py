@@ -35,3 +35,15 @@ class IsStaffOrReadOnly(BasePermission):
         if not request.user or not request.user.is_authenticated:
             return False
         return request.method in SAFE_METHODS or request.user.is_staff
+
+
+class IsSuperUser(BasePermission):
+    message = "只有超级管理员可以执行此操作"
+
+    def has_permission(self, request, view):
+        return bool(
+            request.user
+            and request.user.is_authenticated
+            and request.user.is_active
+            and request.user.is_superuser
+        )

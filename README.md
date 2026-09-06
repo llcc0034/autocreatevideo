@@ -97,6 +97,7 @@ Pop-Location
 - [MVP 边界](docs/mvp-requirements.md)
 - [运行与运维](docs/operations.md)
 - [生产操作员手册](docs/production-operator-manual.md)
+- [系统设置新手图文指南](docs/system-settings-beginner-guide.md)
 - [生产就绪检查](docs/production-readiness.md)
 - [备份与恢复](docs/backup-restore.md)
 - [生产部署](docs/production-deployment.md)

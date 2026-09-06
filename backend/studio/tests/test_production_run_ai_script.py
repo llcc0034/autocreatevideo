@@ -1,3 +1,4 @@
+import hashlib
 import json
 from datetime import timedelta
 from unittest.mock import Mock, patch
@@ -31,6 +32,7 @@ from studio.services.production_runs import validate_production_recipe_executabi
 from studio.services.readiness import _text_generation_worker_required
 from studio.services.script_bible_materialization import apply_frozen_script_bible
 from studio.services.script_sources import create_pasted_script_source
+from studio.services.series_concept_drafts import SERIES_CONCEPT_DRAFT_SCHEMA_VERSION
 from studio.services.text_generation_queue import (
     claim_next_text_attempt,
     process_text_attempt,
@@ -40,7 +42,11 @@ from studio.services.text_generation_queue import (
 from studio.services.provider_registry import ProviderDriverError
 from studio.services.secret_store import rotate_secret_binding
 from studio.tests.secret_fixtures import create_test_secret, enable_test_keyring
-from studio.tests.factories import create_test_prompt_profile_binding
+from studio.tests.factories import (
+    create_test_prompt_profile_binding,
+    series_concept_field_contract,
+    series_concept_resource_advisory,
+)
 
 
 @override_settings(AI_PROVIDER_ALLOWED_HOSTS=("approved.example", "other.example", "127.0.0.1"))
@@ -55,7 +61,7 @@ class ProductionRunAiScriptTests(TestCase):
             actor=self.user,
             value="production-run-test-secret",
         )
-        self.project = SeriesProject.objects.create(owner=self.user, title="AI 剧本闭环")
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="AI 剧本闭环", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         self.client = APIClient()
         self.client.force_authenticate(self.user)
         self.deployment = self._deployment()
@@ -75,6 +81,7 @@ class ProductionRunAiScriptTests(TestCase):
             "base_url": "https://approved.example",
             "chat_path": "/frozen/chat/completions",
             "timeout_seconds": 30,
+            "capability_ttl_seconds": 3_600,
             "pricing": {"currency": "USD", "fixed_per_request": "0.25"},
         })
         provider.save()
@@ -88,12 +95,18 @@ class ProductionRunAiScriptTests(TestCase):
         )
         assign_json_contract(profile, "specification", {
             "schema_version": 1,
+            "model_family": "strict_script_model",
             "capabilities": ["script.generate"] if capability else ["text.translate"],
             "series_concept": {
                 "minimum_shot_duration_ms": 1000,
                 "maximum_shot_duration_ms": 10000,
                 "max_output_tokens": 4096,
                 "timeout_seconds": 30,
+                "field_contract": series_concept_field_contract(),
+                "chat_request_options": {
+                    "temperature": 0.3,
+                    "response_format": {"type": "json_object"},
+                },
             },
         })
         profile.save()
@@ -177,6 +190,119 @@ class ProductionRunAiScriptTests(TestCase):
         payload.update(overrides)
         return payload
 
+    def test_structured_ai_plan_freezes_a_run_scoped_shot_duration_contract(self):
+        response = self.client.post(
+            "/api/v1/production-runs/",
+            self._payload(
+                key="one-second-duration-contract",
+                shots_per_episode=1,
+                episode_duration_seconds=1,
+            ),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201, response.data)
+        run = ProductionRun.objects.get(pk=response.data["id"])
+        expected_values = {
+            "production.video_shot_min_duration_ms": 1000,
+            "production.default_shot_duration_ms": 1000,
+            "production.video_shot_max_duration_ms": 1000,
+        }
+        self.assertEqual(
+            {
+                key: run.config_snapshot["values"][key]
+                for key in expected_values
+            },
+            expected_values,
+        )
+        self.assertEqual(
+            {
+                key: run.input_snapshot["config_overrides"][key]
+                for key in expected_values
+            },
+            expected_values,
+        )
+        contract = run.input_snapshot["structured_shot_duration_contract"]
+        self.assertEqual(contract["source"], "structured_ai_plan")
+        self.assertEqual(contract["episode_count"], 1)
+        self.assertEqual(contract["shots_per_episode"], 1)
+        self.assertEqual(contract["episode_duration_ms"], 1000)
+        self.assertEqual(contract["minimum_duration_ms"], 1000)
+        self.assertEqual(contract["default_duration_ms"], 1000)
+        self.assertEqual(contract["maximum_duration_ms"], 1000)
+        self.assertEqual(contract["route_stage_key"], "script_generate")
+        self.assertEqual(contract["model_policy_key"], "series_concept")
+        self.assertEqual(contract["route_policies"], [{
+            "route_index": 0,
+            "minimum_duration_ms": 1000,
+            "maximum_duration_ms": 10000,
+        }])
+        self.assertEqual(
+            run.input_snapshot["structured_shot_duration_contract_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    contract,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        attempt = GenerationAttempt.objects.get(
+            stage_run__production_run=run,
+            operation="script.generate",
+        )
+        self.assertEqual(attempt.request_snapshot["plan"]["minimum_shot_duration_ms"], 1000)
+        self.assertEqual(attempt.request_snapshot["plan"]["maximum_shot_duration_ms"], 1000)
+
+    def test_explicit_duration_overrides_are_preserved_or_rejected_on_conflict(self):
+        explicit = {
+            "production.video_shot_min_duration_ms": 2000,
+            "production.default_shot_duration_ms": 4000,
+            "production.video_shot_max_duration_ms": 5000,
+        }
+        accepted = self.client.post(
+            "/api/v1/production-runs/",
+            self._payload(
+                key="explicit-duration-contract",
+                config_overrides=explicit,
+            ),
+            format="json",
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.data)
+        accepted_run = ProductionRun.objects.get(pk=accepted.data["id"])
+        self.assertEqual(
+            {
+                key: accepted_run.config_snapshot["values"][key]
+                for key in explicit
+            },
+            explicit,
+        )
+        self.assertEqual(
+            accepted_run.input_snapshot["structured_shot_duration_contract"][
+                "explicit_override_keys"
+            ],
+            sorted(explicit),
+        )
+
+        rejected = self.client.post(
+            "/api/v1/production-runs/",
+            self._payload(
+                key="conflicting-duration-contract",
+                shots_per_episode=1,
+                episode_duration_seconds=1,
+                config_overrides={
+                    "production.video_shot_min_duration_ms": 5000,
+                },
+            ),
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+        self.assertIn("单集", str(rejected.data))
+        self.assertFalse(ProductionRun.objects.filter(
+            idempotency_key="conflicting-duration-contract",
+        ).exists())
+
     def test_run_creation_fails_closed_without_published_prompt_profile_binding(self):
         self.deployment.profile_version.prompt_profile_bindings.update(is_active=False)
 
@@ -205,17 +331,31 @@ class ProductionRunAiScriptTests(TestCase):
             maximum_shot_duration_ms=1000,
             model_identifier="strict-script-model",
             timeout_seconds=30,
+            chat_request_options={
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            },
             configured_output_token_hint=4096,
+            field_contract=series_concept_field_contract(),
+            resource_advisory=series_concept_resource_advisory(),
         )
 
         payload = provider_payload(plan)
         system = payload["messages"][0]["content"]
         contract = json.loads(system.split("CONTRACT=", 1)[1])
 
+        self.assertEqual(payload["chat_request_options"], {
+            "temperature": 0.3,
+            "response_format": {"type": "json_object"},
+        })
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("response_format", payload)
+        self.assertNotIn("chat_completion_options", payload)
         self.assertIn("exactly 1 episode(s)", system)
         self.assertIn("exactly 2 shot(s)", system)
         self.assertIn("MUST equal 1000", system)
         self.assertIn("printable ASCII phrase", system)
+        self.assertEqual(contract["schema_version"], SERIES_CONCEPT_DRAFT_SCHEMA_VERSION)
         self.assertEqual(len(contract["episodes"]), 1)
         self.assertEqual(len(contract["episodes"][0]["shots"]), 2)
         self.assertEqual(
@@ -226,11 +366,19 @@ class ProductionRunAiScriptTests(TestCase):
             set(contract["episodes"][0]["shots"][0]),
             {"setting", "action", "duration_ms", "dialogue"},
         )
+        self.assertEqual(
+            contract["episodes"][0]["shots"][0]["dialogue"],
+            {
+                "speaker": "", "delivery": "", "text": "",
+                "start_ms": 0, "end_ms": 0,
+            },
+        )
+        self.assertIn("0 <= start_ms < end_ms", system)
 
     @staticmethod
     def _candidate_text(plan):
         return json.dumps({
-            "schema_version": 2,
+            "schema_version": SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
             "title": "雨夜密信",
             "logline": "沈砚在雨夜老宅通过密信追查真相。",
             "bible": {
@@ -253,7 +401,13 @@ class ProductionRunAiScriptTests(TestCase):
                     "setting": "雨夜老宅",
                     "action": "沈砚展开密信并看见失踪者留下的暗号。",
                     "duration_ms": 6000,
-                    "dialogue": {"speaker": "沈砚", "delivery": "quietly", "text": "他还活着。"},
+                    "dialogue": {
+                        "speaker": "沈砚",
+                        "delivery": "quietly",
+                        "text": "他还活着。",
+                        "start_ms": 1_250,
+                        "end_ms": 4_750,
+                    },
                 }],
             }],
         }, ensure_ascii=False)
@@ -276,18 +430,6 @@ class ProductionRunAiScriptTests(TestCase):
             "pricing": {"currency": "USD", "fixed_per_request": "9"},
         })
         provider.save()
-        profile = self.deployment.profile_version
-        assign_json_contract(profile, "specification", {
-            "schema_version": 1,
-            "capabilities": ["script.generate"],
-            "series_concept": {
-                "minimum_shot_duration_ms": 2000,
-                "maximum_shot_duration_ms": 3000,
-                "max_output_tokens": 128,
-                "timeout_seconds": 1,
-            },
-        })
-        profile.save()
 
         driver = Mock()
         driver.invoke.side_effect = lambda deployment, operation, payload: {
@@ -366,7 +508,11 @@ class ProductionRunAiScriptTests(TestCase):
         conflict = self.client.post(
             "/api/v1/production-runs/", self._payload(idea="另一故事"), format="json",
         )
-        self.assertEqual(conflict.status_code, 400, conflict.data)
+        self.assertEqual(conflict.status_code, 409, conflict.data)
+        self.assertEqual(
+            conflict.data["error"]["code"],
+            "production_run_conflict",
+        )
 
         self.assertFalse(ScriptRevision.objects.filter(source__project=self.project).exists())
         _, preview = create_pasted_script_source(
@@ -426,6 +572,13 @@ class ProductionRunAiScriptTests(TestCase):
             is_locked=False,
         )
 
+        # A ProductionRun is bound to its confirmed ScriptRevision.  Bible
+        # approval must not switch to the mutable project.master_script field,
+        # which can be empty for an imported/manual script before storyboard
+        # materialization.
+        self.project.master_script = ""
+        self.project.save(update_fields=("master_script", "updated_at"))
+
         bible = self.client.post(f"/api/v1/production-runs/{run.id}/approve/", {
             "stage_key": "bible_review", "decision": "approve", "comment": "Bible 通过",
         }, format="json")
@@ -438,7 +591,11 @@ class ProductionRunAiScriptTests(TestCase):
 
         materialize = StageRun.objects.get(production_run=run, stage_key="bible_materialize")
         frozen = materialize.output_snapshot.get("review_payload", materialize.output_snapshot)
-        apply_frozen_script_bible(project=self.project, frozen=frozen)
+        apply_frozen_script_bible(
+            project=self.project,
+            source_content=revision.content,
+            frozen=frozen,
+        )
         self.assertEqual(CharacterBible.objects.filter(project=self.project).count(), 1)
         self.assertEqual(SceneBible.objects.filter(project=self.project).count(), 1)
         self.assertEqual(PropBible.objects.filter(project=self.project).count(), 1)
@@ -735,6 +892,47 @@ class ProductionRunAiScriptTests(TestCase):
         result.refresh_from_db()
         self.assertEqual(result.status, GenerationAttempt.Status.FAILED)
         self.assertNotEqual(result.error_code, "uncertain_remote_response")
+        self.assertEqual(run.status, ProductionRun.Status.BLOCKED)
+        driver.invoke.assert_not_called()
+
+    def test_pre_submit_model_profile_version_drift_fails_without_invoking_provider(self):
+        created = self.client.post(
+            "/api/v1/production-runs/",
+            self._payload(key="pre-submit-model-profile-drift"),
+            format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        run = ProductionRun.objects.get(pk=created.data["id"])
+        attempt = claim_next_text_attempt("model-profile-drift-worker")
+
+        profile = self.deployment.profile_version
+        assign_json_contract(profile, "specification", {
+            "schema_version": 1,
+            "model_family": "strict_script_model",
+            "capabilities": ["script.generate"],
+            "series_concept": {
+                "minimum_shot_duration_ms": 2000,
+                "maximum_shot_duration_ms": 3000,
+                "max_output_tokens": 128,
+                "timeout_seconds": 1,
+                "field_contract": series_concept_field_contract(),
+                "chat_request_options": {
+                    "temperature": 0.3,
+                    "response_format": {"type": "json_object"},
+                },
+            },
+        })
+        profile.save()
+
+        driver = Mock()
+        with patch("studio.services.text_generation_queue.driver_for", return_value=driver):
+            result = process_text_attempt(attempt)
+
+        run.refresh_from_db()
+        result.refresh_from_db()
+        self.assertEqual(result.status, GenerationAttempt.Status.FAILED)
+        self.assertEqual(result.error_code, "text_attempt_pre_submit_validation_failed")
+        self.assertIn("model specification", result.error_message)
         self.assertEqual(run.status, ProductionRun.Status.BLOCKED)
         driver.invoke.assert_not_called()
 

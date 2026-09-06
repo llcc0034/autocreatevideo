@@ -16,7 +16,6 @@ from studio.models import (
     ConsistencyLock,
     DeferredGenerationRequest,
     Episode,
-    EpisodeCreativeDraft,
     GeneratedArtifact,
     GeneratedWorkflow,
     GenerationAttempt,
@@ -125,7 +124,8 @@ class StyleAdmin(admin.ModelAdmin):
 class AssetAdmin(admin.ModelAdmin):
     list_display = ("name", "kind", "style", "owner", "is_active")
     list_filter = ("kind", "style", "is_active")
-    search_fields = ("name", "description", "local_path", "checksum")
+    search_fields = ("name", "description", "source_info", "local_path", "checksum")
+    readonly_fields = ("source_info",)
 
 
 @admin.register(SeriesProject)
@@ -204,30 +204,17 @@ class EpisodeAdmin(admin.ModelAdmin):
     search_fields = ("project__title", "title", "synopsis")
 
 
-@admin.register(EpisodeCreativeDraft)
-class EpisodeCreativeDraftAdmin(ImmutableProductionAuditAdmin):
-    list_display = (
-        "episode", "generation_no", "status", "revision", "creativity", "updated_at",
-    )
-    list_filter = ("status", "creativity", "provider")
-    search_fields = ("project__title", "episode__title", "variation_note", "error_message")
-    readonly_fields = (
-        "context_hash", "context_snapshot", "draft_data", "validation", "warnings",
-        "runtime_metadata", "revision_history", "confirmed_at", "applied_at",
-    )
-
-
 @admin.register(Shot)
 class ShotAdmin(admin.ModelAdmin):
-    list_display = ("episode", "number", "title", "media_type", "h3_mode", "duration_ms", "include_audio")
-    list_filter = ("media_type", "h3_mode", "include_audio")
+    list_display = ("episode", "number", "title", "media_type", "conditioning_mode", "duration_ms", "include_audio")
+    list_filter = ("media_type", "conditioning_mode", "include_audio")
     search_fields = ("title", "narrative", "action")
 
 
 @admin.register(PromptArtifact)
 class PromptArtifactAdmin(ImmutableProductionAuditAdmin):
-    list_display = ("project", "episode", "shot", "prompt_type", "h3_mode", "revision", "created_at")
-    list_filter = ("prompt_type", "h3_mode", "is_multi_shot", "include_audio")
+    list_display = ("project", "episode", "shot", "prompt_type", "conditioning_mode", "revision", "created_at")
+    list_filter = ("prompt_type", "conditioning_mode", "is_multi_shot", "include_audio")
     search_fields = ("prompt_text", "content_hash")
 
 
@@ -339,15 +326,36 @@ class WorkflowTemplateVersionAdmin(ImmutableProductionAuditAdmin):
 
 @admin.register(ConfigDefinition)
 class ConfigDefinitionAdmin(ImmutableProductionAuditAdmin):
-    list_display = ("key", "domain", "value_type", "is_required", "is_secret", "is_active")
-    list_filter = ("domain", "value_type", "is_required", "is_secret", "is_active")
+    """Read-only mirror; managed configuration writes use the audited API.
+
+    In particular, a security_boundary must never gain an admin-model write
+    bypass. Only a superuser may change it through the formal settings/API
+    path, where complete revision, checksum and lifecycle checks are enforced.
+    """
+
+    list_display = (
+        "key", "domain", "configuration_class", "value_type",
+        "is_required", "is_secret", "is_active",
+    )
+    list_filter = (
+        "domain", "configuration_class", "value_type",
+        "is_required", "is_secret", "is_active",
+    )
     search_fields = ("key", "description")
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(ConfigRevision)
 class ConfigRevisionAdmin(ImmutableProductionAuditAdmin):
+    """Immutable revision evidence; publish/activate only through audited API."""
+
     list_display = ("scope_type", "revision", "status", "project", "run", "published_at")
     list_filter = ("scope_type", "status")
+
+    def has_change_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(ScriptSource)

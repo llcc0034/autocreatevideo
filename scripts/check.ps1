@@ -15,12 +15,77 @@ function Assert-NativeSuccess([string]$Step) {
     }
 }
 
+function Assert-NoLegacyConditioningFieldNames([string]$RootPath) {
+    $ResolvedRoot = [System.IO.Path]::GetFullPath($RootPath).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    $LegacyNames = @(
+        ('default' + '_h3' + '_mode'),
+        ('workflow' + '_h3' + '_modes'),
+        ('h3' + '_modes'),
+        ('h3' + '_mode')
+    )
+    $LegacyPattern = '(?i)(?:' + (($LegacyNames | ForEach-Object {
+        [regex]::Escape($_)
+    }) -join '|') + ')'
+    $AllowedExtensions = @(
+        '.py', '.pyi', '.ts', '.tsx', '.vue', '.js', '.mjs', '.cjs',
+        '.ps1', '.psm1', '.json', '.yaml', '.yml', '.md'
+    )
+    $SourceRoots = @(
+        (Join-Path $RootPath 'backend'),
+        (Join-Path $RootPath 'frontend'),
+        (Join-Path $RootPath 'scripts'),
+        (Join-Path $RootPath 'docs')
+    )
+    $CandidateFiles = @(
+        foreach ($SourceRoot in $SourceRoots) {
+            if (Test-Path -LiteralPath $SourceRoot -PathType Container) {
+                Get-ChildItem -LiteralPath $SourceRoot -Recurse -File | Where-Object {
+                    $AllowedExtensions -contains $_.Extension.ToLowerInvariant() -and
+                    $_.FullName -notmatch '[\\/](?:\.venv|node_modules|dist|\.runtime|__pycache__)[\\/]' -and
+                    $_.FullName -notmatch '[\\/]backend[\\/]studio[\\/]migrations[\\/]' -and
+                    $_.FullName -notmatch '[\\/]docs[\\/]e2e-short-drama-ref2va-dual-clock-test-[^\\/]+\.md$'
+                }
+            }
+        }
+        foreach ($RootFileName in @('README.md', 'openapi.yaml')) {
+            $RootFile = Join-Path $RootPath $RootFileName
+            if (Test-Path -LiteralPath $RootFile -PathType Leaf) {
+                Get-Item -LiteralPath $RootFile
+            }
+        }
+    )
+    $Violations = @(
+        foreach ($CandidateFile in $CandidateFiles) {
+            Select-String -LiteralPath $CandidateFile.FullName -Pattern $LegacyPattern -AllMatches |
+                ForEach-Object {
+                    $ResolvedFile = [System.IO.Path]::GetFullPath($_.Path)
+                    $RelativePath = if ($ResolvedFile.StartsWith(
+                        $ResolvedRoot, [System.StringComparison]::OrdinalIgnoreCase
+                    )) {
+                        $ResolvedFile.Substring($ResolvedRoot.Length)
+                    } else {
+                        $ResolvedFile
+                    }
+                    '{0}:{1}: {2}' -f $RelativePath, $_.LineNumber, $_.Line.Trim()
+                }
+        }
+    )
+    if ($Violations.Count -gt 0) {
+        throw (
+            "Legacy model-specific conditioning field names remain in formal source. " +
+            "Django migrations and the named historical E2E reports are the only exclusions.`n" +
+            ($Violations -join "`n")
+        )
+    }
+}
+
 if (-not (Test-Path -LiteralPath $PythonPath)) {
     throw 'Run scripts\setup.ps1 first.'
 }
 Assert-AutoPromptOpenApiAuthority `
     -RootContractPath $OpenApiPath `
     -LegacyContractPath $LegacyOpenApiPath
+Assert-NoLegacyConditioningFieldNames -RootPath $ProjectRoot
 
 $FfmpegRuntime = Resolve-AutoPromptFfmpegRuntime -ProjectRoot $ProjectRoot
 if ($null -eq $FfmpegRuntime) {
@@ -125,24 +190,24 @@ try {
     Assert-NativeSuccess 'Dialogue adapter tests'
     & $NpmPath run test:adapters
     Assert-NativeSuccess 'Backend adapter tests'
-    & $NpmPath run test:creative
-    Assert-NativeSuccess 'Creative draft failure recovery tests'
-    & $NpmPath run test:series-concept
-    Assert-NativeSuccess 'Series concept boundary tests'
-    & $NpmPath run test:script-bible
-    Assert-NativeSuccess 'Script Bible boundary tests'
     & $NpmPath run test:bible-images
     Assert-NativeSuccess 'Bible image history tests'
     & $NpmPath run test:deferred-generation
     Assert-NativeSuccess 'Deferred generation diagnostics tests'
-    & $NpmPath run test:shot-detail
-    Assert-NativeSuccess 'Single-shot high-detail draft UI tests'
-    & $NpmPath run test:visual-rules
-    Assert-NativeSuccess 'Global visual rules draft tests'
+    & $NpmPath run test:shot-detail-field
+    Assert-NativeSuccess 'Storyboard detailed description tests'
     & $NpmPath run test:manual
     Assert-NativeSuccess 'Versioned production operator manual tests'
+    & $NpmPath run test:settings-guide
+    Assert-NativeSuccess 'System settings beginner guide and bilingual presentation tests'
     & $NpmPath run test:workflow-selection
     Assert-NativeSuccess 'Production workflow selection entry tests'
+    & $NpmPath run test:saved-workflow-import
+    Assert-NativeSuccess 'Saved Comfy workflow import tests'
+    & $NpmPath run test:workflow-inputs
+    Assert-NativeSuccess 'Workflow execution input and smoke fixture presentation tests'
+    & $NpmPath run test:task-grouping
+    Assert-NativeSuccess 'Task grouping tests'
     & $NpmPath run test:projects
     Assert-NativeSuccess 'Series project management tests'
     & $NpmPath run test:assets
@@ -155,6 +220,8 @@ try {
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_backup_restore.ps1')
 Assert-NativeSuccess 'Backup and restore safety tests'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_setup_bootstrap.ps1')
+Assert-NativeSuccess 'Fresh-install setup bootstrap ordering tests'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_restart_config.ps1')
 Assert-NativeSuccess 'Restart configuration tests'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_restart_processes.ps1')

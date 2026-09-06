@@ -26,6 +26,7 @@ from studio.models import (
     WorkflowTemplateVersion,
 )
 from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
+from studio.services.bible_reference_contract import BIBLE_IMAGE_GENERATION_STAGE_KEY
 from studio.services.comfyui_contract import (
     ComfyUIContractError,
     ComfyUIContractUnavailable,
@@ -54,13 +55,122 @@ from studio.services.script_structure import (
 )
 from studio.services.prompt_normalization import validate_prompt_normalization_model_profile
 from studio.services.prompt_normalization_contract import PROMPT_NORMALIZE_OPERATION
+
+
+from studio.services.production_visual_rules import (
+    VISUAL_RULES_OPERATION,
+    validate_visual_rules_model_profile,
+)
+from studio.services.media_capabilities import resolve_conditioning_contract
+from studio.services.model_profile_contracts import (
+    verified_model_profile_specification,
+)
 from studio.services.prompt_profiles import (
+    compatible_prompt_profile_bindings,
     model_family_for_profile,
     require_prompt_profile_binding,
+    validate_bible_image_prompt_profile,
+)
+from studio.services.security_boundaries import security_boundary_resolution_cache
+from studio.services.workflow_versions import (
+    declared_workflow_operation,
+    verify_published_workflow_capability,
 )
 
 
+READINESS_RUNTIME_KEYS = (
+    "runtime.readiness_worker_max_age_seconds",
+    "runtime.readiness_min_disk_free_bytes",
+    "runtime.readiness_generation_worker_required",
+    "runtime.readiness_text_generation_worker_required",
+    "runtime.readiness_assembly_worker_required",
+)
+_RUNTIME_VALUES_UNSET = object()
+
+
+def _readiness_runtime_values() -> dict[str, object]:
+    values = resolve_configuration(required_keys=READINESS_RUNTIME_KEYS).values
+    worker_age = values["runtime.readiness_worker_max_age_seconds"]
+    disk_free = values["runtime.readiness_min_disk_free_bytes"]
+    worker_flags = {
+        "generation_worker_required": values[
+            "runtime.readiness_generation_worker_required"
+        ],
+        "text_generation_worker_required": values[
+            "runtime.readiness_text_generation_worker_required"
+        ],
+        "assembly_worker_required": values[
+            "runtime.readiness_assembly_worker_required"
+        ],
+    }
+    if type(worker_age) is not int or worker_age < 1:
+        raise ConfigurationResolutionError(
+            "runtime.readiness_worker_max_age_seconds 必须是正整数",
+            code="readiness_config_invalid",
+            missing_keys=("runtime.readiness_worker_max_age_seconds",),
+        )
+    if type(disk_free) is not int or disk_free < 0:
+        raise ConfigurationResolutionError(
+            "runtime.readiness_min_disk_free_bytes 必须是非负整数",
+            code="readiness_config_invalid",
+            missing_keys=("runtime.readiness_min_disk_free_bytes",),
+        )
+    invalid_flags = [
+        name for name, value in worker_flags.items()
+        if type(value) is not bool
+    ]
+    if invalid_flags:
+        raise ConfigurationResolutionError(
+            "readiness worker required 配置必须是布尔值",
+            code="readiness_config_invalid",
+            missing_keys=tuple(
+                f"runtime.readiness_{name}" for name in invalid_flags
+            ),
+        )
+    return {
+        "worker_max_age_seconds": worker_age,
+        "minimum_disk_free_bytes": disk_free,
+        **worker_flags,
+    }
+
+
+def _runtime_values_or_raise(runtime_values: object = _RUNTIME_VALUES_UNSET) -> dict:
+    if runtime_values is _RUNTIME_VALUES_UNSET:
+        return _readiness_runtime_values()
+    if isinstance(runtime_values, BaseException):
+        raise runtime_values
+    if not isinstance(runtime_values, dict):
+        raise ConfigurationResolutionError(
+            "readiness 运行配置不可用",
+            code="readiness_config_invalid",
+            missing_keys=READINESS_RUNTIME_KEYS,
+        )
+    return runtime_values
+
+
 User = get_user_model()
+
+
+_TEXT_STAGE_OPERATIONS = {
+    "script_generate": SCRIPT_GENERATE_OPERATION,
+    "script_structure": SCRIPT_STRUCTURE_OPERATION,
+    "visual_rules_generate": VISUAL_RULES_OPERATION,
+    "script_normalize": PROMPT_NORMALIZE_OPERATION,
+}
+
+_TEXT_PROFILE_CONTRACT_REASON_CODES = {
+    SCRIPT_GENERATE_OPERATION: "script_profile_contract_invalid",
+    SCRIPT_STRUCTURE_OPERATION: "script_structure_profile_contract_invalid",
+    VISUAL_RULES_OPERATION: "visual_rules_profile_contract_invalid",
+    PROMPT_NORMALIZE_OPERATION: "prompt_normalize_profile_contract_invalid",
+}
+
+_TEXT_SMOKE_REASON_CODES = {
+    SCRIPT_GENERATE_OPERATION: "script_smoke_missing_or_stale",
+    SCRIPT_STRUCTURE_OPERATION: "script_structure_smoke_missing_or_stale",
+    VISUAL_RULES_OPERATION: "visual_rules_smoke_missing_or_stale",
+    PROMPT_NORMALIZE_OPERATION: "prompt_normalize_smoke_missing_or_stale",
+}
 
 
 def _result(ok: bool, message: str, **details) -> dict:
@@ -187,9 +297,17 @@ def _secret_store_check() -> dict:
     )
 
 
-def _storage_check() -> dict:
+def _storage_check(*, runtime_values: object = _RUNTIME_VALUES_UNSET) -> dict:
     media_root = Path(settings.MEDIA_ROOT)
-    minimum = max(0, int(getattr(settings, "READINESS_MIN_DISK_FREE_BYTES", 512 * 1024 * 1024)))
+    try:
+        minimum = _runtime_values_or_raise(runtime_values)["minimum_disk_free_bytes"]
+    except Exception:
+        return _result(
+            False,
+            "无法读取媒体存储就绪配置",
+            free_bytes=None,
+            minimum_free_bytes=None,
+        )
     try:
         if not media_root.is_dir() or not os.access(media_root, os.W_OK):
             return _result(False, "媒体存储目录不可写", free_bytes=None, minimum_free_bytes=minimum)
@@ -233,11 +351,11 @@ def _toolchain_check() -> dict:
     )
 
 
-def _comfyui_output_check() -> dict:
+def _comfyui_output_check(*, runtime_values: object = _RUNTIME_VALUES_UNSET) -> dict:
     configured = str(getattr(settings, "COMFYUI_OUTPUT_DIR", "") or "").strip()
     if not configured:
         return _result(True, "未配置本地 ComfyUI 输出目录；仅影响本地媒体能力", required=False)
-    minimum = max(0, int(getattr(settings, "READINESS_MIN_DISK_FREE_BYTES", 512 * 1024 * 1024)))
+    minimum = _runtime_values_or_raise(runtime_values)["minimum_disk_free_bytes"]
     try:
         root = Path(configured)
         available = root.is_dir() and os.access(root, os.R_OK)
@@ -254,10 +372,16 @@ def _comfyui_output_check() -> dict:
     )
 
 
-def _worker_check(key: str, label: str, *, required: bool) -> dict:
+def _worker_check(
+    key: str,
+    label: str,
+    *,
+    required: bool,
+    runtime_values: object = _RUNTIME_VALUES_UNSET,
+) -> dict:
     if not required:
         return _result(True, f"{label}未设为必需", required=False, last_seen_at=None)
-    max_age = max(5, int(getattr(settings, "READINESS_WORKER_MAX_AGE_SECONDS", 30)))
+    max_age = _runtime_values_or_raise(runtime_values)["worker_max_age_seconds"]
     try:
         last_seen = WorkerLease.objects.filter(pk=key).values_list("updated_at", flat=True).first()
     except Exception:
@@ -316,12 +440,22 @@ def _workflow_catalog_check() -> dict:
             failures[str(version.id)] = "validated_deployment_unavailable"
             continue
         try:
+            operation = declared_workflow_operation(version)
+            verify_published_workflow_capability(
+                version,
+                deployment,
+                operation=operation,
+            )
             driver = driver_for(version.provider)
             health = driver.invoke(deployment, "health", {})
             object_info = driver.invoke(deployment, "object_info", {})
             validate_comfyui_api_contract(version.graph, object_info)
             if not isinstance(health, dict):
                 raise ProviderDriverError("invalid health response")
+        except ValidationError as exc:
+            failures[str(version.id)] = str(
+                getattr(exc, "code", None) or "workflow_capability_contract_invalid",
+            )
         except (
             ProviderDriverError,
             ComfyUIContractError,
@@ -340,9 +474,19 @@ def _workflow_catalog_check() -> dict:
     )
 
 
-def _text_generation_worker_required() -> bool:
-    if not bool(getattr(settings, "READINESS_TEXT_GENERATION_WORKER_REQUIRED", True)):
+def _text_generation_worker_required(
+    *,
+    runtime_values: object = _RUNTIME_VALUES_UNSET,
+    requirements: dict[str, object] | None = None,
+) -> bool:
+    if not _runtime_values_or_raise(runtime_values)["text_generation_worker_required"]:
         return False
+    if requirements is not None:
+        # The capability collector uses the same published recipe snapshot.
+        # Treating any declared AI text route as requiring the worker is at
+        # least as strict as the former per-recipe validator, while avoiding a
+        # second full validation pass over the same immutable definitions.
+        return bool(requirements["text_deployments"])
     from studio.services.production_runs import validate_production_recipe_executability
 
     for recipe in ProductionRecipeVersion.objects.filter(
@@ -353,7 +497,7 @@ def _text_generation_worker_required() -> bool:
         except Exception:
             continue
         if any(
-            item["key"] in {"script_generate", "script_structure", "script_normalize"}
+            item["key"] in _TEXT_STAGE_OPERATIONS
             and item["mode"] == "ai"
             for item in stages
         ):
@@ -369,7 +513,7 @@ def _text_provider_credentials_check() -> dict:
         definition = recipe.definition if isinstance(recipe.definition, dict) else {}
         for stage in definition.get("stages") or []:
             if not isinstance(stage, dict) or not (
-                stage.get("key") in {"script_generate", "script_structure", "script_normalize"}
+                stage.get("key") in _TEXT_STAGE_OPERATIONS
                 and stage.get("mode") == "ai"
             ):
                 continue
@@ -422,23 +566,26 @@ def _requirements_from_stages(stages: list[dict]) -> dict[str, object]:
             requirements["assembly"] = True
             continue
         routing = stage.get("routing") if isinstance(stage.get("routing"), dict) else {}
+        bible_route_group = object() if key == BIBLE_IMAGE_GENERATION_STAGE_KEY else None
         for route in routing.get("routes") or []:
             if not isinstance(route, dict) or not route.get("model_deployment_id"):
                 continue
-            if key in {"script_generate", "script_structure", "script_normalize"}:
+            if key in _TEXT_STAGE_OPERATIONS:
                 deployment_id = str(route["model_deployment_id"])
                 requirements["text_deployments"].add(deployment_id)
-                operation = (
-                    SCRIPT_GENERATE_OPERATION
-                    if key == "script_generate"
-                    else SCRIPT_STRUCTURE_OPERATION
-                    if key == "script_structure"
-                    else PROMPT_NORMALIZE_OPERATION
-                )
+                operation = _TEXT_STAGE_OPERATIONS[key]
                 requirements["text_operations"].setdefault(deployment_id, set()).add(operation)
             elif key == "media_generation":
                 requirements["image_routes"].append(route)
                 requirements["video_routes"].append(route)
+            elif key == BIBLE_IMAGE_GENERATION_STAGE_KEY:
+                requirements["image_routes"].append({
+                    **route,
+                    # Bible routes form one exact-selection group: the UI and
+                    # create path require one binding that is valid for every
+                    # route in this stage, not merely a generic image profile.
+                    "_bible_route_group": bible_route_group,
+                })
     return requirements
 
 
@@ -464,7 +611,12 @@ def _published_recipe_requirements() -> dict[str, object]:
     return requirements
 
 
-def _media_capability_readiness(routes: list[dict], *, modality: str) -> dict:
+def _media_capability_readiness(
+    routes: list[dict],
+    *,
+    modality: str,
+    runtime_values: object = _RUNTIME_VALUES_UNSET,
+) -> dict:
     if not routes:
         return {"state": "not_required", "required": False, "reason_codes": []}
     workflow_ids = {
@@ -484,18 +636,77 @@ def _media_capability_readiness(routes: list[dict], *, modality: str) -> dict:
             "runtime_host", "profile_version__provider",
         ).filter(pk__in=deployment_ids)
     }
-    operation = "image.text_to_image" if modality == "image" else "video.text_to_video"
+    async_operation = {
+        "image": "image.text_to_image",
+        "video": "video.text_to_video",
+        "audio": "audio.text_to_audio",
+    }.get(modality)
+    if async_operation is None:
+        return None
     relevant = []
+    invalid_model_profile_deployment_ids: set[str] = set()
     for route in routes:
         deployment = deployments.get(str(route.get("model_deployment_id")))
         if deployment and deployment.provider.driver_type == ProviderProfile.DriverType.ASYNC_REST:
-            capabilities = deployment.profile_version.specification.get("capabilities")
-            if isinstance(capabilities, list) and operation in capabilities:
+            try:
+                specification = verified_model_profile_specification(
+                    deployment.profile_version,
+                )
+            except ValidationError:
+                invalid_model_profile_deployment_ids.add(str(deployment.id))
+                relevant.append(route)
+                continue
+            capabilities = specification.get("capabilities")
+            if isinstance(capabilities, list) and async_operation in capabilities:
                 relevant.append(route)
         elif str(route.get("workflow_version_id")) in workflows:
             relevant.append(route)
     if not relevant:
         return {"state": "not_required", "required": False, "reason_codes": []}
+
+    def compatible_choice_ids(
+        route: dict,
+        deployment: ModelDeployment,
+        prompt_mode: str,
+    ) -> set[str]:
+        try:
+            model_family = model_family_for_profile(deployment.profile_version)
+        except ValidationError:
+            invalid_model_profile_deployment_ids.add(str(deployment.id))
+            return set()
+        choices = compatible_prompt_profile_bindings(
+            operation=f"{modality}.generate",
+            model_family=model_family,
+            mode=prompt_mode,
+            model_profile_version=deployment.profile_version,
+        )
+        if route.get("_bible_route_group") is None:
+            return {str(item.binding.id) for item in choices}
+        bible_choices = set()
+        for item in choices:
+            try:
+                validate_bible_image_prompt_profile(item.profile_version)
+            except ValidationError:
+                continue
+            bible_choices.add(str(item.binding.id))
+        return bible_choices
+
+    bible_group_choice_ids: dict[int, set[str]] = {}
+    for route in relevant:
+        group = route.get("_bible_route_group")
+        if group is None:
+            continue
+        group_key = id(group)
+        deployment = deployments.get(str(route.get("model_deployment_id")))
+        route_choices = (
+            compatible_choice_ids(route, deployment, "")
+            if deployment is not None
+            else set()
+        )
+        if group_key in bible_group_choice_ids:
+            bible_group_choice_ids[group_key].intersection_update(route_choices)
+        else:
+            bible_group_choice_ids[group_key] = route_choices
     reasons: set[str] = set()
     ready_count = 0
     viable_async_routes = 0
@@ -512,27 +723,51 @@ def _media_capability_readiness(routes: list[dict], *, modality: str) -> dict:
         ):
             reasons.add("deployment_inactive")
             continue
+        try:
+            model_specification = verified_model_profile_specification(
+                deployment.profile_version,
+            )
+        except ValidationError:
+            invalid_model_profile_deployment_ids.add(str(deployment.id))
+            reasons.add("model_profile_contract_invalid")
+            continue
         workflow = workflows.get(str(route.get("workflow_version_id")))
         prompt_modes = [""]
         if modality == "video":
-            if deployment.provider.driver_type == ProviderProfile.DriverType.ASYNC_REST:
-                prompt_modes = ["T2VA"]
-            elif workflow is not None:
-                declared_modes = (workflow.input_contract or {}).get("h3_modes") or []
-                prompt_modes = [str(value) for value in declared_modes] or [""]
-        try:
-            for prompt_mode in prompt_modes:
-                require_prompt_profile_binding(
-                    operation=f"{modality}.generate",
-                    model_family=model_family_for_profile(deployment.profile_version),
-                    mode=prompt_mode,
-                    model_profile_version=deployment.profile_version,
+            try:
+                conditioning_contract = resolve_conditioning_contract(
+                    workflow_input_contract=(
+                        workflow.input_contract if workflow is not None else None
+                    ),
+                    model_specification=model_specification,
+                    output_kind="video",
+                    required=True,
                 )
-        except ValidationError:
-            reasons.add("prompt_profile_binding_missing_or_invalid")
+            except ValidationError:
+                reasons.add("conditioning_contract_invalid")
+                continue
+            prompt_modes = [
+                str(item["key"])
+                for item in conditioning_contract["modes"]
+            ]
+        bible_group = route.get("_bible_route_group")
+        prompt_choices_ready = (
+            bool(bible_group_choice_ids.get(id(bible_group), set()))
+            if bible_group is not None
+            else all(
+                bool(compatible_choice_ids(route, deployment, prompt_mode))
+                for prompt_mode in prompt_modes
+            )
+        )
+        if not prompt_choices_ready:
+            reasons.add(
+                "model_profile_contract_invalid"
+                if str(deployment.id) in invalid_model_profile_deployment_ids
+                else "prompt_profile_binding_missing_or_invalid"
+            )
             continue
         if deployment.provider.driver_type == ProviderProfile.DriverType.ASYNC_REST:
-            if fresh_smoke_snapshot(deployment, operation) is None:
+            if fresh_smoke_snapshot(deployment, async_operation) is None:
                 reasons.add("async_smoke_missing_or_stale")
                 continue
             ready_count += 1
@@ -541,13 +776,18 @@ def _media_capability_readiness(routes: list[dict], *, modality: str) -> dict:
         if workflow is None:
             reasons.add("workflow_missing")
             continue
-        if (
-            workflow.status != WorkflowTemplateVersion.Status.PUBLISHED
-            or not workflow.is_current
-            or workflow.validation_state != WorkflowTemplateVersion.ValidationState.PASSED
-            or workflow.smoke_test_state != WorkflowTemplateVersion.ValidationState.PASSED
-        ):
-            reasons.add("workflow_not_production_ready")
+        try:
+            workflow_operation = declared_workflow_operation(workflow)
+            verify_published_workflow_capability(
+                workflow,
+                deployment,
+                operation=workflow_operation,
+            )
+        except ValidationError as exc:
+            reasons.add(str(
+                getattr(exc, "code", None)
+                or "workflow_capability_contract_invalid",
+            ))
             continue
         if deployment.runtime_host_id is None:
             ready_count += 1
@@ -583,10 +823,16 @@ def _media_capability_readiness(routes: list[dict], *, modality: str) -> dict:
         ready_count += 1
         viable_comfy_routes += 1
     comfy_worker = _worker_check(
-        "generation-worker-heartbeat", "生成 Worker", required=viable_comfy_routes > 0,
+        "generation-worker-heartbeat",
+        "生成 Worker",
+        required=viable_comfy_routes > 0,
+        runtime_values=runtime_values,
     )
     async_worker = _worker_check(
-        "async-media-worker-heartbeat", "异步媒体 Worker", required=viable_async_routes > 0,
+        "async-media-worker-heartbeat",
+        "异步媒体 Worker",
+        required=viable_async_routes > 0,
+        runtime_values=runtime_values,
     )
     if viable_comfy_routes and not comfy_worker["ok"]:
         reasons.add("generation_worker_unavailable")
@@ -605,12 +851,19 @@ def _media_capability_readiness(routes: list[dict], *, modality: str) -> dict:
     }
 
 
-def _capability_readiness_for_requirements(requirements: dict[str, object]) -> dict:
+def _capability_readiness_for_requirements(
+    requirements: dict[str, object],
+    *,
+    runtime_values: object = _RUNTIME_VALUES_UNSET,
+) -> dict:
     text_ids = requirements["text_deployments"]
     text_operations = requirements.get("text_operations") or {}
     if text_ids:
         text_worker = _worker_check(
-            "text-generation-worker-heartbeat", "文本生成 Worker", required=True,
+            "text-generation-worker-heartbeat",
+            "文本生成 Worker",
+            required=True,
+            runtime_values=runtime_values,
         )
         deployments = {
             str(item.id): item
@@ -641,20 +894,21 @@ def _capability_readiness_for_requirements(requirements: dict[str, object]) -> d
                     policy = (
                         validate_script_structure_model_profile(deployment.profile_version)
                         if operation == SCRIPT_STRUCTURE_OPERATION
+                        else validate_visual_rules_model_profile(deployment.profile_version)
+                        if operation == VISUAL_RULES_OPERATION
                         else validate_prompt_normalization_model_profile(deployment.profile_version)
                         if operation == PROMPT_NORMALIZE_OPERATION
                         else validate_script_generation_model_profile(deployment.profile_version)
+                        if operation == SCRIPT_GENERATE_OPERATION
+                        else None
                     )
                 except ValidationError:
                     policy = None
                 if policy is None:
-                    text_reasons.add(
-                        "script_structure_profile_contract_invalid"
-                        if operation == SCRIPT_STRUCTURE_OPERATION
-                        else "prompt_normalize_profile_contract_invalid"
-                        if operation == PROMPT_NORMALIZE_OPERATION
-                        else "script_profile_contract_invalid"
-                    )
+                    text_reasons.add(_TEXT_PROFILE_CONTRACT_REASON_CODES.get(
+                        operation,
+                        "text_profile_contract_invalid",
+                    ))
                     operation_contract_invalid = True
                 try:
                     require_prompt_profile_binding(
@@ -687,13 +941,10 @@ def _capability_readiness_for_requirements(requirements: dict[str, object]) -> d
             ]
             if missing_smoke:
                 for operation in missing_smoke:
-                    text_reasons.add(
-                        "script_structure_smoke_missing_or_stale"
-                        if operation == SCRIPT_STRUCTURE_OPERATION
-                        else "prompt_normalize_smoke_missing_or_stale"
-                        if operation == PROMPT_NORMALIZE_OPERATION
-                        else "script_smoke_missing_or_stale"
-                    )
+                    text_reasons.add(_TEXT_SMOKE_REASON_CODES.get(
+                        operation,
+                        "text_smoke_missing_or_stale",
+                    ))
                 continue
             viable_text += 1
         if not text_worker["ok"]:
@@ -707,11 +958,24 @@ def _capability_readiness_for_requirements(requirements: dict[str, object]) -> d
         }
     else:
         text = {"state": "not_required", "required": False, "reason_codes": []}
-    image = _media_capability_readiness(requirements["image_routes"], modality="image")
-    video = _media_capability_readiness(requirements["video_routes"], modality="video")
+    image = _media_capability_readiness(
+        requirements["image_routes"],
+        modality="image",
+        runtime_values=runtime_values,
+    )
+    video = _media_capability_readiness(
+        requirements["video_routes"],
+        modality="video",
+        runtime_values=runtime_values,
+    )
     if requirements["assembly"]:
         toolchain = _toolchain_check()
-        worker = _worker_check("assembly-worker-heartbeat", "组装 Worker", required=True)
+        worker = _worker_check(
+            "assembly-worker-heartbeat",
+            "组装 Worker",
+            required=True,
+            runtime_values=runtime_values,
+        )
         assembly_reasons = []
         if not toolchain["ok"]:
             assembly_reasons.append("toolchain_unavailable")
@@ -733,11 +997,24 @@ def _capability_readiness_for_requirements(requirements: dict[str, object]) -> d
     }
 
 
-def collect_capability_readiness() -> dict:
-    return _capability_readiness_for_requirements(_published_recipe_requirements())
+def collect_capability_readiness(
+    *,
+    requirements: dict[str, object] | None = None,
+    runtime_values: object = _RUNTIME_VALUES_UNSET,
+) -> dict:
+    with security_boundary_resolution_cache():
+        return _capability_readiness_for_requirements(
+            requirements or _published_recipe_requirements(),
+            runtime_values=runtime_values,
+        )
 
 
 def collect_production_readiness() -> dict:
+    with security_boundary_resolution_cache():
+        return _collect_production_readiness()
+
+
+def _collect_production_readiness() -> dict:
     """Return a redacted, per-published-recipe production closure report."""
 
     from studio.services.production_runs import validate_production_recipe_executability
@@ -763,7 +1040,9 @@ def collect_production_readiness() -> dict:
         except Exception as exc:
             text = str(exc)
             reason = (
-                "script_structure_contract_invalid"
+                "visual_rules_contract_invalid"
+                if "visual_rules_generate" in text or "visual_rules.generate" in text
+                else "script_structure_contract_invalid"
                 if "script_structure" in text or "script.structure" in text
                 else "script_generate_contract_invalid"
                 if "script_generate" in text or "script.generate" in text
@@ -823,12 +1102,24 @@ def _safe_runtime_diagnostic(callback, message: str) -> dict:
 
 
 def collect_readiness() -> dict:
+    with security_boundary_resolution_cache():
+        return _collect_readiness()
+
+
+def _collect_readiness() -> dict:
     database = _database_check()
     migrations = _migration_check()
+    try:
+        runtime_values: object = _readiness_runtime_values()
+    except Exception as exc:
+        # Preserve the original fail-closed diagnostics while ensuring every
+        # downstream check observes the same resolution failure rather than
+        # re-querying a broken configuration repeatedly.
+        runtime_values = exc
     checks = {
         "database": database,
         "migrations": migrations,
-        "storage": _storage_check(),
+        "storage": _storage_check(runtime_values=runtime_values),
     }
     if not database["ok"] or not migrations["ok"]:
         checks.update({
@@ -858,19 +1149,23 @@ def collect_readiness() -> dict:
         "secret_store": _secret_store_check(),
     })
     try:
-        text_worker_required = _text_generation_worker_required()
+        requirements = _published_recipe_requirements()
     except Exception:
-        text_worker_required = True
+        requirements = None
     diagnostics = {
         "toolchain": _safe_runtime_diagnostic(_toolchain_check, "无法核对媒体工具链"),
         "comfyui_output": _safe_runtime_diagnostic(
-            _comfyui_output_check, "无法核对 ComfyUI 输出目录",
+            lambda: _comfyui_output_check(runtime_values=runtime_values),
+            "无法核对 ComfyUI 输出目录",
         ),
         "generation_worker": _safe_runtime_diagnostic(
             lambda: _worker_check(
                 "generation-worker-heartbeat",
                 "生成 Worker",
-                required=bool(getattr(settings, "READINESS_GENERATION_WORKER_REQUIRED", True)),
+                required=_runtime_values_or_raise(runtime_values)[
+                    "generation_worker_required"
+                ],
+                runtime_values=runtime_values,
             ),
             "无法核对生成 Worker",
         ),
@@ -878,7 +1173,11 @@ def collect_readiness() -> dict:
             lambda: _worker_check(
                 "text-generation-worker-heartbeat",
                 "文本生成 Worker",
-                required=text_worker_required,
+                required=_text_generation_worker_required(
+                    runtime_values=runtime_values,
+                    requirements=requirements,
+                ),
+                runtime_values=runtime_values,
             ),
             "无法核对文本生成 Worker",
         ),
@@ -889,14 +1188,20 @@ def collect_readiness() -> dict:
             lambda: _worker_check(
                 "assembly-worker-heartbeat",
                 "组装 Worker",
-                required=bool(getattr(settings, "READINESS_ASSEMBLY_WORKER_REQUIRED", True)),
+                required=_runtime_values_or_raise(runtime_values)[
+                    "assembly_worker_required"
+                ],
+                runtime_values=runtime_values,
             ),
             "无法核对组装 Worker",
         ),
     }
     ready = all(item["ok"] for item in checks.values())
     try:
-        capabilities = collect_capability_readiness()
+        capabilities = collect_capability_readiness(
+            requirements=requirements,
+            runtime_values=runtime_values,
+        )
     except Exception:
         capabilities = {
             "schema_version": 1,

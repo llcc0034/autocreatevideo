@@ -38,9 +38,6 @@ class AssemblyQueueTests(TestCase):
         self.media_root = Path(self.temp.name) / "media"
         self.override = override_settings(
             MEDIA_ROOT=self.media_root,
-            ASSEMBLY_TIMEOUT_SECONDS=30,
-            ASSEMBLY_HEARTBEAT_SECONDS=0.01,
-            WORKER_HEARTBEAT_INTERVAL_SECONDS=60,
         )
         self.override.enable()
         self.addCleanup(self.override.disable)

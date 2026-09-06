@@ -1,3 +1,4 @@
+import hashlib
 import json
 import uuid
 from datetime import timedelta
@@ -5,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
-from django.test import SimpleTestCase, TestCase, override_settings
+from django.test import TestCase, override_settings
 from django.utils import timezone
 from rest_framework.test import APIClient
 
@@ -13,6 +14,7 @@ from studio.models import (
     ApprovalDecision,
     GeneratedArtifact,
     GenerationAttempt,
+    GenerationAttemptResolution,
     ModelDeployment,
     ModelDeploymentCapabilitySnapshot,
     ModelDeploymentSmokeAttempt,
@@ -26,16 +28,24 @@ from studio.models import (
     StageRun,
 )
 from studio.services.json_contracts import assign_json_contract
+from studio.services.production_runs import (
+    StageBlocked,
+    _structured_script_route_duration_policy,
+    _validate_storyboard_duration_policy,
+)
 from studio.services.deployment_smoke import record_deployment_capability_snapshot
 from studio.services.deployment_smoke_queue import (
     claim_next_deployment_smoke,
     process_deployment_smoke,
 )
+from studio.services.provider_registry import ProviderDriverError
 from studio.services.script_structure import (
+    SCRIPT_STRUCTURE_SCHEMA_VERSION,
     ScriptStructureError,
     build_script_structure_plan,
     canonical_no_submission_result,
     finalize_script_structure,
+    intersect_script_structure_duration_policy,
     is_canonical_script,
     parse_canonical_script,
     structure_provider_payload,
@@ -49,10 +59,64 @@ from studio.services.text_generation_queue import (
     claim_next_text_attempt,
     process_text_attempt,
 )
-from studio.tests.factories import create_test_prompt_profile_binding
+from studio.tests.factories import (
+    create_test_prompt_profile_binding,
+    script_structure_field_contract,
+)
 
 
-class ScriptStructureContractTests(SimpleTestCase):
+def _structure_chat_request_options() -> dict:
+    return {"temperature": 0, "response_format": {"type": "json_object"}}
+
+
+class ScriptStructureContractTests(TestCase):
+    def test_all_frozen_structure_routes_share_one_duration_intersection(self):
+        minimum, maximum, policies = _structured_script_route_duration_policy(
+            [{
+                "key": "script_structure",
+                "mode": "ai",
+                "routing": {
+                    "routes": [
+                        {
+                            "index": 0,
+                            "model_specification": {
+                                "script_structure": {
+                                    "minimum_shot_duration_ms": 1000,
+                                    "maximum_shot_duration_ms": 6000,
+                                },
+                            },
+                        },
+                        {
+                            "index": 1,
+                            "model_specification": {
+                                "script_structure": {
+                                    "minimum_shot_duration_ms": 2000,
+                                    "maximum_shot_duration_ms": 4000,
+                                },
+                            },
+                        },
+                    ],
+                },
+            }],
+            stage_key="script_structure",
+            stage_mode="ai",
+            model_policy_key="script_structure",
+        )
+
+        self.assertEqual((minimum, maximum), (2000, 4000))
+        self.assertEqual(policies, [
+            {
+                "route_index": 0,
+                "minimum_duration_ms": 1000,
+                "maximum_duration_ms": 6000,
+            },
+            {
+                "route_index": 1,
+                "minimum_duration_ms": 2000,
+                "maximum_duration_ms": 4000,
+            },
+        ])
+
     def setUp(self):
         self.bible = {
             "characters": [{
@@ -74,7 +138,10 @@ class ScriptStructureContractTests(SimpleTestCase):
                     "setting": "雨夜旅馆",
                     "action": "林雾推开房门，旧磁带开始自行转动。",
                     "duration_ms": 2_000,
-                    "dialogue": {"speaker": "", "delivery": "", "text": ""},
+                    "dialogue": {
+                        "speaker": "", "delivery": "", "text": "",
+                        "start_ms": 0, "end_ms": 0,
+                    },
                 },
                 {
                     "setting": "雨夜旅馆",
@@ -84,6 +151,8 @@ class ScriptStructureContractTests(SimpleTestCase):
                         "speaker": "林雾",
                         "delivery": "quietly",
                         "text": "谁在那里？",
+                        "start_ms": 250,
+                        "end_ms": 1_750,
                     },
                 },
             ],
@@ -104,7 +173,7 @@ class ScriptStructureContractTests(SimpleTestCase):
             status=ScriptRevision.Status.CONFIRMED,
         )
 
-    def _plan(self, content: str):
+    def _plan(self, content: str, *, field_contract=None):
         return build_script_structure_plan(
             revision=self._revision(content),
             model_identifier="strict-structure-model",
@@ -114,6 +183,12 @@ class ScriptStructureContractTests(SimpleTestCase):
                 "max_input_bytes": 64_000,
                 "max_output_tokens": 8_192,
                 "timeout_seconds": 30,
+                "field_contract": (
+                    field_contract
+                    if field_contract is not None
+                    else script_structure_field_contract()
+                ),
+                "chat_request_options": _structure_chat_request_options(),
             },
         )
 
@@ -123,6 +198,18 @@ class ScriptStructureContractTests(SimpleTestCase):
         self.assertTrue(is_canonical_script(self.canonical))
         self.assertEqual(parsed["master_script"], self.canonical)
         self.assertEqual(len(parsed["episodes"][0]["shots"]), 2)
+        self.assertEqual(
+            parsed["episodes"][0]["shots"][1]["dialogue"],
+            {
+                "speaker": "林雾",
+                "delivery": "quietly",
+                "text": "谁在那里？",
+                "start_ms": 250,
+                "end_ms": 1_750,
+            },
+        )
+        self.assertIn("[0.25-1.75秒] 林雾", self.canonical)
+        self.assertNotIn("[1-2秒] 林雾", self.canonical)
         self.assertFalse(is_canonical_script(self.canonical.replace("【尾帧连续=是】", "【尾帧连续=否】", 1)))
         self.assertFalse(is_canonical_script(self.canonical + "\n"))
         self.assertFalse(is_canonical_script("\ufeff" + self.canonical))
@@ -140,6 +227,26 @@ class ScriptStructureContractTests(SimpleTestCase):
             "canonical_input_no_submission",
         )
 
+    def test_storyboard_rejects_frozen_duration_policy_that_would_rewrite_canonical_script(self):
+        with self.assertRaises(StageBlocked) as raised:
+            _validate_storyboard_duration_policy(
+                self.canonical,
+                minimum_duration_ms=1_000,
+                maximum_duration_ms=1_000,
+            )
+
+        self.assertEqual(
+            raised.exception.code,
+            "script_duration_policy_mismatch",
+        )
+        self.assertIn("第1集镜头1=2000ms", str(raised.exception))
+
+        _validate_storyboard_duration_policy(
+            self.canonical,
+            minimum_duration_ms=1_000,
+            maximum_duration_ms=10_000,
+        )
+
     def test_full_source_is_frozen_in_provider_payload_without_slicing(self):
         source = "第一幕\n林雾进入旅馆。\n结尾标记-不可丢失"
         plan = self._plan(source)
@@ -154,12 +261,47 @@ class ScriptStructureContractTests(SimpleTestCase):
             plan["resource_estimate"]["submission_policy"],
             "full_source_or_fail_no_truncation",
         )
+        self.assertEqual(payload["timeout_seconds"], 30.0)
+        self.assertEqual(
+            payload["chat_request_options"],
+            _structure_chat_request_options(),
+        )
+        self.assertNotIn("temperature", payload)
+        self.assertNotIn("response_format", payload)
+        contract = json.loads(payload["messages"][0]["content"].split("CONTRACT=", 1)[1])
+        self.assertEqual(contract["schema_version"], SCRIPT_STRUCTURE_SCHEMA_VERSION)
+        self.assertEqual(
+            contract["episodes"][0]["shots"][0]["dialogue"],
+            {
+                "speaker": "", "delivery": "", "text": "",
+                "start_ms": 0, "end_ms": 0,
+            },
+        )
+        self.assertIn("0 <= start_ms < end_ms", payload["messages"][0]["content"])
 
-    def test_strict_ir_requires_exact_source_identity_and_every_non_empty_line_once(self):
+    def test_field_contract_is_frozen_listed_and_finalize_ignores_live_mutation(self):
         source = "第一幕\n林雾进入旅馆。"
-        plan = self._plan(source)
+        contract = script_structure_field_contract()
+        contract["shot.action"]["max_chars"] = 12
+        contract["bible.entity.description"]["max_chars"] = 20
+        plan = self._plan(source, field_contract=contract)
+        contract["shot.action"]["max_chars"] = 1
+        contract["bible.entity.description"]["max_chars"] = 1
+
+        self.assertEqual(plan["field_contract"]["shot.action"]["max_chars"], 12)
+        system_prompt = structure_provider_payload(plan)["messages"][0]["content"]
+        self.assertIn("FIELD_CONTRACT", system_prompt)
+        self.assertIn(
+            "- shot.action: required/non-empty; single-line; max 12 characters",
+            system_prompt,
+        )
+        self.assertIn(
+            "- bible.entity.description: optional; single-line; max 20 characters",
+            system_prompt,
+        )
+
         candidate = {
-            "schema_version": 1,
+            "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
             "source_revision_id": plan["source_revision"]["id"],
             "source_sha256": plan["source_revision"]["content_sha256"],
             "source_size_bytes": plan["source_revision"]["content_size_bytes"],
@@ -173,7 +315,107 @@ class ScriptStructureContractTests(SimpleTestCase):
                     "setting": "雨夜旅馆",
                     "action": "林雾进入旅馆。",
                     "duration_ms": 2_000,
-                    "dialogue": {"speaker": "", "delivery": "", "text": ""},
+                    "dialogue": {
+                        "speaker": "", "delivery": "", "text": "",
+                        "start_ms": 0, "end_ms": 0,
+                    },
+                }],
+            }],
+        }
+        result = finalize_script_structure(plan=plan, payload=candidate)
+        self.assertTrue(is_canonical_script(result["candidate"]["master_script"]))
+
+    def test_response_count_limits_read_current_security_boundaries(self):
+        plan = self._plan("第一幕\n林雾进入旅馆。")
+        shot = {
+            "source_lines": [1, 2],
+            "setting": "雨夜旅馆",
+            "action": "林雾进入旅馆。",
+            "duration_ms": 2_000,
+            "dialogue": {
+                "speaker": "", "delivery": "", "text": "",
+                "start_ms": 0, "end_ms": 0,
+            },
+        }
+        candidate = {
+            "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
+            "source_revision_id": plan["source_revision"]["id"],
+            "source_sha256": plan["source_revision"]["content_sha256"],
+            "source_size_bytes": plan["source_revision"]["content_size_bytes"],
+            "title": "雾港回声",
+            "logline": "林雾在旧旅馆追查失踪案。",
+            "bible": self.bible,
+            "episodes": [{"title": "第一幕", "shots": [shot]}],
+        }
+        cases = (
+            (
+                "episodes",
+                [{"title": "第一幕", "shots": [shot]}] * 2,
+                {
+                    "security.production.max_episodes": 1,
+                    "security.production.max_shots_per_episode": 2,
+                    "security.production.max_total_shots": 2,
+                },
+                "episodes",
+            ),
+            (
+                "shots_per_episode",
+                [{"title": "第一幕", "shots": [shot, shot]}],
+                {
+                    "security.production.max_episodes": 1,
+                    "security.production.max_shots_per_episode": 1,
+                    "security.production.max_total_shots": 2,
+                },
+                "每集镜头",
+            ),
+            (
+                "total_shots",
+                [
+                    {"title": "第一幕", "shots": [shot]},
+                    {"title": "第二幕", "shots": [shot]},
+                ],
+                {
+                    "security.production.max_episodes": 2,
+                    "security.production.max_shots_per_episode": 1,
+                    "security.production.max_total_shots": 1,
+                },
+                "总镜头",
+            ),
+        )
+        for label, episodes, boundaries, message in cases:
+            with self.subTest(label=label), patch(
+                "studio.services.script_structure.boundary_int",
+                side_effect=lambda key: boundaries[key],
+            ), self.assertRaises(ScriptStructureError) as raised:
+                finalize_script_structure(
+                    plan=plan,
+                    payload={**candidate, "episodes": episodes},
+                )
+            self.assertEqual(raised.exception.code, "script_structure_ir_invalid")
+            self.assertIn(message, str(raised.exception))
+
+    def test_strict_ir_requires_exact_source_identity_and_every_non_empty_line_once(self):
+        source = "第一幕\n林雾进入旅馆。"
+        plan = self._plan(source)
+        candidate = {
+            "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
+            "source_revision_id": plan["source_revision"]["id"],
+            "source_sha256": plan["source_revision"]["content_sha256"],
+            "source_size_bytes": plan["source_revision"]["content_size_bytes"],
+            "title": "雾港回声",
+            "logline": "林雾在旧旅馆追查失踪案。",
+            "bible": self.bible,
+            "episodes": [{
+                "title": "第一幕",
+                "shots": [{
+                    "source_lines": [1, 2],
+                    "setting": "雨夜旅馆",
+                    "action": "林雾进入旅馆。",
+                    "duration_ms": 2_000,
+                    "dialogue": {
+                        "speaker": "", "delivery": "", "text": "",
+                        "start_ms": 0, "end_ms": 0,
+                    },
                 }],
             }],
         }
@@ -203,6 +445,47 @@ class ScriptStructureContractTests(SimpleTestCase):
             finalize_script_structure(plan=plan, payload=wrong_source)
         self.assertEqual(raised.exception.code, "script_structure_source_mismatch")
 
+    def test_strict_ir_rejects_missing_or_out_of_shot_dialogue_clocks(self):
+        plan = self._plan("林雾说出警告。")
+        base = {
+            "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
+            "source_revision_id": plan["source_revision"]["id"],
+            "source_sha256": plan["source_revision"]["content_sha256"],
+            "source_size_bytes": plan["source_revision"]["content_size_bytes"],
+            "title": "雾港回声",
+            "logline": "林雾在旧旅馆追查失踪案。",
+            "bible": self.bible,
+            "episodes": [{
+                "title": "第一幕",
+                "shots": [{
+                    "source_lines": [1],
+                    "setting": "雨夜旅馆",
+                    "action": "林雾说出警告。",
+                    "duration_ms": 2_000,
+                    "dialogue": {
+                        "speaker": "林雾",
+                        "delivery": "firmly",
+                        "text": "不要进来。",
+                        "start_ms": 200,
+                        "end_ms": 1_400,
+                    },
+                }],
+            }],
+        }
+
+        result = finalize_script_structure(plan=plan, payload=base)
+        self.assertIn("[0.2-1.4秒] 林雾", result["candidate"]["master_script"])
+
+        missing = json.loads(json.dumps(base, ensure_ascii=False))
+        missing["episodes"][0]["shots"][0]["dialogue"].pop("start_ms")
+        outside = json.loads(json.dumps(base, ensure_ascii=False))
+        outside["episodes"][0]["shots"][0]["dialogue"]["end_ms"] = 2_001
+        for candidate in (missing, outside):
+            with self.subTest(dialogue=candidate["episodes"][0]["shots"][0]["dialogue"]):
+                with self.assertRaises(ScriptStructureError) as raised:
+                    finalize_script_structure(plan=plan, payload=candidate)
+                self.assertEqual(raised.exception.code, "script_structure_ir_invalid")
+
     def test_input_larger_than_profile_limit_blocks_instead_of_truncating(self):
         revision = self._revision("完整剧本不可截断")
         with self.assertRaises(ScriptStructureError) as raised:
@@ -215,9 +498,39 @@ class ScriptStructureContractTests(SimpleTestCase):
                     "max_input_bytes": 3,
                     "max_output_tokens": 8_192,
                     "timeout_seconds": 30,
+                    "field_contract": script_structure_field_contract(),
+                    "chat_request_options": _structure_chat_request_options(),
                 },
             )
         self.assertEqual(raised.exception.code, "script_structure_input_too_large")
+
+    def test_model_and_frozen_production_duration_policies_are_intersected(self):
+        effective = intersect_script_structure_duration_policy(
+            {
+                "minimum_shot_duration_ms": 1_000,
+                "maximum_shot_duration_ms": 10_000,
+                "max_input_bytes": 64_000,
+                "max_output_tokens": 8_192,
+                "timeout_seconds": 30.0,
+                "chat_request_options": _structure_chat_request_options(),
+            },
+            production_minimum_duration_ms=5_000,
+            production_maximum_duration_ms=15_000,
+        )
+
+        self.assertEqual(effective["minimum_shot_duration_ms"], 5_000)
+        self.assertEqual(effective["maximum_shot_duration_ms"], 10_000)
+
+        with self.assertRaises(ScriptStructureError) as raised:
+            intersect_script_structure_duration_policy(
+                effective,
+                production_minimum_duration_ms=12_000,
+                production_maximum_duration_ms=15_000,
+            )
+        self.assertEqual(
+            raised.exception.code,
+            "script_structure_duration_policy_incompatible",
+        )
 
 
 @override_settings(AI_PROVIDER_ALLOWED_HOSTS=("127.0.0.1",))
@@ -242,6 +555,7 @@ class ScriptStructureProductionRunTests(TestCase):
             "base_url": "http://127.0.0.1:9901",
             "chat_path": "/v1/chat/completions",
             "timeout_seconds": 30,
+            "capability_ttl_seconds": 3_600,
             "pricing": {"currency": "USD", "fixed_per_request": "0.01"},
         })
         provider.save()
@@ -255,6 +569,7 @@ class ScriptStructureProductionRunTests(TestCase):
         )
         assign_json_contract(profile, "specification", {
             "schema_version": 1,
+            "model_family": "strict_structure_model",
             "capabilities": ["script.structure"],
             "script_structure": {
                 "minimum_shot_duration_ms": 1_000,
@@ -262,6 +577,8 @@ class ScriptStructureProductionRunTests(TestCase):
                 "max_input_bytes": 256_000,
                 "max_output_tokens": 8_192,
                 "timeout_seconds": 30,
+                "field_contract": script_structure_field_contract(),
+                "chat_request_options": _structure_chat_request_options(),
             },
         })
         profile.save()
@@ -318,9 +635,11 @@ class ScriptStructureProductionRunTests(TestCase):
         self.recipe.save()
 
     def _project_revision(self, content: str, *, suffix: str = ""):
-        project = SeriesProject.objects.create(
+        project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16",
             owner=self.user,
             title=f"人工项目{suffix}",
+            width=768, height=1344, fps=24, default_shot_duration_ms=5000,
+            continuity_seed=1,
             logline=f"人工梗概{suffix}",
         )
         _source, revision = create_pasted_script_source(
@@ -334,16 +653,321 @@ class ScriptStructureProductionRunTests(TestCase):
         project.save(update_fields=("master_script", "updated_at"))
         return project, revision
 
-    def _create_run(self, project, revision, *, key: str):
-        response = self.client.post("/api/v1/production-runs/", {
+    def _additional_structure_deployment(
+        self,
+        *,
+        minimum_duration_ms: int,
+        maximum_duration_ms: int,
+    ) -> ModelDeployment:
+        profile = ModelProfileVersion(
+            profile_key=f"strict-structure-model-{ModelProfileVersion.objects.count() + 1}",
+            version=1,
+            provider=self.deployment.profile_version.provider,
+            model_identifier="strict-structure-fallback-model",
+            modality=ModelProfileVersion.Modality.TEXT,
+            status=ModelProfileVersion.Status.PUBLISHED,
+        )
+        assign_json_contract(profile, "specification", {
+            "schema_version": 1,
+            "model_family": "strict_structure_fallback_model",
+            "capabilities": ["script.structure"],
+            "script_structure": {
+                "minimum_shot_duration_ms": minimum_duration_ms,
+                "maximum_shot_duration_ms": maximum_duration_ms,
+                "max_input_bytes": 256_000,
+                "max_output_tokens": 8_192,
+                "timeout_seconds": 30,
+                "field_contract": script_structure_field_contract(),
+                "chat_request_options": _structure_chat_request_options(),
+            },
+        })
+        profile.save()
+        deployment = ModelDeployment(
+            key=f"strict-structure-deployment-{ModelDeployment.objects.count() + 1}",
+            name="Strict structure fallback deployment",
+            profile_version=profile,
+            status=ModelDeployment.Status.ACTIVE,
+        )
+        assign_json_contract(deployment, "runtime_config", {})
+        deployment.save()
+        create_test_prompt_profile_binding(
+            actor=self.user,
+            model_profile_version=profile,
+            operation="script.structure",
+        )
+        record_deployment_capability_snapshot(
+            deployment,
+            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
+            status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
+            operations=["script.structure"],
+            evidence={
+                "schema_version": 1,
+                "execution_submitted": True,
+                "request_sha256": "4" * 64,
+                "response_sha256": "5" * 64,
+                "result_sha256": "6" * 64,
+            },
+        )
+        return deployment
+
+    def _create_run(self, project, revision, *, key: str, **overrides):
+        payload = {
             "project_id": str(project.id),
             "script_revision_id": str(revision.id),
             "recipe_version_id": str(self.recipe.id),
             "idempotency_key": key,
             "allow_external_calls": False,
-        }, format="json")
+        }
+        payload.update(overrides)
+        response = self.client.post(
+            "/api/v1/production-runs/",
+            payload,
+            format="json",
+        )
         self.assertEqual(response.status_code, 201, response.data)
         return ProductionRun.objects.get(pk=response.data["id"])
+
+    def test_import_structure_plan_freezes_one_second_duration_before_submission(self):
+        project, revision = self._project_revision(
+            "第1集：倒数\n镜头1：雨夜电梯内，周岚举起门禁卡。\n"
+            "0.15至0.85秒，周岚说：倒数开始了。",
+            suffix="-一秒合同",
+        )
+
+        run = self._create_run(
+            project,
+            revision,
+            key="structure-one-second-contract",
+            episode_count=1,
+            shots_per_episode=1,
+            episode_duration_seconds=1,
+        )
+
+        expected_values = {
+            "production.video_shot_min_duration_ms": 1000,
+            "production.default_shot_duration_ms": 1000,
+            "production.video_shot_max_duration_ms": 1000,
+        }
+        self.assertEqual(
+            {key: run.config_snapshot["values"][key] for key in expected_values},
+            expected_values,
+        )
+        self.assertEqual(
+            {key: run.input_snapshot["config_overrides"][key] for key in expected_values},
+            expected_values,
+        )
+        contract = run.input_snapshot["structured_shot_duration_contract"]
+        self.assertEqual(contract["source"], "confirmed_revision_structure_plan")
+        self.assertEqual(contract["episode_count"], 1)
+        self.assertEqual(contract["shots_per_episode"], 1)
+        self.assertEqual(contract["episode_duration_ms"], 1000)
+        self.assertEqual(contract["minimum_duration_ms"], 1000)
+        self.assertEqual(contract["default_duration_ms"], 1000)
+        self.assertEqual(contract["maximum_duration_ms"], 1000)
+        self.assertEqual(contract["route_stage_key"], "script_structure")
+        self.assertEqual(contract["model_policy_key"], "script_structure")
+        self.assertEqual(contract["route_policies"], [{
+            "route_index": 0,
+            "minimum_duration_ms": 1000,
+            "maximum_duration_ms": 10000,
+        }])
+        self.assertEqual(
+            run.input_snapshot["structured_shot_duration_contract_sha256"],
+            hashlib.sha256(
+                json.dumps(
+                    contract,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest(),
+        )
+        attempt = GenerationAttempt.objects.get(
+            stage_run__production_run=run,
+            operation="script.structure",
+        )
+        self.assertEqual(attempt.status, GenerationAttempt.Status.QUEUED)
+        self.assertIsNone(attempt.claimed_at)
+        self.assertEqual(
+            attempt.request_snapshot["plan"]["request"]["options"][
+                "minimum_shot_duration_ms"
+            ],
+            1000,
+        )
+        self.assertEqual(
+            attempt.request_snapshot["plan"]["request"]["options"][
+                "maximum_shot_duration_ms"
+            ],
+            1000,
+        )
+
+    def test_import_structure_plan_conflict_is_rejected_before_run_or_attempt(self):
+        project, revision = self._project_revision(
+            "第1集：过载\n三个镜头在一秒内完成。",
+            suffix="-冲突合同",
+        )
+        response = self.client.post("/api/v1/production-runs/", {
+            "project_id": str(project.id),
+            "script_revision_id": str(revision.id),
+            "recipe_version_id": str(self.recipe.id),
+            "idempotency_key": "structure-duration-conflict",
+            "allow_external_calls": False,
+            "episode_count": 1,
+            "shots_per_episode": 3,
+            "episode_duration_seconds": 1,
+        }, format="json")
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("最短镜头时长", str(response.data))
+        self.assertFalse(ProductionRun.objects.filter(
+            idempotency_key="structure-duration-conflict",
+        ).exists())
+        self.assertFalse(GenerationAttempt.objects.filter(
+            stage_run__production_run__idempotency_key="structure-duration-conflict",
+        ).exists())
+
+    def test_import_structure_plan_requires_both_count_and_duration(self):
+        project, revision = self._project_revision(
+            "第1集：缺项\n一个镜头。",
+            suffix="-缺项合同",
+        )
+        cases = (
+            ("missing-duration", {"shots_per_episode": 1}, "episode_duration_seconds"),
+            ("missing-count", {"episode_duration_seconds": 1}, "shots_per_episode"),
+        )
+        for suffix, partial_plan, expected_field in cases:
+            with self.subTest(suffix=suffix):
+                response = self.client.post("/api/v1/production-runs/", {
+                    "project_id": str(project.id),
+                    "script_revision_id": str(revision.id),
+                    "recipe_version_id": str(self.recipe.id),
+                    "idempotency_key": f"structure-plan-{suffix}",
+                    "allow_external_calls": False,
+                    "episode_count": 1,
+                    **partial_plan,
+                }, format="json")
+                self.assertEqual(response.status_code, 400, response.data)
+                self.assertIn(expected_field, str(response.data))
+                self.assertFalse(ProductionRun.objects.filter(
+                    idempotency_key=f"structure-plan-{suffix}",
+                ).exists())
+        self.assertFalse(GenerationAttempt.objects.filter(
+            stage_run__production_run__idempotency_key__startswith="structure-plan-missing-",
+        ).exists())
+
+    def test_import_structure_fallback_conflict_is_rejected_before_attempt(self):
+        fallback = self._additional_structure_deployment(
+            minimum_duration_ms=2000,
+            maximum_duration_ms=10000,
+        )
+        definition = json.loads(json.dumps(self.recipe.definition))
+        routing = definition["stages"][1]["routing"]
+        routing["mode"] = "ordered_fallback"
+        routing["routes"].append({
+            "model_deployment_id": str(fallback.id),
+        })
+        assign_json_contract(self.recipe, "definition", definition)
+        self.recipe.save(update_fields=(
+            "definition",
+            "definition_schema_version",
+            "definition_size_bytes",
+            "definition_sha256",
+            "updated_at",
+        ))
+        project, revision = self._project_revision(
+            "第1集：回退冲突\n一个一秒镜头。",
+            suffix="-回退冲突",
+        )
+
+        response = self.client.post("/api/v1/production-runs/", {
+            "project_id": str(project.id),
+            "script_revision_id": str(revision.id),
+            "recipe_version_id": str(self.recipe.id),
+            "idempotency_key": "structure-fallback-duration-conflict",
+            "allow_external_calls": False,
+            "episode_count": 1,
+            "shots_per_episode": 1,
+            "episode_duration_seconds": 1,
+        }, format="json")
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("最短镜头时长", str(response.data))
+        self.assertFalse(ProductionRun.objects.filter(
+            idempotency_key="structure-fallback-duration-conflict",
+        ).exists())
+        self.assertFalse(GenerationAttempt.objects.filter(
+            stage_run__production_run__idempotency_key=(
+                "structure-fallback-duration-conflict"
+            ),
+        ).exists())
+
+    def test_import_structure_override_conflict_is_rejected_before_attempt(self):
+        project, revision = self._project_revision(
+            "第1集：覆盖冲突\n一个一秒镜头。",
+            suffix="-覆盖冲突",
+        )
+        response = self.client.post("/api/v1/production-runs/", {
+            "project_id": str(project.id),
+            "script_revision_id": str(revision.id),
+            "recipe_version_id": str(self.recipe.id),
+            "idempotency_key": "structure-override-duration-conflict",
+            "allow_external_calls": False,
+            "episode_count": 1,
+            "shots_per_episode": 1,
+            "episode_duration_seconds": 1,
+            "config_overrides": {
+                "production.video_shot_min_duration_ms": 2000,
+            },
+        }, format="json")
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("单集", str(response.data))
+        self.assertFalse(ProductionRun.objects.filter(
+            idempotency_key="structure-override-duration-conflict",
+        ).exists())
+        self.assertFalse(GenerationAttempt.objects.filter(
+            stage_run__production_run__idempotency_key=(
+                "structure-override-duration-conflict"
+            ),
+        ).exists())
+
+    def test_import_plan_is_rejected_when_recipe_has_no_structure_stage(self):
+        direct_recipe = ProductionRecipeVersion(
+            recipe_key="confirmed-without-structure",
+            version=1,
+            name="Confirmed without structure",
+            status=ProductionRecipeVersion.Status.PUBLISHED,
+        )
+        assign_json_contract(direct_recipe, "definition", {
+            "schema_version": 1,
+            "stages": [{
+                "key": "script_input",
+                "mode": "confirmed_revision",
+                "approval": "auto",
+            }],
+        })
+        direct_recipe.save()
+        project, revision = self._project_revision(
+            "已规范剧本正文。",
+            suffix="-无结构化阶段",
+        )
+
+        response = self.client.post("/api/v1/production-runs/", {
+            "project_id": str(project.id),
+            "script_revision_id": str(revision.id),
+            "recipe_version_id": str(direct_recipe.id),
+            "idempotency_key": "structure-plan-without-stage",
+            "allow_external_calls": False,
+            "episode_count": 1,
+            "shots_per_episode": 1,
+            "episode_duration_seconds": 1,
+        }, format="json")
+
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertIn("script_structure", str(response.data))
+        self.assertFalse(ProductionRun.objects.filter(
+            idempotency_key="structure-plan-without-stage",
+        ).exists())
 
     def test_run_creation_fails_closed_without_script_structure_profile_binding(self):
         project, revision = self._project_revision(
@@ -370,7 +994,7 @@ class ScriptStructureProductionRunTests(TestCase):
     def _response_for_attempt(attempt):
         plan = attempt.request_snapshot["plan"]
         return json.dumps({
-            "schema_version": 1,
+            "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
             "source_revision_id": plan["source_revision"]["id"],
             "source_sha256": plan["source_revision"]["content_sha256"],
             "source_size_bytes": plan["source_revision"]["content_size_bytes"],
@@ -383,8 +1007,13 @@ class ScriptStructureProductionRunTests(TestCase):
                     "source_lines": plan["request"]["non_empty_source_line_numbers"],
                     "setting": "雨夜旅馆",
                     "action": "林雾进入旅馆，发现自行转动的磁带。",
-                    "duration_ms": 2_000,
-                    "dialogue": {"speaker": "", "delivery": "", "text": ""},
+                    "duration_ms": int(
+                        plan["request"]["options"]["minimum_shot_duration_ms"]
+                    ),
+                    "dialogue": {
+                        "speaker": "", "delivery": "", "text": "",
+                        "start_ms": 0, "end_ms": 0,
+                    },
                 }],
             }],
         }, ensure_ascii=False)
@@ -401,6 +1030,16 @@ class ScriptStructureProductionRunTests(TestCase):
         attempt = claim_next_text_attempt("structure-worker")
         self.assertIsNotNone(attempt)
         self.assertEqual(attempt.operation, "script.structure")
+        self.assertEqual(
+            attempt.request_snapshot["plan"]["request"]["options"],
+            {
+                "minimum_shot_duration_ms": 5_000,
+                "maximum_shot_duration_ms": 10_000,
+                "max_output_tokens": 8_192,
+                "timeout_seconds": 30.0,
+                "chat_request_options": _structure_chat_request_options(),
+            },
+        )
         driver = Mock()
         driver.invoke.return_value = {
             "schema_version": 1,
@@ -441,6 +1080,135 @@ class ScriptStructureProductionRunTests(TestCase):
         evidence = review.output_snapshot["review_payload"]
         self.assertEqual(evidence["metadata_adoption"]["title"]["status"], "adopted")
         self.assertEqual(evidence["metadata_adoption"]["logline"]["status"], "adopted")
+
+    @staticmethod
+    def _safe_length_failure() -> ProviderDriverError:
+        failure = ProviderDriverError(
+            "raw provider message TOP-SECRET",
+            code="provider_response_invalid",
+            submission_uncertain=False,
+        )
+        failure.metadata = {
+            "contract_error_code": "response_output_budget_exhausted",
+            "finish_reason": "length",
+            "usage": {
+                "prompt_tokens": 321,
+                "completion_tokens": 8_192,
+                "total_tokens": 8_513,
+                "cached_tokens": 77,
+            },
+            "response_id_sha256": hashlib.sha256(
+                b"provider-request-id",
+            ).hexdigest(),
+            "raw_message": "TOP-SECRET metadata",
+            "provider_payload": {"secret": "must-not-persist"},
+        }
+        return failure
+
+    def _assert_safe_failure_evidence(self, attempt: GenerationAttempt) -> None:
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, GenerationAttempt.Status.FAILED)
+        self.assertEqual(attempt.error_code, "provider_response_invalid")
+        resolution = GenerationAttemptResolution.objects.get(attempt=attempt)
+        self.assertEqual(
+            resolution.outcome,
+            GenerationAttemptResolution.Outcome.KNOWN_RESPONSE_REJECTED,
+        )
+        evidence = resolution.evidence
+        self.assertEqual(
+            evidence["contract_error_code"],
+            "response_output_budget_exhausted",
+        )
+        self.assertEqual(evidence["finish_reason"], "length")
+        self.assertEqual(evidence["usage"], {
+            "prompt_tokens": 321,
+            "completion_tokens": 8_192,
+            "total_tokens": 8_513,
+        })
+        self.assertEqual(
+            evidence["response_id_sha256"],
+            hashlib.sha256(b"provider-request-id").hexdigest(),
+        )
+        persisted = json.dumps(
+            {"evidence": evidence, "note": resolution.note},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        self.assertNotIn("TOP-SECRET", persisted)
+        self.assertNotIn("must-not-persist", persisted)
+        self.assertNotIn("cached_tokens", persisted)
+        self.assertNotIn("raw_message", persisted)
+        self.assertNotIn("provider_payload", persisted)
+
+    def test_script_structure_driver_failure_persists_only_safe_metadata(self):
+        project, revision = self._project_revision(
+            "林雾进入雨夜旅馆。\n她发现一盘自行转动的磁带。",
+            suffix="-结构失败元数据",
+        )
+        self._create_run(
+            project,
+            revision,
+            key="structure-safe-failure-metadata",
+        )
+        attempt = claim_next_text_attempt("structure-safe-failure-worker")
+        driver = Mock()
+        driver.invoke.side_effect = self._safe_length_failure()
+
+        with patch("studio.services.text_generation_queue.driver_for", return_value=driver):
+            process_text_attempt(attempt)
+
+        self._assert_safe_failure_evidence(attempt)
+
+    def test_visual_rules_driver_failure_persists_only_safe_metadata(self):
+        project, revision = self._project_revision(
+            "林雾进入雨夜旅馆。\n她发现一盘自行转动的磁带。",
+            suffix="-视觉规则失败元数据",
+        )
+        self._create_run(
+            project,
+            revision,
+            key="visual-rules-safe-failure-metadata",
+        )
+        queued = GenerationAttempt.objects.get(
+            stage_run__production_run__idempotency_key=(
+                "visual-rules-safe-failure-metadata"
+            ),
+        )
+        request_snapshot = dict(queued.request_snapshot)
+        request_snapshot["plan"] = {
+            "schema_version": 1,
+            "operation": "visual_rules.generate",
+        }
+        assign_json_contract(queued, "request_snapshot", request_snapshot)
+        queued.operation = "visual_rules.generate"
+        queued.save(update_fields=(
+            "operation",
+            "request_snapshot",
+            "request_snapshot_schema_version",
+            "request_snapshot_size_bytes",
+            "request_snapshot_sha256",
+            "updated_at",
+        ))
+        attempt = claim_next_text_attempt("visual-rules-safe-failure-worker")
+        driver = Mock()
+        driver.invoke.side_effect = self._safe_length_failure()
+
+        with (
+            patch("studio.services.text_generation_queue._verify_attempt_prompt_profile"),
+            patch("studio.services.text_generation_queue.verify_visual_rules_smoke"),
+            patch(
+                "studio.services.text_generation_queue.frozen_text_deployment",
+                return_value=self.deployment,
+            ),
+            patch(
+                "studio.services.text_generation_queue.visual_rules_provider_payload",
+                return_value={"messages": []},
+            ),
+            patch("studio.services.text_generation_queue.driver_for", return_value=driver),
+        ):
+            process_text_attempt(attempt)
+
+        self._assert_safe_failure_evidence(attempt)
 
     def test_concurrent_project_metadata_edits_are_preserved_and_audited(self):
         project, original = self._project_revision(
@@ -502,7 +1270,10 @@ class ScriptStructureProductionRunTests(TestCase):
                     "setting": "空镜走廊",
                     "action": "灯光逐盏熄灭。",
                     "duration_ms": 2_000,
-                    "dialogue": {"speaker": "", "delivery": "", "text": ""},
+                    "dialogue": {
+                        "speaker": "", "delivery": "", "text": "",
+                        "start_ms": 0, "end_ms": 0,
+                    },
                 }],
             }],
         )
@@ -544,7 +1315,7 @@ class ScriptStructureProductionRunTests(TestCase):
                 "schema_version": 1,
                 "request_id": "structure-smoke-request-plaintext",
                 "text": json.dumps({
-                    "schema_version": 1,
+                    "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
                     "source_revision_id": source["id"],
                     "source_sha256": source["content_sha256"],
                     "source_size_bytes": source["content_size_bytes"],
@@ -558,7 +1329,10 @@ class ScriptStructureProductionRunTests(TestCase):
                             "setting": "风雨灯塔",
                             "action": "旅人进入灯塔并发现旧信。",
                             "duration_ms": 1_000,
-                            "dialogue": {"speaker": "", "delivery": "", "text": ""},
+                            "dialogue": {
+                                "speaker": "", "delivery": "", "text": "",
+                                "start_ms": 0, "end_ms": 0,
+                            },
                         }],
                     }],
                 }, ensure_ascii=False),
@@ -630,6 +1404,8 @@ class ScriptStructureProductionRunTests(TestCase):
                 # max_input_bytes is intentionally absent.
                 "max_output_tokens": 8_192,
                 "timeout_seconds": 30,
+                "field_contract": script_structure_field_contract(),
+                "chat_request_options": _structure_chat_request_options(),
             },
         })
         draft.save()

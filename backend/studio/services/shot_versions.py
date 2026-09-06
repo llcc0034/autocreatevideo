@@ -22,7 +22,6 @@ RESERVED_SHOT_VERSION_METADATA_KEYS = (
     "creative_version_key",
     "creative_version_label",
     "creative_version_mode",
-    "creative_version_draft_id",
     "creative_version_generation_no",
     "creative_version_applied_at",
     "creative_version_active",

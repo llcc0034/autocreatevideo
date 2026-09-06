@@ -22,9 +22,9 @@ authoring adapter 可以帮助操作员生成或翻译导演字段、提示文�
 
 部署只有在 provider、credential binding、配置签名和未过期真实 smoke 都有效时才是 `ready`。smoke 与正式调用共用 request id、受保护 token 和 English 非拉丁文字校验；返回原样中文不会通过 smoke。
 
-旧 Qwen/DeepSeek settings 不会被 legacy import 自动转成可用 deployment。管理员必须显式审核并发布 v2 text profile，绑定受控 endpoint，通过 SecretBinding 选择受管凭据（若驱动要求）并执行真实 smoke。catalog 中出现 provider 名称不代表目标环境已经安装、授权或验证。
+管理员必须显式审核并发布 text profile，绑定受控 endpoint，通过 SecretBinding 选择受管凭据（若驱动要求）并执行真实 smoke。catalog 中出现 provider 名称不代表目标环境已经安装、授权或验证。
 
-本地模型仅通过显式安装参数或专用脚本下载；普通 setup、restart 和 demo seed 不会静默下载媒体模型或发布配置。
+本地模型的安装与进程生命周期由部署运维负责；平台只连接已登记的受管 endpoint。普通 setup、restart 和 demo seed 不会下载模型或发布模型配置。
 
 ## 数据规则
 

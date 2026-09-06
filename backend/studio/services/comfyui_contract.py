@@ -7,11 +7,22 @@ import math
 import re
 
 from studio.services.comfyui import ComfyUIClient, ComfyUIError
+from studio.services.comfyui_schema import (
+    autogrow_canvas_names,
+    dynamic_widget_definitions,
+)
 from studio.services.workflow import WorkflowBuildError, validate_comfy_graph
+from studio.services.security_boundaries import boundary_int
 
 
-MAX_CONTRACT_ISSUES = 40
-MAX_AUTOGROW_INPUTS = 128
+
+
+def _contract_max_issues() -> int:
+    return boundary_int("security.comfy.contract.max_issues")
+
+
+def _contract_max_autogrow_inputs() -> int:
+    return boundary_int("security.comfy.contract.max_autogrow_inputs")
 _STAGED_ASSET_PREFIX = "__AUTOPROMPT_ASSET__:"
 _WIDGET_TYPES = frozenset({
     "BOOLEAN",
@@ -72,7 +83,7 @@ class _InputSpec:
 
 
 def _append_issue(issues: list[str], message: str) -> None:
-    if len(issues) < MAX_CONTRACT_ISSUES:
+    if len(issues) < _contract_max_issues():
         issues.append(message)
 
 
@@ -123,6 +134,7 @@ def _input_specs(info: dict, api_inputs: dict, *, node_label: str) -> tuple[dict
 
     specs: dict[str, _InputSpec] = {}
     dynamic_groups: list[tuple[str, dict, bool]] = []
+    dynamic_widgets: list[tuple[str, str, dict]] = []
     for category in ("required", "optional"):
         definitions = input_schema.get(category) or {}
         if not isinstance(definitions, dict):
@@ -157,6 +169,41 @@ def _input_specs(info: dict, api_inputs: dict, *, node_label: str) -> tuple[dict
                 required=category == "required",
                 enum_options=enum_options,
             )
+            if type_name == "COMFY_DYNAMICCOMBO_V3" or isinstance(config.get("formats"), dict):
+                dynamic_widgets.append((name, type_name, config))
+
+    for parent_name, input_type, config in dynamic_widgets:
+        for child_name, child_definition, child_required in dynamic_widget_definitions(
+            parent_name,
+            input_type,
+            config,
+            selected_value=api_inputs.get(parent_name),
+        ):
+            if child_name in specs:
+                _append_issue(issues, f"{node_label}.{child_name} 动态输入与静态 schema 冲突")
+                continue
+            try:
+                child_type, child_config, child_options = _parse_definition(
+                    child_definition,
+                    context=f"{node_label}.{child_name}",
+                )
+            except ValueError as exc:
+                _append_issue(issues, str(exc))
+                continue
+            if child_type == "COMBO" and child_options is None:
+                configured_options = child_config.get("options")
+                child_options = (
+                    tuple(configured_options)
+                    if isinstance(configured_options, list)
+                    else None
+                )
+            specs[child_name] = _InputSpec(
+                name=child_name,
+                type_name=child_type,
+                config=child_config,
+                required=child_required,
+                enum_options=child_options,
+            )
 
     for group_name, config, group_required in dynamic_groups:
         template = config.get("template")
@@ -164,21 +211,16 @@ def _input_specs(info: dict, api_inputs: dict, *, node_label: str) -> tuple[dict
             template.get("input", {}).get("required", {})
             if isinstance(template, dict) else {}
         )
-        prefix = template.get("prefix") if isinstance(template, dict) else None
+        allowed_names = autogrow_canvas_names(group_name, config)
         minimum = template.get("min", 0) if isinstance(template, dict) else None
-        maximum = template.get("max") if isinstance(template, dict) else None
         if (
             not isinstance(template_required, dict)
             or len(template_required) != 1
-            or not isinstance(prefix, str)
-            or not prefix
             or not isinstance(minimum, int)
             or isinstance(minimum, bool)
             or minimum < 0
-            or not isinstance(maximum, int)
-            or isinstance(maximum, bool)
-            or maximum < minimum
-            or maximum > MAX_AUTOGROW_INPUTS
+            or allowed_names is None
+            or len(allowed_names) < minimum
         ):
             _append_issue(issues, f"{node_label}.{group_name} 的 autogrow schema 不受支持")
             continue
@@ -194,38 +236,43 @@ def _input_specs(info: dict, api_inputs: dict, *, node_label: str) -> tuple[dict
         if child_options is not None or child_type in _WIDGET_TYPES | {"COMFY_AUTOGROW_V3"}:
             _append_issue(issues, f"{node_label}.{group_name} 的 autogrow 子输入必须是连接端口")
             continue
-        pattern = re.compile(
-            rf"^{re.escape(group_name)}\.{re.escape(prefix)}(0|[1-9][0-9]*)$"
-        )
         found: list[tuple[int, str]] = []
+        prefix = template.get("prefix") if isinstance(template, dict) else None
+        indexed_pattern = (
+            re.compile(rf"^{re.escape(group_name)}\.{re.escape(prefix)}(0|[1-9][0-9]*)$")
+            if isinstance(prefix, str) and prefix else None
+        )
         for input_name in api_inputs:
-            match = pattern.fullmatch(input_name)
-            if match:
+            if input_name in allowed_names:
+                found.append((allowed_names.index(input_name), input_name))
+                continue
+            match = indexed_pattern.fullmatch(input_name) if indexed_pattern is not None else None
+            if match is not None:
                 found.append((int(match.group(1)), input_name))
         found.sort()
-        indices = [index for index, _ in found]
-        if indices and indices != list(range(len(indices))):
+        found_names = {name for _, name in found}
+        missing_required = [
+            name for name in allowed_names[:minimum]
+            if name not in found_names
+        ]
+        if missing_required or (group_required and not found and minimum > 0):
             _append_issue(
                 issues,
-                f"{node_label}.{group_name} 的 autogrow 槽位必须从 0 连续编号，实际为 {indices}",
-            )
-        if len(found) < minimum or (group_required and not found and minimum > 0):
-            _append_issue(
-                issues,
-                f"{node_label}.{group_name} 至少需要 {minimum} 个 autogrow 输入",
+                f"{node_label}.{group_name} 缺少必填 autogrow 输入: "
+                + ", ".join(missing_required or allowed_names[:minimum]),
             )
         for index, input_name in found:
-            if index >= maximum:
+            if index >= len(allowed_names):
                 _append_issue(
                     issues,
-                    f"{node_label}.{input_name} 超过 autogrow 最大槽位 {maximum - 1}",
+                    f"{node_label}.{input_name} 超过 autogrow 最大槽位 {len(allowed_names) - 1}",
                 )
                 continue
             specs[input_name] = _InputSpec(
                 name=input_name,
                 type_name=child_type,
                 config=child_config,
-                required=True,
+                required=index < minimum,
                 enum_options=child_options,
             )
     return specs, issues
@@ -290,8 +337,19 @@ def _validate_widget_value(
     value,
     *,
     uploaded_paths: frozenset[str],
+    allow_managed_asset_tokens: bool,
+    allow_unverified_upload_names: bool,
 ) -> str | None:
     if isinstance(value, str) and value.startswith(_STAGED_ASSET_PREFIX):
+        if (
+            allow_managed_asset_tokens
+            and value == f"{_STAGED_ASSET_PREFIX}managed"
+            and any(
+                bool(spec.config.get(flag))
+                for flag in ("image_upload", "video_upload", "audio_upload")
+            )
+        ):
+            return None
         return "仍包含未上传的素材占位符"
     options = spec.enum_options
     if options is not None:
@@ -309,10 +367,44 @@ def _validate_widget_value(
                 return "必须是 ComfyUI 上传接口返回的非空相对路径"
             if value in options or value in uploaded_paths:
                 return None
+            if allow_unverified_upload_names:
+                normalized = value.replace("\\", "/")
+                parts = normalized.split("/")
+                if (
+                    len(value) <= 500
+                    and not normalized.startswith("/")
+                    and not re.match(r"^[A-Za-z]:", normalized)
+                    and not any(
+                        part in {"", ".", ".."}
+                        or any(ord(character) < 32 for character in part)
+                        for part in parts
+                    )
+                ):
+                    return None
+                return "canvas 素材名不是安全相对路径"
             return "既不在实时文件枚举中，也不在本任务已确认的上传结果中"
         if options:
             if value not in options:
-                return f"值 {value!r} 不在实时 /object_info 枚举中"
+                from studio.services.comfyui_artifacts import safe_model_relative_filename
+
+                normalized_value = (
+                    safe_model_relative_filename(value)
+                    if isinstance(value, str) else None
+                )
+                normalized_options = {
+                    normalized
+                    for option in options
+                    if isinstance(option, str)
+                    for normalized in [safe_model_relative_filename(option)]
+                    if normalized is not None
+                }
+                if normalized_value is not None and normalized_value in normalized_options:
+                    return None
+                # Contract errors cross an API boundary during saved-workflow
+                # review.  Never echo a canvas literal: model names are
+                # reported through the separately reviewed dependency surface
+                # and arbitrary widget values may contain prompts or secrets.
+                return "值不在实时 /object_info 受控枚举中"
         else:
             return "实时 /object_info 未提供可用枚举值"
         if not isinstance(value, (str, int, float, bool)) or value == "":
@@ -336,6 +428,8 @@ def validate_comfyui_api_contract(
     object_info: dict,
     *,
     uploaded_paths: set[str] | frozenset[str] | tuple[str, ...] = (),
+    allow_managed_asset_tokens: bool = False,
+    allow_unverified_upload_names: bool = False,
 ) -> ComfyUIContractReport:
     """Validate an executable API graph against the connected server contract.
 
@@ -384,6 +478,103 @@ def validate_comfyui_api_contract(
         for issue in spec_issues:
             _append_issue(issues, issue)
 
+    resolved_matchtypes: dict[tuple[str, str], str | None] = {}
+    resolving_matchtypes: set[tuple[str, str]] = set()
+    resolved_outputs: dict[tuple[str, int], str | None] = {}
+
+    def matchtype_template(spec: _InputSpec) -> str | None:
+        template = spec.config.get("template") if isinstance(spec.config, dict) else None
+        template_id = template.get("template_id") if isinstance(template, dict) else None
+        return template_id if isinstance(template_id, str) and template_id else None
+
+    def resolve_matchtype(node_id: str, template_id: str) -> str | None:
+        key = (node_id, template_id)
+        if key in resolved_matchtypes:
+            return resolved_matchtypes[key]
+        if key in resolving_matchtypes:
+            _append_issue(issues, f"节点 {node_id} 的 matchtype {template_id!r} 含递归依赖")
+            return None
+        resolving_matchtypes.add(key)
+        try:
+            node = api_graph[node_id]
+            specs = input_specs_by_node.get(node_id, {})
+            group = [
+                spec for spec in specs.values()
+                if spec.type_name == "COMFY_MATCHTYPE_V3"
+                and matchtype_template(spec) == template_id
+            ]
+            if not group:
+                _append_issue(issues, f"节点 {node_id} 的 matchtype {template_id!r} 没有绑定输入")
+                resolved_matchtypes[key] = None
+                return None
+            candidates: list[set[str]] = []
+            for spec in group:
+                link = _parse_link(node.get("inputs", {}).get(spec.name))
+                if link is None:
+                    if spec.required:
+                        _append_issue(
+                            issues,
+                            f"节点 {node_id} 的 matchtype 输入 {spec.name} 未连接",
+                        )
+                    continue
+                source_id, source_slot = link
+                if source_id not in api_graph:
+                    continue
+                source_type = resolve_output_type(source_id, source_slot)
+                if source_type is None:
+                    continue
+                concrete = {
+                    item.strip() for item in source_type.split(",")
+                    if item.strip() and item.strip() not in _ANY_TYPES | {"COMFY_MATCHTYPE_V3"}
+                }
+                if not concrete:
+                    _append_issue(
+                        issues,
+                        f"节点 {node_id} 的 matchtype 输入 {spec.name} 类型无法解析",
+                    )
+                    continue
+                candidates.append(concrete)
+            if not candidates:
+                _append_issue(issues, f"节点 {node_id} 的 matchtype {template_id!r} 没有具体类型")
+                resolved_matchtypes[key] = None
+                return None
+            common = set.intersection(*candidates)
+            if not common:
+                _append_issue(issues, f"节点 {node_id} 的 matchtype {template_id!r} 分支类型不一致")
+                resolved_matchtypes[key] = None
+                return None
+            value = ",".join(sorted(common))
+            resolved_matchtypes[key] = value
+            return value
+        finally:
+            resolving_matchtypes.remove(key)
+
+    def resolve_output_type(node_id: str, source_slot: int) -> str | None:
+        key = (node_id, source_slot)
+        if key in resolved_outputs:
+            return resolved_outputs[key]
+        outputs = outputs_by_node.get(node_id, ())
+        if source_slot >= len(outputs):
+            return None
+        output_type = outputs[source_slot]
+        if output_type != "COMFY_MATCHTYPE_V3":
+            resolved_outputs[key] = output_type
+            return output_type
+        info = schemas.get(api_graph[node_id]["class_type"], {})
+        matchtypes = info.get("output_matchtypes")
+        template_id = (
+            matchtypes[source_slot]
+            if isinstance(matchtypes, list) and source_slot < len(matchtypes)
+            else None
+        )
+        if not isinstance(template_id, str) or not template_id:
+            _append_issue(issues, f"节点 {node_id}[{source_slot}] 的 COMFY_MATCHTYPE_V3 无模板绑定")
+            resolved_outputs[key] = None
+            return None
+        value = resolve_matchtype(node_id, template_id)
+        resolved_outputs[key] = value
+        return value
+
     link_count = 0
     for node_id, node in api_graph.items():
         class_type = node["class_type"]
@@ -406,13 +597,15 @@ def validate_comfyui_api_contract(
                 if not spec.is_widget:
                     _append_issue(
                         issues,
-                        f"{node_label}.{name} 需要 {spec.type_name} 连接，不能使用常量 {value!r}",
+                        f"{node_label}.{name} 需要 {spec.type_name} 连接，不能使用常量",
                     )
                     continue
                 value_error = _validate_widget_value(
                     spec,
                     value,
                     uploaded_paths=confirmed_uploaded_paths,
+                    allow_managed_asset_tokens=allow_managed_asset_tokens,
+                    allow_unverified_upload_names=allow_unverified_upload_names,
                 )
                 if value_error:
                     _append_issue(issues, f"{node_label}.{name} {value_error}")
@@ -434,11 +627,27 @@ def validate_comfyui_api_contract(
                     f"但源节点仅有 {len(source_outputs)} 个输出",
                 )
                 continue
-            actual_type = source_outputs[source_slot]
-            if not _compatible_types(actual_type, spec.type_name):
+            actual_type = resolve_output_type(source_id, source_slot)
+            expected_type = spec.type_name
+            if expected_type == "COMFY_MATCHTYPE_V3":
+                template_id = matchtype_template(spec)
+                expected_type = (
+                    resolve_matchtype(node_id, template_id)
+                    if template_id is not None else None
+                )
+                if template_id is None:
+                    _append_issue(
+                        issues,
+                        f"{node_label}.{name} 的 COMFY_MATCHTYPE_V3 无模板绑定",
+                    )
+            if (
+                actual_type is not None
+                and expected_type is not None
+                and not _compatible_types(actual_type, expected_type)
+            ):
                 _append_issue(
                     issues,
-                    f"{node_label}.{name} 需要 {spec.type_name}，"
+                    f"{node_label}.{name} 需要 {expected_type}，"
                     f"但 {source_id}[{source_slot}] 输出 {actual_type}",
                 )
 

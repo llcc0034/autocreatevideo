@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import csv
+from contextlib import contextmanager
 from copy import deepcopy
 import hashlib
 import io
+import ipaddress
+import math
 import os
 import platform
 import shutil
 import subprocess
+import stat
+from dataclasses import dataclass
 from datetime import timedelta
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -43,6 +48,14 @@ from studio.services.configuration import (
     resolve_configuration,
 )
 from studio.services.async_media_contract import fresh_smoke_snapshot, validate_async_model_profile
+from studio.services.comfyui_artifacts import (
+    _plain_existing_path,
+    artifact_inventory_spec,
+    controlled_local_model_path,
+    controlled_local_models_root,
+    object_info_inventory_names,
+    safe_model_relative_filename,
+)
 from studio.services.json_contracts import (
     assign_json_contract,
     canonical_json_bytes,
@@ -50,25 +63,27 @@ from studio.services.json_contracts import (
     json_contract,
     verify_json_contract,
 )
+from studio.services.registry_reference_lock import registry_reference_writer
+from studio.services.registry_deletion import validate_recipe_registry_references
+from studio.services.model_profile_contracts import (
+    verified_model_profile_specification,
+)
 from studio.services.provider_registry import (
     ProviderDriverError,
     credential_binding_sha256,
     driver_for,
     resolve_credential,
+    validate_deployment_execution_contract,
 )
-
-
-_MODEL_FOLDER_BY_ROLE = {
-    ModelArtifact.Role.CHECKPOINT: "checkpoints",
-    ModelArtifact.Role.DIFFUSION_MODEL: "diffusion_models",
-    ModelArtifact.Role.TEXT_ENCODER: "text_encoders",
-    ModelArtifact.Role.VAE: "vae",
-    ModelArtifact.Role.LORA: "loras",
-}
+from studio.services.security_boundaries import boundary_int
 
 
 class RecommendationStale(ValidationError):
     """The frozen recommendation no longer describes executable live state."""
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
 
 def _memory_total_bytes() -> int:
@@ -99,7 +114,16 @@ def _memory_total_bytes() -> int:
         return 0
 
 
-def _gpu_probe() -> tuple[list[dict[str, Any]], str]:
+def _gpu_probe(*, timeout_seconds: float) -> tuple[list[dict[str, Any]], str]:
+    if (
+        isinstance(timeout_seconds, bool)
+        or not isinstance(timeout_seconds, (int, float))
+        or not math.isfinite(float(timeout_seconds))
+        or float(timeout_seconds) <= 0
+    ):
+        raise ValidationError({
+            "runtime.gpu_probe_timeout_seconds": "必须是有限正数",
+        })
     binary = shutil.which("nvidia-smi")
     if not binary:
         return [], "nvidia-smi_not_found"
@@ -113,7 +137,7 @@ def _gpu_probe() -> tuple[list[dict[str, Any]], str]:
             command,
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=float(timeout_seconds),
             check=False,
             encoding="utf-8",
             errors="replace",
@@ -159,7 +183,14 @@ def _deployment_is_loopback(deployment: ModelDeployment) -> bool:
         **(deployment.runtime_config or {}),
     }
     hostname = (urlparse(str(config.get("base_url") or "")).hostname or "").casefold()
-    return hostname in {"localhost", "127.0.0.1", "::1"}
+    if hostname == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        # Never resolve DNS here: an arbitrary hostname can be rebound after
+        # review and is not authoritative proof of a local filesystem scope.
+        return False
 
 
 def _host_probe_is_local(host: RuntimeHost) -> bool:
@@ -175,31 +206,235 @@ def _host_probe_is_local(host: RuntimeHost) -> bool:
     return all(_deployment_is_loopback(item) for item in deployments)
 
 
-def _controlled_local_model_path(folder: str, filename: str) -> Path | None:
-    output_raw = str(getattr(settings, "COMFYUI_OUTPUT_DIR", "") or "").strip()
-    if not output_raw:
-        return None
-    relative = PurePosixPath(str(filename or "").replace("\\", "/"))
-    if relative.is_absolute() or not relative.parts or any(
-        part in {"", ".", ".."} for part in relative.parts
+def draft_model_profile_fingerprint(profile: ModelProfileVersion) -> str:
+    """Freeze the non-secret draft contract used by model byte attestation."""
+
+    return json_contract({
+        "profile_id": str(profile.id),
+        "provider_id": str(profile.provider_id),
+        "status": profile.status,
+        "model_identifier": profile.model_identifier,
+        "modality": profile.modality,
+        "specification_schema_version": profile.specification_schema_version,
+        "specification_size_bytes": profile.specification_size_bytes,
+        "specification_sha256": profile.specification_sha256,
+    }, max_bytes=_stage_snapshot_max_bytes()).sha256
+
+
+@dataclass(frozen=True)
+class _ObservedFileFacts:
+    size_bytes: int
+    sha256: str
+    path: Path
+    fingerprint: tuple[int, int, int, int, int, int]
+    allowed_root: Path
+    final_path: Path
+    stream: Any | None = None
+
+    def verify_unchanged(self) -> None:
+        if self.stream is None or self.stream.closed:
+            raise OSError("attestation model file handle is no longer open")
+        opened = os.fstat(self.stream.fileno())
+        if not _plain_existing_path(self.path):
+            raise OSError("model path contains a link or reparse point")
+        current = self.path.lstat()
+        fingerprint = (
+            current.st_mode,
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+            current.st_ctime_ns,
+        )
+        opened_fingerprint = (
+            opened.st_mode,
+            opened.st_dev,
+            opened.st_ino,
+            opened.st_size,
+            opened.st_mtime_ns,
+            opened.st_ctime_ns,
+        )
+        if (
+            not stat.S_ISREG(current.st_mode)
+            or fingerprint != self.fingerprint
+            or opened_fingerprint != self.fingerprint
+            or _final_path_for_stream(self.stream) != self.final_path
+            or not _path_is_within(self.final_path, self.allowed_root)
+        ):
+            raise OSError("model file changed after hashing")
+
+    def close(self) -> None:
+        if self.stream is not None and not self.stream.closed:
+            self.stream.close()
+
+
+def _path_is_within(path: Path, root: Path) -> bool:
+    try:
+        common = os.path.commonpath((str(path), str(root)))
+    except ValueError:
+        return False
+    if os.name == "nt":
+        return os.path.normcase(common) == os.path.normcase(str(root))
+    return common == str(root)
+
+
+def _normalize_windows_final_path(value: str) -> Path:
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
+
+
+def _final_path_for_stream(stream) -> Path:
+    if os.name != "nt":
+        proc_path = Path(f"/proc/self/fd/{stream.fileno()}")
+        try:
+            return Path(os.readlink(proc_path)).resolve(strict=True)
+        except OSError:
+            return Path(stream.name).resolve(strict=True)
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    handle = wintypes.HANDLE(msvcrt.get_osfhandle(stream.fileno()))
+    buffer = ctypes.create_unicode_buffer(32768)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.GetFinalPathNameByHandleW.argtypes = (
+        wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD,
+    )
+    kernel32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    size = kernel32.GetFinalPathNameByHandleW(handle, buffer, len(buffer), 0)
+    if size == 0 or size >= len(buffer):
+        raise OSError(ctypes.get_last_error(), "cannot resolve opened model handle")
+    return _normalize_windows_final_path(buffer.value)
+
+
+def _open_model_file(path: Path, *, allowed_root: Path):
+    path = Path(path)
+    allowed_root = Path(allowed_root)
+    if (
+        not path.is_absolute()
+        or not allowed_root.is_absolute()
+        or not _path_is_within(path, allowed_root)
+        or not _plain_existing_path(path)
     ):
-        return None
-    models_root = (Path(output_raw).resolve().parent / "models").resolve()
-    folder_root = (models_root / folder).resolve()
-    candidate = (folder_root / Path(*relative.parts)).resolve()
-    if not candidate.is_relative_to(folder_root) or not candidate.is_file():
-        return None
-    return candidate
+        raise OSError("model path is outside the controlled root or contains a link")
+    if os.name != "nt":
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(path, flags)
+        try:
+            stream = os.fdopen(descriptor, "rb")
+            final_path = _final_path_for_stream(stream)
+            if not _path_is_within(final_path, allowed_root):
+                raise OSError("opened model file escaped the controlled root")
+            return stream, final_path
+        except Exception:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            raise
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    generic_read = 0x80000000
+    file_share_read = 0x00000001
+    open_existing = 3
+    file_flag_open_reparse_point = 0x00200000
+    file_flag_sequential_scan = 0x08000000
+    file_attribute_reparse_point = 0x00000400
+    invalid_handle_value = ctypes.c_void_p(-1).value
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE,
+    )
+    kernel32.CreateFileW.restype = wintypes.HANDLE
+    handle = kernel32.CreateFileW(
+        str(path),
+        generic_read,
+        file_share_read,
+        None,
+        open_existing,
+        file_flag_open_reparse_point | file_flag_sequential_scan,
+        None,
+    )
+    if handle == invalid_handle_value:
+        raise OSError(ctypes.get_last_error(), "cannot open controlled model file")
+
+    class FileAttributeTagInfo(ctypes.Structure):
+        _fields_ = (
+            ("file_attributes", wintypes.DWORD),
+            ("reparse_tag", wintypes.DWORD),
+        )
+
+    try:
+        info = FileAttributeTagInfo()
+        kernel32.GetFileInformationByHandleEx.argtypes = (
+            wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD,
+        )
+        kernel32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+        if not kernel32.GetFileInformationByHandleEx(
+            handle,
+            9,  # FileAttributeTagInfo
+            ctypes.byref(info),
+            ctypes.sizeof(info),
+        ):
+            raise OSError(ctypes.get_last_error(), "cannot inspect model file handle")
+        if info.file_attributes & file_attribute_reparse_point:
+            raise OSError("model file is a reparse point")
+        descriptor = msvcrt.open_osfhandle(
+            int(handle),
+            os.O_RDONLY | getattr(os, "O_BINARY", 0),
+        )
+        handle = None  # descriptor now owns the native handle
+        stream = os.fdopen(descriptor, "rb")
+        final_path = _final_path_for_stream(stream)
+        if not _path_is_within(final_path, allowed_root):
+            stream.close()
+            raise OSError("opened model file escaped the controlled root")
+        return stream, final_path
+    finally:
+        if handle is not None:
+            kernel32.CloseHandle(handle)
 
 
 def _observed_file_facts(
     path: Path,
     *,
     lease_renew: Callable[[], None] | None = None,
-) -> tuple[int, str]:
+    allowed_root: Path | None = None,
+    hold_open: bool = False,
+) -> _ObservedFileFacts:
     digest = hashlib.sha256()
     size = 0
-    with path.open("rb") as stream:
+    path = Path(path)
+    root = Path(allowed_root or path.parent).resolve(strict=True)
+    stream, final_path = _open_model_file(path, allowed_root=root)
+    try:
+        opened_before = os.fstat(stream.fileno())
+        path_before = path.lstat()
+        before_fingerprint = (
+            opened_before.st_mode,
+            opened_before.st_dev,
+            opened_before.st_ino,
+            opened_before.st_size,
+            opened_before.st_mtime_ns,
+            opened_before.st_ctime_ns,
+        )
+        if before_fingerprint != (
+            path_before.st_mode,
+            path_before.st_dev,
+            path_before.st_ino,
+            path_before.st_size,
+            path_before.st_mtime_ns,
+            path_before.st_ctime_ns,
+        ) or not stat.S_ISREG(opened_before.st_mode):
+            raise OSError("model file changed before hashing")
         while True:
             chunk = stream.read(8 * 1024 * 1024)
             if not chunk:
@@ -208,7 +443,62 @@ def _observed_file_facts(
             digest.update(chunk)
             if lease_renew is not None:
                 lease_renew()
-    return size, digest.hexdigest()
+        opened_after = os.fstat(stream.fileno())
+        path_after = path.lstat()
+        after_fingerprint = (
+            opened_after.st_mode,
+            opened_after.st_dev,
+            opened_after.st_ino,
+            opened_after.st_size,
+            opened_after.st_mtime_ns,
+            opened_after.st_ctime_ns,
+        )
+        if (
+            before_fingerprint != after_fingerprint
+            or before_fingerprint != (
+                path_after.st_mode,
+                path_after.st_dev,
+                path_after.st_ino,
+                path_after.st_size,
+                path_after.st_mtime_ns,
+                path_after.st_ctime_ns,
+            )
+            or size != opened_after.st_size
+        ):
+            raise OSError("model file changed while hashing")
+        facts = _ObservedFileFacts(
+            size_bytes=size,
+            sha256=digest.hexdigest(),
+            path=path,
+            fingerprint=before_fingerprint,
+            allowed_root=root,
+            final_path=final_path,
+            stream=stream if hold_open else None,
+        )
+        if not hold_open:
+            stream.close()
+        return facts
+    except Exception:
+        stream.close()
+        raise
+
+
+def _close_availability_file_facts(availability) -> None:
+    seen: set[int] = set()
+    for item in availability or []:
+        file_facts = item.get("file_facts") if isinstance(item, dict) else None
+        if isinstance(file_facts, _ObservedFileFacts) and id(file_facts) not in seen:
+            seen.add(id(file_facts))
+            file_facts.close()
+
+
+@contextmanager
+def _close_file_facts_on_error(availability):
+    try:
+        yield
+    except BaseException:
+        _close_availability_file_facts(availability)
+        raise
 
 
 def verified_artifact_availability(
@@ -221,18 +511,30 @@ def verified_artifact_availability(
 
     verify_host_snapshot(snapshot)
     if deployment.runtime_host_id is None or snapshot.host_id != deployment.runtime_host_id:
-        raise ValidationError("artifact evidence 的主机与 deployment 不一致")
+        raise ValidationError(
+            "artifact evidence 的主机与 deployment 不一致",
+            code="artifact_host_mismatch",
+        )
     latest = HostCapabilitySnapshot.objects.filter(host_id=snapshot.host_id).order_by(
         "-captured_at", "-revision",
     ).first()
     if latest is None or latest.id != snapshot.id:
-        raise ValidationError("artifact evidence 不是该主机最新快照")
+        raise ValidationError(
+            "artifact evidence 不是该主机最新快照",
+            code="host_snapshot_not_latest",
+        )
     if snapshot.expires_at is None or snapshot.expires_at <= timezone.now():
-        raise ValidationError("artifact evidence 已过期")
+        raise ValidationError("artifact evidence 已过期", code="host_snapshot_stale")
     if snapshot.probe_status == HostCapabilitySnapshot.ProbeStatus.FAILED:
-        raise ValidationError("artifact evidence 所属主机探测失败")
+        raise ValidationError(
+            "artifact evidence 所属主机探测失败",
+            code="host_probe_failed",
+        )
     if artifact.profile_version_id != deployment.profile_version_id:
-        raise ValidationError("artifact 与 deployment model profile 不一致")
+        raise ValidationError(
+            "artifact 与 deployment model profile 不一致",
+            code="artifact_profile_mismatch",
+        )
     availability = RuntimeModelAvailability.objects.filter(
         snapshot=snapshot,
         deployment=deployment,
@@ -258,8 +560,153 @@ def verified_artifact_availability(
             and not _deployment_is_loopback(deployment)
         )
     ):
-        raise ValidationError("artifact 缺少与声明一致的主机观测 size/hash")
+        raise ValidationError(
+            "artifact 缺少与声明一致的主机观测 size/hash",
+            code="artifact_observation_unverified",
+        )
     return availability
+
+
+def validate_draft_profile_artifacts_for_publish(
+    profile: ModelProfileVersion,
+    *,
+    artifacts: list[ModelArtifact] | None = None,
+) -> None:
+    """Require fresh loopback byte evidence before freezing Comfy artifacts."""
+
+    if profile.provider.driver_type != ProviderProfile.DriverType.COMFYUI:
+        return
+    if artifacts is None:
+        artifacts = list(profile.artifacts.select_related(
+            "verified_snapshot__probe_attempt",
+            "verified_snapshot__host",
+        ).all())
+    else:
+        artifacts = list(artifacts)
+    if not artifacts:
+        return
+    now = timezone.now()
+    for artifact in artifacts:
+        snapshot = artifact.verified_snapshot
+        if (
+            artifact.status != ModelArtifact.Status.AVAILABLE
+            or artifact.size_bytes is None
+            or artifact.size_bytes <= 0
+            or not artifact.sha256
+            or snapshot is None
+            or snapshot.expires_at is None
+            or snapshot.expires_at <= now
+            or snapshot.probe_status == HostCapabilitySnapshot.ProbeStatus.FAILED
+        ):
+            raise ValidationError(
+                f"artifact {artifact.logical_name} 缺少新鲜的本机 size/hash 证明",
+            )
+
+    snapshot_ids = {artifact.verified_snapshot_id for artifact in artifacts}
+    if len(snapshot_ids) != 1:
+        raise ValidationError("draft profile 的全部 artifact 必须由同一次证明快照覆盖")
+    snapshot = artifacts[0].verified_snapshot
+    verify_host_snapshot(snapshot)
+    attempt = snapshot.probe_attempt
+    if (
+        attempt is None
+        or attempt.probe_kind
+        != RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+        or attempt.status != RuntimeHostProbeAttempt.Status.SUCCEEDED
+        or attempt.host_id != snapshot.host_id
+    ):
+        raise ValidationError("draft profile 的证明不是成功的草稿模型证明任务")
+    verify_json_contract(
+        attempt.request_snapshot,
+        schema_version=attempt.request_snapshot_schema_version,
+        size_bytes=attempt.request_snapshot_size_bytes,
+        sha256=attempt.request_snapshot_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
+    request = attempt.request_snapshot
+    if request.get("request_contract_sha256") != json_contract(
+        {
+            key: value
+            for key, value in request.items()
+            if key != "request_contract_sha256"
+        },
+        max_bytes=_stage_snapshot_max_bytes(),
+    ).sha256:
+        raise ValidationError("draft profile 的证明 request contract 已损坏")
+    artifact_rows = request.get("artifacts")
+    if not isinstance(artifact_rows, list):
+        raise ValidationError("draft profile 的证明缺少 artifact closure")
+    current_ids = {str(artifact.id) for artifact in artifacts}
+    frozen_ids = {
+        str(row.get("artifact_id") or "")
+        for row in artifact_rows
+        if isinstance(row, dict)
+    }
+    if (
+        len(frozen_ids) != len(artifact_rows)
+        or frozen_ids != current_ids
+        or str(request.get("target_model_profile_version_id") or "")
+        != str(profile.id)
+        or request.get("target_profile_fingerprint_sha256")
+        != draft_model_profile_fingerprint(profile)
+    ):
+        raise ValidationError("draft profile 当前 artifact 与证明冻结 closure 不一致")
+
+    for artifact in artifacts:
+        matching_rows = [
+            row for row in artifact_rows
+            if isinstance(row, dict)
+            and str(row.get("artifact_id") or "") == str(artifact.id)
+        ]
+        if (
+            len(matching_rows) != 1
+            or matching_rows[0].get("role") != artifact.role
+            or matching_rows[0].get("filename") != artifact.filename
+            or matching_rows[0].get("inventory_folder") != artifact.inventory_folder
+            or matching_rows[0].get("inventory_node_type")
+            != artifact.inventory_node_type
+            or matching_rows[0].get("inventory_input_name")
+            != artifact.inventory_input_name
+        ):
+            raise ValidationError(
+                f"artifact {artifact.logical_name} 不属于该证明任务冻结的精确 closure",
+            )
+        availability = RuntimeModelAvailability.objects.select_related(
+            "deployment__profile_version__provider",
+        ).filter(
+            snapshot=snapshot,
+            artifact=artifact,
+            status=RuntimeModelAvailability.Status.AVAILABLE,
+            observation_source=RuntimeModelAvailability.ObservationSource.LOCAL_FILESYSTEM,
+            observed_size_bytes=artifact.size_bytes,
+            observed_sha256=artifact.sha256,
+        ).first()
+        if (
+            availability is None
+            or str(request.get("source_deployment_id") or "")
+            != str(availability.deployment_id)
+            or availability.deployment.status != ModelDeployment.Status.ACTIVE
+            or availability.deployment.runtime_host_id != snapshot.host_id
+            or availability.deployment.profile_version.provider_id != profile.provider_id
+            or not _deployment_is_loopback(availability.deployment)
+            or not _host_probe_is_local(snapshot.host)
+        ):
+            raise ValidationError(
+                f"artifact {artifact.logical_name} 的证明不是同 provider loopback 主机事实",
+            )
+        # A mutable deployment FK alone is not provenance.  The source
+        # endpoint/provider/runtime-host contract must still equal the frozen
+        # request when the draft profile is published.
+        from studio.services.comfyui_workflow_imports import (
+            source_deployment_fingerprint,
+        )
+        if (
+            source_deployment_fingerprint(availability.deployment)
+            != request.get("source_deployment_fingerprint_sha256")
+        ):
+            raise ValidationError(
+                f"artifact {artifact.logical_name} 的 source deployment 已变化",
+            )
 
 
 def required_workflow_artifacts(
@@ -298,6 +745,7 @@ def _comfy_probe(
     host: RuntimeHost,
     *,
     lease_renew: Callable[[], None] | None = None,
+    attestation_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], list[str]]:
     deployments = list(
         ModelDeployment.objects.select_related(
@@ -313,6 +761,17 @@ def _comfy_probe(
     errors: list[str] = []
     availability: list[dict[str, Any]] = []
     deployment_details: list[dict[str, Any]] = []
+    attestation_deployment_id = (
+        attestation_context["source_deployment"].id
+        if isinstance(attestation_context, dict) else None
+    )
+    attestation_artifacts = {
+        artifact.id: artifact
+        for artifact in (
+            attestation_context.get("artifacts", [])
+            if isinstance(attestation_context, dict) else []
+        )
+    }
     for deployment in deployments:
         if lease_renew is not None:
             lease_renew()
@@ -331,7 +790,15 @@ def _comfy_probe(
                 "status": "unavailable",
                 "reason_code": "comfyui_probe_failed",
             })
-            for artifact in ModelArtifact.objects.filter(profile_version=deployment.profile_version):
+            artifacts = list(ModelArtifact.objects.filter(
+                profile_version=deployment.profile_version,
+            ))
+            if deployment.id == attestation_deployment_id:
+                artifacts = list({
+                    artifact.id: artifact
+                    for artifact in (*artifacts, *attestation_artifacts.values())
+                }.values())
+            for artifact in artifacts:
                 availability.append({
                     "deployment": deployment,
                     "artifact": artifact,
@@ -341,23 +808,47 @@ def _comfy_probe(
                     "observed_size_bytes": None,
                     "observed_sha256": "",
                     "observation_source": RuntimeModelAvailability.ObservationSource.NAME_ONLY,
+                    "is_attestation": (
+                        deployment.id == attestation_deployment_id
+                        and artifact.id in attestation_artifacts
+                    ),
+                    "file_facts": None,
                 })
             continue
         system = health.get("system") if isinstance(health, dict) else {}
         node_types = sorted(object_info) if isinstance(object_info, dict) else []
+        artifacts = list(ModelArtifact.objects.filter(profile_version=deployment.profile_version))
+        if deployment.id == attestation_deployment_id:
+            artifacts = list({
+                artifact.id: artifact
+                for artifact in (*artifacts, *attestation_artifacts.values())
+            }.values())
+        inventory_specs = {}
+        for artifact in artifacts:
+            try:
+                inventory_specs[artifact.id] = artifact_inventory_spec(artifact)
+            except ValueError:
+                inventory_specs[artifact.id] = None
         folder_values: dict[str, set[str]] = {}
         folder_summaries: dict[str, dict[str, Any]] = {}
         deployment_errors: list[str] = []
-        for folder in sorted(set(_MODEL_FOLDER_BY_ROLE.values())):
+        model_api_folders = sorted({
+            spec.folder
+            for spec in inventory_specs.values()
+            if spec is not None and spec.source == "models_api"
+        })
+        for folder in model_api_folders:
             if lease_renew is not None:
                 lease_renew()
             try:
                 response = driver.invoke(deployment, "models", {"folder": folder})
                 items = response.get("items") if isinstance(response, dict) else []
                 values = {
-                    str(item)
+                    normalized
                     for item in items
-                    if isinstance(item, str) and item
+                    if isinstance(item, str)
+                    for normalized in [safe_model_relative_filename(item)]
+                    if normalized is not None
                 }
                 folder_values[folder] = values
                 folder_summaries[folder] = {
@@ -369,9 +860,8 @@ def _comfy_probe(
                 errors.append(code)
                 deployment_errors.append(code.split(":", 1)[0])
                 folder_values[folder] = set()
-        artifacts = ModelArtifact.objects.filter(profile_version=deployment.profile_version)
         for artifact in artifacts:
-            folder = _MODEL_FOLDER_BY_ROLE.get(artifact.role)
+            spec = inventory_specs[artifact.id]
             availability_key = f"deployment:{deployment.id}:artifact:{artifact.id}"
             if artifact.status in {ModelArtifact.Status.INVALID, ModelArtifact.Status.MISSING}:
                 availability.append({
@@ -383,51 +873,111 @@ def _comfy_probe(
                     "observed_size_bytes": None,
                     "observed_sha256": "",
                     "observation_source": RuntimeModelAvailability.ObservationSource.NAME_ONLY,
+                    "is_attestation": (
+                        deployment.id == attestation_deployment_id
+                        and artifact.id in attestation_artifacts
+                    ),
+                    "file_facts": None,
                 })
                 continue
-            if folder is None:
+            if spec is None:
                 availability.append({
                     "deployment": deployment,
                     "artifact": artifact,
                     "key": availability_key,
                     "status": RuntimeModelAvailability.Status.UNKNOWN,
-                    "reason": "该 artifact role 无 ComfyUI 文件夹探测器",
+                    "reason": "artifact 缺少合法的受控库存目录或 object_info selector",
                     "observed_size_bytes": None,
                     "observed_sha256": "",
                     "observation_source": RuntimeModelAvailability.ObservationSource.NAME_ONLY,
+                    "is_attestation": (
+                        deployment.id == attestation_deployment_id
+                        and artifact.id in attestation_artifacts
+                    ),
+                    "file_facts": None,
                 })
                 continue
+            folder = spec.folder
+            artifact_filename = safe_model_relative_filename(artifact.filename)
             observed_size = None
             observed_sha = ""
+            file_facts = None
             observation_source = RuntimeModelAvailability.ObservationSource.NAME_ONLY
-            if folder not in folder_values or any(
-                error.startswith(f"comfyui_models_{folder}_unavailable")
-                for error in deployment_errors
-            ):
+            if spec.source == "object_info":
+                try:
+                    reported_names = object_info_inventory_names(object_info, spec)
+                except ValueError:
+                    reported_names = set()
+                    catalog_unavailable = True
+                    selector_key = f"object_info:{spec.node_type}.{spec.input_name}"
+                    deployment_errors.append("comfyui_custom_inventory_unavailable")
+                    errors.append(f"comfyui_custom_inventory_unavailable:{deployment.key}")
+                else:
+                    catalog_unavailable = False
+                    selector_key = f"object_info:{spec.node_type}.{spec.input_name}"
+                    folder_summaries[selector_key] = {
+                        "count": len(reported_names),
+                        "sha256": _hash_string_list(list(reported_names)),
+                    }
+            else:
+                reported_names = folder_values.get(folder, set())
+                catalog_unavailable = (
+                    folder not in folder_values
+                    or any(
+                        error.startswith(f"comfyui_models_{folder}_unavailable")
+                        for error in deployment_errors
+                    )
+                )
+            if artifact_filename is None:
+                state = RuntimeModelAvailability.Status.INCOMPATIBLE
+                reason = "artifact filename 不是受控 models 相对路径"
+            elif catalog_unavailable:
                 state = RuntimeModelAvailability.Status.UNKNOWN
-                reason = "ComfyUI 未返回该模型文件夹库存"
-            elif artifact.filename in folder_values[folder] and not local_filesystem:
+                reason = "ComfyUI 未返回该 artifact 的受控库存"
+            elif artifact_filename in reported_names and not local_filesystem:
                 state = RuntimeModelAvailability.Status.UNKNOWN
                 reason = "远程 ComfyUI 仅报告文件名，缺少受认证 size/hash 证明"
-            elif artifact.filename in folder_values[folder]:
-                candidate = _controlled_local_model_path(folder, artifact.filename)
+            elif artifact_filename in reported_names:
+                candidate = controlled_local_model_path(folder, artifact_filename)
                 if candidate is None:
                     state = RuntimeModelAvailability.Status.INCOMPATIBLE
                     reason = "本地模型路径不在受控 Comfy 根或文件不可读"
                 else:
+                    is_attestation = (
+                        deployment.id == attestation_deployment_id
+                        and artifact.id in attestation_artifacts
+                    )
                     try:
-                        observed_size, observed_sha = _observed_file_facts(
+                        file_facts = _observed_file_facts(
                             candidate,
                             lease_renew=lease_renew,
+                            allowed_root=controlled_local_models_root(),
+                            hold_open=is_attestation,
                         )
                     except OSError:
                         state = RuntimeModelAvailability.Status.UNKNOWN
                         reason = "本地模型文件无法读取"
                     else:
+                        observed_size = file_facts.size_bytes
+                        observed_sha = file_facts.sha256
                         observation_source = (
                             RuntimeModelAvailability.ObservationSource.LOCAL_FILESYSTEM
                         )
-                        if not artifact.sha256 or artifact.size_bytes is None:
+                        if (
+                            is_attestation
+                            and artifact.sha256
+                            and artifact.sha256 != observed_sha
+                        ) or (
+                            is_attestation
+                            and artifact.size_bytes is not None
+                            and artifact.size_bytes != observed_size
+                        ):
+                            state = RuntimeModelAvailability.Status.INCOMPATIBLE
+                            reason = "草稿 artifact 的既有 size/hash 与主机观测不一致"
+                        elif is_attestation:
+                            state = RuntimeModelAvailability.Status.AVAILABLE
+                            reason = "草稿 artifact 已从受控本地文件系统生成 size/hash 证明"
+                        elif not artifact.sha256 or artifact.size_bytes is None:
                             state = RuntimeModelAvailability.Status.INCOMPATIBLE
                             reason = "artifact 声明缺少生产必需的 size/hash"
                         elif (
@@ -451,6 +1001,14 @@ def _comfy_probe(
                 "observed_size_bytes": observed_size,
                 "observed_sha256": observed_sha,
                 "observation_source": observation_source,
+                "is_attestation": (
+                    deployment.id == attestation_deployment_id
+                    and artifact.id in attestation_artifacts
+                ),
+                # Internal only.  This object is never serialized into details or
+                # RuntimeModelAvailability; it carries the opened-file identity
+                # across the network probe to the fenced DB commit.
+                "file_facts": file_facts,
             })
         deployment_details.append({
             "deployment_id": str(deployment.id),
@@ -486,6 +1044,7 @@ def probe_runtime_host(
     lease_renew: Callable[[], None] | None = None,
     probe_attempt: RuntimeHostProbeAttempt | None = None,
     commit_guard: Callable[[], None] | None = None,
+    attestation_context: dict[str, Any] | None = None,
 ) -> HostCapabilitySnapshot:
     host = RuntimeHost.objects.get(pk=host.pk)
     if probe_attempt is not None and probe_attempt.host_id != host.pk:
@@ -494,11 +1053,19 @@ def probe_runtime_host(
         raise ValidationError("已禁用主机不能执行探测；请先通过受控状态入口启用")
     if lease_renew is not None:
         lease_renew()
-    configuration = resolve_configuration(required_keys=("runtime.capability_ttl_seconds",))
+    configuration = resolve_configuration(required_keys=(
+        "runtime.capability_ttl_seconds",
+        "runtime.gpu_probe_timeout_seconds",
+    ))
+    gpu_probe_timeout_seconds = float(
+        configuration.values["runtime.gpu_probe_timeout_seconds"]
+    )
     errors: list[str] = []
     local_probe = _host_probe_is_local(host)
     if local_probe:
-        gpus, gpu_error = _gpu_probe()
+        gpus, gpu_error = _gpu_probe(
+            timeout_seconds=gpu_probe_timeout_seconds,
+        )
         if gpu_error:
             errors.append(gpu_error)
     else:
@@ -515,8 +1082,42 @@ def probe_runtime_host(
             disk_total, disk_free = int(disk.total), int(disk.free)
         except OSError:
             errors.append("media_storage_unavailable")
-    comfy, availability, comfy_errors = _comfy_probe(host, lease_renew=lease_renew)
+    comfy, availability, comfy_errors = _comfy_probe(
+        host,
+        lease_renew=lease_renew,
+        attestation_context=attestation_context,
+    )
     errors.extend(comfy_errors)
+    attestation_items: list[dict[str, Any]] = []
+    attestation_complete = False
+    if isinstance(attestation_context, dict):
+        expected_ids = {
+            artifact.id for artifact in attestation_context.get("artifacts", [])
+        }
+        attestation_items = [
+            item for item in availability if item.get("is_attestation")
+        ]
+        observed_ids = [item["artifact"].id for item in attestation_items]
+        if (
+            not expected_ids
+            or len(observed_ids) != len(expected_ids)
+            or set(observed_ids) != expected_ids
+        ):
+            _close_availability_file_facts(availability)
+            raise ValidationError(
+                "draft artifact attestation 未形成精确且唯一的 artifact closure",
+            )
+        attestation_complete = all(
+            item["status"] == RuntimeModelAvailability.Status.AVAILABLE
+            and item["observation_source"]
+            == RuntimeModelAvailability.ObservationSource.LOCAL_FILESYSTEM
+            and item["observed_size_bytes"] is not None
+            and bool(item["observed_sha256"])
+            and isinstance(item.get("file_facts"), _ObservedFileFacts)
+            for item in attestation_items
+        )
+        if not attestation_complete:
+            errors.append("draft_artifact_attestation_incomplete")
     details = {
         "schema_version": 1,
         "probe_scope": "local_process" if local_probe else "remote_unattested",
@@ -528,8 +1129,19 @@ def probe_runtime_host(
         "gpus": gpus,
         "comfyui": comfy,
         "probe_errors": sorted(set(errors)),
+        "runtime_configuration": {
+            "resolution_sha256": configuration.sha256,
+            "gpu_probe_timeout_seconds": gpu_probe_timeout_seconds,
+        },
     }
-    details_contract = json_contract(details)
+    try:
+        details_contract = json_contract(
+            details,
+            max_bytes=_stage_snapshot_max_bytes(),
+        )
+    except BaseException:
+        _close_availability_file_facts(availability)
+        raise
     core_ok = bool(local_probe and os.cpu_count() and _memory_total_bytes() and disk_total)
     status = (
         HostCapabilitySnapshot.ProbeStatus.SUCCEEDED
@@ -540,8 +1152,12 @@ def probe_runtime_host(
     )
     captured_at = timezone.now()
     if lease_renew is not None:
-        lease_renew()
-    with transaction.atomic():
+        try:
+            lease_renew()
+        except BaseException:
+            _close_availability_file_facts(availability)
+            raise
+    with _close_file_facts_on_error(availability), transaction.atomic():
         host = RuntimeHost.objects.select_for_update().get(pk=host.pk)
         if host.status == RuntimeHost.Status.DISABLED:
             raise ValidationError("主机在探测期间已被禁用；探测结果未写入")
@@ -549,7 +1165,26 @@ def probe_runtime_host(
             # The durable attempt claim is fenced inside the same transaction
             # that persists the immutable snapshot. A cancelled or recovered
             # worker therefore cannot commit a late result.
-            commit_guard()
+            try:
+                commit_guard()
+            except OSError as exc:
+                raise ValidationError(
+                    "attestation 模型文件在提交围栏期间无法保持不变",
+                ) from exc
+        # Re-check the exact path identity after the durable claim and source /
+        # profile / artifact declarations have been locked.  A replacement in
+        # the gap between closing the hashed fd and this transaction therefore
+        # yields no snapshot and no artifact mutation.
+        for item in attestation_items:
+            file_facts = item.get("file_facts")
+            if file_facts is None:
+                continue
+            try:
+                file_facts.verify_unchanged()
+            except OSError as exc:
+                raise ValidationError(
+                    "attestation 模型文件在 hash 后、提交前发生变化",
+                ) from exc
         next_revision = (
             HostCapabilitySnapshot.objects.filter(host=host)
             .aggregate(value=Max("revision"))["value"]
@@ -597,6 +1232,49 @@ def probe_runtime_host(
             )
             for item in availability
         ])
+        if attestation_complete:
+            items_by_artifact = {
+                item["artifact"].id: item for item in attestation_items
+            }
+            locked_artifacts = list(
+                ModelArtifact.objects.select_for_update()
+                .select_related("profile_version")
+                .filter(pk__in=sorted(items_by_artifact, key=str))
+                .order_by("pk")
+            )
+            if len(locked_artifacts) != len(items_by_artifact):
+                raise ValidationError("attestation artifact closure 在提交前发生变化")
+            target_profile_id = attestation_context["target_profile"].id
+            for artifact in locked_artifacts:
+                item = items_by_artifact[artifact.id]
+                if (
+                    artifact.profile_version_id != target_profile_id
+                    or artifact.profile_version.status
+                    != ModelProfileVersion.Status.DRAFT
+                ):
+                    raise ValidationError("attestation 目标 model profile 已不再是 draft")
+                if artifact.sha256 and artifact.sha256 != item["observed_sha256"]:
+                    raise ValidationError("attestation artifact hash 在提交前发生变化")
+                if (
+                    artifact.size_bytes is not None
+                    and artifact.size_bytes != item["observed_size_bytes"]
+                ):
+                    raise ValidationError("attestation artifact size 在提交前发生变化")
+            # This second loop is intentionally separate: all declarations are
+            # checked before the first row is mutated, while transaction.atomic
+            # still guarantees rollback if a later save fails.
+            for artifact in locked_artifacts:
+                item = items_by_artifact[artifact.id]
+                artifact.sha256 = item["observed_sha256"]
+                artifact.size_bytes = item["observed_size_bytes"]
+                artifact.status = ModelArtifact.Status.AVAILABLE
+                artifact.verified_snapshot = snapshot
+                artifact.verified_at = captured_at
+                artifact.verified_by = attestation_context.get("verified_by")
+                artifact.save(update_fields=(
+                    "sha256", "size_bytes", "status", "verified_snapshot",
+                    "verified_at", "verified_by", "updated_at",
+                ))
         if local_probe:
             host.name = platform.node() or host.name
             host.fingerprint_sha256 = _host_fingerprint()
@@ -606,6 +1284,7 @@ def probe_runtime_host(
         if local_probe:
             host_fields.extend(("name", "fingerprint_sha256"))
         host.save(update_fields=host_fields)
+    _close_availability_file_facts(availability)
     return snapshot
 
 
@@ -623,6 +1302,7 @@ def verify_host_snapshot(snapshot: HostCapabilitySnapshot) -> None:
         schema_version=snapshot.details_schema_version,
         size_bytes=snapshot.details_size_bytes,
         sha256=snapshot.details_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
 
 
@@ -749,13 +1429,14 @@ def host_resolution_and_concurrency(
 
 
 def _declared_model_capabilities(deployment: ModelDeployment) -> set[str]:
-    specification = deployment.profile_version.specification
+    specification = verified_model_profile_specification(
+        deployment.profile_version,
+    )
     declared: set[str] = set()
-    if isinstance(specification, dict):
-        for field in ("capabilities", "operations", "protocols"):
-            values = specification.get(field)
-            if isinstance(values, list):
-                declared.update(str(item).strip() for item in values if str(item).strip())
+    for field in ("capabilities", "operations", "protocols"):
+        values = specification.get(field)
+        if isinstance(values, list):
+            declared.update(str(item).strip() for item in values if str(item).strip())
     return declared
 
 
@@ -808,6 +1489,19 @@ def _candidate_state(
     availability: list[RuntimeModelAvailability],
     max_vram_bytes: int,
 ) -> tuple[str, str]:
+    try:
+        model_specification = verified_model_profile_specification(
+            deployment.profile_version,
+        )
+    except ValidationError:
+        return RecommendationCandidate.Status.UNAVAILABLE, "model_profile_contract_invalid"
+    try:
+        validate_deployment_execution_contract(deployment)
+    except (ProviderDriverError, ValidationError):
+        return (
+            RecommendationCandidate.Status.UNAVAILABLE,
+            "deployment_execution_contract_invalid",
+        )
     is_local = deployment.runtime_host_id is not None
     modality = deployment.profile_version.modality
     if is_local and snapshot.expires_at and snapshot.expires_at <= timezone.now():
@@ -882,7 +1576,7 @@ def _candidate_state(
             if RuntimeModelAvailability.Status.MISSING in states:
                 return RecommendationCandidate.Status.UNAVAILABLE, "artifact_missing"
             return RecommendationCandidate.Status.SMOKE_TEST_REQUIRED, "artifact_inventory_unverified"
-        minimum_vram = _minimum_vram_bytes(deployment.profile_version.specification or {})
+        minimum_vram = _minimum_vram_bytes(model_specification)
         if minimum_vram and max_vram_bytes < minimum_vram:
             return RecommendationCandidate.Status.UNAVAILABLE, "insufficient_vram"
     if modality in {"image", "video", "multimodal"}:
@@ -999,13 +1693,7 @@ def recommend_for_host(
     )
     candidate_rows: list[dict[str, Any]] = []
     for deployment in deployments:
-        specification = deployment.profile_version.specification
-        verify_json_contract(
-            specification,
-            schema_version=deployment.profile_version.specification_schema_version,
-            size_bytes=deployment.profile_version.specification_size_bytes,
-            sha256=deployment.profile_version.specification_sha256,
-        )
+        verified_model_profile_specification(deployment.profile_version)
         workflows: list[WorkflowTemplateVersion | None]
         if deployment.profile_version.modality == "text":
             workflows = [None]
@@ -1094,7 +1782,10 @@ def recommend_for_host(
         "config_sha256": configuration.sha256,
         "catalog_sha256": catalog_sha256,
     }
-    recommendation_contract = json_contract(recommendation)
+    recommendation_contract = json_contract(
+        recommendation,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
     input_payload = {
         "host_snapshot_sha256": snapshot.details_sha256,
         "project_id": str(project.id) if project else None,
@@ -1152,7 +1843,10 @@ def recommend_for_host(
                 ),
             },
         }
-        contract = json_contract(suggested_values)
+        contract = json_contract(
+            suggested_values,
+            max_bytes=_stage_snapshot_max_bytes(),
+        )
         RecommendationCandidate.objects.create(
             recommendation_snapshot=recommendation_snapshot,
             capability_key=item["capability_key"],
@@ -1169,6 +1863,7 @@ def recommend_for_host(
     return recommendation_snapshot
 
 
+@registry_reference_writer
 def _draft_recommended_recipe(
     candidate: RecommendationCandidate,
     *,
@@ -1214,7 +1909,13 @@ def _draft_recommended_recipe(
         name=f"{base.name} · 推荐草稿",
         status=ProductionRecipeVersion.Status.DRAFT,
     )
-    assign_json_contract(draft, "definition", definition)
+    assign_json_contract(
+        draft,
+        "definition",
+        definition,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
+    validate_recipe_registry_references(definition)
     draft.save()
     return draft
 
@@ -1230,6 +1931,7 @@ def _assert_recommendation_current(
         schema_version=recommendation.recommendation_schema_version,
         size_bytes=recommendation.recommendation_size_bytes,
         sha256=recommendation.recommendation_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
     snapshot = HostCapabilitySnapshot.objects.select_related("host").get(
         pk=recommendation.host_snapshot_id,
@@ -1311,6 +2013,7 @@ def decide_recommendation(
             schema_version=candidate.suggested_values_schema_version,
             size_bytes=candidate.suggested_values_size_bytes,
             sha256=candidate.suggested_values_sha256,
+            max_bytes=_stage_snapshot_max_bytes(),
         )
     if decision not in RecommendationDecision.Decision.values:
         raise ValidationError("decision 无效")
@@ -1340,7 +2043,10 @@ def decide_recommendation(
         raise ValidationError(
             f"override_values 不能包含敏感字段: {', '.join(sensitive)}"
         )
-    contract = json_contract(override_values)
+    contract = json_contract(
+        override_values,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
     config_revision = None
     recipe_version = None
     if decision != RecommendationDecision.Decision.REJECT:

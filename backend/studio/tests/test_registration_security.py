@@ -1,3 +1,4 @@
+from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import TestCase
 from rest_framework.test import APIClient
@@ -9,6 +10,10 @@ from studio.services.configuration import create_config_revision, publish_config
 class RegistrationSecurityTests(TestCase):
     def setUp(self):
         cache.clear()
+        self.superadmin = get_user_model().objects.create_superuser(
+            username="registration-superadmin",
+            password="x",
+        )
         self.client = APIClient()
         self.payload = {
             "username": "new-user", "email": "new@example.test",
@@ -20,7 +25,7 @@ class RegistrationSecurityTests(TestCase):
         self.assertEqual(response.status_code, 403, response.data)
         self.assertIn("公开注册已关闭", str(response.data))
 
-    def test_operator_can_enable_registration_with_database_rate_limit(self):
+    def test_superadmin_can_enable_registration_with_database_rate_limit(self):
         revision = create_config_revision(
             scope_type=ConfigRevision.ScopeType.SYSTEM,
             values={
@@ -29,10 +34,10 @@ class RegistrationSecurityTests(TestCase):
                 "access.throttle_user_rate": "1000/hour",
                 "access.throttle_registration_rate": "1/hour",
             },
-            created_by=None,
+            created_by=self.superadmin,
             clone_published=True,
         )
-        publish_config_revision(revision, published_by=None)
+        publish_config_revision(revision, published_by=self.superadmin)
 
         response = self.client.post("/api/v1/auth/register/", self.payload, format="json")
         self.assertEqual(response.status_code, 201, response.data)

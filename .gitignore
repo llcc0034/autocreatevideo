@@ -30,5 +30,6 @@ backups/
 # Editors / OS
 .idea/
 .vscode/
+.VSCodeCounter/
 .DS_Store
 Thumbs.db

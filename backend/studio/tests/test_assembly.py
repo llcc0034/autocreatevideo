@@ -22,7 +22,7 @@ from studio.models import (
     WorkflowTemplate,
 )
 from studio.media_signing import signed_media_token
-from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
+from studio.tests.media_prompt_fixtures import MediaPromptOptions, build_test_video_prompt
 from studio.services.assembly import (
     AssemblyError,
     Clip,
@@ -54,8 +54,6 @@ class AssemblyTests(TestCase):
             COMFYUI_OUTPUT_DIR=str(self.comfy_output),
             MEDIA_ROOT=self.media_root,
             FFMPEG_BINARY="ffmpeg-test",
-            ASSEMBLY_AI_LABEL_ENABLED=True,
-            ASSEMBLY_AI_LABEL_TEXT="AI-generated · MiniMax H3",
             ASSEMBLY_AI_LABEL_FONTFILE=str(self.label_font),
         )
         self.override.enable()
@@ -85,12 +83,14 @@ class AssemblyTests(TestCase):
         )
 
     def _successful_task(self, shot, filename):
-        result = build_h3_video_prompt(
-            self.project, [shot], H3PromptOptions(language_gate_mode="warn"),
+        result = build_test_video_prompt(
+            self.project, [shot], MediaPromptOptions(
+                model_identifier="minimax-h3-test", language_gate_mode="warn",
+            ),
         )
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=self.project, episode=self.episode, shot=shot, created_by=self.user,
-            prompt_type="video", h3_mode="T2VA", prompt_text=result.text,
+            prompt_type="video", conditioning_mode="T2VA", prompt_text=result.text,
             total_duration_ms=result.total_duration_ms, structured_payload=result.payload,
             consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
             request_options={"shot_ids": [str(shot.id)]},
@@ -104,6 +104,7 @@ class AssemblyTests(TestCase):
             owner=self.user, project=self.project, episode=self.episode,
             generated_workflow=workflow, kind="video", status=GenerationTask.Status.SUCCEEDED,
             progress=100, effective_duration_ms=result.total_duration_ms,
+            max_attempts=3,
             outputs=[{"kind": "videos", "filename": filename, "subfolder": "episode-1", "type": "output"}],
         )
         path = self.comfy_output / "episode-1" / filename
@@ -112,12 +113,14 @@ class AssemblyTests(TestCase):
         return task
 
     def _successful_multishot_task(self, shots, filename):
-        result = build_h3_video_prompt(
-            self.project, shots, H3PromptOptions(language_gate_mode="warn"),
+        result = build_test_video_prompt(
+            self.project, shots, MediaPromptOptions(
+                model_identifier="minimax-h3-test", language_gate_mode="warn",
+            ),
         )
         prompt = PromptArtifact.objects.create(
             project=self.project, episode=self.episode, shot=None, created_by=self.user,
-            prompt_type="video", h3_mode="T2VA", prompt_text=result.text,
+            prompt_type="video", conditioning_mode="T2VA", prompt_text=result.text,
             is_multi_shot=True, include_audio=True,
             total_duration_ms=result.total_duration_ms, structured_payload=result.payload,
             consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
@@ -132,6 +135,7 @@ class AssemblyTests(TestCase):
             owner=self.user, project=self.project, episode=self.episode,
             generated_workflow=workflow, kind="video", status=GenerationTask.Status.SUCCEEDED,
             progress=100, effective_duration_ms=result.total_duration_ms,
+            max_attempts=3,
             outputs=[{"kind": "videos", "filename": filename, "subfolder": "episode-1", "type": "output"}],
         )
         path = self.comfy_output / "episode-1" / filename
@@ -140,7 +144,7 @@ class AssemblyTests(TestCase):
         return task
 
     def _successful_image_task(self, shot, filename):
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=False,
             project=self.project,
             episode=self.episode,
             shot=shot,
@@ -170,6 +174,7 @@ class AssemblyTests(TestCase):
             kind=GenerationTask.Kind.IMAGE,
             status=GenerationTask.Status.SUCCEEDED,
             progress=100,
+            max_attempts=3,
             outputs=[{"kind": "images", "filename": filename, "subfolder": "episode-1", "type": "output"}],
         )
         path = self.comfy_output / "episode-1" / filename
@@ -244,6 +249,15 @@ class AssemblyTests(TestCase):
 
         self.assertFalse(clip.has_audio)
 
+    def test_resolve_output_preserves_the_approved_subsecond_shot_duration(self):
+        task = self._successful_task(self.shot1, "subsecond-shot.mp4")
+        self.shot1.duration_ms = 50
+        self.shot1.save(update_fields=("duration_ms", "updated_at"))
+
+        clip = _resolve_output(TaskSelection(task=task, shot=self.shot1))
+
+        self.assertEqual(clip.duration_seconds, 0.05)
+
     def test_mixed_audio_inputs_fill_missing_stream_with_silence(self):
         task1 = self._successful_task(self.shot1, "audio-shot.mp4")
         task2 = self._successful_task(self.shot2, "silent-shot.mp4")
@@ -252,7 +266,7 @@ class AssemblyTests(TestCase):
             Clip(task2, self.comfy_output / "episode-1" / "silent-shot.mp4", False, 5),
         ]
 
-        command = _ffmpeg_command(clips, self.media_root / "mixed.mp4", 768, 1344)
+        command = _ffmpeg_command(clips, self.media_root / "mixed.mp4", 768, 1344, 24)
         filters = command[command.index("-filter_complex") + 1]
 
         self.assertIn("[0:a:0]", filters)
@@ -269,7 +283,7 @@ class AssemblyTests(TestCase):
             Clip(task2, self.comfy_output / "episode-1" / "silent-02.mp4", False, 5),
         ]
 
-        command = _ffmpeg_command(clips, self.media_root / "silent.mp4", 768, 1344)
+        command = _ffmpeg_command(clips, self.media_root / "silent.mp4", 768, 1344, 24)
         filters = command[command.index("-filter_complex") + 1]
 
         self.assertNotIn(":a:0]", filters)
@@ -291,7 +305,7 @@ class AssemblyTests(TestCase):
             media_kind="image",
         )
 
-        command = _ffmpeg_command([clip], self.media_root / "still.mp4", 768, 1344)
+        command = _ffmpeg_command([clip], self.media_root / "still.mp4", 768, 1344, 24)
         filters = command[command.index("-filter_complex") + 1]
         image_path_index = command.index(str(clip.path))
 
@@ -351,7 +365,7 @@ class AssemblyTests(TestCase):
             scope_type=ConfigRevision.ScopeType.SYSTEM,
             values={
                 "delivery.ai_label_enabled": True,
-                "delivery.ai_label_text": "DB-configured AI label",
+                "delivery.ai_label_text": "AI-generated DB label",
             },
             created_by=self.user,
             change_summary="assembly disclosure label test",
@@ -374,9 +388,9 @@ class AssemblyTests(TestCase):
         command = response.data["ffmpeg_command"]
         joined = " ".join(command)
         self.assertIn("drawtext=fontfile=", joined)
-        self.assertIn("text='DB-configured AI label'", joined)
-        self.assertIn("comment=DB-configured AI label", command)
-        self.assertIn("description=AI-generated content produced with MiniMax H3", command)
+        self.assertIn("text='AI-generated DB label'", joined)
+        self.assertIn("comment=AI-generated DB label", command)
+        self.assertIn("description=AI-generated DB label", command)
         self.episode.refresh_from_db()
         self.assertNotEqual(self.episode.status, "completed")
 
@@ -390,20 +404,42 @@ class AssemblyTests(TestCase):
             scope_type=ConfigRevision.ScopeType.SYSTEM,
             values={
                 "delivery.ai_label_enabled": False,
-                "delivery.ai_label_text": "AI-generated · MiniMax H3",
+                "delivery.ai_label_text": "AI-generated studio label",
             },
             created_by=self.user,
             change_summary="assembly disclosure test",
             clone_published=True,
         )
         publish_config_revision(revision, published_by=self.user)
-        command = _ffmpeg_command(clips, self.media_root / "clean.mp4", 768, 1344)
+        command = _ffmpeg_command(clips, self.media_root / "clean.mp4", 768, 1344, 24)
 
         joined = " ".join(command)
         self.assertNotIn("drawtext=", joined)
-        self.assertIn("comment=AI-generated · MiniMax H3", command)
-        self.assertIn("description=AI-generated content produced with MiniMax H3", command)
+        self.assertIn("comment=AI-generated studio label", command)
+        self.assertIn("description=AI-generated studio label", command)
         self.assertIn("[vout]", command[command.index("-filter_complex") + 1])
+
+    def test_project_delivery_fps_drives_still_inputs_filters_and_signature(self):
+        self.project.fps = 30
+        self.project.save(update_fields=("fps", "updated_at"))
+        self.shot1.media_type = "image"
+        self.shot2.media_type = "image"
+        self.shot1.save(update_fields=("media_type", "updated_at"))
+        self.shot2.save(update_fields=("media_type", "updated_at"))
+        self._successful_image_task(self.shot1, "still-30fps.png")
+        self._successful_image_task(self.shot2, "still-30fps-2.png")
+
+        response = self._create_episode({
+            "episode_id": str(self.episode.id),
+            "dry_run": True,
+        }, format="json")
+
+        self.assertEqual(response.status_code, 201, response.data)
+        command = response.data["ffmpeg_command"]
+        self.assertIn("30", command[command.index("-framerate") + 1])
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertIn("fps=30", filters)
+        self.assertNotIn("MiniMax", " ".join(command))
 
     def test_execute_marks_complete_only_after_nonempty_output(self):
         self._successful_task(self.shot1, "shot-01.mp4")
@@ -572,6 +608,7 @@ class AssemblyTests(TestCase):
             scope=AssemblyJob.Scope.EPISODE,
             status=AssemblyJob.Status.SUCCEEDED,
             dry_run=False,
+            max_attempts=3,
             source_signature=signature,
             source_contract_version=2,
             output_path=str(self.media_root / "legacy-mixed.mp4"),
@@ -742,6 +779,7 @@ class AssemblyTests(TestCase):
             owner=self.user, project=self.project, episode=self.episode,
             generated_workflow=old_task.generated_workflow, kind="video",
             status=GenerationTask.Status.QUEUED,
+            max_attempts=3,
         )
 
         blocked = self._create_episode( {

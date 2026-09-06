@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
+import math
 import time
 import uuid
 
@@ -18,8 +19,13 @@ from studio.services.async_media_contract import (
     frozen_async_deployment,
     validate_standard_payload,
 )
+from studio.services.configuration import resolve_configuration
 from studio.services.json_contracts import canonical_json_bytes, verify_json_contract
-from studio.services.provider_registry import ProviderDriverError, driver_for
+from studio.services.provider_registry import (
+    ProviderDriverError,
+    driver_for,
+    restricted_async_rest_runtime_budget,
+)
 from studio.services.execution_deadlines import (
     expired_kind,
     initial_deadlines,
@@ -27,44 +33,25 @@ from studio.services.execution_deadlines import (
     validate_deadline_seconds,
 )
 from studio.services.remote_artifacts import archive_remote_artifacts
+from studio.services.bible_reference_contract import BIBLE_IMAGE_GENERATION_STAGE_KEY
 from studio.services.text_generation_queue import append_attempt_resolution
 from studio.services.production_run_auto_advance import schedule_production_run_advance
+from studio.services.security_boundaries import boundary_int
 
 
-STALE_CLAIM_MINUTES = 10
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
 
 def _attempt_deadline_seconds(attempt: GenerationAttempt) -> tuple[float, float]:
-    """Return the frozen production idle/hard pair for this attempt.
-
-    New attempts always carry the pair in their integrity-protected request
-    snapshot. The stage snapshot branch is the upgrade path for attempts that
-    were queued before the request contract gained this field.
-    """
+    """Return the integrity-protected idle/hard pair frozen for this attempt."""
     snapshot = _snapshot(attempt)
     deadline_snapshot = snapshot.get("execution_deadlines")
-    if isinstance(deadline_snapshot, dict):
-        return validate_deadline_seconds(
-            idle_seconds=deadline_snapshot.get("idle_timeout_seconds"),
-            hard_seconds=deadline_snapshot.get("hard_timeout_seconds"),
-        )
-    stage = attempt.stage_run
-    verify_json_contract(
-        stage.config_snapshot,
-        schema_version=stage.config_snapshot_schema_version,
-        size_bytes=stage.config_snapshot_size_bytes,
-        sha256=stage.config_snapshot_sha256,
-    )
-    stage_snapshot = stage.config_snapshot if isinstance(stage.config_snapshot, dict) else {}
-    route_values = (stage_snapshot.get("routes") or {}).get(str(attempt.route_index))
-    if not isinstance(route_values, dict):
-        route_values = stage_snapshot.get("base")
-    values = route_values.get("values") if isinstance(route_values, dict) else None
-    if not isinstance(values, dict):
+    if not isinstance(deadline_snapshot, dict):
         raise ValidationError("异步媒体 attempt 缺少冻结的任务时限配置")
     return validate_deadline_seconds(
-        idle_seconds=values.get("runtime.task_idle_timeout_seconds"),
-        hard_seconds=values.get("production.task_timeout_seconds"),
+        idle_seconds=deadline_snapshot.get("idle_timeout_seconds"),
+        hard_seconds=deadline_snapshot.get("hard_timeout_seconds"),
     )
 
 
@@ -137,6 +124,7 @@ def _snapshot(attempt: GenerationAttempt) -> dict:
         schema_version=attempt.request_snapshot_schema_version,
         size_bytes=attempt.request_snapshot_size_bytes,
         sha256=attempt.request_snapshot_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
     if attempt.request_sha256 != attempt.request_snapshot_sha256:
         raise ValidationError("async attempt request identity 已漂移")
@@ -303,14 +291,15 @@ def _succeed(
         ).update(status=GeneratedArtifact.Status.REJECTED, updated_at=timezone.now())
     else:
         attempt.status = GenerationAttempt.Status.SUCCEEDED
-        first = sorted(artifacts, key=lambda item: item.variant_index)[0]
-        if not GeneratedArtifact.objects.filter(
-            production_run=run,
-            variant_group=first.variant_group,
-            status=GeneratedArtifact.Status.SELECTED,
-        ).exists():
-            first.status = GeneratedArtifact.Status.SELECTED
-            first.save(update_fields=("status", "updated_at"))
+        if attempt.stage_run.stage_key != BIBLE_IMAGE_GENERATION_STAGE_KEY:
+            first = sorted(artifacts, key=lambda item: item.variant_index)[0]
+            if not GeneratedArtifact.objects.filter(
+                production_run=run,
+                variant_group=first.variant_group,
+                status=GeneratedArtifact.Status.SELECTED,
+            ).exists():
+                first.status = GeneratedArtifact.Status.SELECTED
+                first.save(update_fields=("status", "updated_at"))
         attempt.result_sha256 = hashlib.sha256(canonical_json_bytes([
             {"id": str(item.id), "sha256": item.sha256} for item in artifacts
         ])).hexdigest()
@@ -353,8 +342,9 @@ def _schedule(
     progress_fraction: float | None = None,
 ) -> GenerationAttempt:
     config = _config(frozen_async_deployment(_snapshot(attempt)["route"]))
+    runtime_budget = restricted_async_rest_runtime_budget(config)
     configured_idle, _hard_seconds = _attempt_deadline_seconds(attempt)
-    interval = float(config.get("poll_interval_seconds", 2))
+    interval = float(runtime_budget["poll_interval_seconds"])
     with transaction.atomic():
         locked = GenerationAttempt.objects.select_for_update().get(pk=attempt.pk)
         if locked.claim_token != claim_token:
@@ -465,10 +455,15 @@ def _submit(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment,
 
 def _collect(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment, driver) -> GenerationAttempt:
     last_heartbeat = [0.0]
+    heartbeat_seconds = float(resolve_configuration(
+        required_keys=("runtime.task_heartbeat_seconds",),
+    ).values["runtime.task_heartbeat_seconds"])
+    if not math.isfinite(heartbeat_seconds) or heartbeat_seconds <= 0:
+        raise ValidationError("异步媒体归档心跳间隔必须是正有限秒数")
 
     def heartbeat() -> None:
         now_monotonic = time.monotonic()
-        if now_monotonic - last_heartbeat[0] < 5:
+        if now_monotonic - last_heartbeat[0] < heartbeat_seconds:
             return
         updated = GenerationAttempt.objects.filter(
             pk=attempt.pk,
@@ -656,7 +651,7 @@ def process_async_media_attempt(attempt: GenerationAttempt) -> GenerationAttempt
         return _fail(
             attempt.pk,
             claim_token,
-            code=getattr(exc, "code", "async_attempt_invalid"),
+            code=getattr(exc, "code", None) or "async_attempt_invalid",
             message=str(exc),
         )
 
@@ -674,9 +669,17 @@ def fail_unhandled_async_media_attempt(attempt: GenerationAttempt) -> Generation
 
 
 @transaction.atomic
-def recover_stale_async_media_attempts(minutes: int = STALE_CLAIM_MINUTES) -> dict[str, int]:
+def recover_stale_async_media_attempts(minutes: float | None = None) -> dict[str, int]:
     now = timezone.now()
-    requested_seconds = max(60, int(minutes) * 60)
+    if minutes is None:
+        configured_seconds = resolve_configuration(
+            required_keys=("runtime.task_idle_timeout_seconds",),
+        ).values["runtime.task_idle_timeout_seconds"]
+        requested_seconds = float(configured_seconds)
+    else:
+        requested_seconds = float(minutes) * 60
+    if not math.isfinite(requested_seconds) or requested_seconds <= 0:
+        raise ValueError("异步媒体陈旧任务回收阈值必须是正有限秒数")
     cutoff = now - timedelta(seconds=requested_seconds)
     recovered = 0
     uncertain = 0
@@ -687,20 +690,19 @@ def recover_stale_async_media_attempts(minutes: int = STALE_CLAIM_MINUTES) -> di
         heartbeat_at__lt=cutoff,
     ))
     for attempt in attempts:
-        snapshot = attempt.request_snapshot if isinstance(attempt.request_snapshot, dict) else {}
-        route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
-        provider_config = route.get("provider_config") if isinstance(route.get("provider_config"), dict) else {}
-        deployment_config = route.get("deployment_config") if isinstance(route.get("deployment_config"), dict) else {}
-        try:
-            request_timeout = float(deployment_config.get(
-                "timeout_seconds", provider_config.get("timeout_seconds", 60),
-            ))
-        except (TypeError, ValueError):
-            request_timeout = 60
         # A CLI recovery setting is an operator preference, not permission to
         # steal a claim that can still be inside the driver's bounded request.
-        # The hard floor also covers checksum/ffprobe work after a large download.
-        safe_seconds = max(requested_seconds, request_timeout + 60, 15 * 60)
+        # Reconstruct the integrity-checked frozen deployment instead of using
+        # a process constant or the mutable live Provider configuration.  The
+        # shared validator also applies the current Security Boundary ceiling;
+        # a corrupt or now-forbidden frozen budget blocks recovery explicitly.
+        snapshot = _snapshot(attempt)
+        deployment = frozen_async_deployment(snapshot["route"])
+        runtime_budget = restricted_async_rest_runtime_budget(_config(deployment))
+        safe_seconds = max(
+            requested_seconds,
+            float(runtime_budget["timeout_seconds"]),
+        )
         heartbeat_at = attempt.heartbeat_at or attempt.claimed_at
         if heartbeat_at is not None and (now - heartbeat_at).total_seconds() < safe_seconds:
             continue

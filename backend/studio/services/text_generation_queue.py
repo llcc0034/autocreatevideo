@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from copy import copy
+from copy import copy, deepcopy
 import hashlib
 import json
+import math
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -24,19 +25,48 @@ from studio.models import (
     StageRun,
 )
 from studio.services.json_contracts import json_contract, verify_json_contract
+from studio.services.model_profile_contracts import (
+    CHAT_REQUEST_OPTIONS_KEY,
+    verified_frozen_model_profile_specification,
+    verified_model_profile_specification,
+)
 from studio.services.provider_registry import (
     ProviderDriverError,
     credential_binding_sha256,
     deployment_supports_script_generation,
     driver_for,
 )
-from studio.services.prompt_normalization_contract import PROMPT_NORMALIZE_OPERATION
-from studio.services.prompt_translation import restore_prompt_normalization_candidate
+from studio.services.prompt_normalization_contract import (
+    PROMPT_NORMALIZE_OPERATION,
+    normalization_batch_max_items,
+    normalization_request_max_bytes,
+    normalization_text_max_characters,
+    prompt_usage_max_count,
+    prompt_normalization_chat_messages_input_bytes,
+    prompt_normalization_chat_payload,
+    prompt_normalization_policy_from_specification,
+    safe_prompt_field_validation_context,
+    safe_prompt_field_validation_reason_code,
+)
+from studio.services.prompt_translation import (
+    PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC,
+    PROMPT_NORMALIZATION_EXECUTION_PROVIDER,
+    PROMPT_NORMALIZATION_LOCAL_SUBMISSION_SEMANTICS,
+    deterministic_prompt_normalization_materialization,
+    restore_prompt_normalization_candidate,
+)
 from studio.services.prompt_profiles import (
     verify_frozen_profile_assembly,
     verify_frozen_profile_reference,
 )
 from studio.services.script_sources import create_pasted_script_source
+from studio.services.security_boundaries import boundary_int
+from studio.services.production_visual_rules import (
+    VISUAL_RULES_OPERATION,
+    finalize_visual_rules,
+    verify_visual_rules_smoke,
+    visual_rules_provider_payload,
+)
 from studio.services.script_structure import (
     SCRIPT_STRUCTURE_OPERATION,
     finalize_script_structure,
@@ -44,23 +74,60 @@ from studio.services.script_structure import (
     structure_provider_payload,
     verify_script_structure_smoke,
 )
-from studio.services.series_concept_drafts import finalize_series_concept_draft
+from studio.services.series_concept_drafts import (
+    SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+    finalize_series_concept_draft,
+)
+from studio.services.text_field_contracts import (
+    SERIES_CONCEPT_FIELD_KEYS,
+    field_contract_prompt_lines,
+    text_field_rule,
+    validate_text_field_contract,
+)
 
 
 TEXT_OPERATION = "script.generate"
 TEXT_UNIT_KEY = "series-script"
 PROMPT_NORMALIZE_UNIT_KEY = "prompt-normalization"
+SAFE_PROMPT_RESPONSE_CLASSIFIERS = frozenset({
+    "prompt_field_generation_contract_invalid",
+    "prompt_normalize_contract_invalid",
+    "prompt_normalization_batch_input_exceeded",
+    "prompt_normalization_batch_items_exceeded",
+    "prompt_normalization_policy_invalid",
+    "prompt_normalization_policy_missing",
+    "response_content_filtered",
+    "response_missing_json_text",
+    "response_missing_text",
+    "response_not_strict_json",
+    "response_output_budget_exhausted",
+    "response_reasoning_without_text",
+    "response_root_invalid",
+    "response_tool_call_without_text",
+})
+SAFE_PROMPT_FINISH_REASONS = frozenset({
+    "content_filter", "function_call", "length", "stop", "tool_calls",
+})
+SAFE_PROMPT_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
 TEXT_OPERATIONS = frozenset({
     TEXT_OPERATION,
     SCRIPT_STRUCTURE_OPERATION,
+    VISUAL_RULES_OPERATION,
     PROMPT_NORMALIZE_OPERATION,
 })
-MAX_TEXT_SNAPSHOT_BYTES = 8 * 1024 * 1024
 TERMINAL_RUN_STATUSES = frozenset({
     ProductionRun.Status.SUCCEEDED,
     ProductionRun.Status.FAILED,
     ProductionRun.Status.CANCELLED,
 })
+
+
+def _text_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.text_max_bytes")
+
+
+def _prompt_advisory_max_items() -> int:
+    return boundary_int("security.prompt_normalization.advisory_max_items")
 
 
 def _verify_attempt_prompt_profile(
@@ -80,6 +147,287 @@ def _verify_attempt_prompt_profile(
     verify_frozen_profile_assembly(profile, assembly)
 
 
+def _safe_prompt_normalization_advisories(
+    value: Any,
+    *,
+    batch_index: int,
+) -> list[dict[str, Any]]:
+    """Re-allowlist server-authored advisory evidence before persistence."""
+
+    if value in (None, []):
+        return []
+    if not isinstance(value, list) or len(value) > _prompt_advisory_max_items():
+        raise ValidationError("prompt.normalize warnings 结构无效")
+    result: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValidationError("prompt.normalize warning 必须是对象")
+        code = str(item.get("code") or "")
+        if code == "recommended_input_bytes_exceeded":
+            expected = {
+                "schema_version", "code", "severity", "measured",
+                "recommended_maximum", "hard_maximum",
+            }
+            numbers = (
+                item.get("measured"),
+                item.get("recommended_maximum"),
+                item.get("hard_maximum"),
+            )
+            valid = (
+                set(item) == expected
+                and all(
+                    type(number) is int
+                    and 0 <= number <= normalization_request_max_bytes()
+                    for number in numbers
+                )
+                and numbers[0] > numbers[1]
+                and numbers[1] <= numbers[2]
+            )
+        elif code == "recommended_output_tokens_exceeded":
+            expected = {
+                "schema_version", "code", "severity", "usage_field",
+                "measured", "recommended_maximum", "hard_maximum",
+            }
+            usage_field = item.get("usage_field")
+            numbers = (
+                item.get("measured"),
+                item.get("recommended_maximum"),
+                item.get("hard_maximum"),
+            )
+            valid = (
+                set(item) == expected
+                and usage_field in {"completion_tokens", "output_tokens"}
+                and all(
+                    type(number) is int
+                    and 0 <= number <= prompt_usage_max_count()
+                    for number in numbers
+                )
+                and numbers[0] > numbers[1]
+                and numbers[1] <= numbers[2]
+            )
+        elif code == "recommended_length_out_of_range":
+            expected = {
+                "schema_version", "code", "severity", "request_id",
+                "field_key", "measured", "minimum", "maximum",
+                "length_unit", "request_index",
+            }
+            measured = item.get("measured")
+            minimum = item.get("minimum")
+            maximum = item.get("maximum")
+            valid = (
+                set(item) == expected
+                and isinstance(item.get("request_id"), str)
+                and 1 <= len(item["request_id"]) <= 191
+                and isinstance(item.get("field_key"), str)
+                and 1 <= len(item["field_key"]) <= 191
+                and item.get("length_unit") in {"characters", "english_words", "items"}
+                and type(measured) is int
+                and 0 <= measured <= prompt_usage_max_count()
+                and (
+                    minimum is None
+                    or type(minimum) is int
+                    and 1 <= minimum <= normalization_text_max_characters()
+                )
+                and (
+                    maximum is None
+                    or type(maximum) is int
+                    and 1 <= maximum <= normalization_text_max_characters()
+                )
+                and type(item.get("request_index")) is int
+                and 0 <= item["request_index"] < normalization_batch_max_items()
+                and (
+                    (minimum is not None and measured < minimum)
+                    or (maximum is not None and measured > maximum)
+                )
+            )
+        else:
+            valid = False
+        if (
+            not valid
+            or item.get("schema_version") != 1
+            or item.get("severity") != "warning"
+        ):
+            raise ValidationError("prompt.normalize warning 合同无效")
+        result.append({**deepcopy(item), "batch_index": batch_index})
+    return result
+
+
+def _prompt_normalization_progress_snapshot(
+    *,
+    stage: StageRun,
+    batch_plan: dict[str, Any],
+    result: dict[str, Any],
+    result_sha256: str,
+    provider_request_id_sha256: str,
+) -> dict[str, Any]:
+    """Append one immutable batch result and finalize in original row order."""
+
+    existing = stage.output_snapshot if isinstance(stage.output_snapshot, dict) else {}
+    if existing:
+        verify_json_contract(
+            existing,
+            schema_version=stage.output_snapshot_schema_version,
+            size_bytes=stage.output_snapshot_size_bytes,
+            sha256=stage.output_snapshot_sha256,
+            max_bytes=_text_snapshot_max_bytes(),
+        )
+    if existing == {"schema_version": 1}:
+        # Stage rows start with this signed empty snapshot.  It is not a
+        # completed batch and must not become a competing progress kind.
+        existing = {}
+    if existing and existing.get("kind") != "prompt_normalization_batch_progress":
+        raise ValidationError("prompt.normalize 批次进度快照类型无效")
+    if existing and existing.get("batch_plan_sha256") != batch_plan.get(
+        "batch_plan_sha256",
+    ):
+        raise ValidationError("prompt.normalize 批次进度与冻结计划不一致")
+    completed = deepcopy(existing.get("completed_batches") or []) if existing else []
+    if not isinstance(completed, list):
+        raise ValidationError("prompt.normalize completed_batches 无效")
+    batch_index = int(result["batch_index"])
+    if any(
+        not isinstance(item, dict)
+        or item.get("batch_index") == batch_index
+        or item.get("attempt_id") == result.get("attempt_id")
+        for item in completed
+    ):
+        raise ValidationError("prompt.normalize 批次结果重复或结构无效")
+    completed.append({
+        "batch_index": batch_index,
+        "attempt_id": str(result["attempt_id"]),
+        "result_sha256": result_sha256,
+        "provider_request_id_sha256": provider_request_id_sha256,
+        "result": deepcopy(result),
+    })
+    completed.sort(key=lambda item: int(item["batch_index"]))
+    advisories = [
+        advisory
+        for completed_batch in completed
+        for advisory in _safe_prompt_normalization_advisories(
+            (completed_batch.get("result") or {}).get("warnings"),
+            batch_index=int(completed_batch["batch_index"]),
+        )
+    ]
+    batches = batch_plan.get("batches")
+    if not isinstance(batches, list):
+        raise ValidationError("prompt.normalize 冻结批次计划无效")
+    expected_prefix = list(range(len(completed)))
+    if [int(item["batch_index"]) for item in completed] != expected_prefix:
+        raise ValidationError("prompt.normalize 仅允许按冻结批次顺序提交")
+    if len(completed) < len(batches):
+        return {
+            "schema_version": 1,
+            "kind": "prompt_normalization_batch_progress",
+            "batch_plan_sha256": str(batch_plan["batch_plan_sha256"]),
+            "batch_count": len(batches),
+            "completed_batches": completed,
+            "advisories": advisories,
+        }
+    if len(completed) != len(batches):
+        raise ValidationError("prompt.normalize 已完成批次数超过冻结计划")
+
+    by_request_id: dict[str, dict[str, Any]] = {}
+    providers: list[str] = []
+    models: list[str] = []
+    semantics: list[str] = []
+    execution_kinds: list[str] = []
+    batch_evidence: list[dict[str, Any]] = []
+    for completed_batch in completed:
+        batch_result = completed_batch.get("result")
+        if not isinstance(batch_result, dict):
+            raise ValidationError("prompt.normalize 批次结果缺失")
+        result_batch_index = int(completed_batch["batch_index"])
+        execution_kind = str(batch_result.get("execution_kind") or "")
+        if (
+            result_batch_index >= len(batches)
+            or execution_kind
+            != str((batches[result_batch_index] or {}).get("execution_kind") or "")
+        ):
+            raise ValidationError("prompt.normalize 批次执行来源与冻结计划不一致")
+        if execution_kind not in execution_kinds:
+            execution_kinds.append(execution_kind)
+        if json_contract(
+            batch_result,
+            max_bytes=_text_snapshot_max_bytes(),
+        ).sha256 != completed_batch.get("result_sha256"):
+            raise ValidationError("prompt.normalize 批次结果 checksum 无效")
+        candidates = batch_result.get("candidates")
+        if not isinstance(candidates, list):
+            raise ValidationError("prompt.normalize 批次 candidates 无效")
+        for candidate in candidates:
+            request_id = str(candidate.get("request_id") or "") if isinstance(candidate, dict) else ""
+            if not request_id or request_id in by_request_id:
+                raise ValidationError("prompt.normalize 合并 request_id 缺失或重复")
+            by_request_id[request_id] = deepcopy(candidate)
+        for value, destination in (
+            (str(batch_result.get("provider") or ""), providers),
+            (str(batch_result.get("model") or ""), models),
+            (str(batch_result.get("submission_semantics") or ""), semantics),
+        ):
+            if value and value not in destination:
+                destination.append(value)
+        batch_evidence.append({
+            "batch_index": int(completed_batch["batch_index"]),
+            "attempt_id": str(completed_batch["attempt_id"]),
+            "result_sha256": str(completed_batch["result_sha256"]),
+            "execution_kind": execution_kind,
+        })
+    original_request_ids = batch_plan.get("original_request_ids")
+    if (
+        not isinstance(original_request_ids, list)
+        or set(original_request_ids) != set(by_request_id)
+        or len(original_request_ids) != len(by_request_id)
+    ):
+        raise ValidationError("prompt.normalize 合并结果未覆盖完整 request_id")
+    merged_candidates = [by_request_id[request_id] for request_id in original_request_ids]
+    aggregate_evidence = {
+        "schema_version": 1,
+        "batch_plan_sha256": str(batch_plan["batch_plan_sha256"]),
+        "batch_results": batch_evidence,
+        "candidates": merged_candidates,
+    }
+    frozen_input = batch_plan.get("full_frozen_input")
+    return {
+        "schema_version": 1,
+        "kind": "prompt_normalization_candidates",
+        "review_origin": (
+            "server_deterministic_candidate"
+            if execution_kinds == [PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC]
+            else "hybrid_candidate"
+            if PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC in execution_kinds
+            else "model_candidate"
+        ),
+        "attempt_id": str(completed[-1]["attempt_id"]),
+        "attempt_ids": [str(item["attempt_id"]) for item in completed],
+        "result_sha256": json_contract(
+            aggregate_evidence,
+            max_bytes=_text_snapshot_max_bytes(),
+        ).sha256,
+        "batch_plan_sha256": str(batch_plan["batch_plan_sha256"]),
+        "batch_count": len(batches),
+        "batch_results": completed,
+        "advisories": advisories,
+        "provider": " / ".join(providers)[:80],
+        "model": " / ".join(models)[:200],
+        "submission_semantics": (
+            PROMPT_NORMALIZATION_LOCAL_SUBMISSION_SEMANTICS
+            if execution_kinds == [PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC]
+            else "hybrid_batched_durable_attempt"
+            if PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC in execution_kinds
+            else semantics[0]
+            if len(semantics) == 1 and len(completed) == 1
+            else "batched_durable_attempt"
+        ),
+        "frozen_input": deepcopy(frozen_input),
+        "frozen_input_schema_version": batch_plan.get(
+            "full_frozen_input_schema_version",
+        ),
+        "frozen_input_size_bytes": batch_plan.get("full_frozen_input_size_bytes"),
+        "frozen_input_sha256": batch_plan.get("full_frozen_input_sha256"),
+        "candidates": merged_candidates,
+    }
+
+
 def append_attempt_resolution(
     attempt: GenerationAttempt,
     *,
@@ -88,7 +436,7 @@ def append_attempt_resolution(
     note: str = "",
     decided_by=None,
 ) -> GenerationAttemptResolution:
-    contract = json_contract(evidence, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+    contract = json_contract(evidence, max_bytes=_text_snapshot_max_bytes())
     revision = (
         attempt.resolutions.aggregate(value=Max("revision"))["value"] or 0
     ) + 1
@@ -109,40 +457,52 @@ def append_attempt_resolution(
 def _messages(plan: dict[str, Any]) -> list[dict[str, str]]:
     request = plan["request"]
     options = request["options"]
+    field_contract = validate_text_field_contract(
+        plan.get("field_contract"),
+        fields=SERIES_CONCEPT_FIELD_KEYS,
+        label="series_concept frozen plan",
+    )
+    def placeholder(field: str, subject: str) -> str:
+        rule = text_field_rule(field_contract, field)
+        required = "required" if rule["required"] else "optional"
+        line_shape = "single-line" if rule["single_line"] else "text"
+        return f"<{required} {line_shape} {subject}, <= {int(rule['max_chars'])} chars>"
     shot_contract = {
-        "setting": "<required single-line setting, <= 200 chars>",
-        "action": "<required single-line visual action, <= 500 chars>",
+        "setting": placeholder("shot.setting", "setting"),
+        "action": placeholder("shot.action", "visual action"),
         "duration_ms": int(options["minimum_duration_ms"]),
         "dialogue": {
             "speaker": "",
             "delivery": "",
             "text": "",
+            "start_ms": 0,
+            "end_ms": 0,
         },
     }
     contract = {
-        "schema_version": 2,
-        "title": "<required single-line project title, <= 60 chars>",
-        "logline": "<required single-line logline, <= 500 chars>",
+        "schema_version": SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
+        "title": placeholder("title", "project title"),
+        "logline": placeholder("logline", "logline"),
         "bible": {
             "characters": [{
-                "name": "<single-line name>",
-                "description": "<single-line description>",
-                "visual_identity_en": "<English visual identity>",
+                "name": placeholder("bible.entity.name", "canonical character name"),
+                "description": placeholder("bible.entity.description", "character description"),
+                "visual_identity_en": placeholder("bible.entity.visual_identity_en", "English character visual identity"),
             }],
             "scenes": [{
-                "name": "<single-line name>",
-                "description": "<single-line description>",
-                "visual_identity_en": "<English visual identity>",
+                "name": placeholder("bible.entity.name", "canonical scene name"),
+                "description": placeholder("bible.entity.description", "scene description"),
+                "visual_identity_en": placeholder("bible.entity.visual_identity_en", "English scene visual identity"),
             }],
             "props": [{
-                "name": "<single-line name>",
-                "description": "<single-line description>",
-                "visual_identity_en": "<English visual identity>",
+                "name": placeholder("bible.entity.name", "canonical prop name"),
+                "description": placeholder("bible.entity.description", "prop description"),
+                "visual_identity_en": placeholder("bible.entity.visual_identity_en", "English prop visual identity"),
             }],
         },
         "episodes": [
             {
-                "title": f"<required title for episode {episode_index + 1}>",
+                "title": placeholder("episode.title", f"title for episode {episode_index + 1}"),
                 "shots": [dict(shot_contract) for _ in range(int(options["shots_per_episode"]))],
             }
             for episode_index in range(int(options["episode_count"]))
@@ -180,12 +540,20 @@ def _messages(plan: dict[str, Any]) -> list[dict[str, str]]:
         f"{int(options['episode_count'])} episode(s), each with exactly "
         f"{int(options['shots_per_episode'])} shot(s). {duration_rule} "
         "Each shot MUST contain exactly setting,action,duration_ms,dialogue. "
-        "dialogue MUST contain exactly speaker,delivery,text. For a silent shot all three "
-        "dialogue strings MUST be empty. For spoken dialogue speaker and text MUST both be "
-        "non-empty and delivery MUST be a non-empty printable ASCII phrase with no "
-        "parentheses. title,logline,episode title,setting and action MUST be non-empty "
-        "single-line strings. Use the exact keys and array lengths shown in CONTRACT. "
-        "CONTRACT="
+        "dialogue MUST contain exactly speaker,delivery,text,start_ms,end_ms. For a silent "
+        "shot all three dialogue strings MUST be empty and start_ms/end_ms MUST both equal "
+        "0. For spoken dialogue speaker and text MUST both be non-empty, delivery MUST be "
+        "a non-empty printable ASCII phrase with no parentheses, and integer timing MUST "
+        "satisfy 0 <= start_ms < end_ms <= the same shot.duration_ms. "
+        "All configurable text fields MUST follow the frozen FIELD_CONTRACT below. "
+        "Every declared Bible entity name MUST appear verbatim in at "
+        "least one shot setting, action, dialogue speaker, or dialogue text; do not replace "
+        "a canonical Bible name with a synonym. Every non-empty dialogue speaker MUST "
+        "exactly equal one declared Bible character name. Use the exact keys and array "
+        "lengths shown in CONTRACT. "
+        "FIELD_CONTRACT:\n"
+        + field_contract_prompt_lines(field_contract)
+        + "\nCONTRACT="
         + json.dumps(contract, ensure_ascii=False, separators=(",", ":"))
     )
     if profile_system:
@@ -217,9 +585,9 @@ def provider_payload(plan: dict[str, Any]) -> dict[str, Any]:
     request = plan["request"]
     return {
         "messages": _messages(plan),
-        "temperature": 0.3,
         "max_tokens": int(plan["resource_estimate"]["configured_output_token_hint"]),
-        "response_format": {"type": "json_object"},
+        "timeout_seconds": float(request["timeout_seconds"]),
+        CHAT_REQUEST_OPTIONS_KEY: deepcopy(request[CHAT_REQUEST_OPTIONS_KEY]),
         "seed": int(request["seed"]),
     }
 
@@ -247,22 +615,31 @@ def frozen_text_deployment(snapshot: dict[str, Any]) -> ModelDeployment:
         raise ValidationError("冻结 route 的 provider/model 已停用")
     provider_config = route.get("provider_config")
     deployment_config = route.get("deployment_config")
-    model_specification = route.get("model_specification")
+    model_specification = verified_frozen_model_profile_specification(
+        deployment.profile_version,
+        route,
+    )
     if (
         not isinstance(provider_config, dict)
         or not isinstance(deployment_config, dict)
-        or not isinstance(model_specification, dict)
     ):
         raise ValidationError("冻结 route 缺少 provider/deployment/model specification")
-    provider_contract = json_contract(provider_config)
-    deployment_contract = json_contract(deployment_config)
+    provider_contract = json_contract(
+        provider_config,
+        max_bytes=_text_snapshot_max_bytes(),
+    )
+    deployment_contract = json_contract(
+        deployment_config,
+        max_bytes=_text_snapshot_max_bytes(),
+    )
     if provider_contract.sha256 != route.get("provider_config_sha256"):
         raise ValidationError("冻结 route 的 provider_config hash 无效")
     if deployment_contract.sha256 != route.get("deployment_config_sha256"):
         raise ValidationError("冻结 route 的 deployment_config hash 无效")
-    specification_contract = json_contract(model_specification)
-    if specification_contract.sha256 != route.get("frozen_model_specification_sha256"):
-        raise ValidationError("冻结 route 的 model specification hash 无效")
+    specification_contract = json_contract(
+        model_specification,
+        max_bytes=_text_snapshot_max_bytes(),
+    )
     # Build an in-memory execution view.  Endpoint/model/timeout are immutable run
     # inputs; only enablement and credential binding are deliberately read live.
     frozen_provider = copy(provider)
@@ -332,8 +709,15 @@ def release_text_attempt_claim(attempt: GenerationAttempt) -> bool:
 
 
 @transaction.atomic
-def recover_stale_text_attempts(minutes: int) -> dict[str, int]:
-    cutoff = timezone.now() - timedelta(minutes=max(1, int(minutes)))
+def recover_stale_text_attempts(minutes: float) -> dict[str, int]:
+    if (
+        isinstance(minutes, bool)
+        or not isinstance(minutes, (int, float))
+        or not math.isfinite(float(minutes))
+        or float(minutes) <= 0
+    ):
+        raise ValueError("文本 attempt 陈旧任务回收阈值必须是正有限分钟数")
+    cutoff = timezone.now() - timedelta(minutes=float(minutes))
     requeued = 0
     uncertain = 0
     for attempt in GenerationAttempt.objects.select_for_update().select_related(
@@ -413,6 +797,7 @@ def _fail_attempt(
     uncertain: bool,
     record_committed_cost: bool = False,
     release_committed_cost: bool = False,
+    failure_metadata: dict[str, Any] | None = None,
 ) -> None:
     auto_fallback_run_id = None
     with transaction.atomic():
@@ -485,6 +870,47 @@ def _fail_attempt(
             "heartbeat_at", "updated_at",
         ))
         if record_committed_cost:
+            classifier = str(
+                (failure_metadata or {}).get("contract_error_code") or "",
+            )
+            safe_classifier = (
+                classifier if classifier in SAFE_PROMPT_RESPONSE_CLASSIFIERS else ""
+            )
+            safe_reason_code = safe_prompt_field_validation_reason_code(
+                (failure_metadata or {}).get("reason_code"),
+            )
+            safe_validation_context = safe_prompt_field_validation_context(
+                safe_reason_code,
+                (failure_metadata or {}).get("validation_context"),
+                request_payload=(
+                    attempt.request_snapshot.get("payload")
+                    if isinstance(attempt.request_snapshot, dict)
+                    else None
+                ),
+            )
+            finish_reason = str(
+                (failure_metadata or {}).get("finish_reason") or "",
+            )
+            safe_finish_reason = (
+                finish_reason if finish_reason in SAFE_PROMPT_FINISH_REASONS else ""
+            )
+            raw_usage = (failure_metadata or {}).get("usage")
+            safe_usage = {
+                field: raw_usage[field]
+                for field in SAFE_PROMPT_USAGE_FIELDS
+                if isinstance(raw_usage, dict)
+                and type(raw_usage.get(field)) is int
+                and 0 <= raw_usage[field] <= prompt_usage_max_count()
+            }
+            response_id_sha256 = str(
+                (failure_metadata or {}).get("response_id_sha256") or "",
+            )
+            safe_response_id_sha256 = (
+                response_id_sha256
+                if len(response_id_sha256) == 64
+                and all(character in "0123456789abcdef" for character in response_id_sha256)
+                else ""
+            )
             append_attempt_resolution(
                 attempt,
                 outcome=GenerationAttemptResolution.Outcome.KNOWN_RESPONSE_REJECTED,
@@ -493,23 +919,64 @@ def _fail_attempt(
                     "attempt_id": str(attempt.id),
                     "request_sha256": attempt.request_sha256,
                     "failure_code": code,
+                    **(
+                        {"contract_error_code": safe_classifier}
+                        if safe_classifier else {}
+                    ),
+                    **(
+                        {"reason_code": safe_reason_code}
+                        if safe_reason_code else {}
+                    ),
+                    **(
+                        {"validation_context": safe_validation_context}
+                        if safe_validation_context else {}
+                    ),
+                    **(
+                        {"finish_reason": safe_finish_reason}
+                        if safe_finish_reason else {}
+                    ),
+                    **({"usage": safe_usage} if safe_usage else {}),
+                    **(
+                        {"response_id_sha256": safe_response_id_sha256}
+                        if safe_response_id_sha256 else {}
+                    ),
                     "actual_cost": str(attempt.actual_cost) if attempt.actual_cost is not None else None,
                     "actual_cost_source": "committed_cost",
                 },
                 note="Provider returned a response that failed strict finalization",
             )
+        prompt_validation_recoverable = (
+            attempt.operation == PROMPT_NORMALIZE_OPERATION
+            and attempt.error_code in {
+                "prompt_normalize_contract_failed",
+                "provider_response_invalid",
+            }
+        )
+        text_contract_recoverable = (
+            attempt.operation in {
+                TEXT_OPERATION,
+                SCRIPT_STRUCTURE_OPERATION,
+                VISUAL_RULES_OPERATION,
+            }
+            and attempt.error_code == "provider_response_invalid"
+            and record_committed_cost
+        )
         auto_fallback = (
             not uncertain
-            and isinstance(stage.routing, dict)
-            and stage.routing.get("mode") == "ordered_fallback"
-            and attempt.error_code in {
-                "text_attempt_pre_submit_validation_failed",
-                "series_concept_invalid_response",
-                "prompt_normalize_contract_failed",
-                "provider_request_rejected",
-                "provider_response_invalid",
-                "remote_absence_confirmed",
-            }
+            and (
+                prompt_validation_recoverable
+                or text_contract_recoverable
+                or (
+                    isinstance(stage.routing, dict)
+                    and stage.routing.get("mode") == "ordered_fallback"
+                    and attempt.error_code in {
+                        "text_attempt_pre_submit_validation_failed",
+                        "series_concept_invalid_response",
+                        "provider_request_rejected",
+                        "remote_absence_confirmed",
+                    }
+                )
+            )
         )
         stage.status = StageRun.Status.RUNNING if auto_fallback else StageRun.Status.BLOCKED
         stage.reason_code = "" if auto_fallback else attempt.error_code
@@ -565,7 +1032,7 @@ def _process_script_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
                 schema_version=locked.request_snapshot_schema_version,
                 size_bytes=locked.request_snapshot_size_bytes,
                 sha256=locked.request_snapshot_sha256,
-                max_bytes=MAX_TEXT_SNAPSHOT_BYTES,
+                max_bytes=_text_snapshot_max_bytes(),
             )
             snapshot = locked.request_snapshot
             plan = snapshot.get("plan")
@@ -616,6 +1083,11 @@ def _process_script_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
             uncertain=not known_driver_failure,
             record_committed_cost=known_response_invalid,
             release_committed_cost=known_driver_failure and not known_response_invalid,
+            failure_metadata=(
+                exc.metadata
+                if isinstance(getattr(exc, "metadata", None), dict)
+                else None
+            ),
         )
         return GenerationAttempt.objects.get(pk=attempt_id)
     try:
@@ -644,7 +1116,7 @@ def _process_script_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
             return locked
         stage = locked.stage_run
         run = stage.production_run
-        result_contract = json_contract(result, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        result_contract = json_contract(result, max_bytes=_text_snapshot_max_bytes())
         if (
             run.status in TERMINAL_RUN_STATUSES
             or stage.status == StageRun.Status.CANCELLED
@@ -707,7 +1179,7 @@ def _process_script_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
             "logline": result["candidate"]["logline"],
             "warnings": result["warnings"],
         }
-        manifest = json_contract(metadata, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        manifest = json_contract(metadata, max_bytes=_text_snapshot_max_bytes())
         artifact = GeneratedArtifact.objects.create(
             manifest_key=f"run:{run.id}:generated-script:{locked.id}",
             production_run=run,
@@ -762,7 +1234,7 @@ def _process_script_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
             "logline": result["candidate"]["logline"],
             "warnings": result["warnings"],
         }
-        contract = json_contract(review_payload, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        contract = json_contract(review_payload, max_bytes=_text_snapshot_max_bytes())
         stage.output_snapshot = contract.value
         stage.output_snapshot_schema_version = contract.schema_version
         stage.output_snapshot_size_bytes = contract.size_bytes
@@ -791,7 +1263,7 @@ def _process_script_structure_attempt(attempt: GenerationAttempt) -> GenerationA
                 schema_version=locked.request_snapshot_schema_version,
                 size_bytes=locked.request_snapshot_size_bytes,
                 sha256=locked.request_snapshot_sha256,
-                max_bytes=MAX_TEXT_SNAPSHOT_BYTES,
+                max_bytes=_text_snapshot_max_bytes(),
             )
             snapshot = locked.request_snapshot
             plan = snapshot.get("plan")
@@ -847,12 +1319,18 @@ def _process_script_structure_attempt(attempt: GenerationAttempt) -> GenerationA
             uncertain=not known_driver_failure,
             record_committed_cost=known_response_invalid,
             release_committed_cost=known_driver_failure and not known_response_invalid,
+            failure_metadata=(
+                exc.metadata
+                if isinstance(exc, ProviderDriverError)
+                and isinstance(getattr(exc, "metadata", None), dict)
+                else None
+            ),
         )
         return GenerationAttempt.objects.get(pk=attempt_id)
     try:
         if not isinstance(response, dict):
             raise ValidationError("script.structure provider 响应必须是对象")
-        json_contract(response, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        json_contract(response, max_bytes=_text_snapshot_max_bytes())
         decoded = json.loads(str(response.get("text") or ""))
         result = finalize_script_structure(plan=snapshot["plan"], payload=decoded)
     except Exception as exc:
@@ -876,7 +1354,7 @@ def _process_script_structure_attempt(attempt: GenerationAttempt) -> GenerationA
             return locked
         stage = locked.stage_run
         run = stage.production_run
-        result_contract = json_contract(result, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        result_contract = json_contract(result, max_bytes=_text_snapshot_max_bytes())
         if (
             run.status in TERMINAL_RUN_STATUSES
             or stage.status == StageRun.Status.CANCELLED
@@ -952,7 +1430,220 @@ def _process_script_structure_attempt(attempt: GenerationAttempt) -> GenerationA
             "status", "error_code", "error_message", "finished_at", "heartbeat_at",
             "updated_at",
         ))
-        contract = json_contract(review_payload, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        contract = json_contract(review_payload, max_bytes=_text_snapshot_max_bytes())
+        stage.output_snapshot = contract.value
+        stage.output_snapshot_schema_version = contract.schema_version
+        stage.output_snapshot_size_bytes = contract.size_bytes
+        stage.output_snapshot_sha256 = contract.sha256
+        stage.save(update_fields=(
+            "output_snapshot", "output_snapshot_schema_version", "output_snapshot_size_bytes",
+            "output_snapshot_sha256", "updated_at",
+        ))
+    from studio.services.production_runs import advance_production_run
+
+    advance_production_run(run)
+    return GenerationAttempt.objects.get(pk=attempt_id)
+
+
+def _process_visual_rules_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
+    attempt_id = attempt.pk
+    claim_token = attempt.claim_token
+    try:
+        with transaction.atomic():
+            locked = GenerationAttempt.objects.select_for_update().get(pk=attempt_id)
+            if locked.status != GenerationAttempt.Status.RUNNING or locked.claim_token != claim_token:
+                return locked
+            if locked.operation != VISUAL_RULES_OPERATION:
+                raise ValidationError("文本 attempt operation 与 visual_rules.generate worker 不匹配")
+            verify_json_contract(
+                locked.request_snapshot,
+                schema_version=locked.request_snapshot_schema_version,
+                size_bytes=locked.request_snapshot_size_bytes,
+                sha256=locked.request_snapshot_sha256,
+                max_bytes=_text_snapshot_max_bytes(),
+            )
+            snapshot = locked.request_snapshot
+            plan = snapshot.get("plan")
+            if not isinstance(plan, dict) or plan.get("operation") != VISUAL_RULES_OPERATION:
+                raise ValidationError("visual_rules.generate attempt 缺少冻结 plan")
+            _verify_attempt_prompt_profile(locked, plan.get("prompt_profile_assembly"))
+            if locked.model_deployment_id is None:
+                raise ValidationError("visual_rules.generate attempt 缺少 model deployment")
+            live_deployment = ModelDeployment.objects.select_related(
+                "profile_version__provider",
+            ).get(pk=locked.model_deployment_id)
+            verify_visual_rules_smoke(live_deployment, snapshot.get("route") or {})
+            deployment = frozen_text_deployment(snapshot)
+            driver = driver_for(deployment.profile_version.provider)
+            submitted_at = timezone.now()
+            locked.status = GenerationAttempt.Status.SUBMITTED
+            locked.submission_started_at = locked.submission_started_at or submitted_at
+            locked.submitted_at = locked.submitted_at or submitted_at
+            locked.heartbeat_at = submitted_at
+            locked.save(update_fields=(
+                "status", "submission_started_at", "submitted_at", "heartbeat_at", "updated_at",
+            ))
+    except Exception as exc:
+        _fail_attempt(
+            attempt_id,
+            claim_token,
+            code=str(getattr(exc, "code", None) or "text_attempt_pre_submit_validation_failed"),
+            message=str(exc),
+            uncertain=False,
+            release_committed_cost=True,
+        )
+        return GenerationAttempt.objects.get(pk=attempt_id)
+    try:
+        response = driver.invoke(
+            deployment,
+            "chat_completion",
+            visual_rules_provider_payload(snapshot["plan"]),
+        )
+    except Exception as exc:
+        known_driver_failure = isinstance(exc, ProviderDriverError) and not exc.submission_uncertain
+        code = str(getattr(exc, "code", "provider_unclassified_failure"))
+        known_response_invalid = known_driver_failure and code == "provider_response_invalid"
+        normalized_code = (
+            code
+            if code in {"provider_request_rejected", "provider_response_invalid"}
+            else "text_attempt_pre_submit_validation_failed"
+            if known_driver_failure
+            else code
+        )
+        _fail_attempt(
+            attempt_id,
+            claim_token,
+            code=normalized_code,
+            message=str(exc),
+            uncertain=not known_driver_failure,
+            record_committed_cost=known_response_invalid,
+            release_committed_cost=known_driver_failure and not known_response_invalid,
+            failure_metadata=(
+                exc.metadata
+                if isinstance(exc, ProviderDriverError)
+                and isinstance(getattr(exc, "metadata", None), dict)
+                else None
+            ),
+        )
+        return GenerationAttempt.objects.get(pk=attempt_id)
+    try:
+        if not isinstance(response, dict):
+            raise ValidationError("visual_rules.generate provider 响应必须是对象")
+        json_contract(response, max_bytes=_text_snapshot_max_bytes())
+        decoded = json.loads(str(response.get("text") or ""))
+        result = finalize_visual_rules(plan=snapshot["plan"], payload=decoded)
+        resource_estimate = snapshot["plan"].get("resource_estimate")
+        warning_threshold = (
+            resource_estimate.get("output_token_warning_threshold")
+            if isinstance(resource_estimate, dict) else None
+        )
+        response_usage = response.get("usage")
+        completion_tokens = (
+            response_usage.get("completion_tokens")
+            if isinstance(response_usage, dict) else None
+        )
+        if (
+            type(warning_threshold) is int
+            and type(completion_tokens) is int
+            and completion_tokens > warning_threshold
+        ):
+            result["warnings"] = [
+                *list(result.get("warnings") or []),
+                (
+                    "模型完成 token 超过配置的建议阈值；严格结构校验已通过，"
+                    "本次候选继续进入审核。"
+                ),
+            ]
+        result_contract = json_contract(result, max_bytes=_text_snapshot_max_bytes())
+    except Exception as exc:
+        _fail_attempt(
+            attempt_id,
+            claim_token,
+            code=str(getattr(exc, "code", None) or "visual_rules_response_invalid"),
+            message=str(exc),
+            uncertain=False,
+            record_committed_cost=True,
+        )
+        return GenerationAttempt.objects.get(pk=attempt_id)
+
+    with transaction.atomic():
+        locked = GenerationAttempt.objects.select_for_update().select_related(
+            "stage_run__production_run",
+            "model_deployment__profile_version__provider",
+        ).get(pk=attempt_id)
+        if locked.status != GenerationAttempt.Status.SUBMITTED or locked.claim_token != claim_token:
+            return locked
+        stage = locked.stage_run
+        run = stage.production_run
+        provider_request_id = str(response.get("request_id") or "")[:191]
+        if (
+            run.status in TERMINAL_RUN_STATUSES
+            or stage.status == StageRun.Status.CANCELLED
+            or locked.ignore_late_result
+        ):
+            locked.provider_request_id = provider_request_id
+            locked.result_sha256 = result_contract.sha256
+            if locked.actual_cost is None and locked.committed_cost is not None:
+                reserved = locked.committed_cost
+                locked.actual_cost = reserved
+                locked.committed_cost = Decimal("0")
+                run.actual_cost_total += reserved
+                run.committed_cost_total = max(Decimal("0"), run.committed_cost_total - reserved)
+                run.save(update_fields=(
+                    "actual_cost_total", "committed_cost_total", "updated_at",
+                ))
+            locked.status = GenerationAttempt.Status.CANCELLED
+            locked.ignore_late_result = True
+            locked.error_code = "late_result_ignored"
+            locked.error_message = "ProductionRun 已终态；晚到影视规则候选未写入正式项目字段。"
+            locked.finished_at = timezone.now()
+            locked.heartbeat_at = locked.finished_at
+            locked.save(update_fields=(
+                "provider_request_id", "result_sha256", "actual_cost", "committed_cost",
+                "status", "ignore_late_result", "error_code", "error_message",
+                "finished_at", "heartbeat_at", "updated_at",
+            ))
+            append_attempt_resolution(
+                locked,
+                outcome=GenerationAttemptResolution.Outcome.LATE_RESULT_IGNORED,
+                evidence={
+                    "schema_version": 1,
+                    "attempt_id": str(locked.id),
+                    "result_sha256": locked.result_sha256,
+                    "actual_cost": str(locked.actual_cost) if locked.actual_cost is not None else None,
+                    "actual_cost_source": "committed_cost",
+                },
+                note="Validated late visual_rules.generate result ignored after run termination",
+            )
+            return locked
+        reserved = locked.committed_cost or Decimal("0")
+        run.actual_cost_total += reserved
+        run.committed_cost_total = max(Decimal("0"), run.committed_cost_total - reserved)
+        run.save(update_fields=("actual_cost_total", "committed_cost_total", "updated_at"))
+        locked.provider_request_id = provider_request_id
+        locked.result_sha256 = result_contract.sha256
+        locked.actual_cost = reserved
+        locked.committed_cost = Decimal("0")
+        locked.status = GenerationAttempt.Status.SUCCEEDED
+        locked.error_code = ""
+        locked.error_message = ""
+        locked.finished_at = timezone.now()
+        locked.heartbeat_at = locked.finished_at
+        locked.save(update_fields=(
+            "provider_request_id", "result_sha256", "actual_cost", "committed_cost",
+            "status", "error_code", "error_message", "finished_at", "heartbeat_at",
+            "updated_at",
+        ))
+        profile = locked.model_deployment.profile_version
+        provider = profile.provider
+        review_payload = {
+            **result,
+            "attempt_id": str(locked.id),
+            "result_sha256": locked.result_sha256,
+            "provider": str(provider.key or "")[:80],
+            "model": str(profile.model_identifier or "")[:200],
+        }
+        contract = json_contract(review_payload, max_bytes=_text_snapshot_max_bytes())
         stage.output_snapshot = contract.value
         stage.output_snapshot_schema_version = contract.schema_version
         stage.output_snapshot_size_bytes = contract.size_bytes
@@ -974,6 +1665,9 @@ def _process_prompt_normalization_attempt(
         ROUTE_CONTEXT_DURABLE_ATTEMPT,
         invoke_prompt_normalization,
     )
+    from studio.services.production_runs import (
+        _verify_prompt_normalization_batch_plan,
+    )
 
     attempt_id = attempt.pk
     claim_token = attempt.claim_token
@@ -989,7 +1683,7 @@ def _process_prompt_normalization_attempt(
                 schema_version=locked.request_snapshot_schema_version,
                 size_bytes=locked.request_snapshot_size_bytes,
                 sha256=locked.request_snapshot_sha256,
-                max_bytes=MAX_TEXT_SNAPSHOT_BYTES,
+                max_bytes=_text_snapshot_max_bytes(),
             )
             snapshot = locked.request_snapshot
             payload = snapshot.get("payload")
@@ -999,7 +1693,7 @@ def _process_prompt_normalization_attempt(
                 locked,
                 payload.get("prompt_profile_assembly"),
             )
-            payload_contract = json_contract(payload, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+            payload_contract = json_contract(payload, max_bytes=_text_snapshot_max_bytes())
             if (
                 payload_contract.sha256 != locked.request_sha256
                 or snapshot.get("payload_sha256") != payload_contract.sha256
@@ -1009,17 +1703,120 @@ def _process_prompt_normalization_attempt(
             if not isinstance(targets, list) or len(targets) != len(payload.get("items") or []):
                 raise ValidationError("prompt.normalize targets 快照无效")
             deployment = frozen_text_deployment(snapshot)
-            submission_boundary = timezone.now()
-            locked.status = GenerationAttempt.Status.SUBMITTED
-            locked.submission_started_at = (
-                locked.submission_started_at or submission_boundary
+            batch_plan = _verify_prompt_normalization_batch_plan(
+                snapshot.get("batch_plan"),
             )
-            locked.submitted_at = locked.submitted_at or submission_boundary
-            locked.heartbeat_at = submission_boundary
-            locked.save(update_fields=(
-                "status", "submission_started_at", "submitted_at",
-                "heartbeat_at", "updated_at",
-            ))
+            batch_index = snapshot.get("batch_index")
+            batches = batch_plan["batches"]
+            if type(batch_index) is not int or not 0 <= batch_index < len(batches):
+                raise ValidationError("prompt.normalize batch_index 无效")
+            frozen_batch = batches[batch_index]
+            request_ids = [
+                str(item.get("request_id") or "")
+                for item in payload.get("items") or []
+                if isinstance(item, dict)
+            ]
+            target_request_ids = [
+                str(item.get("request_id") or "")
+                for item in targets
+                if isinstance(item, dict)
+            ]
+            if (
+                locked.unit_key != frozen_batch.get("unit_key")
+                or request_ids != frozen_batch.get("request_ids")
+                or target_request_ids != frozen_batch.get("request_ids")
+                or snapshot.get("batch_count") != len(batches)
+            ):
+                raise ValidationError("prompt.normalize attempt 与冻结批次身份不一致")
+            capacity_policy = prompt_normalization_policy_from_specification(
+                verified_model_profile_specification(deployment.profile_version),
+                required=True,
+            )
+            if (
+                capacity_policy is None
+                or snapshot.get("capacity_policy") != capacity_policy
+                or snapshot.get("capacity_policy_sha256")
+                != json_contract(
+                    capacity_policy,
+                    max_bytes=_text_snapshot_max_bytes(),
+                ).sha256
+            ):
+                raise ValidationError("prompt.normalize 冻结模型容量合同已漂移")
+            chat_payload = prompt_normalization_chat_payload(
+                payload,
+                policy=capacity_policy,
+            )
+            if snapshot.get(
+                "chat_input_bytes",
+            ) != prompt_normalization_chat_messages_input_bytes(
+                chat_payload["messages"],
+            ):
+                raise ValidationError("prompt.normalize 冻结 chat 输入字节数已漂移")
+            execution_kind = str(snapshot.get("execution_kind") or "")
+            if (
+                execution_kind != str(frozen_batch.get("execution_kind") or "")
+                or snapshot.get("materialization_proofs_sha256")
+                != frozen_batch.get("materialization_proofs_sha256")
+            ):
+                raise ValidationError("prompt.normalize attempt 执行种类已漂移")
+            if execution_kind == PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC:
+                if (
+                    locked.is_external
+                    or locked.estimated_cost != Decimal("0")
+                    or locked.committed_cost != Decimal("0")
+                    or locked.actual_cost not in {None, Decimal("0")}
+                    or locked.cost_currency
+                    or snapshot.get("submission_semantics")
+                    != PROMPT_NORMALIZATION_LOCAL_SUBMISSION_SEMANTICS
+                    or snapshot.get("repair_of_attempt_id")
+                ):
+                    raise ValidationError("prompt.normalize 本地物化费用或提交合同无效")
+                local_items = []
+                local_warnings = []
+                for item, target in zip(payload.get("items") or [], targets, strict=True):
+                    materialization = deterministic_prompt_normalization_materialization(
+                        item=item,
+                        target=target,
+                        request_payload=payload,
+                    )
+                    if materialization is None:
+                        raise ValidationError(
+                            "prompt.normalize 本地物化批次包含 Provider 字段",
+                        )
+                    local_items.append({
+                        "request_id": str(item.get("request_id") or ""),
+                        "translation": str(materialization["translated_text"]),
+                    })
+                    local_warnings.extend(deepcopy(materialization["warnings"]))
+                response = {
+                    "items": local_items,
+                    "request_id": "",
+                    "metadata": {
+                        "provider": "",
+                        "model_identifier": "",
+                        "submission_semantics": (
+                            PROMPT_NORMALIZATION_LOCAL_SUBMISSION_SEMANTICS
+                        ),
+                        "usage": {},
+                        "warnings": local_warnings,
+                    },
+                }
+                locked.heartbeat_at = timezone.now()
+                locked.save(update_fields=("heartbeat_at", "updated_at"))
+            elif execution_kind == PROMPT_NORMALIZATION_EXECUTION_PROVIDER:
+                submission_boundary = timezone.now()
+                locked.status = GenerationAttempt.Status.SUBMITTED
+                locked.submission_started_at = (
+                    locked.submission_started_at or submission_boundary
+                )
+                locked.submitted_at = locked.submitted_at or submission_boundary
+                locked.heartbeat_at = submission_boundary
+                locked.save(update_fields=(
+                    "status", "submission_started_at", "submitted_at",
+                    "heartbeat_at", "updated_at",
+                ))
+            else:
+                raise ValidationError("prompt.normalize execution_kind 无效")
     except Exception as exc:
         _fail_attempt(
             attempt_id,
@@ -1031,45 +1828,52 @@ def _process_prompt_normalization_attempt(
         )
         return GenerationAttempt.objects.get(pk=attempt_id)
 
-    try:
-        response = invoke_prompt_normalization(
-            deployment_id=locked.model_deployment_id,
-            payload=payload,
-            execution_context=ROUTE_CONTEXT_DURABLE_ATTEMPT,
-            generation_attempt=locked,
-            execution_deployment=deployment,
-        )
-    except Exception as exc:
-        known_driver_failure = (
-            isinstance(exc, ProviderDriverError)
-            and not exc.submission_uncertain
-        )
-        code = str(getattr(exc, "code", "provider_unclassified_failure"))
-        known_response_invalid = known_driver_failure and code in {
-            "provider_response_invalid",
-            "prompt_normalize_contract_failed",
-        }
-        normalized_code = (
-            code
-            if code in {
-                "provider_request_rejected",
+    if execution_kind == PROMPT_NORMALIZATION_EXECUTION_PROVIDER:
+        try:
+            response = invoke_prompt_normalization(
+                deployment_id=locked.model_deployment_id,
+                payload=payload,
+                execution_context=ROUTE_CONTEXT_DURABLE_ATTEMPT,
+                generation_attempt=locked,
+                execution_deployment=deployment,
+            )
+        except Exception as exc:
+            known_driver_failure = (
+                isinstance(exc, ProviderDriverError)
+                and not exc.submission_uncertain
+            )
+            code = str(getattr(exc, "code", "provider_unclassified_failure"))
+            known_response_invalid = known_driver_failure and code in {
                 "provider_response_invalid",
                 "prompt_normalize_contract_failed",
             }
-            else "text_attempt_pre_submit_validation_failed"
-            if known_driver_failure
-            else code
-        )
-        _fail_attempt(
-            attempt_id,
-            claim_token,
-            code=normalized_code,
-            message=str(exc),
-            uncertain=not known_driver_failure,
-            record_committed_cost=known_response_invalid,
-            release_committed_cost=known_driver_failure and not known_response_invalid,
-        )
-        return GenerationAttempt.objects.get(pk=attempt_id)
+            normalized_code = (
+                code
+                if code in {
+                    "provider_request_rejected",
+                    "provider_response_invalid",
+                    "prompt_normalize_contract_failed",
+                }
+                else "text_attempt_pre_submit_validation_failed"
+                if known_driver_failure
+                else code
+            )
+            _fail_attempt(
+                attempt_id,
+                claim_token,
+                code=normalized_code,
+                message=str(exc),
+                uncertain=not known_driver_failure,
+                record_committed_cost=known_response_invalid,
+                release_committed_cost=known_driver_failure and not known_response_invalid,
+                failure_metadata=(
+                    exc.metadata
+                    if isinstance(exc, ProviderDriverError)
+                    and isinstance(getattr(exc, "metadata", None), dict)
+                    else None
+                ),
+            )
+            return GenerationAttempt.objects.get(pk=attempt_id)
 
     try:
         response_items = response.get("items")
@@ -1090,9 +1894,12 @@ def _process_prompt_normalization_attempt(
             translated = restore_prompt_normalization_candidate(
                 target=target,
                 translated_text=str(row.get("translation") or ""),
+                request_payload=payload,
             )
-            candidates.append({
+            candidate = {
                 "request_id": str(target.get("request_id") or ""),
+                "generation_attempt_id": str(attempt_id),
+                "batch_index": int(batch_index),
                 "scope_type": str(target.get("scope_type") or ""),
                 "scope_id": str(target.get("scope_id") or ""),
                 "field_key": str(target.get("field_key") or ""),
@@ -1101,11 +1908,51 @@ def _process_prompt_normalization_attempt(
                 "source_hash": str(target.get("source_hash") or ""),
                 "context_hash": str(target.get("context_hash") or ""),
                 "translated_text": translated,
-            })
+            }
+            if target.get("target_kind") == "prompt_profile_field":
+                candidate.update({
+                    "target_kind": "prompt_profile_field",
+                    "shot_id": str(target.get("shot_id") or ""),
+                    "profile_selection_sha256": str(
+                        target.get("profile_selection_sha256") or ""
+                    ),
+                    "prompt_profile_version_id": str(
+                        target.get("prompt_profile_version_id") or ""
+                    ),
+                    "profile_field_key": str(target.get("profile_field_key") or ""),
+                    "profile_source_selector": str(
+                        target.get("profile_source_selector") or ""
+                    ),
+                    "generation_mode": str(target.get("generation_mode") or ""),
+                    "generation_output_semantics": str(
+                        target.get("generation_output_semantics") or ""
+                    ),
+                    "generation_source_selector": str(
+                        target.get("generation_source_selector") or ""
+                    ),
+                    "generation_source_scope_type": str(
+                        target.get("generation_source_scope_type") or ""
+                    ),
+                    "generation_source_scope_id": str(
+                        target.get("generation_source_scope_id") or ""
+                    ),
+                    "generation_source_field_key": str(
+                        target.get("generation_source_field_key") or ""
+                    ),
+                })
+            candidates.append(candidate)
         metadata = response.get("metadata") if isinstance(response.get("metadata"), dict) else {}
         result = {
             "schema_version": 1,
-            "kind": "prompt_normalization_candidates",
+            "kind": "prompt_normalization_batch_result",
+            "attempt_id": str(attempt_id),
+            "batch_index": int(batch_index),
+            "batch_count": len(batches),
+            "unit_key": str(frozen_batch["unit_key"]),
+            "generation_mode": str(frozen_batch["generation_mode"]),
+            "execution_kind": execution_kind,
+            "request_ids": list(frozen_batch["request_ids"]),
+            "batch_plan_sha256": str(batch_plan["batch_plan_sha256"]),
             "provider": str(metadata.get("provider") or response.get("provider") or "")[:80],
             "model": str(metadata.get("model_identifier") or response.get("model") or "")[:200],
             "submission_semantics": str(
@@ -1113,17 +1960,38 @@ def _process_prompt_normalization_attempt(
                 or snapshot.get("submission_semantics")
                 or ""
             ),
+            "usage": (
+                deepcopy(metadata.get("usage"))
+                if isinstance(metadata.get("usage"), dict)
+                else {}
+            ),
+            "warnings": (
+                deepcopy(metadata.get("warnings"))
+                if isinstance(metadata.get("warnings"), list)
+                else []
+            ),
             "candidates": candidates,
         }
-        result_contract = json_contract(result, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        result_contract = json_contract(result, max_bytes=_text_snapshot_max_bytes())
     except Exception as exc:
         _fail_attempt(
             attempt_id,
             claim_token,
-            code="prompt_normalize_contract_failed",
+            code=(
+                "server_deterministic_materialization_failed"
+                if execution_kind
+                == PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC
+                else "prompt_normalize_contract_failed"
+            ),
             message=str(exc),
             uncertain=False,
-            record_committed_cost=True,
+            record_committed_cost=(
+                execution_kind == PROMPT_NORMALIZATION_EXECUTION_PROVIDER
+            ),
+            release_committed_cost=(
+                execution_kind
+                == PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC
+            ),
         )
         return GenerationAttempt.objects.get(pk=attempt_id)
 
@@ -1131,7 +1999,12 @@ def _process_prompt_normalization_attempt(
         locked = GenerationAttempt.objects.select_for_update().select_related(
             "stage_run__production_run",
         ).get(pk=attempt_id)
-        if locked.status != GenerationAttempt.Status.SUBMITTED or locked.claim_token != claim_token:
+        expected_status = (
+            GenerationAttempt.Status.RUNNING
+            if execution_kind == PROMPT_NORMALIZATION_EXECUTION_DETERMINISTIC
+            else GenerationAttempt.Status.SUBMITTED
+        )
+        if locked.status != expected_status or locked.claim_token != claim_token:
             return locked
         stage = locked.stage_run
         run = stage.production_run
@@ -1208,13 +2081,14 @@ def _process_prompt_normalization_attempt(
             "status", "error_code", "error_message", "finished_at", "heartbeat_at",
             "updated_at",
         ))
-        review_payload = {
-            **result,
-            "attempt_id": str(locked.id),
-            "result_sha256": locked.result_sha256,
-            "provider_request_id_sha256": provider_request_id_sha256,
-        }
-        contract = json_contract(review_payload, max_bytes=MAX_TEXT_SNAPSHOT_BYTES)
+        review_payload = _prompt_normalization_progress_snapshot(
+            stage=stage,
+            batch_plan=batch_plan,
+            result=result,
+            result_sha256=locked.result_sha256,
+            provider_request_id_sha256=provider_request_id_sha256,
+        )
+        contract = json_contract(review_payload, max_bytes=_text_snapshot_max_bytes())
         stage.output_snapshot = contract.value
         stage.output_snapshot_schema_version = contract.schema_version
         stage.output_snapshot_size_bytes = contract.size_bytes
@@ -1233,6 +2107,8 @@ def process_text_attempt(attempt: GenerationAttempt) -> GenerationAttempt:
         return _process_script_attempt(attempt)
     if attempt.operation == SCRIPT_STRUCTURE_OPERATION:
         return _process_script_structure_attempt(attempt)
+    if attempt.operation == VISUAL_RULES_OPERATION:
+        return _process_visual_rules_attempt(attempt)
     if attempt.operation == PROMPT_NORMALIZE_OPERATION:
         return _process_prompt_normalization_attempt(attempt)
     raise ValidationError("text worker 收到不支持的 operation")

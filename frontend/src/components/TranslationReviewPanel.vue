@@ -2,6 +2,7 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { AlertTriangle, Check, ChevronDown, Languages, LoaderCircle, RotateCcw, ShieldCheck, Undo2 } from 'lucide-vue-next'
 import { repository } from '@/services/repository'
+import { isBackendId } from '@/services/backendAdapters'
 import {
   createTranslationLoadGate,
   reconcileTranslationDrafts,
@@ -27,9 +28,8 @@ const props = withDefaults(defineProps<{
   compact?: boolean
   title?: string
   refreshKey?: number
-  repairLegacyNegativePrompt?: boolean
   blockedReason?: string
-}>(), { episodeId: '', shotId: '', compact: false, title: '英文提示词标准化 · 人工审核', refreshKey: 0, repairLegacyNegativePrompt: false, blockedReason: '' })
+}>(), { episodeId: '', shotId: '', compact: false, title: '英文提示词标准化 · 人工审核', refreshKey: 0, blockedReason: '' })
 
 const emit = defineEmits<{
   changed: []
@@ -129,10 +129,11 @@ const load = async () => {
   if (!props.projectId) return
   const requestSequence = loadGate.begin()
   loading.value = true; error.value = ''
+  const persistedShotId = isBackendId(props.shotId) ? props.shotId : ''
   try {
     const [nextCapability, nextEntries] = await Promise.all([
       repository.getTranslationCapability(props.projectId),
-      repository.getProjectTranslations(props.projectId, { episodeId: props.episodeId, shotId: props.shotId }),
+      repository.getProjectTranslations(props.projectId, { episodeId: props.episodeId, shotId: persistedShotId }),
     ])
     if (!loadGate.isCurrent(requestSequence)) return
     capability.value = nextCapability
@@ -201,7 +202,7 @@ const upsertEntries = (
   const promotedShotId = rows.find((row) => row.scopeType === 'shot' && row.scopeId && row.promotedFields?.length)?.scopeId || props.shotId
   rememberPromotedFields(promoted, promotedShotId)
   if (promoted.length && options.emitPromotion !== false) {
-    emit('promoted', { shotId: promotedShotId, promotedFields: promoted, entries: rows, shotPatch: {} })
+    emit('promoted', { shotId: promotedShotId, promotedFields: promoted, entries: rows })
   }
   if (options.emitChanged !== false) emit('changed')
 }
@@ -277,7 +278,7 @@ const confirm = async (field: PromptTranslationField) => {
     const row = await repository.confirmProjectTranslation(entry.id, translatedText, entry.revision)
     if (requestShotId && requestShotId !== props.shotId) {
       const promotedFields = promotedFieldsFrom([row])
-      if (promotedFields.length) emit('promoted', { shotId: row.scopeId || requestShotId, promotedFields, entries: [row], shotPatch: {} })
+      if (promotedFields.length) emit('promoted', { shotId: row.scopeId || requestShotId, promotedFields, entries: [row] })
     } else upsertEntries([row])
   }
   catch (cause) { error.value = translationReviewRequestError(cause, `${field.label}确认失败，请刷新后重试。`) }
@@ -289,14 +290,14 @@ const confirm = async (field: PromptTranslationField) => {
 
 const promoteConfirmedShot = async () => {
   if (reviewMutationBlocked.value) { error.value = props.blockedReason; return }
-  if (!props.shotId || (!promotableEntries.value.length && !props.repairLegacyNegativePrompt)) return
+  if (!props.shotId || !promotableEntries.value.length) return
   promotingShot.value = true; error.value = ''
   const requestShotId = props.shotId
   setPromotionOperation(true)
   try {
     const result = await repository.promoteShotTranslations(props.shotId, promotableEntries.value.map((entry) => ({
       entryId: entry.id, expectedRevision: entry.revision,
-    })), { repairLegacyNegativePrompt: props.repairLegacyNegativePrompt })
+    })))
     if (requestShotId === props.shotId) {
       upsertEntries(result.entries, { emitPromotion: false, emitChanged: false })
       rememberPromotedFields(result.promotedFields, result.shotId)
@@ -340,9 +341,9 @@ onMounted(load)
       <div class="translation-heading"><div><Languages :size="18"/></div><span><strong>{{ title }}</strong><small>中文原文永久保留；只有人工确认且源文未变化的英文译文才可进入正式 prompt。<template v-if="shotId"> 本面板审核英文候选；确认镜头导演字段后会原子同步到下方正式表单，镜头标题和对白正文仍保留中文，两处不是重复输入区。</template><template v-if="includesProjectFields"> 当前面板只审核项目级全剧字段；人物、场景和道具字段请在各自 Bible 面板审核。</template></small></span></div>
       <div class="translation-header-actions">
         <label v-if="capability?.deployments.length" class="translation-provider"><span>模型部署</span><select v-model="selectedDeploymentId" :disabled="bulkTranslating||Object.keys(busy).length>0"><option value="" disabled>请选择已烟测部署</option><option v-for="deployment in capability.deployments" :key="deployment.modelDeploymentId" :value="deployment.modelDeploymentId" :disabled="!deployment.ready">{{ deployment.label }} · {{ deployment.modelIdentifier }}{{ deployment.ready ? '' : `（${deployment.reasonCode}）` }}</option></select></label>
-        <button v-if="shotId&&(promotableEntries.length||repairLegacyNegativePrompt)" type="button" class="secondary" :disabled="loading||promotingShot||bulkTranslating||reviewMutationBlocked" :title="blockedReason||''" @click="promoteConfirmedShot">
+        <button v-if="shotId&&promotableEntries.length" type="button" class="secondary" :disabled="loading||promotingShot||bulkTranslating||reviewMutationBlocked" :title="blockedReason||''" @click="promoteConfirmedShot">
           <LoaderCircle v-if="promotingShot" class="spin" :size="13"/><Check v-else :size="13"/>
-          {{ promotingShot?'正在同步与审计…':repairLegacyNegativePrompt?(promotableEntries.length?'同步英文并审计负面约束':'审计并恢复负面约束'):'一键同步已确认英文到正式字段' }}
+          {{ promotingShot?'正在同步与审计…':'一键同步已确认英文到正式字段' }}
         </button>
         <button type="button" :disabled="loading||bulkTranslating||promotingShot||!fieldsNeedingTranslation.length||!capabilityReady||reviewMutationBlocked" :title="blockedReason||''" @click="translateAll">
           <LoaderCircle v-if="bulkTranslating" class="spin" :size="13"/><Languages v-else :size="13"/>
@@ -351,7 +352,6 @@ onMounted(load)
       </div>
     </header>
     <div v-if="blockedReason" class="translation-error"><AlertTriangle :size="14"/><span><strong>canonical 术语碰撞 · 翻译确认与正式字段同步已暂停：</strong> {{ blockedReason }} 请先回到“项目总览 → 全剧视觉规则”修正并保存；系统不会自动猜译名。</span></div>
-    <div v-if="repairLegacyNegativePrompt" class="translation-recovery"><AlertTriangle :size="14"/><span><strong>来源匹配的创作草稿负面约束待审计：</strong>保存和生成已暂停。点击上方按钮后，服务端只会在 applied CreativeDraft 来源和值逐字匹配时清除；若这是您手工填写的真实缺陷词，请直接改写为英文负面约束后保存。</span></div>
     <div class="translation-safety"><ShieldCheck :size="14"/><span><strong>模型候选不可直接生产：</strong>必须逐项核对专名、人物性别、左右方位、道具部位、数值与比例、景别与运镜、动作先后和镜头终态，确认无误后再点“确认译文”。对白、歌词和真实屏显文字保留原文，只翻译 delivery 与导演字段。部署列表完全来自服务端 <code>prompt.normalize</code> 注册表；不会把未知模型偷偷映射为内置模型。</span></div>
     <div v-if="capability&&!capabilityReady" class="translation-error"><AlertTriangle :size="14"/>{{ selectedDeployment ? `所选部署不可用：${selectedDeployment.reasonCode}` : '未选择 prompt.normalize 部署；系统不会自动采用列表第一项。' }}</div>
     <div v-if="error" class="translation-error"><AlertTriangle :size="14"/>{{ error }}</div>
@@ -384,7 +384,7 @@ onMounted(load)
 </template>
 
 <style scoped>
-.translation-review{display:grid;gap:11px;padding:13px;border:1px solid rgba(94,164,218,.2);border-radius:9px;background:rgba(35,75,105,.055)}.translation-review>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.translation-heading{display:flex;align-items:center;gap:9px}.translation-heading>div{width:32px;height:32px;display:grid;place-items:center;border-radius:8px;background:rgba(94,164,218,.12);color:#79bde5}.translation-heading span{display:grid;gap:3px}.translation-heading strong{font-size:12px}.translation-heading small{color:#7f8c98;font-size:10px;line-height:1.45}.translation-review button{min-height:31px;padding:6px 10px;display:inline-flex;align-items:center;justify-content:center;gap:5px;border:1px solid rgba(94,164,218,.32);border-radius:6px;background:#327caf;color:#eef8ff;font-size:10px;font-weight:700;cursor:pointer}.translation-review button.secondary{background:#111820;color:#a9bac7;border-color:#2a3741}.translation-review button:disabled{opacity:.45;cursor:not-allowed}.translation-safety,.translation-error,.translation-recovery,.translation-loading,.translation-empty{display:flex;align-items:flex-start;gap:7px;padding:9px 10px;border-radius:6px;font-size:10px;line-height:1.55}.translation-safety{border:1px solid rgba(104,197,167,.16);background:rgba(104,197,167,.05);color:#8cb9aa}.translation-error,.source-warning{color:#e59b8f}.translation-error{border:1px solid rgba(229,112,99,.2);background:rgba(229,112,99,.06)}.translation-recovery{border:1px solid rgba(217,164,95,.24);background:rgba(217,164,95,.07);color:#c9a773}.translation-loading,.translation-empty{color:#77838e;background:#0b1015}.translation-summary{display:flex;align-items:center;gap:12px;padding:7px 9px;border:1px solid rgba(255,255,255,.05);border-radius:6px;background:#0a0f14;color:#89949e;font-size:10px}.translation-summary b{color:#dbe5ec}.translation-summary .changed{color:#e59b8f}.translation-summary small{margin-left:auto;color:#65727d}.translation-list{display:grid;gap:9px}.translation-list>article{padding:11px;border:1px solid #28333d;border-radius:7px;background:#0b1015}.translation-list>article.state-success{border-color:rgba(104,197,167,.22)}.translation-list>article.state-danger{border-color:rgba(229,112,99,.25)}.translation-list>article>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.translation-list>article>header>div{display:grid;grid-template-columns:auto 1fr;gap:2px 7px}.translation-list>article>header span{grid-row:1/3;padding:3px 5px;border-radius:3px;background:#151e26;color:#6f8799;font:8px Consolas,monospace}.translation-list>article>header strong{font-size:11px}.translation-list>article>header small{color:#6e7a84;font-size:9px}.translation-status{display:inline-flex;align-items:center;gap:4px;padding:4px 6px;border-radius:10px;background:#182028;color:#84919d;font-size:9px}.translation-status.warning,.translation-status.working{color:#d9a45f;background:rgba(217,164,95,.1)}.translation-status.success{color:#71c9ad;background:rgba(104,197,167,.1)}.translation-status.danger{color:#e9867b;background:rgba(229,112,99,.1)}.translation-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:9px}.translation-columns label{display:grid;gap:5px}.translation-columns label>span{color:#73818c;font-size:9px}.translation-columns textarea{width:100%;resize:vertical;padding:8px;border:1px solid #26323c;border-radius:5px;background:#080c10;color:#c2cdd5;font:10px/1.55 Consolas,monospace;outline:none}.translation-columns textarea:focus{border-color:#477fa4}.translation-columns textarea:read-only,.translation-columns textarea:disabled{color:#8d979f;background:#090d11}.source-warning{margin:7px 0 0;display:flex;align-items:center;gap:5px;font-size:9px}.translation-list>article>footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:#65727d;font-size:9px}.translation-list>article>footer>div{display:flex;gap:6px}.compact{padding:11px}.compact .translation-columns textarea{max-height:112px}@media(max-width:800px){.translation-review>header,.translation-list>article>footer{align-items:stretch;flex-direction:column}.translation-columns{grid-template-columns:1fr}.translation-summary{flex-wrap:wrap}.translation-summary small{width:100%;margin-left:0}}
+.translation-review{display:grid;gap:11px;padding:13px;border:1px solid rgba(94,164,218,.2);border-radius:9px;background:rgba(35,75,105,.055)}.translation-review>header{display:flex;align-items:center;justify-content:space-between;gap:12px}.translation-heading{display:flex;align-items:center;gap:9px}.translation-heading>div{width:32px;height:32px;display:grid;place-items:center;border-radius:8px;background:rgba(94,164,218,.12);color:#79bde5}.translation-heading span{display:grid;gap:3px}.translation-heading strong{font-size:12px}.translation-heading small{color:#7f8c98;font-size:10px;line-height:1.45}.translation-review button{min-height:31px;padding:6px 10px;display:inline-flex;align-items:center;justify-content:center;gap:5px;border:1px solid rgba(94,164,218,.32);border-radius:6px;background:#327caf;color:#eef8ff;font-size:10px;font-weight:700;cursor:pointer}.translation-review button.secondary{background:#111820;color:#a9bac7;border-color:#2a3741}.translation-review button:disabled{opacity:.45;cursor:not-allowed}.translation-safety,.translation-error,.translation-loading,.translation-empty{display:flex;align-items:flex-start;gap:7px;padding:9px 10px;border-radius:6px;font-size:10px;line-height:1.55}.translation-safety{border:1px solid rgba(104,197,167,.16);background:rgba(104,197,167,.05);color:#8cb9aa}.translation-error,.source-warning{color:#e59b8f}.translation-error{border:1px solid rgba(229,112,99,.2);background:rgba(229,112,99,.06)}.translation-loading,.translation-empty{color:#77838e;background:#0b1015}.translation-summary{display:flex;align-items:center;gap:12px;padding:7px 9px;border:1px solid rgba(255,255,255,.05);border-radius:6px;background:#0a0f14;color:#89949e;font-size:10px}.translation-summary b{color:#dbe5ec}.translation-summary .changed{color:#e59b8f}.translation-summary small{margin-left:auto;color:#65727d}.translation-list{display:grid;gap:9px}.translation-list>article{padding:11px;border:1px solid #28333d;border-radius:7px;background:#0b1015}.translation-list>article.state-success{border-color:rgba(104,197,167,.22)}.translation-list>article.state-danger{border-color:rgba(229,112,99,.25)}.translation-list>article>header{display:flex;align-items:flex-start;justify-content:space-between;gap:10px}.translation-list>article>header>div{display:grid;grid-template-columns:auto 1fr;gap:2px 7px}.translation-list>article>header span{grid-row:1/3;padding:3px 5px;border-radius:3px;background:#151e26;color:#6f8799;font:8px Consolas,monospace}.translation-list>article>header strong{font-size:11px}.translation-list>article>header small{color:#6e7a84;font-size:9px}.translation-status{display:inline-flex;align-items:center;gap:4px;padding:4px 6px;border-radius:10px;background:#182028;color:#84919d;font-size:9px}.translation-status.warning,.translation-status.working{color:#d9a45f;background:rgba(217,164,95,.1)}.translation-status.success{color:#71c9ad;background:rgba(104,197,167,.1)}.translation-status.danger{color:#e9867b;background:rgba(229,112,99,.1)}.translation-columns{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;margin-top:9px}.translation-columns label{display:grid;gap:5px}.translation-columns label>span{color:#73818c;font-size:9px}.translation-columns textarea{width:100%;resize:vertical;padding:8px;border:1px solid #26323c;border-radius:5px;background:#080c10;color:#c2cdd5;font:10px/1.55 Consolas,monospace;outline:none}.translation-columns textarea:focus{border-color:#477fa4}.translation-columns textarea:read-only,.translation-columns textarea:disabled{color:#8d979f;background:#090d11}.source-warning{margin:7px 0 0;display:flex;align-items:center;gap:5px;font-size:9px}.translation-list>article>footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:#65727d;font-size:9px}.translation-list>article>footer>div{display:flex;gap:6px}.compact{padding:11px}.compact .translation-columns textarea{max-height:112px}@media(max-width:800px){.translation-review>header,.translation-list>article>footer{align-items:stretch;flex-direction:column}.translation-columns{grid-template-columns:1fr}.translation-summary{flex-wrap:wrap}.translation-summary small{width:100%;margin-left:0}}
 .spin{animation:translation-spin 1s linear infinite}@keyframes translation-spin{to{transform:rotate(360deg)}}
 .translation-summary .attention{color:#d9a45f}.translation-entry-state{display:flex!important;align-items:center!important;justify-content:flex-end;gap:7px;grid-template-columns:none!important}.translation-entry-state em{display:inline-flex;align-items:center;gap:3px;color:#73818c;font-size:9px;font-style:normal;font-weight:500}.translation-list>details{padding:11px;border:1px solid rgba(104,197,167,.22);border-radius:7px;background:#0b1015}.translation-list>details>summary{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;cursor:pointer;list-style:none}.translation-list>details>summary::-webkit-details-marker{display:none}.translation-list>details>summary>div:first-child{display:grid;grid-template-columns:auto 1fr;gap:2px 7px}.translation-list>details>summary span{grid-row:1/3;padding:3px 5px;border-radius:3px;background:#151e26;color:#6f8799;font:8px Consolas,monospace}.translation-list>details>summary strong{font-size:11px}.translation-list>details>summary small{color:#6e7a84;font-size:9px}.translation-list>details[open]>summary .translation-entry-state em svg{transform:rotate(180deg)}.translation-list>details>footer{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:9px;color:#65727d;font-size:9px}.translation-columns label.stale>span{color:#d18b80}.translation-columns label.stale textarea{border-color:rgba(229,112,99,.22);color:#8d979f;background:#090d11}
 @media(max-width:800px){.translation-list>details>summary,.translation-list>details>footer{align-items:stretch;flex-direction:column}.translation-entry-state{justify-content:flex-start}}

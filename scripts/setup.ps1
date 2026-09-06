@@ -1,7 +1,6 @@
 [CmdletBinding()]
 param(
-    [switch]$WithDemoProject,
-    [switch]$WithLocalTranslationModel
+    [switch]$WithDemoProject
 )
 
 $ErrorActionPreference = 'Stop'
@@ -167,10 +166,12 @@ try {
     Assert-NativeSuccess 'Database migration'
     & $PythonPath manage.py bootstrap_superadmin --if-missing
     Assert-NativeSuccess 'Initial super administrator bootstrap'
+    $SeedArguments = @('manage.py', 'seed_data')
     if ($WithDemoProject) {
-        & $PythonPath manage.py seed_data --with-demo-project
-        Assert-NativeSuccess 'Explicit local demo seeding'
+        $SeedArguments += '--with-demo-project'
     }
+    & $PythonPath @SeedArguments
+    Assert-NativeSuccess 'System style and optional local demo seeding'
     & $PythonPath manage.py import_asset_library --manifest (Join-Path $ProjectRoot 'assets\library\manifest.json')
     Assert-NativeSuccess 'Asset library import'
 } finally {
@@ -183,15 +184,6 @@ try {
     Assert-NativeSuccess 'Frontend dependency installation'
 } finally {
     Pop-Location
-}
-
-if ($WithLocalTranslationModel) {
-    & (Join-Path $PSScriptRoot 'download_local_translation_model.ps1') -Runtime cpu
-    Assert-NativeSuccess 'Official local Qwen translation model installation'
-} else {
-    Write-Host 'Optional local director-field translation model was not downloaded.' -ForegroundColor Yellow
-    Write-Host 'Install it later with:'
-    Write-Host '  powershell -ExecutionPolicy Bypass -File .\scripts\download_local_translation_model.ps1 -Runtime cpu'
 }
 
 if ($WithDemoProject) {

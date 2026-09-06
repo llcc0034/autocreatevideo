@@ -157,7 +157,7 @@ const confirmDelete = async () => {
   <div class="series-projects page-stack">
     <section class="page-heading split-heading">
       <div>
-        <span class="eyebrow">SERIES LIBRARY</span>
+        <span class="eyebrow">连续剧项目库 / SERIES LIBRARY</span>
         <h2>连续剧项目</h2>
         <p>查看已有连续剧的故事概要与制作进度，继续管理项目，或从新故事开始创作。</p>
       </div>
@@ -268,7 +268,7 @@ const confirmDelete = async () => {
       </article>
     </section>
 
-    <BaseModal :open="Boolean(redoTarget)" title="基于此项目重做" eyebrow="CREATE INDEPENDENT DRAFT" width="520px" @close="closeRedo">
+    <BaseModal :open="Boolean(redoTarget)" title="基于此项目重做" eyebrow="创建独立草稿（Independent Draft）" width="520px" @close="closeRedo">
       <div v-if="redoTarget" class="confirmation-copy">
         <div class="confirmation-icon"><RotateCcw :size="20" /></div>
         <div>
@@ -285,7 +285,7 @@ const confirmDelete = async () => {
       </template>
     </BaseModal>
 
-    <BaseModal :open="Boolean(deleteTarget)" title="删除连续剧项目" eyebrow="IRREVERSIBLE ACTION" width="520px" @close="closeDelete">
+    <BaseModal :open="Boolean(deleteTarget)" title="删除连续剧项目" eyebrow="不可撤销操作（Irreversible Action）" width="520px" @close="closeDelete">
       <div v-if="deleteTarget" class="delete-confirmation">
         <div class="delete-warning"><AlertTriangle :size="18" /><span>数据库中的项目、剧集及从属记录将被永久删除，此操作无法撤销；任务与装配指向的物理产物按存储保留和清理策略另行处置。存在活动任务、未终结远端提交或受保护审计与发行证据时，系统会拒绝删除。</span></div>
         <label class="field" for="delete-project-confirmation">

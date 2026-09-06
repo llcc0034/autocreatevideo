@@ -62,11 +62,6 @@ class SeriesProjectCoverAPITests(TestCase):
         self.override = override_settings(
             MEDIA_ROOT=self.media_root,
             ASSET_LIBRARY_ROOT=self.asset_root,
-            ASSET_UPLOAD_MAX_BYTES=1024 * 1024,
-            ASSET_TENANT_QUOTA_BYTES=10 * 1024 * 1024,
-            ASSET_IMAGE_MAX_WIDTH=1024,
-            ASSET_IMAGE_MAX_HEIGHT=1024,
-            ASSET_IMAGE_MAX_PIXELS=1024 * 1024,
         )
         self.override.enable()
         self.addCleanup(self.override.disable)
@@ -77,7 +72,7 @@ class SeriesProjectCoverAPITests(TestCase):
         self.other = get_user_model().objects.create_user(
             username="cover-other", password="StrongPass123!",
         )
-        self.project = SeriesProject.objects.create(owner=self.user, title="封面测试连续剧")
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="封面测试连续剧", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
@@ -130,12 +125,12 @@ class SeriesProjectCoverAPITests(TestCase):
 
     def test_cover_binding_is_tenant_and_project_scoped(self):
         asset, _ = self.upload_cover()
-        sibling = SeriesProject.objects.create(owner=self.user, title="同租户另一项目")
+        sibling = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="同租户另一项目", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         mismatch = self.bind_cover(sibling, asset)
         self.assertEqual(mismatch.status_code, 400, mismatch.data)
 
         self.client.force_authenticate(self.other)
-        other_project = SeriesProject.objects.create(owner=self.other, title="另一租户项目")
+        other_project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.other, title="另一租户项目", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         other_asset, _ = self.upload_cover(other_project, name="other.png")
         self.client.force_authenticate(self.user)
         cross_tenant = self.bind_cover(self.project, other_asset)
@@ -253,7 +248,7 @@ class SeriesProjectCoverAPITests(TestCase):
         self.assertFalse(Asset.objects.filter(pk=asset.pk).exists())
         self.assertFalse(path.exists())
 
-        project = SeriesProject.objects.create(owner=self.user, title="直接删除封面素材")
+        project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="直接删除封面素材", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         asset, _ = self.upload_cover(project, name="direct.png")
         self.assertEqual(self.bind_cover(project, asset).status_code, 200)
         path = Path(asset.file.path)
@@ -305,8 +300,8 @@ class SeriesProjectCoverAPITests(TestCase):
         )
         self.assertEqual(promoted.status_code, 400, promoted.data)
 
-        episode = Episode.objects.create(project=self.project, number=1, title="第一集")
-        shot = Shot.objects.create(
+        episode = Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=1, title="第一集")
+        shot = Shot.objects.create(include_audio=False,
             episode=episode,
             number=1,
             title="开场",
@@ -329,7 +324,7 @@ class SeriesProjectCoverAPITests(TestCase):
             self.client.get("/api/v1/projects/")
 
         for index in range(4):
-            project = SeriesProject.objects.create(owner=self.user, title=f"列表封面 {index}")
+            project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title=f"列表封面 {index}", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
             asset, _ = self.upload_cover(project, name=f"list-{index}.png")
             self.assertEqual(self.bind_cover(project, asset).status_code, 200)
         with CaptureQueriesContext(connection) as many_queries:

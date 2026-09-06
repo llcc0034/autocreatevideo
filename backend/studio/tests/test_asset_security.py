@@ -3,6 +3,7 @@ import hashlib
 from pathlib import Path
 import tempfile
 
+from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase, override_settings
 from django.urls import Resolver404, resolve
@@ -35,6 +36,10 @@ class AssetSecurityTests(TestCase):
         self.override.enable()
         self.addCleanup(self.override.disable)
         self.user, self.project, *_ = build_story()
+        self.config_admin = get_user_model().objects.create_superuser(
+            username="asset-security-config-admin",
+            password="StrongPass123!",
+        )
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
@@ -42,11 +47,11 @@ class AssetSecurityTests(TestCase):
         revision = create_config_revision(
             scope_type=ConfigRevision.ScopeType.SYSTEM,
             values=values,
-            created_by=self.user,
+            created_by=self.config_admin,
             change_summary="asset security test",
             clone_published=True,
         )
-        publish_config_revision(revision, published_by=self.user)
+        publish_config_revision(revision, published_by=self.config_admin)
 
     def test_non_staff_cannot_claim_server_local_path(self):
         candidate = self.asset_root / "global.png"

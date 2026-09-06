@@ -1,4 +1,5 @@
 from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.core.management import call_command
@@ -24,16 +25,36 @@ class RecoverInterruptedAssembliesCommandTests(TestCase):
             max_attempts=max_attempts,
         )
 
+    def test_omitted_stale_window_uses_runtime_configuration(self):
+        with (
+            patch(
+                "studio.management.commands.recover_interrupted_assemblies.resolve_configuration",
+                return_value=SimpleNamespace(values={
+                    "runtime.task_idle_timeout_seconds": 720,
+                }),
+            ) as resolve,
+            patch(
+                "studio.management.commands.recover_interrupted_assemblies.recover_stale_assemblies",
+                return_value={"succeeded": 0, "requeued": 0, "failed": 0},
+            ) as recover,
+        ):
+            call_command(
+                "recover_interrupted_assemblies",
+                reason="Configured restart",
+                stdout=StringIO(),
+            )
+
+        resolve.assert_called_once_with(required_keys=(
+            "runtime.task_idle_timeout_seconds",
+        ))
+        recover.assert_called_once_with(12.0, reason="Configured restart")
+
     def test_only_interrupted_running_jobs_are_recovered(self):
         running = self._job(
             status=AssemblyJob.Status.RUNNING, dry_run=False, attempts=1,
         )
         queued = self._job(status=AssemblyJob.Status.QUEUED, dry_run=False)
-        incomplete_legacy = self._job(status=AssemblyJob.Status.PLANNED, dry_run=False)
-        prepared_legacy = self._job(status=AssemblyJob.Status.PLANNED, dry_run=False)
-        prepared_legacy.output_path = "prepared.mp4"
-        prepared_legacy.ffmpeg_command = ["ffmpeg", "prepared.mp4"]
-        prepared_legacy.save(update_fields=("output_path", "ffmpeg_command", "updated_at"))
+        incomplete_plan = self._job(status=AssemblyJob.Status.PLANNED, dry_run=False)
         legitimate_plan = self._job(status=AssemblyJob.Status.PLANNED, dry_run=True)
         completed = self._job(status=AssemblyJob.Status.SUCCEEDED, dry_run=False)
         exhausted = self._job(
@@ -44,13 +65,13 @@ class RecoverInterruptedAssembliesCommandTests(TestCase):
         call_command(
             "recover_interrupted_assemblies",
             reason="Test process restart",
+            stale_minutes=0,
             stdout=output,
         )
 
         running.refresh_from_db()
         queued.refresh_from_db()
-        incomplete_legacy.refresh_from_db()
-        prepared_legacy.refresh_from_db()
+        incomplete_plan.refresh_from_db()
         legitimate_plan.refresh_from_db()
         completed.refresh_from_db()
         exhausted.refresh_from_db()
@@ -58,16 +79,13 @@ class RecoverInterruptedAssembliesCommandTests(TestCase):
         self.assertIsNone(running.finished_at)
         self.assertIn("Test process restart", running.error_message)
         self.assertEqual(queued.status, AssemblyJob.Status.QUEUED)
-        self.assertEqual(incomplete_legacy.status, AssemblyJob.Status.FAILED)
-        self.assertIn("no executable command", incomplete_legacy.error_message)
-        self.assertEqual(prepared_legacy.status, AssemblyJob.Status.QUEUED)
-        self.assertIn("legacy prepared job was queued", prepared_legacy.error_message)
+        self.assertEqual(incomplete_plan.status, AssemblyJob.Status.PLANNED)
         self.assertEqual(legitimate_plan.status, AssemblyJob.Status.PLANNED)
         self.assertEqual(completed.status, AssemblyJob.Status.SUCCEEDED)
         self.assertEqual(exhausted.status, AssemblyJob.Status.FAILED)
         self.assertIsNotNone(exhausted.finished_at)
         self.assertIn("retry limit reached", exhausted.error_message)
-        self.assertIn("Recovered 4 interrupted assembly job(s)", output.getvalue())
+        self.assertIn("Recovered 2 interrupted assembly job(s)", output.getvalue())
 
     def test_recovery_is_idempotent_and_does_not_rewrite_terminal_jobs(self):
         running = self._job(
@@ -81,6 +99,7 @@ class RecoverInterruptedAssembliesCommandTests(TestCase):
         call_command(
             "recover_interrupted_assemblies",
             reason="First restart",
+            stale_minutes=0,
             stdout=first_output,
         )
         running.refresh_from_db()
@@ -91,6 +110,7 @@ class RecoverInterruptedAssembliesCommandTests(TestCase):
         call_command(
             "recover_interrupted_assemblies",
             reason="Second restart",
+            stale_minutes=0,
             stdout=second_output,
         )
         running.refresh_from_db()
@@ -117,6 +137,7 @@ class RecoverInterruptedAssembliesCommandTests(TestCase):
             call_command(
                 "recover_interrupted_assemblies",
                 reason="Same clock tick restart",
+                stale_minutes=0,
                 stdout=StringIO(),
             )
 

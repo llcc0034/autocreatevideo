@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path, PureWindowsPath
 from typing import Any, Iterable
 
@@ -27,10 +28,15 @@ from studio.models import (
     SecretVersion,
 )
 from studio.services.json_contracts import (
+    DEFAULT_JSON_LIMIT_BYTES,
     canonical_json_bytes,
     find_sensitive_json_keys,
     json_contract,
     verify_json_contract,
+)
+from studio.services.registry_reference_lock import registry_reference_writer
+from studio.services.model_profile_contracts import (
+    verified_model_profile_specification,
 )
 from studio.services.provider_registry import credential_reference_digest
 
@@ -47,6 +53,18 @@ VIDEO_SHOT_DURATION_CONFIG_KEYS = (
     "production.video_shot_min_duration_ms",
     "production.video_shot_max_duration_ms",
 )
+
+PROJECT_CREATION_POLICY_CONFIG_KEYS = (
+    "production.project_creation_policy",
+    "production.default_resolution_width",
+    "production.default_resolution_height",
+    "production.default_shot_duration_ms",
+    "production.default_include_audio",
+)
+
+PROJECT_CREATION_POLICY_SCHEMA_VERSION = 2
+
+SECURITY_BOUNDARY_DOMAIN = "security"
 
 
 @dataclass(frozen=True)
@@ -103,7 +121,7 @@ def video_shot_duration_policy(
     default = int(raw_default)
     minimum = int(raw_minimum)
     maximum = int(raw_maximum)
-    if not 100 <= minimum <= default <= maximum:
+    if not 1 <= minimum <= default <= maximum:
         raise ConfigurationResolutionError(
             "视频分镜默认时长必须位于有效的最小/最大时长范围内",
             code="production_config_invalid",
@@ -112,6 +130,193 @@ def video_shot_duration_policy(
         "default_duration_ms": default,
         "minimum_duration_ms": minimum,
         "maximum_duration_ms": maximum,
+    }
+
+
+def project_creation_policy(
+    *,
+    values: dict[str, Any] | None = None,
+    project: SeriesProject | None = None,
+    run: ProductionRun | None = None,
+) -> dict[str, Any]:
+    """Resolve the single database-owned project and shot creation policy.
+
+    The object contract owns semantic defaults (language, aspect choices,
+    media kind, episode plan and seed policy).  Existing scalar configuration
+    remains authoritative for resolution, shot duration and audio so those
+    values are not duplicated inside the object contract.
+    """
+
+    if values is None:
+        values = resolve_configuration(
+            project=project,
+            run=run,
+            required_keys=PROJECT_CREATION_POLICY_CONFIG_KEYS,
+        ).values
+    missing = [key for key in PROJECT_CREATION_POLICY_CONFIG_KEYS if key not in values]
+    if missing:
+        raise ConfigurationResolutionError(
+            f"缺少必需配置: {', '.join(missing)}",
+            code="required_config_missing",
+            missing_keys=missing,
+        )
+    raw = values["production.project_creation_policy"]
+    required = {
+        "schema_version",
+        "default_language",
+        "default_aspect_ratio",
+        "aspect_ratio_options",
+        "fps",
+        "default_shot_media_type",
+        "default_episode_count",
+        "default_shots_per_episode",
+        "default_episode_duration_seconds",
+        "default_max_generation_tasks",
+        "continuity_seed_policy",
+    }
+    if (
+        not isinstance(raw, dict)
+        or set(raw) != required
+        or raw.get("schema_version") != PROJECT_CREATION_POLICY_SCHEMA_VERSION
+    ):
+        raise ConfigurationResolutionError(
+            "项目创建策略合同缺失、版本不受支持或包含未知字段",
+            code="project_creation_policy_invalid",
+            missing_keys=("production.project_creation_policy",),
+        )
+
+    default_language = raw["default_language"]
+    default_aspect_ratio = raw["default_aspect_ratio"]
+    default_shot_media_type = raw["default_shot_media_type"]
+    if (
+        not isinstance(default_language, str)
+        or not default_language.strip()
+        or len(default_language) > 32
+    ):
+        raise ConfigurationResolutionError(
+            "项目创建策略 default_language 必须是 1 到 32 字符",
+            code="project_creation_policy_invalid",
+        )
+    if default_shot_media_type not in {"video", "image"}:
+        raise ConfigurationResolutionError(
+            "项目创建策略 default_shot_media_type 无效",
+            code="project_creation_policy_invalid",
+        )
+
+    raw_options = raw["aspect_ratio_options"]
+    if not isinstance(raw_options, list) or not raw_options:
+        raise ConfigurationResolutionError(
+            "项目创建策略至少需要一个 aspect_ratio_options 选项",
+            code="project_creation_policy_invalid",
+        )
+    options: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for index, item in enumerate(raw_options):
+        if not isinstance(item, dict) or set(item) != {"value", "label"}:
+            raise ConfigurationResolutionError(
+                f"项目创建策略 aspect_ratio_options[{index}] 合同无效",
+                code="project_creation_policy_invalid",
+            )
+        value = str(item["value"] or "").strip()
+        label = str(item["label"] or "").strip()
+        if (
+            re.fullmatch(r"[1-9][0-9]{0,3}:[1-9][0-9]{0,3}", value) is None
+            or not label
+            or len(label) > 80
+            or value in seen
+        ):
+            raise ConfigurationResolutionError(
+                f"项目创建策略 aspect_ratio_options[{index}] 值、标签或唯一性无效",
+                code="project_creation_policy_invalid",
+            )
+        seen.add(value)
+        options.append({"value": value, "label": label})
+    if default_aspect_ratio not in seen:
+        raise ConfigurationResolutionError(
+            "项目创建策略 default_aspect_ratio 不在 aspect_ratio_options 中",
+            code="project_creation_policy_invalid",
+        )
+
+    integer_fields = (
+        "fps",
+        "default_episode_count",
+        "default_shots_per_episode",
+        "default_episode_duration_seconds",
+        "default_max_generation_tasks",
+    )
+    if any(type(raw[field]) is not int or raw[field] < 1 for field in integer_fields):
+        raise ConfigurationResolutionError(
+            "项目创建策略的数值默认项必须是正整数",
+            code="project_creation_policy_invalid",
+        )
+    width = values["production.default_resolution_width"]
+    height = values["production.default_resolution_height"]
+    duration = values["production.default_shot_duration_ms"]
+    include_audio = values["production.default_include_audio"]
+    if any(type(value) is not int or value < 1 for value in (width, height, duration)):
+        raise ConfigurationResolutionError(
+            "项目创建分辨率与镜头时长配置必须是正整数",
+            code="project_creation_policy_invalid",
+        )
+    if type(include_audio) is not bool:
+        raise ConfigurationResolutionError(
+            "production.default_include_audio 必须是布尔值",
+            code="project_creation_policy_invalid",
+        )
+
+    seed_policy = raw["continuity_seed_policy"]
+    if not isinstance(seed_policy, dict) or set(seed_policy) != {"mode", "value"}:
+        raise ConfigurationResolutionError(
+            "连续性种子策略无效",
+            code="project_creation_policy_invalid",
+        )
+    if seed_policy["mode"] not in {"random_per_project", "explicit"}:
+        raise ConfigurationResolutionError(
+            "连续性种子策略 mode 无效",
+            code="project_creation_policy_invalid",
+        )
+    if type(seed_policy["value"]) is not int or seed_policy["value"] < 1:
+        raise ConfigurationResolutionError(
+            "连续性种子策略 value 必须是正整数",
+            code="project_creation_policy_invalid",
+        )
+
+    long_edge = max(width, height)
+    resolved_options: list[dict[str, Any]] = []
+    for option in options:
+        if option["value"] == default_aspect_ratio:
+            option_width, option_height = width, height
+        else:
+            numerator, denominator = (
+                int(part) for part in option["value"].split(":", 1)
+            )
+            if numerator == denominator:
+                option_width = min(width, height)
+                option_height = min(width, height)
+            elif numerator > denominator:
+                option_width = long_edge
+                option_height = max(1, round(long_edge * denominator / numerator))
+            else:
+                option_height = long_edge
+                option_width = max(1, round(long_edge * numerator / denominator))
+        resolved_options.append({
+            **option,
+            "width": option_width,
+            "height": option_height,
+        })
+
+    return {
+        **{field: raw[field] for field in integer_fields},
+        "schema_version": PROJECT_CREATION_POLICY_SCHEMA_VERSION,
+        "default_language": default_language.strip(),
+        "default_aspect_ratio": default_aspect_ratio,
+        "aspect_ratio_options": resolved_options,
+        "default_shot_media_type": default_shot_media_type,
+        "default_include_audio": include_audio,
+        "default_shot_duration_ms": duration,
+        "width": width,
+        "height": height,
+        "continuity_seed_policy": dict(seed_policy),
     }
 
 
@@ -128,11 +333,30 @@ def redact_configuration_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def redact_sensitive_bindings(value: Any) -> Any:
+def redact_sensitive_bindings(
+    value: Any,
+    *,
+    _usage_max_count: int | None = None,
+) -> Any:
     """Defensively remove credential binding identifiers from API snapshots."""
 
+    if _usage_max_count is None:
+        resolved = resolve_security_boundaries(
+            required_keys=("security.prompt.max_usage_count",),
+        )
+        raw_maximum = resolved.values["security.prompt.max_usage_count"]
+        if type(raw_maximum) is not int or raw_maximum < 1:
+            raise ConfigurationResolutionError(
+                "安全边界 security.prompt.max_usage_count 必须是正整数",
+                code="security_boundary_value_invalid",
+                missing_keys=("security.prompt.max_usage_count",),
+            )
+        _usage_max_count = raw_maximum
     if isinstance(value, list):
-        return [redact_sensitive_bindings(item) for item in value]
+        return [
+            redact_sensitive_bindings(item, _usage_max_count=_usage_max_count)
+            for item in value
+        ]
     if not isinstance(value, dict):
         return value
     redacted = {}
@@ -148,7 +372,7 @@ def redact_sensitive_bindings(value: Any) -> Any:
                 }
                 and isinstance(raw, int)
                 and not isinstance(raw, bool)
-                and 0 <= raw <= 1_000_000_000
+                and 0 <= raw <= _usage_max_count
             }
             continue
         if normalized in {"credential_id", "credential_version", "credential_ref"}:
@@ -160,7 +384,10 @@ def redact_sensitive_bindings(value: Any) -> Any:
         if normalized != "credential_configured" and find_sensitive_json_keys({str(key): None}):
             redacted[f"{key}_configured"] = bool(item)
             continue
-        redacted[key] = redact_sensitive_bindings(item)
+        redacted[key] = redact_sensitive_bindings(
+            item,
+            _usage_max_count=_usage_max_count,
+        )
     return redacted
 
 
@@ -178,6 +405,81 @@ def _allowed_default_sources(definition: ConfigDefinition) -> set[str]:
         for item in str(definition.allowed_default_sources or "").split(",")
         if item.strip()
     }
+
+
+def _assert_security_definition_contract(definition: ConfigDefinition) -> None:
+    if definition.configuration_class != ConfigDefinition.ConfigurationClass.SECURITY_BOUNDARY:
+        raise ConfigurationResolutionError(
+            f"配置 {definition.key} 不是安全边界定义",
+            code="security_boundary_definition_invalid",
+            missing_keys=(definition.key,),
+        )
+    if (
+        definition.domain != SECURITY_BOUNDARY_DOMAIN
+        or _allowed_scopes(definition) != {ConfigRevision.ScopeType.SYSTEM}
+        or _allowed_default_sources(definition)
+        or not definition.is_required
+        or definition.is_secret
+        or not definition.is_active
+    ):
+        raise ConfigurationResolutionError(
+            f"安全边界定义 {definition.key} 的分类、作用域或必需属性无效",
+            code="security_boundary_definition_invalid",
+            missing_keys=(definition.key,),
+        )
+
+
+def resolve_security_boundaries(
+    *,
+    required_keys: Iterable[str],
+) -> ResolvedConfiguration:
+    """Resolve the currently active system-owned security envelope.
+
+    Security boundaries are intentionally not read from a ProductionRun
+    snapshot.  Tightening an active boundary must protect already queued work
+    at the next external-submit, download, parse, or ingest boundary.  Callers
+    should persist the returned revision/hash alongside their attempt evidence.
+    """
+
+    keys = tuple(sorted({str(item) for item in required_keys if str(item)}))
+    definitions = {
+        row.key: row
+        for row in ConfigDefinition.objects.filter(key__in=keys)
+    }
+    missing = sorted(set(keys) - set(definitions))
+    if missing:
+        raise ConfigurationResolutionError(
+            f"缺少安全边界定义: {', '.join(missing)}",
+            code="security_boundary_definition_missing",
+            missing_keys=missing,
+        )
+    for definition in definitions.values():
+        _assert_security_definition_contract(definition)
+    resolved = resolve_configuration(required_keys=keys)
+    invalid_sources = sorted(
+        key for key in keys
+        if (resolved.sources.get(key) or {}).get("source") != ConfigRevision.ScopeType.SYSTEM
+    )
+    if invalid_sources:
+        raise ConfigurationResolutionError(
+            "安全边界必须来自当前激活的 system revision: "
+            + ", ".join(invalid_sources),
+            code="security_boundary_source_invalid",
+            missing_keys=invalid_sources,
+        )
+    values = {key: resolved.values[key] for key in keys}
+    sources = {key: resolved.sources[key] for key in keys}
+    digest_payload = {
+        "values": values,
+        "sources": sources,
+        "revision_ids": list(resolved.revision_ids),
+    }
+    return ResolvedConfiguration(
+        values=values,
+        sources=sources,
+        revision_ids=resolved.revision_ids,
+        sha256=hashlib.sha256(canonical_json_bytes(digest_payload)).hexdigest(),
+    )
 
 
 def validate_config_override_values(
@@ -268,6 +570,12 @@ def validate_config_value(
         raise ValidationError({definition.key: f"值类型必须为 {expected}"})
 
     schema = definition.value_schema if isinstance(definition.value_schema, dict) else {}
+    if schema.get("closed_contract") is True:
+        _validate_closed_configuration_contract(
+            value,
+            schema,
+            definition_key=definition.key,
+        )
     if "enum" in schema and value not in schema["enum"]:
         raise ValidationError({definition.key: "值不在允许枚举中"})
     if type(value) in {int, float}:
@@ -282,6 +590,16 @@ def validate_config_value(
             raise ValidationError({definition.key: "字符串过长"})
         if schema.get("pattern") and re.fullmatch(str(schema["pattern"]), value) is None:
             raise ValidationError({definition.key: "字符串格式不符合约束"})
+        if schema.get("format") == "comfyui-saved-workflow-directory":
+            from studio.services.comfyui_workflow_library import (
+                SavedWorkflowDirectoryError,
+                normalize_saved_workflow_directory,
+            )
+
+            try:
+                normalize_saved_workflow_directory(value)
+            except SavedWorkflowDirectoryError as exc:
+                raise ValidationError({definition.key: str(exc)}) from exc
         resource_ref = schema.get("resource_ref")
         if resource_ref is not None:
             _validate_config_resource_reference(
@@ -293,6 +611,86 @@ def validate_config_value(
     if isinstance(value, (list, dict)) and "maxItems" in schema:
         if len(value) > int(schema["maxItems"]):
             raise ValidationError({definition.key: "集合元素数量超过上限"})
+
+
+def _validate_closed_configuration_contract(
+    value: Any,
+    schema: dict[str, Any],
+    *,
+    definition_key: str,
+    path: str = "",
+) -> None:
+    """Validate the closed JSON-schema subset used by versioned object contracts."""
+
+    label = definition_key if not path else f"{definition_key}.{path}"
+    expected = schema.get("type")
+    type_valid = {
+        "object": isinstance(value, dict),
+        "array": isinstance(value, list),
+        "string": isinstance(value, str),
+        "integer": isinstance(value, int) and not isinstance(value, bool),
+        "number": type(value) in {int, float},
+        "boolean": isinstance(value, bool),
+        "null": value is None,
+    }
+    if isinstance(expected, str) and expected in type_valid and not type_valid[expected]:
+        raise ValidationError({definition_key: f"{label} 类型必须为 {expected}"})
+    if isinstance(expected, list) and not any(type_valid.get(str(item), False) for item in expected):
+        raise ValidationError({definition_key: f"{label} 类型不符合合同"})
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValidationError({definition_key: f"{label} 不在允许枚举中"})
+    if type(value) in {int, float}:
+        if "minimum" in schema and value < schema["minimum"]:
+            raise ValidationError({definition_key: f"{label} 不能小于 {schema['minimum']}"})
+        if "maximum" in schema and value > schema["maximum"]:
+            raise ValidationError({definition_key: f"{label} 不能大于 {schema['maximum']}"})
+    if isinstance(value, str):
+        if "minLength" in schema and len(value) < int(schema["minLength"]):
+            raise ValidationError({definition_key: f"{label} 字符串长度不足"})
+        if "maxLength" in schema and len(value) > int(schema["maxLength"]):
+            raise ValidationError({definition_key: f"{label} 字符串过长"})
+        if schema.get("pattern") and re.fullmatch(str(schema["pattern"]), value) is None:
+            raise ValidationError({definition_key: f"{label} 字符串格式不符合约束"})
+    if isinstance(value, list):
+        if "minItems" in schema and len(value) < int(schema["minItems"]):
+            raise ValidationError({definition_key: f"{label} 集合元素不足"})
+        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+            raise ValidationError({definition_key: f"{label} 集合元素过多"})
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                child_path = f"{path}.{index}" if path else str(index)
+                _validate_closed_configuration_contract(
+                    item,
+                    item_schema,
+                    definition_key=definition_key,
+                    path=child_path,
+                )
+    if isinstance(value, dict):
+        properties = schema.get("properties")
+        if not isinstance(properties, dict):
+            raise ValidationError({definition_key: f"{label} 缺少 properties 合同"})
+        required = schema.get("required", [])
+        if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+            raise ValidationError({definition_key: f"{label}.required 合同无效"})
+        missing = sorted(set(required) - set(value))
+        if missing:
+            raise ValidationError({definition_key: f"{label} 缺少字段: {', '.join(missing)}"})
+        if schema.get("additionalProperties") is False:
+            extra = sorted(set(value) - set(properties))
+            if extra:
+                raise ValidationError({definition_key: f"{label} 包含未知字段: {', '.join(extra)}"})
+        for field, field_value in value.items():
+            field_schema = properties.get(field)
+            if not isinstance(field_schema, dict):
+                continue
+            child_path = f"{path}.{field}" if path else field
+            _validate_closed_configuration_contract(
+                field_value,
+                field_schema,
+                definition_key=definition_key,
+                path=child_path,
+            )
 
 
 def _validate_config_resource_reference(
@@ -441,7 +839,22 @@ def _revision_values_map(revision: ConfigRevision | None) -> dict[str, dict[str,
     }
 
 
-@transaction.atomic
+def _config_value_differs_from_baseline(
+    *,
+    value: Any,
+    credential_version_id: Any,
+    baseline: dict[str, Any] | None,
+) -> bool:
+    if baseline is None:
+        return True
+    baseline_credential = baseline.get("credential_version")
+    return (
+        baseline.get("value") != value
+        or getattr(baseline_credential, "pk", None) != credential_version_id
+    )
+
+
+@registry_reference_writer
 def create_config_revision(
     *,
     scope_type: str,
@@ -453,13 +866,27 @@ def create_config_revision(
     clone_published: bool = True,
     unset_keys: Iterable[str] = (),
 ) -> ConfigRevision:
+    unset_keys = tuple(str(key) for key in unset_keys)
+    explicitly_managed_keys = {str(key) for key in values} | {
+        key for key in unset_keys
+    }
+    if (
+        created_by is not None
+        and not getattr(created_by, "is_superuser", False)
+        and ConfigDefinition.objects.filter(
+            key__in=explicitly_managed_keys,
+            configuration_class=ConfigDefinition.ConfigurationClass.SECURITY_BOUNDARY,
+        ).exists()
+    ):
+        raise PermissionDenied("只有超级管理员可以修改安全边界配置")
     scope_kwargs = _scope_kwargs(scope_type, project=project, run=run)
     scope_rows = _scope_queryset(scope_type, project=project, run=run).select_for_update()
     current = scope_rows.filter(
         status=ConfigRevision.Status.PUBLISHED,
         activation_state=ConfigRevision.ActivationState.ACTIVE,
     ).first()
-    materialized = _revision_values_map(current) if clone_published else {}
+    baseline_materialized = _revision_values_map(current) if clone_published else {}
+    materialized = dict(baseline_materialized)
     for key, raw in values.items():
         materialized[str(key)] = (
             raw if isinstance(raw, dict) and bool(raw) and set(raw) <= {
@@ -522,7 +949,23 @@ def create_config_revision(
         credential_version = raw.get("credential_version")
         if credential_version is None:
             credential_version = _credential_version(raw.get("credential_id"))
-        validate_config_value(definition, value, credential_version)
+        resource_state_changed = _config_value_differs_from_baseline(
+            value=value,
+            credential_version_id=getattr(credential_version, "pk", None),
+            baseline=baseline_materialized.get(key),
+        )
+        validate_config_value(
+            definition,
+            value,
+            credential_version,
+            # A cloned revision carries immutable values that may have become
+            # temporarily unready since the active baseline was published.
+            # Only values that actually differ from the active baseline are
+            # new resource selections.  Inherited rows and explicit no-op
+            # submissions still receive type/schema/hash validation without
+            # turning an unrelated edit into a live deployment-health gate.
+            validate_resource_state=resource_state_changed,
+        )
         if definition.is_secret:
             contract_size, contract_sha = 0, ""
             digest_values[key] = {
@@ -530,7 +973,13 @@ def create_config_revision(
                 "credential_binding_sha256": credential_reference_digest(credential_version),
             }
         else:
-            contract = json_contract(value)
+            # Config revisions bootstrap the security-boundary registry itself;
+            # resolving a boundary here would recurse through _verify_revision.
+            # Individual config schemas keep these internal values small.
+            contract = json_contract(
+                value,
+                max_bytes=DEFAULT_JSON_LIMIT_BYTES,
+            )
             contract_size, contract_sha = contract.size_bytes, contract.sha256
             digest_values[key] = value
         rows.append(ConfigValue(
@@ -560,20 +1009,37 @@ def _verify_revision(
     Historical and active revisions must remain readable when referenced
     resources change lifecycle state.  Lifecycle gates opt into the live
     resource check explicitly; ordinary resolution verifies type/schema,
-    stored JSON contracts and the revision checksum only.
+    stored JSON contracts and the revision checksum only.  When a lifecycle
+    gate requests live resource validation, only references added or changed
+    relative to ``based_on_revision`` are checked; unchanged materialized rows
+    must not block an otherwise unrelated revision after their live evidence
+    expires.
     """
 
     resolved: dict[str, tuple[Any, ConfigValue]] = {}
     digest_values: dict[str, Any] = {}
+    baseline_values = (
+        _revision_values_map(revision.based_on_revision)
+        if validate_resource_state and revision.based_on_revision_id is not None
+        else {}
+    )
     for row in revision.values.select_related(
         "definition", "credential_version__binding",
     ).all():
         definition = row.definition
+        resource_state_changed = (
+            validate_resource_state
+            and _config_value_differs_from_baseline(
+                value=row.value,
+                credential_version_id=row.credential_version_id,
+                baseline=baseline_values.get(definition.key),
+            )
+        )
         validate_config_value(
             definition,
             row.value,
             row.credential_version,
-            validate_resource_state=validate_resource_state,
+            validate_resource_state=resource_state_changed,
         )
         if definition.is_secret:
             value = {
@@ -586,6 +1052,9 @@ def _verify_revision(
                 schema_version=row.value_schema_version,
                 size_bytes=row.value_size_bytes,
                 sha256=row.value_sha256,
+                # See create_config_revision: this is the bootstrap integrity
+                # path for the boundary registry, not a runtime payload.
+                max_bytes=DEFAULT_JSON_LIMIT_BYTES,
             )
             value = row.value
         resolved[definition.key] = (value, row)
@@ -649,12 +1118,13 @@ def _assert_effective_deadline_pairs(
         "runtime.task_idle_timeout_seconds",
         "production.task_timeout_seconds",
     )
-    current = resolve_configuration(
-        project=revision.project,
-        run=revision.run,
-        required_keys=keys,
-    ).values
-    candidate = dict(current)
+    if revision.scope_type == ConfigRevision.ScopeType.PROJECT:
+        candidate = dict(resolve_configuration(required_keys=keys).values)
+    else:
+        candidate = dict(resolve_configuration(
+            project=revision.project,
+            required_keys=keys,
+        ).values)
     candidate.update({key: value for key, (value, _row) in values.items()})
     for idle_key, hard_key in (
         ("workflow.smoke_idle_timeout_seconds", "workflow.smoke_hard_timeout_seconds"),
@@ -662,6 +1132,123 @@ def _assert_effective_deadline_pairs(
     ):
         if float(candidate[idle_key]) > float(candidate[hard_key]):
             raise ValidationError({idle_key: f"有效值不能大于 {hard_key}"})
+
+
+def _assert_security_ceiling_relations(
+    revision: ConfigRevision,
+    values: dict[str, tuple[Any, ConfigValue]],
+) -> None:
+    """Validate declarative standard-value -> security-envelope relations."""
+
+    if revision.scope_type == ConfigRevision.ScopeType.SYSTEM:
+        candidate = {key: value for key, (value, _row) in values.items()}
+    elif revision.scope_type == ConfigRevision.ScopeType.PROJECT:
+        candidate = dict(resolve_configuration().values)
+        candidate.update({key: value for key, (value, _row) in values.items()})
+    else:
+        candidate = dict(resolve_configuration(project=revision.project).values)
+        candidate.update({key: value for key, (value, _row) in values.items()})
+    _assert_effective_security_ceiling_values(candidate)
+
+
+def _numeric_not_above(value: Any, ceiling: Any) -> bool:
+    if type(value) is int and type(ceiling) is int:
+        return value <= ceiling
+    if type(value) not in {int, float} or type(ceiling) not in {int, float}:
+        return False
+    try:
+        normalized_value = Decimal(str(value))
+        normalized_ceiling = Decimal(str(ceiling))
+    except (InvalidOperation, ValueError):
+        return False
+    return (
+        normalized_value.is_finite()
+        and normalized_ceiling.is_finite()
+        and normalized_value <= normalized_ceiling
+    )
+
+
+def _security_ceiling_bindings(schema: dict[str, Any]) -> tuple[tuple[str, str], ...]:
+    """Return declarative value-path -> security-boundary bindings.
+
+    The empty path preserves the original scalar ``security_ceiling_key``
+    contract.  Object-valued configuration uses ``security_ceiling_paths`` so
+    nested runtime policy remains data driven rather than consumer-specific.
+    """
+
+    bindings: list[tuple[str, str]] = []
+    scalar = str(schema.get("security_ceiling_key") or "").strip()
+    if scalar:
+        bindings.append(("", scalar))
+    nested = schema.get("security_ceiling_paths")
+    if nested is None:
+        return tuple(bindings)
+    if not isinstance(nested, dict):
+        raise ValidationError("security_ceiling_paths 必须是字段路径到安全边界键的对象")
+    for raw_path, raw_key in nested.items():
+        path = str(raw_path or "").strip()
+        ceiling_key = str(raw_key or "").strip()
+        parts = path.split(".") if path else []
+        if (
+            not parts
+            or any(not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", part) for part in parts)
+            or not ceiling_key
+        ):
+            raise ValidationError("security_ceiling_paths 包含无效字段路径或安全边界键")
+        bindings.append((path, ceiling_key))
+    return tuple(bindings)
+
+
+def _configured_path_value(value: Any, path: str) -> Any:
+    current = value
+    for part in path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            raise KeyError(path)
+        current = current[part]
+    return current
+
+
+def _assert_effective_security_ceiling_values(values: dict[str, Any]) -> None:
+    """Reject an effective configuration that exceeds its current envelope."""
+
+    definitions = {
+        row.key: row
+        for row in ConfigDefinition.objects.filter(
+            key__in=values,
+            is_active=True,
+        )
+    }
+    for key, value in values.items():
+        definition = definitions.get(key)
+        if definition is None:
+            continue
+        schema = definition.value_schema if isinstance(definition.value_schema, dict) else {}
+        try:
+            bindings = _security_ceiling_bindings(schema)
+        except ValidationError as exc:
+            raise ValidationError({key: str(exc)}) from exc
+        for path, ceiling_key in bindings:
+            ceiling_definition = definitions.get(ceiling_key)
+            if ceiling_definition is None:
+                ceiling_definition = ConfigDefinition.objects.filter(key=ceiling_key).first()
+            if ceiling_definition is None:
+                raise ValidationError({key: f"引用的安全边界 {ceiling_key} 不存在"})
+            try:
+                _assert_security_definition_contract(ceiling_definition)
+            except ConfigurationResolutionError as exc:
+                raise ValidationError({key: str(exc)}) from exc
+            if ceiling_key not in values:
+                raise ValidationError({key: f"缺少安全边界值 {ceiling_key}"})
+            try:
+                effective_value = value if not path else _configured_path_value(value, path)
+            except KeyError as exc:
+                raise ValidationError({key: f"安全边界字段路径不存在: {path}"}) from exc
+            ceiling = values[ceiling_key]
+            if not _numeric_not_above(effective_value, ceiling):
+                label = key if not path else f"{key}.{path}"
+                raise ValidationError({
+                    key: f"{label} 必须小于或等于当前安全边界 {ceiling_key}={ceiling}",
+                })
 
 
 def revision_changes_secret_bindings(
@@ -693,6 +1280,34 @@ def revision_changes_secret_bindings(
     return current != previous
 
 
+def revision_changes_security_boundaries(
+    revision: ConfigRevision,
+    *,
+    baseline: ConfigRevision | None = None,
+) -> bool:
+    """Return whether a materialized revision changes any protected limit."""
+
+    if baseline is None:
+        baseline = revision.based_on_revision
+    current = {
+        row.definition_id: (row.value, row.value_sha256)
+        for row in revision.values.select_related("definition").filter(
+            definition__configuration_class=(
+                ConfigDefinition.ConfigurationClass.SECURITY_BOUNDARY
+            ),
+        )
+    }
+    previous = {
+        row.definition_id: (row.value, row.value_sha256)
+        for row in baseline.values.select_related("definition").filter(
+            definition__configuration_class=(
+                ConfigDefinition.ConfigurationClass.SECURITY_BOUNDARY
+            ),
+        )
+    } if baseline is not None else {}
+    return current != previous
+
+
 def _assert_secret_revision_actor(
     revision: ConfigRevision,
     *,
@@ -712,6 +1327,20 @@ def _assert_secret_revision_actor(
         and revision_changes_secret_bindings(revision, baseline=baseline)
     ):
         raise PermissionDenied("只有超级管理员可以发布或激活敏感配置绑定变更")
+
+
+def _assert_security_revision_actor(
+    revision: ConfigRevision,
+    *,
+    baseline: ConfigRevision | None,
+    actor,
+) -> None:
+    if (
+        actor is not None
+        and not getattr(actor, "is_superuser", False)
+        and revision_changes_security_boundaries(revision, baseline=baseline)
+    ):
+        raise PermissionDenied("只有超级管理员可以发布或激活安全边界变更")
 
 
 def _clear_satisfied_migration_reviews(
@@ -735,6 +1364,7 @@ def publish_config_revision(revision: ConfigRevision, *, published_by) -> Config
         values = _verify_revision(revision, validate_resource_state=True)
         _assert_required_system_values(revision, values)
         _assert_effective_deadline_pairs(revision, values)
+        _assert_security_ceiling_relations(revision, values)
         scope_qs = _scope_queryset(
             revision.scope_type,
             project=revision.project,
@@ -750,6 +1380,11 @@ def publish_config_revision(revision: ConfigRevision, *, published_by) -> Config
                 code="stale_config_base",
             )
         _assert_secret_revision_actor(
+            revision,
+            baseline=active,
+            actor=published_by,
+        )
+        _assert_security_revision_actor(
             revision,
             baseline=active,
             actor=published_by,
@@ -861,10 +1496,24 @@ def _validate_activation_value(definition: ConfigDefinition, value: Any) -> None
 
 
 def activate_config_revision(revision: ConfigRevision, *, activated_by) -> ConfigRevision:
+    # Permission checks must precede validation because the failure path below
+    # persists activation_error.  An unauthorized staff user must not be able
+    # to mutate a protected pending revision by intentionally triggering it.
+    _assert_secret_revision_actor(
+        revision,
+        baseline=revision.based_on_revision,
+        actor=activated_by,
+    )
+    _assert_security_revision_actor(
+        revision,
+        baseline=revision.based_on_revision,
+        actor=activated_by,
+    )
     try:
         verified = _verify_revision(revision, validate_resource_state=True)
         _assert_required_system_values(revision, verified)
         _assert_deadline_pairs(verified)
+        _assert_security_ceiling_relations(revision, verified)
         for value, row in verified.values():
             if row.definition.restart_required and not row.definition.is_secret:
                 _validate_activation_value(row.definition, value)
@@ -918,6 +1567,11 @@ def activate_config_revision(revision: ConfigRevision, *, activated_by) -> Confi
                 baseline=active,
                 actor=activated_by,
             )
+            _assert_security_revision_actor(
+                locked,
+                baseline=active,
+                actor=activated_by,
+            )
             now = timezone.now()
             scope_qs.filter(
                 activation_state=ConfigRevision.ActivationState.ACTIVE,
@@ -948,13 +1602,9 @@ def _version_defaults(
     sources: dict[str, dict[str, Any]] = {}
     entries: list[tuple[str, object, dict[str, Any], str, int, str]] = []
     if model_profile_version is not None:
-        verify_json_contract(
-            model_profile_version.specification,
-            schema_version=model_profile_version.specification_schema_version,
-            size_bytes=model_profile_version.specification_size_bytes,
-            sha256=model_profile_version.specification_sha256,
+        specification = verified_model_profile_specification(
+            model_profile_version,
         )
-        specification = model_profile_version.specification or {}
         entries.append((
             "model", model_profile_version,
             specification.get("config_defaults") or {},
@@ -962,11 +1612,16 @@ def _version_defaults(
             model_profile_version.specification_sha256,
         ))
     if workflow_version is not None:
+        # Delayed import avoids configuration <-> security-boundary bootstrap
+        # recursion while still applying the workflow's configured graph cap.
+        from studio.services.security_boundaries import boundary_int
+
         verify_json_contract(
             workflow_version.input_contract,
             schema_version=workflow_version.input_contract_schema_version,
             size_bytes=workflow_version.input_contract_size_bytes,
             sha256=workflow_version.input_contract_sha256,
+            max_bytes=boundary_int("security.workflow.max_graph_bytes"),
         )
         contract = workflow_version.input_contract or {}
         entries.append((
@@ -1053,6 +1708,67 @@ def resolve_configuration_from_snapshot(
         raise ConfigurationResolutionError("冻结基础配置无效", code="base_config_snapshot_invalid")
     values = {**defaults, **base_values}
     sources = {**default_sources, **base_sources}
+    ceiling_keys: set[str] = set()
+    for definition in ConfigDefinition.objects.filter(
+        key__in=values,
+        is_active=True,
+    ):
+        schema = definition.value_schema if isinstance(definition.value_schema, dict) else {}
+        try:
+            ceiling_keys.update(
+                ceiling_key
+                for _path, ceiling_key in _security_ceiling_bindings(schema)
+            )
+        except ValidationError as exc:
+            raise ConfigurationResolutionError(
+                f"配置 {definition.key} 的安全边界声明无效: {exc}",
+                code="security_boundary_schema_invalid",
+                missing_keys=(definition.key,),
+            ) from exc
+    current_security_revision_id = ""
+    if ceiling_keys:
+        system = ConfigRevision.objects.filter(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            status=ConfigRevision.Status.PUBLISHED,
+            activation_state=ConfigRevision.ActivationState.ACTIVE,
+        ).first()
+        if system is None:
+            raise ConfigurationResolutionError(
+                "当前没有激活的 system 安全边界 revision",
+                code="security_boundary_revision_missing",
+                missing_keys=ceiling_keys,
+            )
+        verified_system = _verify_revision(system)
+        for ceiling_key in sorted(ceiling_keys):
+            definition = ConfigDefinition.objects.filter(key=ceiling_key).first()
+            if definition is None:
+                raise ConfigurationResolutionError(
+                    f"缺少安全边界定义 {ceiling_key}",
+                    code="security_boundary_definition_missing",
+                    missing_keys=(ceiling_key,),
+                )
+            _assert_security_definition_contract(definition)
+            if ceiling_key not in verified_system:
+                raise ConfigurationResolutionError(
+                    f"当前 system revision 缺少安全边界 {ceiling_key}",
+                    code="security_boundary_value_missing",
+                    missing_keys=(ceiling_key,),
+                )
+            value, _row = verified_system[ceiling_key]
+            values[ceiling_key] = value
+            sources[ceiling_key] = {
+                "source": ConfigRevision.ScopeType.SYSTEM,
+                "id": str(system.id),
+                "scope": ConfigRevision.ScopeType.SYSTEM,
+                "source_type": ConfigRevision.ScopeType.SYSTEM,
+                "source_id": str(system.id),
+                "version": system.revision,
+                "revision": system.revision,
+                "revision_id": str(system.id),
+                "hash": system.values_sha256,
+                "sha256": system.values_sha256,
+            }
+        current_security_revision_id = str(system.id)
     required = {str(item) for item in (required_keys or ())}
     missing = sorted(required - set(values))
     if missing:
@@ -1061,7 +1777,22 @@ def resolve_configuration_from_snapshot(
             code="required_config_missing",
             missing_keys=missing,
         )
-    revision_ids = tuple(str(item) for item in (base_snapshot.get("revision_ids") or []))
+    try:
+        _assert_effective_security_ceiling_values(values)
+    except ValidationError as exc:
+        raise ConfigurationResolutionError(
+            str(exc),
+            code="security_boundary_exceeded",
+        ) from exc
+    revision_ids_list = [
+        str(item) for item in (base_snapshot.get("revision_ids") or [])
+    ]
+    if (
+        current_security_revision_id
+        and current_security_revision_id not in revision_ids_list
+    ):
+        revision_ids_list.append(current_security_revision_id)
+    revision_ids = tuple(revision_ids_list)
     digest = hashlib.sha256(canonical_json_bytes({
         "values": values,
         "sources": sources,
@@ -1145,6 +1876,13 @@ def resolve_configuration(
             code="required_config_missing",
             missing_keys=missing,
         )
+    try:
+        _assert_effective_security_ceiling_values(values)
+    except ValidationError as exc:
+        raise ConfigurationResolutionError(
+            str(exc),
+            code="security_boundary_exceeded",
+        ) from exc
     digest_payload = {
         "values": values,
         "sources": sources,

@@ -1,3 +1,4 @@
+import json
 from unittest.mock import patch
 
 from django.urls import reverse
@@ -16,7 +17,6 @@ from studio.services.canonical_glossary import validate_canonical_english
 from studio.services.prompt_translation import (
     build_translation_context,
     PromptTranslationError,
-    PromptTranslationResourceBusy,
     TRANSLATION_CONTEXT_VERSION,
     source_text_hash,
     TranslationResult,
@@ -224,8 +224,8 @@ class CanonicalGlossaryApiTests(TestCase):
         self.assertEqual(self.project.production_settings["translation_glossary"], {"林默": "Lin Mo"})
 
     @patch("studio.services.canonical_glossary.translate_texts_once")
-    def test_qwen_lease_busy_is_a_retryable_row_not_an_http_failure(self, translate):
-        translate.side_effect = PromptTranslationResourceBusy(
+    def test_provider_resource_busy_is_a_retryable_row_not_an_http_failure(self, translate):
+        translate.side_effect = PromptTranslationError(
             "共享计算资源正忙", code="translation_resource_busy",
         )
 
@@ -704,6 +704,93 @@ class CanonicalGlossaryApiTests(TestCase):
         self.assertEqual(entry.source_text, self.prop.visual_identity)
         self.assertEqual(entry.source_hash, source_text_hash(self.prop.visual_identity))
 
+    @patch("studio.services.canonical_glossary.translate_texts_once")
+    def test_full_model_context_is_not_truncated_and_advisories_are_audited(self, translate):
+        long_description = ("完整描述" * 220) + "描述末端"
+        long_visual = "玄纹剑" + ("银色暗纹" * 220) + "视觉末端"
+        long_source = "长术语" + ("甲" * 170)
+        long_value = "LongCanonicalTerm" + ("A" * 170)
+        glossary = {
+            f"术语{index}": f"Canonical Term {index}"
+            for index in range(80)
+        }
+        glossary[long_source] = long_value
+        self.project.production_settings = {"translation_glossary": glossary}
+        self.project.save(update_fields=("production_settings", "updated_at"))
+        self.prop.description = long_description
+        self.prop.visual_identity = long_visual
+        self.prop.save(update_fields=(
+            "description", "visual_identity", "updated_at",
+        ))
+
+        def translate_both(_texts, **kwargs):
+            visual_context = json.loads(kwargs["contexts"][1])
+            token = visual_context["canonical_identity_tokens"][0]["token"]
+            return [
+                translated("Xuanwen Sword"),
+                translated(f"The {token} has a complete silver patterned blade."),
+            ]
+
+        translate.side_effect = translate_both
+        payload = self.selectors(self.prop)
+        payload["ensure_visual_identity_translation"] = True
+
+        response = self.client.post(self.url, payload, format="json")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        call = translate.call_args
+        proper_context = json.loads(call.kwargs["contexts"][0])
+        visual_context = json.loads(call.kwargs["contexts"][1])
+        self.assertEqual(proper_context["entity"]["description"], long_description)
+        self.assertEqual(proper_context["entity"]["visual_identity"], long_visual)
+        self.assertEqual(
+            proper_context["existing_canonical_glossary"][long_source],
+            long_value,
+        )
+        self.assertEqual(len(proper_context["existing_canonical_glossary"]), 81)
+        self.assertEqual(
+            visual_context["entity_description_reference"],
+            long_description,
+        )
+        self.assertEqual(
+            visual_context["canonical_glossary_at_inference"][long_source],
+            long_value,
+        )
+        self.assertIn("视觉末端", call.args[0][1])
+
+        advisory_codes = {
+            item["code"]
+            for item in response.data["runtime"]["canonical_context_advisories"]
+        }
+        self.assertTrue({
+            "proper_name_glossary_entries_above_advisory",
+            "visual_identity_glossary_entries_above_advisory",
+            "description_characters_above_advisory",
+            "visual_identity_characters_above_advisory",
+            "glossary_term_characters_above_advisory",
+        } <= advisory_codes)
+        self.assertTrue(
+            response.data["runtime"]["canonical_policy_resolution_sha256"],
+        )
+        rows = PromptFieldTranslation.objects.filter(
+            project=self.project,
+            scope_type="prop",
+            scope_id=self.prop.pk,
+        )
+        self.assertEqual(rows.count(), 2)
+        for row in rows:
+            self.assertEqual(
+                row.runtime_metadata["canonical_context_policy"]["schema_version"],
+                1,
+            )
+            self.assertEqual(
+                {
+                    item["code"]
+                    for item in row.runtime_metadata["canonical_context_advisories"]
+                },
+                advisory_codes,
+            )
+
     def test_foreign_or_missing_entity_returns_non_leaking_conflict(self):
         _, foreign_project, foreign_character, *_ = build_story("canonical-foreign")
 
@@ -723,17 +810,40 @@ class CanonicalGlossaryApiTests(TestCase):
         self.assertEqual(response.status_code, 400)
 
     @patch("studio.services.canonical_glossary.translate_texts_once")
-    def test_visual_request_rejects_more_than_fifty_selected_entities(self, translate):
-        response = self.client.post(self.url, {
-            "entries": [{
-                "scope_type": "prop", "scope_id": str(self.prop.pk),
-            } for _ in range(51)],
-            "ensure_visual_identity_translation": True,
-        }, format="json")
+    def test_ordinary_entity_and_runtime_capacities_warn_without_blocking(self, translate):
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.PROJECT,
+            project=self.project,
+            values={
+                "production.canonical_name_policy": {
+                    "schema_version": 1,
+                    "max_characters": 80,
+                    "max_words": 8,
+                    "max_entities_per_request": 1,
+                    "max_entities_with_visual_identity_translation": 1,
+                    "max_runtime_items_per_request": 1,
+                },
+            },
+            created_by=self.user,
+        )
+        publish_config_revision(revision, published_by=self.user)
+        translate.return_value = [translated("Lin Mo"), translated("Xuanwen Sword")]
 
-        self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("50", str(response.data))
-        translate.assert_not_called()
+        response = self.client.post(
+            self.url,
+            self.selectors(self.character, self.prop),
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(translate.call_count, 1)
+        self.assertEqual(response.data["summary"]["generated"], 2)
+        advisory_codes = {
+            item["code"]
+            for item in response.data["runtime"]["canonical_context_advisories"]
+        }
+        self.assertIn("canonical_entity_count_above_advisory", advisory_codes)
+        self.assertIn("canonical_runtime_item_count_above_advisory", advisory_codes)
 
     @patch("studio.services.canonical_glossary.translate_texts_once")
     def test_visual_backfill_rejects_runtime_batch_over_safe_limit(self, translate):
@@ -751,7 +861,7 @@ class CanonicalGlossaryApiTests(TestCase):
         }, format="json")
 
         self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("50", str(response.data))
+        self.assertIn("100", str(response.data))
         translate.assert_not_called()
 
 

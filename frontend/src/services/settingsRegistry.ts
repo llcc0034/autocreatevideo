@@ -1,5 +1,6 @@
 import type { ConfigDefinition, JsonObject } from './platformTypes'
 import { parseConfigValue } from './configValueSchema'
+import { scopeLabel } from './presentationLabels'
 
 export interface SystemConfigDraftInput {
   definitions: ConfigDefinition[]
@@ -40,5 +41,5 @@ export const effectiveSourceLabel = (source: {
 } | undefined): string => {
   if (!source) return '未解析'
   const origin = source.source || source.scope || 'unknown'
-  return source.revision ? `${origin} · revision ${source.revision}` : origin
+  return source.revision ? `${scopeLabel(origin)} · 修订版本（revision）${source.revision}` : scopeLabel(origin)
 }

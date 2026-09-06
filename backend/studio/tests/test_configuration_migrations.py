@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 
+from django.core.management import call_command
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TransactionTestCase
@@ -10,28 +12,95 @@ from django.utils import timezone
 
 
 class _MigrationTestCase(TransactionTestCase):
+    # Migration tests deliberately move the shared test database away from the
+    # leaf schema.  Django flushes TransactionTestCase data after ``tearDown``;
+    # restoring the serialized leaf data on the next case preserves data-
+    # migration seeds that a flush cannot replay by itself.
+    serialized_rollback = True
+
     migrate_from: str
     migrate_to: str
+    bootstrap_from: str = ""
+    migrate_to_in_setup = True
+
+    @classmethod
+    def _fixture_setup(cls):
+        # A regular TransactionTestCase flush emits post_migrate and therefore
+        # recreates django_content_type/auth_permission rows.  Deserializing
+        # Django's leaf-schema snapshot on top of those rows raises their
+        # uniqueness constraints when a serialized migration test follows a
+        # regular transaction test.  Start snapshot restoration from an empty
+        # database and inhibit post_migrate so the snapshot remains the only
+        # source of the baseline rows.
+        for db_name in cls._databases_names(include_mirrors=False):
+            call_command(
+                "flush",
+                verbosity=0,
+                interactive=False,
+                database=db_name,
+                reset_sequences=False,
+                inhibit_post_migrate=True,
+            )
+        super()._fixture_setup()
 
     def setUp(self):
         super().setUp()
+        self._leaf_sqlite_snapshot = None
+        if connection.vendor == "sqlite":
+            connection.ensure_connection()
+            self._leaf_sqlite_snapshot = sqlite3.connect(":memory:")
+            connection.connection.backup(self._leaf_sqlite_snapshot)
+        # Cleanups also run when setUp or the test body fails, so no following
+        # test observes a historical schema.
+        self.addCleanup(self._restore_leaf_schema)
         executor = MigrationExecutor(connection)
+        if self.bootstrap_from:
+            executor.migrate([("studio", self.bootstrap_from)])
+            executor = MigrationExecutor(connection)
         executor.migrate([("studio", self.migrate_from)])
         old_apps = executor.loader.project_state([
             ("studio", self.migrate_from),
         ]).apps
         self.set_up_before_migration(old_apps)
 
-        executor = MigrationExecutor(connection)
-        executor.migrate([("studio", self.migrate_to)])
-        self.apps = executor.loader.project_state([
-            ("studio", self.migrate_to),
-        ]).apps
+        if self.migrate_to_in_setup:
+            executor = MigrationExecutor(connection)
+            executor.migrate([("studio", self.migrate_to)])
+            self.apps = executor.loader.project_state([
+                ("studio", self.migrate_to),
+            ]).apps
+        else:
+            self.apps = old_apps
 
-    def tearDown(self):
+    def _restore_leaf_schema(self):
+        if self._leaf_sqlite_snapshot is not None:
+            snapshot = self._leaf_sqlite_snapshot
+            self._leaf_sqlite_snapshot = None
+            try:
+                raw_connection = connection.connection
+                if raw_connection.in_transaction:
+                    raw_connection.rollback()
+                snapshot.backup(raw_connection)
+            finally:
+                snapshot.close()
+            return
+
+        # Backends without SQLite's page-level backup use the conservative
+        # path: discard every historical fixture before rebuilding the studio
+        # migration graph.  This is intentionally slower, but no fixture data
+        # is allowed to cross later fail-closed RunPython migrations.
+        call_command(
+            "flush",
+            verbosity=0,
+            interactive=False,
+            database=connection.alias,
+            reset_sequences=False,
+            inhibit_post_migrate=True,
+        )
+        executor = MigrationExecutor(connection)
+        executor.migrate([("studio", None)])
         executor = MigrationExecutor(connection)
         executor.migrate(executor.loader.graph.leaf_nodes())
-        super().tearDown()
 
     def set_up_before_migration(self, apps):
         raise NotImplementedError
@@ -283,3 +352,947 @@ class ExactPromptBindingCapabilityMigrationTests(_MigrationTestCase):
         self.assertEqual(audit.reason_code, "exact_model_capability_missing")
         self.assertTrue(audit.before_summary["is_active"])
         self.assertFalse(audit.after_summary["is_active"])
+
+
+class PromptFieldValidationRetryPolicyMigrationTests(_MigrationTestCase):
+    migrate_from = "0069_h3_ref2va_official_prompt_sources"
+    migrate_to = "0070_prompt_field_validation_retry_policy"
+
+    def set_up_before_migration(self, apps):
+        ConfigDefinition = apps.get_model("studio", "ConfigDefinition")
+        ConfigRevision = apps.get_model("studio", "ConfigRevision")
+        ConfigValue = apps.get_model("studio", "ConfigValue")
+        ConfigValue.objects.filter(
+            definition__key="production.prompt_field_retry_limit",
+        ).delete()
+        ConfigDefinition.objects.filter(
+            key="production.prompt_field_retry_limit",
+        ).delete()
+        preserved_value = {"kept": True}
+        preserved_schema = {"type": "object"}
+        preserved_value_bytes = json.dumps(
+            preserved_value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        preserved_schema_bytes = json.dumps(
+            preserved_schema,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        preserved_definition, _ = ConfigDefinition.objects.get_or_create(
+            key="test.migration_preserved_value",
+            defaults={
+                "domain": "test",
+                "value_type": "object",
+                "description": "Migration fixture that must survive revision cloning.",
+                "allowed_scopes": "system",
+                "is_required": True,
+                "is_active": True,
+                "value_schema": preserved_schema,
+                "value_schema_version": 1,
+                "value_schema_size_bytes": len(preserved_schema_bytes),
+                "value_schema_sha256": hashlib.sha256(preserved_schema_bytes).hexdigest(),
+                "initial_value": preserved_value,
+                "initial_value_schema_version": 1,
+                "initial_value_size_bytes": len(preserved_value_bytes),
+                "initial_value_sha256": hashlib.sha256(preserved_value_bytes).hexdigest(),
+            },
+        )
+        active = ConfigRevision.objects.filter(
+            scope_type="system",
+            status="published",
+            activation_state="active",
+        ).order_by("-revision").first()
+        if active is None:
+            next_revision = (
+                ConfigRevision.objects.filter(scope_type="system")
+                .order_by("-revision")
+                .values_list("revision", flat=True)
+                .first()
+                or 0
+            ) + 1
+            active = ConfigRevision.objects.create(
+                scope_type="system",
+                revision=next_revision,
+                status="published",
+                activation_state="active",
+                activated_at=timezone.now(),
+                published_at=timezone.now(),
+                values_sha256="0" * 64,
+                change_summary="Prompt retry migration test baseline",
+            )
+        ConfigValue.objects.get_or_create(
+            revision=active,
+            definition=preserved_definition,
+            defaults={
+                "value": preserved_value,
+                "value_schema_version": 1,
+                "value_size_bytes": len(preserved_value_bytes),
+                "value_sha256": hashlib.sha256(preserved_value_bytes).hexdigest(),
+            },
+        )
+        self.previous_active_id = active.id
+        self.previous_value_count = ConfigValue.objects.filter(
+            revision=active,
+        ).count()
+
+    def test_definition_and_active_revision_are_created_without_losing_values(self):
+        ConfigDefinition = self.apps.get_model("studio", "ConfigDefinition")
+        ConfigRevision = self.apps.get_model("studio", "ConfigRevision")
+        ConfigValue = self.apps.get_model("studio", "ConfigValue")
+        definition = ConfigDefinition.objects.get(
+            key="production.prompt_field_retry_limit",
+        )
+        self.assertEqual(definition.domain, "production")
+        self.assertEqual(definition.value_type, "integer")
+        self.assertEqual(definition.initial_value, 2)
+        self.assertEqual(definition.value_schema, {"minimum": 0, "maximum": 5})
+        self.assertEqual(definition.allowed_scopes, "system,project,run")
+        self.assertFalse(definition.restart_required)
+
+        previous = ConfigRevision.objects.get(pk=self.previous_active_id)
+        active = ConfigRevision.objects.get(
+            scope_type="system",
+            activation_state="active",
+        )
+        self.assertEqual(previous.status, "superseded")
+        self.assertEqual(active.based_on_revision_id, previous.id)
+        self.assertEqual(
+            ConfigValue.objects.filter(revision=active).count(),
+            self.previous_value_count + 1,
+        )
+        preserved = ConfigValue.objects.get(
+            revision=active,
+            definition__key="test.migration_preserved_value",
+        )
+        self.assertEqual(preserved.value, {"kept": True})
+        value = ConfigValue.objects.get(
+            revision=active,
+            definition=definition,
+        )
+        self.assertEqual(value.value, 2)
+        expected = json.dumps(2, separators=(",", ":")).encode("utf-8")
+        self.assertEqual(value.value_size_bytes, len(expected))
+        self.assertEqual(value.value_sha256, hashlib.sha256(expected).hexdigest())
+
+
+class H3Ref2VAPromptProfileV2MigrationTests(_MigrationTestCase):
+    migrate_from = "0071_prompt_profile_field_generation_contract"
+    migrate_to = "0072_upgrade_h3_ref2va_prompt_profile_v2"
+
+    def set_up_before_migration(self, apps):
+        Profile = apps.get_model("studio", "PromptProfileVersion")
+        Rule = apps.get_model("studio", "PromptProfileFieldRule")
+        Field = apps.get_model("studio", "PromptFieldDefinition")
+        Binding = apps.get_model("studio", "PromptProfileBinding")
+        profile = Profile.objects.create(
+            profile_key="minimax_h3.video.ref2va",
+            version=4,
+            name="H3 Ref2VA v4",
+            model_family="minimax_h3",
+            operation="video.generate",
+            mode="Ref2VA",
+            status="published",
+            review_state="ready",
+            contract_schema_version=1,
+            contract_size_bytes=2,
+            contract_sha256="a" * 64,
+            published_at=timezone.now(),
+        )
+        specs = (
+            ("subject_definitions", "request.h3_ref2va.subject_definitions", "label_block"),
+            ("summary", "request.h3_ref2va.summary", "label_colon"),
+            ("retention_analysis", "request.h3_ref2va.retention_analysis", "label_block"),
+            ("detailed_description", "request.h3_ref2va.detailed_description", "label_block"),
+            ("overall_soundscape", "request.h3_ref2va.overall_soundscape", "label_colon"),
+            ("non_diegetic_music", "request.h3_ref2va.non_diegetic_music", "label_colon"),
+        )
+        for position, (field_key, selector, label_style) in enumerate(specs, start=1):
+            definition, _created = Field.objects.get_or_create(
+                key=field_key,
+                defaults={
+                    "label": field_key,
+                    "category": "prompt",
+                    "description": "Migration fixture field",
+                    "impact": "Migration fixture impact",
+                    "value_type": "long_text",
+                    "default_value": None,
+                    "value_options": [],
+                    "is_required": False,
+                    "is_active": True,
+                    "display_order": position,
+                },
+            )
+            Rule.objects.create(
+                profile_version=profile,
+                field_definition=definition,
+                source_selector=selector,
+                channel="positive_prompt",
+                position=position,
+                label_style=label_style,
+                separator="newline",
+                required=True,
+                omit_if_empty=False,
+                max_chars=7000,
+                generation_source_selector=selector,
+            )
+        Binding.objects.create(
+            key="minimax-h3-ref2va-official-v4",
+            name="H3 Ref2VA v4",
+            operation="video.generate",
+            model_family="minimax_h3",
+            mode="Ref2VA",
+            prompt_profile_version=profile,
+            priority=100,
+            is_active=True,
+        )
+
+    def test_v5_is_published_with_configured_layer_two_rules_and_binding(self):
+        Profile = self.apps.get_model("studio", "PromptProfileVersion")
+        Binding = self.apps.get_model("studio", "PromptProfileBinding")
+        profile = Profile.objects.get(
+            profile_key="minimax_h3.video.ref2va",
+            version=5,
+        )
+        self.assertEqual(profile.contract_schema_version, 2)
+        self.assertEqual(profile.status, "published")
+        self.assertEqual(
+            profile.source_projection_key,
+            "classified_reference_context_ir_v1",
+        )
+        rules = list(
+            profile.field_rules.select_related("field_definition")
+            .order_by("position", "id")
+        )
+        self.assertEqual(
+            [rule.generation_mode for rule in rules],
+            ["server_locked"] * 3 + ["model_generated"] * 3,
+        )
+        self.assertEqual(
+            [rule.generation_output_semantics for rule in rules],
+            ["final"] * 3 + ["contribution"] * 3,
+        )
+        self.assertEqual(
+            [rule.generation_source_selector for rule in rules[3:]],
+            ["shot.detailed_description", "shot.sound_effects", "shot.music"],
+        )
+        self.assertEqual(
+            [(rule.generation_min, rule.generation_max) for rule in rules[3:]],
+            [(140, 220), (1, 80), (1, 60)],
+        )
+        contract = {
+            "schema_version": 2,
+            "profile_key": profile.profile_key,
+            "version": profile.version,
+            "model_family": profile.model_family,
+            "operation": profile.operation,
+            "mode": profile.mode,
+            "source_projection_key": profile.source_projection_key,
+            "rules": [{
+                "field_key": rule.field_definition.key,
+                "field_value_type": rule.field_definition.value_type,
+                "field_default_value": rule.field_definition.default_value,
+                "field_value_options": rule.field_definition.value_options,
+                "field_required": rule.field_definition.is_required,
+                "source_selector": rule.source_selector,
+                "channel": rule.channel,
+                "position": rule.position,
+                "label_style": rule.label_style,
+                "separator": rule.separator,
+                "required": rule.required,
+                "omit_if_empty": rule.omit_if_empty,
+                "max_chars": rule.max_chars,
+                "generation_mode": rule.generation_mode,
+                "generation_source_selector": rule.generation_source_selector,
+                "generation_instruction": rule.generation_instruction,
+                "generation_output_semantics": rule.generation_output_semantics,
+                "generation_required": rule.generation_required,
+                "language_policy": rule.language_policy,
+                "length_unit": rule.length_unit,
+                "generation_min": rule.generation_min,
+                "generation_max": rule.generation_max,
+                "generation_validator_keys": rule.generation_validator_keys,
+            } for rule in rules],
+        }
+        encoded = json.dumps(
+            contract,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        self.assertEqual(profile.contract_size_bytes, len(encoded))
+        self.assertEqual(profile.contract_sha256, hashlib.sha256(encoded).hexdigest())
+        self.assertFalse(Binding.objects.get(
+            key="minimax-h3-ref2va-official-v4",
+        ).is_active)
+        self.assertTrue(Binding.objects.get(
+            key="minimax-h3-ref2va-official-v5",
+        ).is_active)
+
+
+class PromptProfileChannelLimitsV3MigrationTests(_MigrationTestCase):
+    migrate_from = "0075_generic_prompt_language_gate_config"
+    migrate_to = "0076_prompt_profile_channel_limits_v3"
+
+    @staticmethod
+    def _contract(value):
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return len(encoded), hashlib.sha256(encoded).hexdigest()
+
+    @staticmethod
+    def _profile_contract(profile, rules, *, schema_version, channel_limits=None):
+        contract = {
+            "schema_version": schema_version,
+            "profile_key": profile.profile_key,
+            "version": profile.version,
+            "model_family": profile.model_family,
+            "operation": profile.operation,
+            "mode": profile.mode,
+            "source_projection_key": profile.source_projection_key,
+            "rules": [{
+                "field_key": rule.field_definition.key,
+                "field_value_type": rule.field_definition.value_type,
+                "field_default_value": rule.field_definition.default_value,
+                "field_value_options": rule.field_definition.value_options,
+                "field_required": rule.field_definition.is_required,
+                "source_selector": rule.source_selector,
+                "channel": rule.channel,
+                "position": rule.position,
+                "label_style": rule.label_style,
+                "separator": rule.separator,
+                "required": rule.required,
+                "omit_if_empty": rule.omit_if_empty,
+                "max_chars": rule.max_chars,
+                "generation_mode": rule.generation_mode,
+                "generation_source_selector": rule.generation_source_selector,
+                "generation_instruction": rule.generation_instruction,
+                "generation_output_semantics": rule.generation_output_semantics,
+                "generation_required": rule.generation_required,
+                "language_policy": rule.language_policy,
+                "length_unit": rule.length_unit,
+                "generation_min": rule.generation_min,
+                "generation_max": rule.generation_max,
+                "generation_validator_keys": rule.generation_validator_keys,
+            } for rule in rules],
+        }
+        if schema_version >= 3:
+            contract["channel_limits"] = channel_limits or {}
+        return contract
+
+    def set_up_before_migration(self, apps):
+        Profile = apps.get_model("studio", "PromptProfileVersion")
+        Rule = apps.get_model("studio", "PromptProfileFieldRule")
+        Field = apps.get_model("studio", "PromptFieldDefinition")
+        Binding = apps.get_model("studio", "PromptProfileBinding")
+
+        profile = Profile.objects.create(
+            profile_key="minimax_h3.video.ref2va",
+            version=6,
+            name="H3 Ref2VA frozen v6",
+            model_family="minimax_h3",
+            operation="video.generate",
+            mode="Ref2VA",
+            source_projection_key="classified_reference_context_ir_v1",
+            status="published",
+            review_state="ready",
+            contract_schema_version=2,
+            contract_size_bytes=2,
+            contract_sha256="",
+            published_at=timezone.now(),
+        )
+        specs = (
+            (
+                "subject_definitions",
+                "request.h3_ref2va.subject_definitions",
+                "label_block",
+                "server_locked",
+                "final",
+                "none",
+                None,
+                None,
+            ),
+            (
+                "summary",
+                "request.h3_ref2va.summary",
+                "label_colon",
+                "server_locked",
+                "final",
+                "none",
+                None,
+                None,
+            ),
+            (
+                "retention_analysis",
+                "request.h3_ref2va.retention_analysis",
+                "label_block",
+                "server_locked",
+                "final",
+                "none",
+                None,
+                None,
+            ),
+            (
+                "detailed_description",
+                "request.h3_ref2va.detailed_description",
+                "label_block",
+                "model_generated",
+                "contribution",
+                "english_words",
+                140,
+                220,
+            ),
+            (
+                "overall_soundscape",
+                "request.h3_ref2va.overall_soundscape",
+                "label_colon",
+                "model_generated",
+                "contribution",
+                "characters",
+                1,
+                80,
+            ),
+            (
+                "non_diegetic_music",
+                "request.h3_ref2va.non_diegetic_music",
+                "label_colon",
+                "model_generated",
+                "contribution",
+                "characters",
+                1,
+                60,
+            ),
+        )
+        generation_sources = {
+            "detailed_description": "shot.detailed_description",
+            "overall_soundscape": "shot.sound_effects",
+            "non_diegetic_music": "shot.music",
+        }
+        for position, spec in enumerate(specs, start=1):
+            (
+                field_key,
+                source_selector,
+                label_style,
+                generation_mode,
+                output_semantics,
+                length_unit,
+                generation_min,
+                generation_max,
+            ) = spec
+            definition, _created = Field.objects.get_or_create(
+                key=field_key,
+                defaults={
+                    "label": field_key,
+                    "category": "prompt",
+                    "description": "Migration fixture field",
+                    "impact": "Migration fixture impact",
+                    "value_type": "long_text",
+                    "default_value": None,
+                    "value_options": [],
+                    "is_required": False,
+                    "is_active": True,
+                    "display_order": position,
+                },
+            )
+            Rule.objects.create(
+                profile_version=profile,
+                field_definition=definition,
+                source_selector=source_selector,
+                channel="positive_prompt",
+                position=position,
+                label_style=label_style,
+                separator="newline",
+                required=True,
+                omit_if_empty=False,
+                max_chars=7000,
+                generation_mode=generation_mode,
+                generation_source_selector=generation_sources.get(field_key, ""),
+                generation_instruction=f"Generate {field_key}",
+                generation_output_semantics=output_semantics,
+                generation_required=generation_mode == "model_generated",
+                language_policy="inherit",
+                length_unit=length_unit,
+                generation_min=generation_min,
+                generation_max=generation_max,
+                generation_validator_keys=[],
+            )
+        rules = list(
+            Rule.objects.filter(profile_version_id=profile.id)
+            .select_related("field_definition")
+            .order_by("position", "id")
+        )
+        size, sha256 = self._contract(self._profile_contract(
+            profile,
+            rules,
+            schema_version=2,
+        ))
+        Profile.objects.filter(pk=profile.pk).update(
+            contract_size_bytes=size,
+            contract_sha256=sha256,
+        )
+        Binding.objects.create(
+            key="minimax-h3-ref2va-official-v6",
+            name="H3 Ref2VA frozen v6",
+            operation="video.generate",
+            model_family="minimax_h3",
+            mode="Ref2VA",
+            prompt_profile_version=profile,
+            priority=100,
+            is_active=True,
+        )
+        self.source_profile_id = profile.id
+        self.source_contract_size = size
+        self.source_contract_sha256 = sha256
+
+    def test_v7_adds_channel_contract_without_rewriting_frozen_v6(self):
+        Profile = self.apps.get_model("studio", "PromptProfileVersion")
+        Binding = self.apps.get_model("studio", "PromptProfileBinding")
+
+        source = Profile.objects.get(pk=self.source_profile_id)
+        self.assertEqual(source.version, 6)
+        self.assertEqual(source.contract_schema_version, 2)
+        self.assertEqual(source.contract_size_bytes, self.source_contract_size)
+        self.assertEqual(source.contract_sha256, self.source_contract_sha256)
+        self.assertEqual(source.channel_limits, {})
+
+        target = Profile.objects.get(
+            profile_key="minimax_h3.video.ref2va",
+            version=7,
+        )
+        self.assertEqual(target.status, "published")
+        self.assertEqual(target.contract_schema_version, 3)
+        self.assertEqual(target.channel_limits, {
+            "positive_prompt": {
+                "max_chars": 7000,
+                "warn_at_chars": 6200,
+            },
+        })
+        rules = list(
+            target.field_rules.select_related("field_definition")
+            .order_by("position", "id")
+        )
+        detail = next(
+            rule for rule in rules
+            if rule.field_definition.key == "detailed_description"
+        )
+        self.assertEqual(detail.length_unit, "english_words")
+        self.assertEqual(detail.generation_min, 350)
+        self.assertEqual(detail.generation_max, 500)
+        size, sha256 = self._contract(self._profile_contract(
+            target,
+            rules,
+            schema_version=3,
+            channel_limits=target.channel_limits,
+        ))
+        self.assertEqual(target.contract_size_bytes, size)
+        self.assertEqual(target.contract_sha256, sha256)
+        self.assertFalse(Binding.objects.get(
+            key="minimax-h3-ref2va-official-v6",
+        ).is_active)
+        self.assertTrue(Binding.objects.get(
+            key="minimax-h3-ref2va-official-v7",
+        ).is_active)
+
+
+class PromptProfileStaticReferencePolicyV4MigrationTests(_MigrationTestCase):
+    migrate_from = "0076_prompt_profile_channel_limits_v3"
+    migrate_to = "0077_prompt_profile_static_reference_policy_v4"
+
+    @staticmethod
+    def _contract(value):
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return len(encoded), hashlib.sha256(encoded).hexdigest()
+
+    def set_up_before_migration(self, apps):
+        Profile = apps.get_model("studio", "PromptProfileVersion")
+        Rule = apps.get_model("studio", "PromptProfileFieldRule")
+        Field = apps.get_model("studio", "PromptFieldDefinition")
+        Binding = apps.get_model("studio", "PromptProfileBinding")
+        profile = Profile.objects.create(
+            profile_key="z-image.bible.reference",
+            version=1,
+            name="Z-Image Bible reference v1",
+            model_family="z-image",
+            operation="image.generate",
+            mode="",
+            source_projection_key="direct_v1",
+            channel_limits={},
+            status="published",
+            review_state="ready",
+            contract_schema_version=3,
+            contract_size_bytes=2,
+            contract_sha256="a" * 64,
+            published_at=timezone.now(),
+        )
+        for position, (key, selector, channel) in enumerate((
+            ("subject", "request.subject", "positive_prompt"),
+            ("theme", "request.theme", "positive_prompt"),
+            ("composition", "request.composition", "positive_prompt"),
+            ("environment", "request.environment", "positive_prompt"),
+            ("lighting", "request.lighting", "positive_prompt"),
+            ("color_palette", "request.color_palette", "positive_prompt"),
+            ("visual_style", "request.style", "positive_prompt"),
+            ("negative_constraints", "request.negative_constraints", "negative_prompt"),
+        ), start=1):
+            definition, _created = Field.objects.get_or_create(
+                key=key,
+                defaults={
+                    "label": key,
+                    "category": "migration",
+                    "description": "Static reference migration fixture",
+                    "impact": "Static reference migration fixture",
+                    "value_type": "long_text",
+                    "default_value": None,
+                    "value_options": [],
+                    "is_required": False,
+                    "is_active": True,
+                    "display_order": position,
+                },
+            )
+            Rule.objects.create(
+                profile_version=profile,
+                field_definition=definition,
+                source_selector=selector,
+                channel=channel,
+                position=position,
+                label_style="label_colon",
+                separator="newline",
+                required=position <= 3,
+                omit_if_empty=True,
+                max_chars=4000,
+                generation_mode="passthrough",
+                generation_source_selector=selector,
+                generation_instruction="",
+                generation_output_semantics="final",
+                generation_required=False,
+                language_policy="inherit",
+                length_unit="none",
+                generation_min=None,
+                generation_max=None,
+                generation_validator_keys=[],
+            )
+        Binding.objects.create(
+            key="z-image-turbo-bible-v1",
+            name="Z-Image Bible v1",
+            operation="image.generate",
+            model_family="z-image",
+            mode="",
+            prompt_profile_version=profile,
+            priority=200,
+            is_active=True,
+        )
+        h3 = Profile.objects.create(
+            profile_key="minimax_h3.video.ref2va",
+            version=7,
+            name="H3 Ref2VA v7 migration fixture",
+            model_family="minimax_h3",
+            operation="video.generate",
+            mode="Ref2VA",
+            source_projection_key="classified_reference_context_ir_v1",
+            channel_limits={
+                "positive_prompt": {
+                    "max_chars": 7000,
+                    "warn_at_chars": 6200,
+                },
+            },
+            status="published",
+            review_state="ready",
+            contract_schema_version=3,
+            contract_size_bytes=2,
+            contract_sha256="b" * 64,
+            published_at=timezone.now(),
+        )
+        h3_specs = (
+            (
+                "subject_definitions",
+                "request.h3_ref2va.subject_definitions",
+                "label_block",
+                "server_locked",
+                "final",
+                "none",
+                None,
+                None,
+            ),
+            (
+                "summary",
+                "request.h3_ref2va.summary",
+                "label_colon",
+                "server_locked",
+                "final",
+                "none",
+                None,
+                None,
+            ),
+            (
+                "retention_analysis",
+                "request.h3_ref2va.retention_analysis",
+                "label_block",
+                "server_locked",
+                "final",
+                "none",
+                None,
+                None,
+            ),
+            (
+                "detailed_description",
+                "request.h3_ref2va.detailed_description",
+                "label_block",
+                "model_generated",
+                "contribution",
+                "english_words",
+                350,
+                500,
+            ),
+            (
+                "overall_soundscape",
+                "request.h3_ref2va.overall_soundscape",
+                "label_colon",
+                "model_generated",
+                "contribution",
+                "characters",
+                1,
+                80,
+            ),
+            (
+                "non_diegetic_music",
+                "request.h3_ref2va.non_diegetic_music",
+                "label_colon",
+                "model_generated",
+                "contribution",
+                "characters",
+                1,
+                60,
+            ),
+        )
+        for position, (
+            key,
+            selector,
+            label_style,
+            generation_mode,
+            output_semantics,
+            length_unit,
+            generation_min,
+            generation_max,
+        ) in enumerate(h3_specs, start=1):
+            definition, _created = Field.objects.get_or_create(
+                key=key,
+                defaults={
+                    "label": key,
+                    "category": "migration",
+                    "description": "H3 migration fixture",
+                    "impact": "H3 migration fixture",
+                    "value_type": "long_text",
+                    "default_value": None,
+                    "value_options": [],
+                    "is_required": False,
+                    "is_active": True,
+                    "display_order": position,
+                },
+            )
+            Rule.objects.create(
+                profile_version=h3,
+                field_definition=definition,
+                source_selector=selector,
+                channel="positive_prompt",
+                position=position,
+                label_style=label_style,
+                separator="newline",
+                required=True,
+                omit_if_empty=False,
+                max_chars=7000,
+                generation_mode=generation_mode,
+                generation_source_selector=selector,
+                generation_instruction=(
+                    f"Generate {key}" if generation_mode == "model_generated" else ""
+                ),
+                generation_output_semantics=output_semantics,
+                generation_required=generation_mode == "model_generated",
+                language_policy="inherit",
+                length_unit=length_unit,
+                generation_min=generation_min,
+                generation_max=generation_max,
+                generation_validator_keys=[],
+            )
+        Binding.objects.create(
+            key="minimax-h3-ref2va-official-v7",
+            name="H3 Ref2VA v7",
+            operation="video.generate",
+            model_family="minimax_h3",
+            mode="Ref2VA",
+            prompt_profile_version=h3,
+            priority=100,
+            is_active=True,
+        )
+        self.source_profile_id = profile.id
+
+    def test_v2_freezes_static_initial_policy_and_switches_binding(self):
+        Profile = self.apps.get_model("studio", "PromptProfileVersion")
+        Binding = self.apps.get_model("studio", "PromptProfileBinding")
+
+        source = Profile.objects.get(pk=self.source_profile_id)
+        self.assertEqual(source.version, 1)
+        self.assertEqual(source.source_projection_config, {})
+        target = Profile.objects.get(
+            profile_key="z-image.bible.reference",
+            version=2,
+        )
+        self.assertEqual(target.contract_schema_version, 4)
+        self.assertEqual(target.status, "published")
+        policy = target.source_projection_config["static_reference_policy"]
+        self.assertEqual(policy["snapshot_selector"], "initial")
+        self.assertFalse(policy["allow_context"]["default"])
+        self.assertTrue(policy["allow_context"]["target_overrides"]["scene"])
+        self.assertEqual(policy["violation_action"], "block")
+        rules = list(
+            target.field_rules.select_related("field_definition")
+            .order_by("position", "id")
+        )
+        contract = {
+            "schema_version": 4,
+            "profile_key": target.profile_key,
+            "version": target.version,
+            "model_family": target.model_family,
+            "operation": target.operation,
+            "mode": target.mode,
+            "source_projection_key": target.source_projection_key,
+            "channel_limits": target.channel_limits,
+            "source_projection_config": target.source_projection_config,
+            "rules": [{
+                "field_key": rule.field_definition.key,
+                "field_value_type": rule.field_definition.value_type,
+                "field_default_value": rule.field_definition.default_value,
+                "field_value_options": rule.field_definition.value_options,
+                "field_required": rule.field_definition.is_required,
+                "source_selector": rule.source_selector,
+                "channel": rule.channel,
+                "position": rule.position,
+                "label_style": rule.label_style,
+                "separator": rule.separator,
+                "required": rule.required,
+                "omit_if_empty": rule.omit_if_empty,
+                "max_chars": rule.max_chars,
+                "generation_mode": rule.generation_mode,
+                "generation_source_selector": rule.generation_source_selector,
+                "generation_instruction": rule.generation_instruction,
+                "generation_output_semantics": rule.generation_output_semantics,
+                "generation_required": rule.generation_required,
+                "language_policy": rule.language_policy,
+                "length_unit": rule.length_unit,
+                "generation_min": rule.generation_min,
+                "generation_max": rule.generation_max,
+                "generation_validator_keys": rule.generation_validator_keys,
+            } for rule in rules],
+        }
+        size, sha256 = self._contract(contract)
+        self.assertEqual(target.contract_size_bytes, size)
+        self.assertEqual(target.contract_sha256, sha256)
+        self.assertFalse(Binding.objects.get(
+            key="z-image-turbo-bible-v1",
+        ).is_active)
+        self.assertTrue(Binding.objects.get(
+            key="z-image-turbo-bible-v2",
+        ).is_active)
+
+    def test_h3_v8_only_advances_contract_schema_and_active_binding(self):
+        Profile = self.apps.get_model("studio", "PromptProfileVersion")
+        Binding = self.apps.get_model("studio", "PromptProfileBinding")
+        source = Profile.objects.get(
+            profile_key="minimax_h3.video.ref2va",
+            version=7,
+        )
+        target = Profile.objects.get(
+            profile_key="minimax_h3.video.ref2va",
+            version=8,
+        )
+        self.assertEqual(target.contract_schema_version, 4)
+        self.assertEqual(target.source_projection_config, {})
+        for field in (
+            "name",
+            "description",
+            "model_family",
+            "operation",
+            "mode",
+            "source_projection_key",
+            "official_reference",
+            "channel_limits",
+            "review_state",
+        ):
+            self.assertEqual(getattr(target, field), getattr(source, field))
+        source_rules = list(
+            source.field_rules.order_by("position", "id").values(
+                "field_definition_id",
+                "source_selector",
+                "channel",
+                "position",
+                "label_style",
+                "separator",
+                "required",
+                "omit_if_empty",
+                "max_chars",
+                "generation_mode",
+                "generation_source_selector",
+                "generation_instruction",
+                "generation_output_semantics",
+                "generation_required",
+                "language_policy",
+                "length_unit",
+                "generation_min",
+                "generation_max",
+                "generation_validator_keys",
+            )
+        )
+        target_rules = list(
+            target.field_rules.order_by("position", "id").values(
+                "field_definition_id",
+                "source_selector",
+                "channel",
+                "position",
+                "label_style",
+                "separator",
+                "required",
+                "omit_if_empty",
+                "max_chars",
+                "generation_mode",
+                "generation_source_selector",
+                "generation_instruction",
+                "generation_output_semantics",
+                "generation_required",
+                "language_policy",
+                "length_unit",
+                "generation_min",
+                "generation_max",
+                "generation_validator_keys",
+            )
+        )
+        self.assertEqual(target_rules, source_rules)
+        self.assertFalse(Binding.objects.get(
+            key="minimax-h3-ref2va-official-v7",
+        ).is_active)
+        target_binding = Binding.objects.get(
+            key="minimax-h3-ref2va-official-v8",
+        )
+        self.assertTrue(target_binding.is_active)
+        self.assertEqual(
+            Binding.objects.filter(
+                operation=target_binding.operation,
+                model_family=target_binding.model_family,
+                mode=target_binding.mode,
+                model_profile_version_id=target_binding.model_profile_version_id,
+                is_active=True,
+            ).count(),
+            1,
+        )

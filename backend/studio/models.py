@@ -247,17 +247,18 @@ class PlatformLifecycleAuditEvent(UUIDTimeStampedModel):
         "category", "channel", "contract_sha256", "field_definition_id",
         "graph_sha256", "initial_value_sha256", "input_contract_sha256",
         "is_active", "is_current", "is_default", "is_required", "is_secret",
-        "is_system", "key", "modality", "model_profile_version_id",
+        "is_system", "key", "locator_sha256", "modality", "model_profile_version_id",
         "profile_key", "profile_version_id", "project_id", "provider_id",
+        "configuration_class",
         "prompt_profile_version_id", "review_state", "source_selector",
         "published_at", "recipe_key", "restart_required", "revision", "run_id",
         "role", "runtime_config_sha256", "runtime_host_id", "scope_type", "sha256",
         "size_bytes",
         "smoke_test_evidence_sha256", "smoke_test_state", "specification_sha256",
-        "status", "template_id", "validation_evidence_sha256",
+        "status", "template_id", "validated_deployment_id", "validation_evidence_sha256",
         "validation_state", "value_schema_sha256", "value_type", "values_sha256", "verified_at",
         "verified_snapshot_id", "version", "position", "model_family", "mode",
-        "operation", "priority",
+        "operation", "output_kind", "priority", "engine_key", "engine_version", "projector_id",
     })
 
     actor = models.ForeignKey(
@@ -373,6 +374,7 @@ class Asset(UUIDTimeStampedModel):
         REFERENCE_VIDEO = "reference_video", "参考视频"
         REFERENCE_AUDIO = "reference_audio", "参考音频"
         AUDIO = "audio", "音频"
+        SCRIPT = "script", "剧本"
         OUTPUT_IMAGE = "output_image", "生成图片"
         OUTPUT_VIDEO = "output_video", "生成视频"
 
@@ -382,6 +384,11 @@ class Asset(UUIDTimeStampedModel):
     name = models.CharField(max_length=160)
     description = models.TextField(blank=True)
     prompt_hint = models.TextField(blank=True)
+    source_info = models.CharField(
+        max_length=1000,
+        blank=True,
+        help_text="面向素材库用户的来源说明；系统生成素材由服务端写入并保留机器 provenance。",
+    )
     file = models.FileField(upload_to=asset_upload_path, blank=True)
     local_path = models.CharField(max_length=1000, blank=True)
     reference_url = models.URLField(max_length=1000, blank=True)
@@ -419,14 +426,16 @@ class SeriesProject(UUIDTimeStampedModel):
         on_delete=models.SET_NULL,
         related_name="cover_projects",
     )
-    target_model = models.CharField(max_length=80, default="minimax-h3")
-    language = models.CharField(max_length=32, default="Chinese")
-    aspect_ratio = models.CharField(max_length=16, default="9:16")
-    width = models.PositiveIntegerField(default=768)
-    height = models.PositiveIntegerField(default=1344)
-    fps = models.PositiveSmallIntegerField(default=24, validators=[MinValueValidator(1), MaxValueValidator(120)])
-    default_shot_duration_ms = models.PositiveIntegerField(default=5000, validators=[MinValueValidator(100)])
-    continuity_seed = models.BigIntegerField(default=20260808)
+    target_model = models.CharField(max_length=80, blank=True, default="")
+    language = models.CharField(max_length=32)
+    aspect_ratio = models.CharField(max_length=16)
+    width = models.PositiveIntegerField()
+    height = models.PositiveIntegerField()
+    fps = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
+    default_shot_duration_ms = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+    )
+    continuity_seed = models.BigIntegerField()
     continuity_summary = models.TextField(blank=True)
     production_settings = models.JSONField(default=dict, blank=True)
     completed_at = models.DateTimeField(null=True, blank=True)
@@ -568,13 +577,6 @@ class Shot(UUIDTimeStampedModel):
         VIDEO = "video", "视频"
         IMAGE = "image", "图片"
 
-    class H3Mode(models.TextChoices):
-        T2VA = "T2VA", "Text-to-video with audio"
-        I2VA = "I2VA", "Image-to-video with audio"
-        FL2VA = "FL2VA", "First/last frame-to-video with audio"
-        L2VA = "L2VA", "Last-frame-to-video with audio"
-        REF2VA = "Ref2VA", "Reference-to-video with audio"
-
     episode = models.ForeignKey(Episode, on_delete=models.CASCADE, related_name="shots")
     number = models.PositiveIntegerField()
     title = models.CharField(max_length=200, blank=True)
@@ -591,10 +593,17 @@ class Shot(UUIDTimeStampedModel):
     dialogue = models.JSONField(default=list, blank=True, help_text='[{"speaker_id":"S1","text":"..."}]')
     sound_effects = models.TextField(blank=True)
     music = models.TextField(blank=True)
-    duration_ms = models.PositiveIntegerField(default=5000, validators=[MinValueValidator(100)])
-    media_type = models.CharField(max_length=12, choices=MediaType.choices, default=MediaType.VIDEO)
-    h3_mode = models.CharField(max_length=12, choices=H3Mode.choices, default=H3Mode.T2VA)
-    include_audio = models.BooleanField(default=True)
+    duration_ms = models.PositiveIntegerField(
+        validators=[MinValueValidator(1)],
+    )
+    media_type = models.CharField(max_length=12, choices=MediaType.choices)
+    conditioning_mode = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        validators=[RegexValidator(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")],
+    )
+    include_audio = models.BooleanField()
     scene = models.ForeignKey(SceneBible, null=True, blank=True, on_delete=models.SET_NULL, related_name="shots")
     characters = models.ManyToManyField(CharacterBible, blank=True, related_name="shots")
     props = models.ManyToManyField(PropBible, blank=True, related_name="shots")
@@ -641,12 +650,17 @@ class PromptArtifact(UUIDTimeStampedModel):
     prompt_profile_binding_key = models.CharField(max_length=120, blank=True)
     prompt_profile_contract_sha256 = models.CharField(max_length=64, blank=True)
     prompt_type = models.CharField(max_length=12, choices=PromptType.choices)
-    model = models.CharField(max_length=80, default="minimax-h3")
-    h3_mode = models.CharField(max_length=12, choices=Shot.H3Mode.choices, default=Shot.H3Mode.T2VA)
+    model = models.CharField(max_length=80, blank=True, default="")
+    conditioning_mode = models.CharField(
+        max_length=64,
+        blank=True,
+        default="",
+        validators=[RegexValidator(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")],
+    )
     revision = models.PositiveIntegerField(default=1)
-    is_multi_shot = models.BooleanField(default=False)
-    include_audio = models.BooleanField(default=True)
-    total_duration_ms = models.PositiveIntegerField(default=3500)
+    is_multi_shot = models.BooleanField()
+    include_audio = models.BooleanField()
+    total_duration_ms = models.PositiveIntegerField()
     prompt_text = models.TextField()
     negative_prompt = models.TextField(blank=True)
     structured_payload = models.JSONField(default=dict)
@@ -735,347 +749,19 @@ class PromptFieldTranslation(UUIDTimeStampedModel):
         return f"{self.scope_type}:{self.scope_id}:{self.field_key}@{self.revision}"
 
 
-class EpisodeCreativeDraft(UUIDTimeStampedModel):
-    """Review-gated local-Qwen storyboard proposal for one existing episode.
-
-    A creative draft is deliberately isolated from :class:`Episode` and
-    :class:`Shot`.  Generation, regeneration, and manual editing only mutate
-    this row (or create a successor row).  Formal production data changes only
-    through the explicit ``apply`` action after a current-context confirmation.
-    """
-
-    class Status(models.TextChoices):
-        DRAFT = "draft", "待审核"
-        CONFIRMED = "confirmed", "已确认待应用"
-        APPLIED = "applied", "已应用"
-        SUPERSEDED = "superseded", "已被新版本替代"
-        FAILED = "failed", "生成失败"
-
-    class Creativity(models.TextChoices):
-        CONSERVATIVE = "conservative", "保守"
-        BALANCED = "balanced", "均衡"
-        BOLD = "bold", "大胆"
-
-    project = models.ForeignKey(
-        SeriesProject, on_delete=models.CASCADE, related_name="creative_drafts",
-    )
-    episode = models.ForeignKey(
-        Episode, on_delete=models.CASCADE, related_name="creative_drafts",
-    )
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
-        related_name="episode_creative_drafts",
-    )
-    parent_draft = models.ForeignKey(
-        "self", null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="regenerations",
-    )
-    status = models.CharField(
-        max_length=24, choices=Status.choices, default=Status.DRAFT,
-    )
-    revision = models.PositiveIntegerField(default=1)
-    generation_no = models.PositiveIntegerField(default=1)
-    context_hash = models.CharField(max_length=64, db_index=True)
-    context_snapshot = models.JSONField(default=dict)
-    input_settings = models.JSONField(default=dict)
-    creativity = models.CharField(
-        max_length=24, choices=Creativity.choices, default=Creativity.BALANCED,
-    )
-    variation_note = models.TextField(blank=True)
-    draft_data = models.JSONField(default=dict, blank=True)
-    validation = models.JSONField(default=dict, blank=True)
-    warnings = models.JSONField(default=list, blank=True)
-    error_message = models.TextField(blank=True)
-    provider = models.CharField(max_length=80, default="local_qwen")
-    model = models.CharField(max_length=200, blank=True)
-    runtime_metadata = models.JSONField(default=dict, blank=True)
-    revision_history = models.JSONField(default=list, blank=True)
-    confirmed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="confirmed_episode_creative_drafts",
-    )
-    confirmed_at = models.DateTimeField(null=True, blank=True)
-    applied_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="applied_episode_creative_drafts",
-    )
-    applied_at = models.DateTimeField(null=True, blank=True)
-    applied_shot_ids = models.JSONField(default=list, blank=True)
-
-    class Meta:
-        ordering = ("-created_at",)
-        constraints = [
-            models.UniqueConstraint(
-                fields=("episode", "generation_no"),
-                name="unique_creative_generation_per_episode",
-            ),
-            models.UniqueConstraint(
-                fields=("episode",),
-                condition=Q(status="applied"),
-                name="unique_applied_creative_draft_per_episode",
-            ),
-        ]
-        indexes = [
-            models.Index(
-                fields=("project", "episode", "status"),
-                name="studio_ecdraft_scope_idx",
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"E{self.episode.number} creative v{self.generation_no} ({self.status})"
-
-
-class ShotDetailDraft(UUIDTimeStampedModel):
-    """Review-gated high-detail expansion for one formal :class:`Shot`.
-
-    Unlike ``EpisodeCreativeDraft`` this proposal never creates or replaces
-    timeline shots.  It captures the exact target shot, adjacent continuity
-    boundaries and relevant Bible context used by one local-Qwen request.
-    Applying a confirmed draft is the only path that writes
-    ``Shot.detailed_description``.
-    """
-
-    class Status(models.TextChoices):
-        DRAFT = "draft", "待审核"
-        CONFIRMED = "confirmed", "已确认待应用"
-        APPLIED = "applied", "已应用"
-        SUPERSEDED = "superseded", "已被新版本替代"
-        FAILED = "failed", "生成失败"
-
-    project = models.ForeignKey(
-        SeriesProject, on_delete=models.CASCADE, related_name="shot_detail_drafts",
-    )
-    episode = models.ForeignKey(
-        Episode, on_delete=models.CASCADE, related_name="shot_detail_drafts",
-    )
-    shot = models.ForeignKey(
-        Shot, on_delete=models.CASCADE, related_name="detail_drafts",
-    )
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
-        related_name="shot_detail_drafts",
-    )
-    parent_draft = models.ForeignKey(
-        "self", null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="regenerations",
-    )
-    status = models.CharField(
-        max_length=24, choices=Status.choices, default=Status.DRAFT,
-    )
-    revision = models.PositiveIntegerField(default=1)
-    generation_no = models.PositiveIntegerField(default=1)
-    context_hash = models.CharField(max_length=64, db_index=True)
-    context_snapshot = models.JSONField(default=dict)
-    input_settings = models.JSONField(default=dict)
-    variation_note = models.TextField(blank=True)
-    draft_data = models.JSONField(default=dict, blank=True)
-    validation = models.JSONField(default=dict, blank=True)
-    warnings = models.JSONField(default=list, blank=True)
-    error_message = models.TextField(blank=True)
-    provider = models.CharField(max_length=80, default="local_qwen")
-    model = models.CharField(max_length=200, blank=True)
-    runtime_metadata = models.JSONField(default=dict, blank=True)
-    revision_history = models.JSONField(default=list, blank=True)
-    confirmed_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="confirmed_shot_detail_drafts",
-    )
-    confirmed_at = models.DateTimeField(null=True, blank=True)
-    applied_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="applied_shot_detail_drafts",
-    )
-    applied_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        ordering = ("-created_at",)
-        constraints = [
-            models.UniqueConstraint(
-                fields=("shot", "generation_no"),
-                name="unique_shot_detail_generation",
-            ),
-        ]
-        indexes = [
-            models.Index(
-                fields=("project", "episode", "shot", "status"),
-                name="studio_sdetail_scope_idx",
-            ),
-        ]
-
-    def __str__(self) -> str:
-        return f"E{self.episode.number}S{self.shot.number} detail v{self.generation_no} ({self.status})"
-
-
-class ShotDetailDraftBatch(UUIDTimeStampedModel):
-    """Durable episode-level orchestration for independent shot detail drafts."""
-
-    class GenerationStatus(models.TextChoices):
-        QUEUED = "queued", "排队中"
-        RUNNING = "running", "生成中"
-        COMPLETED = "completed", "已完成"
-        COMPLETED_WITH_ERRORS = "completed_with_errors", "部分完成"
-        FAILED = "failed", "已失败"
-        CANCELLED = "cancelled", "已取消"
-
-    class ApplyStatus(models.TextChoices):
-        NOT_STARTED = "not_started", "未应用"
-        COMPLETE = "complete", "已全部应用"
-
-    class VersionScopeStatus(models.TextChoices):
-        RESOLVED = "resolved", "已归属分镜版本"
-        LEGACY_MIXED = "legacy_mixed", "历史混合版本"
-        LEGACY_PARTIAL = "legacy_partial", "历史镜头记录不完整"
-        LEGACY_UNKNOWN = "legacy_unknown", "历史归属未知"
-
-    project = models.ForeignKey(
-        SeriesProject, on_delete=models.CASCADE, related_name="shot_detail_batches",
-    )
-    episode = models.ForeignKey(
-        Episode, on_delete=models.CASCADE, related_name="shot_detail_batches",
-    )
-    created_by = models.ForeignKey(
-        settings.AUTH_USER_MODEL, on_delete=models.CASCADE,
-        related_name="shot_detail_batches",
-    )
-    request_id = models.UUIDField(unique=True, editable=False)
-    provider = models.CharField(max_length=80, default="local_qwen")
-    variation_note = models.TextField(blank=True)
-    shot_version_key = models.CharField(max_length=191, null=True, blank=True)
-    shot_version_label = models.CharField(max_length=200, blank=True)
-    version_scope_status = models.CharField(
-        max_length=20, choices=VersionScopeStatus.choices,
-        default=VersionScopeStatus.RESOLVED,
-    )
-    source_manifest_hash = models.CharField(max_length=64, db_index=True)
-    policy_snapshot = models.JSONField(default=dict)
-    config_hash = models.CharField(max_length=64)
-    generation_status = models.CharField(
-        max_length=32, choices=GenerationStatus.choices,
-        default=GenerationStatus.QUEUED, db_index=True,
-    )
-    apply_status = models.CharField(
-        max_length=20, choices=ApplyStatus.choices,
-        default=ApplyStatus.NOT_STARTED,
-    )
-    revision = models.PositiveIntegerField(default=1)
-    total_count = models.PositiveIntegerField(default=0)
-    pending_count = models.PositiveIntegerField(default=0)
-    succeeded_count = models.PositiveIntegerField(default=0)
-    failed_count = models.PositiveIntegerField(default=0)
-    stale_count = models.PositiveIntegerField(default=0)
-    skipped_count = models.PositiveIntegerField(default=0)
-    applied_count = models.PositiveIntegerField(default=0)
-    started_at = models.DateTimeField(null=True, blank=True)
-    finished_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        ordering = ("-created_at",)
-        constraints = [
-            models.UniqueConstraint(
-                fields=("episode", "shot_version_key"),
-                condition=Q(
-                    version_scope_status="resolved",
-                    generation_status__in=("queued", "running"),
-                ),
-                name="unique_active_sdetail_version",
-            ),
-            models.CheckConstraint(
-                condition=(
-                    Q(version_scope_status="resolved", shot_version_key__isnull=False)
-                    | Q(
-                        version_scope_status__in=(
-                            "legacy_mixed", "legacy_partial", "legacy_unknown",
-                        ),
-                        shot_version_key__isnull=True,
-                    )
-                ),
-                name="sdetail_version_scope_consistent",
-            ),
-        ]
-        indexes = [
-            models.Index(
-                fields=(
-                    "project", "episode", "shot_version_key",
-                    "generation_status", "created_at",
-                ),
-                name="studio_sdbatch_ver_idx",
-            ),
-        ]
-
-
-class ShotDetailDraftBatchItem(UUIDTimeStampedModel):
-    """One frozen shot input and its independently persisted batch outcome."""
-
-    class Status(models.TextChoices):
-        PENDING = "pending", "待处理"
-        RUNNING = "running", "处理中"
-        SUCCEEDED = "succeeded", "已生成"
-        FAILED = "failed", "失败"
-        STALE = "stale", "源数据已变化"
-        SKIPPED = "skipped", "已跳过"
-
-    batch = models.ForeignKey(
-        ShotDetailDraftBatch, on_delete=models.CASCADE, related_name="items",
-    )
-    shot = models.ForeignKey(
-        Shot, on_delete=models.RESTRICT, related_name="detail_batch_items",
-    )
-    ordinal = models.PositiveIntegerField()
-    source_context_hash = models.CharField(max_length=64, db_index=True)
-    before_snapshot = models.JSONField(default=dict)
-    draft = models.OneToOneField(
-        ShotDetailDraft, null=True, blank=True, on_delete=models.SET_NULL,
-        related_name="batch_item",
-    )
-    status = models.CharField(
-        max_length=20, choices=Status.choices, default=Status.PENDING,
-        db_index=True,
-    )
-    attempts = models.PositiveSmallIntegerField(default=0)
-    max_attempts = models.PositiveSmallIntegerField(
-        default=3, validators=[MinValueValidator(1)],
-    )
-    next_attempt_at = models.DateTimeField(default=timezone.now, db_index=True)
-    worker_id = models.CharField(max_length=160, blank=True)
-    claim_token = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
-    claimed_at = models.DateTimeField(null=True, blank=True)
-    heartbeat_at = models.DateTimeField(null=True, blank=True, db_index=True)
-    finished_at = models.DateTimeField(null=True, blank=True)
-    error_code = models.CharField(max_length=80, blank=True)
-    error_message = models.TextField(blank=True)
-    apply_run_id = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
-    applied_at = models.DateTimeField(null=True, blank=True)
-
-    class Meta:
-        ordering = ("batch", "ordinal")
-        constraints = [
-            models.UniqueConstraint(
-                fields=("batch", "shot"), name="unique_shot_detail_batch_shot",
-            ),
-            models.UniqueConstraint(
-                fields=("batch", "ordinal"), name="unique_shot_detail_batch_ordinal",
-            ),
-        ]
-        indexes = [
-            models.Index(
-                fields=("status", "next_attempt_at", "created_at"),
-                name="studio_sdbitem_claim_idx",
-            ),
-        ]
-
-
 class WorkflowTemplate(UUIDTimeStampedModel):
     class OutputKind(models.TextChoices):
         VIDEO = "video", "视频"
         IMAGE = "image", "图片"
+        AUDIO = "audio", "音频"
+        TEXT = "text", "文本"
 
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="workflow_templates")
     name = models.CharField(max_length=160)
     slug = models.SlugField(max_length=100)
     provider = models.CharField(max_length=80, default="comfyui")
     output_kind = models.CharField(max_length=12, choices=OutputKind.choices)
-    model = models.CharField(max_length=80, default="minimax-h3")
+    model = models.CharField(max_length=80, blank=True, default="")
     version = models.PositiveIntegerField(default=1)
     definition = models.JSONField(default=dict)
     input_schema = models.JSONField(default=dict, blank=True)
@@ -1185,8 +871,8 @@ class GenerationTask(UUIDTimeStampedModel):
     episode = models.ForeignKey(Episode, null=True, blank=True, on_delete=models.CASCADE, related_name="generation_tasks")
     generated_workflow = models.ForeignKey(GeneratedWorkflow, on_delete=models.PROTECT, related_name="tasks")
     kind = models.CharField(max_length=12, choices=Kind.choices)
-    backend = models.CharField(max_length=80, default="comfy_local_h3")
-    model_profile = models.CharField(max_length=120, default="local_base_official")
+    backend = models.CharField(max_length=80, blank=True, default="")
+    model_profile = models.CharField(max_length=120, blank=True, default="")
     workflow_version = models.PositiveIntegerField(default=1)
     seed = models.BigIntegerField(default=0)
     # Immutable post-alignment request plan.  Actual returned-container facts
@@ -1224,7 +910,7 @@ class GenerationTask(UUIDTimeStampedModel):
     )
     progress_telemetry_error = models.TextField(blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
-    max_attempts = models.PositiveSmallIntegerField(default=3, validators=[MinValueValidator(1)])
+    max_attempts = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
     comfy_prompt_id = models.CharField(max_length=120, blank=True, db_index=True)
     client_id = models.CharField(max_length=120, blank=True)
     outputs = models.JSONField(default=list, blank=True)
@@ -1304,12 +990,13 @@ class DeferredGenerationRequest(UUIDTimeStampedModel):
         related_name="deferred_generation_requests",
     )
     frame_slot = models.CharField(max_length=20, choices=FrameSlot.choices)
-    target_template = models.ForeignKey(
-        WorkflowTemplate,
+    target_workflow_version = models.ForeignKey(
+        "WorkflowTemplateVersion",
         on_delete=models.PROTECT,
         related_name="deferred_generation_requests",
     )
-    target_template_hash = models.CharField(max_length=64)
+    target_workflow_snapshot = models.JSONField(default=dict)
+    target_workflow_snapshot_sha256 = models.CharField(max_length=64)
     idempotency_key = models.CharField(max_length=120)
     request_fingerprint = models.CharField(max_length=64)
     target_input_fingerprint = models.CharField(max_length=64)
@@ -1342,7 +1029,9 @@ class DeferredGenerationRequest(UUIDTimeStampedModel):
     priority = models.SmallIntegerField(default=0)
     attempts = models.PositiveSmallIntegerField(default=0)
     max_attempts = models.PositiveSmallIntegerField(
-        default=3,
+        validators=[MinValueValidator(1)],
+    )
+    retry_backoff_seconds = models.PositiveIntegerField(
         validators=[MinValueValidator(1)],
     )
     next_attempt_at = models.DateTimeField(default=timezone.now)
@@ -1423,7 +1112,7 @@ class AssemblyJob(UUIDTimeStampedModel):
     source_signature = models.CharField(max_length=64, blank=True, db_index=True)
     source_contract_version = models.PositiveSmallIntegerField(default=2)
     attempts = models.PositiveSmallIntegerField(default=0)
-    max_attempts = models.PositiveSmallIntegerField(default=3, validators=[MinValueValidator(1)])
+    max_attempts = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
     worker_id = models.CharField(max_length=160, blank=True, db_index=True)
     claim_token = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
     error_message = models.TextField(blank=True)
@@ -1533,7 +1222,7 @@ class ProviderProfile(UUIDTimeStampedModel):
     )
     name = models.CharField(max_length=160)
     driver_type = models.CharField(max_length=32, choices=DriverType.choices)
-    modalities = models.CharField(max_length=120, help_text="逗号分隔的 text,image,video")
+    modalities = models.CharField(max_length=120, help_text="逗号分隔的 text,image,video,audio")
     operations = models.CharField(max_length=500, blank=True, help_text="逗号分隔的受控操作名")
     credential = models.ForeignKey(
         SecretBinding,
@@ -1557,6 +1246,249 @@ class ProviderProfile(UUIDTimeStampedModel):
         return self.name
 
 
+class AssetGenerationJob(UUIDTimeStampedModel):
+    """Durable owner-scoped request producing an editable text candidate or Asset.
+
+    Prompt drafting and final asset generation share one history surface but use
+    explicit job types.  Provider requests are frozen before a worker can claim
+    the row; browser requests never invoke a model directly.
+    """
+
+    class JobType(models.TextChoices):
+        PROMPT = "prompt", "提示词候选"
+        ASSET = "asset", "素材生成"
+
+    class MediaType(models.TextChoices):
+        IMAGE = "image", "图片"
+        VIDEO = "video", "视频"
+        AUDIO = "audio", "音频"
+        SCRIPT = "script", "剧本"
+
+    class ExecutionKind(models.TextChoices):
+        DEPLOYMENT = "deployment", "模型部署"
+        COMFY_WORKFLOW = "comfy_workflow", "ComfyUI 工作流"
+
+    class Status(models.TextChoices):
+        QUEUED = "queued", "排队中"
+        SUBMITTING = "submitting", "正在提交"
+        SUBMITTED = "submitted", "已提交"
+        RUNNING = "running", "运行中"
+        CANCEL_REQUESTED = "cancel_requested", "取消中"
+        SUCCEEDED = "succeeded", "已成功"
+        FAILED = "failed", "已失败"
+        CANCELLED = "cancelled", "已取消"
+        UNCERTAIN = "uncertain", "远端状态不确定"
+
+    owner = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="asset_generation_jobs",
+    )
+    style = models.ForeignKey(
+        Style,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="asset_generation_jobs",
+    )
+    model_deployment = models.ForeignKey(
+        "ModelDeployment",
+        on_delete=models.PROTECT,
+        related_name="asset_generation_jobs",
+    )
+    workflow_template_version = models.ForeignKey(
+        "WorkflowTemplateVersion",
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="asset_generation_jobs",
+    )
+    output_asset = models.OneToOneField(
+        Asset,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="generation_job",
+    )
+    job_type = models.CharField(max_length=16, choices=JobType.choices)
+    media_type = models.CharField(max_length=16, choices=MediaType.choices)
+    execution_kind = models.CharField(
+        max_length=24,
+        choices=ExecutionKind.choices,
+        default=ExecutionKind.DEPLOYMENT,
+    )
+    image_category = models.CharField(max_length=16, blank=True)
+    name = models.CharField(max_length=160, blank=True)
+    description = models.TextField(blank=True)
+    prompt = models.TextField()
+    negative_prompt = models.TextField(blank=True)
+    parameters = models.JSONField(default=dict, blank=True)
+    status = models.CharField(
+        max_length=24,
+        choices=Status.choices,
+        default=Status.QUEUED,
+        db_index=True,
+    )
+    operation = models.CharField(max_length=100)
+    is_external = models.BooleanField(default=False)
+    allow_external_calls = models.BooleanField(default=False)
+    budget_limit = models.DecimalField(
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+    )
+    estimated_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+    )
+    actual_cost = models.DecimalField(
+        max_digits=14,
+        decimal_places=6,
+        null=True,
+        blank=True,
+    )
+    cost_currency = models.CharField(max_length=12, blank=True)
+    request_snapshot = models.JSONField(default=dict)
+    request_snapshot_schema_version = models.PositiveIntegerField(default=1)
+    request_snapshot_size_bytes = models.PositiveIntegerField(default=2)
+    request_snapshot_sha256 = models.CharField(max_length=64)
+    staged_inputs = models.JSONField(default=list, blank=True)
+    result_text = models.TextField(blank=True)
+    result_text_size_bytes = models.PositiveIntegerField(default=0)
+    result_text_sha256 = models.CharField(max_length=64, blank=True)
+    provider_request_id = models.CharField(max_length=191, blank=True)
+    provider_request_id_sha256 = models.CharField(max_length=64, blank=True)
+    idempotency_key = models.CharField(max_length=191, unique=True)
+    remote_status = models.CharField(max_length=120, blank=True)
+    submission_started_at = models.DateTimeField(null=True, blank=True)
+    submitted_at = models.DateTimeField(null=True, blank=True)
+    last_polled_at = models.DateTimeField(null=True, blank=True)
+    poll_count = models.PositiveIntegerField(default=0)
+    cancel_requested_at = models.DateTimeField(null=True, blank=True)
+    cancel_submitted_at = models.DateTimeField(null=True, blank=True)
+    ignore_late_result = models.BooleanField(default=False)
+    next_poll_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    claim_token = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
+    worker_id = models.CharField(max_length=160, blank=True)
+    claimed_at = models.DateTimeField(null=True, blank=True)
+    heartbeat_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    error_code = models.CharField(max_length=100, blank=True)
+    error_message = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(
+                fields=("status", "next_poll_at", "created_at"),
+                name="studio_asset_job_queue_idx",
+            ),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        execution_kind="deployment",
+                        workflow_template_version__isnull=True,
+                    )
+                    | Q(
+                        execution_kind="comfy_workflow",
+                        workflow_template_version__isnull=False,
+                    )
+                ),
+                name="asset_job_execution_target_consistent",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(budget_limit__isnull=True) | Q(budget_limit__gte=0)
+                ),
+                name="asset_job_budget_nonnegative",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(estimated_cost__isnull=True) | Q(estimated_cost__gte=0)
+                ) & (
+                    Q(actual_cost__isnull=True) | Q(actual_cost__gte=0)
+                ),
+                name="asset_job_costs_nonnegative",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.job_type}:{self.media_type}:{self.id} [{self.status}]"
+
+
+class AppendOnlyAssetGenerationResolutionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("AssetGenerationJobResolution 不允许更新")
+
+    def delete(self):
+        raise ValidationError("AssetGenerationJobResolution 不允许删除")
+
+
+class AppendOnlyAssetGenerationResolutionManager(
+    models.Manager.from_queryset(AppendOnlyAssetGenerationResolutionQuerySet),
+):
+    pass
+
+
+class AssetGenerationJobResolution(UUIDTimeStampedModel):
+    """Append-only staff evidence resolving one uncertain library generation."""
+
+    class Outcome(models.TextChoices):
+        CONFIRMED_NOT_SUBMITTED = "confirmed_not_submitted", "确认未提交"
+        CONFIRMED_REMOTE_FAILED = "confirmed_remote_failed", "确认远端失败"
+        CONFIRMED_REMOTE_CANCELLED = "confirmed_remote_cancelled", "确认远端取消"
+        CONFIRMED_REMOTE_SUCCEEDED = "confirmed_remote_succeeded", "确认远端成功"
+
+    job = models.ForeignKey(
+        AssetGenerationJob,
+        on_delete=models.PROTECT,
+        related_name="resolutions",
+    )
+    revision = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    outcome = models.CharField(max_length=40, choices=Outcome.choices)
+    idempotency_key = models.CharField(max_length=191)
+    request_sha256 = models.CharField(max_length=64)
+    provider_request_id_sha256 = models.CharField(max_length=64, blank=True)
+    evidence = models.JSONField(default=dict)
+    evidence_schema_version = models.PositiveIntegerField(default=1)
+    evidence_size_bytes = models.PositiveIntegerField(default=2)
+    evidence_sha256 = models.CharField(max_length=64)
+    note = models.TextField(blank=True)
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="asset_generation_job_resolutions",
+    )
+    objects = AppendOnlyAssetGenerationResolutionManager()
+
+    class Meta:
+        ordering = ("job", "revision")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("job", "revision"),
+                name="unique_asset_job_resolution",
+            ),
+            models.UniqueConstraint(
+                fields=("job", "idempotency_key"),
+                name="unique_asset_job_resolution_key",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("AssetGenerationJobResolution 是不可变审计事实，不能修改")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("AssetGenerationJobResolution 是不可变审计事实，不能删除")
+
+
 class ModelProfileVersion(UUIDTimeStampedModel):
     """Immutable-after-publish model capability and parameter contract."""
 
@@ -1564,6 +1496,7 @@ class ModelProfileVersion(UUIDTimeStampedModel):
         TEXT = "text", "文本"
         IMAGE = "image", "图片"
         VIDEO = "video", "视频"
+        AUDIO = "audio", "音频"
         MULTIMODAL = "multimodal", "多模态"
 
     class Status(models.TextChoices):
@@ -1686,7 +1619,28 @@ class PromptProfileVersion(UUIDTimeStampedModel):
         blank=True,
         validators=[RegexValidator(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$")],
     )
+    source_projection_key = models.CharField(
+        max_length=64,
+        default="direct_v1",
+        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,63}$")],
+        help_text="受控确定性来源投影器；普通策略使用 direct_v1。",
+    )
+    source_projection_config = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "来源投影器的版本化数据合同；只接受登记的声明式配置与简单占位符模板，不接受表达式、函数或自定义正则。"
+        ),
+    )
     official_reference = models.URLField(max_length=1000, blank=True)
+    channel_limits = models.JSONField(
+        default=dict,
+        blank=True,
+        help_text=(
+            "按输出通道配置最终提示词长度合同；键为受控 channel，值包含 "
+            "max_chars 与可选 warn_at_chars。"
+        ),
+    )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
     review_state = models.CharField(
         max_length=20,
@@ -1722,8 +1676,81 @@ class PromptProfileVersion(UUIDTimeStampedModel):
 class PromptProfileFieldRule(UUIDTimeStampedModel):
     """One allow-listed source-to-channel mapping in a prompt profile."""
 
+    class GenerationMode(models.TextChoices):
+        SERVER_LOCKED = "server_locked", "服务端锁定 / Server locked"
+        MODEL_GENERATED = "model_generated", "模型生成 / Model generated"
+        TRANSLATE_ONLY = "translate_only", "仅翻译 / Translate only"
+        PASSTHROUGH = "passthrough", "原值透传 / Passthrough"
+
+    class GenerationOutputSemantics(models.TextChoices):
+        FINAL = "final", "最终字段值 / Final field value"
+        CONTRIBUTION = "contribution", "确定性投影贡献 / Projection contribution"
+
+    class LengthUnit(models.TextChoices):
+        NONE = "none", "不限制 / None"
+        CHARACTERS = "characters", "字符数 / Characters"
+        ENGLISH_WORDS = "english_words", "英文词数 / English words"
+        ITEMS = "items", "列表项数 / Items"
+
+    class GenerationValidator(models.TextChoices):
+        NON_EMPTY = "non_empty", "非空 / Non-empty"
+        NO_CONTROL_CHARACTERS = (
+            "no_control_characters",
+            "禁止控制字符 / No control characters",
+        )
+        NO_UNRESOLVED_PLACEHOLDERS = (
+            "no_unresolved_placeholders",
+            "禁止未解析占位符 / No unresolved placeholders",
+        )
+        SINGLE_LINE = "single_line", "仅单行 / Single line"
+        VALID_JSON = "valid_json", "合法 JSON / Valid JSON"
+        JSON_OBJECT = "json_object", "JSON 对象 / JSON object"
+        JSON_ARRAY = "json_array", "JSON 数组 / JSON array"
+        UNIQUE_ITEMS = "unique_items", "列表项唯一 / Unique items"
+        LENGTH_ADVISORY = (
+            "length_advisory",
+            "长度仅建议 / Advisory length",
+        )
+        PROTECTED_TOKENS_PRESERVE_COUNT = (
+            "protected_tokens_preserve_count",
+            "受保护内容保持来源次数 / Preserve protected-token source count",
+        )
+        PROTECTED_TOKENS_AT_LEAST_ONCE = (
+            "protected_tokens_at_least_once",
+            "受保护内容至少出现一次 / Protected tokens at least once",
+        )
+
+    class GenerationContextSelector(models.TextChoices):
+        PROJECT_CORE = "project.core", "项目核心事实 / Project core facts"
+        PROJECT_STYLE = "project.style", "项目视觉风格 / Project visual style"
+        TARGET_SHOT_CORE = (
+            "target_shot.core",
+            "当前镜头核心事实 / Target-shot core facts",
+        )
+        TARGET_SHOT_DIALOGUE_METADATA = (
+            "target_shot.dialogue_metadata",
+            "当前镜头对白元数据 / Target-shot dialogue metadata",
+        )
+        TARGET_SHOT_DIALOGUE_AUTHORED_TEXT = (
+            "target_shot.dialogue_authored_text",
+            "当前镜头对白正文 / Target-shot authored dialogue text",
+        )
+        TARGET_SHOT_LINKED_BIBLE = (
+            "target_shot.linked_bible",
+            "当前镜头关联 Bible / Target-shot linked Bible",
+        )
+        ADJACENT_SHOTS_CORE = (
+            "adjacent_shots.core",
+            "相邻镜头核心事实 / Adjacent-shot core facts",
+        )
+        ALL_SHOTS_CORE = (
+            "all_shots.core",
+            "全剧镜头核心事实 / All-shot core facts",
+        )
+
     class SourceSelector(models.TextChoices):
         DEFINITION_DEFAULT = "definition.default", "字段默认值"
+        PROJECTION_OUTPUT = "projection.output", "声明式投影输出"
         PROJECT_TITLE = "project.title", "项目名称"
         PROJECT_LOGLINE = "project.logline", "一句话梗概"
         PROJECT_SCRIPT = "project.master_script", "项目剧本"
@@ -1762,6 +1789,27 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
         REQUEST_SOUND_EFFECTS = "request.sound_effects", "音效"
         REQUEST_VOICEOVER = "request.voiceover", "旁白"
         REQUEST_REFERENCE = "request.reference_assets", "参考素材"
+        H3_REF2VA_SUBJECT_DEFINITIONS = (
+            "request.h3_ref2va.subject_definitions",
+            "H3 Ref2VA 主体定义",
+        )
+        H3_REF2VA_SUMMARY = "request.h3_ref2va.summary", "H3 Ref2VA 任务摘要"
+        H3_REF2VA_RETENTION_ANALYSIS = (
+            "request.h3_ref2va.retention_analysis",
+            "H3 Ref2VA 保留关系",
+        )
+        H3_REF2VA_DETAILED_DESCRIPTION = (
+            "request.h3_ref2va.detailed_description",
+            "H3 Ref2VA 导演描述",
+        )
+        H3_REF2VA_OVERALL_SOUNDSCAPE = (
+            "request.h3_ref2va.overall_soundscape",
+            "H3 Ref2VA 总体声景",
+        )
+        H3_REF2VA_NON_DIEGETIC_MUSIC = (
+            "request.h3_ref2va.non_diegetic_music",
+            "H3 Ref2VA 非画内音乐",
+        )
 
     class Channel(models.TextChoices):
         SYSTEM_INSTRUCTION = "system_instruction", "系统约束"
@@ -1772,6 +1820,7 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
     class LabelStyle(models.TextChoices):
         NONE = "none", "不显示字段名"
         LABEL_COLON = "label_colon", "字段名加冒号"
+        LABEL_BLOCK = "label_block", "字段名独占一行"
         BRACKETED = "bracketed", "方括号字段名"
 
     class Separator(models.TextChoices):
@@ -1791,6 +1840,15 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
         related_name="profile_rules",
     )
     source_selector = models.CharField(max_length=80, choices=SourceSelector.choices)
+    projection_primitive = models.CharField(
+        max_length=80,
+        blank=True,
+        default="",
+        help_text=(
+            "source_selector=projection.output 时必填；只能选择服务端登记的"
+            "确定性原语，不接受模板、函数或脚本。"
+        ),
+    )
     channel = models.CharField(max_length=32, choices=Channel.choices)
     position = models.PositiveIntegerField(validators=[MinValueValidator(1)])
     label_style = models.CharField(
@@ -1807,7 +1865,64 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
     omit_if_empty = models.BooleanField(default=True)
     max_chars = models.PositiveIntegerField(
         default=2000,
-        validators=[MinValueValidator(1), MaxValueValidator(30_000)],
+        validators=[MinValueValidator(1)],
+    )
+    generation_mode = models.CharField(
+        max_length=24,
+        choices=GenerationMode.choices,
+        default=GenerationMode.PASSTHROUGH,
+    )
+    generation_source_selector = models.CharField(
+        max_length=191,
+        blank=True,
+        default="",
+        help_text=(
+            "受控点路径；历史 schema v1 可为空，新建 schema v2 规则必须显式填写。"
+        ),
+    )
+    generation_instruction = models.TextField(
+        blank=True,
+        default="",
+        help_text=(
+            "版本化、不可执行的字段生成说明；禁止模板、脚本和动态表达式。"
+        ),
+    )
+    generation_output_semantics = models.CharField(
+        max_length=16,
+        choices=GenerationOutputSemantics.choices,
+        default=GenerationOutputSemantics.FINAL,
+    )
+    generation_required = models.BooleanField(default=False)
+    language_policy = models.CharField(
+        max_length=64,
+        default="inherit",
+        help_text=(
+            "inherit、preserve_source、any、BCP 47 语言标签，或 "
+            "bilingual:<tag>+<tag>。"
+        ),
+    )
+    length_unit = models.CharField(
+        max_length=24,
+        choices=LengthUnit.choices,
+        default=LengthUnit.NONE,
+    )
+    generation_min = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+    )
+    generation_max = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        validators=[MinValueValidator(1)],
+    )
+    generation_validator_keys = models.JSONField(default=list, blank=True)
+    generation_context_selectors = models.JSONField(
+        default=list,
+        blank=True,
+        help_text=(
+            "字段生成可读取的服务端投影事实范围；空数组表示仅可读取当前 item/source。"
+        ),
     )
 
     class Meta:
@@ -1910,6 +2025,13 @@ class RuntimeHostProbeAttempt(UUIDTimeStampedModel):
         MANUAL = "manual", "管理员手动"
         SCHEDULED = "scheduled", "平台维护"
 
+    class ProbeKind(models.TextChoices):
+        CAPABILITY = "capability", "主机能力"
+        DRAFT_MODEL_ARTIFACT_ATTESTATION = (
+            "draft_model_artifact_attestation",
+            "草稿模型文件证明",
+        )
+
     host = models.ForeignKey(
         RuntimeHost,
         on_delete=models.PROTECT,
@@ -1926,6 +2048,19 @@ class RuntimeHostProbeAttempt(UUIDTimeStampedModel):
         max_length=16,
         choices=Trigger.choices,
         default=Trigger.MANUAL,
+    )
+    probe_kind = models.CharField(
+        max_length=48,
+        choices=ProbeKind.choices,
+        default=ProbeKind.CAPABILITY,
+        db_index=True,
+    )
+    request_snapshot = models.JSONField(default=dict, blank=True)
+    request_snapshot_schema_version = models.PositiveIntegerField(default=1)
+    request_snapshot_size_bytes = models.PositiveIntegerField(default=2)
+    request_snapshot_sha256 = models.CharField(
+        max_length=64,
+        default="44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
     )
     status = models.CharField(
         max_length=24,
@@ -1967,6 +2102,7 @@ class ModelDeployment(UUIDTimeStampedModel):
         ACTIVE = "active", "启用"
         DISABLED = "disabled", "禁用"
         ERROR = "error", "异常"
+        RETIRED = "retired", "已退役"
 
     key = models.CharField(
         max_length=100,
@@ -2039,13 +2175,28 @@ class ModelArtifact(UUIDTimeStampedModel):
 
     profile_version = models.ForeignKey(
         ModelProfileVersion,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="artifacts",
     )
     role = models.CharField(max_length=24, choices=Role.choices)
     logical_name = models.CharField(max_length=120)
     filename = models.CharField(max_length=500)
     storage_uri = models.CharField(max_length=1000, blank=True)
+    inventory_folder = models.CharField(
+        max_length=120,
+        blank=True,
+        help_text="ComfyUI models 根下的受控目录；留空时按 role 使用平台默认目录。",
+    )
+    inventory_node_type = models.CharField(
+        max_length=191,
+        blank=True,
+        help_text="自定义模型目录通过 object_info 枚举核对时使用的节点类型。",
+    )
+    inventory_input_name = models.CharField(
+        max_length=120,
+        blank=True,
+        help_text="与 inventory_node_type 配套的模型文件输入名。",
+    )
     sha256 = models.CharField(max_length=64, blank=True)
     size_bytes = models.PositiveBigIntegerField(null=True, blank=True)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.DECLARED)
@@ -2178,6 +2329,446 @@ class WorkflowTemplateVersion(UUIDTimeStampedModel):
         return f"{self.template.slug} platform-v{self.version}"
 
 
+class WorkflowProjectorQuerySet(models.QuerySet):
+    """Preserve the stable family identity outside the API serializer too."""
+
+    def update(self, **kwargs):
+        if "key" in kwargs:
+            raise ValidationError("WorkflowProjector 稳定 key 创建后不可修改")
+        return super().update(**kwargs)
+
+
+class WorkflowProjectorManager(models.Manager.from_queryset(WorkflowProjectorQuerySet)):
+    pass
+
+
+class WorkflowProjector(UUIDTimeStampedModel):
+    """Stable identity for a server-reviewed saved-workflow contract family."""
+
+    key = models.CharField(
+        max_length=100,
+        unique=True,
+        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
+    )
+    name = models.CharField(max_length=160)
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    objects = WorkflowProjectorManager()
+
+    class Meta:
+        ordering = ("key",)
+
+    def __str__(self) -> str:
+        return self.key
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            existing_key = WorkflowProjector.objects.filter(pk=self.pk).values_list(
+                "key", flat=True,
+            ).first()
+            if existing_key is not None and existing_key != self.key:
+                raise ValidationError("WorkflowProjector 稳定 key 创建后不可修改")
+        return super().save(*args, **kwargs)
+
+
+class WorkflowProjectorVersionQuerySet(models.QuerySet):
+    """Keep published configuration content immutable outside lifecycle actions."""
+
+    def update(self, **kwargs):
+        if set(kwargs) - {"is_current", "updated_at"}:
+            raise ValidationError(
+                "WorkflowProjectorVersion 内容不能通过批量更新改写",
+            )
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise ValidationError("WorkflowProjectorVersion 是版本化配置，不能批量删除")
+
+
+class WorkflowProjectorVersionManager(
+    models.Manager.from_queryset(WorkflowProjectorVersionQuerySet),
+):
+    pass
+
+
+class WorkflowProjectorVersion(UUIDTimeStampedModel):
+    """Versioned data contract composed from registered, code-reviewed engines."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "草稿"
+        PUBLISHED = "published", "已发布"
+        RETIRED = "retired", "已停用"
+
+    projector = models.ForeignKey(
+        WorkflowProjector,
+        on_delete=models.PROTECT,
+        related_name="versions",
+    )
+    version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    provider_driver_type = models.CharField(
+        max_length=32,
+        choices=ProviderProfile.DriverType.choices,
+        default=ProviderProfile.DriverType.COMFYUI,
+    )
+    operation = models.CharField(max_length=120, default="workflow.import")
+    output_kind = models.CharField(
+        max_length=16,
+        choices=WorkflowTemplate.OutputKind.choices,
+        blank=True,
+        default="",
+        help_text="留空表示由工作流主输出节点决定。",
+    )
+    engine_key = models.CharField(
+        max_length=100,
+        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
+    )
+    engine_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    definition = models.JSONField(default=dict)
+    definition_schema_version = models.PositiveIntegerField(default=1)
+    definition_size_bytes = models.PositiveIntegerField(default=2)
+    definition_sha256 = models.CharField(max_length=64)
+    status = models.CharField(
+        max_length=16,
+        choices=Status.choices,
+        default=Status.DRAFT,
+    )
+    is_current = models.BooleanField(default=False)
+    published_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="published_workflow_projector_versions",
+    )
+    objects = WorkflowProjectorVersionManager()
+
+    class Meta:
+        ordering = ("projector", "-version")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("projector", "version"),
+                name="unique_workflow_projector_version",
+            ),
+            models.UniqueConstraint(
+                fields=("projector",),
+                condition=Q(is_current=True),
+                name="one_current_workflow_projector",
+            ),
+            models.CheckConstraint(
+                condition=Q(is_current=False) | Q(status="published"),
+                name="current_workflow_projector_is_published",
+            ),
+        ]
+        indexes = [models.Index(fields=("status", "engine_key"))]
+
+    def __str__(self) -> str:
+        return f"{self.projector.key} v{self.version}"
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            existing = WorkflowProjectorVersion.objects.filter(pk=self.pk).first()
+            if existing is not None:
+                immutable_fields = (
+                    "projector_id", "version", "provider_driver_type", "operation",
+                    "output_kind", "engine_key", "engine_version", "definition",
+                    "definition_schema_version", "definition_size_bytes",
+                    "definition_sha256", "published_at", "published_by_id",
+                )
+                if existing.status != self.Status.DRAFT and any(
+                    getattr(existing, field) != getattr(self, field)
+                    for field in immutable_fields
+                ):
+                    raise ValidationError(
+                        "published/retired WorkflowProjectorVersion 内容不可修改",
+                    )
+                allowed_transitions = {
+                    self.Status.DRAFT: {self.Status.DRAFT, self.Status.PUBLISHED},
+                    self.Status.PUBLISHED: {
+                        self.Status.PUBLISHED, self.Status.RETIRED,
+                    },
+                    self.Status.RETIRED: {self.Status.RETIRED},
+                }
+                if self.status not in allowed_transitions[existing.status]:
+                    raise ValidationError("WorkflowProjectorVersion 生命周期逆转无效")
+        if self.is_current and self.status != self.Status.PUBLISHED:
+            raise ValidationError("只有 published WorkflowProjectorVersion 可以是 current")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError(
+            "WorkflowProjectorVersion 不能直接删除；未发布草稿请使用受控放弃动作",
+        )
+
+    def discard(self, *args, **kwargs):
+        if self.status != self.Status.DRAFT or self.is_current:
+            raise ValidationError("只有未发布且非 current 的 Projector 草稿可以放弃")
+        return super().delete(*args, **kwargs)
+
+
+class ImmutableComfyWorkflowSourceQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("ComfyWorkflowSource 不允许批量更新")
+
+    def delete(self):
+        raise ValidationError("ComfyWorkflowSource 不允许批量删除")
+
+
+class ImmutableComfyWorkflowSourceManager(
+    models.Manager.from_queryset(ImmutableComfyWorkflowSourceQuerySet),
+):
+    pass
+
+
+class ComfyWorkflowSource(UUIDTimeStampedModel):
+    """Immutable import provenance for one exact ComfyUI userdata revision."""
+
+    class ImportKind(models.TextChoices):
+        CANDIDATE = "candidate", "候选来源"
+        TEMPLATE_VERSION = "template_version", "模板版本"
+        EXECUTION_SNAPSHOT = "execution_snapshot", "执行快照"
+        IGNORED = "ignored", "明确忽略"
+
+    source_deployment = models.ForeignKey(
+        ModelDeployment,
+        on_delete=models.PROTECT,
+        related_name="comfy_workflow_sources",
+    )
+    source_scope_schema_version = models.PositiveSmallIntegerField(default=1)
+    source_scope_sha256 = models.CharField(max_length=64)
+    source_path = models.CharField(max_length=500)
+    source_path_key = models.CharField(max_length=500)
+    source_path_sha256 = models.CharField(max_length=64)
+    source_sha256 = models.CharField(max_length=64)
+    source_size_bytes = models.PositiveIntegerField()
+    source_workflow_id = models.CharField(max_length=191, blank=True)
+    source_document = models.JSONField(default=dict, blank=True)
+    source_document_schema_version = models.PositiveIntegerField(default=1)
+    source_document_size_bytes = models.PositiveIntegerField(default=2)
+    source_document_sha256 = models.CharField(
+        max_length=64,
+        default="44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a",
+    )
+    import_contract_sha256 = models.CharField(max_length=64)
+    import_kind = models.CharField(max_length=24, choices=ImportKind.choices)
+    converted_graph_sha256 = models.CharField(max_length=64, blank=True)
+    conversion_report = models.JSONField(default=dict, blank=True)
+    conversion_report_schema_version = models.PositiveIntegerField(default=1)
+    conversion_report_size_bytes = models.PositiveIntegerField(default=2)
+    conversion_report_sha256 = models.CharField(max_length=64)
+    workflow_version = models.ForeignKey(
+        WorkflowTemplateVersion,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="comfy_sources",
+    )
+    generated_workflow = models.ForeignKey(
+        GeneratedWorkflow,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="comfy_sources",
+    )
+    generation_task = models.ForeignKey(
+        GenerationTask,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="comfy_sources",
+    )
+    imported_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="imported_comfy_workflow_sources",
+    )
+    objects = ImmutableComfyWorkflowSourceManager()
+
+    class Meta:
+        ordering = ("source_scope_sha256", "source_path_key", "-created_at")
+        constraints = [
+            models.UniqueConstraint(
+                fields=(
+                    "source_scope_schema_version", "source_scope_sha256",
+                    "source_path_sha256", "source_sha256", "import_contract_sha256",
+                ),
+                name="uq_comfy_src_scope_contract",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        import_kind="template_version",
+                        workflow_version__isnull=False,
+                        generated_workflow__isnull=True,
+                        generation_task__isnull=True,
+                    )
+                    | Q(import_kind="execution_snapshot", workflow_version__isnull=True)
+                    | Q(
+                        import_kind="candidate",
+                        workflow_version__isnull=True,
+                        generated_workflow__isnull=True,
+                        generation_task__isnull=True,
+                    )
+                    | Q(
+                        import_kind="ignored",
+                        workflow_version__isnull=True,
+                        generated_workflow__isnull=True,
+                        generation_task__isnull=True,
+                    )
+                ),
+                name="valid_comfy_workflow_source_target",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=(
+                    "source_scope_schema_version", "source_scope_sha256",
+                    "source_path_sha256", "-created_at",
+                ),
+                name="studio_comfy_scope_path_idx",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.source_path}@{self.source_sha256[:12]}"
+
+    def save(self, *args, **kwargs):
+        if self.pk and ComfyWorkflowSource.objects.filter(pk=self.pk).exists():
+            raise ValidationError("ComfyWorkflowSource 是不可变来源事实")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("ComfyWorkflowSource 是不可变来源事实")
+
+
+class ImmutableComfyWorkflowContractDraftQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("ComfyWorkflowContractDraft 不允许批量更新")
+
+    def delete(self):
+        raise ValidationError("ComfyWorkflowContractDraft 不允许批量删除")
+
+
+class ImmutableComfyWorkflowContractDraftManager(
+    models.Manager.from_queryset(ImmutableComfyWorkflowContractDraftQuerySet),
+):
+    pass
+
+
+class ComfyWorkflowContractDraft(UUIDTimeStampedModel):
+    """Immutable, non-executable projection of one managed candidate revision."""
+
+    class AdmissionTier(models.TextChoices):
+        CANDIDATE = "candidate", "候选"
+        GENERIC_FIXED = "generic_fixed", "Generic 固定合同"
+        PROJECTED_DYNAMIC = "projected_dynamic", "动态投影合同"
+
+    class Actionability(models.TextChoices):
+        CANDIDATE_ONLY = "candidate_only", "仅候选"
+        READY_FOR_EXECUTABLE_IMPORT = (
+            "ready_for_executable_import", "可提升为工作流版本",
+        )
+
+    candidate_source = models.ForeignKey(
+        ComfyWorkflowSource,
+        on_delete=models.PROTECT,
+        related_name="contract_drafts",
+    )
+    revision = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    primary_output_node_id = models.CharField(max_length=32)
+    model_profile_version = models.ForeignKey(
+        ModelProfileVersion,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="comfy_workflow_contract_drafts",
+    )
+    projector_version = models.ForeignKey(
+        WorkflowProjectorVersion,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="contract_drafts",
+    )
+    object_info_schema_sha256 = models.CharField(max_length=64)
+    converted_graph_sha256 = models.CharField(max_length=64, blank=True, default="")
+    structural_contract_sha256 = models.CharField(max_length=64, blank=True, default="")
+    projection = models.JSONField(default=dict)
+    projection_schema_version = models.PositiveIntegerField(default=1)
+    projection_size_bytes = models.PositiveIntegerField(default=2)
+    projection_sha256 = models.CharField(max_length=64)
+    admission_tier = models.CharField(max_length=24, choices=AdmissionTier.choices)
+    actionability = models.CharField(max_length=40, choices=Actionability.choices)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="created_comfy_workflow_contract_drafts",
+    )
+    objects = ImmutableComfyWorkflowContractDraftManager()
+
+    class Meta:
+        ordering = ("candidate_source", "-revision")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("candidate_source", "revision"),
+                name="unique_comfy_workflow_contract_draft_revision",
+            ),
+            models.UniqueConstraint(
+                fields=("candidate_source", "projection_sha256"),
+                name="unique_comfy_workflow_contract_draft_projection",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=("candidate_source", "actionability", "-created_at"),
+                name="st_comfy_contract_act_idx",
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if (
+            self.candidate_source_id
+            and self.candidate_source.import_kind
+            != ComfyWorkflowSource.ImportKind.CANDIDATE
+        ):
+            raise ValidationError("合同草稿必须绑定 candidate 来源")
+
+    def save(self, *args, **kwargs):
+        if self.pk and ComfyWorkflowContractDraft.objects.filter(pk=self.pk).exists():
+            raise ValidationError("ComfyWorkflowContractDraft 是不可变合同草稿")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("ComfyWorkflowContractDraft 是不可变合同草稿")
+
+
+class WorkflowSmokeAttemptQuerySet(models.QuerySet):
+    _IMMUTABLE_EXECUTION_FIELDS = frozenset((
+        "workflow_version", "workflow_version_id",
+        "deployment", "deployment_id", "created_by", "created_by_id",
+        "submission_token",
+        "graph_sha256", "execution_contract_sha256",
+        "validation_evidence_sha256", "target_sha256",
+        "fixture_values", "fixture_values_schema_version",
+        "fixture_values_size_bytes", "fixture_values_sha256", "fixture_sha256",
+    ))
+
+    def update(self, **kwargs):
+        if self._IMMUTABLE_EXECUTION_FIELDS & set(kwargs):
+            raise ValidationError("WorkflowSmokeAttempt 冻结执行合同不允许批量更新")
+        return super().update(**kwargs)
+
+    def delete(self):
+        raise ValidationError("WorkflowSmokeAttempt 是持久执行事实，不能删除")
+
+
+class WorkflowSmokeAttemptManager(
+    models.Manager.from_queryset(WorkflowSmokeAttemptQuerySet),
+):
+    pass
+
+
 class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     """Durable, single-submit execution of one workflow smoke test."""
 
@@ -2213,6 +2804,11 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     execution_contract_sha256 = models.CharField(max_length=64)
     validation_evidence_sha256 = models.CharField(max_length=64)
     target_sha256 = models.CharField(max_length=64)
+    fixture_values = models.JSONField(default=dict, blank=True)
+    fixture_values_schema_version = models.PositiveIntegerField(default=2)
+    fixture_values_size_bytes = models.PositiveIntegerField(default=2)
+    fixture_values_sha256 = models.CharField(max_length=64, blank=True)
+    fixture_sha256 = models.CharField(max_length=64, blank=True)
     claim_token = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
     worker_id = models.CharField(max_length=160, blank=True)
     claimed_at = models.DateTimeField(null=True, blank=True)
@@ -2234,6 +2830,7 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     error_code = models.CharField(max_length=100, blank=True)
     error_message = models.TextField(blank=True)
     result = models.JSONField(default=dict, blank=True)
+    objects = WorkflowSmokeAttemptManager()
 
     class Meta:
         ordering = ("-created_at",)
@@ -2250,6 +2847,160 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
             fields=("status", "next_poll_at"),
             name="studio_work_status_70a205_idx",
         )]
+
+    _IMMUTABLE_EXECUTION_FIELDS = (
+        "workflow_version_id", "deployment_id", "created_by_id", "submission_token",
+        "graph_sha256", "execution_contract_sha256",
+        "validation_evidence_sha256", "target_sha256",
+        "fixture_values", "fixture_values_schema_version",
+        "fixture_values_size_bytes", "fixture_values_sha256", "fixture_sha256",
+    )
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            prior = WorkflowSmokeAttempt.objects.filter(pk=self.pk).values(
+                *self._IMMUTABLE_EXECUTION_FIELDS,
+            ).first()
+            if prior is not None and any(
+                prior[field] != getattr(self, field)
+                for field in self._IMMUTABLE_EXECUTION_FIELDS
+            ):
+                raise ValidationError("WorkflowSmokeAttempt 冻结合同是不可变执行事实")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("WorkflowSmokeAttempt 是持久执行事实，不能删除")
+
+
+class AppendOnlyWorkflowSmokeResolutionQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("WorkflowSmokeAttemptResolution 不允许更新")
+
+    def delete(self):
+        raise ValidationError("WorkflowSmokeAttemptResolution 不允许删除")
+
+
+class AppendOnlyWorkflowSmokeResolutionManager(
+    models.Manager.from_queryset(AppendOnlyWorkflowSmokeResolutionQuerySet),
+):
+    pass
+
+
+class WorkflowSmokeAttemptResolution(UUIDTimeStampedModel):
+    """Append-only operator evidence resolving an uncertain remote execution."""
+
+    class Outcome(models.TextChoices):
+        CONFIRMED_NOT_SUBMITTED = "confirmed_not_submitted", "确认未提交"
+        CONFIRMED_REMOTE_FAILED = "confirmed_remote_failed", "确认远端失败"
+        CONFIRMED_REMOTE_SUCCEEDED = "confirmed_remote_succeeded", "确认远端成功"
+
+    attempt = models.ForeignKey(
+        WorkflowSmokeAttempt,
+        on_delete=models.PROTECT,
+        related_name="resolutions",
+    )
+    revision = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    outcome = models.CharField(max_length=40, choices=Outcome.choices)
+    provider_request_id_sha256 = models.CharField(max_length=64, blank=True)
+    evidence = models.JSONField(default=dict)
+    evidence_schema_version = models.PositiveIntegerField(default=1)
+    evidence_size_bytes = models.PositiveIntegerField(default=2)
+    evidence_sha256 = models.CharField(max_length=64)
+    note = models.TextField()
+    decided_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.PROTECT,
+        related_name="workflow_smoke_attempt_resolutions",
+    )
+    objects = AppendOnlyWorkflowSmokeResolutionManager()
+
+    class Meta:
+        ordering = ("attempt", "revision")
+        constraints = [models.UniqueConstraint(
+            fields=("attempt", "revision"),
+            name="unique_workflow_smoke_resolution",
+        )]
+
+    def save(self, *args, **kwargs):
+        if self.pk and WorkflowSmokeAttemptResolution.objects.filter(pk=self.pk).exists():
+            raise ValidationError("WorkflowSmokeAttemptResolution 是不可变审计事实")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("WorkflowSmokeAttemptResolution 是不可变审计事实")
+
+
+class AppendOnlyWorkflowSmokeBindingQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        raise ValidationError("WorkflowSmokeAssetBinding 不允许更新")
+
+    def delete(self):
+        raise ValidationError("WorkflowSmokeAssetBinding 不允许删除")
+
+
+class AppendOnlyWorkflowSmokeBindingManager(
+    models.Manager.from_queryset(AppendOnlyWorkflowSmokeBindingQuerySet),
+):
+    pass
+
+
+class WorkflowSmokeAssetBinding(UUIDTimeStampedModel):
+    """Immutable concrete Asset fact used by one workflow smoke attempt."""
+
+    attempt = models.ForeignKey(
+        WorkflowSmokeAttempt,
+        on_delete=models.PROTECT,
+        related_name="asset_bindings",
+    )
+    semantic_key = models.CharField(max_length=120)
+    input_slot = models.PositiveIntegerField()
+    asset = models.ForeignKey(
+        Asset,
+        on_delete=models.PROTECT,
+        related_name="workflow_smoke_bindings",
+    )
+    media_kind = models.CharField(max_length=12)
+    category = models.CharField(max_length=80)
+    checksum = models.CharField(
+        max_length=64,
+        validators=[RegexValidator(r"^[0-9a-f]{64}$")],
+    )
+    mime_type = models.CharField(max_length=120)
+    size_bytes = models.PositiveBigIntegerField()
+    objects = AppendOnlyWorkflowSmokeBindingManager()
+
+    class Meta:
+        ordering = ("attempt", "media_kind", "input_slot", "semantic_key")
+        constraints = [
+            models.UniqueConstraint(
+                fields=("attempt", "semantic_key"),
+                name="unique_workflow_smoke_semantic",
+            ),
+            models.UniqueConstraint(
+                fields=("attempt", "media_kind", "input_slot"),
+                name="unique_workflow_smoke_slot",
+            ),
+            models.CheckConstraint(
+                condition=Q(input_slot__gte=1),
+                name="workflow_smoke_slot_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(size_bytes__gte=1),
+                name="workflow_smoke_asset_size_positive",
+            ),
+            models.CheckConstraint(
+                condition=Q(media_kind__in=("image", "video", "audio")),
+                name="workflow_smoke_media_kind_valid",
+            ),
+        ]
+
+    def save(self, *args, **kwargs):
+        if self.pk and WorkflowSmokeAssetBinding.objects.filter(pk=self.pk).exists():
+            raise ValidationError("WorkflowSmokeAssetBinding 是不可变烟测事实")
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("WorkflowSmokeAssetBinding 是不可变烟测事实")
 
 
 class WorkflowSemanticBinding(UUIDTimeStampedModel):
@@ -2392,6 +3143,10 @@ class WorkflowModelRequirement(UUIDTimeStampedModel):
 
 
 class ConfigDefinition(UUIDTimeStampedModel):
+    class ConfigurationClass(models.TextChoices):
+        STANDARD = "standard", "普通配置"
+        SECURITY_BOUNDARY = "security_boundary", "安全边界"
+
     class ValueType(models.TextChoices):
         BOOLEAN = "boolean", "布尔"
         INTEGER = "integer", "整数"
@@ -2406,6 +3161,12 @@ class ConfigDefinition(UUIDTimeStampedModel):
         validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,159}$")],
     )
     domain = models.CharField(max_length=80)
+    configuration_class = models.CharField(
+        max_length=32,
+        choices=ConfigurationClass.choices,
+        default=ConfigurationClass.STANDARD,
+        db_index=True,
+    )
     value_type = models.CharField(max_length=16, choices=ValueType.choices)
     description = models.TextField(blank=True)
     unit = models.CharField(max_length=40, blank=True)
@@ -2429,7 +3190,10 @@ class ConfigDefinition(UUIDTimeStampedModel):
 
     class Meta:
         ordering = ("domain", "key")
-        indexes = [models.Index(fields=("domain", "is_active"))]
+        indexes = [
+            models.Index(fields=("domain", "is_active")),
+            models.Index(fields=("configuration_class", "is_active")),
+        ]
 
     def __str__(self) -> str:
         return self.key
@@ -2620,7 +3384,18 @@ class HostCapabilitySnapshot(UUIDTimeStampedModel):
 
 
 class ModelDeploymentCapabilitySnapshot(UUIDTimeStampedModel):
-    """Immutable evidence from a real deployment probe or media smoke-test."""
+    """Immutable evidence from a real deployment probe or smoke-test."""
+
+    # Null means historical/unscoped evidence, never a certified prompt strategy.
+    prompt_profile_binding = models.ForeignKey(
+        "PromptProfileBinding", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="deployment_smoke_snapshots",
+    )
+    prompt_profile_version = models.ForeignKey(
+        "PromptProfileVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="deployment_smoke_snapshots",
+    )
+    prompt_profile_contract_sha256 = models.CharField(max_length=64, blank=True)
 
     class Status(models.TextChoices):
         PASSED = "passed", "通过"
@@ -2666,6 +3441,16 @@ class ModelDeploymentCapabilitySnapshot(UUIDTimeStampedModel):
 
 class ModelDeploymentSmokeAttempt(UUIDTimeStampedModel):
     """Durable single-submit boundary for one real deployment smoke request."""
+
+    prompt_profile_binding = models.ForeignKey(
+        "PromptProfileBinding", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="deployment_smoke_attempts",
+    )
+    prompt_profile_version = models.ForeignKey(
+        "PromptProfileVersion", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="deployment_smoke_attempts",
+    )
+    prompt_profile_contract_sha256 = models.CharField(max_length=64, blank=True)
 
     class Status(models.TextChoices):
         QUEUED = "queued", "排队中"
@@ -2806,7 +3591,7 @@ class RuntimeModelAvailability(UUIDTimeStampedModel):
         ModelArtifact,
         null=True,
         blank=True,
-        on_delete=models.CASCADE,
+        on_delete=models.PROTECT,
         related_name="runtime_availability",
     )
     availability_key = models.CharField(max_length=191)
@@ -3001,6 +3786,7 @@ class ScriptSource(UUIDTimeStampedModel):
     class SourceType(models.TextChoices):
         PASTE = "paste", "粘贴"
         UPLOAD = "upload", "上传"
+        LIBRARY_ASSET = "library_asset", "素材库剧本"
         AI_GENERATED = "ai_generated", "AI 生成"
 
     class SourceFormat(models.TextChoices):
@@ -3023,6 +3809,13 @@ class ScriptSource(UUIDTimeStampedModel):
     project = models.ForeignKey(
         SeriesProject,
         on_delete=models.CASCADE,
+        related_name="script_sources",
+    )
+    source_asset = models.ForeignKey(
+        Asset,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
         related_name="script_sources",
     )
     source_type = models.CharField(max_length=16, choices=SourceType.choices)
@@ -3239,6 +4032,8 @@ class StageRun(UUIDTimeStampedModel):
     status = models.CharField(max_length=24, choices=Status.choices, default=Status.PENDING)
     idempotency_key = models.CharField(max_length=191)
     approval_required = models.BooleanField(default=False)
+    decision_policy = models.CharField(max_length=120, blank=True)
+    decision_policy_sha256 = models.CharField(max_length=64, blank=True)
     attempt_count = models.PositiveIntegerField(default=0)
     routing = models.JSONField(default=dict)
     routing_schema_version = models.PositiveIntegerField(default=1)
@@ -3302,6 +4097,16 @@ class StageRun(UUIDTimeStampedModel):
                 condition=Q(approved_estimated_cost__isnull=True) | Q(approved_estimated_cost__gte=0),
                 name="stage_approved_cost_nonnegative",
             ),
+            models.CheckConstraint(
+                condition=(
+                    Q(decision_policy="", decision_policy_sha256="")
+                    | (
+                        ~Q(decision_policy="")
+                        & Q(decision_policy_sha256__regex=r"^[0-9a-f]{64}$")
+                    )
+                ),
+                name="stage_decision_policy_hash_consistent",
+            ),
         ]
         indexes = [models.Index(fields=("status", "updated_at"))]
 
@@ -3310,6 +4115,10 @@ class ApprovalDecision(UUIDTimeStampedModel):
     class Decision(models.TextChoices):
         APPROVE = "approve", "通过"
         REJECT = "reject", "拒绝"
+
+    class Actor(models.TextChoices):
+        HUMAN = "human", "人工"
+        RECIPE_POLICY = "recipe_policy", "配方策略"
 
     stage_run = models.ForeignKey(
         StageRun,
@@ -3320,8 +4129,17 @@ class ApprovalDecision(UUIDTimeStampedModel):
     decision = models.CharField(max_length=16, choices=Decision.choices)
     comment = models.TextField(blank=True)
     output_snapshot_sha256 = models.CharField(max_length=64, blank=True)
+    actor = models.CharField(
+        max_length=24,
+        choices=Actor.choices,
+        default=Actor.HUMAN,
+    )
+    decision_policy = models.CharField(max_length=120, blank=True)
+    decision_policy_sha256 = models.CharField(max_length=64, blank=True)
     decided_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
         on_delete=models.PROTECT,
         related_name="production_approval_decisions",
     )
@@ -3332,6 +4150,22 @@ class ApprovalDecision(UUIDTimeStampedModel):
             models.UniqueConstraint(
                 fields=("stage_run", "revision"),
                 name="unique_stage_approval_revision",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(
+                        actor="human",
+                        decided_by__isnull=False,
+                        decision_policy="",
+                        decision_policy_sha256="",
+                    )
+                    | (
+                        Q(actor="recipe_policy", decided_by__isnull=True)
+                        & ~Q(decision_policy="")
+                        & Q(decision_policy_sha256__regex=r"^[0-9a-f]{64}$")
+                    )
+                ),
+                name="approval_decision_actor_consistent",
             ),
         ]
 

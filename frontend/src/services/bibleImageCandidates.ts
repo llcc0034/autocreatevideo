@@ -1,17 +1,10 @@
 import type {
   BibleImageAssetSummary,
   BibleImageCandidateProjection,
-  BibleImageCandidateQuality,
   BibleImageCandidatesResult,
   BibleImageEntityType,
   BibleImageLatestCandidate,
-  BibleImagePromptConfig,
-  BibleImagePromptInput,
-  BibleImagePromptInputs,
-  BibleImageQualityIssue,
-  BibleImageTaskStatus,
 } from '@/types'
-import { adaptTaskOutputMedia } from './backendAdapters'
 
 type Raw = Record<string, unknown>
 
@@ -19,10 +12,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-
 const SHA256_RE = /^[0-9a-f]{64}$/
 const SAFE_CODE_RE = /^[a-z][a-z0-9_]{0,99}$/
 const entityTypes: BibleImageEntityType[] = ['character', 'scene', 'prop']
-const taskStatuses: BibleImageTaskStatus[] = ['queued', 'running', 'succeeded', 'failed', 'cancel_requested', 'cancelled', 'incomplete']
+const artifactStatuses: BibleImageLatestCandidate['status'][] = ['available', 'selected', 'rejected', 'invalid', 'legacy_missing']
+const bindingRoles: BibleImageLatestCandidate['bindingRole'][] = ['anchor', 'reference', 'unbound']
+const integrityStatuses: BibleImageLatestCandidate['integrityStatus'][] = ['valid', 'invalid']
 
 const invalidContract = (): never => {
-  throw new Error('服务端返回的实体图片候选契约无效，请刷新后重试。')
+  throw new Error('服务端返回的正式 ProductionRun 实体参考图历史契约无效，请刷新后重试。')
 }
 
 const objectValue = (value: unknown): Raw => (
@@ -44,52 +39,6 @@ const sha256Value = (value: unknown): string => {
   const result = stringValue(value)
   return SHA256_RE.test(result) ? result : invalidContract()
 }
-const entityMapValue = (value: unknown): Record<BibleImageEntityType, string> => {
-  const raw = objectValue(value)
-  return {
-    character: stringValue(raw.character),
-    scene: stringValue(raw.scene),
-    prop: stringValue(raw.prop),
-  }
-}
-
-export const adaptBibleImagePromptConfig = (value: unknown): BibleImagePromptConfig => {
-  const raw = objectValue(value)
-  return {
-    schemaVersion: 1,
-    stylePrompt: stringValue(raw.style_prompt),
-    styleNegativePrompt: stringValue(raw.style_negative_prompt),
-    compositionRules: entityMapValue(raw.composition_rules),
-    negativeRules: entityMapValue(raw.negative_rules),
-    qualitySuffix: stringValue(raw.quality_suffix),
-  }
-}
-
-const adaptPromptInput = (value: unknown): BibleImagePromptInput => {
-  const raw = objectValue(value)
-  const role = stringValue(raw.role)
-  if (role !== 'positive' && role !== 'negative') invalidContract()
-  return {
-    key: stringValue(raw.key),
-    label: stringValue(raw.label),
-    value: stringValue(raw.value),
-    role: role as BibleImagePromptInput['role'],
-    source: stringValue(raw.source),
-    editable: booleanValue(raw.editable),
-  }
-}
-
-const adaptPromptInputs = (value: unknown): BibleImagePromptInputs => {
-  const raw = objectValue(value)
-  if (!Array.isArray(raw.positive) || !Array.isArray(raw.negative)) invalidContract()
-  return {
-    schemaVersion: 1,
-    positive: (raw.positive as unknown[]).map(adaptPromptInput),
-    negative: (raw.negative as unknown[]).map(adaptPromptInput),
-    finalPromptText: stringValue(raw.final_prompt_text),
-    negativePrompt: stringValue(raw.negative_prompt),
-  }
-}
 
 const adaptAssetSummary = (value: unknown): BibleImageAssetSummary => {
   const raw = objectValue(value)
@@ -107,71 +56,69 @@ const adaptAssetSummaries = (value: unknown): BibleImageAssetSummary[] => {
   return (value as unknown[]).map(adaptAssetSummary)
 }
 
-const adaptQualityIssue = (value: unknown): BibleImageQualityIssue => {
+const adaptCandidateHistory = (value: unknown): BibleImageLatestCandidate => {
   const raw = objectValue(value)
-  return {
-    code: stringValue(raw.code),
-    severity: stringValue(raw.severity),
-    path: stringValue(raw.path),
-    message: stringValue(raw.message),
-  }
-}
-
-export const adaptBibleImageCandidateQuality = (value: unknown): BibleImageCandidateQuality => {
-  const raw = objectValue(value)
-  const rawIssues = raw.issues === undefined ? [] : raw.issues
-  const rawWarnings = raw.warnings === undefined ? [] : raw.warnings
-  if (!Array.isArray(rawIssues) || !Array.isArray(rawWarnings) || rawWarnings.some((item) => typeof item !== 'string')) invalidContract()
-  return {
-    policyId: typeof raw.policy_id === 'string' ? raw.policy_id : undefined,
-    status: typeof raw.status === 'string' ? raw.status : undefined,
-    advisoryOnly: typeof raw.advisory_only === 'boolean' ? raw.advisory_only : undefined,
-    wouldBlockEnqueue: typeof raw.would_block_enqueue === 'boolean' ? raw.would_block_enqueue : undefined,
-    issues: (rawIssues as unknown[]).map(adaptQualityIssue),
-    warnings: rawWarnings as string[],
-    raw: { ...raw },
-  }
-}
-
-const adaptLatestCandidate = (value: unknown): BibleImageLatestCandidate => {
-  const raw = objectValue(value)
-  const status = stringValue(raw.task_status)
-  if (!taskStatuses.includes(status as BibleImageTaskStatus) || !Array.isArray(raw.output_media)) invalidContract()
-  return {
-    promptArtifactId: uuidValue(raw.prompt_artifact_id),
-    generatedWorkflowId: nullableUuidValue(raw.generated_workflow_id),
+  const status = stringValue(raw.status) as BibleImageLatestCandidate['status']
+  const bindingRole = stringValue(raw.binding_role) as BibleImageLatestCandidate['bindingRole']
+  const integrityStatus = stringValue(raw.integrity_status) as BibleImageLatestCandidate['integrityStatus']
+  if (
+    !artifactStatuses.includes(status)
+    || !bindingRoles.includes(bindingRole)
+    || !integrityStatuses.includes(integrityStatus)
+  ) invalidContract()
+  const sourceSnapshotSha256 = stringValue(raw.source_snapshot_sha256)
+  if (sourceSnapshotSha256 && !SHA256_RE.test(sourceSnapshotSha256)) invalidContract()
+  const candidate: BibleImageLatestCandidate = {
+    artifactId: uuidValue(raw.artifact_id),
+    productionRunId: uuidValue(raw.production_run_id),
+    stageRunId: uuidValue(raw.stage_run_id),
+    generationAttemptId: nullableUuidValue(raw.generation_attempt_id),
     generationTaskId: nullableUuidValue(raw.generation_task_id),
-    taskStatus: status as BibleImageTaskStatus,
-    createdAt: stringValue(raw.created_at),
-    idempotencyKey: stringValue(raw.idempotency_key),
-    requestFingerprint: sha256Value(raw.request_fingerprint),
-    sourceFingerprint: sha256Value(raw.source_fingerprint),
+    promptArtifactId: nullableUuidValue(raw.prompt_artifact_id),
+    workflowVersionId: nullableUuidValue(raw.workflow_version_id),
+    modelProfileVersionId: nullableUuidValue(raw.model_profile_version_id),
+    modelIdentifier: stringValue(raw.model_identifier),
+    promptProfileVersionId: nullableUuidValue(raw.prompt_profile_version_id),
+    promptProfileBindingKey: stringValue(raw.prompt_profile_binding_key),
+    promptProfileContractSha256: stringValue(raw.prompt_profile_contract_sha256),
+    sourceSnapshotSha256,
     sourceCurrent: booleanValue(raw.source_current),
-    quality: adaptBibleImageCandidateQuality(raw.quality),
-    promptInputs: adaptPromptInputs(raw.prompt_inputs),
-    outputMedia: (raw.output_media as unknown[]).map(adaptTaskOutputMedia),
-    promotedAssets: adaptAssetSummaries(raw.promoted_assets),
-    reviewRequired: booleanValue(raw.review_required),
-    persistedAsAsset: booleanValue(raw.persisted_as_asset),
+    integrityStatus,
+    integrityErrorCode: stringValue(raw.integrity_error_code),
+    variantGroup: stringValue(raw.variant_group),
+    variantIndex: integerValue(raw.variant_index, 1),
+    status,
+    bindingRole,
+    materializedAsset: raw.materialized_asset === null ? null : adaptAssetSummary(raw.materialized_asset),
+    previewUrl: stringValue(raw.preview_url),
+    downloadUrl: stringValue(raw.download_url),
+    sha256: sha256Value(raw.sha256),
+    sizeBytes: integerValue(raw.size_bytes, 1),
+    mimeType: stringValue(raw.mime_type),
+    createdAt: stringValue(raw.created_at),
   }
+  if (!candidate.variantGroup || !candidate.mimeType || !candidate.createdAt) invalidContract()
+  if (candidate.integrityStatus === 'valid' && !candidate.sourceSnapshotSha256) invalidContract()
+  if (candidate.integrityStatus === 'valid' && candidate.integrityErrorCode) invalidContract()
+  if (candidate.integrityStatus === 'invalid' && !candidate.integrityErrorCode) invalidContract()
+  if (candidate.bindingRole !== 'unbound' && candidate.materializedAsset === null) invalidContract()
+  return candidate
 }
 
 export const adaptBibleImageCandidateProjection = (value: unknown): BibleImageCandidateProjection => {
   const raw = objectValue(value)
   const entityType = stringValue(raw.entity_type)
   if (!entityTypes.includes(entityType as BibleImageEntityType) || !Array.isArray(raw.candidate_history)) invalidContract()
-  const candidateHistory = (raw.candidate_history as unknown[]).map(adaptLatestCandidate)
-  const latestCandidate = raw.latest_candidate === null ? null : adaptLatestCandidate(raw.latest_candidate)
+  const candidateHistory = (raw.candidate_history as unknown[]).map(adaptCandidateHistory)
+  const latestCandidate = raw.latest_candidate === null ? null : adaptCandidateHistory(raw.latest_candidate)
   if (
     (latestCandidate === null && candidateHistory.length > 0)
-    || (latestCandidate !== null && candidateHistory[0]?.promptArtifactId !== latestCandidate.promptArtifactId)
+    || (latestCandidate !== null && candidateHistory[0]?.artifactId !== latestCandidate.artifactId)
   ) invalidContract()
   return {
     entityType: entityType as BibleImageEntityType,
     entityId: uuidValue(raw.entity_id),
     entityName: stringValue(raw.entity_name),
-    sourceFingerprint: sha256Value(raw.source_fingerprint),
-    currentPromptInputs: adaptPromptInputs(raw.current_prompt_inputs),
     anchorAsset: raw.anchor_asset === null ? null : adaptAssetSummary(raw.anchor_asset),
     referenceAssets: adaptAssetSummaries(raw.reference_assets),
     latestCandidate,
@@ -185,7 +132,6 @@ export const adaptBibleImageCandidates = (value: unknown): BibleImageCandidatesR
   if (!Array.isArray(raw.candidates)) invalidContract()
   const result: BibleImageCandidatesResult = {
     projectId: uuidValue(raw.project_id),
-    promptConfig: adaptBibleImagePromptConfig(raw.prompt_config),
     candidates: (raw.candidates as unknown[]).map(adaptBibleImageCandidateProjection),
     counts: {
       characters: integerValue(counts.characters),
@@ -210,16 +156,15 @@ const bibleImageCandidateErrorCode = (error: unknown): string => {
 }
 
 const errorMessages: Record<string, string> = {
-  bible_image_candidate_incomplete_chain: '实体参考图候选历史链不完整，页面不会推断或补写。',
-  bible_image_candidate_target_invalid: '实体参考图候选历史的冻结目标校验失败。',
-  bible_image_candidate_target_conflict: '实体参考图候选历史与冻结目标不一致。',
-  bible_image_candidate_provenance_mismatch: '实体参考图候选历史的来源校验失败。',
-  bible_image_candidate_source_invalid: '实体参考图候选历史无法重建原始来源。',
+  bible_image_candidate_target_invalid: '实体参考图历史的冻结目标校验失败。',
+  bible_image_candidate_target_conflict: '实体参考图历史与冻结目标不一致。',
+  bible_image_candidate_provenance_mismatch: '实体参考图历史的来源校验失败。',
+  bible_image_source_changed: 'Bible 实体来源已变化；请新建 ProductionRun 重新生成并审核。',
 }
 
 export const bibleImageCandidateErrorMessage = (error: unknown, fallback: string): string => {
   const code = bibleImageCandidateErrorCode(error)
   if (errorMessages[code]) return errorMessages[code]
-  if (code.startsWith('bible_image_candidate_')) return '实体图片候选未通过服务端校验，本次没有伪造成功或自动降级。'
+  if (code.startsWith('bible_image_')) return '实体参考图历史未通过服务端校验，本次没有伪造成功或自动降级。'
   return error instanceof Error && error.message ? error.message : fallback
 }

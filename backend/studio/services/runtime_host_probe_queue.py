@@ -13,24 +13,66 @@ from django.utils import timezone
 
 from studio.models import (
     HostCapabilitySnapshot,
+    ModelArtifact,
     RuntimeHost,
     RuntimeHostProbeAttempt,
     WorkerLease,
 )
-from studio.services.configuration import ConfigurationResolutionError
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    resolve_configuration,
+)
+from studio.services.json_contracts import assign_json_contract, verify_json_contract
 from studio.services.runtime_platform import probe_runtime_host
+from studio.services.draft_model_artifact_attestation import (
+    load_draft_attestation_context,
+)
+from studio.services.security_boundaries import boundary_int
 
 
 logger = logging.getLogger(__name__)
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
 ACTIVE = (
     RuntimeHostProbeAttempt.Status.QUEUED,
     RuntimeHostProbeAttempt.Status.RUNNING,
     RuntimeHostProbeAttempt.Status.CANCEL_REQUESTED,
 )
-HOST_LEASE_SECONDS = 300
-HEARTBEAT_INTERVAL_SECONDS = 2.0
-DEFAULT_STALE_SECONDS = 300
+RUNTIME_HOST_PROBE_POLICY_KEYS = (
+    "runtime.host_probe_heartbeat_seconds",
+    "runtime.host_probe_lease_seconds",
+    "runtime.host_probe_stale_seconds",
+    "runtime.host_probe_refresh_buffer_seconds",
+)
+
+
+def _runtime_host_probe_policy() -> dict[str, float]:
+    values = resolve_configuration(
+        required_keys=RUNTIME_HOST_PROBE_POLICY_KEYS,
+    ).values
+    policy: dict[str, float] = {}
+    for key in RUNTIME_HOST_PROBE_POLICY_KEYS:
+        value = values[key]
+        if type(value) not in {int, float} or float(value) < 0:
+            raise ConfigurationResolutionError(
+                f"运行主机探测配置 {key} 必须是非负数字",
+                code="runtime_host_probe_policy_invalid",
+                missing_keys=(key,),
+            )
+        policy[key] = float(value)
+    heartbeat = policy["runtime.host_probe_heartbeat_seconds"]
+    lease = policy["runtime.host_probe_lease_seconds"]
+    stale = policy["runtime.host_probe_stale_seconds"]
+    if heartbeat <= 0 or lease <= heartbeat or stale < lease:
+        raise ConfigurationResolutionError(
+            "运行主机探测配置必须满足 0 < heartbeat < lease <= stale",
+            code="runtime_host_probe_policy_invalid",
+            missing_keys=RUNTIME_HOST_PROBE_POLICY_KEYS[:3],
+        )
+    return policy
 
 
 class RuntimeHostProbeCancelled(Exception):
@@ -39,6 +81,46 @@ class RuntimeHostProbeCancelled(Exception):
 
 class RuntimeHostProbeClaimLost(Exception):
     """A recovered worker no longer owns the durable attempt fence."""
+
+
+def _capability_snapshot_refresh_is_due(
+    snapshot: HostCapabilitySnapshot | None,
+    *,
+    now,
+) -> bool:
+    if snapshot is None:
+        return True
+    if snapshot.expires_at is None:
+        return False
+
+    policy = _runtime_host_probe_policy()
+    lead_seconds = policy["runtime.host_probe_lease_seconds"]
+    attempt = snapshot.probe_attempt
+    if attempt is not None and attempt.started_at is not None:
+        observed_seconds = max(
+            0.0,
+            (snapshot.captured_at - attempt.started_at).total_seconds(),
+        )
+        lead_seconds = max(
+            lead_seconds,
+            observed_seconds + policy["runtime.host_probe_refresh_buffer_seconds"],
+        )
+
+    snapshot_ttl_seconds = max(
+        0.0,
+        (snapshot.expires_at - snapshot.captured_at).total_seconds(),
+    )
+    lead_seconds = min(lead_seconds, snapshot_ttl_seconds)
+    return snapshot.expires_at <= now + timedelta(seconds=lead_seconds)
+
+
+def _latest_snapshot_for_refresh(host: RuntimeHost) -> HostCapabilitySnapshot | None:
+    return (
+        HostCapabilitySnapshot.objects.select_related("probe_attempt")
+        .filter(host=host)
+        .order_by("-captured_at", "-revision")
+        .first()
+    )
 
 
 def _snapshot_for_attempt(attempt: RuntimeHostProbeAttempt) -> HostCapabilitySnapshot | None:
@@ -51,15 +133,62 @@ def _mark_succeeded_from_snapshot(
     now=None,
 ) -> RuntimeHostProbeAttempt:
     now = now or timezone.now()
-    attempt.status = RuntimeHostProbeAttempt.Status.SUCCEEDED
-    attempt.progress_marker = "phase:succeeded"
+    attestation_failed = False
+    request_contract_invalid = False
+    if (
+        attempt.probe_kind
+        == RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+    ):
+        try:
+            verify_json_contract(
+                attempt.request_snapshot,
+                schema_version=attempt.request_snapshot_schema_version,
+                size_bytes=attempt.request_snapshot_size_bytes,
+                sha256=attempt.request_snapshot_sha256,
+                max_bytes=_stage_snapshot_max_bytes(),
+            )
+        except ValidationError:
+            request_contract_invalid = True
+            artifact_ids = []
+        else:
+            artifact_ids = [
+                row.get("artifact_id")
+                for row in attempt.request_snapshot.get("artifacts", [])
+                if isinstance(row, dict)
+            ]
+        snapshot = _snapshot_for_attempt(attempt)
+        attestation_failed = (
+            snapshot is None
+            or not artifact_ids
+            or ModelArtifact.objects.filter(
+                pk__in=artifact_ids,
+                status=ModelArtifact.Status.AVAILABLE,
+                verified_snapshot=snapshot,
+            ).count() != len(set(artifact_ids))
+        )
+    attempt.status = (
+        RuntimeHostProbeAttempt.Status.FAILED
+        if attestation_failed else RuntimeHostProbeAttempt.Status.SUCCEEDED
+    )
+    attempt.progress_marker = (
+        "phase:failed" if attestation_failed else "phase:succeeded"
+    )
     attempt.finished_at = attempt.finished_at or now
     attempt.heartbeat_at = now
     attempt.claim_token = None
     attempt.worker_id = ""
     attempt.claimed_at = None
-    attempt.error_code = ""
-    attempt.error_message = ""
+    attempt.error_code = (
+        "attestation_request_contract_invalid"
+        if request_contract_invalid else
+        "draft_artifact_attestation_failed" if attestation_failed else ""
+    )
+    attempt.error_message = (
+        "模型证明请求快照的 size/hash 合同损坏。"
+        if request_contract_invalid else
+        "草稿模型文件未形成完整的本机 size/hash 证明；请查看最终主机快照。"
+        if attestation_failed else ""
+    )
     attempt.save(update_fields=(
         "status", "progress_marker", "finished_at", "heartbeat_at",
         "claim_token", "worker_id", "claimed_at", "error_code",
@@ -84,23 +213,37 @@ def enqueue_runtime_host_probe(
         status__in=ACTIVE,
     ).order_by("created_at").first()
     if existing is not None:
+        if existing.probe_kind != RuntimeHostProbeAttempt.ProbeKind.CAPABILITY:
+            if due_only:
+                return None, False
+            raise ValidationError(
+                "主机已有草稿模型证明任务；完成或取消后才能启动能力探测",
+            )
         return existing, False
     if due_only:
         now = timezone.now()
-        latest = HostCapabilitySnapshot.objects.filter(host=host).order_by(
-            "-captured_at", "-revision",
-        ).first()
-        if latest is not None and (
-            latest.expires_at is None or latest.expires_at > now
-        ):
+        latest = _latest_snapshot_for_refresh(host)
+        if not _capability_snapshot_refresh_is_due(latest, now=now):
             return None, False
     try:
         with transaction.atomic():
-            attempt = RuntimeHostProbeAttempt.objects.create(
+            attempt = RuntimeHostProbeAttempt(
                 host=host,
                 created_by=created_by,
                 trigger=trigger,
+                probe_kind=RuntimeHostProbeAttempt.ProbeKind.CAPABILITY,
             )
+            assign_json_contract(
+                attempt,
+                "request_snapshot",
+                {
+                    "schema_version": 1,
+                    "probe_kind": RuntimeHostProbeAttempt.ProbeKind.CAPABILITY,
+                    "host_id": str(host.id),
+                },
+                max_bytes=_stage_snapshot_max_bytes(),
+            )
+            attempt.save()
     except IntegrityError:
         attempt = RuntimeHostProbeAttempt.objects.get(host=host, status__in=ACTIVE)
         return attempt, False
@@ -189,23 +332,21 @@ def claim_runtime_host_lease(
         ).first()
         if active_attempt is not None and active_attempt.id != attempt_id:
             return False, "attempt_active"
-        latest = HostCapabilitySnapshot.objects.filter(host=host).order_by(
-            "-captured_at", "-revision",
-        ).first()
-        if due_only and latest is not None and (
-            latest.expires_at is None or latest.expires_at > now
-        ):
+        latest = _latest_snapshot_for_refresh(host)
+        if due_only and not _capability_snapshot_refresh_is_due(latest, now=now):
             return False, "not_due"
         lease.holder_id = str(holder_id)[:64]
-        lease.expires_at = now + timedelta(seconds=HOST_LEASE_SECONDS)
+        lease_seconds = _runtime_host_probe_policy()["runtime.host_probe_lease_seconds"]
+        lease.expires_at = now + timedelta(seconds=lease_seconds)
         lease.save(update_fields=("holder_id", "expires_at", "updated_at"))
     return True, "claimed"
 
 
 def renew_runtime_host_lease(lease_key: str, *, holder_id: str) -> None:
     now = timezone.now()
+    lease_seconds = _runtime_host_probe_policy()["runtime.host_probe_lease_seconds"]
     updated = WorkerLease.objects.filter(pk=lease_key, holder_id=holder_id).update(
-        expires_at=now + timedelta(seconds=HOST_LEASE_SECONDS),
+        expires_at=now + timedelta(seconds=lease_seconds),
         updated_at=now,
     )
     if updated != 1:
@@ -318,10 +459,14 @@ def process_runtime_host_probe(
 
     last_control = 0.0
 
+    heartbeat_interval = _runtime_host_probe_policy()[
+        "runtime.host_probe_heartbeat_seconds"
+    ]
+
     def control(*, force: bool = False) -> None:
         nonlocal last_control
         current = time.monotonic()
-        if not force and current - last_control < HEARTBEAT_INTERVAL_SECONDS:
+        if not force and current - last_control < heartbeat_interval:
             return
         _heartbeat_attempt(attempt.pk, claim_token)
         renew_runtime_host_lease(lease_key, holder_id=lease_holder)
@@ -331,16 +476,33 @@ def process_runtime_host_probe(
 
     try:
         control(force=True)
-        snapshot = probe_runtime_host(
-            attempt.host,
-            lease_renew=control,
-            probe_attempt=attempt,
-            commit_guard=lambda: _heartbeat_attempt(
+        attestation_context = None
+        if (
+            attempt.probe_kind
+            == RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+        ):
+            attestation_context = load_draft_attestation_context(attempt)
+
+        def commit_guard() -> None:
+            _heartbeat_attempt(
                 attempt.pk,
                 claim_token,
                 marker="phase:persisting",
-            ),
-        )
+            )
+            if attestation_context is not None:
+                # Re-lock and compare deployment/profile/artifact declarations
+                # inside the snapshot transaction. A late endpoint or draft
+                # mutation therefore produces no snapshot and no artifact fill.
+                load_draft_attestation_context(attempt, for_update=True)
+
+        probe_kwargs = {
+            "lease_renew": control,
+            "probe_attempt": attempt,
+            "commit_guard": commit_guard,
+        }
+        if attestation_context is not None:
+            probe_kwargs["attestation_context"] = attestation_context
+        snapshot = probe_runtime_host(attempt.host, **probe_kwargs)
     except RuntimeHostProbeCancelled:
         return _finish_terminal(
             attempt.pk,
@@ -425,9 +587,13 @@ def request_runtime_host_probe_cancel(
 @transaction.atomic
 def recover_stale_runtime_host_probes(
     *,
-    stale_seconds: int = DEFAULT_STALE_SECONDS,
+    stale_seconds: int | None = None,
 ) -> int:
     now = timezone.now()
+    if stale_seconds is None:
+        stale_seconds = int(
+            _runtime_host_probe_policy()["runtime.host_probe_stale_seconds"]
+        )
     recovered = 0
     completed = list(RuntimeHostProbeAttempt.objects.select_for_update().filter(
         status__in=ACTIVE,
@@ -436,7 +602,13 @@ def recover_stale_runtime_host_probes(
     for attempt in completed:
         _mark_succeeded_from_snapshot(attempt, now=now)
         recovered += 1
-    cutoff = now - timedelta(seconds=max(60, int(stale_seconds)))
+    if type(stale_seconds) is not int or stale_seconds <= 0:
+        raise ConfigurationResolutionError(
+            "运行主机探测 stale_seconds 必须是正整数",
+            code="runtime_host_probe_policy_invalid",
+            missing_keys=("runtime.host_probe_stale_seconds",),
+        )
+    cutoff = now - timedelta(seconds=stale_seconds)
     stale = list(RuntimeHostProbeAttempt.objects.select_for_update().filter(
         status__in=ACTIVE,
         claim_token__isnull=False,

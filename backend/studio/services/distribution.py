@@ -24,29 +24,40 @@ import uuid
 
 from django.conf import settings
 from django.core import signing
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.utils import timezone
 from PIL import Image, ImageChops, ImageDraw, ImageFont, ImageOps, PngImagePlugin, UnidentifiedImageError
 
 from studio.media_signing import classify_task_output
 from studio.models import GenerationTask
+from studio.services.delivery_disclosure import (
+    DeliveryDisclosureError,
+    resolve_delivery_disclosure,
+)
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    resolve_configuration,
+)
+from studio.services.media_processing_profiles import (
+    MediaProcessingProfileError,
+    ResolvedMediaProcessingProfile,
+    resolve_distribution_media_profile,
+    validate_distribution_profile,
+)
 from studio.services.provenance import (
     ProvenanceError,
     resolve_task_output_path,
     sha256_file,
     verified_task_manifest,
 )
+from studio.services.security_boundaries import boundary_bool
 
 
 DISTRIBUTION_SCHEMA = "https://autoprompt.local/schemas/task-distribution-provenance/v1"
 DISTRIBUTION_SIGNING_SALT = "autoprompt.task-distribution.v1"
-H3_DISTRIBUTION_DESCRIPTION = "AI-generated video produced with MiniMax H3"
-SDXL_DISTRIBUTION_DESCRIPTION = "AI-generated image produced with Stable Diffusion XL 1.0"
-# Backward-compatible export for callers specifically testing the H3 video
-# profile. New code must use the task-resolved description from the manifest.
-DISTRIBUTION_DESCRIPTION = H3_DISTRIBUTION_DESCRIPTION
+DISTRIBUTION_PROTOCOL_VERSION = "shot-public-v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
-_VERSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 
 
 class DistributionError(ValueError):
@@ -83,82 +94,54 @@ def _write_json(path: Path, document: dict) -> None:
         os.fsync(stream.fileno())
 
 
-def _valid_label(label: str, *, model_key: str) -> str:
-    if not bool(getattr(settings, "TASK_DISTRIBUTION_ENABLED", False)):
-        raise DistributionError("Managed public distribution copies are disabled")
-    label = str(label or "").strip()
-    folded = label.casefold()
-    generated = "generated" in folded or "生成" in label
-    model_named = (
-        "minimax h3" in folded
-        if model_key == "minimax-h3"
-        else any(value in folded for value in ("sdxl", "stable diffusion xl"))
-        if model_key == "sdxl-1.0"
-        else False
-    )
-    if (
-        not label
-        or len(label) > 120
-        or any(character in label for character in "\r\n")
-        or "ai" not in folded
-        or not generated
-        or not model_named
-    ):
+def _assert_distribution_enabled() -> None:
+    try:
+        enabled = boundary_bool("security.delivery.public_distribution_enabled")
+    except (ConfigurationResolutionError, ValidationError) as exc:
         raise DistributionError(
-            f"The {model_key} distribution label must explicitly identify AI-generated content and its actual model"
-        )
-    return label
-
-
-def _disclosure_for_model_key(model_key: str) -> dict:
-    if model_key == "minimax-h3":
-        label = getattr(settings, "TASK_DISTRIBUTION_LABEL_TEXT", "")
-        description = H3_DISTRIBUTION_DESCRIPTION
-        media_kind = "video"
-    elif model_key == "sdxl-1.0":
-        label = getattr(settings, "TASK_IMAGE_DISTRIBUTION_LABEL_TEXT", "")
-        description = SDXL_DISTRIBUTION_DESCRIPTION
-        media_kind = "image"
-    else:
-        raise DistributionError("Task model has no managed-distribution disclosure profile")
-    return {
-        "model_key": model_key,
-        "model": model_key,
-        "media_kind": media_kind,
-        "label": _valid_label(label, model_key=model_key),
-        "description": description,
-    }
+            "Managed public distribution security boundary is unavailable"
+        ) from exc
+    if not enabled:
+        raise DistributionError("Managed public distribution copies are disabled")
 
 
 def _task_disclosure(task: GenerationTask, media_kind: str) -> dict:
-    template = task.generated_workflow.template
-    model = str(template.model or "").strip().casefold().replace("_", "-")
-    if media_kind == "video" and ("minimax-h3" in model or "minimax h3" in model):
-        model_key = "minimax-h3"
-    elif media_kind == "image" and (
-        "sdxl" in model
-        or "sd-xl" in model
-        or "sd xl" in model
-        or "stable-diffusion-xl" in model
-        or "stable diffusion xl" in model
-    ):
-        model_key = "sdxl-1.0"
-    else:
-        model_key = None
-    if not model_key:
-        raise DistributionError("Task model cannot be resolved to a managed distribution profile")
-    disclosure = _disclosure_for_model_key(model_key)
-    disclosure["model"] = str(template.model or model_key)
-    if disclosure["media_kind"] != media_kind or task.kind != media_kind:
+    _assert_distribution_enabled()
+    if task.kind != media_kind:
         raise DistributionError("Task output kind does not match its model distribution profile")
-    return disclosure
+    workflow = task.generated_workflow
+    if not workflow.workflow_template_version_id:
+        raise DistributionError(
+            "Unversioned workflow distribution is retired",
+        )
+    versioned_profile = workflow.workflow_template_version.model_profile_version
+    if versioned_profile is None:
+        raise DistributionError(
+            "Versioned workflow has no frozen model profile",
+        )
+    model = str(versioned_profile.model_identifier or "").strip()
+    if not model:
+        raise DistributionError("Task execution contract has no model identity")
+    model_key = f"{versioned_profile.profile_key}:v{versioned_profile.version}"
+    try:
+        disclosure = resolve_delivery_disclosure(
+            model=model,
+            model_key=model_key,
+            media_kind=media_kind,
+        )
+    except DeliveryDisclosureError as exc:
+        raise DistributionError(str(exc)) from exc
+    return {
+        "model_key": disclosure.model_key,
+        "model": disclosure.model,
+        "media_kind": disclosure.media_kind,
+        "label": disclosure.label,
+        "description": disclosure.description,
+    }
 
 
 def _valid_version() -> str:
-    version = str(getattr(settings, "TASK_DISTRIBUTION_VERSION", "") or "").strip()
-    if not _VERSION_RE.fullmatch(version):
-        raise DistributionError("TASK_DISTRIBUTION_VERSION is invalid")
-    return version
+    return DISTRIBUTION_PROTOCOL_VERSION
 
 
 def _font_candidates() -> list[Path]:
@@ -211,6 +194,7 @@ def _drawtext_value(value: str) -> str:
 
 def _release_config(
     *, source_sha256: str, media_kind: str, font_sha256: str, disclosure: dict,
+    media_profile: ResolvedMediaProcessingProfile,
 ) -> dict:
     return {
         "source_sha256": source_sha256,
@@ -221,7 +205,9 @@ def _release_config(
         "description": disclosure["description"],
         "version": _valid_version(),
         "font_sha256": font_sha256,
-        "video_profile": "h264-crf18-yuv420p-aac-faststart",
+        "media_profile_key": media_profile.key,
+        "media_profile_sha256": media_profile.sha256,
+        "media_profile": media_profile.value,
         "image_profile": "png-rgba-visible-box-v1",
     }
 
@@ -229,20 +215,25 @@ def _release_config(
 def distribution_configuration() -> dict:
     """Return a path-free, verified snapshot of the publication renderer config."""
 
+    _assert_distribution_enabled()
     font = _resolve_font()
-    h3 = _disclosure_for_model_key("minimax-h3")
-    sdxl = _disclosure_for_model_key("sdxl-1.0")
+    try:
+        media_profile = resolve_distribution_media_profile()
+    except MediaProcessingProfileError as exc:
+        raise DistributionError(str(exc)) from exc
+    try:
+        disclosure = resolve_delivery_disclosure()
+    except DeliveryDisclosureError as exc:
+        raise DistributionError(str(exc)) from exc
     return {
-        "enabled": bool(getattr(settings, "TASK_DISTRIBUTION_ENABLED", False)),
-        "video_label": h3["label"],
-        "image_label": sdxl["label"],
+        "enabled": True,
+        "base_label": disclosure.base_label,
         "version": _valid_version(),
         "lock_stale_seconds": _lock_stale_seconds(),
         "font_sha256": sha256_file(font),
-        "profiles": {
-            h3["model_key"]: h3["description"],
-            sdxl["model_key"]: sdxl["description"],
-        },
+        "media_profile_key": media_profile.key,
+        "media_profile_sha256": media_profile.sha256,
+        "media_profile": media_profile.value,
     }
 
 
@@ -266,12 +257,14 @@ def _release_paths(task: GenerationTask, output_index: int, release_id: str, med
 
 def _lock_stale_seconds() -> float:
     try:
-        value = float(getattr(settings, "TASK_DISTRIBUTION_LOCK_STALE_SECONDS", 180))
-    except (TypeError, ValueError) as exc:
-        raise DistributionError("TASK_DISTRIBUTION_LOCK_STALE_SECONDS is invalid") from exc
-    if not 0 < value <= 86_400:
-        raise DistributionError("TASK_DISTRIBUTION_LOCK_STALE_SECONDS is invalid")
-    return value
+        value = resolve_configuration(required_keys=(
+            "runtime.distribution_lock_stale_seconds",
+        )).values["runtime.distribution_lock_stale_seconds"]
+    except (ConfigurationResolutionError, ValidationError) as exc:
+        raise DistributionError("distribution lock stale configuration is unavailable") from exc
+    if type(value) is not int or value < 1:
+        raise DistributionError("runtime.distribution_lock_stale_seconds is invalid")
+    return float(value)
 
 
 def _lock_document(owner_token: str) -> dict:
@@ -315,7 +308,7 @@ def _lock_is_stale(path: Path) -> bool:
         started = float(payload.get("started_at_epoch"))
         # A corrupt/future timestamp cannot pin a lock indefinitely; fall back
         # to the filesystem timestamp when it is implausible.
-        if not 0 < started <= now + 60:
+        if not 0 < started <= now:
             raise ValueError
         age = min(mtime_age, max(0.0, now - started))
     except (OSError, ValueError, TypeError, json.JSONDecodeError, AttributeError):
@@ -398,7 +391,8 @@ def distribution_manifest_path(task: GenerationTask, output_index: int) -> Path:
     return manifest
 
 
-def _video_metadata(path: Path) -> dict:
+def _video_metadata(path: Path, *, media_profile: dict) -> dict:
+    profile = validate_distribution_profile(media_profile)
     command = [
         str(getattr(settings, "FFPROBE_BINARY", "ffprobe")),
         "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path),
@@ -406,7 +400,7 @@ def _video_metadata(path: Path) -> dict:
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8", errors="strict",
-            timeout=max(5.0, min(60.0, float(settings.TASK_DISTRIBUTION_TIMEOUT_SECONDS))),
+            timeout=profile["probe_timeout_seconds"],
         )
     except (OSError, subprocess.SubprocessError) as exc:
         raise DistributionError("FFprobe could not verify the managed video copy") from exc
@@ -429,17 +423,26 @@ def _video_metadata(path: Path) -> dict:
 
 def _render_video(
     source: Path, target: Path, *, label: str, description: str, font: Path,
+    media_profile: dict,
 ) -> dict:
+    profile = validate_distribution_profile(media_profile)
+    overlay = profile["video_overlay"]
     drawtext = (
         f"drawtext=fontfile='{_drawtext_value(font.as_posix())}':"
-        f"text='{_drawtext_value(label)}':fontcolor=white:fontsize=h/40:"
-        "box=1:boxcolor=black@0.70:boxborderw=10:x=w-tw-24:y=h-th-24"
+        f"text='{_drawtext_value(label)}':fontcolor={overlay['font_color']}:"
+        f"fontsize=h/{overlay['font_size_divisor']}:box=1:"
+        f"boxcolor={overlay['box_color']}@{overlay['box_opacity']}:"
+        f"boxborderw={overlay['box_border_width_px']}:"
+        f"x=w-tw-{overlay['margin_x_px']}:y=h-th-{overlay['margin_y_px']}"
     )
     command = [
         str(settings.FFMPEG_BINARY), "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
         "-i", str(source), "-map_metadata", "-1", "-map", "0:v:0", "-map", "0:a?",
-        "-vf", drawtext, "-c:v", "libx264", "-preset", "medium", "-crf", "18",
-        "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-sn", "-dn",
+        "-vf", drawtext, "-c:v", profile["video_codec"],
+        "-preset", profile["video_preset"], "-crf", str(profile["video_crf"]),
+        "-pix_fmt", profile["pixel_format"], "-c:a", profile["audio_codec"],
+        "-b:a", f"{profile['audio_bitrate_kbps']}k",
+        "-ar", str(profile["audio_sample_rate_hz"]), "-sn", "-dn",
         "-metadata", f"comment={label}",
         "-metadata", f"description={description}",
         "-movflags", "+faststart", str(target),
@@ -447,7 +450,7 @@ def _render_video(
     try:
         result = subprocess.run(
             command, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=max(1.0, float(settings.TASK_DISTRIBUTION_TIMEOUT_SECONDS)),
+            timeout=profile["render_timeout_seconds"],
         )
     except subprocess.TimeoutExpired as exc:
         raise DistributionError("Managed video copy timed out before publication") from exc
@@ -455,7 +458,7 @@ def _render_video(
         raise DistributionError("FFmpeg could not create the managed video copy") from exc
     if result.returncode != 0 or not target.is_file() or target.stat().st_size <= 0:
         raise DistributionError("FFmpeg failed to create the managed video copy")
-    metadata = _video_metadata(target)
+    metadata = _video_metadata(target, media_profile=profile)
     normalized_comment = unicodedata.normalize("NFC", metadata.get("comment", "")).strip()
     normalized_description = unicodedata.normalize(
         "NFC", metadata.get("description", ""),
@@ -469,28 +472,38 @@ def _render_video(
             f"(comment={metadata.get('comment')!r}, description={metadata.get('description')!r})"
         )
     return {
-        "profile": "h264-crf18-yuv420p-aac-faststart",
+        "media_profile": profile,
         "visible_overlay": True,
-        "overlay_filter": "bottom-right boxed drawtext",
+        "overlay_filter": "configured bottom-right boxed drawtext",
         "metadata_verified": True,
     }
 
 
-def _fit_font(font_path: Path, label: str, width: int, height: int) -> tuple[ImageFont.FreeTypeFont, tuple[int, int, int, int]]:
-    maximum_width = max(20, width - 16)
-    size = max(8, min(width, height) // 28)
+def _fit_font(
+    font_path: Path,
+    label: str,
+    width: int,
+    height: int,
+    *,
+    image_overlay: dict,
+) -> tuple[ImageFont.FreeTypeFont, tuple[int, int, int, int]]:
+    minimum_size = image_overlay["minimum_font_size_px"]
+    maximum_width = max(minimum_size, width - image_overlay["width_inset_px"])
+    size = max(minimum_size, min(width, height) // image_overlay["font_size_divisor"])
     while True:
         font = ImageFont.truetype(str(font_path), size)
         bounds = font.getbbox(label)
-        if bounds[2] - bounds[0] <= maximum_width or size <= 8:
+        if bounds[2] - bounds[0] <= maximum_width or size <= minimum_size:
             return font, bounds
         size -= 1
 
 
 def _render_image(
     source: Path, target: Path, *, label: str, description: str, font: Path,
-    source_sha256: str, version: str,
+    source_sha256: str, version: str, media_profile: dict,
 ) -> dict:
+    profile = validate_distribution_profile(media_profile)
+    image_overlay = profile["image_overlay"]
     try:
         with Image.open(source) as opened:
             opened.load()
@@ -498,23 +511,38 @@ def _render_image(
     except (OSError, UnidentifiedImageError) as exc:
         raise DistributionError("Source image cannot be decoded for managed publication") from exc
     width, height = base.size
-    if width < 32 or height < 32:
+    if (
+        width < image_overlay["minimum_source_dimension_px"]
+        or height < image_overlay["minimum_source_dimension_px"]
+    ):
         raise DistributionError("Source image is too small for a clear AI disclosure label")
-    font_object, bounds = _fit_font(font, label, width, height)
+    font_object, bounds = _fit_font(
+        font, label, width, height, image_overlay=image_overlay,
+    )
     text_width = bounds[2] - bounds[0]
     text_height = bounds[3] - bounds[1]
-    padding = max(4, min(width, height) // 80)
-    margin = max(6, min(width, height) // 50)
+    padding = max(
+        image_overlay["minimum_padding_px"],
+        min(width, height) // image_overlay["padding_divisor"],
+    )
+    margin = max(
+        image_overlay["minimum_margin_px"],
+        min(width, height) // image_overlay["margin_divisor"],
+    )
     left = max(0, width - margin - text_width - padding * 2)
     top = max(0, height - margin - text_height - padding * 2)
     right = min(width, left + text_width + padding * 2)
     bottom = min(height, top + text_height + padding * 2)
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
-    draw.rounded_rectangle((left, top, right, bottom), radius=max(2, padding), fill=(0, 0, 0, 190))
+    draw.rounded_rectangle(
+        (left, top, right, bottom),
+        radius=max(image_overlay["minimum_corner_radius_px"], padding),
+        fill=tuple(image_overlay["box_rgba"]),
+    )
     draw.text(
         (left + padding - bounds[0], top + padding - bounds[1]),
-        label, font=font_object, fill=(255, 255, 255, 255),
+        label, font=font_object, fill=tuple(image_overlay["text_rgba"]),
     )
     rendered = Image.alpha_composite(base, overlay).convert("RGB")
     metadata = PngImagePlugin.PngInfo()
@@ -548,6 +576,7 @@ def _render_image(
         raise DistributionError("Managed image copy has no verifiable visible disclosure pixels")
     return {
         "profile": "png-rgba-visible-box-v1",
+        "media_profile": profile,
         "visible_overlay": True,
         "label_bbox": [left, top, right, bottom],
         "metadata_verified": True,
@@ -763,12 +792,17 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
         source = resolve_task_output_path(task, output_index)
         source_sha256 = source_manifest["artifact"]["sha256"]
         font = _resolve_font()
+        try:
+            media_profile = resolve_distribution_media_profile(project=task.project)
+        except MediaProcessingProfileError as exc:
+            raise DistributionError(str(exc)) from exc
         disclosure = _task_disclosure(task, media_kind)
         config = _release_config(
             source_sha256=source_sha256,
             media_kind=media_kind,
             font_sha256=sha256_file(font),
             disclosure=disclosure,
+            media_profile=media_profile,
         )
     except DistributionError as exc:
         record_distribution_failure(task, output_index, exc)
@@ -820,12 +854,14 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
             render = _render_video(
                 source, temporary_artifact, label=config["label"],
                 description=config["description"], font=font,
+                media_profile=media_profile.value,
             )
         else:
             render = _render_image(
                 source, temporary_artifact, label=config["label"],
                 description=config["description"], font=font,
                 source_sha256=source_sha256, version=config["version"],
+                media_profile=media_profile.value,
             )
         # The renderer is not allowed to mutate the ComfyUI master.
         source_after = verified_task_manifest(task, output_index)

@@ -5,8 +5,17 @@ from typing import Any
 from django.core.exceptions import ValidationError
 
 from studio.models import ModelProfileVersion
-from studio.services.json_contracts import verify_json_contract
+from studio.services.model_profile_contracts import (
+    CHAT_REQUEST_OPTIONS_KEY,
+    chat_request_options_from_policy,
+    verified_model_profile_specification,
+)
 from studio.services.provider_registry import driver_for
+from studio.services.security_boundaries import boundary_number
+from studio.services.text_field_contracts import (
+    SERIES_CONCEPT_FIELD_KEYS,
+    validate_text_field_contract,
+)
 
 
 SCRIPT_GENERATE_OPERATION = "script.generate"
@@ -15,7 +24,7 @@ SCRIPT_GENERATE_PROFILE_SCHEMA_VERSION = 1
 
 def validate_script_generation_model_profile(
     profile: ModelProfileVersion,
-) -> dict[str, int | float] | None:
+) -> dict[str, Any] | None:
     """Validate the one supported script.generate model-profile contract.
 
     Profiles that do not declare ``script.generate`` are outside this contract
@@ -24,14 +33,7 @@ def validate_script_generation_model_profile(
     parses differently later.
     """
 
-    specification = verify_json_contract(
-        profile.specification,
-        schema_version=profile.specification_schema_version,
-        size_bytes=profile.specification_size_bytes,
-        sha256=profile.specification_sha256,
-    ).value
-    if not isinstance(specification, dict):
-        raise ValidationError({"specification": "model profile specification 必须是对象"})
+    specification = verified_model_profile_specification(profile)
     aliases = sorted(
         field
         for field in ("operations", "protocols")
@@ -72,9 +74,20 @@ def validate_script_generation_model_profile(
             "specification": "provider driver 未实现受控 chat_completion transport",
         })
     series = specification.get("series_concept")
-    if not isinstance(series, dict):
+    required_series_fields = {
+        "minimum_shot_duration_ms",
+        "maximum_shot_duration_ms",
+        "max_output_tokens",
+        "timeout_seconds",
+        "field_contract",
+        CHAT_REQUEST_OPTIONS_KEY,
+    }
+    if not isinstance(series, dict) or set(series) != required_series_fields:
         raise ValidationError({
-            "specification": "script.generate model profile 缺少 series_concept policy",
+            "specification": (
+                "script.generate model profile 缺少精确 series_concept policy，"
+                "或包含未注册字段"
+            ),
         })
     integer_fields = (
         "minimum_shot_duration_ms",
@@ -102,13 +115,30 @@ def validate_script_generation_model_profile(
             "specification": "series_concept.timeout_seconds 必须显式配置为数值",
         })
     timeout = float(timeout_value)
-    if not 0.5 <= timeout <= 3600:
+    timeout_max = boundary_number(
+        "security.provider.async_rest_timeout_max_seconds",
+        minimum=0.001,
+    )
+    if not 0 < timeout <= timeout_max:
         raise ValidationError({
-            "specification": "series_concept.timeout_seconds 必须在 0.5 到 3600 秒之间",
+            "specification": (
+                "series_concept.timeout_seconds 必须大于 0 且不超过"
+                f"当前安全边界 {timeout_max:g} 秒"
+            ),
         })
+    field_contract = validate_text_field_contract(
+        series["field_contract"],
+        fields=SERIES_CONCEPT_FIELD_KEYS,
+        label="series_concept",
+    )
     return {
         "minimum_shot_duration_ms": minimum,
         "maximum_shot_duration_ms": maximum,
         "max_output_tokens": int(series["max_output_tokens"]),
         "timeout_seconds": timeout,
+        "field_contract": field_contract,
+        CHAT_REQUEST_OPTIONS_KEY: chat_request_options_from_policy(
+            series,
+            label="series_concept",
+        ),
     }

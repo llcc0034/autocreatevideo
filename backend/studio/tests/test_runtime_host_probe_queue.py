@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from datetime import timedelta
 from io import StringIO
+import os
+from pathlib import Path
+import tempfile
 import uuid
 from unittest.mock import patch
 
@@ -24,11 +27,13 @@ from studio.models import (
 from studio.services.json_contracts import assign_json_contract
 from studio.services.runtime_host_probe_queue import (
     claim_next_runtime_host_probe,
+    enqueue_due_runtime_host_probes,
     enqueue_runtime_host_probe,
     process_runtime_host_probe,
     recover_stale_runtime_host_probes,
     request_runtime_host_probe_cancel,
 )
+from studio.services.runtime_platform import _observed_file_facts
 
 
 class RuntimeHostProbeQueueTests(TestCase):
@@ -110,6 +115,38 @@ class RuntimeHostProbeQueueTests(TestCase):
         denied = self.client.get("/api/v1/runtime-host-probe-attempts/")
         self.assertEqual(denied.status_code, 403, denied.data)
 
+    def test_probe_attempt_collection_filters_capability_from_attestation(self):
+        capability, _ = enqueue_runtime_host_probe(self.host, created_by=self.admin)
+        request_runtime_host_probe_cancel(capability)
+        attestation = RuntimeHostProbeAttempt(
+            host=self.host,
+            created_by=self.admin,
+            probe_kind=(
+                RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+            ),
+            status=RuntimeHostProbeAttempt.Status.FAILED,
+            finished_at=timezone.now(),
+        )
+        assign_json_contract(attestation, "request_snapshot", {
+            "schema_version": 1,
+            "probe_kind": (
+                RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+            ),
+            "host_id": str(self.host.id),
+        })
+        attestation.save()
+
+        response = self.client.get(
+            "/api/v1/runtime-host-probe-attempts/",
+            {"probe_kind": RuntimeHostProbeAttempt.ProbeKind.CAPABILITY},
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            [row["id"] for row in response.data["results"]],
+            [str(capability.id)],
+        )
+
     def test_worker_persists_snapshot_and_terminal_state_with_crash_recovery_link(self):
         attempt, _ = enqueue_runtime_host_probe(self.host, created_by=self.admin)
         claimed = claim_next_runtime_host_probe("runtime-probe-worker")
@@ -154,8 +191,13 @@ class RuntimeHostProbeQueueTests(TestCase):
             raise AssertionError("cancel checkpoint should stop the probe")
 
         with patch(
-            "studio.services.runtime_host_probe_queue.HEARTBEAT_INTERVAL_SECONDS",
-            0,
+            "studio.services.runtime_host_probe_queue._runtime_host_probe_policy",
+            return_value={
+                "runtime.host_probe_heartbeat_seconds": 0,
+                "runtime.host_probe_lease_seconds": 300,
+                "runtime.host_probe_stale_seconds": 300,
+                "runtime.host_probe_refresh_buffer_seconds": 120,
+            },
         ), patch(
             "studio.services.runtime_host_probe_queue.probe_runtime_host",
             side_effect=fake_probe,
@@ -184,6 +226,126 @@ class RuntimeHostProbeQueueTests(TestCase):
         self.assertEqual(reclaimed.id, attempt.id)
         self.assertIsNotNone(reclaimed.claim_token)
 
+    def test_corrupt_attestation_request_contract_recovers_to_explicit_failure(self):
+        attempt = RuntimeHostProbeAttempt(
+            host=self.host,
+            created_by=self.admin,
+            probe_kind=(
+                RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+            ),
+            status=RuntimeHostProbeAttempt.Status.RUNNING,
+        )
+        assign_json_contract(attempt, "request_snapshot", {
+            "schema_version": 1,
+            "probe_kind": (
+                RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+            ),
+            "artifacts": [{"artifact_id": str(uuid.uuid4())}],
+        })
+        attempt.save()
+        self._snapshot(attempt)
+        RuntimeHostProbeAttempt.objects.filter(pk=attempt.pk).update(
+            request_snapshot={"tampered": True},
+        )
+
+        recovered = recover_stale_runtime_host_probes()
+
+        attempt.refresh_from_db()
+        self.assertEqual(recovered, 1)
+        self.assertEqual(attempt.status, RuntimeHostProbeAttempt.Status.FAILED)
+        self.assertEqual(
+            attempt.error_code,
+            "attestation_request_contract_invalid",
+        )
+
+    def test_due_capability_sweep_skips_host_with_active_attestation(self):
+        attempt = RuntimeHostProbeAttempt(
+            host=self.host,
+            created_by=self.admin,
+            probe_kind=(
+                RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+            ),
+            status=RuntimeHostProbeAttempt.Status.QUEUED,
+        )
+        assign_json_contract(attempt, "request_snapshot", {
+            "schema_version": 1,
+            "probe_kind": (
+                RuntimeHostProbeAttempt.ProbeKind.DRAFT_MODEL_ARTIFACT_ATTESTATION
+            ),
+            "host_id": str(self.host.id),
+        })
+        attempt.save()
+
+        created = enqueue_due_runtime_host_probes()
+
+        self.assertGreaterEqual(created, 0)
+        self.assertFalse(RuntimeHostProbeAttempt.objects.filter(
+            host=self.host,
+            probe_kind=RuntimeHostProbeAttempt.ProbeKind.CAPABILITY,
+        ).exists())
+        attempt.refresh_from_db()
+        self.assertEqual(attempt.status, RuntimeHostProbeAttempt.Status.QUEUED)
+
+    def test_due_probe_is_enqueued_before_expiry_using_observed_probe_duration(self):
+        now = timezone.now()
+        previous = RuntimeHostProbeAttempt.objects.create(
+            host=self.host,
+            created_by=self.admin,
+            trigger=RuntimeHostProbeAttempt.Trigger.SCHEDULED,
+            status=RuntimeHostProbeAttempt.Status.SUCCEEDED,
+            started_at=now - timedelta(minutes=29),
+            finished_at=now - timedelta(minutes=20),
+        )
+        snapshot = self._snapshot(previous)
+        HostCapabilitySnapshot.objects.filter(pk=snapshot.pk).update(
+            captured_at=now - timedelta(minutes=20),
+            expires_at=now + timedelta(minutes=10),
+        )
+
+        with patch(
+            "studio.services.runtime_host_probe_queue.timezone.now",
+            return_value=now,
+        ):
+            attempt, created = enqueue_runtime_host_probe(
+                self.host,
+                trigger=RuntimeHostProbeAttempt.Trigger.SCHEDULED,
+                due_only=True,
+            )
+
+        self.assertTrue(created)
+        self.assertIsNotNone(attempt)
+        self.assertEqual(attempt.trigger, RuntimeHostProbeAttempt.Trigger.SCHEDULED)
+        self.assertEqual(attempt.status, RuntimeHostProbeAttempt.Status.QUEUED)
+
+    def test_due_probe_stays_skipped_outside_early_refresh_window(self):
+        now = timezone.now()
+        previous = RuntimeHostProbeAttempt.objects.create(
+            host=self.host,
+            created_by=self.admin,
+            trigger=RuntimeHostProbeAttempt.Trigger.SCHEDULED,
+            status=RuntimeHostProbeAttempt.Status.SUCCEEDED,
+            started_at=now - timedelta(minutes=12),
+            finished_at=now - timedelta(minutes=10),
+        )
+        snapshot = self._snapshot(previous)
+        HostCapabilitySnapshot.objects.filter(pk=snapshot.pk).update(
+            captured_at=now - timedelta(minutes=10),
+            expires_at=now + timedelta(minutes=50),
+        )
+
+        with patch(
+            "studio.services.runtime_host_probe_queue.timezone.now",
+            return_value=now,
+        ):
+            attempt, created = enqueue_runtime_host_probe(
+                self.host,
+                trigger=RuntimeHostProbeAttempt.Trigger.SCHEDULED,
+                due_only=True,
+            )
+
+        self.assertFalse(created)
+        self.assertIsNone(attempt)
+
     def test_failure_is_terminal_and_does_not_expose_internal_path(self):
         attempt, _ = enqueue_runtime_host_probe(self.host, created_by=self.admin)
         claimed = claim_next_runtime_host_probe("runtime-probe-failure-worker")
@@ -200,6 +362,48 @@ class RuntimeHostProbeQueueTests(TestCase):
         self.assertEqual(result.error_code, "runtime_host_probe_failed")
         self.assertNotIn("secret.safetensors", result.error_message)
         self.assertFalse(HostCapabilitySnapshot.objects.filter(probe_attempt=attempt).exists())
+
+    def test_local_model_hash_rejects_file_mutation_during_chunked_read(self):
+        with tempfile.TemporaryDirectory() as root:
+            model_path = Path(root) / "mutable.safetensors"
+            model_path.write_bytes(b"before")
+            mutated = False
+
+            def mutate_once():
+                nonlocal mutated
+                if not mutated:
+                    with model_path.open("ab") as stream:
+                        stream.write(b"-after")
+                    mutated = True
+
+            with self.assertRaises(OSError):
+                _observed_file_facts(model_path, lease_renew=mutate_once)
+
+    def test_attestation_hash_holds_and_rechecks_the_same_no_follow_file_handle(self):
+        with tempfile.TemporaryDirectory() as root:
+            controlled_root = Path(root) / "models"
+            controlled_root.mkdir()
+            model_path = controlled_root / "held.safetensors"
+            model_path.write_bytes(b"held-model")
+            facts = _observed_file_facts(
+                model_path,
+                allowed_root=controlled_root,
+                hold_open=True,
+            )
+            try:
+                if os.name == "nt":
+                    with self.assertRaises(OSError):
+                        model_path.write_bytes(b"replacement")
+                    facts.verify_unchanged()
+                else:
+                    replacement = controlled_root / "replacement.safetensors"
+                    replacement.write_bytes(b"replacement")
+                    model_path.unlink()
+                    os.symlink(replacement, model_path)
+                    with self.assertRaises(OSError):
+                        facts.verify_unchanged()
+            finally:
+                facts.close()
 
     def test_snapshot_api_returns_trusted_size_and_full_hash_without_path(self):
         attempt = RuntimeHostProbeAttempt.objects.create(

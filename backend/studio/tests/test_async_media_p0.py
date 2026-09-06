@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from decimal import Decimal
 from datetime import timedelta
 from io import BytesIO
@@ -12,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.utils import timezone
 from PIL import Image
@@ -19,6 +21,7 @@ from rest_framework.test import APIClient
 
 from studio.models import (
     AssemblySourceItem,
+    ConfigRevision,
     Episode,
     GenerationAttempt,
     GeneratedArtifact,
@@ -39,7 +42,11 @@ from studio.models import (
     WorkerLease,
 )
 from studio.services.async_media_contract import async_operation_contract, fresh_smoke_snapshot
-from studio.services.deployment_smoke import probe_async_deployment
+from studio.services.configuration import create_config_revision, publish_config_revision
+from studio.services.deployment_smoke import (
+    probe_async_deployment,
+    record_deployment_capability_snapshot,
+)
 from studio.services.deployment_smoke_queue import (
     claim_next_deployment_smoke,
     enqueue_async_deployment_smoke,
@@ -58,6 +65,7 @@ from studio.services.production_runs import (
     cancel_production_run,
     resolve_uncertain_attempt,
     select_run_artifact,
+    validate_production_recipe_executability,
 )
 from studio.services.provider_registry import ProviderDriverError, RestrictedAsyncRestDriver
 from studio.services.provider_registry import credential_binding_sha256
@@ -65,12 +73,27 @@ from studio.services.remote_artifacts import (
     _download_one, _validated_artifact_url, archive_remote_artifacts,
 )
 from studio.services.async_media_queue import (
-    _succeed, process_async_media_attempt, recover_stale_async_media_attempts,
+    _attempt_deadline_seconds, _succeed, process_async_media_attempt,
+    recover_stale_async_media_attempts,
 )
 from studio.services.readiness import _media_capability_readiness
 from studio.services.provenance import persist_assembly_provenance
 from studio.services.release_bundles import verified_release_bundle
-from studio.tests.factories import create_test_prompt_profile_binding
+from studio.tests.factories import conditioning_contract, create_test_prompt_profile_binding
+
+
+def _media_constraints():
+    return {
+        "schema_version": 1,
+        "resolution": {
+            "minimum_width": 64,
+            "maximum_width": 4096,
+            "minimum_height": 64,
+            "maximum_height": 4096,
+        },
+        "fps": {"allowed": [24]},
+        "duration_ms": {"minimum": 100, "maximum": 30_000},
+    }
 
 
 def _async_spec():
@@ -99,12 +122,15 @@ def _async_spec():
                 "model": "cloud-v1",
                 "width": 64,
                 "height": 64,
-                **({"duration_seconds": 0.5, "fps": 8} if kind == "video" else {}),
+                **({"duration_seconds": 0.5, "fps": 24} if kind == "video" else {}),
             },
         }
     return {
         "schema_version": 1,
+        "model_family": "async_cloud",
         "capabilities": ["image.text_to_image", "video.text_to_video"],
+        "conditioning_contract": conditioning_contract("T2VA"),
+        "media_constraints": _media_constraints(),
         "async_media": {
             "schema_version": 1,
             "operations": {
@@ -125,11 +151,20 @@ def _provider_config():
         "collect_path": "/jobs/{request_id}",
         "request_id_field": "id",
         "status_field": "status",
+        "artifacts_field": "artifacts",
+        "artifact_url_field": "url",
+        "artifact_kind_field": "kind",
+        "artifact_id_field": "id",
+        "artifact_sha256_field": "sha256",
+        "actual_cost_field": "actual_cost",
+        "currency_field": "currency",
+        "idempotency_header": "Idempotency-Key",
         "terminal_success": ["succeeded"],
         "terminal_failure": ["failed"],
         "terminal_cancelled": ["cancelled"],
         "artifact_allowed_hosts": ["cdn.example.com"],
         "request_field_map": {"model": "model", "prompt": "prompt", "width": "width", "height": "height"},
+        "timeout_seconds": 30,
         "poll_interval_seconds": 1,
         "max_poll_seconds": 60,
         "capability_ttl_seconds": 3600,
@@ -137,8 +172,98 @@ def _provider_config():
     }
 
 
-@override_settings(AI_PROVIDER_ALLOWED_HOSTS=("api.example.com", "cdn.example.com"))
-class RestrictedAsyncRestDriverTests(SimpleTestCase):
+@override_settings(AI_PROVIDER_ALLOWED_HOSTS=(
+    "api.example.com", "cdn.example.com", "cdn2.example.com",
+))
+class RestrictedAsyncRestDriverTests(TestCase):
+    def test_terminal_and_artifact_host_security_boundaries_are_configurable(self):
+        superuser = get_user_model().objects.create_superuser(
+            username="provider-boundary-admin",
+            email="provider-boundary@example.com",
+            password="not-used-in-test",
+        )
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={
+                "security.provider.async_rest_terminal_status_max_items": 1,
+                "security.provider.async_rest_terminal_status_max_characters": 10,
+                "security.provider.async_rest_artifact_host_max_items": 1,
+            },
+            created_by=superuser,
+        )
+        publish_config_revision(revision, published_by=superuser)
+        driver = RestrictedAsyncRestDriver()
+
+        config = _provider_config()
+        driver.validate_config(config)
+        config["terminal_success"] = ["succeeded", "complete"]
+        with self.assertRaisesMessage(ValidationError, "1 个非空状态字符串"):
+            driver.validate_config(config)
+
+        config = _provider_config()
+        config["terminal_success"] = ["x" * 11]
+        with self.assertRaisesMessage(ValidationError, "10 个字符"):
+            driver.validate_config(config)
+
+        config = _provider_config()
+        config["artifact_allowed_hosts"] = [
+            "cdn.example.com", "cdn2.example.com",
+        ]
+        with self.assertRaisesMessage(ValidationError, "1 个产物主机"):
+            driver.validate_config(config)
+
+        config = _provider_config()
+        provider = SimpleNamespace(driver_config=config, credential=None)
+        deployment = SimpleNamespace(
+            provider=provider,
+            profile_version=SimpleNamespace(provider=provider),
+            runtime_config={},
+            credential=None,
+        )
+        with patch(
+            "studio.services.provider_registry._combined_config",
+            return_value=config,
+        ), patch(
+            "studio.services.provider_registry.validate_endpoint",
+            return_value=config["base_url"],
+        ), patch(
+            "studio.services.provider_registry._request_json",
+            return_value={"status": "x" * 11},
+        ):
+            with self.assertRaises(ProviderDriverError) as captured:
+                driver.invoke(deployment, "poll", {"request_id": "request-1"})
+        self.assertEqual(captured.exception.code, "provider_response_invalid")
+
+    def test_runtime_budget_must_be_explicit_and_bounded(self):
+        for field in ("timeout_seconds", "poll_interval_seconds", "max_poll_seconds"):
+            with self.subTest(field=field):
+                config = _provider_config()
+                config.pop(field)
+                with self.assertRaisesMessage(ValidationError, field):
+                    RestrictedAsyncRestDriver().validate_config(config)
+
+        config = _provider_config()
+        config["max_poll_seconds"] = 10.5
+        with self.assertRaisesMessage(ValidationError, "max_poll_seconds"):
+            RestrictedAsyncRestDriver().validate_config(config)
+
+    def test_paths_response_fields_and_progress_scale_have_no_hidden_defaults(self):
+        for field in (
+            "health_path", "submit_path", "poll_path", "cancel_path", "collect_path",
+            "request_id_field", "status_field", "artifacts_field", "actual_cost_field",
+            "currency_field", "artifact_url_field", "artifact_kind_field",
+            "artifact_id_field", "artifact_sha256_field", "idempotency_header",
+        ):
+            with self.subTest(field=field):
+                config = _provider_config()
+                config.pop(field)
+                with self.assertRaisesMessage(ValidationError, field):
+                    RestrictedAsyncRestDriver().validate_config(config)
+        config = _provider_config()
+        config["progress_field"] = "progress"
+        with self.assertRaisesMessage(ValidationError, "progress_max"):
+            RestrictedAsyncRestDriver().validate_config(config)
+
     def test_submit_timeout_is_one_post_and_idempotency_is_header_only(self):
         config = _provider_config()
         provider = SimpleNamespace(driver_config=config, credential=None)
@@ -219,7 +344,10 @@ class RemoteArtifactSecurityTests(SimpleTestCase):
         )
 
     def test_private_dns_and_redirect_are_fail_closed(self):
-        config = {"artifact_allowed_hosts": ["cdn.example.com"]}
+        config = {
+            "artifact_allowed_hosts": ["cdn.example.com"],
+            "timeout_seconds": 1,
+        }
         with patch("studio.services.remote_artifacts.socket.getaddrinfo", return_value=[
             (None, None, None, None, ("127.0.0.1", 443)),
         ]):
@@ -302,7 +430,7 @@ class RemoteArtifactSecurityTests(SimpleTestCase):
 class AsyncProductionContractTests(TestCase):
     def setUp(self):
         self.user = get_user_model().objects.create_user(username="async-user", password="x")
-        self.project = SeriesProject.objects.create(owner=self.user, title="Cloud media", width=768, height=1344)
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="Cloud media", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         provider_contract = json_contract(_provider_config())
         self.provider = ProviderProfile.objects.create(
             key="async.test", name="Async test", driver_type=ProviderProfile.DriverType.ASYNC_REST,
@@ -331,7 +459,7 @@ class AsyncProductionContractTests(TestCase):
             actor=self.user,
             model_profile_version=self.profile,
             operation="video.generate",
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
         )
         runtime_contract = json_contract({})
         self.deployment = ModelDeployment.objects.create(
@@ -341,6 +469,29 @@ class AsyncProductionContractTests(TestCase):
             runtime_config_size_bytes=runtime_contract.size_bytes,
             runtime_config_sha256=runtime_contract.sha256,
         )
+
+    def test_prompt_capability_limit_is_explicit_beneath_platform_envelope(self):
+        for value, expected in ((None, "maxLength"), (60_001, "60000")):
+            with self.subTest(max_length=value):
+                specification = deepcopy(_async_spec())
+                rule = specification["async_media"]["operations"][
+                    "image.text_to_image"
+                ]["request_schema"]["properties"]["prompt"]
+                if value is None:
+                    rule.pop("maxLength")
+                else:
+                    rule["maxLength"] = value
+                profile = ModelProfileVersion(
+                    profile_key="async.limit",
+                    version=1,
+                    provider=self.provider,
+                    model_identifier="cloud-v1",
+                    modality=ModelProfileVersion.Modality.MULTIMODAL,
+                    status=ModelProfileVersion.Status.PUBLISHED,
+                )
+                assign_json_contract(profile, "specification", specification)
+                with self.assertRaisesMessage(ValidationError, expected):
+                    async_operation_contract(profile, "image.text_to_image")
 
     def _run_stage(self, key):
         recipe_contract = json_contract({"schema_version": 1, "stages": []})
@@ -363,7 +514,13 @@ class AsyncProductionContractTests(TestCase):
             input_snapshot=empty.value, input_snapshot_schema_version=empty.schema_version,
             input_snapshot_size_bytes=empty.size_bytes, input_snapshot_sha256=empty.sha256,
         )
-        routing = json_contract({"schema_version": 1})
+        routing = json_contract({
+            "schema_version": 1,
+            "mode": "fixed",
+            "routes": [self._route()],
+            "variant_count": 1,
+            "evaluator": None,
+        })
         stage = StageRun.objects.create(
             production_run=run, stage_key="media_generation", ordinal=1,
             mode="existing_pipeline", status=StageRun.Status.RUNNING,
@@ -376,6 +533,152 @@ class AsyncProductionContractTests(TestCase):
             routing_decision_sha256=routing.sha256,
         )
         return run, stage
+
+    def test_attempt_deadline_requires_the_attempt_owned_snapshot_contract(self):
+        request = json_contract({
+            "schema_version": 1,
+            "transport": "restricted_async_rest",
+            "operation": "image.text_to_image",
+            "output_kind": "image",
+            "route": {},
+            "payload": {},
+        })
+        attempt = GenerationAttempt(
+            operation="image.text_to_image",
+            request_sha256=request.sha256,
+            request_snapshot=request.value,
+            request_snapshot_schema_version=request.schema_version,
+            request_snapshot_size_bytes=request.size_bytes,
+            request_snapshot_sha256=request.sha256,
+        )
+
+        with (
+            patch(
+                "studio.services.async_media_queue._stage_snapshot_max_bytes",
+                return_value=1024 * 1024,
+            ),
+            self.assertRaisesMessage(
+                ValidationError,
+                "缺少冻结的任务时限配置",
+            ),
+        ):
+            _attempt_deadline_seconds(attempt)
+
+    def test_invalid_frozen_request_uses_stable_async_attempt_error_code(self):
+        _run, stage = self._run_stage("invalid-frozen-request")
+        request = json_contract({
+            "schema_version": 1,
+            "transport": "restricted_async_rest",
+            "operation": "image.text_to_image",
+            "route": [],
+            "payload": {},
+        })
+        attempt = GenerationAttempt.objects.create(
+            stage_run=stage,
+            unit_key="invalid-frozen-request",
+            attempt_number=1,
+            model_deployment=self.deployment,
+            operation="image.text_to_image",
+            status=GenerationAttempt.Status.QUEUED,
+            request_sha256=request.sha256,
+            request_snapshot=request.value,
+            request_snapshot_schema_version=request.schema_version,
+            request_snapshot_size_bytes=request.size_bytes,
+            request_snapshot_sha256=request.sha256,
+            claim_token=uuid.uuid4(),
+            worker_id="test",
+        )
+
+        result = process_async_media_attempt(attempt)
+
+        self.assertEqual(result.status, GenerationAttempt.Status.FAILED)
+        self.assertEqual(result.error_code, "async_attempt_invalid")
+
+    def _record_fresh_media_smoke(self):
+        return record_deployment_capability_snapshot(
+            self.deployment,
+            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
+            status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
+            operations=["image.text_to_image", "video.text_to_video"],
+            evidence={
+                "schema_version": 1,
+                "execution_submitted": True,
+                "test_fixture": True,
+            },
+        )
+
+    def _route_options_recipe(self, *, key, stage_key):
+        recipe = ProductionRecipeVersion(
+            recipe_key=key,
+            version=1,
+            name=key,
+            status=ProductionRecipeVersion.Status.PUBLISHED,
+        )
+        assign_json_contract(recipe, "definition", {
+            "schema_version": 1,
+            "stages": [{
+                "key": stage_key,
+                "mode": "existing_pipeline",
+                "approval": "auto",
+                "routing": {
+                    "mode": "fixed",
+                    "routes": [{"model_deployment_id": str(self.deployment.id)}],
+                    "variant_count": 1,
+                    "evaluator": None,
+                },
+            }],
+        })
+        recipe.save()
+        return recipe
+
+    def _route_options(self, recipe):
+        client = APIClient()
+        client.force_authenticate(self.user)
+        return client.get(
+            f"/api/v1/production-recipes/{recipe.id}/media-route-options/",
+        )
+
+    def test_media_route_options_fail_closed_when_async_smoke_expires(self):
+        snapshot = self._record_fresh_media_smoke()
+        recipe = self._route_options_recipe(
+            key="async-media-smoke-route-options",
+            stage_key="media_generation",
+        )
+
+        fresh = self._route_options(recipe)
+        self.assertEqual(fresh.status_code, 200, fresh.data)
+        self.assertTrue(fresh.data["routes"][0]["is_selectable"], fresh.data)
+
+        snapshot.expires_at = snapshot.captured_at
+        snapshot.save(update_fields=("expires_at", "updated_at"))
+        expired = self._route_options(recipe)
+
+        self.assertEqual(expired.status_code, 200, expired.data)
+        route = expired.data["routes"][0]
+        self.assertFalse(route["is_selectable"], route)
+        self.assertIn("async_smoke_missing_or_stale", route["reason_codes"])
+        with self.assertRaisesMessage(ValidationError, "缺少未过期的真实烟测证据"):
+            validate_production_recipe_executability(recipe)
+
+    def test_bible_route_options_remove_choices_when_async_smoke_expires(self):
+        snapshot = self._record_fresh_media_smoke()
+        recipe = self._route_options_recipe(
+            key="async-bible-smoke-route-options",
+            stage_key="bible_image_generation",
+        )
+
+        fresh = self._route_options(recipe)
+        self.assertEqual(fresh.status_code, 200, fresh.data)
+        self.assertTrue(fresh.data["bible_image_generation"]["choices"], fresh.data)
+
+        snapshot.expires_at = snapshot.captured_at
+        snapshot.save(update_fields=("expires_at", "updated_at"))
+        expired = self._route_options(recipe)
+
+        self.assertEqual(expired.status_code, 200, expired.data)
+        self.assertEqual(expired.data["bible_image_generation"]["choices"], [])
+        with self.assertRaisesMessage(ValidationError, "缺少未过期的真实烟测证据"):
+            validate_production_recipe_executability(recipe)
 
     def _add_artifact_review_gate(self, run, media_stage):
         assign_json_contract(media_stage, "config_snapshot", {"schema_version": 1})
@@ -411,9 +714,9 @@ class AsyncProductionContractTests(TestCase):
         return gate
 
     def test_uniform_async_route_without_shots_rejects_non_t2va_project_default(self):
-        self.project.production_settings = {"default_h3_mode": Shot.H3Mode.REF2VA}
+        self.project.production_settings = {"default_conditioning_mode": "Ref2VA"}
         self.project.save(update_fields=("production_settings", "updated_at"))
-        Episode.objects.create(project=self.project, number=1, title="Future storyboard")
+        Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=1, title="Future storyboard")
         recipe = ProductionRecipeVersion(
             recipe_key="future-async-media-route",
             version=1,
@@ -437,6 +740,10 @@ class AsyncProductionContractTests(TestCase):
         recipe.save()
         client = APIClient()
         client.force_authenticate(self.user)
+        video_binding = self.profile.prompt_profile_bindings.get(
+            operation="video.generate",
+            mode="T2VA",
+        )
 
         now = timezone.now()
         smoke = SimpleNamespace(
@@ -454,11 +761,23 @@ class AsyncProductionContractTests(TestCase):
                 "project_id": str(self.project.id),
                 "recipe_version_id": str(recipe.id),
                 "idempotency_key": "future-async-ref2va-mismatch",
+                "workflow_selection": {
+                    "schema_version": 2,
+                    "mode": "uniform",
+                    "route_index": 0,
+                    "prompt_profile_selections": [{
+                        "operation": "video.generate",
+                        "mode": "T2VA",
+                        "prompt_profile_binding_id": str(video_binding.id),
+                    }],
+                },
             }, format="json")
 
         self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("async REST", str(response.data))
-        self.assertIn("T2VA", str(response.data))
+        details = response.data["error"]["details"]
+        self.assertIn("conditioning_mode", details)
+        self.assertIn("Ref2VA", str(details["conditioning_mode"][0]))
+        self.assertIn("conditioning_contract", str(details["conditioning_mode"][0]))
         self.assertFalse(
             ProductionRun.objects.filter(
                 idempotency_key="future-async-ref2va-mismatch",
@@ -510,13 +829,20 @@ class AsyncProductionContractTests(TestCase):
         self.assertEqual(driver.calls, ["submit", "poll", "collect"])
 
     def _route(self):
+        frozen_conditioning = self.profile.specification["conditioning_contract"]
+        frozen_constraints = self.profile.specification["media_constraints"]
         return {
             "index": 0,
             "model_deployment_id": str(self.deployment.id),
             "model_profile_version_id": str(self.profile.id),
             "model_identifier": self.profile.model_identifier,
             "model_specification": self.profile.specification,
+            "model_specification_sha256": self.profile.specification_sha256,
             "frozen_model_specification_sha256": json_contract(self.profile.specification).sha256,
+            "conditioning_contract": deepcopy(frozen_conditioning),
+            "conditioning_contract_sha256": json_contract(frozen_conditioning).sha256,
+            "media_constraints": deepcopy(frozen_constraints),
+            "media_constraints_sha256": json_contract(frozen_constraints).sha256,
             "provider_id": str(self.provider.id),
             "driver_type": ProviderProfile.DriverType.ASYNC_REST,
             "credential_binding_sha256": credential_binding_sha256(self.deployment),
@@ -576,10 +902,11 @@ class AsyncProductionContractTests(TestCase):
             "config_snapshot", "config_snapshot_schema_version",
             "config_snapshot_size_bytes", "config_snapshot_sha256", "updated_at",
         ))
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=False,
             project=self.project,
             created_by=self.user,
             prompt_type=PromptArtifact.PromptType.IMAGE,
+            total_duration_ms=0,
             prompt_text="a lighthouse at night",
             negative_prompt="",
             content_hash="f" * 64,
@@ -622,7 +949,7 @@ class AsyncProductionContractTests(TestCase):
             (PromptArtifact.PromptType.IMAGE, "image.text_to_image"),
             (PromptArtifact.PromptType.VIDEO, "video.text_to_video"),
         ):
-            prompt = PromptArtifact(
+            prompt = PromptArtifact(is_multi_shot=False, include_audio=True,
                 project=self.project, created_by=self.user, prompt_type=prompt_type,
                 prompt_text="a lighthouse", total_duration_ms=500, content_hash="a" * 64,
             )
@@ -662,6 +989,11 @@ class AsyncProductionContractTests(TestCase):
             "routes": [{
                 "index": 0, "driver_type": ProviderProfile.DriverType.ASYNC_REST,
                 "media_operations": ["video.text_to_video"],
+                "conditioning_contract": conditioning_contract(
+                    "I2V",
+                    input_kind="frame_slots",
+                    first_frame=(1, 1),
+                ),
             }],
         })
         decision = json_contract({"schema_version": 1})
@@ -675,9 +1007,10 @@ class AsyncProductionContractTests(TestCase):
             routing_decision_size_bytes=decision.size_bytes,
             routing_decision_sha256=decision.sha256,
         )
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=self.project, created_by=self.user, prompt_type=PromptArtifact.PromptType.VIDEO,
-            prompt_text="animate this frame", h3_mode="I2V",
+            prompt_text="animate this frame", conditioning_mode="I2V",
+            total_duration_ms=self.project.default_shot_duration_ms,
             structured_payload={"reference_bindings": [{"asset_id": "unsafe"}]},
             content_hash="c" * 64,
         )
@@ -1128,6 +1461,43 @@ class AsyncProductionContractTests(TestCase):
         for forbidden in ("credential", "idempotency", "private", "sha256", "prompt"):
             self.assertNotIn(forbidden, serialized)
 
+    def test_bible_async_attempt_rejects_multiple_images_without_partial_archive(self):
+        run, stage = self._run_stage("bible-async-cardinality")
+        stage.stage_key = "bible_image_generation"
+        stage.save(update_fields=("stage_key", "updated_at"))
+        attempt = GenerationAttempt.objects.create(
+            stage_run=stage,
+            unit_key="character:00000000-0000-4000-8000-000000000001:candidate:1",
+            attempt_number=1,
+            model_deployment=self.deployment,
+            operation="image.text_to_image",
+            status=GenerationAttempt.Status.SUBMITTED,
+            request_sha256="d" * 64,
+        )
+        with tempfile.TemporaryDirectory() as directory, override_settings(
+            MEDIA_ROOT=directory,
+        ), patch(
+            "studio.services.remote_artifacts._download_one",
+        ) as download:
+            with self.assertRaises(ProviderDriverError) as captured:
+                archive_remote_artifacts(
+                    attempt,
+                    artifacts=[
+                        {"url": "https://cdn.example.com/a.png", "kind": "image"},
+                        {"url": "https://cdn.example.com/b.png", "kind": "image"},
+                    ],
+                    provider_config=_provider_config(),
+                    expected_kind="image",
+                )
+            leftovers = [item for item in Path(directory).rglob("*") if item.is_file()]
+        self.assertEqual(captured.exception.code, "artifact_response_invalid")
+        download.assert_not_called()
+        self.assertEqual(
+            GeneratedArtifact.objects.filter(generation_attempt=attempt).count(),
+            0,
+        )
+        self.assertEqual(leftovers, [])
+
     def test_cancel_during_collect_removes_unmanaged_download(self):
         run, stage = self._run_stage("cancel-collect")
         attempt = GenerationAttempt.objects.create(
@@ -1197,12 +1567,12 @@ class AsyncProductionContractTests(TestCase):
         import hashlib
 
         run, stage = self._run_stage("managed-assembly")
-        episode = Episode.objects.create(project=self.project, number=1, title="Episode")
-        image_shot = Shot.objects.create(
+        episode = Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=1, title="Episode")
+        image_shot = Shot.objects.create(include_audio=False,
             episode=episode, number=1, narrative="cloud image",
             media_type=Shot.MediaType.IMAGE, duration_ms=500,
         )
-        video_shot = Shot.objects.create(
+        video_shot = Shot.objects.create(include_audio=True,
             episode=episode, number=2, narrative="cloud video",
             media_type=Shot.MediaType.VIDEO, duration_ms=700,
         )
@@ -1213,7 +1583,7 @@ class AsyncProductionContractTests(TestCase):
                 (image_shot, GeneratedArtifact.Kind.IMAGE, "cloud.png", b"managed-image"),
                 (video_shot, GeneratedArtifact.Kind.VIDEO, "cloud.mp4", b"managed-video"),
             ), start=1):
-                prompt = PromptArtifact.objects.create(
+                prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
                     project=self.project, episode=episode, shot=shot, created_by=self.user,
                     prompt_type=kind, prompt_text=f"cloud {kind}",
                     total_duration_ms=shot.duration_ms, content_hash=str(index) * 64,
@@ -1262,7 +1632,7 @@ class AsyncProductionContractTests(TestCase):
                 }
 
             with override_settings(
-                MEDIA_ROOT=root, COMFYUI_OUTPUT_DIR=root, ASSEMBLY_AI_LABEL_ENABLED=False,
+                MEDIA_ROOT=root, COMFYUI_OUTPUT_DIR=root,
             ), patch(
                 "studio.services.assembly.verified_local_media_facts", side_effect=media_facts,
             ), patch(
@@ -1359,16 +1729,24 @@ class AsyncProductionContractTests(TestCase):
                     }
                 raise AssertionError(operation)
 
-        with patch("studio.services.deployment_smoke.driver_for", return_value=SmokeDriver()), patch(
-            "studio.services.deployment_smoke.verify_remote_artifacts_for_smoke",
+        with patch("studio.services.deployment_smoke_queue.driver_for", return_value=SmokeDriver()), patch(
+            "studio.services.deployment_smoke_queue.verify_remote_artifacts_for_smoke",
             return_value=[{
                 "mime_type": "image/png", "size_bytes": 10, "sha256": "d" * 64,
                 "width": 64, "height": 64,
             }],
         ):
-            snapshot = probe_async_deployment(
-                self.deployment, operation="image.text_to_image",
-            )
+            from studio.services.deployment_smoke_queue import enqueue_deployment_smoke, claim_next_deployment_smoke, process_deployment_smoke
+            queued, _ = enqueue_deployment_smoke(self.deployment, operation="image.text_to_image")
+            claimed = claim_next_deployment_smoke("async-smoke-fixture-worker")
+            self.assertEqual(claimed.id, queued.id)
+            finished = process_deployment_smoke(claimed)
+            self.assertEqual(finished.status, "submitted")
+            claimed = claim_next_deployment_smoke("async-smoke-fixture-worker")
+            self.assertEqual(claimed.id, queued.id)
+            finished = process_deployment_smoke(claimed)
+            self.assertEqual(finished.status, "succeeded")
+            snapshot = finished.final_snapshot
         self.assertEqual(snapshot.status, ModelDeploymentCapabilitySnapshot.Status.PASSED)
         self.assertNotIn("https://", str(snapshot.evidence))
         self.assertNotIn("remote-smoke-1", str(snapshot.evidence))
@@ -1396,7 +1774,12 @@ class AsyncProductionContractTests(TestCase):
             driver_config_size_bytes=provider_config.size_bytes,
             driver_config_sha256=provider_config.sha256,
         )
-        spec = json_contract({"schema_version": 1})
+        spec = json_contract({
+            "schema_version": 1,
+            "model_family": "comfy_mixed_readiness",
+            "conditioning_contract": conditioning_contract("T2VA"),
+            "media_constraints": _media_constraints(),
+        })
         profile = ModelProfileVersion.objects.create(
             profile_key="comfy.mixed-readiness", version=1, provider=provider,
             model_identifier="local-video", modality=ModelProfileVersion.Modality.VIDEO,
@@ -1415,18 +1798,26 @@ class AsyncProductionContractTests(TestCase):
             actor=self.user,
             model_profile_version=profile,
             operation="video.generate",
+            mode="T2VA",
         )
         template = WorkflowTemplate.objects.create(
             slug="mixed-readiness-video", version=1, name="mixed readiness",
             output_kind=WorkflowTemplate.OutputKind.VIDEO, definition={}, input_schema={},
         )
         graph = json_contract({"schema_version": 1})
+        workflow_input = json_contract({
+            "schema_version": 1,
+            "workflow_mode": "text_to_video",
+            "capability": "video.text_to_video",
+        })
         workflow = WorkflowTemplateVersion.objects.create(
             template=template, version=1, provider=provider, model_profile_version=profile,
             graph=graph.value, graph_schema_version=graph.schema_version,
             graph_size_bytes=graph.size_bytes, graph_sha256=graph.sha256,
-            input_contract=graph.value, input_contract_schema_version=graph.schema_version,
-            input_contract_size_bytes=graph.size_bytes, input_contract_sha256=graph.sha256,
+            input_contract=workflow_input.value,
+            input_contract_schema_version=workflow_input.schema_version,
+            input_contract_size_bytes=workflow_input.size_bytes,
+            input_contract_sha256=workflow_input.sha256,
             status=WorkflowTemplateVersion.Status.PUBLISHED,
             validation_state=WorkflowTemplateVersion.ValidationState.PASSED,
             smoke_test_state=WorkflowTemplateVersion.ValidationState.PASSED,
@@ -1437,11 +1828,15 @@ class AsyncProductionContractTests(TestCase):
             {"model_deployment_id": str(self.deployment.id)},
         ]
 
-        def worker(key, _label, *, required):
+        def worker(key, _label, *, required, runtime_values):
             return {"ok": (not required) or key == "async-media-worker-heartbeat"}
 
+        # Workflow integrity has dedicated coverage; this case isolates whether
+        # one viable async fallback keeps mixed-route readiness operational.
         with patch(
             "studio.services.readiness.fresh_smoke_snapshot", return_value=SimpleNamespace(),
+        ), patch(
+            "studio.services.readiness.verify_published_workflow_capability",
         ), patch("studio.services.readiness._worker_check", side_effect=worker):
             result = _media_capability_readiness(routes, modality="video")
         self.assertEqual(result["state"], "ready")

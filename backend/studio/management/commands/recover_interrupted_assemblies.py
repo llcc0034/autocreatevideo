@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from django.core.management.base import BaseCommand
 from studio.services.assembly_queue import recover_stale_assemblies
+from studio.services.configuration import resolve_configuration
 
 
 class Command(BaseCommand):
@@ -16,14 +17,24 @@ class Command(BaseCommand):
         parser.add_argument(
             "--stale-minutes",
             type=float,
-            default=0,
-            help="Only recover RUNNING jobs whose heartbeat is at least this old.",
+            default=None,
+            help=(
+                "Only recover jobs whose heartbeat is at least this old. "
+                "Omit to use runtime.task_idle_timeout_seconds; pass 0 only "
+                "when the caller knows every active claim was interrupted."
+            ),
         )
 
     def handle(self, *args, **options):
         reason = str(options["reason"]).strip() or "Assembly process was interrupted"
+        stale_minutes = options["stale_minutes"]
+        if stale_minutes is None:
+            idle_timeout_seconds = float(resolve_configuration(required_keys=(
+                "runtime.task_idle_timeout_seconds",
+            )).values["runtime.task_idle_timeout_seconds"])
+            stale_minutes = idle_timeout_seconds / 60
         recovered = recover_stale_assemblies(
-            options["stale_minutes"],
+            stale_minutes,
             reason=reason,
         )
         total = sum(recovered.values())

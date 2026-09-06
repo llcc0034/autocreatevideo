@@ -10,20 +10,48 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from studio.services.configuration import ConfigurationResolutionError
+from studio.services.security_boundaries import boundary_resolution
 
-DIALOGUE_MAX_ENTRIES = 64
-DIALOGUE_SPEAKER_ID_MAX_LENGTH = 16
-DIALOGUE_TEXT_MAX_LENGTH = 2_000
-DIALOGUE_DELIVERY_MAX_LENGTH = 500
 DIALOGUE_ALLOWED_KEYS = frozenset({
     "speaker_id", "text", "delivery", "voiceover", "start_ms", "end_ms",
 })
 _SPEAKER_ID_RE = re.compile(r"^S[1-9][0-9]*$")
-_VOICEOVER_TOKEN_RE = re.compile(r"(?<![A-Za-z0-9_])voiceover(?![A-Za-z0-9_])", re.IGNORECASE)
+_VOICEOVER_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_])"
+    r"(?:voice[\s_-]?over|off[\s_-]?screen(?:\s+voice)?|vo|旁白|画外音)"
+    r"(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
 
 
 class DialogueContractError(ValueError):
     pass
+
+
+DIALOGUE_SECURITY_KEYS = {
+    "max_entries": "security.dialogue.max_entries",
+    "speaker_id_max_characters": "security.dialogue.speaker_id_max_characters",
+    "text_max_characters": "security.dialogue.text_max_characters",
+    "delivery_max_characters": "security.dialogue.delivery_max_characters",
+}
+
+
+def dialogue_security_limits() -> dict[str, int]:
+    """Resolve the live superadmin-owned dialogue ingestion envelope."""
+
+    resolved = boundary_resolution(DIALOGUE_SECURITY_KEYS.values())
+    limits: dict[str, int] = {}
+    for name, key in DIALOGUE_SECURITY_KEYS.items():
+        value = resolved.values.get(key)
+        if type(value) is not int or value < 1:
+            raise ConfigurationResolutionError(
+                f"安全边界 {key} 必须是正整数",
+                code="security_boundary_value_invalid",
+                missing_keys=(key,),
+            )
+        limits[name] = value
+    return limits
 
 
 def parse_delivery_annotation(value: str) -> tuple[str, bool]:
@@ -35,7 +63,13 @@ def parse_delivery_annotation(value: str) -> tuple[str, bool]:
     return delivery, voiceover
 
 
-def normalize_dialogue_entry(value: Any, *, index: int | None = None) -> dict:
+def normalize_dialogue_entry(
+    value: Any,
+    *,
+    index: int | None = None,
+    _limits: dict[str, int] | None = None,
+) -> dict:
+    limits = _limits or dialogue_security_limits()
     label = f"dialogue[{index}]" if index is not None else "dialogue 项"
     if not isinstance(value, dict):
         raise DialogueContractError(f"{label} 必须是 JSON 对象")
@@ -49,9 +83,10 @@ def normalize_dialogue_entry(value: Any, *, index: int | None = None) -> dict:
     speaker_id = value["speaker_id"]
     if not isinstance(speaker_id, str):
         raise DialogueContractError(f"{label}.speaker_id 必须是字符串")
-    if not speaker_id or len(speaker_id) > DIALOGUE_SPEAKER_ID_MAX_LENGTH:
+    speaker_max = limits["speaker_id_max_characters"]
+    if not speaker_id or len(speaker_id) > speaker_max:
         raise DialogueContractError(
-            f"{label}.speaker_id 长度必须为 1–{DIALOGUE_SPEAKER_ID_MAX_LENGTH} 个字符"
+            f"{label}.speaker_id 长度必须为 1–{speaker_max} 个字符"
         )
     if not _SPEAKER_ID_RE.fullmatch(speaker_id):
         raise DialogueContractError(f"{label}.speaker_id 必须为 S1、S2 这样的格式")
@@ -59,9 +94,10 @@ def normalize_dialogue_entry(value: Any, *, index: int | None = None) -> dict:
     text = value["text"]
     if not isinstance(text, str):
         raise DialogueContractError(f"{label}.text 必须是字符串")
-    if not text.strip() or len(text) > DIALOGUE_TEXT_MAX_LENGTH:
+    text_max = limits["text_max_characters"]
+    if not text.strip() or len(text) > text_max:
         raise DialogueContractError(
-            f"{label}.text 必须为 1–{DIALOGUE_TEXT_MAX_LENGTH} 个字符的非空文本"
+            f"{label}.text 必须为 1–{text_max} 个字符的非空文本"
         )
 
     result = {"speaker_id": speaker_id, "text": text}
@@ -69,9 +105,10 @@ def normalize_dialogue_entry(value: Any, *, index: int | None = None) -> dict:
         delivery = value["delivery"]
         if not isinstance(delivery, str):
             raise DialogueContractError(f"{label}.delivery 必须是字符串")
-        if not delivery.strip() or len(delivery) > DIALOGUE_DELIVERY_MAX_LENGTH:
+        delivery_max = limits["delivery_max_characters"]
+        if not delivery.strip() or len(delivery) > delivery_max:
             raise DialogueContractError(
-                f"{label}.delivery 必须为 1–{DIALOGUE_DELIVERY_MAX_LENGTH} 个字符的非空文本"
+                f"{label}.delivery 必须为 1–{delivery_max} 个字符的非空文本"
             )
         result["delivery"] = delivery.strip()
     if "voiceover" in value:
@@ -101,11 +138,16 @@ def normalize_dialogue_entry(value: Any, *, index: int | None = None) -> dict:
 
 
 def normalize_dialogue(value: Any) -> list[dict]:
+    limits = dialogue_security_limits()
     if not isinstance(value, list):
         raise DialogueContractError("dialogue 必须是数组")
-    if len(value) > DIALOGUE_MAX_ENTRIES:
-        raise DialogueContractError(f"dialogue 最多包含 {DIALOGUE_MAX_ENTRIES} 行")
-    return [normalize_dialogue_entry(item, index=index) for index, item in enumerate(value)]
+    max_entries = limits["max_entries"]
+    if len(value) > max_entries:
+        raise DialogueContractError(f"dialogue 最多包含 {max_entries} 行")
+    return [
+        normalize_dialogue_entry(item, index=index, _limits=limits)
+        for index, item in enumerate(value)
+    ]
 
 
 def validate_dialogue_timing(value: Any, *, duration_ms: int) -> list[dict]:

@@ -43,9 +43,11 @@ from studio.services.configuration import (
     resolve_configuration,
 )
 from studio.services.json_contracts import assign_json_contract, json_contract
+from studio.services.security_boundaries import boundary_int
 from studio.services.production_runs import _freeze_stage_config
 from studio.services.runtime_platform import (
     RecommendationStale,
+    _gpu_probe,
     capability_readiness,
     decide_recommendation,
     probe_runtime_host,
@@ -69,7 +71,7 @@ class ConfigurationLayeringTests(TestCase):
         self.other = get_user_model().objects.create_user(
             username="config-layer-other", password="StrongPass123!",
         )
-        self.project = SeriesProject.objects.create(owner=self.user, title="Config layers")
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="Config layers", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
 
     def _definition(
         self,
@@ -91,6 +93,18 @@ class ConfigurationLayeringTests(TestCase):
         assign_json_contract(definition, "value_schema", definition.value_schema)
         definition.save()
         return definition
+
+    def test_queue_recommendation_definitions_are_explicitly_non_blocking(self):
+        descriptions = dict(
+            ConfigDefinition.objects.filter(key__in=(
+                "production.recommended_max_pending",
+                "production.recommended_max_active_per_user",
+            )).values_list("key", "description")
+        )
+        self.assertEqual(len(descriptions), 2)
+        for description in descriptions.values():
+            self.assertIn("仅生成告警并继续", description)
+            self.assertIn("不作为生产阻断条件", description)
 
     def _model_and_workflow(self, key: str):
         provider = ModelProfileVersion.objects.get(profile_key="deepseek-text", version=1).provider
@@ -145,7 +159,10 @@ class ConfigurationLayeringTests(TestCase):
                 "stages": [{"key": "script_input", "mode": "confirmed_revision"}],
             })
             recipe.save()
-        contract = json_contract(snapshot)
+        contract = json_contract(
+            snapshot,
+            max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+        )
         input_contract = json_contract({"schema_version": 1})
         return ProductionRun.objects.create(
             owner=self.user,
@@ -207,7 +224,10 @@ class ConfigurationLayeringTests(TestCase):
         assign_json_contract(deployment, "runtime_config", {})
         deployment.save()
         run_snapshot = effective.snapshot()
-        run_contract = json_contract(run_snapshot)
+        run_contract = json_contract(
+            run_snapshot,
+            max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+        )
         run.config_snapshot = run_snapshot
         run.config_snapshot_schema_version = run_contract.schema_version
         run.config_snapshot_size_bytes = run_contract.size_bytes
@@ -505,6 +525,10 @@ class ConfigurationLayeringTests(TestCase):
             values={
                 "production.default_concurrency": 7,
                 "production.task_timeout_seconds": 2000,
+                # Recommendations are independent advisory values; their
+                # relative ordering must never make this capability API fail.
+                "production.recommended_max_pending": 1,
+                "production.recommended_max_active_per_user": 2,
             },
             created_by=self.user,
         )
@@ -524,11 +548,21 @@ class ConfigurationLayeringTests(TestCase):
         self.assertEqual(response.data["configured_task_timeout_seconds"], 2000)
         self.assertEqual(response.data["task_timeout_seconds"], 2000)
         self.assertEqual(response.data["task_idle_timeout_seconds"], 1800)
+        self.assertEqual(response.data["queue_guidance_enforcement"], "advisory")
+        self.assertEqual(response.data["queue_advisories"], [])
+        self.assertNotIn("confirmation_required", response.data)
+        self.assertFalse(response.data["business_volume_limited"])
         self.assertEqual(
             response.data["configuration_sources"]["production.default_concurrency"],
             "project",
         )
         self.assertRegex(response.data["configuration_public_sha256"], r"^[0-9a-f]{64}$")
+        self.assertIsInstance(response.data["conditioning_modes"], list)
+        self.assertRegex(
+            response.data["conditioning_contract_sha256"],
+            r"^[0-9a-f]{64}$",
+        )
+        self.assertEqual(response.data["default_conditioning_mode"], "")
 
         client.force_authenticate(self.other)
         denied = client.get(
@@ -544,7 +578,7 @@ class HostRecommendationTests(TestCase):
         self.admin = get_user_model().objects.create_superuser(
             username="host-admin", password="StrongPass123!", email="host@example.test",
         )
-        self.project = SeriesProject.objects.create(owner=self.admin, title="Host recommendation")
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.admin, title="Host recommendation", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         self.host = RuntimeHost.objects.get(key="local")
         self.provider = ModelProfileVersion.objects.get(
             profile_key="sdxl-image", version=1,
@@ -641,7 +675,13 @@ class HostRecommendationTests(TestCase):
             is_default=is_default,
             status=ModelDeployment.Status.ACTIVE,
         )
-        assign_json_contract(deployment, "runtime_config", {"base_url": "http://127.0.0.1:8188"})
+        assign_json_contract(deployment, "runtime_config", {
+            "base_url": "http://127.0.0.1:8188",
+            "timeout_seconds": 30,
+            "poll_interval_seconds": 2,
+            "max_poll_seconds": 3600,
+            "capability_ttl_seconds": 3600,
+        })
         deployment.save()
         workflow.validated_deployment = deployment
         workflow.save(update_fields=("validated_deployment", "updated_at"))
@@ -905,6 +945,14 @@ class HostRecommendationTests(TestCase):
             "collect_path": "/jobs/{request_id}",
             "request_id_field": "id",
             "status_field": "status",
+            "artifacts_field": "artifacts",
+            "artifact_url_field": "url",
+            "artifact_kind_field": "kind",
+            "artifact_id_field": "id",
+            "artifact_sha256_field": "sha256",
+            "actual_cost_field": "actual_cost",
+            "currency_field": "currency",
+            "idempotency_header": "Idempotency-Key",
             "terminal_success": ["succeeded"],
             "terminal_failure": ["failed"],
             "terminal_cancelled": ["cancelled"],
@@ -912,6 +960,9 @@ class HostRecommendationTests(TestCase):
             "request_field_map": {
                 "model": "model", "prompt": "prompt", "width": "width", "height": "height",
             },
+            "timeout_seconds": 30,
+            "poll_interval_seconds": 2,
+            "max_poll_seconds": 3600,
             "capability_ttl_seconds": 3600,
             "pricing": {"currency": "USD", "fixed_per_request": "0.010000"},
         })
@@ -988,7 +1039,13 @@ class HostRecommendationTests(TestCase):
             is_default=True,
             status=ModelDeployment.Status.ACTIVE,
         )
-        assign_json_contract(deployment, "runtime_config", {})
+        assign_json_contract(deployment, "runtime_config", {
+            "runtime_source": "openai_compatible_endpoint",
+            "base_url": "http://127.0.0.1:19001",
+            "chat_path": "/v1/chat/completions",
+            "timeout_seconds": 30,
+            "capability_ttl_seconds": 3600,
+        })
         deployment.save()
         snapshot = self._snapshot()
 
@@ -1020,6 +1077,46 @@ class HostRecommendationTests(TestCase):
             snapshot, project=self.project, created_by=self.admin,
         ).candidates.get(deployment=deployment)
         self.assertEqual(ready.status, RecommendationCandidate.Status.RECOMMENDED)
+
+    def test_text_recommendation_rejects_fresh_health_for_incomplete_execution_contract(self):
+        profile = ModelProfileVersion.objects.get(profile_key="deepseek-text", version=1)
+        deployment = ModelDeployment(
+            key="recommend-text-invalid-contract",
+            name="Recommendation text invalid contract",
+            profile_version=profile,
+            credential=create_test_secret(
+                key="recommend.text-invalid-contract",
+                actor=self.admin,
+                value="test-secret",
+            ),
+            priority=201,
+            is_default=True,
+            status=ModelDeployment.Status.ACTIVE,
+        )
+        assign_json_contract(deployment, "runtime_config", {
+            "runtime_source": "openai_compatible_endpoint",
+            "base_url": "http://127.0.0.1:19002",
+            "capability_ttl_seconds": 3600,
+        })
+        deployment.save()
+        fresh_health = record_deployment_capability_snapshot(
+            deployment,
+            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.HEALTH,
+            status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
+            operations=["chat_completion"],
+            evidence={"schema_version": 1, "execution_submitted": False},
+        )
+        self.assertGreater(fresh_health.expires_at, timezone.now())
+
+        candidate = recommend_for_host(
+            self._snapshot(), project=self.project, created_by=self.admin,
+        ).candidates.get(deployment=deployment)
+
+        self.assertEqual(candidate.status, RecommendationCandidate.Status.UNAVAILABLE)
+        self.assertEqual(
+            candidate.reason_code,
+            "deployment_execution_contract_invalid",
+        )
 
     def test_capability_readiness_requires_verified_inventory_and_smoke_workflow(self):
         deployment, artifact, workflow = self._deployment("strict-ready", priority=50)
@@ -1060,6 +1157,46 @@ class HostRecommendationTests(TestCase):
         response = client.get(f"/api/v1/runtime-hosts/{self.host.id}/")
         self.assertEqual(response.status_code, 200, response.data)
         enqueue_runtime_host_probe.assert_not_called()
+
+    def test_gpu_probe_timeout_comes_from_published_runtime_configuration(self):
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={"runtime.gpu_probe_timeout_seconds": 1.25},
+            created_by=self.admin,
+        )
+        publish_config_revision(revision, published_by=self.admin)
+        with patch(
+            "studio.services.runtime_platform._gpu_probe",
+            return_value=([], "nvidia-smi_not_found"),
+        ) as gpu_probe, patch(
+            "studio.services.runtime_platform._comfy_probe",
+            return_value=(
+                {"status": "not_configured", "version": "", "deployments": []},
+                [],
+                [],
+            ),
+        ):
+            snapshot = probe_runtime_host(self.host)
+
+        gpu_probe.assert_called_once_with(timeout_seconds=1.25)
+        self.assertEqual(
+            snapshot.details["runtime_configuration"]["gpu_probe_timeout_seconds"],
+            1.25,
+        )
+        self.assertTrue(
+            snapshot.details["runtime_configuration"]["resolution_sha256"],
+        )
+
+    @patch("studio.services.runtime_platform.shutil.which", return_value="nvidia-smi")
+    @patch("studio.services.runtime_platform.subprocess.run")
+    def test_gpu_probe_passes_exact_timeout_to_subprocess(self, run, _which):
+        run.return_value = Mock(returncode=0, stdout="")
+
+        gpus, error = _gpu_probe(timeout_seconds=1.25)
+
+        self.assertEqual(gpus, [])
+        self.assertEqual(error, "nvidia-smi_no_devices")
+        self.assertEqual(run.call_args.kwargs["timeout"], 1.25)
 
     @patch("studio.services.runtime_platform._gpu_probe", return_value=([], "nvidia-smi_not_found"))
     @patch("studio.services.runtime_platform.driver_for")
@@ -1103,16 +1240,17 @@ class HostRecommendationTests(TestCase):
         deployment, artifact, _ = self._deployment("probe-observed", priority=30)
         payload = b"verified-model-bytes"
         digest = hashlib.sha256(payload).hexdigest()
+        artifact.filename = f"nested/{artifact.filename}"
         artifact.sha256 = digest
         artifact.size_bytes = len(payload)
-        artifact.save(update_fields=("sha256", "size_bytes", "updated_at"))
+        artifact.save(update_fields=("filename", "sha256", "size_bytes", "updated_at"))
         driver = Mock()
         driver.invoke.side_effect = lambda current, operation, request: (
             {"system": {"comfyui_version": "test-version"}}
             if operation == "health" else
             {"SaveImage": {}}
             if operation == "object_info" else
-            {"items": [artifact.filename] if request.get("folder") == "checkpoints" else []}
+            {"items": [artifact.filename.replace("/", "\\")] if request.get("folder") == "checkpoints" else []}
         )
         driver_for.return_value = driver
         with tempfile.TemporaryDirectory() as root:
@@ -1120,8 +1258,9 @@ class HostRecommendationTests(TestCase):
             output = comfy_root / "output"
             checkpoint_root = comfy_root / "models" / "checkpoints"
             output.mkdir(parents=True)
-            checkpoint_root.mkdir(parents=True)
-            (checkpoint_root / artifact.filename).write_bytes(payload)
+            model_file = checkpoint_root / artifact.filename
+            model_file.parent.mkdir(parents=True)
+            model_file.write_bytes(payload)
             with override_settings(COMFYUI_OUTPUT_DIR=output):
                 snapshot = probe_runtime_host(self.host)
 

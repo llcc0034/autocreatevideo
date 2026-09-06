@@ -36,6 +36,7 @@ class SingleShotPromptScopeTests(TestCase):
                 "duration_ms": 5000,
                 "dialogue": self.shot1.dialogue,
                 "characters": [str(self.character.id)],
+                "conditioning_mode": "T2VA",
             },
             format="json",
         )

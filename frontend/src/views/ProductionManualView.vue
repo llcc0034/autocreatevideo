@@ -62,13 +62,14 @@ onMounted(() => { void syncHash() })
   <div class="manual-page page-stack">
     <section class="manual-hero panel">
       <div class="manual-hero-copy">
-        <span class="eyebrow"><BookOpenCheck :size="13"/> LIVE OPERATOR HANDBOOK</span>
+        <span class="eyebrow"><BookOpenCheck :size="13"/> 当前版本操作手册 / LIVE OPERATOR HANDBOOK</span>
         <h2>{{ productionManual.title }}</h2>
         <p>{{ productionManual.subtitle }}。按钮、输入示例、成功标志和异常恢复均以当前版本为准。</p>
         <div class="manual-version"><span>手册版本 {{ productionManual.version }}</span><span>更新日期 {{ productionManual.updatedAt }}</span><span>内容 Schema v{{ productionManual.schemaVersion }}</span></div>
       </div>
       <div class="manual-hero-actions">
         <button class="button primary" @click="scrollToId('manual-step-create-project')"><Sparkles :size="15"/>从第 1 步开始</button>
+        <RouterLink class="button ghost" to="/manual/settings"><ServerCog :size="15"/>系统设置新手图文指南</RouterLink>
         <button class="button ghost" @click="scrollToId('manual-troubleshooting')"><CircleHelp :size="15"/>异常处理</button>
       </div>
     </section>
@@ -94,7 +95,7 @@ onMounted(() => { void syncHash() })
 
     <div class="manual-layout">
       <aside class="manual-toc panel">
-        <header><span class="eyebrow">PRODUCTION PATH</span><strong>完整制作路径</strong></header>
+        <header><span class="eyebrow">完整生产路径 / PRODUCTION PATH</span><strong>完整制作路径</strong></header>
         <nav>
           <button v-for="step in productionManual.steps" :key="step.id" :class="{ muted: normalizedQuery && !visibleSteps.includes(step) }" @click="scrollToId(stepAnchor(step))"><b>{{ String(step.number).padStart(2,'0') }}</b><span>{{ step.title }}</span></button>
         </nav>
@@ -103,7 +104,7 @@ onMounted(() => { void syncHash() })
 
       <main class="manual-content">
         <section class="manual-flow-intro">
-          <span class="eyebrow">START TO DELIVERY</span><h3>12 步完成逐集交付</h3><p>首次按已发布 workflow 声明的最小可用规格验证真实链路，再按已激活配置与运行快照生产。每一步看到成功标志后再进入下一步。</p>
+          <span class="eyebrow">从创建到交付 / START TO DELIVERY</span><h3>{{ productionManual.steps.length }} 步完成逐集交付</h3><p>首次按已发布工作流（workflow）声明的最小可用规格验证真实链路，再按已激活配置与运行快照生产。每一步看到成功标志后再进入下一步。</p>
         </section>
 
         <article v-for="step in visibleSteps" :id="stepAnchor(step)" :key="step.id" class="manual-step panel">
@@ -131,7 +132,7 @@ onMounted(() => { void syncHash() })
         <section v-if="!visibleSteps.length" class="manual-empty panel"><Search :size="24"/><strong>没有匹配的制作步骤</strong><p>可尝试“翻译”“首尾帧”“ProductionRun”或错误提示中的关键词。</p></section>
 
         <section id="manual-troubleshooting" class="manual-troubleshooting">
-          <header><span class="eyebrow">INCIDENT PLAYBOOK</span><h3>异常处理矩阵</h3><p>先确认症状和原因，再执行恢复动作。不要在状态不明时重复创建生产任务。</p></header>
+          <header><span class="eyebrow">异常处理手册 / INCIDENT PLAYBOOK</span><h3>异常处理矩阵</h3><p>先确认症状和原因，再执行恢复动作。不要在状态不明时重复创建生产任务。</p></header>
           <article v-for="incident in visibleIncidents" :id="incidentAnchor(incident)" :key="incident.id" class="manual-incident panel">
             <header><AlertTriangle :size="17"/><strong>{{ incident.symptom }}</strong></header>
             <div><section><span>常见原因</span><p>{{ incident.likelyCause }}</p></section><section><span>处理步骤</span><ol><li v-for="action in incident.actions" :key="action">{{ action }}</li></ol></section><section class="incident-confirm"><span>恢复确认</span><p><CheckCircle2 :size="13"/>{{ incident.confirmation }}</p></section></div>

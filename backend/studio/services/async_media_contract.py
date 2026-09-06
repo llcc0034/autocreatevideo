@@ -14,14 +14,29 @@ from studio.models import (
     ProviderProfile,
 )
 from studio.services.json_contracts import json_contract, verify_json_contract
+from studio.services.media_request_limits import media_prompt_absolute_max_chars
+from studio.services.model_profile_contracts import (
+    verified_frozen_model_profile_specification,
+    verified_model_profile_specification,
+)
 from studio.services.provider_registry import (
     credential_binding_sha256,
     credential_material_sha256,
     driver_for,
 )
+from studio.services.security_boundaries import boundary_int
 
 
-ASYNC_MEDIA_OPERATIONS = frozenset({"image.text_to_image", "video.text_to_video"})
+ASYNC_MEDIA_OPERATIONS = frozenset({
+    "image.text_to_image",
+    "video.text_to_video",
+    "audio.text_to_audio",
+})
+ASYNC_MEDIA_OUTPUT_KIND = {
+    "image.text_to_image": "image",
+    "video.text_to_video": "video",
+    "audio.text_to_audio": "audio",
+}
 STANDARD_MEDIA_FIELDS = frozenset({
     "model", "prompt", "negative_prompt", "width", "height",
     "duration_seconds", "fps", "seed", "audio",
@@ -34,6 +49,10 @@ _TYPE_MAP = {
 }
 
 
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
+
+
 def _validate_field(name: str, value: Any, rule: dict[str, Any]) -> None:
     value_type = rule.get("type")
     expected = _TYPE_MAP.get(value_type)
@@ -44,8 +63,12 @@ def _validate_field(name: str, value: Any, rule: dict[str, Any]) -> None:
     if not isinstance(value, expected):
         raise ValidationError(f"async_media smoke_inputs.{name} 类型无效")
     if isinstance(value, str):
+        absolute_maximum = media_prompt_absolute_max_chars()
         minimum = int(rule.get("minLength", 0))
-        maximum = int(rule.get("maxLength", 60000))
+        maximum = min(
+            int(rule.get("maxLength", absolute_maximum)),
+            absolute_maximum,
+        )
         if not minimum <= len(value) <= maximum:
             raise ValidationError(f"async_media smoke_inputs.{name} 长度越界")
     if value_type in {"integer", "number"}:
@@ -61,16 +84,10 @@ def async_operation_contract(
     profile: ModelProfileVersion,
     operation: str,
 ) -> dict[str, Any]:
-    verify_json_contract(
-        profile.specification,
-        schema_version=profile.specification_schema_version,
-        size_bytes=profile.specification_size_bytes,
-        sha256=profile.specification_sha256,
-    )
+    specification = verified_model_profile_specification(profile)
     if operation not in ASYNC_MEDIA_OPERATIONS:
-        raise ValidationError("async_rest 首版只支持文生图和文生视频")
-    specification = profile.specification
-    if not isinstance(specification, dict) or specification.get("schema_version") != 1:
+        raise ValidationError("async_rest 只支持已登记的文生图、文生视频和文生音频能力")
+    if specification.get("schema_version") != 1:
         raise ValidationError("async_rest model specification.schema_version 必须为 1")
     capabilities = specification.get("capabilities")
     if not isinstance(capabilities, list) or operation not in capabilities:
@@ -85,7 +102,7 @@ def async_operation_contract(
         "output_kind", "request_schema", "smoke_inputs",
     }:
         raise ValidationError(f"async_media.operations.{operation} 结构无效")
-    expected_kind = "image" if operation == "image.text_to_image" else "video"
+    expected_kind = ASYNC_MEDIA_OUTPUT_KIND[operation]
     if contract.get("output_kind") != expected_kind:
         raise ValidationError(f"{operation} output_kind 必须为 {expected_kind}")
     schema = contract.get("request_schema")
@@ -114,6 +131,33 @@ def async_operation_contract(
             raise ValidationError(f"{operation}.{name} Schema 含不支持关键字")
         if rule.get("type") not in _TYPE_MAP:
             raise ValidationError(f"{operation}.{name}.type 不受支持")
+        if rule.get("type") == "string":
+            absolute_maximum = media_prompt_absolute_max_chars()
+            maximum = rule.get("maxLength")
+            if name == "prompt" and maximum is None:
+                raise ValidationError(
+                    f"{operation}.prompt 必须由冻结请求 Schema 明确声明 maxLength",
+                )
+            if maximum is not None and (
+                isinstance(maximum, bool)
+                or not isinstance(maximum, int)
+                or not 1 <= maximum <= absolute_maximum
+            ):
+                raise ValidationError({
+                    f"{operation}.{name}.maxLength": (
+                        f"必须是 1 到当前安全边界 {absolute_maximum} 的整数"
+                    ),
+                })
+            minimum = rule.get("minLength")
+            if minimum is not None and (
+                isinstance(minimum, bool)
+                or not isinstance(minimum, int)
+                or minimum < 0
+                or (maximum is not None and minimum > maximum)
+            ):
+                raise ValidationError({
+                    f"{operation}.{name}.minLength": "必须是不大于 maxLength 的非负整数",
+                })
     smoke_inputs = contract.get("smoke_inputs")
     if not isinstance(smoke_inputs, dict) or set(smoke_inputs) - set(properties):
         raise ValidationError(f"{operation} smoke_inputs 含未知字段")
@@ -127,10 +171,11 @@ def async_operation_contract(
 def validate_async_model_profile(profile: ModelProfileVersion) -> list[str]:
     if profile.provider.driver_type != ProviderProfile.DriverType.ASYNC_REST:
         return []
-    capabilities = profile.specification.get("capabilities") if isinstance(profile.specification, dict) else None
+    specification = verified_model_profile_specification(profile)
+    capabilities = specification.get("capabilities")
     declared = [item for item in (capabilities or []) if item in ASYNC_MEDIA_OPERATIONS]
     if not declared:
-        raise ValidationError("async_rest model 必须声明至少一个首版媒体能力")
+        raise ValidationError("async_rest model 必须声明至少一个受支持的媒体能力")
     for operation in declared:
         async_operation_contract(profile, operation)
     driver = driver_for(profile.provider)
@@ -160,6 +205,7 @@ def validate_standard_payload(
 
 def deployment_target_payload(deployment: ModelDeployment) -> dict[str, Any]:
     provider = deployment.profile_version.provider
+    verified_model_profile_specification(deployment.profile_version)
     return {
         "schema_version": 1,
         "deployment_id": str(deployment.id),
@@ -180,13 +226,31 @@ def deployment_target_payload(deployment: ModelDeployment) -> dict[str, Any]:
 
 
 def deployment_target_sha256(deployment: ModelDeployment) -> str:
-    return json_contract(deployment_target_payload(deployment)).sha256
+    return json_contract(
+        deployment_target_payload(deployment),
+        max_bytes=_stage_snapshot_max_bytes(),
+    ).sha256
 
 
 def fresh_smoke_snapshot(
     deployment: ModelDeployment,
     operation: str,
+    *, prompt_profile_binding_id=None,
 ) -> ModelDeploymentCapabilitySnapshot | None:
+    from studio.services.deployment_smoke_contract import TEXT_DEPLOYMENT_SMOKE_OPERATIONS
+    from studio.services.deployment_smoke_profiles import snapshot_profile_matches
+    from studio.services.prompt_profiles import resolve_prompt_profile_binding, model_family_for_profile
+    text_operation = operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS
+    if text_operation and not prompt_profile_binding_id:
+        # Existing text production resolves one strategy. Evidence for another
+        # strategy must not admit that route; explicit consumers pass its id.
+        selected = resolve_prompt_profile_binding(
+            operation=operation, model_family=model_family_for_profile(deployment.profile_version),
+            model_profile_version=deployment.profile_version,
+        )
+        if selected is None:
+            return None
+        prompt_profile_binding_id = selected.binding.id
     target = deployment_target_sha256(deployment)
     candidates = deployment.capability_snapshots.filter(
         probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
@@ -195,18 +259,23 @@ def fresh_smoke_snapshot(
         expires_at__gt=timezone.now(),
     ).order_by("-revision")
     for snapshot in candidates:
+        snapshot.deployment = deployment
         verify_json_contract(
             snapshot.operations,
             schema_version=snapshot.operations_schema_version,
             size_bytes=snapshot.operations_size_bytes,
             sha256=snapshot.operations_sha256,
+            max_bytes=_stage_snapshot_max_bytes(),
         )
         verify_json_contract(
             snapshot.evidence,
             schema_version=snapshot.evidence_schema_version,
             size_bytes=snapshot.evidence_size_bytes,
             sha256=snapshot.evidence_sha256,
+            max_bytes=_stage_snapshot_max_bytes(),
         )
+        if text_operation and not snapshot_profile_matches(snapshot, prompt_profile_binding_id):
+            continue
         if operation in snapshot.operations and snapshot.evidence.get("execution_submitted") is True:
             return snapshot
     return None
@@ -235,16 +304,25 @@ def frozen_async_deployment(route: dict[str, Any]) -> ModelDeployment:
         raise ValidationError("冻结 route 不是 async_rest")
     provider_config = route.get("provider_config")
     deployment_config = route.get("deployment_config")
-    specification = route.get("model_specification")
+    specification = verified_frozen_model_profile_specification(
+        deployment.profile_version,
+        route,
+    )
     for value, digest, label in (
         (provider_config, route.get("provider_config_sha256"), "provider_config"),
         (deployment_config, route.get("deployment_config_sha256"), "deployment_config"),
-        (specification, route.get("frozen_model_specification_sha256"), "model specification"),
     ):
-        if not isinstance(value, dict) or json_contract(value).sha256 != digest:
+        if (
+            not isinstance(value, dict)
+            or json_contract(value, max_bytes=_stage_snapshot_max_bytes()).sha256
+            != digest
+        ):
             raise ValidationError(f"冻结 async route 的 {label} hash 无效")
     frozen_provider = copy(provider)
-    provider_contract = json_contract(provider_config)
+    provider_contract = json_contract(
+        provider_config,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
     frozen_provider.driver_config = provider_config
     frozen_provider.driver_config_schema_version = provider_contract.schema_version
     frozen_provider.driver_config_size_bytes = provider_contract.size_bytes
@@ -252,14 +330,20 @@ def frozen_async_deployment(route: dict[str, Any]) -> ModelDeployment:
     frozen_profile = copy(deployment.profile_version)
     frozen_profile.provider = frozen_provider
     frozen_profile.model_identifier = str(route.get("model_identifier") or "")
-    spec_contract = json_contract(specification)
+    spec_contract = json_contract(
+        specification,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
     frozen_profile.specification = specification
     frozen_profile.specification_schema_version = spec_contract.schema_version
     frozen_profile.specification_size_bytes = spec_contract.size_bytes
     frozen_profile.specification_sha256 = spec_contract.sha256
     frozen = copy(deployment)
     frozen.profile_version = frozen_profile
-    runtime_contract = json_contract(deployment_config)
+    runtime_contract = json_contract(
+        deployment_config,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
     frozen.runtime_config = deployment_config
     frozen.runtime_config_schema_version = runtime_contract.schema_version
     frozen.runtime_config_size_bytes = runtime_contract.size_bytes

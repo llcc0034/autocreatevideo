@@ -20,6 +20,8 @@ from studio.models import (
     ProductionRecipeVersion,
     ProviderProfile,
     RuntimeHost,
+    WorkflowProjector,
+    WorkflowProjectorVersion,
     WorkflowTemplateVersion,
 )
 from studio.services.json_contracts import canonical_json_bytes
@@ -64,6 +66,8 @@ def lifecycle_object_type(instance) -> str:
         (PromptProfileVersion, "prompt_profile_version"),
         (PromptProfileFieldRule, "prompt_profile_field_rule"),
         (PromptProfileBinding, "prompt_profile_binding"),
+        (WorkflowProjector, "workflow_projector"),
+        (WorkflowProjectorVersion, "workflow_projector_version"),
         (WorkflowTemplateVersion, "workflow_template_version"),
         (ConfigDefinition, "config_definition"),
         (ConfigRevision, "config_revision"),
@@ -108,9 +112,19 @@ def lifecycle_summary(instance) -> dict[str, Any]:
             "status": instance.status,
         }
     if isinstance(instance, ModelArtifact):
+        locator_sha256 = hashlib.sha256(canonical_json_bytes({
+            "filename": instance.filename,
+            "storage_uri": instance.storage_uri,
+            "inventory_folder": instance.inventory_folder,
+            "inventory_node_type": instance.inventory_node_type,
+            "inventory_input_name": instance.inventory_input_name,
+        })).hexdigest()
         return {
             "profile_version_id": _id(instance.profile_version_id),
             "role": instance.role,
+            # Paths/endpoints stay out of audit payloads; their digest still
+            # makes a registration-only relocation explicitly traceable.
+            "locator_sha256": locator_sha256,
             "sha256": instance.sha256,
             "size_bytes": instance.size_bytes,
             "status": instance.status,
@@ -156,6 +170,25 @@ def lifecycle_summary(instance) -> dict[str, Any]:
             "priority": instance.priority,
             "is_active": instance.is_active,
         }
+    if isinstance(instance, WorkflowProjector):
+        return {
+            "key": instance.key,
+            "is_active": instance.is_active,
+        }
+    if isinstance(instance, WorkflowProjectorVersion):
+        return {
+            "projector_id": _id(instance.projector_id),
+            "version": instance.version,
+            "engine_key": instance.engine_key,
+            "engine_version": instance.engine_version,
+            "driver_type": instance.provider_driver_type,
+            "operation": instance.operation,
+            "output_kind": instance.output_kind,
+            "definition_sha256": instance.definition_sha256,
+            "status": instance.status,
+            "is_current": instance.is_current,
+            "published_at": _time(instance.published_at),
+        }
     if isinstance(instance, WorkflowTemplateVersion):
         return {
             "template_id": _id(instance.template_id),
@@ -166,6 +199,7 @@ def lifecycle_summary(instance) -> dict[str, Any]:
             "input_contract_sha256": instance.input_contract_sha256,
             "status": instance.status,
             "validation_state": instance.validation_state,
+            "validated_deployment_id": _id(instance.validated_deployment_id),
             "validation_evidence_sha256": instance.validation_evidence_sha256,
             "smoke_test_state": instance.smoke_test_state,
             "smoke_test_evidence_sha256": instance.smoke_test_evidence_sha256,
@@ -176,6 +210,7 @@ def lifecycle_summary(instance) -> dict[str, Any]:
         return {
             "key": instance.key,
             "domain": instance.domain,
+            "configuration_class": instance.configuration_class,
             "value_type": instance.value_type,
             "restart_required": instance.restart_required,
             "is_required": instance.is_required,

@@ -47,6 +47,17 @@ export const validateConfigValue = (definition: ConfigDefinition, value: unknown
         return `${definition.key} 的服务端 pattern 无法解析，已禁止保存`
       }
     }
+    if (schema.format === 'comfyui-saved-workflow-directory') {
+      const parts = value.split('/')
+      if (
+        value !== value.trim()
+        || value !== value.normalize('NFC')
+        || value.length > 500
+        || parts[0] !== 'workflows'
+        || parts.some((part) => !part || part === '.' || part === '..' || part !== part.trim() || part.length > 255)
+        || /[\\:%\u0000-\u001f\u007f]/u.test(value)
+      ) return `${definition.key} 只能是 workflows 或其安全子目录`
+    }
   }
   if ((Array.isArray(value) || (value !== null && typeof value === 'object')) && hasOwn(schema, 'maxItems')) {
     const maxItems = Number(schema.maxItems)
@@ -78,6 +89,7 @@ export const configValueConstraintSummary = (definition: ConfigDefinition): stri
   if (hasOwn(schema, 'minimum') || hasOwn(schema, 'maximum')) parts.push(`范围 ${schema.minimum ?? '不限'}–${schema.maximum ?? '不限'}`)
   if (hasOwn(schema, 'maxItems')) parts.push(`最多 ${schema.maxItems} 项`)
   if (typeof schema.pattern === 'string' && schema.pattern) parts.push(`格式 ${schema.pattern}`)
+  if (schema.format === 'comfyui-saved-workflow-directory') parts.push('ComfyUI userdata 相对目录')
   if (schema.resource_ref && typeof schema.resource_ref === 'object') {
     const reference = schema.resource_ref as JsonObject
     parts.push(`依赖 ${String(reference.resource || 'resource')} · ${String(reference.capability || '未声明能力')}`)

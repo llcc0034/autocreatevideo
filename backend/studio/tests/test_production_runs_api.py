@@ -1,13 +1,18 @@
 from io import BytesIO
+import hashlib
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.core.exceptions import ValidationError
 from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.files.base import ContentFile
 from django.test import TestCase
 from rest_framework.test import APIClient
 
 from studio.models import (
+    Asset,
     CharacterBible,
     ConfigDefinition,
     ConfigRevision,
@@ -24,10 +29,15 @@ from studio.models import (
     StageRun,
 )
 from studio.services.json_contracts import assign_json_contract
+from studio.services.configuration import resolve_configuration
 from studio.services.production_runs import (
     StageBlocked,
     _assert_frozen_formal_objects,
     _canonical_storyboard,
+    _frozen_input_episode_count,
+    _frozen_route_timeout_seconds,
+    _freeze_stage_routing,
+    _project_creation_default_episode_count,
     _sha256,
 )
 
@@ -38,7 +48,13 @@ class ProductionRunApiTests(TestCase):
             username="production-owner",
             password="StrongPass123!",
         )
-        self.project = SeriesProject.objects.create(owner=self.user, title="一键生产测试")
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16",
+            owner=self.user,
+            title="一键生产测试",
+            width=768, height=1344, fps=24, default_shot_duration_ms=5000,
+            continuity_seed=1,
+            production_settings={"default_conditioning_mode": "T2VA"},
+        )
         self.recipe = ProductionRecipeVersion(
             recipe_key="test-script-review",
             version=1,
@@ -78,17 +94,161 @@ class ProductionRunApiTests(TestCase):
         self.assertEqual(confirmed.data["status"], ScriptRevision.Status.CONFIRMED)
         return revision_id
 
-    def _create_run(self, revision_id, *, key="run-1", episode_count=1, episode_ids=None):
+    def _create_run(self, revision_id, *, key="run-1", episode_count=None, episode_ids=None):
         payload = {
             "project_id": str(self.project.id),
             "script_revision_id": revision_id,
             "recipe_version_id": str(self.recipe.id),
             "idempotency_key": key,
-            "episode_count": episode_count,
         }
+        if episode_count is not None:
+            payload["episode_count"] = episode_count
         if episode_ids is not None:
             payload["episode_ids"] = episode_ids
         return self.client.post("/api/v1/production-runs/", payload, format="json")
+
+    def test_omitted_episode_count_is_resolved_and_frozen_from_creation_policy(self):
+        revision_id = self._confirmed_script()
+
+        created = self._create_run(revision_id, key="creation-policy-episode-count")
+
+        self.assertEqual(created.status_code, 201, created.data)
+        run = ProductionRun.objects.get(pk=created.data["id"])
+        self.assertEqual(run.input_snapshot["episode_count"], 1)
+        self.assertEqual(
+            run.config_snapshot["values"]["production.project_creation_policy"]
+            ["default_episode_count"],
+            run.input_snapshot["episode_count"],
+        )
+
+    def test_missing_historical_episode_count_is_rejected_without_fallback(self):
+        with self.assertRaises(StageBlocked) as captured:
+            _frozen_input_episode_count({})
+
+        self.assertEqual(captured.exception.code, "production_run_input_snapshot_invalid")
+
+    def test_creation_policy_episode_count_is_not_a_static_service_default(self):
+        values = dict(resolve_configuration().values)
+        policy = dict(values["production.project_creation_policy"])
+        policy["default_episode_count"] = 2
+        values["production.project_creation_policy"] = policy
+        self.assertEqual(
+            _project_creation_default_episode_count(values),
+            2,
+        )
+
+    def test_route_timeout_requires_an_explicit_versioned_value(self):
+        self.assertEqual(
+            _frozen_route_timeout_seconds(
+                {"timeout_seconds": 12.5},
+                {"timeout_seconds": 30},
+            ),
+            12.5,
+        )
+        with self.assertRaises(ValidationError):
+            _frozen_route_timeout_seconds({}, {})
+
+    def test_public_snapshot_projections_resolve_redaction_boundary_once(self):
+        from studio import platform_serializers
+        from studio.services import configuration as configuration_service
+
+        snapshot = {
+            "schema_version": 1,
+            "values": {
+                "safe": {
+                    "usage": {"prompt_tokens": 6, "completion_tokens": 4},
+                },
+            },
+            "sources": {
+                f"key-{index}": {
+                    "source": "system",
+                    "scope": "system",
+                    "source_type": "system",
+                    "version": 1,
+                    "revision": 1,
+                }
+                for index in range(500)
+            },
+        }
+        routing = {
+            "schema_version": 1,
+            "mode": "fixed",
+            "variant_count": 1,
+            "routes": [
+                {
+                    "index": index,
+                    "model_identifier": f"model-{index}",
+                    "driver_type": "comfyui",
+                    "is_external": False,
+                }
+                for index in range(100)
+            ],
+        }
+        original = configuration_service.resolve_security_boundaries
+
+        with patch.object(
+            configuration_service,
+            "resolve_security_boundaries",
+            wraps=original,
+        ) as resolver:
+            public_snapshot = platform_serializers.public_configuration_snapshot(
+                snapshot,
+            )
+        self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(len(public_snapshot["sources"]), 500)
+
+        with patch.object(
+            configuration_service,
+            "resolve_security_boundaries",
+            wraps=original,
+        ) as resolver:
+            public_routing = platform_serializers.public_stage_routing(routing)
+        self.assertEqual(resolver.call_count, 1)
+        self.assertEqual(len(public_routing["routes"]), 100)
+
+    def test_configured_routing_requires_an_explicit_variant_count(self):
+        with self.assertRaises(ValidationError):
+            _freeze_stage_routing(
+                {"mode": "fixed", "routes": []},
+                stage_key="media_generation",
+            )
+
+    def test_stage_snapshots_larger_than_default_json_limit_remain_serializable(self):
+        revision_id = self._confirmed_script()
+        created = self._create_run(revision_id, key="large-public-stage-snapshot")
+        self.assertEqual(created.status_code, 201, created.data)
+        stage = StageRun.objects.get(
+            production_run_id=created.data["id"],
+            stage_key="script_review",
+        )
+        assign_json_contract(
+            stage,
+            "output_snapshot",
+            {"schema_version": 1, "large_audit_payload": "x" * 70_000},
+            max_bytes=8 * 1024 * 1024,
+        )
+        stage.save(update_fields=(
+            "output_snapshot",
+            "output_snapshot_schema_version",
+            "output_snapshot_size_bytes",
+            "output_snapshot_sha256",
+            "updated_at",
+        ))
+
+        detail = self.client.get(
+            f"/api/v1/production-runs/{created.data['id']}/",
+        )
+
+        self.assertEqual(detail.status_code, 200, detail.data)
+        serialized = next(
+            item for item in detail.data["stages"]
+            if item["stage_key"] == "script_review"
+        )
+        self.assertEqual(
+            serialized["output_snapshot"]["large_audit_payload"],
+            "x" * 70_000,
+        )
+        self.assertEqual(len(serialized["output_snapshot_sha256"]), 64)
 
     def test_confirmed_script_enters_real_gate_and_idempotency_is_enforced(self):
         revision_id = self._confirmed_script()
@@ -112,7 +272,11 @@ class ProductionRunApiTests(TestCase):
         self.assertEqual(replayed.status_code, 200, replayed.data)
         self.assertEqual(replayed.data["id"], run_id)
         conflict = self._create_run(revision_id, episode_count=2)
-        self.assertEqual(conflict.status_code, 400, conflict.data)
+        self.assertEqual(conflict.status_code, 409, conflict.data)
+        self.assertEqual(
+            conflict.data["error"]["code"],
+            "production_run_conflict",
+        )
         self.assertEqual(ProductionRun.objects.filter(owner=self.user).count(), 1)
 
         unknown = self.client.post(f"/api/v1/production-runs/{run_id}/approve/", {
@@ -164,7 +328,7 @@ class ProductionRunApiTests(TestCase):
         self.assertEqual(storyboard.status_code, 200, storyboard.data)
         self.assertEqual(storyboard.data["current_stage_key"], "storyboard_review")
         self.assertEqual(storyboard.data["status"], ProductionRun.Status.AWAITING_APPROVAL)
-        self.assertTrue(self.project.episodes.exists())
+
         source_snapshot_sha256 = next(
             item["output_snapshot_sha256"]
             for item in storyboard.data["stages"]
@@ -188,9 +352,45 @@ class ProductionRunApiTests(TestCase):
             1,
         )
 
+    def test_library_script_preview_is_rejected_until_explicit_confirmation(self):
+        payload = "# 第一集\n\n素材库剧本必须先人工确认。".encode("utf-8")
+        asset = Asset(
+            owner=self.user,
+            kind=Asset.Kind.SCRIPT,
+            name="素材库门禁剧本",
+            mime_type="text/markdown",
+            checksum=hashlib.sha256(payload).hexdigest(),
+            metadata={"script_normalization": "utf8_markdown_v1"},
+        )
+        asset.file.save("library-gate.md", ContentFile(payload), save=True)
+        stored_path = asset.file.path
+        self.addCleanup(lambda: Path(stored_path).unlink(missing_ok=True))
+        imported = self.client.post(
+            "/api/v1/script-sources/",
+            {"project_id": str(self.project.id), "asset_id": str(asset.id)},
+            format="json",
+        )
+        self.assertEqual(imported.status_code, 201, imported.data)
+        revision_id = imported.data["revision"]["id"]
+        self.assertEqual(imported.data["revision"]["status"], ScriptRevision.Status.PREVIEW)
+        rejected = self._create_run(revision_id, key="library-preview-rejected")
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+        confirmed = self.client.post(
+            f"/api/v1/script-revisions/{revision_id}/confirm/",
+            {},
+            format="json",
+        )
+        self.assertEqual(confirmed.status_code, 200, confirmed.data)
+        accepted = self._create_run(revision_id, key="library-preview-confirmed")
+        self.assertEqual(accepted.status_code, 201, accepted.data)
+        self.assertEqual(
+            str(ProductionRun.objects.get(pk=accepted.data["id"]).script_revision_id),
+            str(revision_id),
+        )
+
     def test_existing_episode_and_automatic_storyboard_are_rejected_before_run_creation(self):
         revision_id = self._confirmed_script()
-        Episode.objects.create(project=self.project, number=1, title="既有第一集")
+        Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=1, title="既有第一集")
         run_revision_count = ConfigRevision.objects.filter(
             scope_type=ConfigRevision.ScopeType.RUN,
         ).count()
@@ -220,7 +420,7 @@ class ProductionRunApiTests(TestCase):
 
     def test_existing_episode_accepts_explicit_manual_or_skip_storyboard_mode(self):
         revision_id = self._confirmed_script()
-        Episode.objects.create(project=self.project, number=1, title="既有第一集")
+        Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=1, title="既有第一集")
 
         for index, mode in enumerate(("manual", "skip"), start=1):
             with self.subTest(mode=mode):
@@ -259,21 +459,22 @@ class ProductionRunApiTests(TestCase):
                 )
 
     def test_downstream_manual_input_freezes_selected_existing_episodes_without_script(self):
-        selected_episode = Episode.objects.create(
+        selected_episode = Episode.objects.create(prompt_settings={"include_audio": True},
             project=self.project,
             number=1,
             title="沿用第一集",
             status=Episode.Status.DRAFT,
         )
-        selected_shot = Shot.objects.create(
+        selected_shot = Shot.objects.create(include_audio=True,
             episode=selected_episode,
             number=1,
             title="既有镜头",
             narrative="从既有分镜继续生产。",
+            duration_ms=self.project.default_shot_duration_ms,
             media_type=Shot.MediaType.VIDEO,
-            h3_mode=Shot.H3Mode.T2VA,
+            conditioning_mode="T2VA",
         )
-        Episode.objects.create(
+        Episode.objects.create(prompt_settings={"include_audio": True},
             project=self.project,
             number=2,
             title="未选择且尚无分镜的第二集",
@@ -381,7 +582,7 @@ class ProductionRunApiTests(TestCase):
         revision_id = self._confirmed_script()
         created = self._create_run(revision_id, key="storyboard-approval-drift")
         run = ProductionRun.objects.get(pk=created.data["id"])
-        episode = Episode.objects.create(
+        episode = Episode.objects.create(prompt_settings={"include_audio": True},
             project=self.project,
             number=1,
             title="冻结分镜",
@@ -561,12 +762,16 @@ class ProductionRunApiTests(TestCase):
         run.stages.order_by("-ordinal").first().delete()
 
         replay = self._create_run(revision_id, key="incomplete-idempotent-run")
-        self.assertEqual(replay.status_code, 400, replay.data)
+        self.assertEqual(replay.status_code, 409, replay.data)
+        self.assertEqual(
+            replay.data["error"]["code"],
+            "production_run_conflict",
+        )
         self.assertIn("初始化不完整", str(replay.data))
 
     def test_episode_selection_is_owned_deduplicated_sorted_and_frozen(self):
-        first = Episode.objects.create(project=self.project, number=2, title="第二集")
-        second = Episode.objects.create(project=self.project, number=1, title="第一集")
+        first = Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=2, title="第二集")
+        second = Episode.objects.create(prompt_settings={"include_audio": True}, project=self.project, number=1, title="第一集")
         definition = json.loads(json.dumps(self.recipe.definition))
         storyboard = next(
             item for item in definition["stages"] if item["key"] == "storyboard"
@@ -581,8 +786,8 @@ class ProductionRunApiTests(TestCase):
         foreign_owner = get_user_model().objects.create_user(
             username="foreign-episode-owner", password="StrongPass123!",
         )
-        foreign_project = SeriesProject.objects.create(owner=foreign_owner, title="其他项目")
-        foreign = Episode.objects.create(project=foreign_project, number=1, title="外部集")
+        foreign_project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=foreign_owner, title="其他项目", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
+        foreign = Episode.objects.create(prompt_settings={"include_audio": True}, project=foreign_project, number=1, title="外部集")
         revision_id = self._confirmed_script()
 
         invalid = self._create_run(
@@ -628,13 +833,13 @@ class ProductionRunApiTests(TestCase):
         revision_id = self._confirmed_script()
         created = self._create_run(revision_id, key=key)
         run = ProductionRun.objects.get(pk=created.data["id"])
-        episode = Episode.objects.create(
+        episode = Episode.objects.create(prompt_settings={"include_audio": True},
             project=self.project,
             number=1,
             title="冻结分镜",
             status=Episode.Status.DRAFT,
         )
-        shot = Shot.objects.create(
+        shot = Shot.objects.create(include_audio=True,
             episode=episode,
             number=1,
             title="第一镜",

@@ -21,7 +21,7 @@ class GeneratedArtifactMediaTests(TestCase):
         self.other = get_user_model().objects.create_user(
             username="artifact-media-other", password="StrongPass123!",
         )
-        self.project = SeriesProject.objects.create(owner=self.user, title="正式产物读取")
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="正式产物读取", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         recipe = ProductionRecipeVersion.objects.get(
             recipe_key="default-series-production", version=1,
         )
@@ -110,3 +110,61 @@ class GeneratedArtifactMediaTests(TestCase):
                 artifact.status = GeneratedArtifact.Status.INVALID
                 artifact.save(update_fields=("status", "updated_at"))
                 self.assertEqual(anonymous.get(detail.data["preview_url"]).status_code, 404)
+
+    def test_staff_run_uses_project_tenant_for_async_artifact_url_and_access(self):
+        staff = get_user_model().objects.create_user(
+            username="artifact-media-staff", password="StrongPass123!", is_staff=True,
+        )
+        self.run.owner = staff
+        self.run.save(update_fields=("owner", "updated_at"))
+        with tempfile.TemporaryDirectory() as workspace:
+            media_root = Path(workspace) / "media"
+            relative = Path(
+                "generated-artifacts", str(self.user.id), str(self.project.id),
+                "async", "fixture", "artifact-1.media",
+            )
+            managed = media_root / relative
+            managed.parent.mkdir(parents=True)
+            Image.new("RGB", (4, 3), color=(31, 41, 59)).save(managed, format="PNG")
+            payload = managed.read_bytes()
+            metadata = json_contract({
+                "schema_version": 1,
+                "source": "restricted_async_rest",
+                "tenant_owner_id": str(self.user.id),
+            })
+            artifact = GeneratedArtifact.objects.create(
+                manifest_key="managed-cross-owner-async-media-test",
+                production_run=self.run,
+                kind=GeneratedArtifact.Kind.IMAGE,
+                role="primary_generation_output",
+                variant_group="image:cross-owner",
+                variant_index=1,
+                status=GeneratedArtifact.Status.SELECTED,
+                storage_backend="managed_local",
+                object_key=relative.as_posix(),
+                mime_type="image/png",
+                size_bytes=len(payload),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                manifest_metadata=metadata.value,
+                manifest_schema_version=metadata.schema_version,
+                manifest_metadata_size_bytes=metadata.size_bytes,
+                manifest_metadata_sha256=metadata.sha256,
+            )
+            with self.settings(MEDIA_ROOT=media_root):
+                # The project owner can read a staff-created run's tenant media.
+                detail = self.client.get(f"/api/v1/generated-artifacts/{artifact.id}/")
+                self.assertEqual(detail.status_code, 200, detail.data)
+                anonymous = APIClient()
+                preview = anonymous.get(detail.data["preview_url"])
+                self.assertEqual(preview.status_code, 200)
+                self.assertEqual(b"".join(preview.streaming_content), payload)
+
+                actor_token = signed_media_token(
+                    purpose="generated_artifact",
+                    object_id=artifact.id,
+                    owner_id=staff.id,
+                )
+                self.assertEqual(
+                    anonymous.get(f"/api/v1/media/{actor_token}/").status_code,
+                    404,
+                )

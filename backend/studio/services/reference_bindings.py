@@ -1,23 +1,37 @@
-"""Strict, deterministic MiniMax H3 image/video/audio reference bindings.
+"""Strict, deterministic image/video/audio reference bindings.
 
 The user-facing ``Shot.reference_bindings`` JSON is deliberately separated
-from the legacy ``Shot.reference_assets`` many-to-many collection.  The latter
-is only an asset picker/library relationship; it must never decide the semantic
-role or input slot of an image, video, or audio asset.
+from ``Shot.reference_assets``.  The latter is only an asset picker/library
+relationship; it must never decide the semantic role or input slot of an
+image, video, or audio asset.
 
-Both prompt construction and ComfyUI dynamic input injection consume the
-ordered records returned by :func:`resolve_group_reference_bindings`.  This
-keeps ``<Picture N>`` / ``<Video N>`` / ``<Audio N>`` labels and graph inputs
-on one auditable contract.
+Shot persistence validates only the common binding shape, asset ownership and
+safe identifiers.  A selected ProductionRun route must additionally call
+:func:`validate_reference_bindings_against_mode_contract`; only its frozen
+conditioning contract may decide cardinality, purposes, exclusions or pairing.
+
+Model adapters consume the ordered records returned by
+:func:`resolve_group_reference_bindings`.  Model-specific prompt semantics stay
+inside their controlled adapters and are not global platform defaults.
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
+import re
 from uuid import UUID
 
 from django.conf import settings
 
 from studio.models import Asset, Shot
+from studio.services.asset_visibility import is_workflow_smoke_fixture_asset
+from studio.services.media_capabilities import SAFE_CONDITIONING_IDENTIFIER_PATTERN
+from studio.services.provenance import sha256_file
+from studio.services.visual_reference_policy import (
+    VisualReferencePolicyError,
+    character_requires_visual_reference,
+)
+from studio.services.security_boundaries import boundary_int
 
 
 REFERENCE_BINDING_KEYS = frozenset({
@@ -28,46 +42,78 @@ ENTITY_BINDING_KEYS = frozenset({"entity_id", "asset_id"})
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif", ".tif", ".tiff"})
 VIDEO_EXTENSIONS = frozenset({".mp4", ".mov", ".webm"})
 AUDIO_EXTENSIONS = frozenset({".wav", ".mp3", ".flac", ".m4a", ".ogg"})
-VIDEO_REFERENCE_PURPOSES = frozenset({
-    "motion_camera_reference",
-    "video_editing",
-    "video_continuation",
-})
-AUDIO_REFERENCE_PURPOSES = frozenset({"audio_reference", "audio_reuse"})
-DEFAULT_VIDEO_REFERENCE_PURPOSE = "motion_camera_reference"
-DEFAULT_AUDIO_REFERENCE_PURPOSE = "audio_reference"
+_SAFE_IDENTIFIER = re.compile(SAFE_CONDITIONING_IDENTIFIER_PATTERN)
 
 
-def prompt_template_key(requested_mode: str, effective_mode: str, reference_count: int = 0) -> str:
-    """Version prompt syntax while preserving the user's workflow choice."""
-    if requested_mode == Shot.H3Mode.T2VA:
-        return "h3_t2v_text_v1"
-    if requested_mode == Shot.H3Mode.REF2VA:
-        return "h3_r2v_classified_v1" if reference_count else "h3_r2v_zero_reference_v1"
-    return {
-        Shot.H3Mode.T2VA: "h3_i2v_zero_frame_v1",
-        Shot.H3Mode.I2VA: "h3_i2v_first_frame_v1",
-        Shot.H3Mode.L2VA: "h3_i2v_last_frame_v1",
-        Shot.H3Mode.FL2VA: "h3_i2v_first_last_v1",
-    }[effective_mode]
+def max_structural_media_bindings() -> int:
+    return boundary_int("security.reference.max_bindings")
 
 
 class ReferenceBindingError(ValueError):
     pass
 
 
-def effective_conditioning_mode(requested_mode: str, bindings: list[dict]) -> str:
-    """Describe what the ImageToVideo node will actually receive."""
-    if requested_mode == Shot.H3Mode.REF2VA:
-        return Shot.H3Mode.REF2VA
-    categories = {item.get("category") for item in bindings}
-    if "first_frame" in categories and "last_frame" in categories:
-        return Shot.H3Mode.FL2VA
-    if "first_frame" in categories:
-        return Shot.H3Mode.I2VA
-    if "last_frame" in categories:
-        return Shot.H3Mode.L2VA
-    return Shot.H3Mode.T2VA
+def authorized_asset_source(*, owner, asset_id: str) -> tuple[Asset, Path]:
+    """Resolve one tenant-authorized immutable local Asset source.
+
+    Workflow smoke, short-drama production and independent asset generation all
+    need the same ownership, path and checksum boundary.  Keeping it here avoids
+    each worker inventing a subtly different authorization rule.
+    """
+
+    try:
+        asset = Asset.objects.get(pk=asset_id, is_active=True)
+    except (Asset.DoesNotExist, ValueError, TypeError) as exc:
+        raise ReferenceBindingError("参考素材不存在、已停用或当前用户无权使用") from exc
+    owner_id = getattr(owner, "id", None)
+    if asset.owner_id not in (None, owner_id):
+        raise ReferenceBindingError("参考素材不存在、已停用或当前用户无权使用")
+    if is_workflow_smoke_fixture_asset(asset):
+        raise ReferenceBindingError("工作流 Smoke 专用素材不能用于正式生成任务")
+
+    asset_root = Path(settings.ASSET_LIBRARY_ROOT).resolve()
+    media_root = Path(settings.MEDIA_ROOT).resolve()
+    if asset.owner_id is None:
+        if not asset.local_path or asset.file:
+            raise ReferenceBindingError("全局参考素材必须来自只读素材库")
+        path = Path(asset.local_path).resolve()
+        allowed_root = asset_root
+    elif asset.file:
+        try:
+            path = Path(asset.file.path).resolve()
+        except (NotImplementedError, ValueError, OSError) as exc:
+            raise ReferenceBindingError("用户参考素材不是可读取的本地上传") from exc
+        allowed_root = (media_root / "assets" / str(owner_id)).resolve()
+    elif getattr(owner, "is_staff", False) and asset.local_path:
+        try:
+            path = Path(asset.local_path).resolve()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ReferenceBindingError("管理员素材不是可读取的受控本地文件") from exc
+        if path.is_relative_to(asset_root):
+            allowed_root = asset_root
+        elif path.is_relative_to(media_root):
+            allowed_root = media_root
+        else:
+            raise ReferenceBindingError("管理员素材路径越出受控素材目录")
+    else:
+        raise ReferenceBindingError("用户参考素材必须由上传接口写入租户目录")
+    try:
+        allowed = path.is_relative_to(allowed_root)
+    except (OSError, ValueError):
+        allowed = False
+    if not allowed:
+        raise ReferenceBindingError("参考素材路径越出租户授权目录")
+    if not path.is_file():
+        raise ReferenceBindingError("参考素材文件不存在")
+    recorded_checksum = str(asset.checksum or "").casefold()
+    actual_checksum = sha256_file(path)
+    if (
+        len(recorded_checksum) != 64
+        or any(character not in "0123456789abcdef" for character in recorded_checksum)
+        or actual_checksum != recorded_checksum
+    ):
+        raise ReferenceBindingError("参考素材内容哈希与已确认记录不一致")
+    return asset, path
 
 
 def _uuid_string(value, field: str) -> str:
@@ -75,6 +121,15 @@ def _uuid_string(value, field: str) -> str:
         return str(UUID(str(value)))
     except (TypeError, ValueError, AttributeError) as exc:
         raise ReferenceBindingError(f"{field} 必须是有效 UUID") from exc
+
+
+def normalize_reference_identifier(value, field: str = "purpose") -> str:
+    normalized = str(value or "").strip()
+    if _SAFE_IDENTIFIER.fullmatch(normalized) is None:
+        raise ReferenceBindingError(
+            f"{field} 必须是以字母开头、最长 64 字符的安全 identifier"
+        )
+    return normalized
 
 
 def _normalize_entity_items(value, field: str) -> list[dict]:
@@ -119,20 +174,21 @@ def _normalize_videos(value) -> list[dict]:
         "asset_id", "use_embedded_audio", "audio_asset_id", "purpose", "audio_purpose",
     }
     for index, item in enumerate(value):
-        if not isinstance(item, dict) or not item.get("asset_id") or set(item) - allowed:
+        if (
+            not isinstance(item, dict)
+            or not item.get("asset_id")
+            or "purpose" not in item
+            or "use_embedded_audio" not in item
+            or set(item) - allowed
+        ):
             raise ReferenceBindingError(
                 f"videos[{index}] 只能包含 asset_id、use_embedded_audio、audio_asset_id、"
-                "purpose、audio_purpose"
+                "purpose、audio_purpose，且 purpose/use_embedded_audio 必须显式提交"
             )
-        use_embedded = item.get("use_embedded_audio", False)
+        use_embedded = item.get("use_embedded_audio")
         if not isinstance(use_embedded, bool):
             raise ReferenceBindingError(f"videos[{index}].use_embedded_audio 必须是布尔值")
-        purpose = item.get("purpose", DEFAULT_VIDEO_REFERENCE_PURPOSE)
-        if purpose not in VIDEO_REFERENCE_PURPOSES:
-            raise ReferenceBindingError(
-                f"videos[{index}].purpose 必须是 "
-                f"{', '.join(sorted(VIDEO_REFERENCE_PURPOSES))} 之一"
-            )
+        purpose = normalize_reference_identifier(item.get("purpose"), f"videos[{index}].purpose")
         normalized = {
             "asset_id": _uuid_string(item["asset_id"], f"videos[{index}].asset_id"),
             "purpose": purpose,
@@ -142,18 +198,15 @@ def _normalize_videos(value) -> list[dict]:
             normalized["audio_asset_id"] = _uuid_string(
                 item["audio_asset_id"], f"videos[{index}].audio_asset_id",
             )
-        if use_embedded and normalized.get("audio_asset_id"):
-            raise ReferenceBindingError(
-                f"videos[{index}] 不能同时使用内嵌音轨和独立 audio_asset_id"
-            )
         has_paired_audio = use_embedded or bool(normalized.get("audio_asset_id"))
         if has_paired_audio:
-            audio_purpose = item.get("audio_purpose", DEFAULT_AUDIO_REFERENCE_PURPOSE)
-            if audio_purpose not in AUDIO_REFERENCE_PURPOSES:
+            if "audio_purpose" not in item:
                 raise ReferenceBindingError(
-                    f"videos[{index}].audio_purpose 必须是 "
-                    f"{', '.join(sorted(AUDIO_REFERENCE_PURPOSES))} 之一"
+                    f"videos[{index}] 启用配对音频时必须显式提交 audio_purpose"
                 )
+            audio_purpose = normalize_reference_identifier(
+                item.get("audio_purpose"), f"videos[{index}].audio_purpose",
+            )
             normalized["audio_purpose"] = audio_purpose
         elif "audio_purpose" in item:
             raise ReferenceBindingError(
@@ -163,8 +216,11 @@ def _normalize_videos(value) -> list[dict]:
     video_ids = [item["asset_id"] for item in result]
     if len(video_ids) != len(set(video_ids)):
         raise ReferenceBindingError("videos 不能重复绑定同一参考视频")
-    if len(result) > 3:
-        raise ReferenceBindingError("Ref2VA 最多允许 3 个参考视频")
+    if len(result) > max_structural_media_bindings():
+        raise ReferenceBindingError(
+            f"videos 结构上限为 {max_structural_media_bindings()}；"
+            "实际工作流上限由冻结合同决定"
+        )
     return result
 
 
@@ -178,15 +234,13 @@ def _normalize_audios(value) -> list[dict]:
         if (
             not isinstance(item, dict)
             or not item.get("asset_id")
+            or "purpose" not in item
             or set(item) - {"asset_id", "purpose"}
         ):
-            raise ReferenceBindingError(f"audios[{index}] 只能包含 asset_id 和 purpose")
-        purpose = item.get("purpose", DEFAULT_AUDIO_REFERENCE_PURPOSE)
-        if purpose not in AUDIO_REFERENCE_PURPOSES:
             raise ReferenceBindingError(
-                f"audios[{index}].purpose 必须是 "
-                f"{', '.join(sorted(AUDIO_REFERENCE_PURPOSES))} 之一"
+                f"audios[{index}] 只能包含 asset_id 和显式 purpose"
             )
+        purpose = normalize_reference_identifier(item.get("purpose"), f"audios[{index}].purpose")
         result.append({
             "asset_id": _uuid_string(item["asset_id"], f"audios[{index}].asset_id"),
             "purpose": purpose,
@@ -194,9 +248,209 @@ def _normalize_audios(value) -> list[dict]:
     asset_ids = [item["asset_id"] for item in result]
     if len(asset_ids) != len(set(asset_ids)):
         raise ReferenceBindingError("audios 不能重复绑定同一参考音频")
-    if len(result) > 3:
-        raise ReferenceBindingError("Ref2VA 最多允许 3 个独立参考音频")
+    if len(result) > max_structural_media_bindings():
+        raise ReferenceBindingError(
+            f"audios 结构上限为 {max_structural_media_bindings()}；"
+            "实际工作流上限由冻结合同决定"
+        )
     return result
+
+
+def _validate_count(
+    count: int,
+    contract: dict,
+    *,
+    label: str,
+) -> None:
+    try:
+        minimum = int(contract["minimum_items"])
+        maximum = int(contract["maximum_items"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ReferenceBindingError(f"{label} 冻结基数合同无效") from exc
+    if not minimum <= count <= maximum:
+        raise ReferenceBindingError(
+            f"{label} 数量 {count} 不满足冻结范围 {minimum}–{maximum}"
+        )
+
+
+def _validate_purpose_group(
+    items: list[dict],
+    group: dict,
+    *,
+    label: str,
+    purpose_field: str = "purpose",
+) -> None:
+    _validate_count(len(items), group, label=label)
+    definitions = group.get("purposes")
+    if not isinstance(definitions, list):
+        raise ReferenceBindingError(f"{label}.purposes 冻结合同无效")
+    by_key = {
+        str(item.get("key") or ""): item
+        for item in definitions
+        if isinstance(item, dict)
+    }
+    if len(by_key) != len(definitions):
+        raise ReferenceBindingError(f"{label}.purposes 冻结合同重复或无效")
+    counts: dict[str, int] = {key: 0 for key in by_key}
+    for index, item in enumerate(items):
+        purpose = str(item.get(purpose_field) or "")
+        if purpose not in by_key:
+            raise ReferenceBindingError(
+                f"{label}[{index}].{purpose_field}={purpose or '(empty)'} 未在冻结合同声明"
+            )
+        counts[purpose] += 1
+    for key, definition in by_key.items():
+        _validate_count(counts[key], definition, label=f"{label}.purpose[{key}]")
+
+
+def validate_reference_bindings_against_mode_contract(
+    bindings: object,
+    mode_contract: object,
+) -> None:
+    """Strictly validate normalized bindings against one frozen mode contract."""
+
+    if not isinstance(bindings, dict) or not isinstance(mode_contract, dict):
+        raise ReferenceBindingError("reference_bindings 或 mode contract 缺失")
+    inputs = mode_contract.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ReferenceBindingError("mode.inputs 冻结合同缺失")
+    input_kind = str(mode_contract.get("input_kind") or "")
+    first_count = int(bool(bindings.get("first_frame_asset_id")))
+    last_count = int(bool(bindings.get("last_frame_asset_id")))
+    entity_count = (
+        int(bool(bindings.get("first_frame_reference_asset_id")))
+        + len(bindings.get("characters") or [])
+        + int(bool(bindings.get("scene")))
+        + len(bindings.get("props") or [])
+    )
+    total_images = first_count + last_count + entity_count
+    videos = list(bindings.get("videos") or [])
+    audios = list(bindings.get("audios") or [])
+    paired_videos = [
+        item for item in videos
+        if item.get("use_embedded_audio") or item.get("audio_asset_id")
+    ]
+    _validate_count(total_images, inputs.get("total_images") or {}, label="total_images")
+    _validate_count(first_count, inputs.get("first_frame") or {}, label="first_frame")
+    _validate_count(last_count, inputs.get("last_frame") or {}, label="last_frame")
+    _validate_count(entity_count, inputs.get("entity_images") or {}, label="entity_images")
+    _validate_count(len(videos), inputs.get("reference_videos") or {}, label="reference_videos")
+    _validate_count(
+        len(paired_videos),
+        inputs.get("paired_video_audios") or {},
+        label="paired_video_audios",
+    )
+    _validate_count(len(audios), inputs.get("reference_audios") or {}, label="reference_audios")
+
+    if input_kind == "text_only" and bindings:
+        raise ReferenceBindingError("text_only 条件模式不接受任何 reference_bindings")
+    if input_kind == "frame_slots" and any((entity_count, videos, audios)):
+        raise ReferenceBindingError("frame_slots 条件模式只接受首帧/尾帧槽位")
+    if input_kind == "classified_references" and (first_count or last_count):
+        raise ReferenceBindingError("classified_references 条件模式不接受首帧/尾帧执行槽位")
+
+    topology = mode_contract.get("dynamic_reference_topology")
+    if not videos and not audios and not paired_videos:
+        if topology is None:
+            return
+    if not isinstance(topology, dict):
+        raise ReferenceBindingError("动态参考绑定存在，但冻结 mode 缺少 dynamic_reference_topology")
+    video_group = topology.get("videos")
+    audio_group = topology.get("audios")
+    if not isinstance(video_group, dict) or not isinstance(audio_group, dict):
+        raise ReferenceBindingError("dynamic_reference_topology 媒体组合同缺失")
+    _validate_purpose_group(videos, video_group, label="videos")
+    _validate_purpose_group(audios, audio_group, label="audios")
+
+    for rule in topology.get("mutual_exclusion_rules") or []:
+        if not isinstance(rule, dict):
+            raise ReferenceBindingError("mutual_exclusion_rules 冻结合同无效")
+        media_kind = str(rule.get("media_kind") or "")
+        source = videos if media_kind == "video" else audios if media_kind == "audio" else None
+        if source is None:
+            raise ReferenceBindingError("mutual_exclusion_rules.media_kind 冻结合同无效")
+        governed = set(rule.get("purpose_keys") or [])
+        used = {str(item.get("purpose") or "") for item in source}.intersection(governed)
+        maximum_distinct = rule.get("maximum_distinct_purposes")
+        if isinstance(maximum_distinct, bool) or not isinstance(maximum_distinct, int):
+            raise ReferenceBindingError("mutual_exclusion_rules 最大用途数无效")
+        if len(used) > maximum_distinct:
+            raise ReferenceBindingError(
+                f"互斥规则 {rule.get('key') or '(unknown)'} 最多允许 {maximum_distinct} 种用途"
+            )
+
+    pairing_rules = topology.get("pairing_rules")
+    if not isinstance(pairing_rules, list):
+        raise ReferenceBindingError("pairing_rules 冻结合同无效")
+    for index, video in enumerate(videos):
+        purpose = str(video.get("purpose") or "")
+        matches = [
+            rule for rule in pairing_rules
+            if isinstance(rule, dict) and purpose in set(rule.get("source_purpose_keys") or [])
+        ]
+        paired_count = int(bool(video.get("use_embedded_audio"))) + int(
+            bool(video.get("audio_asset_id"))
+        )
+        if len(matches) > 1:
+            raise ReferenceBindingError(f"videos[{index}] 命中多条冻结配对规则")
+        if not matches:
+            if paired_count:
+                raise ReferenceBindingError(f"videos[{index}] 的用途未声明音频配对规则")
+            continue
+        rule = matches[0]
+        minimum = rule.get("minimum_targets_per_source")
+        maximum = rule.get("maximum_targets_per_source")
+        if (
+            isinstance(minimum, bool)
+            or isinstance(maximum, bool)
+            or not isinstance(minimum, int)
+            or not isinstance(maximum, int)
+            or not minimum <= paired_count <= maximum
+        ):
+            raise ReferenceBindingError(
+                f"videos[{index}] 的配对音频数量不满足规则 {rule.get('key') or '(unknown)'}"
+            )
+        if video.get("use_embedded_audio") and not rule.get("allow_embedded_source"):
+            raise ReferenceBindingError(f"videos[{index}] 的用途不允许使用内嵌音轨")
+        if video.get("audio_asset_id") and not rule.get("allow_external_target"):
+            raise ReferenceBindingError(f"videos[{index}] 的用途不允许外配音频")
+        if (
+            video.get("use_embedded_audio")
+            and video.get("audio_asset_id")
+            and rule.get("source_and_external_mutually_exclusive")
+        ):
+            raise ReferenceBindingError(f"videos[{index}] 不能同时使用内嵌与外配音频")
+        if paired_count and video.get("audio_purpose") not in set(
+            rule.get("target_purpose_keys") or []
+        ):
+            raise ReferenceBindingError(
+                f"videos[{index}].audio_purpose 未被冻结配对规则允许"
+            )
+
+
+def validate_dynamic_reference_bindings_against_mode_contract(
+    bindings: object,
+    mode_contract: object,
+) -> None:
+    """Validate a pre-production dynamic-media intent.
+
+    Bible/frame inputs may be generated later in an unattended run, so this
+    projection relaxes only their minimums.  Dynamic media cardinality,
+    purposes, exclusions and pairing remain exact.
+    """
+
+    if not isinstance(mode_contract, dict):
+        raise ReferenceBindingError("mode contract 缺失")
+    projected = deepcopy(mode_contract)
+    inputs = projected.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ReferenceBindingError("mode.inputs 冻结合同缺失")
+    for key in ("total_images", "first_frame", "last_frame", "entity_images"):
+        slot = inputs.get(key)
+        if not isinstance(slot, dict):
+            raise ReferenceBindingError(f"mode.inputs.{key} 冻结合同缺失")
+        slot["minimum_items"] = 0
+    validate_reference_bindings_against_mode_contract(bindings, projected)
 
 
 def _is_image_asset(asset: Asset) -> bool:
@@ -211,33 +465,11 @@ def _is_image_asset(asset: Asset) -> bool:
 
 
 def _validate_executable_local_source(asset: Asset, user) -> None:
-    """Mirror worker source constraints so bad references fail before queueing."""
-    asset_root = Path(settings.ASSET_LIBRARY_ROOT).resolve()
-    media_root = Path(settings.MEDIA_ROOT).resolve()
-    try:
-        if asset.owner_id is None:
-            if asset.file or not asset.local_path:
-                raise ReferenceBindingError(
-                    f"全局参考素材必须来自只读本地素材库: {asset.name}"
-                )
-            path = Path(asset.local_path).resolve()
-            allowed_root = asset_root
-        elif asset.file:
-            path = Path(asset.file.path).resolve()
-            allowed_root = (media_root / "assets" / str(asset.owner_id)).resolve()
-        elif getattr(user, "is_staff", False) and asset.local_path:
-            path = Path(asset.local_path).resolve()
-            allowed_root = asset_root if path.is_relative_to(asset_root) else media_root
-        else:
-            raise ReferenceBindingError(
-                f"用户参考素材必须由上传接口保存为本地文件: {asset.name}"
-            )
-        if not path.is_relative_to(allowed_root) or not path.is_file():
-            raise ReferenceBindingError(f"参考素材本地文件不可执行或越出授权目录: {asset.name}")
-    except (OSError, ValueError, NotImplementedError) as exc:
-        if isinstance(exc, ReferenceBindingError):
-            raise
-        raise ReferenceBindingError(f"无法读取参考素材本地文件: {asset.name}") from exc
+    """Use the same authorization and checksum gate as every staging worker."""
+
+    resolved, _path = authorized_asset_source(owner=user, asset_id=str(asset.id))
+    if resolved.id != asset.id:  # pragma: no cover - defensive identity guard
+        raise ReferenceBindingError("参考素材身份校验失败")
 
 
 def _validate_reference_media_asset(asset: Asset, *, media_type: str) -> None:
@@ -252,15 +484,6 @@ def _validate_reference_media_asset(asset: Asset, *, media_type: str) -> None:
         raise ReferenceBindingError(f"{asset.name} 的 {media_type} 格式不受支持")
     if not (asset.mime_type or "").casefold().startswith(f"{media_type}/"):
         raise ReferenceBindingError(f"{asset.name} 缺少已验证的 {media_type} MIME")
-    try:
-        duration_ms = int((asset.metadata or {}).get("duration_ms", 0))
-    except (TypeError, ValueError):
-        duration_ms = 0
-    minimum_ms = 2_000
-    if not minimum_ms <= duration_ms <= 15_000:
-        raise ReferenceBindingError(
-            f"{asset.name} 的已验证时长必须在 {minimum_ms / 1000:g}–15 秒"
-        )
 
 
 def _available_asset_ids(entity) -> set[str]:
@@ -277,9 +500,6 @@ def _asset_record(asset: Asset, *, category: str, entity=None) -> dict:
         "entity_id": str(entity.id) if entity is not None else None,
         "entity_name": entity.name if entity is not None else "",
         "asset_id": str(asset.id),
-        # ``id`` is retained as a compatibility alias for the task staging
-        # layer; new callers should use the explicit ``asset_id`` field.
-        "id": str(asset.id),
         "name": asset.name,
         "description": asset.description,
         "prompt_hint": asset.prompt_hint,
@@ -292,7 +512,8 @@ def _asset_record(asset: Asset, *, category: str, entity=None) -> dict:
 def normalize_shot_reference_bindings(
     *, mode: str, bindings, project, characters, scene, props, shot_reference_assets, user,
 ) -> dict:
-    """Validate and canonicalize one Shot's persisted snake_case contract."""
+    """Validate one Shot's common shape without guessing a workflow contract."""
+    normalize_reference_identifier(mode, "conditioning_mode")
     if bindings in (None, ""):
         bindings = {}
     if not isinstance(bindings, dict):
@@ -358,36 +579,19 @@ def normalize_shot_reference_bindings(
             "reference_bindings 中 asset_id 必须全局唯一，不能让同一素材承担多个槽位"
         )
 
-    if mode == Shot.H3Mode.T2VA:
-        if normalized:
-            raise ReferenceBindingError("T2VA 是纯文生视频，reference_bindings 必须为空")
-        return {}
-    if mode == Shot.H3Mode.I2VA:
-        if set(normalized) != {"first_frame_asset_id"}:
-            raise ReferenceBindingError("I2VA 必须且只能绑定 first_frame_asset_id")
-    elif mode == Shot.H3Mode.L2VA:
-        if set(normalized) != {"last_frame_asset_id"}:
-            raise ReferenceBindingError("L2VA 必须且只能绑定 last_frame_asset_id")
-    elif mode == Shot.H3Mode.FL2VA:
-        if set(normalized) - {"first_frame_asset_id", "last_frame_asset_id"}:
-            raise ReferenceBindingError(
-                "FL2VA 只能绑定 first_frame_asset_id / last_frame_asset_id"
-            )
-    elif mode == Shot.H3Mode.REF2VA:
-        if frame_ids:
-            raise ReferenceBindingError(
-                "Ref2VA 不使用 first_frame_asset_id / last_frame_asset_id；"
-                "可使用 first_frame_reference_asset_id、characters、scene、props、videos 和 audios"
-            )
-        if len(classified) + (1 if continuity_frame_id else 0) > 9:
-            raise ReferenceBindingError("Ref2VA 最多允许 9 张分类参考图")
-    else:
-        raise ReferenceBindingError(f"不支持的 H3 模式: {mode}")
+    if (
+        len(classified) + (1 if continuity_frame_id else 0)
+        > max_structural_media_bindings()
+    ):
+        raise ReferenceBindingError(
+            f"分类参考图结构上限为 {max_structural_media_bindings()}；"
+            "实际工作流上限由冻结合同决定"
+        )
 
     character_map = {str(item.id): item for item in characters}
     prop_map = {str(item.id): item for item in props}
     scene_id = str(scene.id) if scene is not None else None
-    if mode == Shot.H3Mode.REF2VA and not scene_id and scene_item:
+    if not scene_id and scene_item:
         raise ReferenceBindingError("当前分镜未选择场景，不能保存 scene 分类绑定")
     for field, items, entity_map in (
         ("characters", character_items, character_map),
@@ -399,6 +603,18 @@ def normalize_shot_reference_bindings(
                 raise ReferenceBindingError(
                     f"{field} 绑定实体 {item['entity_id']} 未绑定到当前分镜"
                 )
+            if field == "characters":
+                try:
+                    visual_reference_allowed = character_requires_visual_reference(
+                        entity,
+                    )
+                except VisualReferencePolicyError as exc:
+                    raise ReferenceBindingError(str(exc)) from exc
+                if not visual_reference_allowed:
+                    raise ReferenceBindingError(
+                        f"characters 实体 {entity.name} 的视觉引用策略为排除；"
+                        "说话人事实可保留，但不能绑定图片"
+                    )
             if item["asset_id"] not in _available_asset_ids(entity):
                 raise ReferenceBindingError(
                     f"{field} 的 asset_id 必须来自实体 {entity.name} 的 anchor/reference_assets"
@@ -450,6 +666,10 @@ def normalize_shot_reference_bindings(
         asset = assets.get(UUID(raw_id))
         if asset is None or not asset.is_active:
             raise ReferenceBindingError(f"参考素材不存在或已停用: {raw_id}")
+        if is_workflow_smoke_fixture_asset(asset):
+            raise ReferenceBindingError(
+                f"工作流 Smoke 专用素材不能用于生产分镜: {asset.name}"
+            )
         if not getattr(user, "is_staff", False) and asset.owner_id not in (None, user.id):
             raise ReferenceBindingError(f"不能使用其他用户的参考素材: {raw_id}")
         if raw_id in video_asset_ids:
@@ -498,19 +718,33 @@ def _binding_entity_label(category: str, entity_id: str | None, subject_slots: d
 
 
 def resolve_group_reference_bindings(
-    *, project, shots: list[Shot], mode: str, snapshot: dict,
+    *, project, shots: list[Shot], mode_contract: dict, snapshot: dict,
     single_shot_bindings: dict | None = None,
     single_shot_reference_assets: list[Asset] | None = None,
 ) -> list[dict]:
-    """Return the canonical ordered media-input list used by prompt and graph."""
+    """Return canonical media inputs using one explicit frozen mode contract.
+
+    This resolver knows only the platform input kinds and persisted binding
+    fields.  Model names, model-specific mode names, prompt templates and
+    purpose vocabularies are deliberately absent.
+    """
     if not shots:
         return []
+    if not isinstance(mode_contract, dict):
+        raise ReferenceBindingError("冻结 mode contract 缺失")
+    mode_key = normalize_reference_identifier(mode_contract.get("key"), "mode.key")
+    input_kind = str(mode_contract.get("input_kind") or "").strip()
+    if input_kind not in {"text_only", "frame_slots", "classified_references"}:
+        raise ReferenceBindingError("mode.input_kind 未注册")
+    inputs = mode_contract.get("inputs")
+    if not isinstance(inputs, dict):
+        raise ReferenceBindingError("mode.inputs 冻结合同缺失")
     normalized = []
     if (single_shot_bindings is not None or single_shot_reference_assets is not None) and len(shots) != 1:
         raise ReferenceBindingError("临时 reference_bindings 只允许用于单个分镜")
     for shot in shots:
         normalized.append(normalize_shot_reference_bindings(
-            mode=mode,
+            mode=mode_key,
             bindings=single_shot_bindings if single_shot_bindings is not None else shot.reference_bindings,
             project=project,
             characters=list(shot.characters.all()),
@@ -522,48 +756,71 @@ def resolve_group_reference_bindings(
             ),
             user=project.owner,
         ))
-    if mode == Shot.H3Mode.T2VA:
-        return []
 
     picture_slots, subject_slots = _snapshot_slot_maps(snapshot)
-    asset_ids: list[str]
-    categories: list[tuple[str, str | None, object | None]]
+    asset_ids: list[str] = []
+    categories: list[tuple[str, str | None, object | None]] = []
     media_videos: list[dict] = []
     media_audios: list[dict] = []
-    if mode in {Shot.H3Mode.I2VA, Shot.H3Mode.L2VA, Shot.H3Mode.FL2VA}:
+
+    if input_kind == "text_only":
+        if any(item for item in normalized):
+            raise ReferenceBindingError("text_only 条件模式不接受 reference_bindings")
+        validate_reference_bindings_against_mode_contract({}, mode_contract)
+    elif input_kind == "frame_slots":
+        if any(
+            item.get("first_frame_reference_asset_id")
+            or item.get("characters")
+            or item.get("scene")
+            or item.get("props")
+            or item.get("videos")
+            or item.get("audios")
+            for item in normalized
+        ):
+            raise ReferenceBindingError("frame_slots 条件模式只接受首帧/尾帧槽位")
         first_id = normalized[0].get("first_frame_asset_id")
         last_id = normalized[-1].get("last_frame_asset_id")
-        if len(normalized) > 1:
-            for index, item in enumerate(normalized, start=1):
-                item_first = item.get("first_frame_asset_id")
-                item_last = item.get("last_frame_asset_id")
-                if (
-                    (item_first is not None and item_first != first_id)
-                    or (item_last is not None and item_last != last_id)
-                    or (index > 1 and item_first is not None and first_id is None)
-                    or (index < len(normalized) and item_last is not None and last_id is None)
-                ):
-                    raise ReferenceBindingError(
-                        "多分镜首尾帧任务中间分镜不得新增或改变绑定；"
-                        "执行时只读取 group[0].first_frame 与 group[-1].last_frame"
-                    )
-        asset_ids, categories = [], []
+        for item in normalized:
+            item_first = item.get("first_frame_asset_id")
+            item_last = item.get("last_frame_asset_id")
+            if (
+                (item_first is not None and item_first != first_id)
+                or (item_last is not None and item_last != last_id)
+            ):
+                raise ReferenceBindingError(
+                    "多分镜 frame_slots 绑定必须与组首帧/组尾帧一致；"
+                    "系统不会猜测、合并或重排槽位"
+                )
+        group_bindings: dict[str, str] = {}
         if first_id:
+            group_bindings["first_frame_asset_id"] = first_id
             asset_ids.append(first_id)
             categories.append(("first_frame", None, None))
         if last_id:
+            group_bindings["last_frame_asset_id"] = last_id
             asset_ids.append(last_id)
             categories.append(("last_frame", None, None))
-    elif mode == Shot.H3Mode.REF2VA:
+        validate_reference_bindings_against_mode_contract(
+            group_bindings,
+            mode_contract,
+        )
+    else:
+        if any(
+            item.get("first_frame_asset_id") or item.get("last_frame_asset_id")
+            for item in normalized
+        ):
+            raise ReferenceBindingError(
+                "classified_references 条件模式不接受首帧/尾帧执行槽位"
+            )
         continuity_ids = {
             item["first_frame_reference_asset_id"]
             for item in normalized
             if item.get("first_frame_reference_asset_id")
         }
-        if continuity_ids and len(normalized) > 1:
-            raise ReferenceBindingError("Ref2VA 首帧连续参考只能用于单镜任务")
         if len(continuity_ids) > 1:
-            raise ReferenceBindingError("Ref2VA 首帧连续参考只能绑定一张图片")
+            raise ReferenceBindingError(
+                "同一生产组不能声明多个不同的 first_frame_reference_asset_id"
+            )
         merged: dict[tuple[str, str], str] = {}
         for item in normalized:
             for category, values in (
@@ -576,13 +833,12 @@ def resolve_group_reference_bindings(
                     previous = merged.get(key)
                     if previous and previous != value["asset_id"]:
                         raise ReferenceBindingError(
-                            f"Ref2VA 多分镜中 {category}:{value['entity_id']} 绑定了不同 asset_id"
+                            f"多分镜中 {category}:{value['entity_id']} 绑定了不同 asset_id"
                         )
                     merged[key] = value["asset_id"]
-        if len(set(merged.values())) != len(merged):
-            raise ReferenceBindingError("Ref2VA 合并后同一 asset_id 不能映射到不同实体")
-        if len(merged) + len(continuity_ids) > 9:
-            raise ReferenceBindingError("Ref2VA 多分镜合并后最多允许 9 张参考图")
+        all_image_ids = [*continuity_ids, *merged.values()]
+        if len(set(all_image_ids)) != len(all_image_ids):
+            raise ReferenceBindingError("合并后同一 asset_id 不能映射到多个图片槽位")
         media_videos = normalized[0].get("videos", [])
         media_audios = normalized[0].get("audios", [])
         if any(
@@ -590,8 +846,24 @@ def resolve_group_reference_bindings(
             for item in normalized[1:]
         ):
             raise ReferenceBindingError(
-                "Ref2VA 多分镜的参考视频/音频绑定必须完全一致；系统不会静默合并或重排"
+                "多分镜的参考视频/音频绑定必须完全一致；系统不会猜测、合并或重排"
             )
+        _validate_count(
+            len(all_image_ids),
+            inputs.get("total_images") or {},
+            label="total_images",
+        )
+        _validate_count(0, inputs.get("first_frame") or {}, label="first_frame")
+        _validate_count(0, inputs.get("last_frame") or {}, label="last_frame")
+        _validate_count(
+            len(all_image_ids),
+            inputs.get("entity_images") or {},
+            label="entity_images",
+        )
+        validate_dynamic_reference_bindings_against_mode_contract(
+            {"videos": media_videos, "audios": media_audios},
+            mode_contract,
+        )
         entities = {
             ("character", str(value.id)): value
             for shot in shots for value in shot.characters.all()
@@ -622,8 +894,6 @@ def resolve_group_reference_bindings(
             (category, entity_id, entities[(category, entity_id)])
             for (category, entity_id), _ in ordered
         )
-    else:
-        raise ReferenceBindingError(f"不支持的 H3 模式: {mode}")
 
     assets = Asset.objects.in_bulk(asset_ids)
     records = []
@@ -641,15 +911,6 @@ def resolve_group_reference_bindings(
             "entity_label": _binding_entity_label(category, entity_id, subject_slots)
             if category in {"character", "scene", "prop"} else "",
         })
-        if category == "continuity_frame":
-            record.update({
-                "purpose": "first_frame_continuity_reference",
-                "entity_name": "",
-                "prompt_hint": (
-                    record.get("prompt_hint")
-                    or "Use as the previous-shot tail frame and target starting-state reference."
-                ),
-            })
         records.append(record)
     audio_ordinal = 1
     for video_ordinal, item in enumerate(media_videos, start=1):

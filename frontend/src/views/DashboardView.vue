@@ -35,7 +35,7 @@ const refreshProjectCover = async (projectId: string) => {
   <div class="dashboard page-stack">
     <section class="hero-banner">
       <div class="hero-copy">
-        <span class="eyebrow"><Sparkles :size="13"/> REVIEWED PRODUCTION PIPELINE</span>
+        <span class="eyebrow"><Sparkles :size="13"/> 审核式生产流程 / REVIEWED PRODUCTION PIPELINE</span>
         <h2>{{ greeting }}，导演。</h2>
         <p>今天继续把故事变成镜头。实际模型、工作流与执行能力以 ProductionRun 的已审核路由和运行快照为准。</p>
         <div class="hero-actions"><RouterLink to="/projects/new" class="button primary"><Plus :size="17"/>创建连续剧</RouterLink><RouterLink to="/workflows" class="button ghost"><Workflow :size="17"/>查看生产队列</RouterLink></div>
@@ -53,7 +53,7 @@ const refreshProjectCover = async (projectId: string) => {
 
     <section class="content-grid wide-left">
       <div class="panel project-panel">
-        <header class="panel-header"><div><span class="eyebrow">SERIES IN PRODUCTION</span><h3>最近连续剧</h3></div><RouterLink to="/projects" class="text-link">查看全部 <ArrowRight :size="14"/></RouterLink></header>
+        <header class="panel-header"><div><span class="eyebrow">制作中的连续剧 / SERIES IN PRODUCTION</span><h3>最近连续剧</h3></div><RouterLink to="/projects" class="text-link">查看全部 <ArrowRight :size="14"/></RouterLink></header>
         <div v-if="studio.loading" class="skeleton-list"><i v-for="n in 3" :key="n"></i></div>
         <div v-else class="project-list">
           <RouterLink v-for="project in studio.projects.slice(0,4)" :key="project.id" :to="`/projects/${project.id}`" class="project-row">
@@ -69,7 +69,7 @@ const refreshProjectCover = async (projectId: string) => {
         </div>
       </div>
       <div class="panel workflow-mini-panel">
-        <header class="panel-header"><div><span class="eyebrow">COMFYUI QUEUE</span><h3>生产进度</h3></div><RouterLink to="/workflows" class="icon-btn"><ArrowRight :size="16"/></RouterLink></header>
+        <header class="panel-header"><div><span class="eyebrow">ComfyUI 任务队列 / COMFYUI QUEUE</span><h3>生产进度</h3></div><RouterLink to="/workflows" class="icon-btn"><ArrowRight :size="16"/></RouterLink></header>
         <div v-for="workflow in studio.workflows.slice(0,3)" :key="workflow.id" class="workflow-mini">
           <div class="workflow-mini-top"><div><span class="pulse-dot" :class="workflow.status"></span><strong>{{ workflow.projectTitle }}</strong></div><span>{{ taskProgress(workflow).compactLabel }}</span></div>
           <p>{{ taskProgress(workflow).summary }}</p><div class="progress-track" :class="{indeterminate:taskProgress(workflow).indeterminate}"><i :style="{width:taskProgress(workflow).indeterminate?'8%':`${taskProgress(workflow).percent || 0}%`}"></i></div><small v-if="workflow.eta">{{ workflow.status==='completed' ? '已归档' : `预计剩余 ${workflow.eta}` }}</small>
@@ -79,7 +79,7 @@ const refreshProjectCover = async (projectId: string) => {
     </section>
 
     <section class="panel style-strip-panel">
-      <header class="panel-header"><div><span class="eyebrow">CURATED VISUAL WORLDS</span><h3>10 种热门视觉风格</h3></div><RouterLink to="/assets" class="text-link">浏览全部素材 <ArrowRight :size="14"/></RouterLink></header>
+      <header class="panel-header"><div><span class="eyebrow">精选视觉风格 / CURATED VISUAL WORLDS</span><h3>10 种热门视觉风格</h3></div><RouterLink to="/assets" class="text-link">浏览全部素材 <ArrowRight :size="14"/></RouterLink></header>
       <div class="style-strip">
         <RouterLink v-for="style in studio.styles" :key="style.id" :to="`/assets?style=${style.id}`" class="style-mini-card" :style="{background:style.gradient}">
           <div class="style-pattern"></div><span class="style-count">{{ style.assetCount ?? '—' }} ITEMS</span><div><small>{{ style.englishName }}</small><strong>{{ style.name }}</strong><p>{{ style.tags.join(' · ') }}</p></div>

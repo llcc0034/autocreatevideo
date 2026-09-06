@@ -7,7 +7,8 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 
 from studio.models import CharacterBible, Episode, SceneBible, SeriesProject, Shot, Style
-from studio.services.h3_prompts import sync_consistency_locks
+from studio.services.configuration import project_creation_policy
+from studio.services.consistency import sync_consistency_locks
 
 
 STYLES = [
@@ -57,7 +58,7 @@ class Command(BaseCommand):
                         "duplicate objects, duplicate weapons, extra weapons, extra limbs, "
                         "extra fingers, malformed hands, text, watermark, logo, low detail, flicker"
                     ),
-                    "defaults": {"aspect_ratio": "9:16", "fps": 24, "model": "minimax-h3"},
+                    "defaults": {"aspect_ratio": "9:16", "fps": 24},
                     "description": f"{name}商业短剧预设，可绑定本地人物、场景与道具参考图。",
                     "is_system": True,
                     "is_active": True,
@@ -85,20 +86,48 @@ class Command(BaseCommand):
                 "Store it through an approved secret channel.",
             ))
         style = Style.objects.get(owner=None, slug="wuxia")
-        project, _ = SeriesProject.objects.get_or_create(
+        creation_policy = project_creation_policy()
+        project, project_created = SeriesProject.objects.get_or_create(
             owner=user,
             title="无名剑影",
             defaults={
                 "logline": "失忆剑客在雨夜客栈追查一枚残缺玉佩的主人。",
                 "style": style,
                 "status": SeriesProject.Status.ACTIVE,
+                "language": creation_policy["default_language"],
+                "aspect_ratio": creation_policy["default_aspect_ratio"],
+                "width": creation_policy["width"],
+                "height": creation_policy["height"],
+                "fps": creation_policy["fps"],
+                "default_shot_duration_ms": creation_policy["default_shot_duration_ms"],
                 "continuity_seed": 8675309,
                 "continuity_summary": "玉佩始终由沈砚贴身携带；雨势逐集增强。",
             },
         )
-        if project.width % 32 or project.height % 32 or project.fps != 24:
-            project.width, project.height, project.fps = 768, 1344, 24
-            project.save(update_fields=("width", "height", "fps", "updated_at"))
+        if not project_created:
+            project_policy_values = {
+                "language": creation_policy["default_language"],
+                "aspect_ratio": creation_policy["default_aspect_ratio"],
+                "width": creation_policy["width"],
+                "height": creation_policy["height"],
+                "fps": creation_policy["fps"],
+                "default_shot_duration_ms": creation_policy[
+                    "default_shot_duration_ms"
+                ],
+            }
+            changed_fields = [
+                field
+                for field, value in project_policy_values.items()
+                if getattr(project, field) != value
+            ]
+            if changed_fields:
+                for field in changed_fields:
+                    setattr(project, field, project_policy_values[field])
+                project.save(update_fields=(*changed_fields, "updated_at"))
+                self.stdout.write(
+                    "Updated seeded demo project from published creation policy: "
+                    + ", ".join(changed_fields)
+                )
         character, _ = CharacterBible.objects.get_or_create(
             project=project,
             slug="shen-yan",
@@ -130,19 +159,54 @@ class Command(BaseCommand):
             number=1,
             defaults={"title": "残玉", "synopsis": "沈砚在客栈听见陌生人叫出自己的旧名。"},
         )
-        shot, _ = Shot.objects.get_or_create(
+        shot, shot_created = Shot.objects.get_or_create(
             episode=episode,
             number=1,
             defaults={
                 "title": "推门",
                 "narrative": "沈砚推开客栈木门，雨水沿披风滴落，他停在门槛扫视众人。",
                 "camera": "低机位中景缓慢推近，最后停在右眉浅疤特写",
-                "duration_ms": 5000,
+                "duration_ms": project.default_shot_duration_ms,
+                "media_type": creation_policy["default_shot_media_type"],
+                "include_audio": (
+                    creation_policy["default_include_audio"]
+                    if creation_policy["default_shot_media_type"] == Shot.MediaType.VIDEO
+                    else False
+                ),
                 "dialogue": [{"speaker_id": "S1", "text": "有人在等我？"}],
                 "scene": scene,
                 "sound_effects": "木门吱呀，雨声突然清晰",
                 "music": "低沉古琴单音",
             },
         )
+        if not shot_created:
+            shot_policy_values = {
+                "duration_ms": project.default_shot_duration_ms,
+                "media_type": creation_policy["default_shot_media_type"],
+                "include_audio": (
+                    creation_policy["default_include_audio"]
+                    if creation_policy["default_shot_media_type"]
+                    == Shot.MediaType.VIDEO
+                    else False
+                ),
+            }
+            if creation_policy["default_shot_media_type"] == Shot.MediaType.IMAGE:
+                shot_policy_values.update({
+                    "conditioning_mode": "",
+                    "reference_bindings": {},
+                })
+            changed_fields = [
+                field
+                for field, value in shot_policy_values.items()
+                if getattr(shot, field) != value
+            ]
+            if changed_fields:
+                for field in changed_fields:
+                    setattr(shot, field, shot_policy_values[field])
+                shot.save(update_fields=(*changed_fields, "updated_at"))
+                self.stdout.write(
+                    "Updated seeded demo shot from published creation policy: "
+                    + ", ".join(changed_fields)
+                )
         shot.characters.add(character)
         sync_consistency_locks(project)

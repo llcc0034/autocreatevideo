@@ -7,24 +7,35 @@ import tempfile
 import time
 from unittest.mock import patch
 
+from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from django.utils import timezone
 from PIL import Image
 from rest_framework.test import APIClient
 
-from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
+from studio.models import (
+    ConfigRevision,
+    GeneratedWorkflow,
+    GenerationTask,
+    ModelProfileVersion,
+    PromptArtifact,
+    ProviderProfile,
+    WorkflowTemplate,
+    WorkflowTemplateVersion,
+)
 from studio.services.distribution import (
-    DISTRIBUTION_DESCRIPTION,
-    SDXL_DISTRIBUTION_DESCRIPTION,
     DistributionError,
     distribution_artifact_path,
+    distribution_configuration,
     distribution_manifest_path,
     prepare_task_distribution,
     verified_distribution_manifest,
 )
-from studio.services.h3_prompts import H3PromptOptions, build_consistent_image_prompt, build_h3_video_prompt
+from studio.services.configuration import create_config_revision, publish_config_revision
+from studio.tests.media_prompt_fixtures import MediaPromptOptions, build_test_image_prompt, build_test_video_prompt
+from studio.services.json_contracts import assign_json_contract, json_contract
 from studio.services.provenance import persist_task_provenance, sha256_file
-from studio.tests.factories import build_story
+from studio.tests.factories import build_story, freeze_current_task_contract
 
 
 class ManagedTaskDistributionTests(TestCase):
@@ -49,36 +60,67 @@ class ManagedTaskDistributionTests(TestCase):
             DEPLOYMENT_PROFILE="production",
             COMFYUI_OUTPUT_DIR=str(self.output_root),
             MEDIA_ROOT=self.media_root,
-            TASK_DISTRIBUTION_ENABLED=True,
-            TASK_DISTRIBUTION_LABEL_TEXT="AI-generated · MiniMax H3",
-            TASK_IMAGE_DISTRIBUTION_LABEL_TEXT="AI-generated · SDXL 1.0",
             TASK_DISTRIBUTION_FONTFILE=str(self.font),
-            TASK_DISTRIBUTION_VERSION="shot-public-v1",
-            TASK_DISTRIBUTION_TIMEOUT_SECONDS=30,
             FFMPEG_BINARY=shutil.which("ffmpeg") or "ffmpeg",
             FFPROBE_BINARY=shutil.which("ffprobe") or "ffprobe",
         )
         self.override.enable()
         self.addCleanup(self.override.disable)
         self.user, self.project, _, _, self.episode, self.shot, _ = build_story()
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={
+                "delivery.ai_label_enabled": True,
+                "delivery.ai_label_text": "AI-generated",
+            },
+            created_by=self.user,
+            change_summary="generic distribution disclosure test",
+            clone_published=True,
+        )
+        publish_config_revision(revision, published_by=self.user)
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
+    def _set_distribution_lock_stale_seconds(self, value: int) -> None:
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={"runtime.distribution_lock_stale_seconds": value},
+            created_by=self.user,
+        )
+        publish_config_revision(revision, published_by=self.user)
+
+    def test_public_distribution_gate_follows_superadmin_security_boundary(self):
+        admin = get_user_model().objects.create_superuser(
+            username="distribution-security-admin",
+            email="distribution@example.test",
+            password="StrongPass123!",
+        )
+        disabled = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={"security.delivery.public_distribution_enabled": False},
+            created_by=admin,
+        )
+        publish_config_revision(disabled, published_by=admin)
+        with self.assertRaisesRegex(DistributionError, "disabled"):
+            distribution_configuration()
+
     def _task(self, path: Path, *, kind: str) -> GenerationTask:
         result = (
-            build_consistent_image_prompt(self.project, self.shot)
+            build_test_image_prompt(self.project, self.shot)
             if kind == "image"
-            else build_h3_video_prompt(
-                self.project, [self.shot], H3PromptOptions(language_gate_mode="warn"),
+            else build_test_video_prompt(
+                self.project, [self.shot], MediaPromptOptions(
+                    model_identifier="minimax-h3-test", language_gate_mode="warn",
+                ),
             )
         )
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=self.project,
             episode=self.episode,
             shot=self.shot,
             created_by=self.user,
             prompt_type=kind,
-            h3_mode="T2VA",
+            conditioning_mode="T2VA",
             prompt_text=result.text,
             total_duration_ms=result.total_duration_ms,
             structured_payload=result.payload,
@@ -93,18 +135,84 @@ class ManagedTaskDistributionTests(TestCase):
             name=f"distribution-{kind}-{path.stem}",
             slug=f"distribution-{kind}-{path.stem}",
             output_kind=kind,
-            model="SDXL 1.0" if kind == "image" else "MiniMax H3",
+            model=(
+                "Fictional Prism Image Engine"
+                if kind == "image" else "Fictional Orbit Video Engine"
+            ),
             input_schema={},
             definition={"1": {"class_type": "Mock", "inputs": {}}},
+        )
+        provider = ProviderProfile.objects.filter(
+            key=f"fictional-{kind}-distribution-provider",
+        ).first()
+        if provider is None:
+            provider = ProviderProfile(
+                key=f"fictional-{kind}-distribution-provider",
+                name=f"Fictional {kind} distribution provider",
+                driver_type=ProviderProfile.DriverType.COMFYUI,
+                modalities=kind,
+                operations="health,object_info,submit,poll,cancel,collect",
+            )
+            assign_json_contract(provider, "driver_config", {})
+            provider.save()
+        profile = ModelProfileVersion.objects.filter(
+            profile_key=f"fictional-{kind}-profile", version=1,
+        ).first()
+        if profile is None:
+            profile = ModelProfileVersion(
+                profile_key=f"fictional-{kind}-profile",
+                version=1,
+                provider=provider,
+                model_identifier=template.model,
+                modality=(
+                    ModelProfileVersion.Modality.IMAGE
+                    if kind == "image" else ModelProfileVersion.Modality.VIDEO
+                ),
+                status=ModelProfileVersion.Status.PUBLISHED,
+            )
+            assign_json_contract(profile, "specification", {
+                "schema_version": 1,
+                "model_family": f"fictional_{kind}",
+                "capabilities": [f"{kind}.generate"],
+            })
+            profile.save()
+        graph_contract = json_contract(template.definition)
+        input_contract = {
+            "schema_version": 2,
+            "compiler": {"id": "generic.comfy", "version": 1},
+        }
+        input_contract_json = json_contract(input_contract)
+        version = WorkflowTemplateVersion.objects.create(
+            template=template,
+            version=1,
+            provider=provider,
+            model_profile_version=profile,
+            graph=template.definition,
+            graph_size_bytes=graph_contract.size_bytes,
+            graph_sha256=graph_contract.sha256,
+            input_contract=input_contract,
+            input_contract_size_bytes=input_contract_json.size_bytes,
+            input_contract_sha256=input_contract_json.sha256,
+            compiler_id="generic.comfy",
+            compiler_version=1,
+            semantic_bindings_sha256=json_contract([]).sha256,
+            model_requirements_sha256=json_contract([]).sha256,
+            execution_contract_sha256="b" * 64,
+            status=WorkflowTemplateVersion.Status.PUBLISHED,
+            is_current=True,
         )
         workflow = GeneratedWorkflow.objects.create(
             project=self.project,
             episode=self.episode,
             prompt_artifact=prompt,
             template=template,
+            workflow_template_version=version,
             created_by=self.user,
             workflow_json=template.definition,
-            content_hash="a" * 64,
+            content_hash=graph_contract.sha256,
+            compiler_id="generic.comfy",
+            compiler_version=1,
+            workflow_contract_sha256=version.execution_contract_sha256,
         )
         task = GenerationTask.objects.create(
             owner=self.user,
@@ -113,8 +221,15 @@ class ManagedTaskDistributionTests(TestCase):
             generated_workflow=workflow,
             kind=kind,
             status=GenerationTask.Status.SUCCEEDED,
+            max_attempts=3,
             progress=100,
             finished_at=timezone.now(),
+            backend="comfyui_local",
+            model_profile=profile.model_identifier,
+            capability_snapshot={
+                "model": profile.model_identifier,
+                "model_profile_version_id": str(profile.id),
+            },
             outputs=[{
                 "kind": "images" if kind == "image" else "videos",
                 "filename": path.name,
@@ -123,6 +238,7 @@ class ManagedTaskDistributionTests(TestCase):
                 "type": "output",
             }],
         )
+        freeze_current_task_contract(task)
         persist_task_provenance(task, list(task.outputs), generated_at=task.finished_at)
         task.refresh_from_db()
         return task
@@ -151,13 +267,22 @@ class ManagedTaskDistributionTests(TestCase):
         self.assertEqual(first["artifact"]["sha256"], sha256_file(public))
         self.assertTrue(first["disclosure"]["visible_overlay"])
         self.assertTrue(first["disclosure"]["embedded_metadata"])
-        self.assertEqual(first["disclosure"]["label"], "AI-generated · SDXL 1.0")
-        self.assertEqual(first["release"]["model_key"], "sdxl-1.0")
+        self.assertEqual(
+            first["disclosure"]["label"],
+            "AI-generated · Fictional Prism Image Engine",
+        )
+        self.assertEqual(first["release"]["model_key"], "fictional-image-profile:v1")
         self.assertEqual(first["disclosure"]["version"], "shot-public-v1")
         self.assertTrue(first["release"]["render"]["label_bbox"])
         with Image.open(public) as opened:
-            self.assertEqual(opened.info["Comment"], "AI-generated · SDXL 1.0")
-            self.assertEqual(opened.info["Description"], SDXL_DISTRIBUTION_DESCRIPTION)
+            self.assertEqual(
+                opened.info["Comment"],
+                "AI-generated · Fictional Prism Image Engine",
+            )
+            self.assertEqual(
+                opened.info["Description"],
+                "AI-generated; media=image; model=Fictional Prism Image Engine",
+            )
             self.assertEqual(opened.info["SourceArtifactSHA256"], master_hash)
             self.assertEqual(opened.info["DistributionVersion"], "shot-public-v1")
 
@@ -194,8 +319,8 @@ class ManagedTaskDistributionTests(TestCase):
         release_id = record["release_id"]
         return public.parent.parent / f".{release_id}.lock", release_id
 
-    @override_settings(TASK_DISTRIBUTION_LOCK_STALE_SECONDS=60)
     def test_fresh_distribution_lock_is_never_reclaimed(self):
+        self._set_distribution_lock_stale_seconds(60)
         task, _ = self._image_task("fresh-lock.png")
         prepare_task_distribution(task, 0)
         lock, _ = self._clear_distribution_for_lock_test(task)
@@ -214,8 +339,8 @@ class ManagedTaskDistributionTests(TestCase):
             "active-publisher",
         )
 
-    @override_settings(TASK_DISTRIBUTION_LOCK_STALE_SECONDS=0.05)
     def test_orphaned_stale_distribution_lock_is_recovered(self):
+        self._set_distribution_lock_stale_seconds(1)
         task, master = self._image_task("stale-lock.png")
         master_hash = sha256_file(master)
         prepare_task_distribution(task, 0)
@@ -308,9 +433,16 @@ class ManagedTaskDistributionTests(TestCase):
         self.assertFalse(media["download_url"])
         self.assertIn("font", media["distribution_error"])
 
-        with override_settings(TASK_IMAGE_DISTRIBUTION_LABEL_TEXT="SDXL 1.0"):
-            with self.assertRaisesRegex(DistributionError, "explicitly identify"):
-                prepare_task_distribution(task, 0)
+        invalid = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={"delivery.ai_label_text": "model-only label"},
+            created_by=self.user,
+            change_summary="invalid disclosure test",
+            clone_published=True,
+        )
+        publish_config_revision(invalid, published_by=self.user)
+        with self.assertRaisesRegex(DistributionError, "AI 生成内容披露"):
+            prepare_task_distribution(task, 0)
 
     def test_video_distribution_has_visible_filter_and_verified_container_metadata(self):
         ffmpeg = shutil.which("ffmpeg")
@@ -333,16 +465,19 @@ class ManagedTaskDistributionTests(TestCase):
         self.assertEqual(sha256_file(master), master_hash)
         self.assertNotEqual(sha256_file(public), master_hash)
         self.assertTrue(document["release"]["render"]["visible_overlay"])
-        self.assertEqual(document["release"]["model_key"], "minimax-h3")
+        self.assertEqual(document["release"]["model_key"], "fictional-video-profile:v1")
         self.assertEqual(
             document["release"]["render"]["overlay_filter"],
-            "bottom-right boxed drawtext",
+            "configured bottom-right boxed drawtext",
         )
         probe = subprocess.run([
             ffprobe, "-v", "error", "-show_entries", "format_tags=comment,description",
             "-of", "json", public.as_posix(),
         ], check=True, capture_output=True, text=True, encoding="utf-8", timeout=30)
         tags = json.loads(probe.stdout)["format"]["tags"]
-        self.assertEqual(tags["comment"], "AI-generated · MiniMax H3")
-        self.assertEqual(tags["description"], DISTRIBUTION_DESCRIPTION)
+        self.assertEqual(tags["comment"], "AI-generated · Fictional Orbit Video Engine")
+        self.assertEqual(
+            tags["description"],
+            "AI-generated; media=video; model=Fictional Orbit Video Engine",
+        )
         self.assertEqual(verified_distribution_manifest(task, 0)["verification"]["status"], "verified")

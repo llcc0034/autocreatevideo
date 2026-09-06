@@ -3,6 +3,7 @@ import tempfile
 import hashlib
 import subprocess
 from datetime import timedelta
+from unittest.mock import patch
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -29,36 +30,47 @@ from studio.models import (
     StageRun,
     WorkerLease,
     WorkflowTemplate,
+    WorkflowTemplateVersion,
 )
 from studio.services.configuration import create_config_revision, publish_config_revision
 from studio.services.comfyui import (
     ComfyUIClient,
     ComfyUIError,
     ComfyUIExecutionError,
+    ComfyUIHTTPError,
+    ComfyUIPreSubmitResourceReleaseError,
     ProgressSocketEvent,
     QueueResult,
 )
-from studio.services.h3_prompts import (
-    H3PromptOptions,
-    build_consistent_image_prompt,
-    build_h3_video_prompt,
+from studio.tests.media_prompt_fixtures import (
+    MediaPromptOptions,
+    build_test_image_prompt,
+    build_test_video_prompt,
 )
 from studio.services.production_pipeline import (
-    ProductionQueueConfirmationRequired,
-    assert_queue_capacity,
+    capture_queue_capacity_advisory,
 )
 from studio.services.provenance import verified_task_manifest
 from studio.serializers import GenerationTaskSerializer
 from studio.services.task_queue import (
     _authorized_asset_source,
+    _task_execution_monitoring,
+    _wait_for_task_completion,
+    _mark_task_meaningful_progress,
     claim_next_task,
+    prepare_workflow,
     process_task,
     recover_stale_tasks,
     task_wait_timeout,
 )
+from studio.services.execution_monitoring import (
+    empty_execution_monitoring_contract,
+    execution_monitoring_contract_sha256,
+    resolve_execution_monitoring_contract,
+)
+from studio.services.media_capabilities import empty_conditioning_contract
 from studio.services.json_contracts import assign_json_contract, canonical_json_bytes, json_contract
-from studio.services.workflow import build_workflow
-from studio.tests.factories import build_story
+from studio.tests.factories import build_story, conditioning_contract
 
 
 class FakeClient:
@@ -73,8 +85,11 @@ class FakeClient:
     def queue_prompt(self, workflow, client_id=None, prompt_id=None):
         return QueueResult(prompt_id or "prompt-1", 1, {})
 
-    def wait_for_completion(self, prompt_id, timeout=900):
+    def history(self, prompt_id):
         return {"outputs": {"9": {"videos": [{"filename": "episode.mp4", "subfolder": "show"}]}}}
+
+    def is_queued(self, prompt_id):
+        return False
 
     def extract_outputs(self, history):
         path = Path(settings.COMFYUI_OUTPUT_DIR) / "show" / "episode.mp4"
@@ -100,6 +115,59 @@ class ExistingHistoryClient(FakeClient):
     def queue_prompt(self, workflow, client_id=None, prompt_id=None):
         self.queued = True
         return super().queue_prompt(workflow, client_id, prompt_id)
+
+
+class ResourceReleaseClient(FakeClient):
+    def __init__(self):
+        self.release_calls = 0
+        self.queue_calls = 0
+
+    def release_resources_before_submit(self):
+        self.release_calls += 1
+        return {
+            "schema_version": 1,
+            "status": "succeeded",
+            "policy_sha256": "a" * 64,
+            "unload_models": True,
+            "free_memory": True,
+            "attempted_at": "2026-08-27T01:00:00+00:00",
+            "completed_at": "2026-08-27T01:00:01+00:00",
+            "error_code": "",
+            "http_status": 200,
+        }
+
+    def queue_prompt(self, workflow, client_id=None, prompt_id=None):
+        self.queue_calls += 1
+        return super().queue_prompt(workflow, client_id, prompt_id)
+
+
+class FailingResourceReleaseClient(ResourceReleaseClient):
+    def release_resources_before_submit(self):
+        self.release_calls += 1
+        audit = {
+            "schema_version": 1,
+            "status": "failed",
+            "policy_sha256": "a" * 64,
+            "unload_models": True,
+            "free_memory": True,
+            "attempted_at": "2026-08-27T01:00:00+00:00",
+            "completed_at": "2026-08-27T01:00:01+00:00",
+            "error_code": "comfyui_resource_release_unconfirmed",
+            "http_status": None,
+        }
+        raise ComfyUIPreSubmitResourceReleaseError(
+            audit["error_code"],
+            "test release failure; /prompt was not called",
+            audit=audit,
+        )
+
+
+class ExistingHistoryReleaseGuardClient(ExistingHistoryClient):
+    release_calls = 0
+
+    def release_resources_before_submit(self):
+        self.release_calls += 1
+        raise AssertionError("recovery must not release global resources")
 
 
 class InvalidMediaClient(FakeClient):
@@ -129,7 +197,7 @@ class SDXLImageClient(FakeClient):
         self.submitted_workflow = workflow
         return QueueResult(prompt_id or "image-prompt-1", 1, {})
 
-    def wait_for_completion(self, prompt_id, timeout=900):
+    def history(self, prompt_id):
         path = (
             Path(settings.COMFYUI_OUTPUT_DIR)
             / "autoprompt/image-test"
@@ -191,11 +259,26 @@ class ContractUnavailableClient(FakeClient):
 
 
 class TerminalFailureClient(FakeClient):
-    def wait_for_completion(self, prompt_id, timeout=900):
-        raise ComfyUIExecutionError(
-            "ComfyUI execution failed: CUDA out of memory",
-            remote_status={"status_str": "error", "completed": False},
+    def history(self, prompt_id):
+        # The real history endpoint returns a terminal record; it does not
+        # raise the transport exception used for unavailable history queries.
+        return {"status": {"status_str": "error", "completed": False,
+            "messages": [["execution_error", {"exception_message": "CUDA out of memory"}]]}}
+
+
+class PromptHTTPRejectionClient(FakeClient):
+    def queue_prompt(self, workflow, client_id=None, prompt_id=None):
+        del workflow, client_id, prompt_id
+        raise ComfyUIHTTPError(
+            400,
+            '{"error":"prompt_outputs_failed_validation","node_id":"44"}',
         )
+
+
+class PromptTransportFailureClient(FakeClient):
+    def queue_prompt(self, workflow, client_id=None, prompt_id=None):
+        del workflow, client_id, prompt_id
+        raise ComfyUIError("connection reset before /prompt response")
 
 
 class StickyHealthFailureClient(FakeClient):
@@ -213,10 +296,6 @@ class StickyHealthFailureClient(FakeClient):
 
     def cancel(self, prompt_id):
         self.cancel_calls += 1
-
-    def wait_for_completion(self, prompt_id, timeout=900):
-        raise AssertionError("durable clients must use heartbeat polling")
-
 
 class TransientPollFailureClient(FakeClient):
     def __init__(self, task_id):
@@ -365,6 +444,56 @@ class ProgressOpenFailureClient(ProgressReportingClient):
         raise RuntimeError("handshake refused")
 
 
+class RepeatedNodeProgressClient(ProgressReportingClient):
+    def __init__(self, task_id):
+        super().__init__(task_id)
+        self.observed_idle_deadlines = []
+        self.observed_hard_deadlines = []
+
+    def read_progress_event(self, progress_socket, prompt_id, timeout=0.05):
+        self.progress_reads += 1
+        if self.progress_reads > 1:
+            persisted = GenerationTask.objects.get(pk=self.task_id)
+            self.observed_idle_deadlines.append(persisted.idle_deadline_at)
+            self.observed_hard_deadlines.append(persisted.hard_deadline_at)
+        if self.progress_reads == 1:
+            return ProgressSocketEvent(
+                telemetry_state="receiving",
+                event_type="progress_state",
+                prompt_id=prompt_id,
+                node_id="44",
+                fraction=0.2,
+            )
+        if self.progress_reads == 2:
+            return ProgressSocketEvent(
+                telemetry_state="connected",
+                event_type="executing",
+                prompt_id=prompt_id,
+                node_id="44",
+                fraction=None,
+            )
+        if self.progress_reads == 3:
+            return ProgressSocketEvent(
+                telemetry_state="receiving",
+                event_type="progress_state",
+                prompt_id=prompt_id,
+                node_id="44",
+                fraction=0.8,
+            )
+        return None
+
+    def history(self, prompt_id):
+        self.history_calls += 1
+        if self.history_calls < 4:
+            return None
+        return {"outputs": {"9": {"videos": [{
+            "filename": "episode.mp4", "subfolder": "show",
+        }]}}}
+
+    def is_queued(self, prompt_id):
+        return self.history_calls < 4
+
+
 class PersistedRemoteClient:
     def __init__(self, *, present=True, history=None):
         self.present = present
@@ -394,42 +523,27 @@ class UnavailablePersistedRemoteClient(PersistedRemoteClient):
         raise AssertionError("queue lookup must not run after history lookup fails")
 
 
-class ConcurrentRetryClient(PersistedRemoteClient):
+class ConcurrentTerminalizationClient(PersistedRemoteClient):
     def __init__(self, task_id, *, fail_lookup=False):
         super().__init__(present=True)
         self.task_id = task_id
         self.fail_lookup = fail_lookup
-        self.retry_id = None
 
-    def _terminalize_and_create_retry(self):
-        source = GenerationTask.objects.get(pk=self.task_id)
-        GenerationTask.objects.filter(pk=source.pk).update(
-            submission_state=GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+    def _terminalize_source(self):
+        GenerationTask.objects.filter(pk=self.task_id).update(
+            submission_state=GenerationTask.SubmissionState.TERMINAL_FAILED,
             remote_state=GenerationTask.RemoteState.MISSING,
             remote_error="Remote prompt absent after successful ComfyUI reconciliation",
         )
-        retry = GenerationTask.objects.create(
-            owner=source.owner,
-            project=source.project,
-            episode=source.episode,
-            generated_workflow=source.generated_workflow,
-            kind=source.kind,
-            capability_snapshot={
-                **(source.capability_snapshot or {}),
-                "retry_of": str(source.id),
-                "batch_role": "retry",
-            },
-        )
-        self.retry_id = retry.id
 
     def history(self, prompt_id):
         if self.fail_lookup:
-            self._terminalize_and_create_retry()
+            self._terminalize_source()
             raise ComfyUIError("GET /history read timed out")
         return None
 
     def is_queued(self, prompt_id):
-        self._terminalize_and_create_retry()
+        self._terminalize_source()
         return True
 
 
@@ -446,27 +560,189 @@ class TaskQueueTests(TestCase):
         self.addCleanup(self.override.disable)
         Path(settings.COMFYUI_OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
+    @staticmethod
+    def _recover_stale_with_client(client, *, older_than_minutes=30):
+        with patch(
+            "studio.services.task_queue.comfy_client_for_task",
+            return_value=client,
+        ):
+            return recover_stale_tasks(older_than_minutes=older_than_minutes)
+
     def _task(self):
         user, project, _, _, episode, shot1, _ = build_story()
-        result = build_h3_video_prompt(
-            project, [shot1], H3PromptOptions(language_gate_mode="warn"),
+        result = build_test_video_prompt(
+            project, [shot1], MediaPromptOptions(
+                model_identifier="minimax-h3-test", language_gate_mode="warn",
+            ),
         )
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=project, episode=episode, shot=shot1, created_by=user,
-            prompt_type="video", prompt_text=result.text, structured_payload=result.payload,
+            prompt_type="video", model="fictional-queue-video-v1",
+            total_duration_ms=result.total_duration_ms,
+            prompt_text=result.text, structured_payload=result.payload,
             consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
         )
+        graph = {"1": {"class_type": "SaveImage", "inputs": {}}}
         template = WorkflowTemplate.objects.create(
             name="mock", slug="mock", output_kind="video", is_system=True,
-            definition={"1": {"class_type": "SaveImage", "inputs": {}}},
+            model="fictional-queue-video-v1", definition=graph,
         )
+        graph_contract = json_contract(graph)
+        input_contract = {
+            "schema_version": 2,
+            "compiler": {"id": "generic.comfy", "version": 1},
+            "conditioning_contract": conditioning_contract("T2VA"),
+        }
+        input_contract_json = json_contract(input_contract)
+        workflow_contract_sha256 = "b" * 64
+        workflow_version = WorkflowTemplateVersion.objects.create(
+            template=template,
+            version=(
+                max(
+                    template.platform_versions.values_list("version", flat=True),
+                    default=0,
+                ) + 1
+            ),
+            graph=graph,
+            graph_size_bytes=graph_contract.size_bytes,
+            graph_sha256=graph_contract.sha256,
+            input_contract=input_contract,
+            input_contract_size_bytes=input_contract_json.size_bytes,
+            input_contract_sha256=input_contract_json.sha256,
+            compiler_id="generic.comfy",
+            compiler_version=1,
+            semantic_bindings_sha256=json_contract([]).sha256,
+            model_requirements_sha256=json_contract([]).sha256,
+            execution_contract_sha256=workflow_contract_sha256,
+        )
+        monitoring = empty_execution_monitoring_contract()
+        mode_contract = input_contract["conditioning_contract"]["modes"][0]
+        semantics = {
+            "prompt.positive": result.text,
+            "image.width": project.width,
+            "image.height": project.height,
+            "video.fps": project.fps,
+            "video.duration_ms": shot1.duration_ms,
+            "video.frames": max(1, round(shot1.duration_ms * project.fps / 1000)),
+            "audio.enabled": prompt.include_audio,
+            "sampling.seed": project.continuity_seed,
+        }
+        semantics_sha256 = json_contract(semantics).sha256
+        empty_bindings_sha256 = json_contract([]).sha256
+        empty_requirements_sha256 = json_contract([]).sha256
+        route_snapshot_sha256 = "e" * 64
+        execution_metadata = {
+            "schema_version": 1,
+            "workflow_version_id": str(workflow_version.id),
+            "workflow_version": workflow_version.version,
+            "template": {
+                "id": str(template.id),
+                "slug": template.slug,
+                "name": template.name,
+                "output_kind": template.output_kind,
+            },
+            "model_identifier": "fictional-queue-video-v1",
+            "workflow_mode": "semantic",
+            "source_workflow": "",
+            "required_dimension_multiple": 1,
+            "conditioning_contract": input_contract["conditioning_contract"],
+            "conditioning_contract_sha256": json_contract(
+                input_contract["conditioning_contract"],
+            ).sha256,
+            "conditioning_mode_contract": mode_contract,
+            "conditioning_mode_contract_sha256": json_contract(mode_contract).sha256,
+            "execution_monitoring": monitoring,
+            "execution_monitoring_sha256": execution_monitoring_contract_sha256(
+                monitoring,
+            ),
+        }
         workflow = GeneratedWorkflow.objects.create(
             project=project, episode=episode, prompt_artifact=prompt, template=template,
-            created_by=user, workflow_json=template.definition, content_hash="a" * 64,
+            workflow_template_version=workflow_version,
+            created_by=user, workflow_json=graph,
+            injected_values={
+                "schema_version": 2,
+                "resolved_semantics": semantics,
+                "asset_bindings": [],
+                "model_requirements": [],
+                "output_contract": {
+                    "schema_version": 1,
+                    "primary": {"node_id": "9", "kind": "video", "required": True},
+                },
+                "execution_metadata": execution_metadata,
+                "execution_metadata_sha256": json_contract(execution_metadata).sha256,
+            },
+            content_hash=graph_contract.sha256,
+            compiler_id="generic.comfy",
+            compiler_version=1,
+            workflow_contract_sha256=workflow_contract_sha256,
+            route_snapshot_sha256=route_snapshot_sha256,
+            resolved_semantics_sha256=semantics_sha256,
+            asset_bindings_sha256=empty_bindings_sha256,
+            model_requirements_sha256=empty_requirements_sha256,
         )
-        return GenerationTask.objects.create(
-            owner=user, project=project, episode=episode, generated_workflow=workflow, kind="video",
+        task = GenerationTask.objects.create(
+            owner=user, project=project, episode=episode,
+            generated_workflow=workflow, kind="video",
+            max_attempts=3,
+            backend="comfyui_local", model_profile="fictional-queue-video-v1",
+            effective_frames=semantics["video.frames"],
+            effective_duration_ms=round(
+                semantics["video.frames"] * 1000 / semantics["video.fps"],
+            ),
+            capability_snapshot={
+                "workflow_hash": graph_contract.sha256,
+                "generated_workflow_id": str(workflow.id),
+                "prompt_artifact_id": str(prompt.id),
+                "prompt_content_hash": prompt.content_hash,
+                "template_id": str(template.id),
+                "template_slug": template.slug,
+                "model": execution_metadata["model_identifier"],
+                "conditioning_mode": prompt.conditioning_mode,
+                "effective_conditioning_mode": mode_contract["key"],
+                "prompt_template_key": str(
+                    prompt.structured_payload.get("prompt_template_key") or ""
+                ),
+                "workflow_mode": execution_metadata["workflow_mode"],
+                "source_workflow": execution_metadata["source_workflow"],
+                "workflow_parameters": semantics,
+                "resolution_profile": "semantic_contract",
+                "resolution_multiple": 1,
+                "width": project.width,
+                "height": project.height,
+                "shot_ids": [str(shot1.id)],
+                "shot_count": 1,
+                "whole_episode": False,
+                "workflow_contract_sha256": workflow_contract_sha256,
+                "route_snapshot_sha256": route_snapshot_sha256,
+                "asset_bindings": [],
+                "asset_bindings_sha256": empty_bindings_sha256,
+                "continuity_assets": [],
+                "continuity_assets_sha256": empty_bindings_sha256,
+                "resolved_semantics_sha256": semantics_sha256,
+                "model_requirements": [],
+                "model_requirements_sha256": empty_requirements_sha256,
+                "fps": project.fps,
+                "requested_duration_ms": shot1.duration_ms,
+                "include_audio": prompt.include_audio,
+                "output_contract": workflow.injected_values["output_contract"],
+                "execution_metadata": execution_metadata,
+                "execution_metadata_sha256": json_contract(execution_metadata).sha256,
+                "conditioning_contract": input_contract["conditioning_contract"],
+                "conditioning_contract_sha256": execution_metadata[
+                    "conditioning_contract_sha256"
+                ],
+                "conditioning_mode_contract": mode_contract,
+                "conditioning_mode_contract_sha256": execution_metadata[
+                    "conditioning_mode_contract_sha256"
+                ],
+                "execution_monitoring": monitoring,
+                "execution_monitoring_sha256": execution_monitoring_contract_sha256(
+                    monitoring,
+                ),
+            },
         )
+        return self._freeze_capacity(task)
 
     def _publish_runtime(self, values: dict) -> None:
         revision = create_config_revision(
@@ -483,10 +759,11 @@ class TaskQueueTests(TestCase):
         user, project, _, _, episode, shot, _ = build_story(username="image-queue")
         shot.media_type = Shot.MediaType.IMAGE
         shot.save(update_fields=("media_type", "updated_at"))
-        result = build_consistent_image_prompt(project, shot)
-        prompt = PromptArtifact.objects.create(
+        result = build_test_image_prompt(project, shot)
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=False,
             project=project, episode=episode, shot=shot, created_by=user,
             prompt_type=PromptArtifact.PromptType.IMAGE,
+            total_duration_ms=0,
             model=result.payload["model"], prompt_text=result.text,
             negative_prompt="blurry, duplicate person, watermark",
             structured_payload=result.payload,
@@ -521,23 +798,136 @@ class TaskQueueTests(TestCase):
             },
         }
         template.save(update_fields=("is_active", "model", "input_schema", "updated_at"))
-        workflow_json, injected, content_hash = build_workflow(
-            template, prompt, project, {
-                "RESOLUTION_PROFILE": "0.98",
-                "RESOLUTION_MULTIPLE": 32,
-                "WIDTH": 768,
-                "HEIGHT": 1344,
-            },
+        injected = {
+            "PROMPT": prompt.prompt_text,
+            "NEGATIVE_PROMPT": prompt.negative_prompt,
+            "MODEL": template.model,
+            "SEED": project.continuity_seed,
+            "WIDTH": 768,
+            "HEIGHT": 1344,
+            "OUTPUT_PREFIX": f"autoprompt/{project.id}/{prompt.id}",
+            "RESOLUTION_PROFILE": "0.98",
+            "RESOLUTION_MULTIPLE": 32,
+        }
+
+        def materialize_fixture(value):
+            if isinstance(value, dict):
+                return {
+                    key: materialize_fixture(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [materialize_fixture(item) for item in value]
+            if isinstance(value, str) and value.startswith("${") and value.endswith("}"):
+                return injected.get(value[2:-1], value)
+            return value
+
+        workflow_json = materialize_fixture(template.definition)
+        graph_contract = json_contract(workflow_json)
+        input_contract = {
+            "schema_version": 2,
+            "compiler": {"id": "generic.comfy", "version": 1},
+        }
+        input_contract_json = json_contract(input_contract)
+        workflow_contract_sha256 = "d" * 64
+        workflow_version = WorkflowTemplateVersion.objects.create(
+            template=template,
+            version=(
+                max(
+                    template.platform_versions.values_list("version", flat=True),
+                    default=0,
+                ) + 1
+            ),
+            graph=workflow_json,
+            graph_size_bytes=graph_contract.size_bytes,
+            graph_sha256=graph_contract.sha256,
+            input_contract=input_contract,
+            input_contract_size_bytes=input_contract_json.size_bytes,
+            input_contract_sha256=input_contract_json.sha256,
+            compiler_id="generic.comfy",
+            compiler_version=1,
+            semantic_bindings_sha256=json_contract([]).sha256,
+            model_requirements_sha256=json_contract([]).sha256,
+            execution_contract_sha256=workflow_contract_sha256,
         )
+        monitoring = empty_execution_monitoring_contract()
+        no_conditioning = empty_conditioning_contract()
+        image_semantics_sha256 = json_contract(injected).sha256
+        empty_bindings_sha256 = json_contract([]).sha256
+        empty_requirements_sha256 = json_contract([]).sha256
+        route_snapshot_sha256 = "f" * 64
+        execution_metadata = {
+            "schema_version": 1,
+            "workflow_version_id": str(workflow_version.id),
+            "template": {
+                "slug": template.slug,
+                "output_kind": template.output_kind,
+            },
+            "model_identifier": template.model,
+            "conditioning_contract": no_conditioning,
+            "conditioning_contract_sha256": json_contract(no_conditioning).sha256,
+            "conditioning_mode_contract": None,
+            "conditioning_mode_contract_sha256": "",
+            "execution_monitoring": monitoring,
+            "execution_monitoring_sha256": execution_monitoring_contract_sha256(
+                monitoring,
+            ),
+        }
         workflow = GeneratedWorkflow.objects.create(
             project=project, episode=episode, prompt_artifact=prompt,
-            template=template, created_by=user, workflow_json=workflow_json,
-            injected_values=injected, content_hash=content_hash,
+            template=template, workflow_template_version=workflow_version,
+            created_by=user, workflow_json=workflow_json,
+            injected_values={
+                "schema_version": 2,
+                "resolved_semantics": injected,
+                "asset_bindings": [],
+                "model_requirements": [],
+                "output_contract": {
+                    "schema_version": 1,
+                    "primary": {"node_id": "7", "kind": "image", "required": True},
+                },
+                "execution_metadata": execution_metadata,
+                "execution_metadata_sha256": json_contract(execution_metadata).sha256,
+            },
+            content_hash=graph_contract.sha256,
+            compiler_id="generic.comfy",
+            compiler_version=1,
+            workflow_contract_sha256=workflow_contract_sha256,
+            route_snapshot_sha256=route_snapshot_sha256,
+            resolved_semantics_sha256=image_semantics_sha256,
+            asset_bindings_sha256=empty_bindings_sha256,
+            model_requirements_sha256=empty_requirements_sha256,
         )
-        return GenerationTask.objects.create(
+        task = GenerationTask.objects.create(
             owner=user, project=project, episode=episode,
             generated_workflow=workflow, kind=GenerationTask.Kind.IMAGE,
+            backend="comfyui_local", model_profile=template.model,
+            max_attempts=3,
+            capability_snapshot={
+                "workflow_hash": graph_contract.sha256,
+                "workflow_contract_sha256": workflow_contract_sha256,
+                "route_snapshot_sha256": route_snapshot_sha256,
+                "asset_bindings": [],
+                "asset_bindings_sha256": empty_bindings_sha256,
+                "resolved_semantics_sha256": image_semantics_sha256,
+                "model_requirements": [],
+                "model_requirements_sha256": empty_requirements_sha256,
+                "output_contract": workflow.injected_values["output_contract"],
+                "execution_metadata": execution_metadata,
+                "execution_metadata_sha256": json_contract(execution_metadata).sha256,
+                "conditioning_contract": no_conditioning,
+                "conditioning_contract_sha256": execution_metadata[
+                    "conditioning_contract_sha256"
+                ],
+                "conditioning_mode_contract": None,
+                "conditioning_mode_contract_sha256": "",
+                "execution_monitoring": monitoring,
+                "execution_monitoring_sha256": execution_monitoring_contract_sha256(
+                    monitoring,
+                ),
+            },
         )
+        return self._freeze_capacity(task)
 
     def _freeze_capacity(self, task, *, configured=2, effective=2, timeout=120):
         config_sha = "c" * 64
@@ -575,18 +965,249 @@ class TaskQueueTests(TestCase):
             "task_idle_timeout_seconds": min(60, timeout),
             "config_snapshot_sha256": config_sha,
         }
+        monitoring = empty_execution_monitoring_contract()
+        provider_config = dict(deployment.provider.driver_config or {})
+        deployment_config = dict(deployment.runtime_config or {})
+        provider_config_sha256 = json_contract(provider_config).sha256
+        deployment_config_sha256 = json_contract(deployment_config).sha256
+        deployment_summary = {
+            "schema_version": 1,
+            "route_index": 0,
+            "model_deployment_id": str(deployment.id),
+            "model_profile_version_id": str(deployment.profile_version_id),
+            "provider_profile_id": str(deployment.provider.id),
+            "provider_config_sha256": provider_config_sha256,
+            "deployment_config_sha256": deployment_config_sha256,
+            "credential_binding_sha256": "",
+            "endpoint_is_external": False,
+            "effective_timeout_seconds": timeout,
+            "execution_monitoring_sha256": execution_monitoring_contract_sha256(
+                monitoring,
+            ),
+        }
         task.capability_snapshot = {
             **(task.capability_snapshot or {}),
             "production_run_id": "00000000-0000-0000-0000-000000000001",
             "model_deployment_id": str(deployment.id),
+            "model_profile_version_id": str(deployment.profile_version_id),
+            "provider_profile_id": str(deployment.provider.id),
+            "provider_config": provider_config,
+            "deployment_config": deployment_config,
+            "provider_config_sha256": provider_config_sha256,
+            "deployment_config_sha256": deployment_config_sha256,
+            "frozen_execution_config_sha256": json_contract({
+                "provider_config": provider_config,
+                "deployment_config": deployment_config,
+            }).sha256,
+            "credential_binding_sha256": "",
+            "endpoint_is_external": False,
+            "effective_timeout_seconds": timeout,
+            "route_index": 0,
+            "deployment_summary": deployment_summary,
+            "deployment_summary_sha256": json_contract(deployment_summary).sha256,
             "config_snapshot_sha256": config_sha,
             "execution_capacity": capacity,
             "execution_capacity_sha256": hashlib.sha256(
                 canonical_json_bytes(capacity)
             ).hexdigest(),
+            "execution_monitoring": monitoring,
+            "execution_monitoring_sha256": execution_monitoring_contract_sha256(
+                monitoring,
+            ),
         }
         task.save(update_fields=("capability_snapshot", "updated_at"))
         return task
+
+    def test_wait_requires_durable_history_and_queue_contract(self):
+        task = self._task()
+
+        with self.assertRaisesRegex(
+            ComfyUIError,
+            "durable history/is_queued",
+        ):
+            _wait_for_task_completion(task, object(), "prompt-id")
+
+    def _freeze_monitoring(self, task, monitoring):
+        digest = execution_monitoring_contract_sha256(monitoring)
+        injected = dict(task.generated_workflow.injected_values or {})
+        metadata = dict(injected.get("execution_metadata") or {})
+        metadata.update({
+            "execution_monitoring": monitoring,
+            "execution_monitoring_sha256": digest,
+        })
+        injected.update({
+            "execution_metadata": metadata,
+            "execution_metadata_sha256": json_contract(metadata).sha256,
+        })
+        task.generated_workflow.injected_values = injected
+        task.generated_workflow.save(update_fields=("injected_values", "updated_at"))
+        task.capability_snapshot = {
+            **(task.capability_snapshot or {}),
+            "execution_monitoring": monitoring,
+            "execution_monitoring_sha256": digest,
+        }
+        task.save(update_fields=("capability_snapshot", "updated_at"))
+        return task
+
+    def test_node_transition_uses_frozen_override_once_without_renewing_hard_deadline(self):
+        task = self._freeze_capacity(self._task(), timeout=7_200)
+        graph = {
+            "9": {"class_type": "LoadImage", "inputs": {}},
+            "10": {"class_type": "SamplerCustomAdvanced", "inputs": {}},
+            "11": {"class_type": "CreateVideo", "inputs": {}},
+        }
+        task.generated_workflow.workflow_json = graph
+        task.generated_workflow.save(update_fields=("workflow_json", "updated_at"))
+        monitoring = resolve_execution_monitoring_contract(
+            workflow_input_contract={
+                "execution_monitoring": {
+                    "schema_version": 1,
+                    "default_idle_timeout_seconds": 300,
+                    "node_type_overrides": {
+                        "SamplerCustomAdvanced": 3_600,
+                    },
+                    "node_overrides": {"11": 900},
+                },
+            },
+            workflow_graph=graph,
+        )
+        self._freeze_monitoring(task, monitoring)
+        started = timezone.now()
+        hard_deadline = started + timedelta(seconds=7_200)
+        task.deadline_started_at = started
+        task.hard_deadline_at = hard_deadline
+        task.idle_deadline_at = started + timedelta(seconds=60)
+        task.last_meaningful_progress_at = started
+        task.progress_marker = "phase:submitted"
+        task.save(update_fields=(
+            "deadline_started_at", "hard_deadline_at",
+            "idle_deadline_at", "last_meaningful_progress_at", "progress_marker",
+            "updated_at",
+        ))
+
+        entered_sampler = started + timedelta(seconds=10)
+        self.assertTrue(_mark_task_meaningful_progress(
+            task,
+            "node:10",
+            node_id="10",
+            now=entered_sampler,
+        ))
+        self.assertEqual(
+            task.idle_deadline_at,
+            entered_sampler + timedelta(seconds=3_600),
+        )
+        first_idle_deadline = task.idle_deadline_at
+
+        # Repeated running/progress events for the same node use the same
+        # marker and cannot create a sliding window.
+        self.assertFalse(_mark_task_meaningful_progress(
+            task,
+            "node:10",
+            node_id="10",
+            now=started + timedelta(seconds=1_000),
+        ))
+        self.assertEqual(task.idle_deadline_at, first_idle_deadline)
+
+        entered_encode = started + timedelta(seconds=1_100)
+        self.assertTrue(_mark_task_meaningful_progress(
+            task,
+            "node:11",
+            node_id="11",
+            now=entered_encode,
+        ))
+        self.assertEqual(
+            task.idle_deadline_at,
+            entered_encode + timedelta(seconds=900),
+        )
+        self.assertEqual(task.hard_deadline_at, hard_deadline)
+
+    def test_claim_uses_frozen_monitoring_default_for_initial_idle_deadline(self):
+        task = self._freeze_capacity(self._task(), timeout=7_200)
+        monitoring = resolve_execution_monitoring_contract(
+            workflow_input_contract={
+                "execution_monitoring": {
+                    "schema_version": 1,
+                    "default_idle_timeout_seconds": 300,
+                    "node_type_overrides": {},
+                    "node_overrides": {},
+                },
+            },
+            workflow_graph=task.generated_workflow.workflow_json,
+        )
+        self._freeze_monitoring(task, monitoring)
+
+        claimed = claim_next_task()
+
+        self.assertEqual(claimed.id, task.id)
+        self.assertEqual(
+            claimed.idle_deadline_at - claimed.deadline_started_at,
+            timedelta(seconds=300),
+        )
+        self.assertEqual(
+            claimed.hard_deadline_at - claimed.deadline_started_at,
+            timedelta(seconds=7_200),
+        )
+
+    def test_initial_monitoring_window_is_capped_by_frozen_hard_deadline(self):
+        task = self._freeze_capacity(self._task(), timeout=120)
+        monitoring = resolve_execution_monitoring_contract(
+            workflow_input_contract={
+                "execution_monitoring": {
+                    "schema_version": 1,
+                    "default_idle_timeout_seconds": 5_400,
+                    "node_type_overrides": {},
+                    "node_overrides": {},
+                },
+            },
+            workflow_graph=task.generated_workflow.workflow_json,
+        )
+        self._freeze_monitoring(task, monitoring)
+
+        claimed = claim_next_task()
+
+        self.assertEqual(claimed.id, task.id)
+        self.assertEqual(claimed.idle_deadline_at, claimed.hard_deadline_at)
+        self.assertEqual(
+            claimed.hard_deadline_at - claimed.deadline_started_at,
+            timedelta(seconds=120),
+        )
+
+    def test_task_missing_frozen_monitoring_contract_fails_closed(self):
+        task = self._freeze_capacity(self._task())
+        task.capability_snapshot.pop("execution_monitoring")
+        task.capability_snapshot.pop("execution_monitoring_sha256")
+        task.save(update_fields=("capability_snapshot", "updated_at"))
+
+        with self.assertRaisesMessage(
+            ComfyUIError,
+            "GenerationTask 缺少冻结 execution monitoring",
+        ):
+            _task_execution_monitoring(task)
+        self.assertIsNone(claim_next_task())
+        task.refresh_from_db()
+        self.assertEqual(task.status, GenerationTask.Status.FAILED)
+        self.assertIn("GenerationTask 缺少冻结", task.error_message)
+
+    def test_workflow_missing_frozen_monitoring_contract_fails_closed(self):
+        task = self._freeze_capacity(self._task())
+        injected = dict(task.generated_workflow.injected_values or {})
+        metadata = dict(injected.get("execution_metadata") or {})
+        metadata.pop("execution_monitoring")
+        metadata.pop("execution_monitoring_sha256")
+        injected["execution_metadata"] = metadata
+        injected["execution_metadata_sha256"] = json_contract(metadata).sha256
+        task.generated_workflow.injected_values = injected
+        task.generated_workflow.save(update_fields=("injected_values", "updated_at"))
+
+        with self.assertRaisesMessage(
+            ComfyUIError,
+            "GeneratedWorkflow 缺少冻结 execution monitoring",
+        ):
+            _task_execution_monitoring(task)
+        self.assertIsNone(claim_next_task())
+        task.refresh_from_db()
+        self.assertEqual(task.status, GenerationTask.Status.FAILED)
+        self.assertIn("GeneratedWorkflow 缺少冻结", task.error_message)
 
     def _link_media_run_with_review_gate(self, task):
         recipe_contract = json_contract({"schema_version": 1, "stages": []})
@@ -638,7 +1259,7 @@ class TaskQueueTests(TestCase):
                 idempotency_key=f"{run.id}:{ordinal}:{key}",
             )
             for field, payload in (
-                ("routing", {"schema_version": 1}),
+                ("routing", {"schema_version": 1, "variant_count": 1}),
                 ("routing_decision", {"schema_version": 1}),
                 ("config_snapshot", {"schema_version": 1}),
                 ("input_snapshot", {"schema_version": 1, "stage_key": key}),
@@ -660,8 +1281,12 @@ class TaskQueueTests(TestCase):
             status=StageRun.Status.PENDING,
             approval_required=True,
         )
-        request = json_contract({"schema_version": 1})
-        GenerationAttempt.objects.create(
+        prompt_id = task.generated_workflow.prompt_artifact_id
+        request = json_contract({
+            "schema_version": 1,
+            "prompt_artifact_id": str(prompt_id),
+        })
+        attempt = GenerationAttempt.objects.create(
             stage_run=media_stage,
             unit_key=f"task:{task.id}",
             attempt_number=1,
@@ -674,17 +1299,23 @@ class TaskQueueTests(TestCase):
             request_snapshot_size_bytes=request.size_bytes,
             request_snapshot_sha256=request.sha256,
         )
+        task.capability_snapshot = {
+            **(task.capability_snapshot or {}),
+            "production_run_id": str(run.id),
+            "stage_run_id": str(media_stage.id),
+            "generation_attempt_id": str(attempt.id),
+            "prompt_artifact_id": str(prompt_id),
+        }
+        task.save(update_fields=("capability_snapshot", "updated_at"))
         return run, media_stage, review_gate
 
     def test_claim_and_complete(self):
         pending = self._task()
-        # These are immutable execution-plan facts.  The encoder is allowed to
-        # return a container whose observed duration/frame count differs.
-        pending.effective_frames = 120
-        pending.effective_duration_ms = 5000
-        pending.save(update_fields=(
-            "effective_frames", "effective_duration_ms", "updated_at",
-        ))
+        # These immutable execution-plan facts are frozen together with
+        # resolved_semantics by the shared task fixture.  The encoder is still
+        # allowed to return a container whose observed clock differs.
+        expected_frames = pending.effective_frames
+        expected_duration_ms = pending.effective_duration_ms
         task = claim_next_task()
         self.assertIsNotNone(task)
         self.assertEqual(task.status, GenerationTask.Status.RUNNING)
@@ -694,8 +1325,8 @@ class TaskQueueTests(TestCase):
         )
         self.assertEqual(result_task.progress, 100)
         self.assertEqual(result_task.outputs[0]["filename"], "episode.mp4")
-        self.assertEqual(result_task.effective_frames, 120)
-        self.assertEqual(result_task.effective_duration_ms, 5000)
+        self.assertEqual(result_task.effective_frames, expected_frames)
+        self.assertEqual(result_task.effective_duration_ms, expected_duration_ms)
         observed = result_task.outputs[0]["observed_media"]
         self.assertEqual(observed["observation_source"], "ffprobe")
         self.assertEqual(observed["width"], 64)
@@ -723,9 +1354,42 @@ class TaskQueueTests(TestCase):
             observed,
         )
         serialized = GenerationTaskSerializer(result_task).data
-        self.assertEqual(serialized["input_parameters"]["effective_frames"], 120)
-        self.assertEqual(serialized["input_parameters"]["effective_duration_ms"], 5000)
+        self.assertEqual(
+            serialized["input_parameters"]["effective_frames"], expected_frames,
+        )
+        self.assertEqual(
+            serialized["input_parameters"]["effective_duration_ms"],
+            expected_duration_ms,
+        )
         self.assertEqual(serialized["output_media"][0]["observed_media"], observed)
+
+    def test_prepare_workflow_rejects_missing_frozen_asset_bindings_without_prompt_fallback(self):
+        task = self._task()
+        snapshot = dict(task.capability_snapshot)
+        snapshot.pop("asset_bindings")
+        snapshot.pop("asset_bindings_sha256")
+        task.capability_snapshot = snapshot
+        task.save(update_fields=("capability_snapshot", "updated_at"))
+
+        with self.assertRaisesRegex(
+            ComfyUIError,
+            "asset_bindings .*缺失.*哈希不一致",
+        ):
+            prepare_workflow(task, FakeClient())
+
+    def test_prepare_workflow_rejects_frozen_asset_bindings_hash_drift(self):
+        task = self._task()
+        task.capability_snapshot = {
+            **task.capability_snapshot,
+            "asset_bindings_sha256": "0" * 64,
+        }
+        task.save(update_fields=("capability_snapshot", "updated_at"))
+
+        with self.assertRaisesRegex(
+            ComfyUIError,
+            "asset_bindings .*漂移.*哈希不一致",
+        ):
+            prepare_workflow(task, FakeClient())
 
     def test_terminal_comfy_task_auto_advances_run_into_artifact_review_gate(self):
         pending = self._task()
@@ -802,7 +1466,7 @@ class TaskQueueTests(TestCase):
         task = claim_next_task()
         client = ProgressReportingClient(pending.id)
 
-        result = process_task(task, client, wait_timeout=5)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
         self.assertGreaterEqual(client.observed_progress, 52)
@@ -820,6 +1484,26 @@ class TaskQueueTests(TestCase):
         self.assertTrue(client.socket.closed)
 
     @override_settings(TASK_PROGRESS_WEBSOCKET_ENABLED=True)
+    def test_same_node_progress_running_and_heartbeat_do_not_slide_deadlines(self):
+        self._publish_runtime({
+            "runtime.task_remote_poll_seconds": 0.05,
+            "runtime.task_heartbeat_seconds": 0.05,
+            "runtime.task_health_check_interval_seconds": 0,
+        })
+        pending = self._freeze_capacity(self._task(), timeout=300)
+        task = claim_next_task()
+        client = RepeatedNodeProgressClient(pending.id)
+
+        result = process_task(task, client)
+
+        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
+        self.assertGreaterEqual(len(client.observed_idle_deadlines), 3)
+        self.assertEqual(len(set(client.observed_idle_deadlines)), 1)
+        self.assertEqual(len(set(client.observed_hard_deadlines)), 1)
+        self.assertEqual(result.comfy_progress, 80)
+        self.assertTrue(client.socket.closed)
+
+    @override_settings(TASK_PROGRESS_WEBSOCKET_ENABLED=True)
     def test_websocket_read_failure_is_persisted_without_failing_task(self):
         self._publish_runtime({
             "runtime.task_remote_poll_seconds": 0.05,
@@ -830,7 +1514,7 @@ class TaskQueueTests(TestCase):
         task = claim_next_task()
         client = ProgressReadFailureClient(pending.id)
 
-        result = process_task(task, client, wait_timeout=5)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
         self.assertEqual(
@@ -851,7 +1535,7 @@ class TaskQueueTests(TestCase):
         task = claim_next_task()
         client = ProgressOpenFailureClient(pending.id)
 
-        result = process_task(task, client, wait_timeout=5)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
         self.assertEqual(
@@ -879,7 +1563,7 @@ class TaskQueueTests(TestCase):
         ))
         client = TransientPollFailureClient(task.id)
 
-        result = process_task(task, client, wait_timeout=5)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED, result.error_message)
         self.assertEqual(result.submission_token, task.submission_token)
@@ -910,7 +1594,7 @@ class TaskQueueTests(TestCase):
         task.refresh_from_db()
         client = PollAndHealthFailureClient()
 
-        result = process_task(task, client, wait_timeout=5)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.FAILED)
         self.assertEqual(result.submission_token, token)
@@ -926,6 +1610,7 @@ class TaskQueueTests(TestCase):
         pending.seed = 4242
         pending.workflow_version = 7
         pending.capability_snapshot = {
+            **pending.capability_snapshot,
             "model": "sd_xl_base_1.0.safetensors",
             "template_slug": "minimax-reference-image",
             "workflow_mode": "text_to_image",
@@ -1050,6 +1735,7 @@ class TaskQueueTests(TestCase):
         GenerationTask.objects.create(
             owner=first.owner, project=first.project, episode=first.episode,
             generated_workflow=first.generated_workflow, kind="video",
+            max_attempts=3,
         )
         claimed = claim_next_task()
         self.assertIsNotNone(claimed)
@@ -1065,14 +1751,16 @@ class TaskQueueTests(TestCase):
         second = self._freeze_capacity(GenerationTask.objects.create(
             owner=first.owner, project=first.project, episode=first.episode,
             generated_workflow=first.generated_workflow, kind="video",
+            max_attempts=3,
         ), configured=2, effective=2)
-        self._freeze_capacity(GenerationTask.objects.create(
+        third = self._freeze_capacity(GenerationTask.objects.create(
             owner=first.owner, project=first.project, episode=first.episode,
             generated_workflow=first.generated_workflow, kind="video",
+            max_attempts=3,
         ), configured=2, effective=2)
 
         self.assertEqual(claim_next_task().id, first.id)
-        self.assertEqual(claim_next_task().id, second.id)
+        self.assertIn(claim_next_task().id, {second.id, third.id})
         self.assertIsNone(claim_next_task())
 
     @override_settings(TASK_MAX_CONCURRENT=1)
@@ -1081,6 +1769,7 @@ class TaskQueueTests(TestCase):
         self._freeze_capacity(GenerationTask.objects.create(
             owner=first.owner, project=first.project, episode=first.episode,
             generated_workflow=first.generated_workflow, kind="video",
+            max_attempts=3,
         ), configured=3, effective=3, timeout=120)
 
         claimed = claim_next_task()
@@ -1100,28 +1789,45 @@ class TaskQueueTests(TestCase):
         self.assertEqual(task.status, GenerationTask.Status.FAILED)
         self.assertIn("execution capacity", task.error_message)
 
-    def test_per_user_queue_guidance_requires_confirmation_but_does_not_cap_volume(self):
+    def test_queue_recommendation_overage_is_an_advisory_and_does_not_cap_volume(self):
         task = self._task()
         revision = create_config_revision(
             scope_type=ConfigRevision.ScopeType.PROJECT,
             project=task.project,
             values={
-                "production.recommended_max_pending": 100,
+                "production.recommended_max_pending": 1,
                 "production.recommended_max_active_per_user": 1,
             },
             created_by=task.owner,
         )
         publish_config_revision(revision, published_by=task.owner)
-        with self.assertRaises(ProductionQueueConfirmationRequired):
-            with transaction.atomic():
-                assert_queue_capacity(task.owner, project=task.project)
         with transaction.atomic():
-            snapshot = assert_queue_capacity(
+            snapshot = capture_queue_capacity_advisory(
                 task.owner,
+                additional=1,
                 project=task.project,
-                extended_generation_confirmed=True,
             )
+        self.assertEqual(snapshot["enforcement"], "advisory")
         self.assertEqual(snapshot["recommended_max_active_per_user"], 1)
+        self.assertEqual(snapshot["requested_task_count"], 1)
+        self.assertEqual(snapshot["advisories"], [
+            {
+                "schema_version": 1,
+                "code": "recommended_max_pending_exceeded",
+                "severity": "warning",
+                "scope": "platform",
+                "measured": 2,
+                "recommended_maximum": 1,
+            },
+            {
+                "schema_version": 1,
+                "code": "recommended_max_active_per_user_exceeded",
+                "severity": "warning",
+                "scope": "user",
+                "measured": 2,
+                "recommended_maximum": 1,
+            },
+        ])
 
     def test_existing_comfy_prompt_history_prevents_duplicate_queue(self):
         task = self._task()
@@ -1133,6 +1839,64 @@ class TaskQueueTests(TestCase):
         result = process_task(task, client)
         self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED)
         self.assertFalse(client.queued)
+
+    def test_configured_resource_release_runs_once_before_new_prompt_and_is_audited(self):
+        self._task()
+        task = claim_next_task()
+        client = ResourceReleaseClient()
+
+        result = process_task(task, client)
+
+        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED)
+        self.assertEqual(client.release_calls, 1)
+        self.assertEqual(client.queue_calls, 1)
+        rows = result.capability_snapshot[
+            "comfyui_pre_submit_resource_release_attempts"
+        ]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["status"], "succeeded")
+        self.assertFalse(rows[0]["submission_token_persisted"])
+        self.assertEqual(len(rows[0]["audit_sha256"]), 64)
+
+    def test_resource_release_failure_is_terminal_before_prompt_and_preserves_audit(self):
+        self._task()
+        task = claim_next_task()
+        client = FailingResourceReleaseClient()
+
+        result = process_task(task, client)
+
+        self.assertEqual(result.status, GenerationTask.Status.FAILED)
+        self.assertEqual(result.remote_state, GenerationTask.RemoteState.DEGRADED)
+        self.assertFalse(result.submission_token)
+        self.assertFalse(result.comfy_prompt_id)
+        self.assertEqual(client.release_calls, 1)
+        self.assertEqual(client.queue_calls, 0)
+        rows = result.capability_snapshot[
+            "comfyui_pre_submit_resource_release_attempts"
+        ]
+        self.assertEqual(rows[-1]["status"], "failed")
+        self.assertEqual(
+            rows[-1]["error_code"],
+            "comfyui_resource_release_unconfirmed",
+        )
+        self.assertIn("/prompt was not called", result.error_message)
+
+    def test_existing_prompt_recovery_never_runs_resource_release(self):
+        task = self._task()
+        task.status = GenerationTask.Status.RUNNING
+        task.comfy_prompt_id = "already-submitted"
+        task.attempts = 1
+        task.save(update_fields=("status", "comfy_prompt_id", "attempts", "updated_at"))
+        client = ExistingHistoryReleaseGuardClient()
+
+        result = process_task(task, client)
+
+        self.assertEqual(result.status, GenerationTask.Status.SUCCEEDED)
+        self.assertEqual(client.release_calls, 0)
+        self.assertNotIn(
+            "comfyui_pre_submit_resource_release_attempts",
+            result.capability_snapshot,
+        )
 
     def test_legacy_prompt_id_only_archive_failure_is_not_requeued(self):
         task = self._task()
@@ -1179,6 +1943,43 @@ class TaskQueueTests(TestCase):
         self.assertTrue(result.submission_token)
         self.assertIn("CUDA out of memory", result.error_message)
 
+    def test_prompt_http_rejection_is_terminal_and_preserves_response_detail(self):
+        self._task()
+        task = claim_next_task()
+
+        result = process_task(task, PromptHTTPRejectionClient())
+        serialized = GenerationTaskSerializer(result).data
+
+        self.assertEqual(result.status, GenerationTask.Status.FAILED)
+        self.assertEqual(
+            result.submission_state,
+            GenerationTask.SubmissionState.TERMINAL_FAILED,
+        )
+        self.assertEqual(result.remote_state, GenerationTask.RemoteState.FAILED)
+        self.assertTrue(result.submission_token)
+        self.assertIn("ComfyUI HTTP 400", result.error_message)
+        self.assertIn("prompt_outputs_failed_validation", result.error_message)
+        self.assertTrue(serialized["can_retry"])
+        self.assertFalse(serialized["retry_requires_reconciliation"])
+
+    def test_prompt_transport_failure_remains_submission_uncertain(self):
+        self._task()
+        task = claim_next_task()
+
+        result = process_task(task, PromptTransportFailureClient())
+        serialized = GenerationTaskSerializer(result).data
+
+        self.assertEqual(result.status, GenerationTask.Status.FAILED)
+        self.assertEqual(
+            result.submission_state,
+            GenerationTask.SubmissionState.PREPARED,
+        )
+        self.assertEqual(result.remote_state, GenerationTask.RemoteState.MISSING)
+        self.assertTrue(result.submission_token)
+        self.assertIn("远端是否已接受未知", result.error_message)
+        self.assertFalse(serialized["can_retry"])
+        self.assertTrue(serialized["retry_requires_reconciliation"])
+
     def test_consecutive_health_failures_end_sticky_oom_without_waiting_for_timeout(self):
         self._publish_runtime({
             "runtime.task_remote_poll_seconds": 0.05,
@@ -1190,7 +1991,7 @@ class TaskQueueTests(TestCase):
         task = claim_next_task()
         client = StickyHealthFailureClient()
 
-        result = process_task(task, client, wait_timeout=60)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.FAILED)
         self.assertEqual(result.submission_state, GenerationTask.SubmissionState.SUBMITTED)
@@ -1207,6 +2008,7 @@ class TaskQueueTests(TestCase):
             episode=result.episode,
             generated_workflow=result.generated_workflow,
             kind=result.kind,
+            max_attempts=3,
         )
         self.assertIsNone(claim_next_task())
 
@@ -1221,7 +2023,7 @@ class TaskQueueTests(TestCase):
         task = claim_next_task()
         client = CancellationDuringPollClient(task.id)
 
-        result = process_task(task, client, wait_timeout=60)
+        result = process_task(task, client)
 
         self.assertEqual(result.status, GenerationTask.Status.CANCELLED)
         self.assertEqual(
@@ -1231,6 +2033,7 @@ class TaskQueueTests(TestCase):
         self.assertEqual(result.remote_state, GenerationTask.RemoteState.CANCELLED)
         self.assertTrue(client.cancelled)
         self.assertIsNotNone(result.finished_at)
+        self.assertFalse(GenerationTaskSerializer(result).data["can_retry"])
 
     def test_stale_submitted_task_reattaches_to_same_remote_prompt_without_repost(self):
         task = self._task()
@@ -1248,7 +2051,7 @@ class TaskQueueTests(TestCase):
         )
         client = PersistedRemoteClient(present=True)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         self.assertEqual(recovered, 1)
@@ -1273,7 +2076,7 @@ class TaskQueueTests(TestCase):
         )
         client = PersistedRemoteClient(present=True)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         self.assertEqual(recovered, 1)
@@ -1302,10 +2105,16 @@ class TaskQueueTests(TestCase):
             episode=task.episode,
             generated_workflow=task.generated_workflow,
             kind=task.kind,
+            backend=task.backend,
+            model_profile=task.model_profile,
+            workflow_version=task.workflow_version,
+            seed=task.seed,
+            max_attempts=3,
+            capability_snapshot=dict(task.capability_snapshot or {}),
         )
         client = PersistedRemoteClient(present=False)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
         claimed = claim_next_task()
 
         task.refresh_from_db()
@@ -1313,7 +2122,7 @@ class TaskQueueTests(TestCase):
         self.assertEqual(task.status, GenerationTask.Status.FAILED)
         self.assertEqual(
             task.submission_state,
-            GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+            GenerationTask.SubmissionState.TERMINAL_FAILED,
         )
         self.assertEqual(task.remote_state, GenerationTask.RemoteState.MISSING)
         self.assertIn("retried safely", task.error_message)
@@ -1340,10 +2149,11 @@ class TaskQueueTests(TestCase):
             episode=task.episode,
             generated_workflow=task.generated_workflow,
             kind=task.kind,
+            max_attempts=3,
         )
         client = UnavailablePersistedRemoteClient()
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         fresh_task.refresh_from_db()
@@ -1357,7 +2167,7 @@ class TaskQueueTests(TestCase):
         self.assertIsNone(claim_next_task())
         self.assertFalse(client.queued)
 
-    def test_concurrent_retry_terminalization_prevents_source_reattachment(self):
+    def test_concurrent_terminalization_prevents_source_reattachment(self):
         task = self._task()
         token = "0da1a9bc-e21c-41d5-85f8-b3401f0653d6"
         finished_at = timezone.now()
@@ -1370,24 +2180,24 @@ class TaskQueueTests(TestCase):
             submission_state=GenerationTask.SubmissionState.SUBMITTED,
             remote_state=GenerationTask.RemoteState.DEGRADED,
         )
-        client = ConcurrentRetryClient(task.id)
+        client = ConcurrentTerminalizationClient(task.id)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
-        retry = GenerationTask.objects.get(pk=client.retry_id)
         self.assertEqual(recovered, 0)
         self.assertEqual(task.status, GenerationTask.Status.FAILED)
         self.assertEqual(
             task.submission_state,
-            GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+            GenerationTask.SubmissionState.TERMINAL_FAILED,
         )
         self.assertEqual(task.finished_at, finished_at)
-        self.assertEqual(retry.status, GenerationTask.Status.QUEUED)
-        self.assertEqual(retry.capability_snapshot["retry_of"], str(task.id))
+        self.assertFalse(GenerationTask.objects.filter(
+            capability_snapshot__retry_of=str(task.id),
+        ).exists())
         self.assertFalse(client.queued)
 
-    def test_concurrent_retry_terminalization_prevents_error_overwrite(self):
+    def test_concurrent_terminalization_prevents_error_overwrite(self):
         task = self._task()
         token = "75ecb57d-a35a-4218-9051-188df9ea0d11"
         finished_at = timezone.now()
@@ -1400,22 +2210,22 @@ class TaskQueueTests(TestCase):
             submission_state=GenerationTask.SubmissionState.SUBMITTED,
             remote_state=GenerationTask.RemoteState.DEGRADED,
         )
-        client = ConcurrentRetryClient(task.id, fail_lookup=True)
+        client = ConcurrentTerminalizationClient(task.id, fail_lookup=True)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
-        retry = GenerationTask.objects.get(pk=client.retry_id)
         self.assertEqual(recovered, 0)
         self.assertEqual(task.status, GenerationTask.Status.FAILED)
         self.assertEqual(
             task.submission_state,
-            GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+            GenerationTask.SubmissionState.TERMINAL_FAILED,
         )
         self.assertEqual(task.remote_state, GenerationTask.RemoteState.MISSING)
         self.assertEqual(task.finished_at, finished_at)
-        self.assertEqual(retry.status, GenerationTask.Status.QUEUED)
-        self.assertEqual(retry.capability_snapshot["retry_of"], str(task.id))
+        self.assertFalse(GenerationTask.objects.filter(
+            capability_snapshot__retry_of=str(task.id),
+        ).exists())
         self.assertFalse(client.queued)
 
     def test_max_attempt_submitted_reattachment_preempts_higher_priority_fresh_task(self):
@@ -1438,11 +2248,17 @@ class TaskQueueTests(TestCase):
             episode=task.episode,
             generated_workflow=task.generated_workflow,
             kind=task.kind,
+            backend=task.backend,
+            model_profile=task.model_profile,
+            workflow_version=task.workflow_version,
+            seed=task.seed,
+            max_attempts=3,
+            capability_snapshot=dict(task.capability_snapshot or {}),
             priority=100,
         )
         client = PersistedRemoteClient(present=True)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
         claimed = claim_next_task()
         completion_client = ExistingHistoryClient()
         result = process_task(claimed, completion_client)
@@ -1477,6 +2293,7 @@ class TaskQueueTests(TestCase):
             kind=task.kind,
             status=GenerationTask.Status.RUNNING,
             attempts=1,
+            max_attempts=3,
         )
 
         claimed = claim_next_task()
@@ -1501,7 +2318,7 @@ class TaskQueueTests(TestCase):
         )
         client = PersistedRemoteClient(present=False)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         self.assertEqual(recovered, 1)
@@ -1536,7 +2353,7 @@ class TaskQueueTests(TestCase):
             },
         )
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         self.assertEqual(recovered, 1)
@@ -1565,7 +2382,7 @@ class TaskQueueTests(TestCase):
         )
         client = PersistedRemoteClient(present=True, history=None)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         self.assertEqual(recovered, 0)
@@ -1589,7 +2406,7 @@ class TaskQueueTests(TestCase):
         )
         client = PersistedRemoteClient(present=False, history=None)
 
-        recovered = recover_stale_tasks(older_than_minutes=30, client=client)
+        recovered = self._recover_stale_with_client(client)
 
         task.refresh_from_db()
         self.assertEqual(recovered, 0)
@@ -1602,7 +2419,7 @@ class TaskQueueTests(TestCase):
         asset = Asset.objects.create(
             owner=other, kind=Asset.Kind.REFERENCE, name="其他租户素材", local_path="C:/forged.png",
         )
-        with self.assertRaisesRegex(ComfyUIError, "不属于当前任务租户"):
+        with self.assertRaisesRegex(ComfyUIError, "参考素材不存在、已停用或当前用户无权使用"):
             _authorized_asset_source(task, str(asset.id))
 
     def test_staging_accepts_only_owner_scoped_uploaded_media(self):

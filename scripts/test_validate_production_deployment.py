@@ -149,15 +149,6 @@ class ProductionDeploymentValidatorTamperTests(unittest.TestCase):
         with self.assertRaisesRegex(deployment.DeploymentValidationError, "only VITE_API_BASE_URL"):
             deployment.main()
 
-    def test_retired_qwen_environment_key_is_rejected(self):
-        self._replace(
-            "backend/.env.example",
-            "TASK_MAX_CONCURRENT=1\n",
-            "TASK_MAX_CONCURRENT=1\nQWEN_GPU_LAYERS=0\n",
-        )
-        with self.assertRaisesRegex(deployment.DeploymentValidationError, "retired local-process setting QWEN_GPU_LAYERS"):
-            deployment.main()
-
     def test_backup_archives_entering_build_context_are_rejected(self):
         self._replace(".dockerignore", "backups\nbackups/**\n", "")
         with self.assertRaisesRegex(deployment.DeploymentValidationError, "backup archives"):

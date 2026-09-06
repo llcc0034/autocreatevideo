@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import unicodedata
+from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -15,6 +16,7 @@ from studio.models import (
     ModelDeployment,
     ModelProfileVersion,
     ProductionRun,
+    SeriesProject,
     ScriptRevision,
     ScriptSource,
     StageRun,
@@ -22,25 +24,47 @@ from studio.models import (
 from studio.services.json_contracts import (
     canonical_json_bytes,
     json_contract,
-    verify_json_contract,
+)
+from studio.services.model_profile_contracts import (
+    CHAT_REQUEST_OPTIONS_KEY,
+    chat_request_options_from_policy,
+    verified_model_profile_specification,
 )
 from studio.services.async_media_contract import fresh_smoke_snapshot
 from studio.services.provider_registry import driver_for
+from studio.services.security_boundaries import boundary_int, boundary_number
+from studio.services.text_field_contracts import (
+    SCRIPT_STRUCTURE_FIELD_KEYS,
+    field_contract_prompt_lines,
+    text_field_rule,
+    validate_text_field_contract,
+)
 from studio.services.script_bible import (
     ScriptBibleParseError,
     parse_script_bible,
     validate_script_bible_ir,
 )
 from studio.services.script_sources import create_pasted_script_source
-from studio.services.series_concept_drafts import render_compatible_master_script
+from studio.services.series_concept_drafts import (
+    DIALOGUE_IR_KEYS,
+    render_compatible_master_script,
+    validate_dialogue_clock_contract,
+)
 
 
 SCRIPT_STRUCTURE_OPERATION = "script.structure"
 SCRIPT_STRUCTURE_UNIT_KEY = "script-structure"
-SCRIPT_STRUCTURE_SCHEMA_VERSION = 1
-MAX_EPISODES = 100
-MAX_SHOTS_PER_EPISODE = 200
-MAX_TOTAL_SHOTS = 1_000
+SCRIPT_STRUCTURE_SCHEMA_VERSION = 2
+
+
+def _script_structure_count_boundaries() -> dict[str, int]:
+    return {
+        "max_episodes": boundary_int("security.production.max_episodes"),
+        "max_shots_per_episode": boundary_int(
+            "security.production.max_shots_per_episode"
+        ),
+        "max_total_shots": boundary_int("security.production.max_total_shots"),
+    }
 
 _EPISODE_HEADER = re.compile(r"^第(?P<number>[1-9][0-9]*)集：(?P<title>[^\r\n]+)$")
 _SHOT_HEADER = re.compile(
@@ -94,7 +118,30 @@ def _duration_ms(value: str) -> int:
     return int(milliseconds)
 
 
-def _safe_line(value: Any, *, field: str, maximum: int, required: bool = True) -> str:
+def _timestamp_ms(value: str) -> int:
+    try:
+        seconds = Decimal(value)
+    except InvalidOperation as exc:
+        raise ScriptStructureError(
+            "规范剧本包含无效时间点。",
+            code="script_structure_canonical_duration_invalid",
+        ) from exc
+    milliseconds = seconds * 1_000
+    if milliseconds != milliseconds.to_integral_value() or milliseconds < 0:
+        raise ScriptStructureError(
+            "规范剧本时间点必须是非负整数毫秒。",
+            code="script_structure_canonical_duration_invalid",
+        )
+    return int(milliseconds)
+
+
+def _safe_line(
+    value: Any,
+    *,
+    field: str,
+    maximum: int | None,
+    required: bool = True,
+) -> str:
     if not isinstance(value, str):
         raise ScriptStructureError(
             f"{field} 必须是字符串。",
@@ -103,12 +150,42 @@ def _safe_line(value: Any, *, field: str, maximum: int, required: bool = True) -
     normalized = value.strip()
     if (
         (required and not normalized)
-        or len(normalized) > maximum
+        or (maximum is not None and len(normalized) > maximum)
         or any(character in normalized for character in "\r\n\t")
         or any(unicodedata.category(character) in {"Cc", "Cf"} for character in normalized)
     ):
         raise ScriptStructureError(
             f"{field} 不是允许长度内的安全单行文本。",
+            code="script_structure_ir_invalid",
+        )
+    return normalized
+
+
+def _safe_contract_line(
+    value: Any,
+    *,
+    field: str,
+    contract_field: str,
+    field_contract: dict[str, Any],
+) -> str:
+    rule = text_field_rule(field_contract, contract_field)
+    if not isinstance(value, str):
+        raise ScriptStructureError(
+            f"{field} 必须是字符串。",
+            code="script_structure_ir_invalid",
+        )
+    normalized = value.strip()
+    if (
+        (rule["required"] and not normalized)
+        or len(normalized) > int(rule["max_chars"])
+        or (
+            rule["single_line"]
+            and any(character in normalized for character in "\r\n\t")
+        )
+        or any(unicodedata.category(character) in {"Cc", "Cf"} for character in normalized)
+    ):
+        raise ScriptStructureError(
+            f"{field} 不符合冻结 field_contract。",
             code="script_structure_ir_invalid",
         )
     return normalized
@@ -221,28 +298,41 @@ def parse_canonical_script(value: object) -> dict[str, Any]:
                     "规范镜头动作行无效。",
                     code="script_structure_not_canonical",
                 )
-            dialogue = {"speaker": "", "delivery": "", "text": ""}
+            dialogue = {
+                "speaker": "",
+                "delivery": "",
+                "text": "",
+                "start_ms": 0,
+                "end_ms": 0,
+            }
+            action_end_ms = _duration_ms(action_match.group("end"))
+            if action_end_ms != duration_ms:
+                raise ScriptStructureError(
+                    "规范镜头动作时间未覆盖完整镜头。",
+                    code="script_structure_not_canonical",
+                )
             if len(content_lines) == 1:
-                if _duration_ms(action_match.group("end")) != duration_ms:
-                    raise ScriptStructureError(
-                        "规范镜头动作时间未覆盖完整镜头。",
-                        code="script_structure_not_canonical",
-                    )
+                pass
             else:
                 dialogue_match = _DIALOGUE_LINE.fullmatch(content_lines[1])
-                if (
-                    dialogue_match is None
-                    or action_match.group("end") != dialogue_match.group("start")
-                    or _duration_ms(dialogue_match.group("end")) != duration_ms
-                ):
+                if dialogue_match is None:
                     raise ScriptStructureError(
-                        "规范镜头动作与对白时间范围不连续。",
+                        "规范镜头对白行无效。",
+                        code="script_structure_not_canonical",
+                    )
+                dialogue_start_ms = _timestamp_ms(dialogue_match.group("start"))
+                dialogue_end_ms = _duration_ms(dialogue_match.group("end"))
+                if not 0 <= dialogue_start_ms < dialogue_end_ms <= duration_ms:
+                    raise ScriptStructureError(
+                        "规范镜头对白时间范围必须位于镜头时长内。",
                         code="script_structure_not_canonical",
                     )
                 dialogue = {
                     "speaker": dialogue_match.group("speaker"),
                     "delivery": dialogue_match.group("delivery"),
                     "text": dialogue_match.group("text"),
+                    "start_ms": dialogue_start_ms,
+                    "end_ms": dialogue_end_ms,
                 }
             episode["shots"].append({
                 "setting": shot_match.group("setting"),
@@ -299,15 +389,8 @@ def is_canonical_script(value: object) -> bool:
 
 def validate_script_structure_model_profile(
     profile: ModelProfileVersion,
-) -> dict[str, int | float] | None:
-    specification = verify_json_contract(
-        profile.specification,
-        schema_version=profile.specification_schema_version,
-        size_bytes=profile.specification_size_bytes,
-        sha256=profile.specification_sha256,
-    ).value
-    if not isinstance(specification, dict):
-        raise ValidationError({"specification": "model profile specification 必须是对象"})
+) -> dict[str, Any] | None:
+    specification = verified_model_profile_specification(profile)
     aliases = sorted(
         field
         for field in ("operations", "protocols")
@@ -347,6 +430,8 @@ def validate_script_structure_model_profile(
         "max_input_bytes",
         "max_output_tokens",
         "timeout_seconds",
+        "field_contract",
+        CHAT_REQUEST_OPTIONS_KEY,
     }:
         raise ValidationError({"specification": "script.structure 缺少精确的 script_structure policy"})
     integer_fields = (
@@ -368,11 +453,60 @@ def validate_script_structure_model_profile(
     if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
         raise ValidationError({"specification": "script_structure.timeout_seconds 必须是数值"})
     timeout = float(timeout_value)
-    if not 0.5 <= timeout <= 3_600:
-        raise ValidationError({"specification": "script_structure.timeout_seconds 必须在 0.5 到 3600 秒之间"})
+    timeout_max = boundary_number(
+        "security.provider.async_rest_timeout_max_seconds",
+        minimum=0.001,
+    )
+    if not 0 < timeout <= timeout_max:
+        raise ValidationError({
+            "specification": (
+                "script_structure.timeout_seconds 必须大于 0 且不超过"
+                f"当前安全边界 {timeout_max:g} 秒"
+            ),
+        })
+    field_contract = validate_text_field_contract(
+        policy["field_contract"],
+        fields=SCRIPT_STRUCTURE_FIELD_KEYS,
+        label="script_structure",
+    )
     return {
         **{field: int(policy[field]) for field in integer_fields},
         "timeout_seconds": timeout,
+        "field_contract": field_contract,
+        CHAT_REQUEST_OPTIONS_KEY: chat_request_options_from_policy(
+            policy,
+            label="script_structure",
+        ),
+    }
+
+
+def intersect_script_structure_duration_policy(
+    policy: dict[str, Any],
+    *,
+    production_minimum_duration_ms: int,
+    production_maximum_duration_ms: int,
+) -> dict[str, Any]:
+    """Constrain model output to the frozen ProductionRun duration policy.
+
+    ModelProfile limits describe what the selected structuring route can emit;
+    the production configuration describes what downstream storyboard and
+    media stages accept.  The provider must receive the intersection so a
+    reviewed structure candidate cannot become invalid only after approval.
+    """
+
+    model_minimum = int(policy["minimum_shot_duration_ms"])
+    model_maximum = int(policy["maximum_shot_duration_ms"])
+    effective_minimum = max(model_minimum, int(production_minimum_duration_ms))
+    effective_maximum = min(model_maximum, int(production_maximum_duration_ms))
+    if effective_minimum > effective_maximum:
+        raise ScriptStructureError(
+            "所选 script.structure 模型的镜头时长范围与本次运行冻结的生产范围没有交集。",
+            code="script_structure_duration_policy_incompatible",
+        )
+    return {
+        **policy,
+        "minimum_shot_duration_ms": effective_minimum,
+        "maximum_shot_duration_ms": effective_maximum,
     }
 
 
@@ -415,7 +549,7 @@ def build_script_structure_plan(
     *,
     revision: ScriptRevision,
     model_identifier: str,
-    policy: dict[str, int | float],
+    policy: dict[str, Any],
 ) -> dict[str, Any]:
     if revision.status != ScriptRevision.Status.CONFIRMED:
         raise ScriptStructureError(
@@ -458,10 +592,15 @@ def build_script_structure_plan(
                 "minimum_shot_duration_ms": int(policy["minimum_shot_duration_ms"]),
                 "maximum_shot_duration_ms": int(policy["maximum_shot_duration_ms"]),
                 "max_output_tokens": int(policy["max_output_tokens"]),
+                "timeout_seconds": float(policy["timeout_seconds"]),
+                CHAT_REQUEST_OPTIONS_KEY: deepcopy(
+                    policy[CHAT_REQUEST_OPTIONS_KEY],
+                ),
             },
             "seed": seed,
         },
         "model_identifier": str(model_identifier),
+        "field_contract": deepcopy(policy["field_contract"]),
         "resource_estimate": {
             "source_size_bytes": len(payload),
             "source_line_count": len(content.split("\n")),
@@ -476,38 +615,54 @@ def build_script_structure_plan(
 def structure_provider_payload(plan: dict[str, Any]) -> dict[str, Any]:
     request = plan["request"]
     options = request["options"]
+    field_contract = validate_text_field_contract(
+        plan.get("field_contract"),
+        fields=SCRIPT_STRUCTURE_FIELD_KEYS,
+        label="script_structure frozen plan",
+    )
+    def placeholder(field: str, subject: str) -> str:
+        rule = text_field_rule(field_contract, field)
+        required = "required" if rule["required"] else "optional"
+        line_shape = "single-line" if rule["single_line"] else "text"
+        return f"<{required} {line_shape} {subject}, <= {int(rule['max_chars'])} chars>"
     contract = {
         "schema_version": SCRIPT_STRUCTURE_SCHEMA_VERSION,
         "source_revision_id": plan["source_revision"]["id"],
         "source_sha256": plan["source_revision"]["content_sha256"],
         "source_size_bytes": plan["source_revision"]["content_size_bytes"],
-        "title": "<safe single-line project title>",
-        "logline": "<safe single-line logline>",
+        "title": placeholder("title", "project title"),
+        "logline": placeholder("logline", "logline"),
         "bible": {
             "characters": [{
-                "name": "<name>",
-                "description": "<description>",
-                "visual_identity_en": "<English visual identity>",
+                "name": placeholder("bible.entity.name", "canonical character name"),
+                "description": placeholder("bible.entity.description", "character description"),
+                "visual_identity_en": placeholder("bible.entity.visual_identity_en", "English character visual identity"),
             }],
             "scenes": [{
-                "name": "<name>",
-                "description": "<description>",
-                "visual_identity_en": "<English visual identity>",
+                "name": placeholder("bible.entity.name", "canonical scene name"),
+                "description": placeholder("bible.entity.description", "scene description"),
+                "visual_identity_en": placeholder("bible.entity.visual_identity_en", "English scene visual identity"),
             }],
             "props": [{
-                "name": "<name>",
-                "description": "<description>",
-                "visual_identity_en": "<English visual identity>",
+                "name": placeholder("bible.entity.name", "canonical prop name"),
+                "description": placeholder("bible.entity.description", "prop description"),
+                "visual_identity_en": placeholder("bible.entity.visual_identity_en", "English prop visual identity"),
             }],
         },
         "episodes": [{
-            "title": "<episode title>",
+            "title": placeholder("episode.title", "episode title"),
             "shots": [{
                 "source_lines": [1],
-                "setting": "<single-line setting>",
-                "action": "<single-line action preserving source facts>",
+                "setting": placeholder("shot.setting", "setting"),
+                "action": placeholder("shot.action", "action preserving source facts"),
                 "duration_ms": int(options["minimum_shot_duration_ms"]),
-                "dialogue": {"speaker": "", "delivery": "", "text": ""},
+                "dialogue": {
+                    "speaker": "",
+                    "delivery": "",
+                    "text": "",
+                    "start_ms": 0,
+                    "end_ms": 0,
+                },
             }],
         }],
     }
@@ -534,9 +689,15 @@ def structure_provider_payload(plan: dict[str, Any]) -> dict[str, Any]:
         "source facts. Every non-empty source line number MUST occur exactly once across "
         "all shot.source_lines arrays. Do not truncate any array or string. duration_ms "
         f"MUST be an integer from {int(options['minimum_shot_duration_ms'])} through "
-        f"{int(options['maximum_shot_duration_ms'])}. Spoken dialogue requires non-empty "
-        "speaker, printable-ASCII delivery without parentheses, and text; silent dialogue "
-        "uses three empty strings. Echo the frozen source identity fields exactly. CONTRACT="
+        f"{int(options['maximum_shot_duration_ms'])}. Every dialogue object MUST contain "
+        "exactly speaker, delivery, text, start_ms, end_ms. Spoken dialogue requires "
+        "non-empty speaker, printable-ASCII delivery without parentheses, and text, plus "
+        "integer timing satisfying 0 <= start_ms < end_ms <= the same shot.duration_ms. "
+        "Silent dialogue uses three empty strings and the explicit start_ms=0,end_ms=0 "
+        "sentinel. All configurable text fields MUST follow the frozen FIELD_CONTRACT. "
+        "Echo the frozen source identity fields exactly. FIELD_CONTRACT:\n"
+        + field_contract_prompt_lines(field_contract)
+        + "\nCONTRACT="
         + json.dumps(contract, ensure_ascii=False, separators=(",", ":"))
     )
     if profile_system:
@@ -553,9 +714,9 @@ def structure_provider_payload(plan: dict[str, Any]) -> dict[str, Any]:
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False, separators=(",", ":"))},
         ],
-        "temperature": 0,
         "max_tokens": int(options["max_output_tokens"]),
-        "response_format": {"type": "json_object"},
+        "timeout_seconds": float(options["timeout_seconds"]),
+        CHAT_REQUEST_OPTIONS_KEY: deepcopy(options[CHAT_REQUEST_OPTIONS_KEY]),
         "seed": int(request["seed"]),
     }
 
@@ -591,19 +752,34 @@ def finalize_script_structure(
             "script.structure 响应未精确回显冻结来源。",
             code="script_structure_source_mismatch",
         )
-    title = _safe_line(payload.get("title"), field="title", maximum=200)
-    logline = _safe_line(payload.get("logline"), field="logline", maximum=2_000)
+    field_contract = validate_text_field_contract(
+        plan.get("field_contract"),
+        fields=SCRIPT_STRUCTURE_FIELD_KEYS,
+        label="script_structure frozen plan",
+    )
+    title = _safe_contract_line(payload.get("title"), field="title", contract_field="title", field_contract=field_contract)
+    logline = _safe_contract_line(payload.get("logline"), field="logline", contract_field="logline", field_contract=field_contract)
     try:
-        bible = validate_script_bible_ir(payload.get("bible"))
+        bible = validate_script_bible_ir(
+            payload.get("bible"),
+            field_contract=field_contract,
+        )
     except ScriptBibleParseError as exc:
         raise ScriptStructureError(
             str(exc),
             code="script_structure_ir_invalid",
         ) from exc
+    count_boundaries = _script_structure_count_boundaries()
     episodes = payload.get("episodes")
-    if not isinstance(episodes, list) or not 1 <= len(episodes) <= MAX_EPISODES:
+    if (
+        not isinstance(episodes, list)
+        or not 1 <= len(episodes) <= count_boundaries["max_episodes"]
+    ):
         raise ScriptStructureError(
-            "script.structure episodes 数量无效。",
+            (
+                "script.structure episodes 数量必须为 1 到当前安全边界 "
+                f"{count_boundaries['max_episodes']}。"
+            ),
             code="script_structure_ir_invalid",
         )
     options = plan["request"]["options"]
@@ -620,15 +796,24 @@ def finalize_script_structure(
                 code="script_structure_ir_invalid",
             )
         shots = episode.get("shots")
-        if not isinstance(shots, list) or not 1 <= len(shots) <= MAX_SHOTS_PER_EPISODE:
+        if (
+            not isinstance(shots, list)
+            or not 1 <= len(shots) <= count_boundaries["max_shots_per_episode"]
+        ):
             raise ScriptStructureError(
-                "script.structure 每集镜头数量无效。",
+                (
+                    "script.structure 每集镜头数量必须为 1 到当前安全边界 "
+                    f"{count_boundaries['max_shots_per_episode']}。"
+                ),
                 code="script_structure_ir_invalid",
             )
         total_shots += len(shots)
-        if total_shots > MAX_TOTAL_SHOTS:
+        if total_shots > count_boundaries["max_total_shots"]:
             raise ScriptStructureError(
-                "script.structure 总镜头数量超过安全上限。",
+                (
+                    "script.structure 总镜头数量超过当前安全边界 "
+                    f"{count_boundaries['max_total_shots']}。"
+                ),
                 code="script_structure_ir_invalid",
             )
         validated_shots: list[dict[str, Any]] = []
@@ -658,14 +843,14 @@ def finalize_script_structure(
                     code="script_structure_ir_invalid",
                 )
             dialogue = shot.get("dialogue")
-            if not isinstance(dialogue, dict) or set(dialogue) != {"speaker", "delivery", "text"}:
+            if not isinstance(dialogue, dict) or set(dialogue) != DIALOGUE_IR_KEYS:
                 raise ScriptStructureError(
                     "script.structure dialogue 字段无效。",
                     code="script_structure_ir_invalid",
                 )
-            speaker = _safe_line(dialogue.get("speaker"), field="dialogue.speaker", maximum=160, required=False)
-            delivery = _safe_line(dialogue.get("delivery"), field="dialogue.delivery", maximum=240, required=False)
-            dialogue_text = _safe_line(dialogue.get("text"), field="dialogue.text", maximum=2_000, required=False)
+            speaker = _safe_contract_line(dialogue.get("speaker"), field="dialogue.speaker", contract_field="shot.dialogue.speaker", field_contract=field_contract)
+            delivery = _safe_contract_line(dialogue.get("delivery"), field="dialogue.delivery", contract_field="shot.dialogue.delivery", field_contract=field_contract)
+            dialogue_text = _safe_contract_line(dialogue.get("text"), field="dialogue.text", contract_field="shot.dialogue.text", field_contract=field_contract)
             if (
                 bool(speaker) != bool(dialogue_text)
                 or bool(delivery) != bool(dialogue_text)
@@ -683,19 +868,32 @@ def finalize_script_structure(
                     "script.structure 对白人物、语气或正文组合无效。",
                     code="script_structure_ir_invalid",
                 )
+            normalized_dialogue = {
+                "speaker": speaker,
+                "delivery": delivery,
+                "text": dialogue_text,
+                "start_ms": dialogue.get("start_ms"),
+                "end_ms": dialogue.get("end_ms"),
+            }
+            try:
+                validate_dialogue_clock_contract(
+                    normalized_dialogue,
+                    duration_ms=duration,
+                )
+            except ValueError as exc:
+                raise ScriptStructureError(
+                    "script.structure 对白时钟必须位于镜头时长内；空对白必须使用 0/0。",
+                    code="script_structure_ir_invalid",
+                ) from exc
             validated_shots.append({
                 "source_lines": list(source_lines),
-                "setting": _safe_line(shot.get("setting"), field="shot.setting", maximum=500),
-                "action": _safe_line(shot.get("action"), field="shot.action", maximum=4_000),
+                "setting": _safe_contract_line(shot.get("setting"), field="shot.setting", contract_field="shot.setting", field_contract=field_contract),
+                "action": _safe_contract_line(shot.get("action"), field="shot.action", contract_field="shot.action", field_contract=field_contract),
                 "duration_ms": duration,
-                "dialogue": {
-                    "speaker": speaker,
-                    "delivery": delivery,
-                    "text": dialogue_text,
-                },
+                "dialogue": normalized_dialogue,
             })
         validated_episodes.append({
-            "title": _safe_line(episode.get("title"), field="episode.title", maximum=200),
+            "title": _safe_contract_line(episode.get("title"), field="episode.title", contract_field="episode.title", field_contract=field_contract),
             "shots": validated_shots,
         })
     if covered_lines != expected_lines and sorted(covered_lines) != expected_lines:
@@ -762,8 +960,17 @@ def canonical_no_submission_result(
 ) -> dict[str, Any]:
     canonical = parse_canonical_script(revision.content)
     candidate = {
-        "title": _safe_line(title, field="title", maximum=200),
-        "logline": _safe_line(logline, field="logline", maximum=2_000, required=False),
+        "title": _safe_line(
+            title,
+            field="title",
+            maximum=SeriesProject._meta.get_field("title").max_length,
+        ),
+        "logline": _safe_line(
+            logline,
+            field="logline",
+            maximum=None,
+            required=False,
+        ),
         "bible": canonical["bible"],
         "episodes": canonical["episodes"],
         "master_script": canonical["master_script"],
@@ -857,7 +1064,10 @@ def materialize_script_structure_preview(
         "title_sha256": _text_sha256(str(candidate.get("title") or "")),
         "logline_sha256": _text_sha256(str(candidate.get("logline") or "")),
     }
-    manifest = json_contract(metadata)
+    manifest = json_contract(
+        metadata,
+        max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+    )
     artifact = GeneratedArtifact.objects.create(
         manifest_key=f"run:{run.id}:structured-script:{attempt.id}",
         production_run=run,
@@ -901,7 +1111,10 @@ def materialize_script_structure_preview(
     }
     # Validate the review payload size now. The caller assigns this exact value
     # to StageRun.output_snapshot in the same materialization transaction.
-    json_contract(review_payload)
+    json_contract(
+        review_payload,
+        max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+    )
     return revision, artifact, review_payload
 
 
@@ -938,4 +1151,7 @@ def canonical_no_submission_review_payload(
         "title": str(candidate["title"]),
         "logline": str(candidate["logline"]),
     }
-    return json_contract(payload).value
+    return json_contract(
+        payload,
+        max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+    ).value

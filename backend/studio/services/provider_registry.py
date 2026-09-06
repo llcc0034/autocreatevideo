@@ -6,6 +6,7 @@ import math
 import re
 import socket
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -14,20 +15,213 @@ from urllib.parse import quote, urlparse
 import requests
 from django.conf import settings
 from django.core.exceptions import ValidationError
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NewConnectionError
 
 from studio.models import ModelDeployment, ProviderProfile, SecretBinding, SecretVersion
-from studio.services.json_contracts import find_sensitive_json_keys, verify_json_contract
+from studio.services.json_contracts import (
+    find_sensitive_json_keys,
+    json_contract,
+    verify_json_contract,
+)
+from studio.services.model_profile_contracts import (
+    CHAT_REQUEST_OPTIONS_KEY,
+    validate_chat_request_options,
+    verified_model_profile_specification,
+)
+from studio.services.comfyui_workflow_library import saved_workflow_directory
 from studio.services.secret_store import SecretStoreError, resolve_secret
+from studio.services.security_boundaries import boundary_int, boundary_number, boundary_values
 from studio.services.prompt_normalization_contract import (
     PROMPT_NORMALIZE_OPERATION,
     PromptNormalizationContractError,
     parse_prompt_normalization_chat_response,
+    prompt_normalization_input_warnings,
+    prompt_normalization_policy_from_specification,
     prompt_normalization_chat_payload,
+    prompt_normalization_usage_warnings,
+    safe_prompt_field_validation_context,
+    safe_prompt_field_validation_reason_code,
 )
 
 
-MAX_PROVIDER_RESPONSE_BYTES = 1024 * 1024
+SAFE_CHAT_FINISH_REASONS = frozenset({
+    "content_filter",
+    "function_call",
+    "length",
+    "stop",
+    "tool_calls",
+})
+SAFE_CHAT_USAGE_FIELDS = ("prompt_tokens", "completion_tokens", "total_tokens")
 _DRIVERS: dict[str, type["ProviderDriver"]] = {}
+COMFYUI_WORKFLOW_SOURCE_SCOPE_SCHEMA_VERSION = 2
+
+_ASYNC_REST_TERMINAL_STATUS_MAX_ITEMS_KEY = (
+    "security.provider.async_rest_terminal_status_max_items"
+)
+_ASYNC_REST_TERMINAL_STATUS_MAX_CHARACTERS_KEY = (
+    "security.provider.async_rest_terminal_status_max_characters"
+)
+_ASYNC_REST_ARTIFACT_HOST_MAX_ITEMS_KEY = (
+    "security.provider.async_rest_artifact_host_max_items"
+)
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
+
+
+def _safe_chat_usage(value: Any) -> dict[str, int]:
+    maximum_count = boundary_int("security.prompt.max_usage_count")
+    if not isinstance(value, dict):
+        return {}
+    return {
+        field: raw
+        for field in SAFE_CHAT_USAGE_FIELDS
+        if type((raw := value.get(field))) is int
+        and 0 <= raw <= maximum_count
+    }
+
+
+def restricted_async_rest_runtime_budget(config: dict[str, Any]) -> dict[str, int | float]:
+    """Validate the explicit async transport/poll budget frozen in config."""
+
+    required = ("timeout_seconds", "poll_interval_seconds", "max_poll_seconds")
+    missing = [field for field in required if field not in config]
+    if missing:
+        raise ValidationError({
+            "driver_config": "async_rest 运行预算缺少必填字段: " + ", ".join(missing),
+        })
+    timeout = config["timeout_seconds"]
+    poll_interval = config["poll_interval_seconds"]
+    max_poll = config["max_poll_seconds"]
+    limits = boundary_values(
+        "security.provider.async_rest_timeout_max_seconds",
+        "security.provider.async_rest_poll_interval_max_seconds",
+        "security.provider.async_rest_max_poll_seconds",
+    )
+    timeout_max = float(limits["security.provider.async_rest_timeout_max_seconds"])
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or not 0 < float(timeout) <= timeout_max
+    ):
+        raise ValidationError({"timeout_seconds": f"必须是大于 0 且不超过安全边界 {timeout_max:g} 的有限数"})
+    poll_max = float(limits["security.provider.async_rest_poll_interval_max_seconds"])
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, (int, float))
+        or not math.isfinite(float(poll_interval))
+        or not 0 < float(poll_interval) <= poll_max
+    ):
+        raise ValidationError({
+            "poll_interval_seconds": f"必须是大于 0 且不超过安全边界 {poll_max:g} 的有限数",
+        })
+    max_poll_max = int(limits["security.provider.async_rest_max_poll_seconds"])
+    if (
+        isinstance(max_poll, bool)
+        or not isinstance(max_poll, int)
+        or not 1 <= max_poll <= max_poll_max
+    ):
+        raise ValidationError({
+            "max_poll_seconds": f"必须是正整数且不超过安全边界 {max_poll_max}",
+        })
+    return {
+        "timeout_seconds": float(timeout),
+        "poll_interval_seconds": float(poll_interval),
+        "max_poll_seconds": max_poll,
+    }
+
+
+def restricted_async_rest_contract_limits() -> dict[str, int]:
+    keys = (
+        _ASYNC_REST_TERMINAL_STATUS_MAX_ITEMS_KEY,
+        _ASYNC_REST_TERMINAL_STATUS_MAX_CHARACTERS_KEY,
+        _ASYNC_REST_ARTIFACT_HOST_MAX_ITEMS_KEY,
+    )
+    values = boundary_values(*keys)
+    if any(type(values.get(key)) is not int or values[key] < 1 for key in keys):
+        raise ValidationError({
+            "security_boundary": "受限异步 REST Provider 合同安全边界无效",
+        })
+    return {key: int(values[key]) for key in keys}
+
+
+def restricted_comfyui_runtime_budget(config: dict[str, Any]) -> dict[str, int | float]:
+    """Validate the explicit ComfyUI transport and asset-poll budget."""
+
+    required = ("timeout_seconds", "poll_interval_seconds", "max_poll_seconds")
+    missing = [field for field in required if field not in config]
+    if missing:
+        raise ValidationError({
+            "runtime_config": "ComfyUI 运行预算缺少必填字段: " + ", ".join(missing),
+        })
+    timeout = config["timeout_seconds"]
+    poll_interval = config["poll_interval_seconds"]
+    max_poll = config["max_poll_seconds"]
+    limits = boundary_values(
+        "security.runtime.max_timeout_seconds",
+        "security.runtime.max_interval_seconds",
+    )
+    timeout_max = float(limits["security.runtime.max_timeout_seconds"])
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or not 0 < float(timeout) <= timeout_max
+    ):
+        raise ValidationError({
+            "timeout_seconds": f"必须是大于 0 且不超过安全边界 {timeout_max:g} 的有限数",
+        })
+    poll_max = float(limits["security.runtime.max_interval_seconds"])
+    if (
+        isinstance(poll_interval, bool)
+        or not isinstance(poll_interval, (int, float))
+        or not math.isfinite(float(poll_interval))
+        or not 0 < float(poll_interval) <= poll_max
+    ):
+        raise ValidationError({
+            "poll_interval_seconds": f"必须是大于 0 且不超过安全边界 {poll_max:g} 的有限数",
+        })
+    if (
+        isinstance(max_poll, bool)
+        or not isinstance(max_poll, int)
+        or not 1 <= max_poll <= int(timeout_max)
+    ):
+        raise ValidationError({
+            "max_poll_seconds": f"必须是正整数且不超过安全边界 {int(timeout_max)}",
+        })
+    return {
+        "timeout_seconds": float(timeout),
+        "poll_interval_seconds": float(poll_interval),
+        "max_poll_seconds": max_poll,
+    }
+
+
+def validate_capability_ttl_seconds(
+    config: dict[str, Any],
+    *,
+    required: bool = False,
+) -> None:
+    """Validate a deployment capability snapshot TTL when the driver declares one."""
+
+    if "capability_ttl_seconds" not in config:
+        if required:
+            raise ValidationError({
+                "capability_ttl_seconds": "必须显式配置正整数",
+            })
+        return
+    capability_ttl = config["capability_ttl_seconds"]
+    ttl_max = boundary_int("security.runtime.max_capability_ttl_seconds")
+    if type(capability_ttl) is not int or not 1 <= capability_ttl <= ttl_max:
+        raise ValidationError({
+            "capability_ttl_seconds": (
+                f"必须是正整数且不超过安全边界 {ttl_max}"
+            ),
+        })
 
 
 class ProviderDriverError(RuntimeError):
@@ -43,6 +237,7 @@ class ProviderDriverError(RuntimeError):
         self.code = code
         self.retryable = retryable
         self.submission_uncertain = submission_uncertain
+        self.metadata: dict[str, Any] = {}
 
 
 def _pricing_estimate(
@@ -97,6 +292,20 @@ def register_driver(driver_type: str):
 
 def registered_driver_types() -> tuple[str, ...]:
     return tuple(sorted(_DRIVERS))
+
+
+def registered_driver_capabilities() -> dict[str, dict[str, Any]]:
+    """Return the non-secret capability declaration of every code driver.
+
+    The registry options API uses this read-only catalog so the browser never
+    has to duplicate transport operations or infer them from Provider labels.
+    Driver capability declarations must therefore stay side-effect free.
+    """
+
+    return {
+        driver_type: dict(driver_class().capabilities())
+        for driver_type, driver_class in sorted(_DRIVERS.items())
+    }
 
 
 def driver_for(profile: ProviderProfile) -> "ProviderDriver":
@@ -167,7 +376,29 @@ def _allowed_provider_hosts() -> set[str]:
     }
 
 
-def validate_endpoint(value: str, *, resolve_dns: bool = False) -> str:
+@dataclass(frozen=True, slots=True)
+class _ResolvedSocketAddress:
+    ip: str
+    family: int
+    socktype: int
+    protocol: int
+    sockaddr: tuple[Any, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedProviderEndpoint:
+    endpoint: str
+    scheme: str
+    hostname: str
+    port: int
+    addresses: tuple[_ResolvedSocketAddress, ...]
+
+    @property
+    def peer_addresses(self) -> frozenset[str]:
+        return frozenset(item.ip for item in self.addresses)
+
+
+def _validated_endpoint_parts(value: str) -> tuple[str, Any, str, int]:
     endpoint = str(value or "").strip().rstrip("/")
     parsed = urlparse(endpoint)
     if (
@@ -183,51 +414,119 @@ def validate_endpoint(value: str, *, resolve_dns: bool = False) -> str:
     hostname = parsed.hostname.casefold()
     if hostname not in allowed_hosts:
         raise ValidationError("provider hostname 不在部署允许列表中")
-    addresses: set[str] = set()
     try:
-        addresses.add(str(ipaddress.ip_address(hostname)))
-    except ValueError:
-        if resolve_dns:
-            try:
-                addresses.update(
-                    item[4][0]
-                    for item in socket.getaddrinfo(hostname, parsed.port or 443, type=socket.SOCK_STREAM)
-                )
-            except OSError as exc:
-                raise ProviderDriverError(
-                    "provider hostname 无法解析",
-                    code="provider_dns_unavailable",
-                ) from exc
-    if resolve_dns:
-        if not addresses:
-            raise ProviderDriverError(
-                "provider hostname 没有可验证的 DNS 地址",
-                code="provider_dns_unavailable",
-            )
-        local_hostname = hostname in {"localhost", "127.0.0.1", "::1"}
-        for address in addresses:
-            ip = ipaddress.ip_address(address)
-            if local_hostname:
-                if not ip.is_loopback:
-                    raise ProviderDriverError(
-                        "显式 loopback provider 解析到了非 loopback 地址",
-                        code="provider_loopback_mismatch",
-                    )
-                continue
-            if any((
-                ip.is_private,
-                ip.is_loopback,
-                ip.is_link_local,
-                ip.is_multicast,
-                ip.is_reserved,
-                ip.is_unspecified,
-            )):
-                raise ProviderDriverError(
-                    "公网 provider 解析到了禁止的内网或保留地址",
-                    code="provider_private_address_forbidden",
-                )
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValidationError("provider base_url 端口无效") from exc
     if parsed.scheme == "http" and hostname not in {"localhost", "127.0.0.1", "::1"}:
         raise ValidationError("公网 provider 必须使用 HTTPS")
+    return endpoint, parsed, hostname, port
+
+
+def _resolved_provider_endpoint(value: str) -> _ResolvedProviderEndpoint:
+    endpoint, parsed, hostname, port = _validated_endpoint_parts(value)
+    raw_addresses: list[tuple[int, int, int, tuple[Any, ...]]] = []
+    try:
+        numeric_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        try:
+            raw_addresses = [
+                (family, socktype, protocol, tuple(sockaddr))
+                for family, socktype, protocol, _canonname, sockaddr
+                in socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+            ]
+        except OSError as exc:
+            raise ProviderDriverError(
+                "provider hostname 无法解析",
+                code="provider_dns_unavailable",
+            ) from exc
+    else:
+        family = socket.AF_INET6 if numeric_ip.version == 6 else socket.AF_INET
+        sockaddr = (
+            (str(numeric_ip), port, 0, 0)
+            if family == socket.AF_INET6
+            else (str(numeric_ip), port)
+        )
+        raw_addresses = [(family, socket.SOCK_STREAM, 0, sockaddr)]
+    if not raw_addresses:
+        raise ProviderDriverError(
+            "provider hostname 没有可验证的 DNS 地址",
+            code="provider_dns_unavailable",
+        )
+    local_hostname = hostname in {"localhost", "127.0.0.1", "::1"}
+    addresses: list[_ResolvedSocketAddress] = []
+    seen: set[tuple[str, int, int]] = set()
+    for family, socktype, protocol, sockaddr in raw_addresses:
+        if family not in {socket.AF_INET, socket.AF_INET6} or not sockaddr:
+            raise ProviderDriverError(
+                "provider hostname 返回了不受支持的地址族",
+                code="provider_dns_unavailable",
+            )
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (TypeError, ValueError) as exc:
+            raise ProviderDriverError(
+                "provider hostname 返回了无效地址",
+                code="provider_dns_unavailable",
+            ) from exc
+        if local_hostname:
+            if not ip.is_loopback:
+                raise ProviderDriverError(
+                    "显式 loopback provider 解析到了非 loopback 地址",
+                    code="provider_loopback_mismatch",
+                )
+        elif any((
+            ip.is_private,
+            ip.is_loopback,
+            ip.is_link_local,
+            ip.is_multicast,
+            ip.is_reserved,
+            ip.is_unspecified,
+        )):
+            raise ProviderDriverError(
+                "公网 provider 解析到了禁止的内网或保留地址",
+                code="provider_private_address_forbidden",
+            )
+        canonical_ip = str(ip)
+        key = (canonical_ip, family, protocol)
+        if key in seen:
+            continue
+        seen.add(key)
+        canonical_sockaddr = (
+            (
+                canonical_ip,
+                port,
+                sockaddr[2] if len(sockaddr) > 2 else 0,
+                sockaddr[3] if len(sockaddr) > 3 else 0,
+            )
+            if family == socket.AF_INET6
+            else (canonical_ip, port)
+        )
+        addresses.append(_ResolvedSocketAddress(
+            ip=canonical_ip,
+            family=family,
+            socktype=socktype or socket.SOCK_STREAM,
+            protocol=protocol,
+            sockaddr=canonical_sockaddr,
+        ))
+    if not addresses:
+        raise ProviderDriverError(
+            "provider hostname 没有可验证的 DNS 地址",
+            code="provider_dns_unavailable",
+        )
+    return _ResolvedProviderEndpoint(
+        endpoint=endpoint,
+        scheme=parsed.scheme,
+        hostname=hostname,
+        port=port,
+        addresses=tuple(addresses),
+    )
+
+
+def validate_endpoint(value: str, *, resolve_dns: bool = False) -> str:
+    endpoint, _parsed, _hostname, _port = _validated_endpoint_parts(value)
+    if resolve_dns:
+        _resolved_provider_endpoint(endpoint)
     return endpoint
 
 
@@ -272,13 +571,14 @@ def _endpoint_url(base_url: str, path: str) -> str:
 
 
 def _response_json(response: requests.Response) -> dict[str, Any]:
+    max_response_bytes = boundary_int("security.provider.max_response_bytes")
     raw_length = str(response.headers.get("Content-Length") or "").strip()
     if raw_length:
         try:
-            if int(raw_length) > MAX_PROVIDER_RESPONSE_BYTES:
+            if int(raw_length) > max_response_bytes:
                 response.close()
                 raise ProviderDriverError(
-                    "provider JSON 响应超过 1MiB 上限",
+                    f"provider JSON 响应超过安全边界 {max_response_bytes} bytes",
                     code="provider_response_too_large",
                 )
         except ValueError as exc:
@@ -294,9 +594,9 @@ def _response_json(response: requests.Response) -> dict[str, Any]:
             if not chunk:
                 continue
             size += len(chunk)
-            if size > MAX_PROVIDER_RESPONSE_BYTES:
+            if size > max_response_bytes:
                 raise ProviderDriverError(
-                    "provider JSON 响应超过 1MiB 上限",
+                    f"provider JSON 响应超过安全边界 {max_response_bytes} bytes",
                     code="provider_response_too_large",
                 )
             chunks.append(chunk)
@@ -312,19 +612,118 @@ def _response_json(response: requests.Response) -> dict[str, Any]:
     return payload
 
 
-def _resolved_endpoint_addresses(url: str) -> set[str]:
-    parsed = urlparse(url)
-    try:
-        return {
-            str(ipaddress.ip_address(item[4][0]))
-            for item in socket.getaddrinfo(
-                parsed.hostname,
-                parsed.port or (443 if parsed.scheme == "https" else 80),
-                type=socket.SOCK_STREAM,
+def _connect_to_resolved_address(
+    connection: HTTPConnection | HTTPSConnection,
+    addresses: tuple[_ResolvedSocketAddress, ...],
+) -> socket.socket:
+    last_error: OSError | None = None
+    for address in addresses:
+        sock = None
+        try:
+            sock = socket.socket(address.family, address.socktype, address.protocol)
+            if isinstance(connection.timeout, (int, float)) or connection.timeout is None:
+                sock.settimeout(connection.timeout)
+            if connection.source_address:
+                sock.bind(connection.source_address)
+            for option in connection.socket_options or ():
+                sock.setsockopt(*option)
+            sock.connect(address.sockaddr)
+            return sock
+        except OSError as exc:
+            last_error = exc
+            if sock is not None:
+                sock.close()
+    if isinstance(last_error, TimeoutError):
+        raise ConnectTimeoutError(
+            connection,
+            f"Connection to {connection.host} timed out.",
+        ) from last_error
+    raise NewConnectionError(
+        connection,
+        f"Failed to establish a connection to {connection.host}.",
+    ) from last_error
+
+
+class _PinnedHTTPConnection(HTTPConnection):
+    def __init__(self, *args, resolved_addresses, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._resolved_addresses = tuple(resolved_addresses)
+
+    def _new_conn(self) -> socket.socket:
+        return _connect_to_resolved_address(self, self._resolved_addresses)
+
+
+class _PinnedHTTPSConnection(HTTPSConnection):
+    def __init__(self, *args, resolved_addresses, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._resolved_addresses = tuple(resolved_addresses)
+
+    def _new_conn(self) -> socket.socket:
+        return _connect_to_resolved_address(self, self._resolved_addresses)
+
+
+class _PinnedHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = _PinnedHTTPConnection
+
+
+class _PinnedHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = _PinnedHTTPSConnection
+
+
+class _PinnedAddressAdapter(HTTPAdapter):
+    """Connect one request only to its already filtered DNS result.
+
+    The pool host remains the configured hostname, so the HTTP Host header and
+    HTTPS SNI/certificate verification keep their original security semantics.
+    Only the TCP destination is replaced by the immutable numeric address set.
+    """
+
+    def __init__(self, resolved: _ResolvedProviderEndpoint):
+        super().__init__(max_retries=0)
+        self._resolved = resolved
+        self._pool: HTTPConnectionPool | HTTPSConnectionPool | None = None
+
+    def get_connection_with_tls_context(self, request, verify, proxies=None, cert=None):
+        if any(value for value in (proxies or {}).values()):
+            raise requests.exceptions.ProxyError(
+                "provider pinned transport forbids proxies",
+                request=request,
             )
-        }
-    except OSError as exc:
-        raise ProviderDriverError("provider hostname 无法解析", code="provider_dns_unavailable") from exc
+        parsed = urlparse(request.url)
+        try:
+            request_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        except ValueError as exc:
+            raise requests.exceptions.InvalidURL(str(exc), request=request) from exc
+        if (
+            parsed.scheme != self._resolved.scheme
+            or (parsed.hostname or "").casefold() != self._resolved.hostname
+            or request_port != self._resolved.port
+            or parsed.username
+            or parsed.password
+        ):
+            raise requests.exceptions.InvalidURL(
+                "provider request origin differs from resolved endpoint",
+                request=request,
+            )
+        pool_class = (
+            _PinnedHTTPSConnectionPool
+            if self._resolved.scheme == "https"
+            else _PinnedHTTPConnectionPool
+        )
+        self._pool = pool_class(
+            self._resolved.hostname,
+            self._resolved.port,
+            maxsize=1,
+            block=True,
+            resolved_addresses=self._resolved.addresses,
+        )
+        return self._pool
+
+    def close(self):
+        if self._pool is not None:
+            self._pool.close()
+            self._pool = None
+        super().close()
 
 
 def _peer_address(response: requests.Response) -> str:
@@ -353,10 +752,24 @@ def _request_json(
     payload=None,
     submission: bool = False,
 ) -> dict[str, Any]:
-    validate_endpoint(f"{urlparse(url).scheme}://{urlparse(url).netloc}", resolve_dns=True)
-    resolved_addresses = _resolved_endpoint_addresses(url)
+    parsed_url = urlparse(url)
+    if parsed_url.query or parsed_url.fragment:
+        raise ProviderDriverError(
+            "provider request URL 禁止 query/fragment",
+            code="provider_path_origin_mismatch",
+        )
+    resolved = _resolved_provider_endpoint(
+        f"{parsed_url.scheme}://{parsed_url.netloc}",
+    )
+    adapter = _PinnedAddressAdapter(resolved)
+    session = requests.Session()
+    # Provider traffic must never inherit operator/user proxy settings: doing
+    # so would replace the verified peer with an unvalidated proxy endpoint.
+    session.trust_env = False
+    session.mount(f"{resolved.scheme}://", adapter)
+    response = None
     try:
-        response = requests.request(
+        response = session.request(
             method,
             url,
             json=payload,
@@ -377,7 +790,7 @@ def _request_json(
                 code="provider_peer_unverifiable",
                 submission_uncertain=submission,
             )
-        if peer not in resolved_addresses:
+        if peer not in resolved.peer_addresses:
             response.close()
             raise ProviderDriverError(
                 "provider 连接地址与受控 DNS 解析不一致",
@@ -412,8 +825,10 @@ def _request_json(
                 code="provider_request_rejected",
             )
     except ProviderDriverError:
+        session.close()
         raise
     except requests.RequestException as exc:
+        session.close()
         raise ProviderDriverError(
             "provider 请求失败",
             code="provider_request_failed",
@@ -421,16 +836,19 @@ def _request_json(
             submission_uncertain=submission,
         ) from exc
     try:
-        return _response_json(response)
-    except ProviderDriverError as exc:
-        if not submission:
-            raise
-        raise ProviderDriverError(
-            str(exc),
-            code=exc.code,
-            retryable=exc.retryable,
-            submission_uncertain=True,
-        ) from exc
+        try:
+            return _response_json(response)
+        except ProviderDriverError as exc:
+            if not submission:
+                raise
+            raise ProviderDriverError(
+                str(exc),
+                code=exc.code,
+                retryable=exc.retryable,
+                submission_uncertain=True,
+            ) from exc
+    finally:
+        session.close()
 
 
 def _combined_config(deployment: ModelDeployment) -> dict[str, Any]:
@@ -441,6 +859,7 @@ def _combined_config(deployment: ModelDeployment) -> dict[str, Any]:
         schema_version=deployment.runtime_config_schema_version,
         size_bytes=deployment.runtime_config_size_bytes,
         sha256=deployment.runtime_config_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
     sensitive = find_sensitive_json_keys(deployment.runtime_config)
     if sensitive:
@@ -448,7 +867,71 @@ def _combined_config(deployment: ModelDeployment) -> dict[str, Any]:
             f"runtime_config 含敏感字段: {', '.join(sensitive)}",
             code="provider_plaintext_secret_forbidden",
         )
-    return {**profile.driver_config, **deployment.runtime_config}
+    combined = {**profile.driver_config, **deployment.runtime_config}
+    driver_for(profile).validate_config(combined)
+    return combined
+
+
+@dataclass(frozen=True, slots=True)
+class ComfyUIWorkflowSourceScope:
+    """Stable identity of one configured ComfyUI userdata workflow library.
+
+    A ModelDeployment is only a transport route to that library.  Model
+    profile, priority and timeout settings deliberately do not participate in
+    the scope so several model deployments on one ComfyUI instance are scanned
+    once.  Provider and host boundaries remain explicit.  Credentials are not
+    included until the ComfyUI transport itself actually consumes them.
+    """
+
+    schema_version: int
+    sha256: str
+    endpoint: str
+    directory: str
+
+
+def _canonical_comfyui_source_endpoint(value: str) -> str:
+    endpoint = validate_endpoint(value)
+    parsed = urlparse(endpoint)
+    scheme = parsed.scheme.casefold()
+    hostname = (parsed.hostname or "").casefold()
+    default_port = 443 if scheme == "https" else 80
+    port = parsed.port
+    display_host = f"[{hostname}]" if ":" in hostname else hostname
+    authority = display_host if port in {None, default_port} else f"{display_host}:{port}"
+    path = (parsed.path or "").rstrip("/")
+    return f"{scheme}://{authority}{path}"
+
+
+def comfyui_workflow_source_scope(
+    deployment: ModelDeployment,
+) -> ComfyUIWorkflowSourceScope:
+    """Return the non-secret, non-network source identity for saved workflows."""
+
+    if deployment.profile_version.provider.driver_type != ProviderProfile.DriverType.COMFYUI:
+        raise ValidationError("只有 ComfyUI deployment 具有已保存工作流来源范围")
+    config = _combined_config(deployment)
+    endpoint = _canonical_comfyui_source_endpoint(str(config.get("base_url") or ""))
+    directory = saved_workflow_directory()
+    contract = json_contract({
+        "schema_version": COMFYUI_WORKFLOW_SOURCE_SCOPE_SCHEMA_VERSION,
+        "kind": "comfyui.userdata.saved_workflows",
+        "provider_id": str(deployment.profile_version.provider_id),
+        "runtime_host_id": str(deployment.runtime_host_id or ""),
+        "endpoint": endpoint,
+        "directory": directory,
+    }, max_bytes=_stage_snapshot_max_bytes())
+    return ComfyUIWorkflowSourceScope(
+        schema_version=COMFYUI_WORKFLOW_SOURCE_SCOPE_SCHEMA_VERSION,
+        sha256=contract.sha256,
+        endpoint=endpoint,
+        directory=directory,
+    )
+
+
+def validate_deployment_execution_contract(deployment: ModelDeployment) -> None:
+    """Validate the complete merged Deployment contract without invoking it."""
+
+    _combined_config(deployment)
 
 
 def validate_provider_profile(profile: ProviderProfile) -> None:
@@ -457,6 +940,7 @@ def validate_provider_profile(profile: ProviderProfile) -> None:
         schema_version=profile.driver_config_schema_version,
         size_bytes=profile.driver_config_size_bytes,
         sha256=profile.driver_config_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
     sensitive = find_sensitive_json_keys(profile.driver_config)
     if sensitive:
@@ -465,7 +949,14 @@ def validate_provider_profile(profile: ProviderProfile) -> None:
         driver_class = _DRIVERS[profile.driver_type]
     except KeyError as exc:
         raise ValidationError({"driver_type": "未注册的 provider driver"}) from exc
-    driver_class().validate_config(profile.driver_config)
+    driver = driver_class()
+    # A Provider may deliberately delegate its executable endpoint contract to
+    # each Deployment.  Validate the Provider allowlist here; the merged,
+    # complete contract is validated by _combined_config and deployment writes.
+    if profile.driver_config.get("runtime_source") == "deployment":
+        ProviderDriver.validate_config(driver, profile.driver_config)
+    else:
+        driver.validate_config(profile.driver_config)
 
 
 class ProviderDriver(ABC):
@@ -510,16 +1001,52 @@ def _invoke_chat_completion(
     """One bounded OpenAI-compatible transport using deployment-owned config."""
 
     config = _combined_config(deployment)
-    base_url = validate_endpoint(config.get("base_url"), resolve_dns=True)
-    chat_path = _validate_relative_path(
-        config.get("chat_path", "/v1/chat/completions"), field="chat_path",
+    # Shape/allowlist validation happens here; _request_json performs the one
+    # DNS resolution that is pinned through TCP connect and peer validation.
+    base_url = validate_endpoint(config.get("base_url"))
+    chat_path = _validate_relative_path(config["chat_path"], field="chat_path")
+    raw_timeout = payload.get("timeout_seconds", config["timeout_seconds"])
+    timeout_max = boundary_number(
+        "security.provider.async_rest_timeout_max_seconds",
+        minimum=0.001,
     )
-    timeout = float(config.get("timeout_seconds", 60))
-    if not 0.5 <= timeout <= 600:
-        raise ProviderDriverError("timeout_seconds 无效", code="provider_config_invalid")
+    if (
+        isinstance(raw_timeout, bool)
+        or not isinstance(raw_timeout, (int, float))
+        or not math.isfinite(float(raw_timeout))
+        or not 0 < float(raw_timeout) <= timeout_max
+    ):
+        raise ProviderDriverError(
+            "timeout_seconds 缺失或超过当前安全边界",
+            code="provider_config_invalid",
+        )
+    timeout = float(raw_timeout)
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         raise ProviderDriverError("messages 必须是非空数组", code="provider_payload_invalid")
+    retired_request_fields = sorted(
+        field
+        for field in ("temperature", "response_format", "chat_completion_options")
+        if field in payload
+    )
+    if retired_request_fields:
+        raise ProviderDriverError(
+            (
+                "Chat 请求包含已退役的顶层字段；请使用 chat_request_options: "
+                + ", ".join(retired_request_fields)
+            ),
+            code="provider_payload_invalid",
+        )
+    raw_chat_request_options = payload.get(CHAT_REQUEST_OPTIONS_KEY)
+    try:
+        chat_request_options = validate_chat_request_options(
+            raw_chat_request_options,
+        )
+    except ValidationError as exc:
+        raise ProviderDriverError(
+            "chat_request_options 缺失或未通过受控传输合同",
+            code="provider_payload_invalid",
+        ) from exc
     headers = {"Content-Type": "application/json"}
     credential = deployment.credential or deployment.provider.credential
     hostname = (urlparse(base_url).hostname or "").casefold()
@@ -532,7 +1059,8 @@ def _invoke_chat_completion(
         "model": deployment.profile_version.model_identifier,
         "messages": messages,
     }
-    for key in ("temperature", "max_tokens", "response_format", "seed"):
+    body.update(chat_request_options)
+    for key in ("max_tokens", "seed"):
         if key in payload:
             body[key] = payload[key]
     response = _request_json(
@@ -541,16 +1069,73 @@ def _invoke_chat_completion(
     )
     choices = response.get("choices")
     text = ""
+    finish_reason = ""
+    message: dict[str, Any] | None = None
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-        message = choices[0].get("message")
-        if isinstance(message, dict):
-            text = str(message.get("content") or "")
+        finish_reason = str(choices[0].get("finish_reason") or "").strip().casefold()
+        candidate = choices[0].get("message")
+        if isinstance(candidate, dict):
+            message = candidate
+            text = str(candidate.get("content") or "")
+    if finish_reason in {"length", "content_filter"}:
+        safe_usage = _safe_chat_usage(response.get("usage"))
+        response_id = str(response.get("id") or "")
+        error = ProviderDriverError(
+            "OpenAI-compatible 响应被截断或过滤",
+            code="provider_response_invalid",
+        )
+        error.metadata = {
+            "contract_error_code": (
+                "response_output_budget_exhausted"
+                if finish_reason == "length"
+                else "response_content_filtered"
+            ),
+            "finish_reason": finish_reason,
+            **({"usage": safe_usage} if safe_usage else {}),
+            **(
+                {
+                    "response_id_sha256": hashlib.sha256(
+                        response_id.encode("utf-8"),
+                    ).hexdigest(),
+                }
+                if response_id else {}
+            ),
+        }
+        raise error
     if not text:
+        contract_error_code = "response_missing_text"
+        if finish_reason == "length":
+            contract_error_code = "response_output_budget_exhausted"
+        elif finish_reason == "content_filter":
+            contract_error_code = "response_content_filtered"
+        elif message is not None and message.get("tool_calls"):
+            contract_error_code = "response_tool_call_without_text"
+        elif message is not None and message.get("reasoning_content"):
+            contract_error_code = "response_reasoning_without_text"
         error = ProviderDriverError(
             "OpenAI-compatible 响应缺少文本",
             code="provider_response_invalid",
         )
-        error.metadata = {"contract_error_code": "response_missing_text"}
+        # Persist only a stable internal classifier.  Never attach provider
+        # response bodies, authored reasoning, request ids, or secrets here.
+        safe_usage = _safe_chat_usage(response.get("usage"))
+        response_id = str(response.get("id") or "")
+        error.metadata = {
+            "contract_error_code": contract_error_code,
+            **(
+                {"finish_reason": finish_reason}
+                if finish_reason in SAFE_CHAT_FINISH_REASONS else {}
+            ),
+            **({"usage": safe_usage} if safe_usage else {}),
+            **(
+                {
+                    "response_id_sha256": hashlib.sha256(
+                        response_id.encode("utf-8"),
+                    ).hexdigest(),
+                }
+                if response_id else {}
+            ),
+        }
         raise error
     return {
         "schema_version": 1,
@@ -567,22 +1152,64 @@ def _invoke_prompt_normalization(
     credential_optional: bool,
 ) -> dict[str, Any]:
     try:
-        chat_payload = prompt_normalization_chat_payload(payload)
+        policy = prompt_normalization_policy_from_specification(
+            verified_model_profile_specification(deployment.profile_version),
+            required=True,
+        )
+        assert policy is not None
+        chat_payload = prompt_normalization_chat_payload(payload, policy=policy)
+        input_warnings = prompt_normalization_input_warnings(
+            policy,
+            chat_payload.get("messages"),
+        )
         chat_response = _invoke_chat_completion(
             deployment,
             chat_payload,
             credential_optional=credential_optional,
         )
         result = parse_prompt_normalization_chat_response(payload, chat_response)
+        metadata = (
+            dict(result.get("metadata"))
+            if isinstance(result.get("metadata"), dict)
+            else {}
+        )
+        usage_warnings = prompt_normalization_usage_warnings(
+            policy,
+            metadata.get("usage"),
+        )
+        if input_warnings or usage_warnings:
+            metadata["warnings"] = [
+                *(
+                    metadata.get("warnings")
+                    if isinstance(metadata.get("warnings"), list)
+                    else []
+                ),
+                *input_warnings,
+                *usage_warnings,
+            ]
+        result["metadata"] = metadata
     except PromptNormalizationContractError as exc:
         error = ProviderDriverError(
             str(exc),
             code="provider_response_invalid",
             submission_uncertain=False,
         )
+        reason_code = safe_prompt_field_validation_reason_code(
+            getattr(exc, "reason_code", ""),
+        )
+        validation_context = safe_prompt_field_validation_context(
+            reason_code,
+            getattr(exc, "validation_context", None),
+            request_payload=payload,
+        )
         error.metadata = {
             "contract_error_code": str(
                 getattr(exc, "code", "prompt_normalize_contract_invalid")
+            ),
+            **({"reason_code": reason_code} if reason_code else {}),
+            **(
+                {"validation_context": validation_context}
+                if validation_context else {}
             ),
         }
         raise error from exc
@@ -600,14 +1227,12 @@ def deployment_supports_script_generation(deployment: ModelDeployment) -> bool:
         return False
     try:
         validate_endpoint(base_url)
-        _validate_relative_path(
-            config.get("chat_path", "/v1/chat/completions"),
-            field="chat_path",
-        )
-        timeout = float(config.get("timeout_seconds", 60))
-        if not 0.5 <= timeout <= 600:
+        _validate_relative_path(config["chat_path"], field="chat_path")
+        timeout = float(config["timeout_seconds"])
+        timeout_max = boundary_number("security.provider.async_rest_timeout_max_seconds", minimum=0.001)
+        if not 0 < timeout <= timeout_max:
             return False
-    except (ProviderDriverError, ValidationError, TypeError, ValueError):
+    except (ProviderDriverError, ValidationError, KeyError, TypeError, ValueError):
         return False
     if driver_type == ProviderProfile.DriverType.OPENAI_COMPATIBLE:
         return True
@@ -622,22 +1247,33 @@ def deployment_supports_script_generation(deployment: ModelDeployment) -> bool:
     return False
 
 
-class _LegacyTextDriver(ProviderDriver):
+class _ConfiguredTextDriver(ProviderDriver):
     provider_id = ""
     allowed_config_keys = frozenset({"runtime_source", "base_url", "pricing"})
 
     def validate_config(self, config):
         super().validate_config(config)
+        validate_capability_ttl_seconds(config, required=True)
         if config.get("runtime_source") != "openai_compatible_endpoint":
-            return
+            raise ValidationError({
+                "runtime_source": (
+                    "可执行文本 Deployment 必须显式配置 "
+                    "openai_compatible_endpoint"
+                ),
+            })
         validate_endpoint(config.get("base_url"))
-        _validate_relative_path(
-            config.get("chat_path", "/v1/chat/completions"),
-            field="chat_path",
-        )
-        timeout = float(config.get("timeout_seconds", 60))
-        if not 0.5 <= timeout <= 600:
-            raise ValidationError({"timeout_seconds": "必须在 0.5 到 600 秒之间"})
+        try:
+            chat_path = config["chat_path"]
+        except KeyError as exc:
+            raise ValidationError({"chat_path": "必须显式配置相对路径"}) from exc
+        _validate_relative_path(chat_path, field="chat_path")
+        try:
+            timeout = float(config["timeout_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError({"timeout_seconds": "必须显式配置有限正数"}) from exc
+        timeout_max = boundary_number("security.provider.async_rest_timeout_max_seconds", minimum=0.001)
+        if not 0 < timeout <= timeout_max:
+            raise ValidationError({"timeout_seconds": f"必须大于 0 且不超过安全边界 {timeout_max:g} 秒"})
 
     def estimate(self, deployment, operation, payload):
         config = _combined_config(deployment)
@@ -657,23 +1293,23 @@ class _LegacyTextDriver(ProviderDriver):
             "schema_version": 1,
             "modality": "text",
             "operations": [],
-            "legacy_settings_bridge": True,
         }
 
     def invoke(self, deployment, operation, payload):
         _combined_config(deployment)
         raise ProviderDriverError(
-            f"legacy text driver 尚未为 {operation} 建立统一调用契约",
+            f"当前文本驱动尚未为 {operation} 建立统一调用契约",
             code="provider_operation_not_supported",
         )
 
 
 @register_driver(ProviderProfile.DriverType.LOCAL_QWEN)
-class LocalQwenDriver(_LegacyTextDriver):
+class LocalQwenDriver(_ConfiguredTextDriver):
     provider_id = "local_qwen"
 
     allowed_config_keys = frozenset({
-        "runtime_source", "base_url", "chat_path", "timeout_seconds", "pricing",
+        "runtime_source", "base_url", "chat_path", "timeout_seconds",
+        "capability_ttl_seconds", "pricing",
     })
 
     def capabilities(self):
@@ -695,18 +1331,19 @@ class LocalQwenDriver(_LegacyTextDriver):
                 )
         if operation == PROMPT_NORMALIZE_OPERATION:
             raise ProviderDriverError(
-                "local_qwen deployment 缺少受控 OpenAI-compatible endpoint；禁止回退 legacy settings",
+                "local_qwen deployment 必须显式配置受控 OpenAI-compatible endpoint",
                 code="provider_operation_not_supported",
             )
         return super().invoke(deployment, operation, payload)
 
 
 @register_driver(ProviderProfile.DriverType.DEEPSEEK_API)
-class DeepSeekDriver(_LegacyTextDriver):
+class DeepSeekDriver(_ConfiguredTextDriver):
     provider_id = "deepseek_api"
 
     allowed_config_keys = frozenset({
-        "runtime_source", "base_url", "chat_path", "timeout_seconds", "pricing",
+        "runtime_source", "base_url", "chat_path", "timeout_seconds",
+        "capability_ttl_seconds", "pricing",
     })
 
     def capabilities(self):
@@ -728,28 +1365,189 @@ class DeepSeekDriver(_LegacyTextDriver):
                 )
         if operation == PROMPT_NORMALIZE_OPERATION:
             raise ProviderDriverError(
-                "deepseek deployment 缺少受控 OpenAI-compatible endpoint；禁止回退 legacy settings",
+                "deepseek deployment 必须显式配置受控 OpenAI-compatible endpoint",
                 code="provider_operation_not_supported",
             )
         return super().invoke(deployment, operation, payload)
 
 
+_COMFYUI_DIAGNOSTIC_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]+")
+_COMFYUI_DIAGNOSTIC_SECRET_RE = re.compile(
+    r"(?i)\b("
+    r"api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|authorization|"
+    r"token|secret|password)"
+    r"\b\s*[:=]\s*[^\s,;]+",
+)
+_COMFYUI_DIAGNOSTIC_BEARER_RE = re.compile(
+    r"(?i)\bbearer\s+[a-z0-9._~+/=-]+",
+)
+_COMFYUI_DIAGNOSTIC_URL_RE = re.compile(r"(?i)https?://[^\s,;]+")
+_COMFYUI_DIAGNOSTIC_WINDOWS_PATH_RE = re.compile(
+    r"(?i)(?<![a-z0-9])[a-z]:\\[^\s,;]+",
+)
+_COMFYUI_DIAGNOSTIC_POSIX_PATH_RE = re.compile(
+    r"(?<![:a-zA-Z0-9])/(?:[^/\s]+/)+[^\s,;]*",
+)
+
+
+def _safe_comfyui_diagnostic_text(value: object, *, maximum: int) -> str:
+    """Project one ComfyUI diagnostic field without exposing traceback payloads."""
+
+    if not isinstance(value, str):
+        return ""
+    text = value.split("Traceback (most recent call last):", 1)[0]
+    text = _COMFYUI_DIAGNOSTIC_CONTROL_RE.sub(" ", text)
+    text = " ".join(text.split()).strip()
+    if not text or re.search(r"(?i)<(?:!doctype|html|body|script)\b", text):
+        return ""
+    text = _COMFYUI_DIAGNOSTIC_BEARER_RE.sub("Bearer [REDACTED]", text)
+    text = _COMFYUI_DIAGNOSTIC_URL_RE.sub("[REDACTED_URL]", text)
+    text = _COMFYUI_DIAGNOSTIC_WINDOWS_PATH_RE.sub("[REDACTED_PATH]", text)
+    text = _COMFYUI_DIAGNOSTIC_POSIX_PATH_RE.sub("[REDACTED_PATH]", text)
+    text = _COMFYUI_DIAGNOSTIC_SECRET_RE.sub(
+        lambda match: f"{match.group(1)}=[REDACTED]",
+        text,
+    )
+    return text if len(text) <= maximum else f"{text[:maximum - 1]}…"
+
+
+def _comfyui_failure_explanation(message: str) -> tuple[str, str]:
+    normalized = message.casefold()
+    if "requires at least one reference media input" in normalized:
+        return (
+            "Ref2VA 模式至少需要 1 个参考图片、参考视频或参考音频。",
+            "在“本次 Smoke 输入”中添加至少 1 个合格参考素材，然后创建新的 Smoke 任务。",
+        )
+    if "cuda out of memory" in normalized or "outofmemoryerror" in normalized:
+        return (
+            "运行实例显存不足，ComfyUI 无法继续执行当前工作流。",
+            "先释放同主机上的并行 GPU 任务，或改用显存充足的运行实例；重新探测并 Live Validate 后再创建新的 Smoke 任务。",
+        )
+    if any(marker in normalized for marker in (
+        "model not found", "no such file or directory", "file not found",
+    )):
+        return (
+            message or "工作流依赖的模型或文件不存在。",
+            "核对该运行实例的模型文件与自定义节点依赖；完成主机探测和 Live Validate 后再创建新的 Smoke 任务。",
+        )
+    return (
+        message or "ComfyUI 未返回可安全展示的具体异常正文。",
+        "根据失败节点检查本次输入、模型文件和自定义节点依赖；若修改了节点图，请在 ComfyUI 保存新 revision 并重新导入，否则修正输入后创建新的 Smoke 任务。",
+    )
+
+
+def _comfyui_poll_failure(history: object) -> dict[str, object]:
+    """Project only the reviewed fields of the last ComfyUI execution error."""
+
+    status = history.get("status") if isinstance(history, dict) else None
+    messages = status.get("messages") if isinstance(status, dict) else None
+    failure: dict[str, object] | None = None
+    if isinstance(messages, list):
+        for event in reversed(messages):
+            if (
+                isinstance(event, (list, tuple))
+                and len(event) >= 2
+                and str(event[0]) == "execution_error"
+                and isinstance(event[1], dict)
+            ):
+                failure = event[1]
+                break
+    if failure is None:
+        return {}
+
+    return {
+        "schema_version": 1,
+        "kind": "execution_error",
+        "node_id": _safe_comfyui_diagnostic_text(
+            failure.get("node_id"), maximum=120,
+        ),
+        "exception_type": _safe_comfyui_diagnostic_text(
+            failure.get("exception_type"), maximum=120,
+        ),
+        "exception_message": _safe_comfyui_diagnostic_text(
+            failure.get("exception_message"), maximum=700,
+        ),
+    }
+
+
+def _comfyui_failure_message(failure: object, *, graph: object) -> str:
+    """Format a diagnostic using the frozen submitted graph as node authority."""
+
+    if (
+        not isinstance(failure, dict)
+        or failure.get("schema_version") != 1
+        or failure.get("kind") != "execution_error"
+    ):
+        return ""
+    node_id = _safe_comfyui_diagnostic_text(failure.get("node_id"), maximum=120)
+    node = graph.get(node_id) if isinstance(graph, dict) and node_id else None
+    verified_node_id = node_id if isinstance(node, dict) else ""
+    node_type = _safe_comfyui_diagnostic_text(
+        node.get("class_type") if isinstance(node, dict) else "",
+        maximum=191,
+    )
+    exception_type = _safe_comfyui_diagnostic_text(
+        failure.get("exception_type"), maximum=120,
+    )
+    remote_message = _safe_comfyui_diagnostic_text(
+        failure.get("exception_message"), maximum=700,
+    )
+    reason, recovery = _comfyui_failure_explanation(remote_message)
+    node_label = (
+        f"节点 {verified_node_id}（{node_type}）"
+        if verified_node_id and node_type
+        else f"节点 {verified_node_id}"
+        if verified_node_id
+        else "冻结图中无法确认的节点"
+    )
+    type_label = f" [{exception_type}]" if exception_type else ""
+    original = (
+        f"远端原文：{remote_message}。"
+        if remote_message and remote_message != reason
+        else ""
+    )
+    return (
+        f"ComfyUI {node_label}执行失败{type_label}。"
+        f"原因：{reason}{original}处理建议：{recovery}"
+    )[:1500]
+
+
 @register_driver(ProviderProfile.DriverType.COMFYUI)
 class ComfyUIDriver(ProviderDriver):
-    allowed_config_keys = frozenset({"runtime_source", "base_url", "timeout_seconds", "pricing"})
+    allowed_config_keys = frozenset({
+        "runtime_source", "base_url", "timeout_seconds", "pricing",
+        "pre_submit_resource_release", "capability_ttl_seconds",
+        "poll_interval_seconds", "max_poll_seconds",
+    })
 
     def validate_config(self, config):
         super().validate_config(config)
-        if config.get("base_url"):
-            validate_endpoint(config["base_url"])
-        if "timeout_seconds" in config and not 0.5 <= float(config["timeout_seconds"]) <= 3600:
-            raise ValidationError({"timeout_seconds": "必须在 0.5 到 3600 秒之间"})
+        validate_capability_ttl_seconds(config, required=True)
+        try:
+            base_url = config["base_url"]
+        except KeyError as exc:
+            raise ValidationError({"base_url": "必须显式配置 ComfyUI 服务根地址"}) from exc
+        validate_endpoint(base_url)
+        restricted_comfyui_runtime_budget(config)
+        from studio.services.comfyui import (
+            ComfyUIError,
+            validate_pre_submit_resource_release_policy,
+        )
+        try:
+            validate_pre_submit_resource_release_policy(
+                config.get("pre_submit_resource_release"),
+            )
+        except ComfyUIError as exc:
+            raise ValidationError({"pre_submit_resource_release": str(exc)}) from exc
 
     def capabilities(self):
         return {
             "schema_version": 1,
-            "modalities": ["image", "video"],
-            "operations": ["health", "object_info", "models", "upload", "submit", "poll", "cancel", "collect"],
+            "modalities": ["text", "image", "video", "audio"],
+            "operations": [
+                "health", "object_info", "models", "workflow_library.list",
+                "workflow_library.read", "upload", "submit", "poll", "cancel", "collect",
+            ],
         }
 
     def estimate(self, deployment, operation, payload):
@@ -759,15 +1557,40 @@ class ComfyUIDriver(ProviderDriver):
         return _pricing_estimate(deployment, allow_zero_without_pricing=local)
 
     def invoke(self, deployment, operation, payload):
-        from studio.services.comfyui import ComfyUIClient, ComfyUIError
+        from studio.services.comfyui import (
+            ComfyUIClient,
+            ComfyUIError,
+            ComfyUIHTTPError,
+            ComfyUIPreSubmitResourceReleaseError,
+        )
 
         config = _combined_config(deployment)
         try:
             endpoint = validate_endpoint(config.get("base_url"), resolve_dns=True)
+            configured_timeout = float(config["timeout_seconds"])
+            transport_timeout = payload.get("_transport_timeout_seconds")
+            if transport_timeout is not None:
+                if (
+                    isinstance(transport_timeout, bool)
+                    or not isinstance(transport_timeout, (int, float))
+                    or not math.isfinite(float(transport_timeout))
+                    or float(transport_timeout) <= 0
+                ):
+                    raise ProviderDriverError(
+                        "transport timeout 合同无效",
+                        code="provider_payload_invalid",
+                    )
+                transport_timeout = float(transport_timeout)
+                effective_timeout = min(configured_timeout, transport_timeout)
+            else:
+                effective_timeout = configured_timeout
             client = ComfyUIClient(
                 base_url=endpoint,
-                timeout=float(config.get("timeout_seconds") or 0) or None,
+                timeout=effective_timeout,
                 endpoint_prevalidated=True,
+                pre_submit_resource_release_policy=config.get(
+                    "pre_submit_resource_release",
+                ),
             )
             if operation == "health":
                 return client.health()
@@ -776,6 +1599,24 @@ class ComfyUIDriver(ProviderDriver):
             if operation == "models":
                 folder = str(payload.get("folder") or "")
                 return {"schema_version": 1, "folder": folder, "items": client.models(folder)}
+            if operation == "workflow_library.list":
+                return {
+                    "schema_version": 1,
+                    "items": client.list_saved_workflows(saved_workflow_directory()),
+                }
+            if operation == "workflow_library.read":
+                source_path = str(payload.get("source_path") or "")
+                document = client.read_saved_workflow(
+                    source_path,
+                    saved_workflow_directory(),
+                )
+                return {
+                    "schema_version": 1,
+                    "source_path": document.source_path,
+                    "source_sha256": document.sha256,
+                    "size_bytes": document.size_bytes,
+                    "workflow": document.workflow,
+                }
             if operation == "upload":
                 source_path = payload.get("source_path")
                 if not isinstance(source_path, (str, Path)):
@@ -801,6 +1642,7 @@ class ComfyUIDriver(ProviderDriver):
                         "submit 必须提供 workflow 对象",
                         code="provider_payload_invalid",
                     )
+                release_audit = client.release_resources_before_submit()
                 result = client.queue_prompt(
                     workflow,
                     client_id=str(payload.get("client_id") or "") or None,
@@ -811,6 +1653,7 @@ class ComfyUIDriver(ProviderDriver):
                     "request_id": result.prompt_id,
                     "number": result.number,
                     "node_errors": result.node_errors,
+                    "pre_submit_resource_release": release_audit,
                 }
             if operation in {"poll", "cancel", "collect"}:
                 request_id = str(payload.get("request_id") or "").strip()
@@ -824,7 +1667,11 @@ class ComfyUIDriver(ProviderDriver):
                     return {"schema_version": 1, "request_id": request_id, "status": "cancel_requested"}
                 history = client.history(request_id)
                 if history is None:
-                    return {"schema_version": 1, "request_id": request_id, "status": "running"}
+                    return {
+                        "schema_version": 1,
+                        "request_id": request_id,
+                        "status": "running" if client.is_queued(request_id) else "missing",
+                    }
                 remote_status = history.get("status") if isinstance(history, dict) else {}
                 failed = bool(
                     isinstance(remote_status, dict)
@@ -839,11 +1686,14 @@ class ComfyUIDriver(ProviderDriver):
                     and not failed
                 )
                 if operation == "poll":
-                    return {
+                    result = {
                         "schema_version": 1,
                         "request_id": request_id,
                         "status": "failed" if failed else "succeeded" if completed else "running",
                     }
+                    if failed:
+                        result["failure"] = _comfyui_poll_failure(history)
+                    return result
                 if failed or not completed:
                     raise ProviderDriverError(
                         "远端任务尚未成功，不能 collect",
@@ -863,9 +1713,27 @@ class ComfyUIDriver(ProviderDriver):
                 }
         except ProviderDriverError:
             raise
+        except ComfyUIPreSubmitResourceReleaseError as exc:
+            raise ProviderDriverError(
+                str(exc),
+                code=exc.code,
+                retryable=False,
+                submission_uncertain=False,
+            ) from exc
+        except ComfyUIHTTPError as exc:
+            code = (
+                "provider_request_rejected"
+                if 400 <= exc.status_code < 500
+                else "comfyui_operation_failed"
+            )
+            raise ProviderDriverError(
+                str(exc),
+                code=code,
+                retryable=exc.status_code >= 500,
+            ) from exc
         except (ComfyUIError, ValidationError, ValueError) as exc:
             raise ProviderDriverError(
-                "ComfyUI operation 失败",
+                f"ComfyUI operation 失败: {str(exc)[:1500]}",
                 code="comfyui_operation_failed",
             ) from exc
         raise ProviderDriverError("ComfyUI operation 不受支持", code="provider_operation_not_supported")
@@ -873,15 +1741,26 @@ class ComfyUIDriver(ProviderDriver):
 
 @register_driver(ProviderProfile.DriverType.OPENAI_COMPATIBLE)
 class OpenAICompatibleDriver(ProviderDriver):
-    allowed_config_keys = frozenset({"base_url", "chat_path", "timeout_seconds", "pricing"})
+    allowed_config_keys = frozenset({
+        "base_url", "chat_path", "timeout_seconds", "capability_ttl_seconds", "pricing",
+    })
 
     def validate_config(self, config):
         super().validate_config(config)
+        validate_capability_ttl_seconds(config, required=True)
         validate_endpoint(config.get("base_url"))
-        _validate_relative_path(config.get("chat_path", "/v1/chat/completions"), field="chat_path")
-        timeout = float(config.get("timeout_seconds", 60))
-        if not 0.5 <= timeout <= 600:
-            raise ValidationError({"timeout_seconds": "必须在 0.5 到 600 秒之间"})
+        try:
+            chat_path = config["chat_path"]
+        except KeyError as exc:
+            raise ValidationError({"chat_path": "必须显式配置相对路径"}) from exc
+        _validate_relative_path(chat_path, field="chat_path")
+        try:
+            timeout = float(config["timeout_seconds"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValidationError({"timeout_seconds": "必须显式配置有限正数"}) from exc
+        timeout_max = boundary_number("security.provider.async_rest_timeout_max_seconds", minimum=0.001)
+        if not 0 < timeout <= timeout_max:
+            raise ValidationError({"timeout_seconds": f"必须大于 0 且不超过安全边界 {timeout_max:g} 秒"})
 
     def capabilities(self):
         return {
@@ -923,64 +1802,70 @@ class RestrictedAsyncRestDriver(ProviderDriver):
     def validate_config(self, config):
         super().validate_config(config)
         validate_endpoint(config.get("base_url"))
-        _validate_relative_path(config.get("health_path", "/health"), field="health_path")
-        _validate_relative_path(config.get("submit_path", "/jobs"), field="submit_path")
+        required_fields = (
+            "health_path", "submit_path", "poll_path", "cancel_path", "collect_path",
+            "request_id_field", "status_field", "artifacts_field", "actual_cost_field",
+            "currency_field", "artifact_url_field", "artifact_kind_field",
+            "artifact_id_field", "artifact_sha256_field", "idempotency_header",
+        )
+        missing = [field for field in required_fields if field not in config]
+        if missing:
+            raise ValidationError({
+                "driver_config": "async_rest 执行合同缺少必填字段: " + ", ".join(missing),
+            })
+        _validate_relative_path(config["health_path"], field="health_path")
+        _validate_relative_path(config["submit_path"], field="submit_path")
         _validate_relative_path(
-            config.get("poll_path", "/jobs/{request_id}"),
+            config["poll_path"],
             field="poll_path",
             allow_placeholder=True,
         )
         _validate_relative_path(
-            config.get("cancel_path", "/jobs/{request_id}"),
+            config["cancel_path"],
             field="cancel_path",
             allow_placeholder=True,
         )
         _validate_relative_path(
-            config.get("collect_path", "/jobs/{request_id}"),
+            config["collect_path"],
             field="collect_path",
             allow_placeholder=True,
         )
         for field in ("request_id_field", "status_field"):
-            value = str(config.get(field) or ("id" if field == "request_id_field" else "status"))
+            value = str(config[field])
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value) is None:
                 raise ValidationError({field: "只允许单层 JSON 字段名"})
         progress_field = str(config.get("progress_field") or "").strip()
         if progress_field and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", progress_field) is None:
             raise ValidationError({"progress_field": "只允许单层 JSON 字段名"})
         if progress_field:
+            if "progress_max" not in config:
+                raise ValidationError({"progress_max": "配置 progress_field 时必须显式配置"})
             try:
-                progress_max = float(config.get("progress_max", 100))
+                progress_max = float(config["progress_max"])
             except (TypeError, ValueError) as exc:
                 raise ValidationError({"progress_max": "必须是正数"}) from exc
             if not math.isfinite(progress_max) or progress_max <= 0:
                 raise ValidationError({"progress_max": "必须是有限正数"})
-        for field, fallback in (
-            ("artifacts_field", "artifacts"),
-            ("actual_cost_field", "actual_cost"),
-            ("currency_field", "currency"),
-            ("artifact_url_field", "url"),
-            ("artifact_kind_field", "kind"),
-            ("artifact_id_field", "id"),
-            ("artifact_sha256_field", "sha256"),
+        for field in (
+            "artifacts_field", "actual_cost_field", "currency_field",
+            "artifact_url_field", "artifact_kind_field", "artifact_id_field",
+            "artifact_sha256_field",
         ):
-            value = str(config.get(field) or fallback)
+            value = str(config[field])
             if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", value) is None:
                 raise ValidationError({field: "只允许单层 JSON 字段名"})
-        header = str(config.get("idempotency_header") or "Idempotency-Key")
+        header = str(config["idempotency_header"])
         if re.fullmatch(r"[A-Za-z][A-Za-z0-9-]{0,63}", header) is None:
             raise ValidationError({"idempotency_header": "HTTP header 名无效"})
-        timeout = float(config.get("timeout_seconds", 60))
-        if not 0.5 <= timeout <= 600:
-            raise ValidationError({"timeout_seconds": "必须在 0.5 到 600 秒之间"})
-        poll_interval = float(config.get("poll_interval_seconds", 2))
-        if not 0.25 <= poll_interval <= 300:
-            raise ValidationError({"poll_interval_seconds": "必须在 0.25 到 300 秒之间"})
-        max_poll = int(config.get("max_poll_seconds", 3600))
-        if not 10 <= max_poll <= 604800:
-            raise ValidationError({"max_poll_seconds": "必须在 10 到 604800 秒之间"})
-        capability_ttl = int(config.get("capability_ttl_seconds", 3600))
-        if not 60 <= capability_ttl <= 604800:
-            raise ValidationError({"capability_ttl_seconds": "必须在 60 到 604800 秒之间"})
+        restricted_async_rest_runtime_budget(config)
+        validate_capability_ttl_seconds(config, required=True)
+        contract_limits = restricted_async_rest_contract_limits()
+        terminal_status_max_items = contract_limits[
+            _ASYNC_REST_TERMINAL_STATUS_MAX_ITEMS_KEY
+        ]
+        terminal_status_max_characters = contract_limits[
+            _ASYNC_REST_TERMINAL_STATUS_MAX_CHARACTERS_KEY
+        ]
         terminal_success = config.get("terminal_success")
         terminal_failure = config.get("terminal_failure")
         for field, values in (
@@ -991,10 +1876,20 @@ class RestrictedAsyncRestDriver(ProviderDriver):
             if (
                 not isinstance(values, list)
                 or not values
-                or len(values) > 32
-                or any(not isinstance(item, str) or not item or len(item) > 120 for item in values)
+                or len(values) > terminal_status_max_items
+                or any(
+                    not isinstance(item, str)
+                    or not item
+                    or len(item) > terminal_status_max_characters
+                    for item in values
+                )
             ):
-                raise ValidationError({field: "必须为 1 到 32 个非空状态字符串"})
+                raise ValidationError({
+                    field: (
+                        f"必须为 1 到 {terminal_status_max_items} 个非空状态字符串，"
+                        f"每项不超过 {terminal_status_max_characters} 个字符"
+                    ),
+                })
         terminal_cancelled = config["terminal_cancelled"]
         if (
             set(terminal_success) & set(terminal_failure)
@@ -1021,9 +1916,16 @@ class RestrictedAsyncRestDriver(ProviderDriver):
         if (
             not isinstance(artifact_hosts, list)
             or not artifact_hosts
-            or len(artifact_hosts) > 32
+            or len(artifact_hosts) > contract_limits[
+                _ASYNC_REST_ARTIFACT_HOST_MAX_ITEMS_KEY
+            ]
         ):
-            raise ValidationError({"artifact_allowed_hosts": "必须声明 1 到 32 个产物主机"})
+            raise ValidationError({
+                "artifact_allowed_hosts": (
+                    "必须声明 1 到 "
+                    f"{contract_limits[_ASYNC_REST_ARTIFACT_HOST_MAX_ITEMS_KEY]} 个产物主机"
+                ),
+            })
         global_hosts = _allowed_provider_hosts()
         for host in artifact_hosts:
             normalized = str(host or "").strip().casefold()
@@ -1048,8 +1950,10 @@ class RestrictedAsyncRestDriver(ProviderDriver):
     def invoke(self, deployment, operation, payload):
         config = _combined_config(deployment)
         self.validate_config(config)
-        base_url = validate_endpoint(config["base_url"], resolve_dns=True)
-        timeout = float(config.get("timeout_seconds", 60))
+        contract_limits = restricted_async_rest_contract_limits()
+        runtime_budget = restricted_async_rest_runtime_budget(config)
+        base_url = validate_endpoint(config["base_url"])
+        timeout = float(runtime_budget["timeout_seconds"])
         credential = deployment.credential or deployment.provider.credential
         headers = {"Content-Type": "application/json"}
         if credential:
@@ -1057,7 +1961,7 @@ class RestrictedAsyncRestDriver(ProviderDriver):
         if operation == "health":
             response = _request_json(
                 "GET",
-                _endpoint_url(base_url, config.get("health_path", "/health")),
+                _endpoint_url(base_url, config["health_path"]),
                 timeout=timeout,
                 headers=headers,
             )
@@ -1071,7 +1975,7 @@ class RestrictedAsyncRestDriver(ProviderDriver):
                     "异步 submit 必须提供持久化 idempotency_key",
                     code="provider_payload_invalid",
                 )
-            headers[str(config.get("idempotency_header") or "Idempotency-Key")] = idempotency_key
+            headers[str(config["idempotency_header"])] = idempotency_key
             allowed_payload = self.STANDARD_REQUEST_FIELDS | {"schema_version", "idempotency_key"}
             unknown_payload = sorted(set(payload) - allowed_payload)
             if unknown_payload:
@@ -1090,12 +1994,12 @@ class RestrictedAsyncRestDriver(ProviderDriver):
                     "异步 submit 缺少 model/prompt",
                     code="provider_payload_invalid",
                 )
-            path = config.get("submit_path", "/jobs")
+            path = config["submit_path"]
             response = _request_json(
                 "POST", _endpoint_url(base_url, path),
                 timeout=timeout, headers=headers, payload=body, submission=True,
             )
-            request_id = response.get(config.get("request_id_field", "id"))
+            request_id = response.get(config["request_id_field"])
             if not isinstance(request_id, (str, int)) or not str(request_id):
                 raise ProviderDriverError(
                     "异步 REST 响应缺少 request id",
@@ -1113,7 +2017,7 @@ class RestrictedAsyncRestDriver(ProviderDriver):
             else "cancel_path" if operation == "cancel"
             else "collect_path"
         )
-        path = config.get(path_key, "/jobs/{request_id}").replace(
+        path = config[path_key].replace(
             "{request_id}", quote(request_id, safe=""),
         )
         response = _request_json(
@@ -1123,7 +2027,15 @@ class RestrictedAsyncRestDriver(ProviderDriver):
             headers=headers,
             payload=None,
         )
-        remote_status = str(response.get(config.get("status_field", "status")) or "")
+        remote_status = str(response.get(config["status_field"]) or "")
+        remote_status_max_characters = contract_limits[
+            _ASYNC_REST_TERMINAL_STATUS_MAX_CHARACTERS_KEY
+        ]
+        if len(remote_status) > remote_status_max_characters:
+            raise ProviderDriverError(
+                "异步 REST status 超过已发布安全边界",
+                code="provider_response_invalid",
+            )
         result = {
             "schema_version": 1,
             "request_id": request_id,
@@ -1136,7 +2048,7 @@ class RestrictedAsyncRestDriver(ProviderDriver):
         if operation == "poll" and progress_field and response.get(progress_field) is not None:
             try:
                 raw_progress = float(response[progress_field])
-                progress_max = float(config.get("progress_max", 100))
+                progress_max = float(config["progress_max"])
             except (TypeError, ValueError) as exc:
                 raise ProviderDriverError(
                     "异步 REST progress 字段无效",
@@ -1149,7 +2061,7 @@ class RestrictedAsyncRestDriver(ProviderDriver):
                 )
             result["progress_fraction"] = raw_progress / progress_max
         if operation == "collect":
-            artifacts = response.get(config.get("artifacts_field", "artifacts"))
+            artifacts = response.get(config["artifacts_field"])
             if not isinstance(artifacts, list) or not artifacts:
                 raise ProviderDriverError(
                     "异步 REST collect 缺少 artifacts",
@@ -1162,9 +2074,9 @@ class RestrictedAsyncRestDriver(ProviderDriver):
                         "异步 REST artifact 必须是对象",
                         code="provider_response_invalid",
                     )
-                url = artifact.get(config.get("artifact_url_field", "url"))
-                kind = str(artifact.get(config.get("artifact_kind_field", "kind")) or "")
-                if not isinstance(url, str) or not url or kind not in {"image", "video"}:
+                url = artifact.get(config["artifact_url_field"])
+                kind = str(artifact.get(config["artifact_kind_field"]) or "")
+                if not isinstance(url, str) or not url or kind not in {"image", "video", "audio"}:
                     raise ProviderDriverError(
                         f"异步 REST artifact[{index}] 缺少受支持的 url/kind",
                         code="provider_response_invalid",
@@ -1172,10 +2084,10 @@ class RestrictedAsyncRestDriver(ProviderDriver):
                 normalized_artifacts.append({
                     "url": url,
                     "kind": kind,
-                    "artifact_id": str(artifact.get(config.get("artifact_id_field", "id")) or "")[:191],
-                    "sha256": str(artifact.get(config.get("artifact_sha256_field", "sha256")) or "").casefold(),
+                    "artifact_id": str(artifact.get(config["artifact_id_field"]) or "")[:191],
+                    "sha256": str(artifact.get(config["artifact_sha256_field"]) or "").casefold(),
                 })
             result["artifacts"] = normalized_artifacts
-            result["actual_cost"] = response.get(config.get("actual_cost_field", "actual_cost"))
-            result["currency"] = str(response.get(config.get("currency_field", "currency")) or "")
+            result["actual_cost"] = response.get(config["actual_cost_field"])
+            result["currency"] = str(response.get(config["currency_field"]) or "")
         return result

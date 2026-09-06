@@ -1,4 +1,4 @@
-import type { H3PromptPayload, PromptTranslationEntry, Shot } from '@/types'
+import type { PromptArtifactPayload, PromptTranslationEntry, Shot } from '@/types'
 
 type ShotTranslationScope = Pick<Shot, 'id' | 'characterIds' | 'sceneId' | 'propIds'>
 
@@ -29,7 +29,7 @@ export const translationAppliesToShot = (
  * part of the backend prompt input fingerprint.
  */
 export const promptArtifactNeedsRegeneration = (
-  artifact: H3PromptPayload | undefined,
+  artifact: PromptArtifactPayload | undefined,
   projectId: string,
   shot: ShotTranslationScope,
   translations: PromptTranslationEntry[] = [],

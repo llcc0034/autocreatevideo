@@ -51,7 +51,7 @@ try {
     New-Item -ItemType Directory -Path $mediaRoot, $comfyRoot, $configRoot, $unsafeConfigRoot, $archiveRoot -Force | Out-Null
 
     $databasePath = Join-Path $backendRoot 'db.sqlite3'
-    $createCode = "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); db.execute('create table sample(id integer primary key, value text not null)'); db.execute('insert into sample(value) values (?)', ('backup-test',)); db.commit(); db.close()"
+    $createCode = "import sqlite3,sys; from django.db.backends.sqlite3._functions import register; db=sqlite3.connect(sys.argv[1]); register(db); pattern='^backup-[a-z]+$'; db.execute('create table sample(id integer primary key, value text not null check(value REGEXP '+repr(pattern)+'))'); db.execute('insert into sample(value) values (?)', ('backup-test',)); db.commit(); db.close()"
     & $testPython -c $createCode $databasePath
     if ($LASTEXITCODE -ne 0) { throw 'Unable to create temporary SQLite fixture.' }
 

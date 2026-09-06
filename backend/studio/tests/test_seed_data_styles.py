@@ -58,3 +58,7 @@ class SeedDataStyleTests(TestCase):
             Asset.Kind.SCENE,
             Asset.Kind.PROP,
         })
+        self.assertEqual(
+            set(glamour_assets.values_list("source_info", flat=True)),
+            {"系统素材清单导入"},
+        )

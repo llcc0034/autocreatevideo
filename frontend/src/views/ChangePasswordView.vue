@@ -48,7 +48,7 @@ const logout = async () => { auth.logout(); await router.replace('/login') }
     <section class="password-change-card">
       <BrandMark />
       <div class="password-change-icon"><KeyRound :size="24" /></div>
-      <span class="eyebrow">FIRST LOGIN SECURITY</span>
+      <span class="eyebrow">首次登录安全设置 / FIRST LOGIN SECURITY</span>
       <h1>首次登录，请先修改临时密码</h1>
       <p>临时密码只用于本次身份确认。修改成功后，当前登录凭据会立即失效，请使用新密码重新登录。</p>
       <form @submit.prevent="submit">

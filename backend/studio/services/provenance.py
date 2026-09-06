@@ -17,16 +17,25 @@ import uuid
 
 from django.conf import settings
 from django.core import signing
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 
 from studio.media_signing import classify_task_output
 from studio.models import AssemblyJob, GenerationTask
 from studio.services.json_contracts import json_contract
-from studio.services.production_pipeline import (
-    BIBLE_IMAGE_CANDIDATE_PURPOSE,
-    bible_image_candidate_reserved_snapshot,
+from studio.services.bible_reference_contract import (
+    RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,
+    retired_bible_image_candidate_snapshot,
 )
-from studio.services.workflow import WorkflowBuildError
+from studio.services.security_boundaries import boundary_int
+
+
+def _workflow_graph_max_bytes() -> int:
+    return boundary_int("security.workflow.max_graph_bytes")
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
 
 PROVENANCE_SCHEMA = "https://autoprompt.local/schemas/provenance/v1"
@@ -74,6 +83,12 @@ def _verified_artifact_sha256(path: Path) -> str:
     return _cached_sha256_file(
         str(resolved), stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns,
     )
+
+
+def verified_file_sha256(path: str | Path) -> str:
+    """Verify managed bytes with the same stat-keyed cache used by provenance."""
+
+    return _verified_artifact_sha256(Path(path))
 
 
 def _canonical_bytes(value: dict) -> bytes:
@@ -266,14 +281,14 @@ def _task_body(
             (workflow_sha256, workflow.content_hash, "workflow"),
             (capability.get("workflow_hash"), workflow.content_hash, "task workflow"),
             (capability.get("workflow_contract_sha256"), workflow.workflow_contract_sha256, "workflow contract"),
-            (json_contract(resolved).sha256, workflow.resolved_semantics_sha256, "resolved semantics"),
+            (json_contract(resolved, max_bytes=_workflow_graph_max_bytes()).sha256, workflow.resolved_semantics_sha256, "resolved semantics"),
             (capability.get("resolved_semantics_sha256"), workflow.resolved_semantics_sha256, "task semantics"),
-            (json_contract(asset_bindings).sha256, workflow.asset_bindings_sha256, "asset bindings"),
-            (json_contract(capability.get("asset_bindings") or []).sha256, workflow.asset_bindings_sha256, "task asset bindings"),
-            (json_contract(model_requirements).sha256, workflow.model_requirements_sha256, "model requirements"),
-            (json_contract(capability.get("model_requirements") or []).sha256, workflow.model_requirements_sha256, "task model requirements"),
-            (json_contract(execution_metadata).sha256, injected.get("execution_metadata_sha256"), "execution metadata"),
-            (json_contract(capability.get("execution_metadata") or {}).sha256, injected.get("execution_metadata_sha256"), "task execution metadata"),
+            (json_contract(asset_bindings, max_bytes=_workflow_graph_max_bytes()).sha256, workflow.asset_bindings_sha256, "asset bindings"),
+            (json_contract(capability.get("asset_bindings") or [], max_bytes=_workflow_graph_max_bytes()).sha256, workflow.asset_bindings_sha256, "task asset bindings"),
+            (json_contract(model_requirements, max_bytes=_workflow_graph_max_bytes()).sha256, workflow.model_requirements_sha256, "model requirements"),
+            (json_contract(capability.get("model_requirements") or [], max_bytes=_workflow_graph_max_bytes()).sha256, workflow.model_requirements_sha256, "task model requirements"),
+            (json_contract(execution_metadata, max_bytes=_stage_snapshot_max_bytes()).sha256, injected.get("execution_metadata_sha256"), "execution metadata"),
+            (json_contract(capability.get("execution_metadata") or {}, max_bytes=_stage_snapshot_max_bytes()).sha256, injected.get("execution_metadata_sha256"), "task execution metadata"),
             (capability.get("route_snapshot_sha256"), workflow.route_snapshot_sha256, "route snapshot"),
         )
         for actual, expected, label in checks:
@@ -291,13 +306,13 @@ def _task_body(
             )):
                 raise ProvenanceError("Semantic deployment/config summary is invalid")
             deployment_checks = (
-                (json_contract(provider_config).sha256, capability.get("provider_config_sha256")),
-                (json_contract(deployment_config).sha256, capability.get("deployment_config_sha256")),
+                (json_contract(provider_config, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("provider_config_sha256")),
+                (json_contract(deployment_config, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("deployment_config_sha256")),
                 (json_contract({
                     "provider_config": provider_config,
                     "deployment_config": deployment_config,
-                }).sha256, capability.get("frozen_execution_config_sha256")),
-                (json_contract(deployment_summary).sha256, capability.get("deployment_summary_sha256")),
+                }, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("frozen_execution_config_sha256")),
+                (json_contract(deployment_summary, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("deployment_summary_sha256")),
             )
             if any(not expected or actual != expected for actual, expected in deployment_checks):
                 raise ProvenanceError("Semantic deployment/config summary hash is invalid")
@@ -321,7 +336,7 @@ def _task_body(
     prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
     if semantic_compiled:
         reserved_candidate = None
-        if capability.get("generation_purpose") == BIBLE_IMAGE_CANDIDATE_PURPOSE:
+        if capability.get("generation_purpose") == RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE:
             reserved_candidate = {
                 key: deepcopy(capability.get(key)) for key in (
                     "generation_purpose", "request_fingerprint", "bible_target",
@@ -330,9 +345,9 @@ def _task_body(
             }
     else:
         try:
-            reserved_candidate = bible_image_candidate_reserved_snapshot(prompt)
-        except WorkflowBuildError as exc:
-            raise ProvenanceError("Bible image candidate Prompt provenance is invalid") from exc
+            reserved_candidate = retired_bible_image_candidate_snapshot(prompt)
+        except ValidationError as exc:
+            raise ProvenanceError("历史 Bible 图片候选 Prompt 来源无效") from exc
     candidate_generation = {}
     if reserved_candidate is not None:
         if workflow_sha256 != workflow.content_hash:
@@ -353,7 +368,7 @@ def _task_body(
                     "Bible image candidate task and Prompt provenance do not match"
                 )
         candidate_generation = {
-            "generation_purpose": BIBLE_IMAGE_CANDIDATE_PURPOSE,
+            "generation_purpose": RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,
             "request_fingerprint": reserved_candidate["request_fingerprint"],
             "bible_target": deepcopy(reserved_candidate["bible_target"]),
         }

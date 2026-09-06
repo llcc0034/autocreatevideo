@@ -108,6 +108,12 @@ class Command(BaseCommand):
                 errors.append(f"row {index}: file not found {path}")
                 continue
             checksum = str(row.get("checksum") or "").strip() or self._checksum(path)
+            mime_type = str(row.get("mime_type") or "").strip().lower()
+            if not mime_type.startswith("image/"):
+                errors.append(
+                    f"row {index}: mime_type is required and must declare the image media fact"
+                )
+                continue
             metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
             metadata = {**metadata, "manifest": str(manifest), "manifest_index": index}
             asset, _ = Asset.objects.update_or_create(
@@ -115,8 +121,9 @@ class Command(BaseCommand):
                 defaults={
                     "description": str(row.get("description") or ""),
                     "prompt_hint": str(row.get("prompt_hint") or row.get("prompt") or ""),
+                    "source_info": "系统素材清单导入",
                     "local_path": str(path),
-                    "mime_type": str(row.get("mime_type") or "image/png"),
+                    "mime_type": mime_type,
                     "checksum": checksum,
                     "metadata": metadata,
                     "is_active": True,

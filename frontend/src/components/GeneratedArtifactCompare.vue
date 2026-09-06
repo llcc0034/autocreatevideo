@@ -3,7 +3,9 @@ import { computed, ref, watch } from 'vue'
 import { AlertTriangle, Check, Download, Image as ImageIcon, LoaderCircle, RefreshCw, Video } from 'lucide-vue-next'
 import PlatformStatusPill from './PlatformStatusPill.vue'
 import { comparisonParameterRows, reconcileArtifactSelection, synchronizeVideos, toggleArtifactSelection } from '@/services/artifactComparison'
+import { presentPlatformStatus } from '@/services/platformAdapters'
 import { platformApi } from '@/services/platformApi'
+import { artifactRoleLabel } from '@/services/presentationLabels'
 import type { ArtifactPreview, GeneratedArtifact } from '@/services/platformTypes'
 
 const props = defineProps<{ runId: string; artifacts: GeneratedArtifact[] }>()
@@ -50,10 +52,10 @@ const parameterRows = computed(() => comparisonParameterRows(
 <template>
   <section class="artifact-compare">
     <header><div><strong>同组版本对比</strong><span>并排 {{ visibleArtifacts.length }} / 候选 {{ artifacts.length }} · 可选择 2–4 个</span></div><button class="button ghost tiny" @click="loadAll"><RefreshCw :size="12"/>刷新签名预览</button></header>
-    <div v-if="artifacts.length>4" class="artifact-candidate-picker" role="group" aria-label="选择并排比较的产物版本"><span>比较候选</span><label v-for="artifact in artifacts" :key="artifact.id" :class="{active:selectedIds.includes(artifact.id)}"><input type="checkbox" :checked="selectedIds.includes(artifact.id)" :disabled="selectedIds.includes(artifact.id)?selectedIds.length<=2:selectedIds.length>=4" @change="toggleCandidate(artifact.id,$event)"/><b>V{{ artifact.variantIndex }}</b><small>{{ artifact.status }}</small></label></div>
+    <div v-if="artifacts.length>4" class="artifact-candidate-picker" role="group" aria-label="选择并排比较的产物版本"><span>比较候选</span><label v-for="artifact in artifacts" :key="artifact.id" :class="{active:selectedIds.includes(artifact.id)}"><input type="checkbox" :checked="selectedIds.includes(artifact.id)" :disabled="selectedIds.includes(artifact.id)?selectedIds.length<=2:selectedIds.length>=4" @change="toggleCandidate(artifact.id,$event)"/><b>V{{ artifact.variantIndex }}</b><small>{{ presentPlatformStatus(artifact.status).label }}</small></label></div>
     <div class="artifact-compare-grid" :style="{'--artifact-count':visibleArtifacts.length}">
       <article v-for="artifact in visibleArtifacts" :key="artifact.id" :class="{selected:artifact.status==='selected'}">
-        <header><span><b>V{{ artifact.variantIndex }}</b><small>{{ artifact.role }}</small></span><PlatformStatusPill :status="artifact.status"/></header>
+        <header><span><b>V{{ artifact.variantIndex }}</b><small>{{ artifactRoleLabel(artifact.role) }}</small></span><PlatformStatusPill :status="artifact.status"/></header>
         <div class="artifact-media">
           <div v-if="loading[artifact.id]" class="artifact-media-state"><LoaderCircle class="spin" :size="20"/>读取真实媒体…</div>
           <img v-else-if="previews[artifact.id]?.previewUrl && (artifact.kind==='image'||artifact.mimeType.startsWith('image/'))" :src="previews[artifact.id]?.previewUrl" :alt="artifact.objectKey"/>
@@ -61,7 +63,7 @@ const parameterRows = computed(() => comparisonParameterRows(
           <div v-else class="artifact-media-state danger"><component :is="artifact.kind==='video'?Video:ImageIcon" :size="24"/><span>{{ errors[artifact.id] || '该 artifact 没有浏览器可预览媒体。' }}</span></div>
         </div>
         <div v-if="errors[artifact.id] && previews[artifact.id]?.previewUrl" class="artifact-inline-error"><AlertTriangle :size="12"/>{{ errors[artifact.id] }}</div>
-        <dl><div><dt>文件</dt><dd>{{ artifact.objectKey }}</dd></div><div><dt>SHA256</dt><dd><code>{{ artifact.sha256.slice(0,16) || '—' }}</code></dd></div><div><dt>任务状态</dt><dd>{{ previews[artifact.id]?.backendStatus || '—' }}</dd></div></dl>
+        <dl><div><dt>文件</dt><dd>{{ artifact.objectKey }}</dd></div><div><dt>内容摘要（SHA-256）</dt><dd><code>{{ artifact.sha256.slice(0,16) || '—' }}</code></dd></div><div><dt>任务状态</dt><dd>{{ previews[artifact.id]?.backendStatus ? presentPlatformStatus(previews[artifact.id]!.backendStatus).label : '—' }}</dd></div></dl>
         <footer><a v-if="previews[artifact.id]?.downloadUrl" class="button ghost tiny" :href="previews[artifact.id]?.downloadUrl" target="_blank" rel="noopener"><Download :size="12"/>下载</a><button v-if="artifact.status!=='selected'" class="button primary tiny" :disabled="Boolean(selecting)" @click="select(artifact)">{{ selecting===artifact.id?'选择中…':'选为本组产物' }}</button><span v-else><Check :size="12"/>当前选择</span></footer>
       </article>
     </div>

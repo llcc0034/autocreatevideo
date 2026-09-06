@@ -16,7 +16,6 @@ COPY backend/requirements.txt /app/backend/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY --chown=autoprompt:autoprompt backend /app/backend
-COPY --chown=autoprompt:autoprompt scripts/qwen_translate_once.py /app/scripts/qwen_translate_once.py
 COPY --chown=autoprompt:autoprompt assets /app/assets
 COPY --chown=autoprompt:autoprompt licenses /app/licenses
 COPY --chown=autoprompt:autoprompt NOTICE /app/NOTICE

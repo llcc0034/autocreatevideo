@@ -1,10 +1,8 @@
 import type { ContinuityBible, SeriesProject } from '@/types'
 
 const REDO_TITLE_SUFFIX = ' · 重做'
-const REDO_TITLE_BASE_MAX_LENGTH = 194
 
 export const PROJECT_COVER_ACCEPT = 'image/jpeg,image/png,image/webp'
-export const PROJECT_COVER_MAX_BYTES = 10 * 1024 * 1024
 
 export type ProjectCoverFile = Pick<File, 'name' | 'size' | 'type'>
 
@@ -12,7 +10,6 @@ export type ProjectCoverFile = Pick<File, 'name' | 'size' | 'type'>
 export const projectCoverFileError = (file: ProjectCoverFile): string | null => {
   if (!PROJECT_COVER_ACCEPT.split(',').includes(file.type.toLowerCase())) return '封面仅支持 JPEG、PNG 或 WebP 图片。'
   if (!Number.isFinite(file.size) || file.size <= 0) return '封面文件为空，请重新选择。'
-  if (file.size > PROJECT_COVER_MAX_BYTES) return '封面文件不能超过 10 MB。'
   return null
 }
 
@@ -26,8 +23,11 @@ export type ProjectRedoPayload = Pick<
   | 'translationGlossary'
   | 'styleId'
   | 'status'
+  | 'language'
   | 'aspectRatio'
   | 'resolution'
+  | 'width'
+  | 'height'
   | 'defaultMode'
   | 'bible'
 >
@@ -43,8 +43,7 @@ export const createEmptyProjectBible = (): ContinuityBible => ({
 
 const redoTitle = (title: string): string => {
   const normalized = title.trim() || '未命名连续剧'
-  const base = Array.from(normalized).slice(0, REDO_TITLE_BASE_MAX_LENGTH).join('').trimEnd()
-  return `${base}${REDO_TITLE_SUFFIX}`
+  return `${normalized}${REDO_TITLE_SUFFIX}`
 }
 
 /**
@@ -60,8 +59,11 @@ export const buildProjectRedoPayload = (project: SeriesProject): ProjectRedoPayl
   translationGlossary: {},
   styleId: project.styleId,
   status: 'draft',
+  language: project.language,
   aspectRatio: project.aspectRatio,
   resolution: project.resolution,
+  width: project.width,
+  height: project.height,
   defaultMode: project.defaultMode,
   bible: createEmptyProjectBible(),
 })

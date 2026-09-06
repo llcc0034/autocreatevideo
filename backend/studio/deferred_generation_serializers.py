@@ -6,39 +6,6 @@ from rest_framework import serializers
 from studio.models import DeferredGenerationRequest
 
 
-class DeferredGenerationRequestCreateSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    source_task_id = serializers.UUIDField()
-    target_shot_id = serializers.UUIDField()
-    frame_slot = serializers.ChoiceField(
-        choices=DeferredGenerationRequest.FrameSlot.values,
-    )
-    idempotency_key = serializers.CharField(
-        min_length=1,
-        max_length=120,
-        trim_whitespace=False,
-    )
-    priority = serializers.IntegerField(min_value=-100, max_value=100, default=0)
-    max_attempts = serializers.IntegerField(min_value=1, max_value=10, default=3)
-    extended_generation_confirmed = serializers.BooleanField(default=False)
-
-    def to_internal_value(self, data):
-        if not isinstance(data, dict):
-            raise serializers.ValidationError("请求体必须是 JSON 对象。")
-        unknown = sorted(set(data) - set(self.fields))
-        if unknown:
-            raise serializers.ValidationError({
-                key: "不支持的字段；output_index、模板、模型、工作流和参考图均由服务端解析。"
-                for key in unknown
-            })
-        return super().to_internal_value(data)
-
-    def validate_idempotency_key(self, value: str) -> str:
-        if value != value.strip() or any(char in value for char in "\r\n\t"):
-            raise serializers.ValidationError("idempotency_key 首尾不能有空白，也不能包含控制字符。")
-        return value
-
-
 class DeferredGenerationCancelSerializer(serializers.Serializer):
     def to_internal_value(self, data):
         if data in (None, b"", ""):
@@ -56,7 +23,7 @@ class DeferredGenerationRequestListSerializer(serializers.ModelSerializer):
     project_id = serializers.UUIDField(source="project.id")
     source_task_id = serializers.UUIDField(source="source_task.id")
     target_shot_id = serializers.UUIDField(source="target_shot.id")
-    target_template_id = serializers.UUIDField(source="target_template.id")
+    target_workflow_version_id = serializers.UUIDField(source="target_workflow_version.id")
     derived_asset_id = serializers.UUIDField(source="derived_asset.id", allow_null=True)
     materialized_task_id = serializers.UUIDField(source="materialized_task.id", allow_null=True)
     materialized_prompt_artifact_id = serializers.SerializerMethodField()
@@ -73,8 +40,8 @@ class DeferredGenerationRequestListSerializer(serializers.ModelSerializer):
             "source_output_role",
             "target_shot_id",
             "frame_slot",
-            "target_template_id",
-            "target_template_hash",
+            "target_workflow_version_id",
+            "target_workflow_snapshot_sha256",
             "target_workflow_overrides",
             "idempotency_key",
             "request_fingerprint",
@@ -163,10 +130,6 @@ class _ClosedDeferredGenerationObjectSchemaExtension(OpenApiSerializerExtension)
         )
         schema["additionalProperties"] = False
         return schema
-
-
-class DeferredGenerationRequestCreateSchemaExtension(_ClosedDeferredGenerationObjectSchemaExtension):
-    target_class = DeferredGenerationRequestCreateSerializer
 
 
 class DeferredGenerationCancelSchemaExtension(_ClosedDeferredGenerationObjectSchemaExtension):

@@ -1,11 +1,82 @@
 import { api, fetchAllPages, unwrap } from './api'
-import type { AssemblyResult, Asset, BibleDraftEntityType, BibleImageCandidatesResult, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, DeferredGenerationRequest, DeferredGenerationStatus, Episode, GeneratedWorkflowExport, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, ReleaseSelection, SeriesProject, Shot, ShotTranslationPromotionResult, StylePreset, TaskInputPrompt, TranslationCapability, Workflow } from '@/types'
-import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptProjectSummary, adaptStyles, adaptTasks, backendStyleId, isBackendId, persistBibleEntities, projectPayload, syncShot } from './backendAdapters'
+import type { AssemblyResult, Asset, AssetGenerationExecutionKind, AssetGenerationJob, AssetGenerationJobType, AssetGenerationMediaType, AssetGenerationResolutionOutcome, AssetGenerationRouteOption, BibleDraftEntityType, BibleImageCandidatesResult, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, DeferredGenerationRequest, DeferredGenerationStatus, Episode, GeneratedWorkflowExport, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, ReleaseSelection, SeriesProject, Shot, ShotTranslationPromotionResult, StylePreset, TaskInputPrompt, TranslationCapability, Workflow } from '@/types'
+import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptProjectSummary, adaptStyles, adaptTasks, backendStyleId, isBackendId, persistBibleEntities, projectPayload, styleSlug, syncShot } from './backendAdapters'
 import { adaptCanonicalGlossaryEnsureResult, adaptShotTranslationPromotionResult, adaptTranslationEntry } from './translationReview'
 import { adaptPromptNormalizationCapability } from './promptNormalization'
 import { adaptBibleImageCandidates } from './bibleImageCandidates'
 import { adaptDeferredGenerationRequest } from './deferredGeneration'
 import { adaptAuthenticatedUser, type AuthenticatedUser } from './authTypes'
+import {
+  buildAssetGenerationJobRequestPayload,
+  type AssetGenerationJobCreateInput,
+} from './assetGenerationPayload'
+import {
+  adaptConditioningModes,
+  conditioningModeByKey,
+  type ConditioningModeCapability,
+} from './conditioningCapabilities'
+import { adaptWorkflowSmokeFixtureSchema } from './platformAdapters'
+
+const record = (value: unknown): Record<string, any> => value && typeof value === 'object' ? value as Record<string, any> : {}
+const adaptAssetGenerationJob = (value: unknown): AssetGenerationJob => {
+  const raw = record(value)
+  const outputAsset = raw.output_asset ? adaptAssets([raw.output_asset])[0] || null : null
+  return {
+    id: String(raw.id || ''), jobType: String(raw.job_type || 'asset') as AssetGenerationJobType,
+    mediaType: String(raw.media_type || 'image') as AssetGenerationMediaType,
+    imageCategory: String(raw.image_category || '') as AssetGenerationJob['imageCategory'], name: String(raw.name || ''),
+    description: String(raw.description || ''), prompt: String(raw.prompt || ''), negativePrompt: String(raw.negative_prompt || ''),
+    parameters: record(raw.parameters), styleId: outputAsset?.styleId || styleSlug(String(raw.style || '')),
+    executionKind: String(raw.execution_kind || 'deployment') as AssetGenerationExecutionKind,
+    modelDeploymentId: String(raw.model_deployment || ''), modelDeploymentName: String(raw.model_deployment_name || ''),
+    workflowVersionId: String(raw.workflow_template_version || ''), workflowName: String(raw.workflow_name || ''),
+    workflowVersion: raw.workflow_version === null || raw.workflow_version === undefined ? null : Number(raw.workflow_version),
+    outputAsset, status: String(raw.status || 'queued') as AssetGenerationJob['status'], operation: String(raw.operation || ''),
+    isExternal: raw.is_external === true, allowExternalCalls: raw.allow_external_calls === true,
+    budgetLimit: raw.budget_limit === null || raw.budget_limit === undefined ? null : String(raw.budget_limit),
+    estimatedCost: raw.estimated_cost === null || raw.estimated_cost === undefined ? null : String(raw.estimated_cost),
+    actualCost: raw.actual_cost === null || raw.actual_cost === undefined ? null : String(raw.actual_cost),
+    costCurrency: String(raw.cost_currency || ''), resultText: String(raw.result_text || ''), remoteStatus: String(raw.remote_status || ''),
+    providerRequestIdSha256: String(raw.provider_request_id_sha256 || ''),
+    pollCount: Number(raw.poll_count || 0), errorCode: String(raw.error_code || ''), errorMessage: String(raw.error_message || ''),
+    ignoreLateResult: raw.ignore_late_result === true,
+    submissionStartedAt: String(raw.submission_started_at || ''), cancelRequestedAt: String(raw.cancel_requested_at || ''), cancelSubmittedAt: String(raw.cancel_submitted_at || ''),
+    createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''), submittedAt: String(raw.submitted_at || ''), finishedAt: String(raw.finished_at || ''),
+  }
+}
+
+const adaptAssetGenerationOption = (value: unknown): AssetGenerationRouteOption => {
+  const raw = record(value)
+  const targetKind = String(raw.target_kind || '')
+  if (targetKind !== 'deployment' && targetKind !== 'comfy_workflow') {
+    throw new Error(`服务端返回了不支持的素材生成方案类型：${targetKind || '空值'}`)
+  }
+  const common = {
+    targetId: String(raw.target_id || ''), key: String(raw.key || ''), name: String(raw.name || ''),
+    modelDeploymentId: String(raw.model_deployment_id || ''), modelDeploymentName: String(raw.model_deployment_name || ''),
+    modelIdentifier: String(raw.model_identifier || ''), operation: String(raw.operation || ''),
+    isExternal: raw.is_external === true, smokeEvidenceId: String(raw.smoke_evidence_id || ''),
+    requestSchema: raw.request_schema && typeof raw.request_schema === 'object' ? raw.request_schema : null,
+    parameterDefaults: record(raw.parameter_defaults),
+    workflowInputSchema: raw.workflow_input_schema
+      ? adaptWorkflowSmokeFixtureSchema(raw.workflow_input_schema) : null,
+    acceptsNegativePrompt: raw.accepts_negative_prompt === true,
+  }
+  if (targetKind === 'comfy_workflow') {
+    const workflowVersion = Number(raw.workflow_version)
+    if (!raw.workflow_version_id || !raw.workflow_name || !Number.isInteger(workflowVersion) || workflowVersion < 1) {
+      throw new Error('服务端返回的 ComfyUI 工作流方案缺少版本信息')
+    }
+    return {
+      ...common, targetKind, smokeExpiresAt: null,
+      workflowVersionId: String(raw.workflow_version_id), workflowName: String(raw.workflow_name), workflowVersion,
+    }
+  }
+  return {
+    ...common, targetKind, smokeExpiresAt: String(raw.smoke_expires_at || ''),
+    workflowVersionId: '', workflowName: '', workflowVersion: null,
+  }
+}
 
 const translationRows = (payload: unknown): PromptTranslationEntry[] => {
   const body = unwrap<unknown>(payload)
@@ -34,6 +105,9 @@ const fileDataUrl = (file: File): Promise<string> => new Promise((resolve, rejec
 // timeout does not prove that the content-addressed publication failed.
 
 export interface ProductionCapability {
+  conditioningModes: ConditioningModeCapability[]
+  conditioningContractSha256: string
+  defaultConditioningMode: string
   recommendedMaxPending: number
   recommendedMaxActivePerUser: number
   maxConcurrent: number
@@ -41,7 +115,6 @@ export interface ProductionCapability {
   deploymentMaxConcurrent: number
   taskTimeoutSeconds: number
   configuredTaskTimeoutSeconds: number
-  deploymentTaskTimeoutSeconds: number
   videoShotMinDurationMs: number
   videoShotMaxDurationMs: number
   scriptBreakdownDefaultShotDurationMs: number
@@ -51,10 +124,71 @@ export interface ProductionCapability {
   scriptBreakdownAutoSplitTargetChars: number
   activeTaskCount: number
   userActiveTaskCount: number
-  confirmationRequired: boolean
+  queueGuidanceEnforcement: 'advisory'
+  queueAdvisories: QueueCapacityAdvisory[]
   businessVolumeLimited: boolean
   configurationPublicSha256: string
   configurationSources: Record<string, string>
+  effectiveLimits: ProductionEffectiveLimits
+  creationDefaults: ProductionCreationDefaults
+}
+
+export interface ProductionEffectiveLimits {
+  maxVariants: number
+  maxRoutingRoutes: number
+  maxEpisodes: number
+  maxShotsPerEpisode: number
+  maxTotalShots: number
+  maxGenerationTasks: number
+  maxReferenceBindings: number
+  maxBibleCandidatesPerEntity: number
+  maxBibleReferenceAssetsPerEntity: number
+  maxBibleRegenerationEntitiesPerRequest: number
+  dialogueMaxEntries: number
+  dialogueSpeakerIdMaxCharacters: number
+  dialogueTextMaxCharacters: number
+  dialogueDeliveryMaxCharacters: number
+  executionMonitoringMaxNodeTypeOverrides: number
+  executionMonitoringMaxNodeOverrides: number
+  executionMonitoringMaxIdleTimeoutSeconds: number
+  promptReviewMaxCandidates: number
+  promptReviewMaxAdvisories: number
+  promptReviewMaxInputBytes: number
+  promptReviewMaxFieldCharacters: number
+  promptReviewMaxUsageCount: number
+  auditNoteMinCharacters: number
+  auditNoteMaxCharacters: number
+}
+
+export interface ProductionCreationDefaults {
+  defaultLanguage: string
+  defaultAspectRatio: string
+  aspectRatioOptions: ProductionAspectRatioOption[]
+  defaultShotMediaType: 'video' | 'image'
+  defaultIncludeAudio: boolean
+  episodeCount: number
+  shotsPerEpisode: number
+  episodeDurationSeconds: number
+  maxGenerationTasks: number
+  fps: number
+  width: number
+  height: number
+}
+
+export interface ProductionAspectRatioOption {
+  value: string
+  label: string
+  width: number
+  height: number
+}
+
+export interface QueueCapacityAdvisory {
+  schemaVersion: 1
+  code: 'recommended_max_pending_exceeded' | 'recommended_max_active_per_user_exceeded'
+  severity: 'warning'
+  scope: 'platform' | 'user'
+  measured: number
+  recommendedMaximum: number
 }
 
 export interface DeferredGenerationRequestFilters {
@@ -91,6 +225,39 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     if (typeof raw[key] !== 'boolean') throw new Error(`生产策略缺少有效字段 ${key}`)
     return raw[key] as boolean
   }
+  if (raw.queue_guidance_enforcement !== 'advisory') {
+    throw new Error('生产策略缺少队列建议值告警口径')
+  }
+  if (!Array.isArray(raw.queue_advisories)) {
+    throw new Error('生产策略缺少队列建议值告警')
+  }
+  const queueAdvisories = raw.queue_advisories.map((value): QueueCapacityAdvisory => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+      throw new Error('生产策略的队列建议值告警无效')
+    }
+    const advisory = value as Record<string, unknown>
+    const code = String(advisory.code || '')
+    const scope = String(advisory.scope || '')
+    const measured = Number(advisory.measured)
+    const recommendedMaximum = Number(advisory.recommended_maximum)
+    if (
+      advisory.schema_version !== 1
+      || !['recommended_max_pending_exceeded', 'recommended_max_active_per_user_exceeded'].includes(code)
+      || advisory.severity !== 'warning'
+      || !['platform', 'user'].includes(scope)
+      || !Number.isSafeInteger(measured) || measured < 0
+      || !Number.isSafeInteger(recommendedMaximum) || recommendedMaximum < 1
+      || measured <= recommendedMaximum
+    ) throw new Error('生产策略的队列建议值告警无效')
+    return {
+      schemaVersion: 1,
+      code: code as QueueCapacityAdvisory['code'],
+      severity: 'warning',
+      scope: scope as QueueCapacityAdvisory['scope'],
+      measured,
+      recommendedMaximum,
+    }
+  })
   const videoShotMinDurationMs = positiveInteger('video_shot_min_duration_ms')
   const videoShotMaxDurationMs = positiveInteger('video_shot_max_duration_ms')
   if (videoShotMinDurationMs > videoShotMaxDurationMs) throw new Error('生产策略返回的视频镜头时长范围无效')
@@ -111,10 +278,9 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     throw new Error('生产策略返回的有效并发与配置/部署上限不一致')
   }
   const configuredTaskTimeoutSeconds = positiveNumber('configured_task_timeout_seconds')
-  const deploymentTaskTimeoutSeconds = positiveNumber('deployment_task_timeout_seconds')
   const taskTimeoutSeconds = positiveNumber('task_timeout_seconds')
-  if (taskTimeoutSeconds !== Math.min(configuredTaskTimeoutSeconds, deploymentTaskTimeoutSeconds)) {
-    throw new Error('生产策略返回的有效任务超时与配置/部署上限不一致')
+  if (taskTimeoutSeconds !== configuredTaskTimeoutSeconds) {
+    throw new Error('生产策略返回的有效任务超时与配置值不一致')
   }
   const configurationPublicSha256 = String(raw.configuration_public_sha256 || '')
   if (!/^[0-9a-f]{64}$/.test(configurationPublicSha256)) throw new Error('生产策略缺少公开配置指纹')
@@ -125,7 +291,120 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
   const configurationSources = Object.fromEntries(
     Object.entries(rawSources as Record<string, unknown>).map(([key, value]) => [key, String(value || '')]),
   )
+  const rawEffectiveLimits = raw.effective_limits
+  if (!rawEffectiveLimits || typeof rawEffectiveLimits !== 'object' || Array.isArray(rawEffectiveLimits)) {
+    throw new Error('生产策略缺少有效安全上限投影')
+  }
+  const effectiveLimit = (key: string): number => {
+    const value = Number((rawEffectiveLimits as Record<string, unknown>)[key])
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`生产策略缺少有效安全上限 ${key}`)
+    return value
+  }
+  const effectiveLimits: ProductionEffectiveLimits = {
+    maxVariants: effectiveLimit('max_variants'),
+    maxRoutingRoutes: effectiveLimit('max_routing_routes'),
+    maxEpisodes: effectiveLimit('max_episodes'),
+    maxShotsPerEpisode: effectiveLimit('max_shots_per_episode'),
+    maxTotalShots: effectiveLimit('max_total_shots'),
+    maxGenerationTasks: effectiveLimit('max_generation_tasks'),
+    maxReferenceBindings: effectiveLimit('max_reference_bindings'),
+    maxBibleCandidatesPerEntity: effectiveLimit('max_bible_candidates_per_entity'),
+    maxBibleReferenceAssetsPerEntity: effectiveLimit('max_bible_reference_assets_per_entity'),
+    maxBibleRegenerationEntitiesPerRequest: effectiveLimit('max_bible_regeneration_entities_per_request'),
+    dialogueMaxEntries: effectiveLimit('dialogue_max_entries'),
+    dialogueSpeakerIdMaxCharacters: effectiveLimit('dialogue_speaker_id_max_characters'),
+    dialogueTextMaxCharacters: effectiveLimit('dialogue_text_max_characters'),
+    dialogueDeliveryMaxCharacters: effectiveLimit('dialogue_delivery_max_characters'),
+    executionMonitoringMaxNodeTypeOverrides: effectiveLimit('execution_monitoring_max_node_type_overrides'),
+    executionMonitoringMaxNodeOverrides: effectiveLimit('execution_monitoring_max_node_overrides'),
+    executionMonitoringMaxIdleTimeoutSeconds: effectiveLimit('execution_monitoring_max_idle_timeout_seconds'),
+    promptReviewMaxCandidates: effectiveLimit('prompt_review_max_candidates'),
+    promptReviewMaxAdvisories: effectiveLimit('prompt_review_max_advisories'),
+    promptReviewMaxInputBytes: effectiveLimit('prompt_review_max_input_bytes'),
+    promptReviewMaxFieldCharacters: effectiveLimit('prompt_review_max_field_characters'),
+    promptReviewMaxUsageCount: effectiveLimit('prompt_review_max_usage_count'),
+    auditNoteMinCharacters: effectiveLimit('audit_note_min_characters'),
+    auditNoteMaxCharacters: effectiveLimit('audit_note_max_characters'),
+  }
+  if (effectiveLimits.auditNoteMinCharacters > effectiveLimits.auditNoteMaxCharacters) {
+    throw new Error('生产策略返回的审计说明范围无效')
+  }
+  const rawCreationDefaults = raw.creation_defaults
+  if (!rawCreationDefaults || typeof rawCreationDefaults !== 'object' || Array.isArray(rawCreationDefaults)) {
+    throw new Error('生产策略缺少项目创建默认值投影')
+  }
+  const creationDefault = (key: string): number => {
+    const value = Number((rawCreationDefaults as Record<string, unknown>)[key])
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`生产策略缺少有效创建默认值 ${key}`)
+    return value
+  }
+  const creationText = (key: string): string => {
+    const value = rawCreationDefaults as Record<string, unknown>
+    if (typeof value[key] !== 'string' || !value[key].trim()) {
+      throw new Error(`生产策略缺少有效创建默认值 ${key}`)
+    }
+    return value[key].trim()
+  }
+  const rawAspectRatioOptions = (rawCreationDefaults as Record<string, unknown>).aspect_ratio_options
+  if (!Array.isArray(rawAspectRatioOptions) || !rawAspectRatioOptions.length) {
+    throw new Error('生产策略缺少有效画幅选项')
+  }
+  const aspectRatioOptions = rawAspectRatioOptions.map((item): ProductionAspectRatioOption => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('生产策略画幅选项无效')
+    const option = item as Record<string, unknown>
+    const value = typeof option.value === 'string' ? option.value.trim() : ''
+    const label = typeof option.label === 'string' ? option.label.trim() : ''
+    const width = Number(option.width)
+    const height = Number(option.height)
+    if (!value || !label || !Number.isSafeInteger(width) || width < 1 || !Number.isSafeInteger(height) || height < 1) {
+      throw new Error('生产策略画幅选项无效')
+    }
+    return { value, label, width, height }
+  })
+  if (new Set(aspectRatioOptions.map((option) => option.value)).size !== aspectRatioOptions.length) {
+    throw new Error('生产策略画幅选项存在重复值')
+  }
+  const defaultAspectRatio = creationText('default_aspect_ratio')
+  const defaultAspectRatioOption = aspectRatioOptions.find((option) => option.value === defaultAspectRatio)
+  if (!defaultAspectRatioOption) throw new Error('生产策略默认画幅不在已声明选项中')
+  const rawDefaultShotMediaType = creationText('default_shot_media_type')
+  if (rawDefaultShotMediaType !== 'video' && rawDefaultShotMediaType !== 'image') {
+    throw new Error('生产策略默认分镜媒体类型无效')
+  }
+  const rawDefaultIncludeAudio = (rawCreationDefaults as Record<string, unknown>).default_include_audio
+  if (typeof rawDefaultIncludeAudio !== 'boolean') throw new Error('生产策略默认分镜音频开关无效')
+  if (rawDefaultShotMediaType === 'image' && rawDefaultIncludeAudio) {
+    throw new Error('图片分镜不能声明默认音频')
+  }
+  const creationDefaults: ProductionCreationDefaults = {
+    defaultLanguage: creationText('default_language'),
+    defaultAspectRatio,
+    aspectRatioOptions,
+    defaultShotMediaType: rawDefaultShotMediaType,
+    defaultIncludeAudio: rawDefaultIncludeAudio,
+    episodeCount: creationDefault('episode_count'),
+    shotsPerEpisode: creationDefault('shots_per_episode'),
+    episodeDurationSeconds: creationDefault('episode_duration_seconds'),
+    maxGenerationTasks: creationDefault('max_generation_tasks'),
+    fps: creationDefault('fps'),
+    width: creationDefault('width'),
+    height: creationDefault('height'),
+  }
+  if (creationDefaults.width !== defaultAspectRatioOption.width || creationDefaults.height !== defaultAspectRatioOption.height) {
+    throw new Error('生产策略默认画幅尺寸与创建默认尺寸不一致')
+  }
+  const conditioningModes = adaptConditioningModes(raw.conditioning_modes)
+  if (!conditioningModes.length) throw new Error('生产策略未声明任何条件输入模式')
+  const conditioningContractSha256 = String(raw.conditioning_contract_sha256 || '')
+  if (!/^[0-9a-f]{64}$/.test(conditioningContractSha256)) throw new Error('生产策略缺少条件输入合同指纹')
+  const defaultConditioningMode = String(raw.default_conditioning_mode || '').trim()
+  if (defaultConditioningMode && !conditioningModeByKey(conditioningModes, defaultConditioningMode)) {
+    throw new Error('生产策略的默认条件输入模式不在已声明合同中')
+  }
   return {
+    conditioningModes,
+    conditioningContractSha256,
+    defaultConditioningMode,
     recommendedMaxPending: positiveInteger('recommended_max_pending'),
     recommendedMaxActivePerUser: positiveInteger('recommended_max_active_per_user'),
     maxConcurrent,
@@ -133,7 +412,6 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     deploymentMaxConcurrent,
     taskTimeoutSeconds,
     configuredTaskTimeoutSeconds,
-    deploymentTaskTimeoutSeconds,
     videoShotMinDurationMs,
     videoShotMaxDurationMs,
     scriptBreakdownDefaultShotDurationMs,
@@ -143,10 +421,13 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     scriptBreakdownAutoSplitTargetChars,
     activeTaskCount: nonNegativeInteger('active_task_count'),
     userActiveTaskCount: nonNegativeInteger('user_active_task_count'),
-    confirmationRequired: boolean('confirmation_required'),
+    queueGuidanceEnforcement: 'advisory',
+    queueAdvisories,
     businessVolumeLimited: boolean('business_volume_limited'),
     configurationPublicSha256,
     configurationSources,
+    effectiveLimits,
+    creationDefaults,
   }
 }
 
@@ -278,7 +559,7 @@ export const repository = {
         entries: options.entries?.map((entry) => ({ scope_type: entry.scopeType, scope_id: entry.scopeId })),
         include_all_missing: options.includeAllMissing === true,
         ensure_visual_identity_translation: options.ensureVisualIdentityTranslation === true,
-      }, { timeout: 360_000 })
+      })
       return adaptCanonicalGlossaryEnsureResult(response.data)
     })()
   },
@@ -313,7 +594,7 @@ export const repository = {
           scope_type: field.scopeType,
           scope_id: field.scopeId,
         })),
-      }, { timeout: 360_000 })
+      })
       return translationRows(response.data)
     })()
   },
@@ -344,7 +625,7 @@ export const repository = {
       `/translations/${entryId}/retranslate/`, {
         ...(sourceText === undefined ? {} : { source_text: sourceText }),
         model_deployment_id: options.modelDeploymentId,
-      }, { timeout: 360_000 },
+      },
     )).data)))()
   },
   async confirmProjectTranslation(entryId: string, translatedText: string, expectedRevision: number): Promise<PromptTranslationEntry> {
@@ -355,13 +636,11 @@ export const repository = {
   async promoteShotTranslations(
     shotId: string,
     entries: Array<{ entryId: string; expectedRevision: number }>,
-    options: { repairLegacyNegativePrompt?: boolean } = {},
   ): Promise<ShotTranslationPromotionResult> {
     return (async () => adaptShotTranslationPromotionResult(unwrap<Record<string, unknown>>((await api.post(
       '/translations/promote-shot/', {
         shot_id: shotId,
         entries: entries.map((entry) => ({ entry_id: entry.entryId, expected_revision: entry.expectedRevision })),
-        repair_legacy_negative_prompt: options.repairLegacyNegativePrompt === true,
       },
     )).data)))()
   },
@@ -405,9 +684,15 @@ export const repository = {
       return params?.type?rows.filter((asset)=>asset.type===params.type):rows
     })()
   },
-  async createImageAsset(payload: {
+  async getAsset(id: string): Promise<Asset> {
+    const asset = adaptAssets([unwrap<unknown>((await api.get(`/assets/${id}/`)).data)])[0]
+    if (!asset) throw new Error('服务端未返回可用素材')
+    return asset
+  },
+  async createAsset(payload: {
     file: File
-    kind: BibleDraftEntityType | 'reference'
+    mediaType: AssetGenerationMediaType
+    imageCategory?: BibleDraftEntityType | 'reference'
     name: string
     description: string
     promptHint: string
@@ -416,17 +701,62 @@ export const repository = {
     return (async () => {
       const form = new FormData()
       form.append('file', payload.file, payload.file.name)
-      form.append('kind', payload.kind)
+      const kind = payload.mediaType === 'video' ? 'reference_video'
+        : payload.mediaType === 'audio' ? 'reference_audio'
+          : payload.mediaType === 'script' ? 'script'
+            : payload.imageCategory || 'reference'
+      form.append('kind', kind)
       form.append('name', payload.name.trim())
       form.append('description', payload.description.trim())
       form.append('prompt_hint', payload.promptHint.trim())
       const style = backendStyleId(payload.styleId)
       if (style) form.append('style', style)
-      const raw = unwrap<Record<string, unknown>>((await api.post('/assets/', form, { headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120_000 })).data)
+      const raw = unwrap<Record<string, unknown>>((await api.post('/assets/', form, { headers: { 'Content-Type': 'multipart/form-data' } })).data)
       const asset = adaptAssets([raw])[0]
-      if (!asset) throw new Error('上传成功，但服务端未返回可用的图片素材')
+      if (!asset) throw new Error('上传成功，但服务端未返回可用素材')
       return asset
     })()
+  },
+  async getAssetGenerationOptions(jobType: AssetGenerationJobType, mediaType: AssetGenerationMediaType): Promise<AssetGenerationRouteOption[]> {
+    const raw = record(unwrap<unknown>((await api.get('/asset-generation-jobs/options/', { params: { job_type: jobType, media_type: mediaType } })).data))
+    return Array.isArray(raw.routes) ? raw.routes.map(adaptAssetGenerationOption) : []
+  },
+  async getAssetGenerationJobs(): Promise<AssetGenerationJob[]> {
+    return (await fetchAllPages('/asset-generation-jobs/', { page_size: 100 })).map(adaptAssetGenerationJob)
+  },
+  async createAssetGenerationJob(payload: AssetGenerationJobCreateInput): Promise<AssetGenerationJob> {
+    const raw = unwrap<unknown>((await api.post(
+      '/asset-generation-jobs/',
+      buildAssetGenerationJobRequestPayload(payload, backendStyleId(payload.styleId) || null),
+      { headers: { 'Idempotency-Key': payload.idempotencyKey } },
+    )).data)
+    return adaptAssetGenerationJob(raw)
+  },
+  async cancelAssetGenerationJob(id: string): Promise<AssetGenerationJob> {
+    return adaptAssetGenerationJob(unwrap<unknown>((await api.post(`/asset-generation-jobs/${id}/cancel/`, {})).data))
+  },
+  async retryAssetGenerationJob(id: string): Promise<AssetGenerationJob> {
+    return adaptAssetGenerationJob(unwrap<unknown>((await api.post(
+      `/asset-generation-jobs/${id}/retry/`,
+      {},
+      { headers: { 'Idempotency-Key': `asset-generation-retry:${id}` } },
+    )).data))
+  },
+  async resolveUncertainAssetGenerationJob(id: string, payload: {
+    outcome: AssetGenerationResolutionOutcome
+    note: string
+    providerRequestId?: string
+    actualCost?: string | null
+    costCurrency?: string
+    idempotencyKey: string
+  }): Promise<void> {
+    await api.post(`/asset-generation-jobs/${id}/resolve-uncertain/`, {
+      outcome: payload.outcome,
+      note: payload.note,
+      provider_request_id: payload.providerRequestId || '',
+      actual_cost: payload.actualCost === undefined || payload.actualCost === '' ? null : payload.actualCost,
+      cost_currency: payload.costCurrency || '',
+    }, { headers: { 'Idempotency-Key': payload.idempotencyKey } })
   },
   async setProjectCover(project: SeriesProject, file: File | null): Promise<SeriesProject> {
     return (async () => {
@@ -447,7 +777,7 @@ export const repository = {
       form.append('name', assetName)
       form.append('metadata', JSON.stringify({ usage: 'project_cover', project_id: project.id }))
       const rawAsset = unwrap<Record<string, unknown>>((await api.post('/assets/', form, {
-        headers: { 'Content-Type': 'multipart/form-data' }, timeout: 120_000,
+        headers: { 'Content-Type': 'multipart/form-data' },
       })).data)
       const uploadedAssetId = relationId(rawAsset.id)
       if (!uploadedAssetId) throw new Error('封面上传成功，但服务端未返回素材 ID')
@@ -472,11 +802,11 @@ export const repository = {
       }
     })()
   },
-  async updateAssetMetadata(assetId: string, payload: { name: string; description: string; promptHint: string; kind: BibleDraftEntityType | 'reference'; styleId?: string }): Promise<Asset> {
+  async updateAssetMetadata(assetId: string, payload: { name: string; description: string; promptHint: string; kind?: BibleDraftEntityType | 'reference'; styleId?: string }): Promise<Asset> {
     return (async () => {
       const raw = unwrap<Record<string, unknown>>((await api.patch(`/assets/${assetId}/`, {
         name: payload.name.trim(), description: payload.description.trim(), prompt_hint: payload.promptHint.trim(),
-        kind: payload.kind, style: backendStyleId(payload.styleId) || null,
+        ...(payload.kind ? { kind: payload.kind } : {}), style: backendStyleId(payload.styleId) || null,
       })).data)
       const asset = adaptAssets([raw])[0]
       if (!asset) throw new Error('保存成功，但服务端未返回可用的素材信息')
@@ -489,12 +819,10 @@ export const repository = {
     })()
   },
   async uploadReferenceAsset(file: File, kind: 'reference_video'|'reference_audio', styleId?: string):Promise<Asset> {
-    return (async()=>{
-      const form=new FormData();form.append('file',file,file.name);form.append('name',file.name.replace(/\.[^.]+$/,''));form.append('kind',kind)
-      const style=backendStyleId(styleId);if(style)form.append('style',style)
-      const raw=unwrap<Record<string,unknown>>((await api.post('/assets/',form,{headers:{'Content-Type':'multipart/form-data'},timeout:120_000})).data)
-      const asset=adaptAssets([raw])[0];if(!asset)throw new Error('上传成功，但服务端未返回可用的参考素材');return asset
-    })()
+    return this.createAsset({
+      file, mediaType: kind === 'reference_video' ? 'video' : 'audio',
+      name: file.name.replace(/\.[^.]+$/, ''), description: '', promptHint: '', styleId,
+    })
   },
   async getProjects(): Promise<SeriesProject[]> {
     return (async () => {
@@ -610,7 +938,7 @@ export const repository = {
         promptArtifactId: String(raw.prompt_artifact_id || '') || undefined,
         promptType: String(raw.prompt_type || '') || undefined,
         model: String(raw.model || '') || undefined,
-        h3Mode: String(raw.h3_mode || '') || undefined,
+        conditioningMode: String(raw.conditioning_mode || '') || undefined,
         effectiveConditioningMode: String(raw.effective_conditioning_mode || '') || undefined,
         promptTemplateKey: String(raw.prompt_template_key || '') || undefined,
         contentHash: String(raw.content_hash || '') || undefined,
@@ -618,6 +946,7 @@ export const repository = {
         negativePrompt,
         promptCharacterCount: Number(raw.prompt_character_count ?? prompt.length),
         negativePromptCharacterCount: Number(raw.negative_prompt_character_count ?? negativePrompt.length),
+        negativePromptSubmitted: raw.negative_prompt_submitted === true,
         promptSource: String(raw.prompt_source || '') || undefined,
         negativePromptSource: String(raw.negative_prompt_source || '') || undefined
       }

@@ -12,9 +12,9 @@ from django.db import transaction
 from django.db.models import Max
 
 from studio.models import SecretAuditEvent, SecretBinding, SecretVersion
+from studio.services.security_boundaries import boundary_int
 
 
-MAX_SECRET_BYTES = 64 * 1024
 KEYRING_ENV = "AUTOPROMPT_CONFIG_MASTER_KEYS"
 ACTIVE_KEY_ENV = "AUTOPROMPT_CONFIG_ACTIVE_KEY_ID"
 
@@ -82,8 +82,13 @@ def _normalize_secret(value: str) -> bytes:
     if not isinstance(value, str) or not value:
         raise ValidationError({"secret_value": "秘密值不能为空"})
     material = value.encode("utf-8")
-    if len(material) > MAX_SECRET_BYTES:
-        raise ValidationError({"secret_value": f"秘密值不能超过 {MAX_SECRET_BYTES} bytes"})
+    max_plaintext_bytes = boundary_int(
+        "security.managed_value.max_plaintext_bytes",
+    )
+    if len(material) > max_plaintext_bytes:
+        raise ValidationError({
+            "secret_value": f"秘密值不能超过 {max_plaintext_bytes} bytes",
+        })
     return material
 
 

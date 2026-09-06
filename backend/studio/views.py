@@ -26,12 +26,13 @@ from drf_spectacular.utils import OpenApiParameter, extend_schema
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, NotFound, PermissionDenied, ValidationError
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from studio.models import (
     Asset,
+    AssetGenerationJob,
     AssemblyJob,
     CharacterBible,
     ConsistencyLock,
@@ -47,14 +48,16 @@ from studio.models import (
     SceneBible,
     SeriesProject,
     Shot,
-    ShotDetailDraftBatchItem,
     Style,
     WorkflowTemplate,
 )
 from studio.permissions import IsOwnerOrStaff, IsOwnerOrStaffOrGlobalReadOnly, IsStaffOrReadOnly
 from studio.media_signing import classify_task_output, load_signed_media_token, signed_media_token
+from studio.throttling import DatabaseScopedRateThrottle
 from studio.serializers import (
+    APIValidationErrorEnvelopeSerializer,
     AssetSerializer,
+    WorkflowSmokeAssetCandidateSerializer,
     AssemblyJobSerializer,
     CharacterBibleSerializer,
     CanonicalGlossaryEnsureSerializer,
@@ -64,8 +67,10 @@ from studio.serializers import (
     EpisodeSerializer,
     GeneratedWorkflowSerializer,
     GenerationTaskInputPromptSerializer,
+    GenerationTaskListSerializer,
     GenerationTaskSerializer,
     PromptFieldTranslationSerializer,
+    PromptTranslationListQuerySerializer,
     PromptTranslationConflictErrorResponseSerializer,
     PromptTranslationBatchRequestSerializer,
     PromptTranslationManualBatchRequestSerializer,
@@ -86,22 +91,36 @@ from studio.serializers import (
     ShotSerializer,
     StyleSerializer,
     UserSerializer,
+    FormalBibleAssetImmutableConflict,
+    _is_formal_bible_reference_asset,
     WorkflowTemplateSerializer,
 )
 from studio.services.comfyui import ComfyUIClient, ComfyUIError
-from studio.services.generated_artifacts import verified_local_media_facts
-from studio.services.configuration import resolve_configuration
+from studio.services.generated_artifacts import (
+    generated_artifact_storage_owner_id,
+    verified_local_media_facts,
+)
+from studio.services.smoke_assets import (
+    ManagedSmokeAssetBudget,
+    managed_smoke_asset_eligibility,
+)
+from studio.services.asset_visibility import exclude_workflow_smoke_fixture_assets
+from studio.pagination import WorkflowSmokeCandidatePagination
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    project_creation_policy,
+    resolve_configuration,
+)
 from studio.services.comfyui_canvas import (
     ComfyUICanvasExportError,
     api_graph_to_ui_workflow,
     is_comfyui_ui_workflow,
 )
-from studio.services.h3_prompts import (
-    PROMPT_COMPILER_VERSION,
-    PROMPT_INPUT_FINGERPRINT_VERSION,
+from studio.services.consistency import (
     capture_consistency_snapshot,
     sync_consistency_locks,
 )
+from studio.services.prompt_compiler_contract import PROMPT_COMPILER_VERSION
 from studio.services.prompt_quality_gate import evaluate_prompt_language_gate
 from studio.services.production_pipeline import (
     ProductionIdempotencyConflict,
@@ -111,7 +130,6 @@ from studio.services.production_pipeline import (
 from studio.services.production_batch_slots import (
     build_production_batch_slots,
 )
-from studio.services.shot_prompt_recovery import repair_legacy_negative_prompt
 from studio.services.shot_versions import (
     RESERVED_SHOT_VERSION_METADATA_KEYS,
     ShotVersionResolutionError,
@@ -153,7 +171,6 @@ from studio.services.script_bible import (
     parse_script_bible,
     validate_untrusted_script_bible_metadata,
 )
-from studio.services.resolution import H3_RESOLUTION_MULTIPLE_DEFAULT
 from studio.services.reference_bindings import (
     ReferenceBindingError,
     normalize_shot_reference_bindings,
@@ -164,6 +181,7 @@ from studio.services.provenance import (
     persist_task_provenance,
     verified_assembly_manifest,
     verified_task_manifest,
+    verified_file_sha256,
 )
 from studio.services.distribution import (
     distribution_artifact_path,
@@ -323,6 +341,10 @@ def _asset_structured_reference_labels(asset: Asset) -> list[str]:
             labels.append(label)
     if Shot.objects.filter(reference_assets=asset).exists():
         labels.append("分镜参考")
+    if asset.script_sources.exists():
+        labels.append("项目剧本来源")
+    if AssetGenerationJob.objects.filter(output_asset=asset).exists():
+        labels.append("素材生成审计")
     return labels
 
 
@@ -360,6 +382,23 @@ def _asset_has_active_task_reference(asset: Asset) -> bool:
                 prompt.consistency_snapshot,
                 prompt.request_options,
             )
+        ):
+            return True
+    asset_jobs = AssetGenerationJob.objects.filter(
+        status__in=(
+            AssetGenerationJob.Status.QUEUED,
+            AssetGenerationJob.Status.SUBMITTING,
+            AssetGenerationJob.Status.SUBMITTED,
+            AssetGenerationJob.Status.RUNNING,
+            AssetGenerationJob.Status.CANCEL_REQUESTED,
+        ),
+    )
+    if asset.owner_id is not None:
+        asset_jobs = asset_jobs.filter(owner_id=asset.owner_id)
+    for job in asset_jobs.only("request_snapshot", "staged_inputs"):
+        if _json_contains_asset_id(job.request_snapshot, asset_id) or _json_contains_asset_id(
+            job.staged_inputs,
+            asset_id,
         ):
             return True
     return False
@@ -414,7 +453,7 @@ def _production_workflow_selection_snapshot(
     if canonical:
         selections.sort(key=lambda selection: (
             str(selection.get("output_kind") or ""),
-            str(selection.get("h3_mode") or ""),
+            str(selection.get("conditioning_mode") or ""),
             str(selection.get("template_id") or ""),
         ))
     return selections
@@ -442,70 +481,6 @@ def _canonical_fingerprint_value(value):
 
 
 
-
-
-
-def _production_unit_from_task(task: GenerationTask) -> dict:
-    capability = task.capability_snapshot or {}
-    workflow = task.generated_workflow
-    prompt = workflow.prompt_artifact
-    injected = workflow.injected_values or {}
-    shot_ids = capability.get("shot_ids") or (prompt.request_options or {}).get("shot_ids") or []
-    unit = {
-        "batch_id": capability.get("batch_id"),
-        "batch_kind": capability.get("batch_kind"),
-        "batch_index": capability.get("batch_index"),
-        "batch_size": capability.get("batch_size"),
-        "shot_version_key": capability.get("shot_version_key"),
-        "shot_version_label": capability.get("shot_version_label", ""),
-        "batch_shot_ids": [
-            str(value) for value in capability.get("batch_shot_ids", [])
-        ],
-        "episode_id": capability.get("episode_id") or str(task.episode_id),
-        "episode_number": capability.get("episode_number"),
-        "episode_title": capability.get("episode_title", ""),
-        "shot_ids": [str(value) for value in shot_ids],
-        "shot_id": capability.get("shot_id"),
-        "shot_number": capability.get("shot_number"),
-        "shot_order": capability.get("shot_number"),
-        "shot_title": capability.get("shot_title", ""),
-        "media_type": task.kind,
-        "h3_mode": prompt.h3_mode if task.kind == Shot.MediaType.VIDEO else None,
-        "effective_conditioning_mode": capability.get("effective_conditioning_mode"),
-        "prompt_template_key": capability.get("prompt_template_key"),
-        "workflow_mode": capability.get("workflow_mode"),
-        "source_workflow": capability.get("source_workflow"),
-        "workflow_parameters": capability.get("workflow_parameters", {}),
-        "resolution_profile": capability.get("resolution_profile", "project"),
-        "resolution_multiple": capability.get(
-            "resolution_multiple",
-            int(injected.get("RESOLUTION_MULTIPLE", H3_RESOLUTION_MULTIPLE_DEFAULT)),
-        ),
-        "width": capability.get("width", int(injected.get("WIDTH", 0))),
-        "height": capability.get("height", int(injected.get("HEIGHT", 0))),
-        "template_id": str(workflow.template_id),
-        "template_slug": workflow.template.slug,
-        "prompt_artifact_id": str(prompt.id),
-        "prompt_artifact_reused": bool(
-            capability.get(
-                "prompt_artifact_reused",
-                getattr(prompt, "_production_prompt_reused", False),
-            )
-        ),
-        "workflow_id": str(workflow.id),
-        "task_id": str(task.id),
-        "task_status": task.status,
-    }
-    if task.kind == Shot.MediaType.VIDEO:
-        unit.update({
-            "include_audio": capability.get("include_audio", prompt.include_audio),
-            "requested_duration_ms": capability.get(
-                "requested_duration_ms", prompt.total_duration_ms,
-            ),
-            "effective_duration_ms": task.effective_duration_ms,
-            "fps": capability.get("fps", int(injected.get("FPS", 0))),
-        })
-    return unit
 
 
 
@@ -634,9 +609,9 @@ def _validate_asset_draft_provenance(
         })
     asset = matching[0]
     _validate_bible_asset_access(user, [asset], expected_kind=entity_type)
-    from studio.services.asset_bible_drafts import _snapshot_hash
+    from studio.services.asset_provenance import asset_snapshot_sha256
 
-    current_hash = _snapshot_hash([asset])
+    current_hash = asset_snapshot_sha256([asset])
     if {
         str(provenance.get("asset_metadata_sha256") or "").casefold(),
         str(provenance.get("source_metadata_sha256") or "").casefold(),
@@ -859,12 +834,19 @@ class SignedMediaView(APIView):
 
     authentication_classes = []
     permission_classes = [AllowAny]
+    # Browser media elements cannot attach the authenticated API Bearer token.
+    # A valid short-lived, object-bound signature remains mandatory, while an
+    # independent database-configured scope prevents a thumbnail grid from
+    # consuming the ordinary anonymous API allowance.
+    throttle_classes = [DatabaseScopedRateThrottle]
+    throttle_scope = "signed_media"
 
     @extend_schema(exclude=True)
     def get(self, request, token: str):
         provenance_url = ""
         verified_manifest = None
         verified_content_type = ""
+        generated_asset = False
         try:
             payload = load_signed_media_token(
                 token,
@@ -889,6 +871,15 @@ class SignedMediaView(APIView):
                     allowed_root = Path(settings.ASSET_LIBRARY_ROOT).resolve()
                 else:
                     raise ValueError("asset has no locally served file")
+                generated_asset = AssetGenerationJob.objects.filter(
+                    output_asset=asset,
+                ).exists()
+                if generated_asset:
+                    if not re.fullmatch(r"[0-9a-f]{64}", str(asset.checksum or "")):
+                        raise ValueError("generated asset checksum is unavailable")
+                    if verified_file_sha256(path) != asset.checksum:
+                        raise ValueError("generated asset bytes do not match their lineage")
+                    verified_content_type = str(asset.mime_type or "")
             elif purpose == "assembly":
                 job = AssemblyJob.objects.get(
                     pk=object_id, owner_id=owner_id, status=AssemblyJob.Status.SUCCEEDED,
@@ -974,16 +965,18 @@ class SignedMediaView(APIView):
                 )
             elif purpose == "generated_artifact":
                 artifact = GeneratedArtifact.objects.select_related(
-                    "production_run",
+                    "production_run__project", "generation_task",
                 ).get(
                     pk=object_id,
-                    production_run__owner_id=owner_id,
                     status__in=(
                         GeneratedArtifact.Status.AVAILABLE,
                         GeneratedArtifact.Status.SELECTED,
                     ),
                     storage_backend__in=("managed_local", "local_media"),
                 )
+                storage_owner_id = generated_artifact_storage_owner_id(artifact)
+                if str(owner_id) != str(storage_owner_id):
+                    raise ValueError("signed artifact tenant owner mismatch")
                 if artifact.kind not in {
                     GeneratedArtifact.Kind.IMAGE,
                     GeneratedArtifact.Kind.VIDEO,
@@ -1076,7 +1069,7 @@ class SignedMediaView(APIView):
             content_type=verified_content_type or mimetypes.guess_type(path.name)[0] or "application/octet-stream",
             as_attachment=(
                 (
-                    purpose in {"assembly", "task_distribution", "generated_artifact"}
+                    purpose in {"asset", "assembly", "task_distribution", "generated_artifact"}
                     or (
                         purpose == "task_output"
                         and str(getattr(settings, "DEPLOYMENT_PROFILE", "development")).casefold()
@@ -1088,7 +1081,7 @@ class SignedMediaView(APIView):
         )
         response["Cache-Control"] = "private, max-age=60, no-transform"
         response["X-Content-Type-Options"] = "nosniff"
-        if purpose in {"assembly", "task_output", "task_distribution", "generated_artifact"}:
+        if generated_asset or purpose in {"assembly", "task_output", "task_distribution", "generated_artifact"}:
             response["X-AI-Generated"] = "true"
             if purpose == "task_distribution":
                 response["X-Managed-Distribution"] = "true"
@@ -1163,7 +1156,7 @@ class AssetViewSet(viewsets.ModelViewSet):
     serializer_class = AssetSerializer
     permission_classes = [IsOwnerOrStaffOrGlobalReadOnly]
     filterset_fields = ("style", "kind", "is_active")
-    search_fields = ("name", "description", "prompt_hint")
+    search_fields = ("name", "description", "prompt_hint", "source_info")
     ordering_fields = ("name", "kind", "created_at", "updated_at")
 
     def get_throttles(self):
@@ -1171,8 +1164,79 @@ class AssetViewSet(viewsets.ModelViewSet):
             self.throttle_scope = "asset_upload"
         return super().get_throttles()
 
+    @extend_schema(
+        description=(
+            "读取当前用户或全局的普通生产素材。"
+            "metadata.fixture_scope=workflow_smoke 的技术烟测素材不会进入此列表；"
+            "工作流版本验收页只通过 workflow-smoke-candidates action 读取它们。"
+        ),
+    )
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
     def get_queryset(self):
-        return _owned_or_global(Asset.objects.select_related("style", "owner"), self.request.user)
+        queryset = _owned_or_global(
+            Asset.objects.select_related("style", "owner"),
+            self.request.user,
+        )
+        return exclude_workflow_smoke_fixture_assets(queryset)
+
+    @extend_schema(
+        responses={
+            200: WorkflowSmokeAssetCandidateSerializer(many=True),
+            403: APIValidationErrorEnvelopeSerializer,
+        },
+        description=(
+            "平台管理员专用的 workflow smoke 素材候选。"
+            "这里会保留普通生产素材列表刻意隐藏的 workflow_smoke 技术 fixture；"
+            "服务端在有界分页内实时复核受管路径、媒体类型和 SHA-256；不返回本地路径。"
+        ),
+    )
+    @action(
+        detail=False,
+        methods=["get"],
+        url_path="workflow-smoke-candidates",
+        permission_classes=[IsAdminUser],
+        pagination_class=WorkflowSmokeCandidatePagination,
+    )
+    def workflow_smoke_candidates(self, request):
+        # Deliberately bypass the normal Asset queryset: technical fixtures are
+        # hidden from production/library selectors but remain valid smoke inputs.
+        queryset = Asset.objects.filter(owner__isnull=True).order_by("name", "pk")
+        page = self.paginate_queryset(queryset)
+        if page is None:  # pragma: no cover - action always has a paginator
+            page = []
+        budget = ManagedSmokeAssetBudget()
+        rows = []
+        for asset in page:
+            eligible, reason = managed_smoke_asset_eligibility(asset, budget=budget)
+            checksum = str(asset.checksum or "").strip().casefold()
+            metadata = asset.metadata if isinstance(asset.metadata, dict) else {}
+            try:
+                duration_ms = int(metadata.get("duration_ms"))
+            except (TypeError, ValueError):
+                duration_ms = None
+            try:
+                source_fps = float(
+                    metadata.get("source_fps", metadata.get("fps")),
+                )
+            except (TypeError, ValueError):
+                source_fps = None
+            rows.append({
+                "id": asset.id,
+                "name": asset.name,
+                "kind": str(asset.kind or ""),
+                "mime_type": str(asset.mime_type or ""),
+                "checksum": checksum if re.fullmatch(r"[0-9a-f]{64}", checksum) else "",
+                "duration_ms": duration_ms,
+                "source_fps": source_fps,
+                "has_audio": metadata.get("has_audio") is True,
+                "smoke_eligible": eligible,
+                "smoke_ineligible_reason": reason,
+            })
+        return self.get_paginated_response(
+            WorkflowSmokeAssetCandidateSerializer(rows, many=True).data,
+        )
 
     def perform_create(self, serializer):
         with transaction.atomic():
@@ -1239,6 +1303,8 @@ class AssetViewSet(viewsets.ModelViewSet):
             except Asset.DoesNotExist as exc:
                 raise NotFound("素材不存在") from exc
             self.check_object_permissions(request, asset)
+            if _is_formal_bible_reference_asset(asset):
+                raise FormalBibleAssetImmutableConflict()
             if asset.owner_id is None:
                 raise ValidationError(
                     "全局内置素材为只读；请通过受审计的素材 manifest/import 流程维护。"
@@ -1436,6 +1502,7 @@ class ProjectDeleteConflict(APIException):
     default_code = "project_has_active_work"
 
     def __init__(self, detail=None, code=None):
+        self.default_code = str(code or self.default_code)
         super().__init__(detail=detail, code=code)
         if isinstance(detail, dict):
             for field in (
@@ -1667,6 +1734,19 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
                     "unresolved_remote_tasks": unresolved_remote_tasks,
                     "active_assembly_jobs": active_assembly_jobs,
                 })
+            formal_runs = list(
+                project.production_runs.select_for_update().only("id")
+            )
+            if formal_runs:
+                raise ProjectDeleteConflict(
+                    {
+                        "detail": (
+                            "项目已有正式 ProductionRun 及不可变审计历史，禁止级联删除；"
+                            "请将项目归档保留，或在专门的数据保留流程中处理。"
+                        ),
+                    },
+                    code="protected_resource",
+                )
             # GenerationTask intentionally protects its materialized workflow.
             # All tasks are safe terminal rows at this point, so delete those
             # project-owned rows first and let the project cascade collect the
@@ -1708,14 +1788,19 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
             }) from exc
         return Response(result)
 
-    @extend_schema(responses=PromptFieldTranslationSerializer(many=True))
+    @extend_schema(
+        parameters=[PromptTranslationListQuerySerializer],
+        responses=PromptFieldTranslationSerializer(many=True),
+    )
     @action(detail=True, methods=["get"], url_path="translations")
     def translations(self, request, pk=None):
         project = self.get_object()
         queryset = project.prompt_field_translations.all()
-        episode_id = request.query_params.get("episode")
-        shot_id = request.query_params.get("shot")
-        translation_status = request.query_params.get("status")
+        query = PromptTranslationListQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        episode_id = query.validated_data.get("episode")
+        shot_id = query.validated_data.get("shot")
+        translation_status = query.validated_data.get("status")
         if shot_id:
             queryset = queryset.filter(
                 Q(scope_type=PromptFieldTranslation.ScopeType.SHOT, scope_id=shot_id)
@@ -1861,7 +1946,24 @@ class SeriesProjectViewSet(viewsets.ModelViewSet):
         serializer = NextEpisodeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         next_number = (project.episodes.aggregate(value=Max("number"))["value"] or 0) + 1
-        episode = Episode.objects.create(project=project, number=next_number, **serializer.validated_data)
+        try:
+            creation_policy = project_creation_policy(project=project)
+        except ConfigurationResolutionError as exc:
+            raise ValidationError({
+                "configuration": {
+                    "code": exc.code,
+                    "detail": str(exc),
+                    "missing_keys": list(exc.missing_keys),
+                },
+            }) from exc
+        episode = Episode.objects.create(
+            project=project,
+            number=next_number,
+            prompt_settings={
+                "include_audio": creation_policy["default_include_audio"],
+            },
+            **serializer.validated_data,
+        )
         return Response(EpisodeSerializer(episode, context={"request": request}).data, status=status.HTTP_201_CREATED)
 
 
@@ -2004,7 +2106,7 @@ class ConsistencyLockViewSet(ProjectChildViewSet):
 
 _SHOT_SCALAR_FIELDS = (
     "title", "narrative", "detailed_description", "camera", "action", "dialogue", "sound_effects", "music",
-    "duration_ms", "media_type", "h3_mode", "include_audio", "scene", "reference_bindings",
+    "duration_ms", "media_type", "conditioning_mode", "include_audio", "scene", "reference_bindings",
     "requires_first_frame_continuity", "requires_last_frame_continuity",
     "continuity_notes", "metadata",
 )
@@ -2047,7 +2149,7 @@ class EpisodeViewSet(viewsets.ModelViewSet):
 class ShotViewSet(viewsets.ModelViewSet):
     serializer_class = ShotSerializer
     permission_classes = [IsOwnerOrStaff]
-    filterset_fields = ("episode", "episode__project", "media_type", "h3_mode", "include_audio")
+    filterset_fields = ("episode", "episode__project", "media_type", "conditioning_mode", "include_audio")
     search_fields = ("title", "narrative", "action", "camera")
     ordering_fields = ("number", "duration_ms", "created_at", "updated_at")
 
@@ -2424,7 +2526,7 @@ class PromptFieldTranslationViewSet(viewsets.ReadOnlyModelViewSet):
                 field_key=entry.field_key,
                 label=entry.field_key.replace(".", " / "),
                 context=_translation_context(entry.project, item),
-                attempt=min(entry.revision + 1, 100),
+                attempt=entry.revision + 1,
                 model_deployment_id=deployment_id,
             )
         except PromptTranslationError as exc:
@@ -2523,11 +2625,10 @@ class PromptFieldTranslationViewSet(viewsets.ReadOnlyModelViewSet):
                 })
             promoted_fields = []
             saved_entries = []
-            locked_shot = None
             for entry in ordered_entries:
                 entry.project = project
                 selection = selection_by_id[str(entry.id)]
-                saved, promoted, promoted_shot = _confirm_and_promote_translation(
+                saved, promoted, _ = _confirm_and_promote_translation(
                     entry=entry,
                     expected_revision=selection["expected_revision"],
                     candidate=entry.translated_text,
@@ -2537,36 +2638,10 @@ class PromptFieldTranslationViewSet(viewsets.ReadOnlyModelViewSet):
                 saved_entries.append(saved)
                 if promoted:
                     promoted_fields.append(promoted)
-                locked_shot = promoted_shot or locked_shot
-            shot_patch = {}
-            if data["repair_legacy_negative_prompt"]:
-                if locked_shot is None:
-                    shot_queryset = Shot.objects.select_for_update().select_related(
-                        "episode__project",
-                    )
-                    if not request.user.is_staff:
-                        shot_queryset = shot_queryset.filter(
-                            episode__project__owner=request.user,
-                        )
-                    try:
-                        locked_shot = shot_queryset.get(pk=data["shot_id"])
-                    except Shot.DoesNotExist as exc:
-                        raise TranslationPromotionConflict({
-                            "code": "shot_not_found", "shot_id": shot_id,
-                        }) from exc
-                try:
-                    shot_patch = repair_legacy_negative_prompt(
-                        shot=locked_shot, user=request.user,
-                    )
-                except ValueError as exc:
-                    raise TranslationPromotionConflict({
-                        "code": str(exc), "shot_id": shot_id,
-                    }) from exc
         return Response({
             "shot_id": shot_id,
             "promoted_fields": promoted_fields,
             "entries": PromptFieldTranslationSerializer(saved_entries, many=True).data,
-            "shot_patch": shot_patch,
         })
 
     @action(detail=True, methods=["post"], url_path="request-retranslation")
@@ -2608,53 +2683,11 @@ class PromptFieldTranslationViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(PromptFieldTranslationSerializer(entry).data)
 
 
-def _prompt_artifact_matches_current_input(
-    artifact: PromptArtifact,
-    *,
-    input_fingerprint: str,
-    shot_ids: list[str],
-    consistency_snapshot: dict,
-    reference_bindings: list[dict],
-    negative_prompt: str,
-) -> bool:
-    """Fail closed unless a stored artifact is the exact current compilation.
-
-    ``content_hash`` protects the actual prompt text, while the versioned input
-    fingerprint protects every source field and compiler/optimizer setting that
-    produced it.  Both are required: a matching source snapshot must never make
-    a subsequently edited artifact eligible for production reuse.
-    """
-
-    request_options = artifact.request_options or {}
-    payload = artifact.structured_payload or {}
-    try:
-        fingerprint_version = int(request_options.get("input_fingerprint_version", 0))
-        payload_fingerprint_version = int(payload.get("input_fingerprint_version", 0))
-        compiler_version = int(payload.get("prompt_compiler_version", 0))
-    except (TypeError, ValueError):
-        return False
-    return bool(
-        fingerprint_version == PROMPT_INPUT_FINGERPRINT_VERSION
-        and payload_fingerprint_version == PROMPT_INPUT_FINGERPRINT_VERSION
-        and compiler_version == PROMPT_COMPILER_VERSION
-        and request_options.get("input_fingerprint") == input_fingerprint
-        and payload.get("input_fingerprint") == input_fingerprint
-        and [str(value) for value in request_options.get("shot_ids", [])] == shot_ids
-        and artifact.consistency_snapshot == consistency_snapshot
-        and (payload.get("reference_bindings") or []) == reference_bindings
-        and artifact.negative_prompt == negative_prompt
-        and artifact.content_hash
-        == hashlib.sha256(artifact.prompt_text.encode("utf-8")).hexdigest()
-    )
-
-
-
-
 class PromptArtifactViewSet(viewsets.ReadOnlyModelViewSet):
     lookup_value_regex = r"[0-9a-fA-F-]{36}"
     serializer_class = PromptArtifactSerializer
     permission_classes = [IsOwnerOrStaff]
-    filterset_fields = ("project", "episode", "shot", "prompt_type", "h3_mode", "is_multi_shot")
+    filterset_fields = ("project", "episode", "shot", "prompt_type", "conditioning_mode", "is_multi_shot")
     search_fields = ("prompt_text", "content_hash")
     ordering_fields = ("created_at", "revision", "total_duration_ms")
 
@@ -2713,6 +2746,11 @@ class GenerationTaskViewSet(viewsets.ReadOnlyModelViewSet):
     def get_extra_actions(cls):
         allowed = {"input_prompt", "comfyui_workflow"}
         return [action_method for action_method in super().get_extra_actions() if action_method.__name__ in allowed]
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return GenerationTaskListSerializer
+        return GenerationTaskSerializer
 
     def get_queryset(self):
         queryset = GenerationTask.objects.select_related(

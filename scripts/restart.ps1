@@ -7,6 +7,8 @@ param(
     [switch]$OpenBrowser,
     [switch]$SkipMigrate,
     [int]$StartupTimeoutSeconds = 180,
+    [ValidateRange(0, 128)]
+    [double]$ComfyUIVramHeadroomGB = 0,
     [string]$ComfyUIRoot = $env:AUTOPROMPT_COMFYUI_ROOT
 )
 
@@ -18,8 +20,6 @@ $RuntimeRoot = Join-Path $ProjectRoot '.runtime'
 $LogRoot = Join-Path $RuntimeRoot 'logs'
 $StatePath = Join-Path $RuntimeRoot 'services.json'
 $BackendPython = Join-Path $BackendRoot '.venv\Scripts\python.exe'
-$LocalTranslationModel = Join-Path $ProjectRoot '.runtime\models\Qwen\Qwen3-4B-GGUF\Qwen3-4B-Q4_K_M.gguf'
-$LocalTranslationRuntime = Join-Path $ProjectRoot '.runtime\qwen-python\Scripts\python.exe'
 $RunStamp = Get-Date -Format 'yyyyMMdd-HHmmss'
 $ServiceRecords = [System.Collections.Generic.List[object]]::new()
 $KnownProjectProcessIds = [System.Collections.Generic.HashSet[int]]::new()
@@ -420,10 +420,6 @@ if (-not (Test-Path -LiteralPath (Join-Path $BackendRoot '.env'))) {
 if (-not (Test-Path -LiteralPath (Join-Path $FrontendRoot 'node_modules'))) {
     throw "Frontend dependencies are missing. Run scripts\setup.ps1 first."
 }
-if (-not (Test-Path -LiteralPath $LocalTranslationModel) -or -not (Test-Path -LiteralPath $LocalTranslationRuntime)) {
-    Write-Warning 'Optional local Qwen director-field translation is not installed; the studio can start, but local automatic translation will remain unavailable.'
-    Write-Host 'Install it once with: powershell -ExecutionPolicy Bypass -File .\scripts\download_local_translation_model.ps1 -Runtime cpu' -ForegroundColor Yellow
-}
 $nodeRuntime = Resolve-AutoPromptNodeRuntime -ProjectRoot $ProjectRoot
 if (-not $nodeRuntime) {
     throw 'A complete Node.js 22/npm runtime was not found. Run scripts\install_node_runtime.ps1 to install the pinned runtime under .runtime\toolchains.'
@@ -513,10 +509,16 @@ if (-not $SkipComfyUI) {
         if ((Get-PortOwners 8188).Count -gt 0) {
             throw 'Port 8188 is occupied but ComfyUI health check failed. Use -RestartComfyUI after confirming the current GPU task can be interrupted.'
         }
-        Start-ServiceProcess 'ComfyUI' $ComfyPython @(
+        $comfyArguments = @(
             '-s', 'ComfyUI\main.py', '--windows-standalone-build',
             '--listen', '127.0.0.1', '--port', '8188'
-        ) $ComfyUIRoot | Out-Null
+        )
+        if ($ComfyUIVramHeadroomGB -gt 0) {
+            $headroom = $ComfyUIVramHeadroomGB.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+            $comfyArguments += @('--vram-headroom', $headroom)
+            Write-Host "ComfyUI DynamicVRAM extra headroom: $headroom GB" -ForegroundColor DarkGray
+        }
+        Start-ServiceProcess 'ComfyUI' $ComfyPython $comfyArguments $ComfyUIRoot | Out-Null
     }
     # The worker reconciles stale remote jobs as soon as it starts. Never let
     # it perform that audit while a cold ComfyUI process is still booting.
@@ -529,9 +531,9 @@ Wait-Http 'Django API' 'http://127.0.0.1:8000/api/v1/health/' $StartupTimeoutSec
 # Workers only start after migrations, assembly recovery, ComfyUI readiness
 # and API liveness. Generation is started before assembly so
 # the readiness endpoint observes the same deterministic order on every run.
-Start-ServiceProcess 'Generation worker' $BackendPython @('-u', 'manage.py', 'run_generation_worker', '--startup-recover-minutes', '0') $BackendRoot | Out-Null
-Start-ServiceProcess 'Text generation worker' $BackendPython @('-u', 'manage.py', 'run_text_generation_worker', '--startup-recover-minutes', '0') $BackendRoot | Out-Null
-Start-ServiceProcess 'Async media worker' $BackendPython @('-u', 'manage.py', 'run_async_media_worker', '--recover-minutes', '1') $BackendRoot | Out-Null
+Start-ServiceProcess 'Generation worker' $BackendPython @('-u', 'manage.py', 'run_generation_worker') $BackendRoot | Out-Null
+Start-ServiceProcess 'Text generation worker' $BackendPython @('-u', 'manage.py', 'run_text_generation_worker') $BackendRoot | Out-Null
+Start-ServiceProcess 'Async media worker' $BackendPython @('-u', 'manage.py', 'run_async_media_worker') $BackendRoot | Out-Null
 Start-ServiceProcess 'Assembly worker' $BackendPython @('-u', 'manage.py', 'run_assembly_worker') $BackendRoot | Out-Null
 Start-ServiceProcess 'Platform maintenance' $BackendPython @('-u', 'manage.py', 'run_platform_maintenance') $BackendRoot | Out-Null
 Start-ServiceProcess 'Vue frontend' $nodeRuntime.NpmPath @('run', 'dev', '--', '--host', '127.0.0.1', '--port', '5173', '--strictPort') $FrontendRoot | Out-Null

@@ -49,63 +49,15 @@ def _direct_batch_snapshot(task: GenerationTask) -> dict[str, Any]:
     return dict(snapshot)
 
 
-def effective_batch_snapshot_for_task(task: GenerationTask, *, _depth: int = 0) -> dict[str, Any]:
-    """Return persisted or inferred batch metadata for a generation task.
+def effective_batch_snapshot_for_task(task: GenerationTask) -> dict[str, Any]:
+    """Return only batch metadata persisted on the task itself.
 
-    New deferred materialized tasks persist their batch metadata directly.  Older
-    rows may not have it, but their one-to-one DeferredGenerationRequest still
-    points to the upstream batch task.  This read-side projection keeps the task
-    list factual without mutating historical rows.
+    Deferred materialization writes the complete child snapshot before the task
+    becomes visible.  Missing metadata is therefore an explicit incomplete
+    contract, never authority to reconstruct a task from neighbouring rows.
     """
 
-    direct = _direct_batch_snapshot(task)
-    if direct:
-        return direct
-    if _depth >= 4:
-        return {}
-    try:
-        deferred = task.deferred_generation_request
-    except (DeferredGenerationRequest.DoesNotExist, AttributeError):
-        return {}
-    source_snapshot = effective_batch_snapshot_for_task(
-        deferred.source_task,
-        _depth=_depth + 1,
-    )
-    batch_id = str(source_snapshot.get("batch_id") or "")
-    if not batch_id:
-        return {}
-    source_index = _safe_int(source_snapshot.get("batch_index"))
-    batch_size = _safe_int(source_snapshot.get("batch_size"))
-    target_index = source_index + 1
-    if source_index < 1 or batch_size < target_index:
-        return {}
-    shot = deferred.target_shot
-    episode = shot.episode
-    return {
-        "batch_id": batch_id,
-        "batch_kind": source_snapshot.get("batch_kind") or None,
-        "batch_role": "child",
-        "batch_index": target_index,
-        "batch_size": batch_size,
-        "shot_version_key": str(source_snapshot.get("shot_version_key") or ""),
-        "shot_version_label": str(source_snapshot.get("shot_version_label") or ""),
-        "batch_shot_ids": [
-            str(value) for value in source_snapshot.get("batch_shot_ids", [])
-        ],
-        "episode_id": str(episode.id),
-        "episode_number": episode.number,
-        "episode_title": episode.title,
-        "shot_ids": [str(shot.id)],
-        "shot_id": str(shot.id),
-        "shot_number": shot_version_number(shot),
-        "shot_title": shot.title,
-        "idempotency_key": str(source_snapshot.get("idempotency_key") or ""),
-        "request_fingerprint": str(source_snapshot.get("request_fingerprint") or ""),
-        "extended_generation_confirmed": bool(
-            source_snapshot.get("extended_generation_confirmed", False),
-        ),
-        "inferred_from_deferred_request_id": str(deferred.id),
-    }
+    return _direct_batch_snapshot(task)
 
 
 def production_batch_task_queryset(
@@ -122,11 +74,7 @@ def production_batch_task_queryset(
             project_id=project_id,
         )
         .filter(
-            Q(capability_snapshot__batch_id=batch_id)
-            | Q(deferred_generation_request__source_task__capability_snapshot__batch_id=batch_id)
-            | Q(
-                deferred_generation_request__source_task__deferred_generation_request__source_task__capability_snapshot__batch_id=batch_id
-            )
+            capability_snapshot__batch_id=batch_id,
         )
         .select_related(
             "project",
@@ -247,7 +195,6 @@ def build_production_batch_slots(
         )
         .filter(
             Q(source_task__capability_snapshot__batch_id=batch_id)
-            | Q(source_task__deferred_generation_request__source_task__capability_snapshot__batch_id=batch_id)
             | Q(materialized_task__capability_snapshot__batch_id=batch_id)
         )
         .select_related("source_task", "target_shot__episode", "materialized_task")
@@ -333,48 +280,6 @@ def build_production_batch_slots(
                     else "该槽位 deferred 已取消，可重新发起或重试上游任务恢复链路。"
                 )
                 workflow_mode = "deferred_first_frame_continuity"
-            elif deferred and deferred.status == DeferredGenerationRequest.Status.MATERIALIZED and deferred.materialized_task_id:
-                # Defensive path for historical tasks whose materialized child
-                # did not persist batch metadata and therefore was not returned
-                # by the direct batch query.
-                materialized = deferred.materialized_task
-                latest_task_by_index[index] = materialized
-                snapshot = effective_batch_snapshot_for_task(materialized)
-                slot_status = "cancelled" if materialized.status == GenerationTask.Status.CANCELLED else "materialized"
-                slot = {
-                    "batch_id": batch_id,
-                    "batch_kind": batch_kind or None,
-                    "shot_version_key": str(
-                        snapshot.get("shot_version_key") or shot_version_key_value
-                    ),
-                    "shot_version_label": str(
-                        snapshot.get("shot_version_label") or shot_version_label_value
-                    ),
-                    "batch_index": index,
-                    "batch_size": batch_size,
-                    "slot_status": slot_status,
-                    "message": "该槽位已由 deferred 物化为真实 GenerationTask。",
-                    "task_id": str(materialized.id),
-                    "task_status": materialized.status,
-                    "workflow_id": str(materialized.generated_workflow_id),
-                    "deferred_generation_request_id": str(deferred.id),
-                    "deferred_generation_status": deferred.status,
-                    "deferred_upstream_request_id": None,
-                    "episode_id": snapshot.get("episode_id") or (str(shot.episode_id) if shot else episode_id or None),
-                    "episode_number": snapshot.get("episode_number") or (shot.episode.number if shot else None),
-                    "episode_title": snapshot.get("episode_title") or (shot.episode.title if shot else ""),
-                    "shot_id": snapshot.get("shot_id") or (str(shot.id) if shot else str(deferred.target_shot_id)),
-                    "shot_number": snapshot.get("shot_number") or (
-                        shot_version_number(shot or deferred.target_shot)
-                    ),
-                    "shot_title": snapshot.get("shot_title") or (shot.title if shot else deferred.target_shot.title),
-                    "created_at": materialized.created_at,
-                    "updated_at": materialized.updated_at,
-                }
-                slots.append(slot)
-                previous_slot_status = slot_status
-                previous_task_status = materialized.status
-                continue
             elif previous_slot_status in {"cancelled", "cancelled_by_upstream"} or previous_task_status == GenerationTask.Status.CANCELLED:
                 slot_status = "cancelled_by_upstream"
                 message = "上游任务已取消，后续链路已中断；重试上游任务后可恢复链路。"

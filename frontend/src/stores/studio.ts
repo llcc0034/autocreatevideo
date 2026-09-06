@@ -3,7 +3,7 @@ import { defineStore } from 'pinia'
 import { repository } from '@/services/repository'
 import { applyProjectEpisodeSummary, buildProjectRedoPayload, createSessionEpoch, SessionInvalidatedError } from '@/services/projectManagement'
 import { acceptAuthoritativeCanonicalGlossary } from '@/services/translationReview'
-import type { AssemblyResult, Asset, BibleDraftEntityType, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, Episode, ReleaseBundle, SeriesProject, Shot, StylePreset, Workflow, WorkflowBatchSlot } from '@/types'
+import type { AssemblyResult, Asset, AssetGenerationJob, AssetGenerationJobType, AssetGenerationMediaType, AssetGenerationResolutionOutcome, BibleDraftEntityType, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, Episode, ReleaseBundle, SeriesProject, Shot, StylePreset, Workflow, WorkflowBatchSlot } from '@/types'
 
 const preserveWorkflowMedia = (next: Workflow, previous?: Workflow, preserveSignedUrls = true): Workflow => {
   if (!previous) return next
@@ -36,12 +36,9 @@ const preserveWorkflowMedia = (next: Workflow, previous?: Workflow, preserveSign
     }
   }
   type TaskAssets = Workflow['referenceAssets']
-  const stableAssetKey = (asset: NonNullable<TaskAssets>[number], index: number) => asset.assetId || `${asset.mediaKind}:${asset.displayName}:${asset.inputLabel || index}`
+  const stableAssetKey = (asset: TaskAssets[number], index: number) => asset.assetId || `${asset.mediaKind}:${asset.displayName}:${asset.inputLabel || index}`
   const preserveAssetPreviews = (nextAssets: TaskAssets, previousAssets: TaskAssets): TaskAssets => {
-    // An omitted field means the lightweight polling response did not include
-    // detail data. An explicit [] is authoritative and must clear stale assets.
-    if (nextAssets === undefined) return previousAssets
-    if (!nextAssets.length || !previousAssets?.length) return nextAssets
+    if (!nextAssets.length || !previousAssets.length) return nextAssets
     const previousByKey = new Map(previousAssets.map((asset, index) => [stableAssetKey(asset, index), asset]))
     return nextAssets.map((asset, index) => {
       const stable = previousByKey.get(stableAssetKey(asset, index))
@@ -158,6 +155,8 @@ const makeRestoredVirtualBatchUnit = (anchor: Workflow, slot: number, projects: 
     status: virtualState.status,
     progress: virtualState.status === 'completed' ? 100 : 0,
     currentStep: `整集镜头 ${slot}/${batchSize} · ${virtualState.step}`,
+    referenceAssets: [],
+    continuityAssets: [],
     nodes: [{
       id: workflowId,
       label: slotFact.slotStatus === 'materialized' ? '真实任务槽位' : '尾帧抽取与下游任务槽位',
@@ -262,6 +261,8 @@ const mergePolledWorkflows = (fresh: Workflow[], previous: Workflow[], preserveM
 export const useStudioStore = defineStore('studio', () => {
   const styles = ref<StylePreset[]>([])
   const assets = ref<Asset[]>([])
+  const assetGenerationJobs = ref<AssetGenerationJob[]>([])
+  let assetRefreshSequence = 0
   const projects = ref<SeriesProject[]>([])
   const workflows = ref<Workflow[]>([])
   const loading = ref(false)
@@ -289,7 +290,8 @@ export const useStudioStore = defineStore('studio', () => {
   const resetSessionState = () => {
     sessionEpoch.invalidate()
     toastSequence += 1
-    styles.value = []; assets.value = []; projects.value = []; workflows.value = []
+    assetRefreshSequence += 1
+    styles.value = []; assets.value = []; assetGenerationJobs.value = []; projects.value = []; workflows.value = []
     loading.value = false; error.value = ''; toast.value = null; ready.value = false
     initializeRequest = null
     projectDetailRequests.clear()
@@ -328,13 +330,23 @@ export const useStudioStore = defineStore('studio', () => {
   }
   const refreshAssets = async (filters?: { style?: string; type?: string; search?: string }) => {
     const requestEpoch = sessionEpoch.capture()
+    const requestSequence = ++assetRefreshSequence
     const fresh = await repository.getAssets(filters)
     assertCurrentSession(requestEpoch)
+    if (requestSequence !== assetRefreshSequence) return assets.value
     assets.value = fresh
     return assets.value
   }
-  const createImageAsset = async (payload: { file: File; kind: BibleDraftEntityType|'reference'; name: string; description: string; promptHint: string; styleId?: string }) => { const requestEpoch=sessionEpoch.capture();const item=await repository.createImageAsset(payload);assertCurrentSession(requestEpoch);assets.value=[item,...assets.value.filter((asset)=>asset.id!==item.id)];notify('图片素材已入库');return item }
-  const updateAssetMetadata = async (assetId:string,payload:{name:string;description:string;promptHint:string;kind:BibleDraftEntityType|'reference';styleId?:string}) => {const requestEpoch=sessionEpoch.capture();const item=await repository.updateAssetMetadata(assetId,payload);assertCurrentSession(requestEpoch);const index=assets.value.findIndex((asset)=>asset.id===assetId);if(index>=0)assets.value[index]=item;else assets.value.unshift(item);notify('素材说明已保存');return item}
+  const refreshAsset = async (id:string, mergeIntoList=true) => {const requestEpoch=sessionEpoch.capture();const item=await repository.getAsset(id);assertCurrentSession(requestEpoch);if(mergeIntoList){const index=assets.value.findIndex((asset)=>asset.id===id);if(index>=0)assets.value[index]=item;else assets.value.unshift(item)}return item}
+  const createAsset = async (payload: { file: File; mediaType: AssetGenerationMediaType; imageCategory?: BibleDraftEntityType|'reference'; name: string; description: string; promptHint: string; styleId?: string }) => { const requestEpoch=sessionEpoch.capture();const item=await repository.createAsset(payload);assertCurrentSession(requestEpoch);assets.value=[item,...assets.value.filter((asset)=>asset.id!==item.id)];notify('素材已入库');return item }
+  const refreshAssetGenerationJobs = async () => {const requestEpoch=sessionEpoch.capture();const rows=await repository.getAssetGenerationJobs();assertCurrentSession(requestEpoch);assetGenerationJobs.value=rows;return rows}
+  const getAssetGenerationOptions = (jobType:AssetGenerationJobType,mediaType:AssetGenerationMediaType)=>repository.getAssetGenerationOptions(jobType,mediaType)
+  const getWorkflowInputAssets = () => repository.getAssets()
+  const createAssetGenerationJob = async (payload:Parameters<typeof repository.createAssetGenerationJob>[0]) => {const requestEpoch=sessionEpoch.capture();const job=await repository.createAssetGenerationJob(payload);assertCurrentSession(requestEpoch);assetGenerationJobs.value=[job,...assetGenerationJobs.value.filter((item)=>item.id!==job.id)];notify(job.jobType==='prompt'?'提示词生成任务已排队':'素材生成任务已排队');return job}
+  const cancelAssetGenerationJob = async(id:string)=>{const requestEpoch=sessionEpoch.capture();const job=await repository.cancelAssetGenerationJob(id);assertCurrentSession(requestEpoch);assetGenerationJobs.value=assetGenerationJobs.value.map((item)=>item.id===id?job:item);notify('已提交取消请求','info');return job}
+  const retryAssetGenerationJob = async(id:string)=>{const requestEpoch=sessionEpoch.capture();const job=await repository.retryAssetGenerationJob(id);assertCurrentSession(requestEpoch);assetGenerationJobs.value=[job,...assetGenerationJobs.value.filter((item)=>item.id!==job.id)];notify('重试任务已排队');return job}
+  const resolveUncertainAssetGenerationJob = async(id:string,payload:{outcome:AssetGenerationResolutionOutcome;note:string;providerRequestId?:string;actualCost?:string|null;costCurrency?:string;idempotencyKey:string})=>{const requestEpoch=sessionEpoch.capture();await repository.resolveUncertainAssetGenerationJob(id,payload);assertCurrentSession(requestEpoch);const rows=await repository.getAssetGenerationJobs();assertCurrentSession(requestEpoch);assetGenerationJobs.value=rows;notify('素材生成任务消歧结论已记录');return rows.find((item)=>item.id===id)}
+  const updateAssetMetadata = async (assetId:string,payload:{name:string;description:string;promptHint:string;kind?:BibleDraftEntityType|'reference';styleId?:string}) => {const requestEpoch=sessionEpoch.capture();const item=await repository.updateAssetMetadata(assetId,payload);assertCurrentSession(requestEpoch);const index=assets.value.findIndex((asset)=>asset.id===assetId);if(index>=0)assets.value[index]=item;else assets.value.unshift(item);notify('素材说明已保存');return item}
   const deleteAsset = async (assetId:string) => {const requestEpoch=sessionEpoch.capture();await repository.deleteAsset(assetId);assertCurrentSession(requestEpoch);assets.value=assets.value.filter((asset)=>asset.id!==assetId);notify('素材已删除')}
   const refreshProjects = async () => {
     const requestEpoch = sessionEpoch.capture()
@@ -442,5 +454,5 @@ export const useStudioStore = defineStore('studio', () => {
   const getReleaseBundles = (projectId: string): Promise<ReleaseBundle[]> => repository.getReleaseBundles(projectId)
   const verifyReleaseBundle = (bundleId: string) => repository.verifyReleaseBundle(bundleId)
   const projectById = computed(() => (id: string) => projects.value.find((item) => item.id === id))
-  return { styles, assets, projects, workflows, loading, error, toast, ready, projectById, captureSessionEpoch, initialize, loadProject, resetSessionState, refreshAssets, refreshProjects, createImageAsset, updateAssetMetadata, deleteAsset, uploadReferenceAsset, createProject, saveProject, setProjectCover, setProjectFavorite, duplicateProject, deleteProject, ensureCanonicalGlossary, addEpisode, deleteEpisode, saveEpisode, saveShot, refreshWorkflows, mergeWorkflowDetail, getEpisodeAssemblies, getAssembly, getReleaseBundles, verifyReleaseBundle, notify }
+  return { styles, assets, assetGenerationJobs, projects, workflows, loading, error, toast, ready, projectById, captureSessionEpoch, initialize, loadProject, resetSessionState, refreshAssets, refreshAsset, refreshAssetGenerationJobs, getAssetGenerationOptions, getWorkflowInputAssets, createAssetGenerationJob, cancelAssetGenerationJob, retryAssetGenerationJob, resolveUncertainAssetGenerationJob, refreshProjects, createAsset, updateAssetMetadata, deleteAsset, uploadReferenceAsset, createProject, saveProject, setProjectCover, setProjectFavorite, duplicateProject, deleteProject, ensureCanonicalGlossary, addEpisode, deleteEpisode, saveEpisode, saveShot, refreshWorkflows, mergeWorkflowDetail, getEpisodeAssemblies, getAssembly, getReleaseBundles, verifyReleaseBundle, notify }
 })

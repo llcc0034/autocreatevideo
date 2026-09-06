@@ -119,9 +119,11 @@ class ScriptBibleProductionServiceTests(TestCase):
             username="script-bible-other",
             password="StrongPass123!",
         )
-        self.project = SeriesProject.objects.create(
+        self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16",
             owner=self.user,
             title="雨夜大学",
+            width=768, height=1344, fps=24, default_shot_duration_ms=5000,
+            continuity_seed=1,
             master_script=master_script(),
         )
         self.client = APIClient()
@@ -145,8 +147,16 @@ class ScriptBibleProductionServiceTests(TestCase):
     def test_frozen_apply_is_atomic_locked_and_idempotent(self):
         frozen = freeze_script_bible_candidates(self.project.master_script)
 
-        first = apply_frozen_script_bible(project=self.project, frozen=frozen)
-        second = apply_frozen_script_bible(project=self.project, frozen=frozen)
+        first = apply_frozen_script_bible(
+            project=self.project,
+            source_content=self.project.master_script,
+            frozen=frozen,
+        )
+        second = apply_frozen_script_bible(
+            project=self.project,
+            source_content=self.project.master_script,
+            frozen=frozen,
+        )
 
         self.assertEqual(len(first["created_ids"]), 3)
         self.assertEqual(first["reused_ids"], [])
@@ -173,7 +183,11 @@ class ScriptBibleProductionServiceTests(TestCase):
         self.project.save(update_fields=("master_script", "updated_at"))
 
         with self.assertRaises(ValidationError):
-            apply_frozen_script_bible(project=self.project, frozen=frozen)
+            apply_frozen_script_bible(
+                project=self.project,
+                source_content=self.project.master_script,
+                frozen=frozen,
+            )
 
         self.assertFalse(CharacterBible.objects.exists())
         self.assertFalse(SceneBible.objects.exists())
@@ -190,7 +204,11 @@ class ScriptBibleProductionServiceTests(TestCase):
         )
 
         with self.assertRaises(ValidationError):
-            apply_frozen_script_bible(project=self.project, frozen=frozen)
+            apply_frozen_script_bible(
+                project=self.project,
+                source_content=self.project.master_script,
+                frozen=frozen,
+            )
 
         self.assertFalse(CharacterBible.objects.exists())
         self.assertFalse(SceneBible.objects.exists())
@@ -206,7 +224,11 @@ class ScriptBibleProductionServiceTests(TestCase):
         self.assertEqual(forged.status_code, 400, forged.data)
 
         frozen = freeze_script_bible_candidates(self.project.master_script)
-        apply_frozen_script_bible(project=self.project, frozen=frozen)
+        apply_frozen_script_bible(
+            project=self.project,
+            source_content=self.project.master_script,
+            frozen=frozen,
+        )
         saved = CharacterBible.objects.get(project=self.project)
         removed = self.client.patch(
             f"/api/v1/characters/{saved.id}/",

@@ -26,7 +26,7 @@ class DeferredGenerationRequestViewSet(
             "project",
             "source_task",
             "target_shot",
-            "target_template",
+            "target_workflow_version__template",
             "derived_asset",
             "materialized_task__generated_workflow",
         ).order_by("-priority", "created_at")

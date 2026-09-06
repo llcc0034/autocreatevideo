@@ -12,7 +12,6 @@ import {
   formatProjectUpdatedAt,
   isProjectDeleteConfirmed,
   PROJECT_COVER_ACCEPT,
-  PROJECT_COVER_MAX_BYTES,
   projectCoverFileError,
   projectEpisodeSummary,
   projectCompletion,
@@ -38,6 +37,7 @@ const makeProject = (patch: Partial<SeriesProject> = {}): SeriesProject => ({
   translationGlossary: { 玄纹剑: 'Xuanwen Sword' },
   styleId: 'wuxia',
   status: 'writing',
+  language: 'Chinese',
   aspectRatio: '9:16',
   resolution: '720p',
   width: 768,
@@ -66,6 +66,15 @@ const deferred = <T>() => {
   return { promise, resolve, reject }
 }
 
+test('new project title does not impose a browser-only 60 character cap', () => {
+  const studio = readFileSync(new URL('../src/views/SeriesStudioView.vue', import.meta.url), 'utf8')
+  const titleInput = studio.match(/<input v-model="newProject\.title"[^>]*>/)?.[0] ?? ''
+
+  assert.ok(titleInput, 'new project title input should remain available')
+  assert.doesNotMatch(titleInput, /maxlength=/)
+  assert.doesNotMatch(studio, /newProject\.title\.length\s*}}\/60/)
+})
+
 test('project sorting pins favorites, then uses newest valid update without mutating input', () => {
   const projects = [
     makeProject({ id: 'ordinary-new', updatedAt: '2026-08-12T00:00:00Z' }),
@@ -93,11 +102,12 @@ test('redo payload is an independent draft with an explicit field allowlist', ()
   })
   const payload = buildProjectRedoPayload(source)
 
-  assert.equal(Array.from(payload.title).length, 199)
+  assert.equal(Array.from(payload.title).length, 225)
   assert.ok(payload.title.endsWith(' · 重做'))
   assert.equal(payload.logline, source.logline)
   assert.equal(payload.masterScript, source.masterScript)
   assert.equal(payload.styleId, source.styleId)
+  assert.equal(payload.language, source.language)
   assert.equal(payload.aspectRatio, source.aspectRatio)
   assert.equal(payload.resolution, source.resolution)
   assert.equal(payload.defaultMode, source.defaultMode)
@@ -107,8 +117,8 @@ test('redo payload is an independent draft with an explicit field allowlist', ()
   assert.deepEqual(payload.translationGlossary, {})
   assert.deepEqual(payload.bible, { characters: [], scenes: [], props: [], negativePrompt: '', colorScript: '' })
   assert.deepEqual(Object.keys(payload).sort(), [
-    'aspectRatio', 'bible', 'continuitySummary', 'defaultMode', 'isFavorite', 'logline', 'masterScript',
-    'resolution', 'status', 'styleId', 'title', 'translationGlossary',
+    'aspectRatio', 'bible', 'continuitySummary', 'defaultMode', 'height', 'isFavorite', 'language', 'logline', 'masterScript',
+    'resolution', 'status', 'styleId', 'title', 'translationGlossary', 'width',
   ])
   assert.ok(!('id' in payload))
   assert.ok(!('episodes' in payload))
@@ -118,13 +128,12 @@ test('redo payload is an independent draft with an explicit field allowlist', ()
   assert.notEqual(payload.bible.characters, source.bible.characters)
 })
 
-test('cover file validation matches the backend image contract and 10 MB limit', () => {
+test('cover file validation leaves configurable byte limits to the backend', () => {
   assert.equal(PROJECT_COVER_ACCEPT, 'image/jpeg,image/png,image/webp')
-  assert.equal(PROJECT_COVER_MAX_BYTES, 10 * 1024 * 1024)
-  assert.equal(projectCoverFileError({ name: 'cover.webp', type: 'image/webp', size: PROJECT_COVER_MAX_BYTES }), null)
+  assert.equal(projectCoverFileError({ name: 'cover.webp', type: 'image/webp', size: 10 * 1024 * 1024 }), null)
   assert.match(projectCoverFileError({ name: 'cover.gif', type: 'image/gif', size: 100 }) || '', /JPEG、PNG 或 WebP/)
   assert.match(projectCoverFileError({ name: 'empty.png', type: 'image/png', size: 0 }) || '', /文件为空/)
-  assert.match(projectCoverFileError({ name: 'large.jpg', type: 'image/jpeg', size: PROJECT_COVER_MAX_BYTES + 1 }) || '', /10 MB/)
+  assert.equal(projectCoverFileError({ name: 'large.jpg', type: 'image/jpeg', size: 100 * 1024 * 1024 }), null)
 })
 
 test('delete confirmation trims both values but otherwise requires an exact match', () => {
@@ -412,6 +421,7 @@ test('management view keeps card navigation separate from destructive controls',
   assert.ok(studioSource.includes(':accept="PROJECT_COVER_ACCEPT"'))
   assert.ok(studioSource.includes('projectCoverFileError(file)'))
   assert.ok(studioSource.includes('项目已创建，但封面上传失败'))
+  assert.ok(studioSource.includes("creationError.value = apiErrorSummary(error, '创建流程失败')"))
   assert.ok(studioSource.includes('URL.revokeObjectURL(pendingCoverPreview.value)'))
   assert.ok(studioSource.includes('pendingCoverFile.value = null'))
   assert.ok(studioSource.includes('studio.loadProject(project.value.id, true)'))

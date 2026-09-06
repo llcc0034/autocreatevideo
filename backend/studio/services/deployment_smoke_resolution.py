@@ -18,6 +18,12 @@ from studio.services.deployment_smoke_contract import (
     DEPLOYMENT_SMOKE_SUBMISSION_SEMANTICS,
 )
 from studio.services.json_contracts import json_contract
+from studio.services.security_boundaries import boundary_int
+from studio.services.content_contracts import normalize_audit_note
+
+
+def _deployment_smoke_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
 
 def unresolved_deployment_smoke_attempt(
@@ -57,9 +63,7 @@ def resolve_deployment_smoke_attempt(
 
     if not getattr(user, "is_staff", False):
         raise ValidationError("只有 staff 可以消歧 deployment smoke")
-    normalized_note = str(note or "").strip()
-    if not 8 <= len(normalized_note) <= 4000:
-        raise ValidationError({"note": "消歧说明必须为 8 到 4000 个字符"})
+    normalized_note = normalize_audit_note(note)
     if outcome not in set(ModelDeploymentSmokeAttemptResolution.Outcome.values):
         raise ValidationError({"outcome": "smoke 消歧结果无效"})
     request_id = str(provider_request_id or "").strip()
@@ -123,7 +127,10 @@ def resolve_deployment_smoke_attempt(
         "submission_semantics": DEPLOYMENT_SMOKE_SUBMISSION_SEMANTICS,
         "resolved_at": timezone.now().isoformat(),
     }
-    evidence_contract = json_contract(evidence)
+    evidence_contract = json_contract(
+        evidence,
+        max_bytes=_deployment_smoke_snapshot_max_bytes(),
+    )
     revision = (attempt.resolutions.aggregate(value=Max("revision"))["value"] or 0) + 1
     return ModelDeploymentSmokeAttemptResolution.objects.create(
         attempt=attempt,

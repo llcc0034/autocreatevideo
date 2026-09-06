@@ -25,7 +25,10 @@ class Command(BaseCommand):
         parser.add_argument(
             "--due",
             action="store_true",
-            help="Only probe hosts whose latest snapshot is absent or expired.",
+            help=(
+                "Only probe hosts whose latest snapshot is absent or has entered "
+                "its early refresh window."
+            ),
         )
 
     def handle(self, *args, **options):

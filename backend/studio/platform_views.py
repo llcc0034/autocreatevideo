@@ -1,16 +1,35 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import json
+import uuid
 from urllib.parse import urlencode
 
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Count
+from django.db.models.deletion import ProtectedError
+from django.db.models import (
+    Count,
+    Exists,
+    F,
+    IntegerField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    Value,
+    Window,
+)
+from django.db.models.functions import Coalesce, RowNumber
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.types import OpenApiTypes
-from drf_spectacular.utils import OpenApiParameter, OpenApiResponse, extend_schema
+from drf_spectacular.utils import (
+    OpenApiParameter,
+    OpenApiResponse,
+    extend_schema,
+)
 from rest_framework import mixins, status, viewsets
 from rest_framework.views import APIView
 from rest_framework.decorators import action
@@ -20,6 +39,9 @@ from rest_framework.response import Response
 from rest_framework.reverse import reverse
 
 from studio.models import (
+    Asset,
+    ComfyWorkflowSource,
+    ComfyWorkflowContractDraft,
     ConfigDefinition,
     ConfigRevision,
     GeneratedArtifact,
@@ -27,6 +49,7 @@ from studio.models import (
     HostCapabilitySnapshot,
     ModelArtifact,
     ModelDeployment,
+    ModelDeploymentCapabilitySnapshot,
     ModelDeploymentSmokeAttempt,
     ModelProfileVersion,
     PlatformLifecycleAuditEvent,
@@ -49,19 +72,38 @@ from studio.models import (
     SeriesProject,
     Shot,
     WorkflowTemplateVersion,
+    WorkflowModelRequirement,
+    WorkflowSemanticBinding,
     WorkflowSmokeAttempt,
+    WorkflowProjector,
+    WorkflowProjectorVersion,
 )
-from studio.pagination import StandardPageNumberPagination
+from studio.pagination import AcceptanceSmokePagination, StandardPageNumberPagination
 from studio.permissions import IsStaffOrReadOnly, IsSuperUser
 from studio.platform_serializers import (
     ApprovalDecisionInputSerializer,
+    AcceptanceSmokePageSerializer,
+    AcceptanceSmokeQuerySerializer,
     AuthorizeStageCostInputSerializer,
+    BibleImageRegenerationInputSerializer,
     ConfigDefinitionSerializer,
+    ConfigDefinitionCreateInputSerializer,
+    ConfigDefinitionOptionsSerializer,
+    CONFIG_DEFAULT_SOURCE_CHOICES,
     ConfigResourceOptionSerializer,
     ConfigurationErrorResponseSerializer,
     ConfigRevisionCreateSerializer,
     ConfigRevisionSerializer,
+    ComfySavedWorkflowBatchInputSerializer,
+    ComfySavedWorkflowBatchResponseSerializer,
+    ComfySavedWorkflowDiscoveryResponseSerializer,
+    ComfyDraftArtifactAttestationInputSerializer,
+    ComfySavedWorkflowPreviewInputSerializer,
+    ComfySavedWorkflowPreviewResponseSerializer,
+    ComfyWorkflowSourceSerializer,
+    ComfyWorkflowContractDraftSerializer,
     DeploymentActionSerializer,
+    DeploymentAcceptanceRowSerializer,
     DeploymentProbeInputSerializer,
     GeneratedArtifactDetailSerializer,
     GeneratedArtifactListSerializer,
@@ -72,6 +114,8 @@ from studio.platform_serializers import (
     ModelDeploymentSerializer,
     ModelDeploymentCapabilitySnapshotSerializer,
     ModelDeploymentSmokeAttemptSerializer,
+    ModelProfileNextVersionInputSerializer,
+    ModelProfileRegistryOptionsSerializer,
     ModelProfileVersionSerializer,
     NodeMetadataQuerySerializer,
     NodeMetadataResponseSerializer,
@@ -79,6 +123,8 @@ from studio.platform_serializers import (
     PromptNormalizationSmokeResolutionSerializer,
     ProductionReadinessResponseSerializer,
     ProductionRecipeMediaRouteOptionsSerializer,
+    ProductionRecipeCloneSuccessorInputSerializer,
+    ProductionRecipeEditorOptionsSerializer,
     ProductionRecipeVersionSerializer,
     ProductionRunCreateSerializer,
     ProductionRunDetailSerializer,
@@ -89,15 +135,23 @@ from studio.platform_serializers import (
     ProviderProfileSerializer,
     PlatformLifecycleAuditEventSerializer,
     PromptFieldDefinitionSerializer,
+    PromptFieldDefinitionCreateInputSerializer,
+    PromptFieldDefinitionOptionsSerializer,
     PromptProfileBindingSerializer,
     PromptProfileFieldRuleSerializer,
     PromptProfileOptionsSerializer,
+    PromptProfileCloneSuccessorInputSerializer,
     PromptProfilePreviewInputSerializer,
     PromptProfilePreviewSerializer,
     PromptProfileVersionSerializer,
+    PromptProfileVersionCreateInputSerializer,
     RecommendationDecisionInputSerializer,
     RecommendationDecisionSerializer,
     RecommendationSnapshotSerializer,
+    RegistryDeletionExecuteInputSerializer,
+    RegistryDeletionExecuteResponseSerializer,
+    RegistryDeletionImpactSerializer,
+    RegistryDeletionPreviewInputSerializer,
     RuntimeHostProbeAttemptSerializer,
     RuntimeHostSerializer,
     RuntimeHostStatusSerializer,
@@ -122,11 +176,27 @@ from studio.platform_serializers import (
     WorkflowTemplateVersionDetailSerializer,
     WorkflowTemplateCanvasExportSerializer,
     WorkflowTemplateCanvasExportQuerySerializer,
-    WorkflowTemplateVersionImportSerializer,
     WorkflowTemplateVersionListSerializer,
     WorkflowSmokeTestResponseSerializer,
+    WorkflowSmokeActionSerializer,
     WorkflowSmokeAttemptSerializer,
+    WorkflowSmokeResolutionInputSerializer,
+    WorkflowSmokeResolutionSerializer,
+    WorkflowProjectorSerializer,
+    WorkflowProjectorVersionCloneSerializer,
+    WorkflowProjectorVersionSerializer,
+    WorkflowProjectorOptionsSerializer,
+    WorkflowProjectorRecommendationInputSerializer,
+    WorkflowProjectorRecommendationSerializer,
     WorkflowValidationResponseSerializer,
+    WorkflowAcceptanceRowSerializer,
+    config_definition_system_defaults,
+    prompt_field_system_defaults,
+    prompt_rule_system_defaults,
+)
+from studio.services.acceptance_smoke import (
+    deployment_acceptance_row,
+    workflow_acceptance_row,
 )
 from studio.services.configuration import (
     ConfigurationResolutionError,
@@ -139,12 +209,37 @@ from studio.services.configuration import (
     validate_version_configuration_defaults,
 )
 from studio.services.json_contracts import json_contract, verify_json_contract
+from studio.services.security_boundaries import (
+    boundary_int,
+    boundary_values,
+    security_boundary_resolution_cache,
+)
+from studio.services.model_profile_contracts import (
+    verified_model_profile_specification,
+)
+from studio.services.model_profile_options import (
+    model_capability_values,
+    model_family_value,
+    model_profile_registry_options,
+)
+from studio.services.media_capabilities import (
+    validate_model_profile_media_capabilities,
+)
 from studio.exceptions import api_error_response
 from studio.services.platform_lifecycle_audit import (
     lifecycle_summary,
     record_platform_lifecycle_event,
     request_reason_code,
 )
+from studio.services.registry_deletion import (
+    RegistryDeletionConflict,
+    RegistryDeletionTargetNotFound,
+    build_registry_deletion_impact,
+    execute_registry_deletion,
+    recipe_reference_exists,
+    validate_recipe_registry_references,
+)
+from studio.services.registry_reference_lock import registry_reference_write_guard
 from studio.services.production_runs import (
     ProductionRunConflict,
     ProductionRunCreateRejected,
@@ -156,23 +251,45 @@ from studio.services.production_runs import (
     create_production_run,
     decide_stage,
     production_recipe_media_route_options,
+    production_recipe_editor_options,
+    regenerate_bible_image_candidates,
     retry_production_run,
     resolve_uncertain_attempt,
     select_run_artifact,
     select_stage_route,
     validate_production_recipe_executability,
 )
-from studio.services.provider_registry import ProviderDriverError, driver_for
+from studio.services.provider_registry import (
+    ProviderDriverError,
+    driver_for,
+    validate_deployment_execution_contract,
+)
 from studio.services.prompt_profiles import (
+    CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
+    DECLARATIVE_SOURCE_PROJECTION_KEY,
+    DIRECT_SOURCE_PROJECTION_KEY,
     KNOWN_MODEL_FAMILIES,
     KNOWN_PROMPT_OPERATIONS,
-    assemble_prompt_profile,
+    PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+    SUPPORTED_FIELD_SOURCE_SELECTORS,
+    clone_prompt_profile_successor,
     model_family_for_profile,
     publish_prompt_profile,
     refresh_prompt_profile_contract,
     retire_prompt_profile,
 )
-from studio.services.async_media_contract import validate_async_model_profile
+from studio.services.prompt_generation_sources import (
+    prompt_generation_source_options,
+)
+from studio.services.prompt_profile_preview import preview_prompt_profile
+from studio.services.reference_context import rendering_options
+from studio.services.source_projection_primitives import (
+    source_projection_primitive_options,
+)
+from studio.services.async_media_contract import (
+    deployment_target_sha256,
+    validate_async_model_profile,
+)
 from studio.services.deployment_smoke import (
     SCRIPT_GENERATE_OPERATION,
     probe_async_deployment,
@@ -181,6 +298,7 @@ from studio.services.script_structure import (
     SCRIPT_STRUCTURE_OPERATION,
     validate_script_structure_model_profile,
 )
+from studio.services.production_visual_rules import validate_visual_rules_model_profile
 from studio.services.deployment_smoke_queue import (
     enqueue_deployment_smoke,
     request_deployment_smoke_cancel,
@@ -201,21 +319,28 @@ from studio.services.runtime_platform import (
     capability_readiness,
     decide_recommendation,
     recommend_for_host,
+    validate_draft_profile_artifacts_for_publish,
     verified_artifact_availability,
 )
 from studio.services.runtime_host_probe_queue import (
     enqueue_runtime_host_probe,
     request_runtime_host_probe_cancel,
 )
+from studio.services.draft_model_artifact_attestation import (
+    DraftArtifactAttestationConflict,
+    enqueue_draft_model_artifact_attestation,
+)
 from studio.services.script_sources import (
     ScriptSourceValidationError,
     confirm_script_revision,
     create_pasted_script_source,
+    create_script_source_from_asset,
     create_script_revision,
     create_uploaded_script_source,
 )
 from studio.services.readiness import collect_production_readiness
 from studio.services.workflow_versions import (
+    WorkflowModelEvidenceUnavailable,
     node_metadata,
     publish_workflow_version,
     resolve_workflow_canvas_export_deployment,
@@ -226,9 +351,34 @@ from studio.services.comfyui_canvas import (
     api_graph_to_ui_workflow,
     is_comfyui_ui_workflow,
 )
+from studio.services.comfyui_workflow_imports import (
+    SavedWorkflowImportError,
+    SavedWorkflowRequestBudgetExceeded,
+    _safe_projected_error,
+    batch_import_saved_workflows,
+    discover_saved_workflows,
+    preview_saved_workflow,
+    recommend_workflow_projector_from_candidate,
+)
+from studio.services.comfyui_workflow_library import (
+    saved_workflow_directory,
+    saved_workflow_directory_resolution_cache,
+)
+from studio.services.workflow_projectors import (
+    WORKFLOW_PROJECTOR_DEFINITION_SCHEMA_VERSION,
+    validate_workflow_projector_definition,
+    validate_workflow_projector_publish_conflicts,
+    workflow_projector_configuration_options,
+    workflow_projector_engine_options,
+)
 from studio.services.workflow_smoke_queue import (
     enqueue_workflow_smoke,
     request_workflow_smoke_cancel,
+)
+from studio.services.workflow_smoke_fixtures import WorkflowSmokeFixtureConflict
+from studio.services.workflow_smoke_resolution import (
+    WorkflowSmokeResolutionConflict,
+    resolve_workflow_smoke_attempt,
 )
 from studio.services.secret_store import (
     SecretStoreError,
@@ -238,9 +388,181 @@ from studio.services.secret_store import (
 )
 
 
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
+
+
+def _saved_workflow_effective_limits() -> dict[str, object]:
+    limits = boundary_values(
+        "security.comfy.import.scan_max_items",
+        "security.comfy.import.scan_max_seconds",
+        "security.comfy.import.request_max_bytes",
+        "security.comfy.import.batch_max_items",
+        "security.comfy.import.batch_max_seconds",
+    )
+    return {
+        "scan_max_items": int(limits["security.comfy.import.scan_max_items"]),
+        "scan_max_seconds": float(limits["security.comfy.import.scan_max_seconds"]),
+        "request_max_bytes": int(limits["security.comfy.import.request_max_bytes"]),
+        "batch_max_items": int(limits["security.comfy.import.batch_max_items"]),
+        "batch_max_seconds": float(limits["security.comfy.import.batch_max_seconds"]),
+        "saved_workflow_directory": saved_workflow_directory(),
+    }
+
+
 def _drf_validation(exc: DjangoValidationError) -> ValidationError:
     detail = getattr(exc, "message_dict", None) or getattr(exc, "messages", None) or str(exc)
-    return ValidationError(detail)
+    code = str(getattr(exc, "code", None) or "invalid")
+    error = ValidationError(detail, code=code)
+    error.default_code = code
+    return error
+
+
+def _workflow_model_evidence_recovery(
+    exc: WorkflowModelEvidenceUnavailable,
+    *,
+    version: WorkflowTemplateVersion,
+    deployment: ModelDeployment,
+) -> dict[str, object]:
+    """Describe the current safe recovery path without exposing file paths or hashes."""
+
+    artifact = ModelArtifact.objects.filter(pk=exc.artifact_id).first()
+    snapshot = None
+    evidence_ready = False
+    if deployment.runtime_host_id:
+        snapshot = HostCapabilitySnapshot.objects.filter(
+            host_id=deployment.runtime_host_id,
+        ).order_by("-captured_at", "-revision").first()
+    required_rows = list(
+        version.model_requirements.select_related("artifact").filter(is_required=True),
+    )
+    evidence_artifacts = [
+        row.artifact for row in required_rows if row.artifact_id and row.artifact is not None
+    ] or ([artifact] if artifact is not None else [])
+    if (
+        snapshot is not None
+        and evidence_artifacts
+        and (not required_rows or len(evidence_artifacts) == len(required_rows))
+    ):
+        evidence_ready = True
+        for required_artifact in evidence_artifacts:
+            if (
+                required_artifact.status != ModelArtifact.Status.AVAILABLE
+                or not required_artifact.sha256
+                or required_artifact.size_bytes is None
+            ):
+                evidence_ready = False
+                break
+            try:
+                verified_artifact_availability(
+                    snapshot=snapshot,
+                    deployment=deployment,
+                    artifact=required_artifact,
+                )
+            except DjangoValidationError:
+                evidence_ready = False
+                break
+
+    active_probe = None
+    if deployment.runtime_host_id:
+        active_probe = RuntimeHostProbeAttempt.objects.filter(
+            host_id=deployment.runtime_host_id,
+            probe_kind=RuntimeHostProbeAttempt.ProbeKind.CAPABILITY,
+            status__in=(
+                RuntimeHostProbeAttempt.Status.QUEUED,
+                RuntimeHostProbeAttempt.Status.RUNNING,
+                RuntimeHostProbeAttempt.Status.CANCEL_REQUESTED,
+            ),
+        ).order_by("-created_at").first()
+
+    retry_action = {
+        "kind": "retry_live_validate",
+        "label": "重新校验",
+    }
+    runtime_action = {
+        "kind": "open_settings",
+        "section": "runtime",
+        "label": "前往运行主机",
+    }
+    model_action = {
+        "kind": "open_settings",
+        "section": "models",
+        "label": "检查模型文件",
+    }
+    if evidence_ready:
+        state = "ready_to_retry"
+        title = "主机证明已刷新，可以重新校验"
+        summary = (
+            "系统已找到当前有效的主机证明，文件大小和 SHA-256 与模型声明一致；"
+            "工作流模板和模型文件都不需要修改。"
+        )
+        steps = [
+            "保持当前验收部署不变。",
+            "点击“重新校验”，生成本次 Live Validate 的新证据。",
+        ]
+        actions = [retry_action]
+    elif active_probe is not None:
+        state = "host_probe_running"
+        title = "主机证明正在刷新"
+        summary = (
+            "验收主机已有探测任务正在执行；本次失败通常是校验早于新证明完成，"
+            "不是工作流节点或参数错误。"
+        )
+        steps = [
+            "前往“系统设置 → 运行主机”查看当前探测任务。",
+            "等待任务状态变为“成功”，不要重复创建探测。",
+            "返回本页，点击“重新校验”。",
+        ]
+        actions = [runtime_action, retry_action]
+    elif exc.reason_code in {
+        "host_snapshot_stale",
+        "host_snapshot_not_latest",
+        "host_probe_failed",
+        "artifact_host_mismatch",
+    }:
+        state = "host_probe_required"
+        title = "需要刷新验收主机证明"
+        summary = (
+            "当前验收部署没有可用于本次校验的新鲜主机证明；"
+            "这不是工作流参数或参考素材填写错误。"
+        )
+        steps = [
+            "前往“系统设置 → 运行主机”，选择当前验收部署绑定的主机并执行探测。",
+            "等待探测成功，确认模型文件观测状态为 available。",
+            "返回本页，点击“重新校验”。",
+        ]
+        actions = [runtime_action, retry_action]
+    else:
+        state = "model_evidence_review_required"
+        title = "模型文件证明与声明不一致"
+        summary = (
+            "最新主机证明仍未提供与模型声明一致的文件大小和 SHA-256；"
+            "应检查主机文件和模型声明，不要修改工作流参数。"
+        )
+        steps = [
+            "先在“系统设置 → 运行主机”重新探测，排除旧快照。",
+            "若新探测仍不匹配，前往“系统设置 → 模型 → 文件与证明”核对该文件；已发布模型声明有误时创建下一版本。",
+            "证明一致后返回本页，点击“重新校验”。",
+        ]
+        actions = [runtime_action, model_action, retry_action]
+
+    return {
+        "detail": summary,
+        "reason_code": exc.reason_code,
+        "requirement_alias": exc.requirement_alias,
+        "artifact_id": exc.artifact_id,
+        "workflow_version_id": str(version.id),
+        "deployment_id": str(deployment.id),
+        "runtime_host_id": str(deployment.runtime_host_id or ""),
+        "recovery": {
+            "schema_version": 1,
+            "state": state,
+            "title": title,
+            "summary": summary,
+            "steps": steps,
+            "actions": actions,
+        },
+    }
 
 
 class ProductionReadinessView(APIView):
@@ -251,25 +573,558 @@ class ProductionReadinessView(APIView):
         return Response(collect_production_readiness())
 
 
-def _json_contains_identifier(value, identifier: str) -> bool:
-    if isinstance(value, dict):
-        return any(_json_contains_identifier(item, identifier) for item in value.values())
-    if isinstance(value, list):
-        return any(_json_contains_identifier(item, identifier) for item in value)
-    return isinstance(value, str) and value == identifier
+class AcceptanceSmokeView(APIView):
+    """Read-only, staff-only projection of acceptance and smoke evidence."""
 
+    permission_classes = (IsAdminUser,)
+    related_workflow_batch_size = 200
 
-def _recipe_reference_exists(identifier) -> bool:
-    target = str(identifier)
-    return any(
-        _json_contains_identifier(definition, target)
-        for definition in ProductionRecipeVersion.objects.filter(
-            status__in=(
-                ProductionRecipeVersion.Status.DRAFT,
-                ProductionRecipeVersion.Status.PUBLISHED,
+    @staticmethod
+    def _attempt_ids_for_workflows(versions):
+        ids = {
+            version.latest_acceptance_attempt_id
+            for version in versions
+            if getattr(version, "latest_acceptance_attempt_id", None)
+        }
+        ids.update({
+            version.latest_validated_acceptance_attempt_id
+            for version in versions
+            if getattr(
+                version,
+                "latest_validated_acceptance_attempt_id",
+                None,
+            )
+        })
+        for version in versions:
+            evidence = version.smoke_test_evidence
+            value = evidence.get("smoke_attempt_id") if isinstance(evidence, dict) else None
+            try:
+                ids.add(uuid.UUID(str(value)))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        return ids
+
+    @staticmethod
+    def _workflow_attempt_map(versions):
+        attempt_ids = AcceptanceSmokeView._attempt_ids_for_workflows(versions)
+        return {
+            attempt.id: attempt
+            for attempt in WorkflowSmokeAttempt.objects.filter(
+                id__in=attempt_ids,
+            ).select_related(
+                "deployment__profile_version__provider",
+            ).prefetch_related("resolutions")
+        }
+
+    @staticmethod
+    def _workflow_queryset(*, selected_deployment=None):
+        latest_attempt = WorkflowSmokeAttempt.objects.filter(
+            workflow_version_id=OuterRef("pk"),
+        )
+        if selected_deployment is not None:
+            latest_attempt = latest_attempt.filter(
+                deployment_id=selected_deployment.id,
+            )
+        queryset = WorkflowTemplateVersion.objects.select_related(
+            "template",
+            "provider",
+            "model_profile_version__provider",
+            "validated_deployment__profile_version__provider",
+            "validated_deployment__profile_version__provider__credential__active_version",
+            "validated_deployment__runtime_host",
+            "validated_deployment__credential__active_version",
+        ).prefetch_related(
+            Prefetch(
+                "semantic_bindings",
+                queryset=WorkflowSemanticBinding.objects.order_by(
+                    "semantic_key", "node_id", "input_name", "id",
+                ),
             ),
-        ).values_list("definition", flat=True)
+            Prefetch(
+                "model_requirements",
+                queryset=WorkflowModelRequirement.objects.select_related(
+                    "artifact",
+                ).order_by("role", "alias", "id"),
+            ),
+        ).annotate(
+            latest_acceptance_attempt_id=Subquery(
+                latest_attempt.order_by("-created_at", "-id").values("id")[:1],
+            ),
+            latest_validated_acceptance_attempt_id=Subquery(
+                WorkflowSmokeAttempt.objects.filter(
+                    workflow_version_id=OuterRef("pk"),
+                    deployment_id=OuterRef("validated_deployment_id"),
+                ).order_by("-created_at", "-id").values("id")[:1],
+            ),
+        )
+        if selected_deployment is not None:
+            queryset = queryset.annotate(
+                has_selected_smoke_attempt=Exists(
+                    WorkflowSmokeAttempt.objects.filter(
+                        workflow_version_id=OuterRef("pk"),
+                        deployment_id=selected_deployment.id,
+                    ),
+                ),
+            ).filter(
+                Q(model_profile_version_id=selected_deployment.profile_version_id)
+                | Q(validated_deployment_id=selected_deployment.id)
+                | Q(smoke_attempts__deployment_id=selected_deployment.id)
+            ).distinct()
+        return queryset
+
+    @staticmethod
+    def _workflow_rows(
+        versions,
+        *,
+        selected_deployment=None,
+        graph_limit: int,
+    ):
+        attempts = AcceptanceSmokeView._workflow_attempt_map(versions)
+        rows = []
+        for version in versions:
+            attempt_id = getattr(version, "latest_acceptance_attempt_id", None)
+            if selected_deployment is None and version.validated_deployment_id:
+                attempt_id = getattr(
+                    version,
+                    "latest_validated_acceptance_attempt_id",
+                    None,
+                )
+            latest_attempt = attempts.get(
+                attempt_id,
+            )
+            evidence = version.smoke_test_evidence
+            evidence_attempt = None
+            if isinstance(evidence, dict):
+                try:
+                    evidence_attempt = attempts.get(
+                        uuid.UUID(str(evidence.get("smoke_attempt_id"))),
+                    )
+                except (TypeError, ValueError, AttributeError):
+                    evidence_attempt = None
+            rows.append(workflow_acceptance_row(
+                version,
+                selected_deployment=selected_deployment,
+                latest_attempt=latest_attempt,
+                evidence_attempt=evidence_attempt,
+                has_selected_smoke_attempt=(
+                    bool(getattr(version, "has_selected_smoke_attempt", False))
+                    if selected_deployment is not None
+                    else latest_attempt is not None
+                ),
+                graph_limit=graph_limit,
+            ))
+        return rows
+
+    def _workflow_response(self, request, query, *, graph_limit: int):
+        selected_deployment = None
+        deployment_id = query.get("deployment_id")
+        if deployment_id:
+            selected_deployment = ModelDeployment.objects.select_related(
+                "profile_version__provider__credential__active_version",
+                "runtime_host",
+                "credential__active_version",
+            ).filter(pk=deployment_id).first()
+        queryset = (
+            self._workflow_queryset(selected_deployment=selected_deployment)
+            if selected_deployment is not None or not deployment_id
+            else WorkflowTemplateVersion.objects.none()
+        )
+        workflow_id = query.get("workflow_id")
+        if workflow_id:
+            queryset = queryset.filter(pk=workflow_id)
+        search = str(query.get("search") or "").strip()
+        if search:
+            search_filter = (
+                Q(template__name__icontains=search)
+                | Q(template__slug__icontains=search)
+                | Q(model_profile_version__model_identifier__icontains=search)
+                | Q(validated_deployment__name__icontains=search)
+                | Q(validated_deployment__key__icontains=search)
+            )
+            try:
+                search_filter |= Q(pk=uuid.UUID(search))
+            except (TypeError, ValueError, AttributeError):
+                pass
+            if search.isdecimal():
+                search_filter |= Q(version=int(search))
+            queryset = queryset.filter(search_filter)
+        queryset = queryset.order_by("-updated_at", "-created_at", "id")
+        paginator = AcceptanceSmokePagination()
+        page = paginator.paginate_queryset(queryset, request, view=self)
+        rows = self._workflow_rows(
+            list(page),
+            selected_deployment=selected_deployment,
+            graph_limit=graph_limit,
+        )
+        payload = WorkflowAcceptanceRowSerializer(rows, many=True).data
+        return paginator.get_paginated_response(payload)
+
+    def _deployment_response(self, request, query, *, graph_limit: int):
+        latest_health = ModelDeploymentCapabilitySnapshot.objects.filter(
+            deployment_id=OuterRef("pk"),
+            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.HEALTH,
+        ).order_by("-revision", "-id")
+        profile_match_count = WorkflowTemplateVersion.objects.filter(
+            model_profile_version_id=OuterRef("profile_version_id"),
+        ).order_by().values("model_profile_version_id").annotate(
+            total=Count("id"),
+        ).values("total")[:1]
+        profile_evidence_match_count = WorkflowTemplateVersion.objects.filter(
+            model_profile_version_id=OuterRef("profile_version_id"),
+        ).filter(
+            Q(validated_deployment_id=OuterRef("pk"))
+            | Q(smoke_attempts__deployment_id=OuterRef("pk")),
+        ).order_by().values("model_profile_version_id").annotate(
+            total=Count("id", distinct=True),
+        ).values("total")[:1]
+        validated_count = WorkflowTemplateVersion.objects.filter(
+            validated_deployment_id=OuterRef("pk"),
+        ).order_by().values("validated_deployment_id").annotate(
+            total=Count("id"),
+        ).values("total")[:1]
+        smoke_history_count = WorkflowSmokeAttempt.objects.filter(
+            deployment_id=OuterRef("pk"),
+        ).order_by().values("deployment_id").annotate(
+            total=Count("workflow_version_id", distinct=True),
+        ).values("total")[:1]
+        queryset = ModelDeployment.objects.select_related(
+            "profile_version__provider__credential__active_version",
+            "runtime_host",
+            "credential__active_version",
+        ).annotate(
+            profile_match_count=Coalesce(
+                Subquery(profile_match_count, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            profile_evidence_match_count=Coalesce(
+                Subquery(
+                    profile_evidence_match_count,
+                    output_field=IntegerField(),
+                ),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            validated_count=Coalesce(
+                Subquery(validated_count, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            smoke_history_count=Coalesce(
+                Subquery(smoke_history_count, output_field=IntegerField()),
+                Value(0),
+                output_field=IntegerField(),
+            ),
+            latest_health_snapshot_id=Subquery(latest_health.values("id")[:1]),
+        )
+        deployment_id = query.get("deployment_id")
+        if deployment_id:
+            queryset = queryset.filter(pk=deployment_id)
+        search = str(query.get("search") or "").strip()
+        if search:
+            search_filter = (
+                Q(name__icontains=search)
+                | Q(key__icontains=search)
+                | Q(profile_version__model_identifier__icontains=search)
+                | Q(profile_version__provider__name__icontains=search)
+                | Q(profile_version__provider__driver_type__icontains=search)
+            )
+            try:
+                search_filter |= Q(pk=uuid.UUID(search))
+            except (TypeError, ValueError, AttributeError):
+                pass
+            queryset = queryset.filter(search_filter)
+        queryset = queryset.order_by("-is_default", "-priority", "key", "id")
+        paginator = AcceptanceSmokePagination()
+        deployments = list(paginator.paginate_queryset(queryset, request, view=self))
+        deployment_ids = [row.id for row in deployments]
+
+        health_ids = {
+            row.latest_health_snapshot_id
+            for row in deployments if row.latest_health_snapshot_id
+        }
+        health_by_id = {
+            row.id: row
+            for row in ModelDeploymentCapabilitySnapshot.objects.filter(id__in=health_ids)
+        }
+
+        # Keep the latest history for every operation contract, not just the
+        # deployment's single latest snapshot. Expired operations must remain visible.
+        latest_operation_snapshots = ModelDeploymentCapabilitySnapshot.objects.filter(
+            deployment_id__in=deployment_ids,
+            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
+        ).annotate(
+            operation_row_number=Window(
+                expression=RowNumber(),
+                partition_by=(F("deployment_id"), F("operations_sha256"), F("prompt_profile_binding_id"), F("prompt_profile_version_id")),
+                order_by=(F("revision").desc(), F("id").desc()),
+            ),
+        ).filter(operation_row_number=1).values("id")
+        fresh_snapshot_filter = Q(id__in=latest_operation_snapshots)
+        for deployment in deployments:
+            try:
+                target_sha256 = deployment_target_sha256(deployment)
+            except (DjangoValidationError, RuntimeError, TypeError, ValueError):
+                continue
+            fresh_snapshot_filter |= Q(
+                deployment_id=deployment.id,
+                target_sha256=target_sha256,
+                status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
+                expires_at__gt=timezone.now(),
+            )
+        smoke_snapshots_by_deployment = {}
+        for snapshot in ModelDeploymentCapabilitySnapshot.objects.filter(
+            fresh_snapshot_filter,
+            deployment_id__in=deployment_ids,
+            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
+        ).order_by("deployment_id", "-revision", "-id"):
+            smoke_snapshots_by_deployment.setdefault(
+                snapshot.deployment_id, [],
+            ).append(snapshot)
+
+        latest_attempts = ModelDeploymentSmokeAttempt.objects.filter(
+            deployment_id__in=deployment_ids,
+        ).annotate(
+            acceptance_row_number=Window(
+                expression=RowNumber(),
+                partition_by=(F("deployment_id"), F("operation")),
+                order_by=(F("created_at").desc(), F("id").desc()),
+            ),
+        ).filter(acceptance_row_number=1).prefetch_related("resolutions")
+        deployment_attempts = {}
+        for attempt in latest_attempts:
+            deployment_attempts.setdefault(attempt.deployment_id, []).append(attempt)
+
+        latest_workflow_attempts = WorkflowSmokeAttempt.objects.filter(
+            deployment_id__in=deployment_ids,
+        ).annotate(
+            acceptance_row_number=Window(
+                expression=RowNumber(),
+                partition_by=(F("deployment_id"), F("workflow_version_id")),
+                order_by=(F("created_at").desc(), F("id").desc()),
+            ),
+        ).filter(acceptance_row_number=1).prefetch_related("resolutions")
+        unresolved_workflow_attempt_counts = {}
+        for attempt in latest_workflow_attempts:
+            if (
+                attempt.status == WorkflowSmokeAttempt.Status.UNCERTAIN
+                and not attempt.resolutions.all()
+            ):
+                unresolved_workflow_attempt_counts[attempt.deployment_id] = (
+                    unresolved_workflow_attempt_counts.get(
+                        attempt.deployment_id,
+                        0,
+                    ) + 1
+                )
+
+        related_queryset = self._workflow_queryset().filter(
+            validated_deployment_id__in=deployment_ids,
+        ).order_by("id")
+        related_counts = {
+            deployment_id: {
+                "fresh_validation_count": 0,
+                "drifted_validation_count": 0,
+                "fresh_smoke_count": 0,
+            }
+            for deployment_id in deployment_ids
+        }
+        last_workflow_id = None
+        while True:
+            batch_queryset = related_queryset
+            if last_workflow_id is not None:
+                batch_queryset = batch_queryset.filter(pk__gt=last_workflow_id)
+            related_versions = list(
+                batch_queryset[:self.related_workflow_batch_size],
+            )
+            if not related_versions:
+                break
+            related_rows = self._workflow_rows(
+                related_versions,
+                graph_limit=graph_limit,
+            )
+            for version, row in zip(
+                related_versions,
+                related_rows,
+                strict=True,
+            ):
+                counts = related_counts[version.validated_deployment_id]
+                if row["validation"]["fresh"]:
+                    counts["fresh_validation_count"] += 1
+                elif (
+                    row["validation"]["stored_state"]
+                    == WorkflowTemplateVersion.ValidationState.PASSED
+                ):
+                    counts["drifted_validation_count"] += 1
+                if row["smoke"]["fresh"]:
+                    counts["fresh_smoke_count"] += 1
+            last_workflow_id = related_versions[-1].id
+
+        rows = [
+            deployment_acceptance_row(
+                deployment,
+                health_snapshot=health_by_id.get(
+                    deployment.latest_health_snapshot_id,
+                ),
+                smoke_snapshots=smoke_snapshots_by_deployment.get(
+                    deployment.id, (),
+                ),
+                latest_attempts=deployment_attempts.get(deployment.id, ()),
+                profile_match_count=deployment.profile_match_count,
+                profile_evidence_match_count=(
+                    deployment.profile_evidence_match_count
+                ),
+                validated_count=deployment.validated_count,
+                smoke_history_count=deployment.smoke_history_count,
+                fresh_validation_count=related_counts[deployment.id][
+                    "fresh_validation_count"
+                ],
+                drifted_validation_count=related_counts[deployment.id][
+                    "drifted_validation_count"
+                ],
+                fresh_smoke_count=related_counts[deployment.id][
+                    "fresh_smoke_count"
+                ],
+                unresolved_smoke_count=(
+                    unresolved_workflow_attempt_counts.get(deployment.id, 0)
+                ),
+            )
+            for deployment in deployments
+        ]
+        payload = DeploymentAcceptanceRowSerializer(rows, many=True).data
+        return paginator.get_paginated_response(payload)
+
+    @extend_schema(
+        parameters=[AcceptanceSmokeQuerySerializer],
+        responses={
+            200: OpenApiResponse(
+                response=AcceptanceSmokePageSerializer,
+                description=(
+                    "由必填 subject 决定返回 Workflow 或 Deployment 分页；"
+                    "空 results 仍是合法分页。"
+                ),
+            ),
+            400: ConfigurationErrorResponseSerializer,
+            401: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Staff-only, paginated, read-only projection of persisted deployment and "
+            "workflow acceptance/smoke facts. It never invokes a provider, changes "
+            "historical states, or creates an attempt. The required subject query "
+            "selects workflow or deployment rows."
+        ),
     )
+    @security_boundary_resolution_cache()
+    def get(self, request):
+        serializer = AcceptanceSmokeQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        query = serializer.validated_data
+        graph_limit = int(resolve_configuration(
+            required_keys=("workflow.max_graph_bytes",),
+        ).values["workflow.max_graph_bytes"])
+        if query["subject"] == "workflow":
+            return self._workflow_response(
+                request,
+                query,
+                graph_limit=graph_limit,
+            )
+        return self._deployment_response(
+            request,
+            query,
+            graph_limit=graph_limit,
+        )
+
+
+class RegistryDeletionPreviewView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    @extend_schema(
+        request=RegistryDeletionPreviewInputSerializer,
+        responses={
+            200: RegistryDeletionImpactSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Return the complete server-authored dependency impact for one supported "
+            "registry deletion. The preview never deletes, retires, detaches, or invokes a model."
+        ),
+    )
+    def post(self, request):
+        serializer = RegistryDeletionPreviewInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            impact = build_registry_deletion_impact(
+                serializer.validated_data["resource_type"],
+                serializer.validated_data["object_id"],
+                actor=request.user,
+            )
+        except RegistryDeletionTargetNotFound as exc:
+            return api_error_response(
+                status_code=status.HTTP_404_NOT_FOUND,
+                code="registry_resource_not_found",
+                details={"detail": str(exc)},
+            )
+        return Response(RegistryDeletionImpactSerializer(impact).data)
+
+
+class RegistryDeletionExecuteView(APIView):
+    permission_classes = (IsAdminUser,)
+
+    @extend_schema(
+        request=RegistryDeletionExecuteInputSerializer,
+        parameters=[OpenApiParameter(
+            name="X-Audit-Reason-Code",
+            type=str,
+            location=OpenApiParameter.HEADER,
+            required=True,
+            description="2-80 位稳定审计原因代码。",
+        )],
+        responses={
+            200: RegistryDeletionExecuteResponseSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Atomically execute one reviewed registry deletion. The server recomputes "
+            "the complete graph under the shared recipe/config reference lock."
+        ),
+    )
+    def post(self, request):
+        serializer = RegistryDeletionExecuteInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            reason_code = request_reason_code(request, default="")
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        data = dict(serializer.validated_data)
+        resource_type = data.pop("resource_type")
+        object_id = data.pop("object_id")
+        try:
+            result = execute_registry_deletion(
+                resource_type,
+                object_id,
+                actor=request.user,
+                reason_code=reason_code,
+                **data,
+            )
+        except RegistryDeletionConflict as exc:
+            details: dict[str, object] = {"detail": exc.detail}
+            if exc.impact is not None:
+                details["impact"] = exc.impact
+            return api_error_response(
+                status_code=status.HTTP_409_CONFLICT,
+                code=exc.code,
+                details=details,
+            )
+        return Response(
+            RegistryDeletionExecuteResponseSerializer(result).data,
+            status=status.HTTP_200_OK,
+        )
 
 
 def _conflict(detail: str, *, code: str = "resource_in_use") -> Response:
@@ -337,22 +1192,14 @@ class PlatformLifecycleAuditMixin:
                 after=lifecycle_summary(instance),
             )
 
-    def perform_destroy(self, instance):
-        with transaction.atomic():
-            instance = type(instance)._default_manager.select_for_update().get(
-                pk=instance.pk,
-            )
-            before = lifecycle_summary(instance)
-            self._record_lifecycle(
-                instance,
-                action="delete",
-                reason_default="api.delete",
-                before=before,
-            )
-            instance.delete()
-
-
-class StaffPlatformModelViewSet(PlatformLifecycleAuditMixin, viewsets.ModelViewSet):
+class StaffPlatformModelViewSet(
+    PlatformLifecycleAuditMixin,
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
     permission_classes = (IsAdminUser,)
     pagination_class = StandardPageNumberPagination
 
@@ -446,49 +1293,238 @@ class ProviderProfileViewSet(StaffPlatformModelViewSet):
     filterset_fields = ("driver_type", "is_active", "is_system")
     search_fields = ("key", "name")
 
-    @extend_schema(responses={
-        204: None,
-        400: ConfigurationErrorResponseSerializer,
-        403: ConfigurationErrorResponseSerializer,
-        404: ConfigurationErrorResponseSerializer,
-        409: ConfigurationErrorResponseSerializer,
-    })
-    def destroy(self, request, *args, **kwargs):
-        provider = self.get_object()
-        if provider.is_system:
-            raise ValidationError("系统 Provider 不能删除；只能停用")
-        if provider.is_active:
-            raise ValidationError("请先停用 Provider，再删除未被引用的记录")
-        return super().destroy(request, *args, **kwargs)
-
+    def perform_update(self, serializer):
+        candidate = serializer.instance
+        with transaction.atomic():
+            persisted = ProviderProfile.objects.select_for_update().get(pk=candidate.pk)
+            target_active = serializer.validated_data.get(
+                "is_active",
+                persisted.is_active,
+            )
+            target_driver_type = serializer.validated_data.get(
+                "driver_type",
+                persisted.driver_type,
+            )
+            target_driver_config = serializer.validated_data.get(
+                "driver_config",
+                persisted.driver_config,
+            )
+            execution_contract_changed = (
+                target_driver_type != persisted.driver_type
+                or target_driver_config != persisted.driver_config
+            )
+            if target_active and (
+                not persisted.is_active or execution_contract_changed
+            ):
+                active_deployments = list(
+                    ModelDeployment.objects.select_for_update().select_related(
+                        "profile_version__provider",
+                    ).filter(
+                        profile_version__provider_id=persisted.id,
+                        status=ModelDeployment.Status.ACTIVE,
+                    )
+                )
+                for deployment in active_deployments:
+                    deployment.profile_version.provider = candidate
+                    try:
+                        validate_deployment_execution_contract(deployment)
+                    except (
+                        DjangoValidationError,
+                        ProviderDriverError,
+                        RuntimeError,
+                    ) as exc:
+                        raise ValidationError({
+                            "driver_config": (
+                                "变更会使 active Deployment 的执行合同无效；"
+                                "请先停用或修复关联 Deployment"
+                            ),
+                        }) from exc
+            before = lifecycle_summary(persisted)
+            instance = serializer.save()
+            self._record_lifecycle(
+                instance,
+                action="update",
+                reason_default="api.update",
+                before=before,
+                after=lifecycle_summary(instance),
+            )
 
 class ModelProfileVersionViewSet(StaffPlatformModelViewSet):
     queryset = ModelProfileVersion.objects.select_related("provider", "published_by")
     serializer_class = ModelProfileVersionSerializer
     filterset_fields = ("profile_key", "modality", "status", "provider")
 
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        profile_key = serializer.validated_data["profile_key"]
+        try:
+            with transaction.atomic():
+                if ModelProfileVersion.objects.filter(
+                    profile_key=profile_key,
+                ).exists():
+                    raise ValidationError({
+                        "profile_key": (
+                            "该模型版本族已存在；请从模型卡片使用“新建下一版本”"
+                        ),
+                    })
+                instance = serializer.save(version=1)
+                self._record_lifecycle(
+                    instance,
+                    action="create",
+                    reason_default="api.create",
+                    after=lifecycle_summary(instance),
+                )
+        except IntegrityError as exc:
+            raise ValidationError({
+                "profile_key": "该模型版本族已被并发创建；请刷新后新建下一版本",
+            }) from exc
+        return Response(
+            self.get_serializer(instance).data,
+            status=status.HTTP_201_CREATED,
+        )
+
     def update(self, request, *args, **kwargs):
-        if self.get_object().status in {
+        instance = self.get_object()
+        if instance.status in {
             ModelProfileVersion.Status.PUBLISHED,
             ModelProfileVersion.Status.RETIRED,
         }:
             raise ValidationError("published/retired model profile version 不可修改")
+        if "version" in request.data:
+            raise ValidationError({
+                "version": "版本号由服务端分配，不能通过普通编辑修改",
+            })
         return super().update(request, *args, **kwargs)
 
-    @extend_schema(responses={
-        204: None,
-        400: ConfigurationErrorResponseSerializer,
-        403: ConfigurationErrorResponseSerializer,
-        404: ConfigurationErrorResponseSerializer,
-        409: ConfigurationErrorResponseSerializer,
-    })
-    def destroy(self, request, *args, **kwargs):
-        if self.get_object().status in {
-            ModelProfileVersion.Status.PUBLISHED,
-            ModelProfileVersion.Status.RETIRED,
-        }:
-            raise ValidationError("published/retired model profile version 不可删除")
-        return super().destroy(request, *args, **kwargs)
+    @extend_schema(
+        request=ModelProfileNextVersionInputSerializer,
+        responses={
+            201: ModelProfileVersionSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=("post",), url_path="draft-next")
+    def draft_next(self, request, pk=None):
+        source = self.get_object()
+        input_serializer = ModelProfileNextVersionInputSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        overrides = input_serializer.validated_data
+        for attempt in range(4):
+            try:
+                with transaction.atomic():
+                    # Every existing family has one stable anchor row. Lock it
+                    # first so concurrent writers serialize before checking
+                    # that the requested source is still the latest version.
+                    anchor = (
+                        ModelProfileVersion.objects.select_for_update()
+                        .filter(profile_key=source.profile_key)
+                        .order_by("version", "pk")
+                        .first()
+                    )
+                    if anchor is None:
+                        raise ValidationError({
+                            "profile_key": "源模型版本族已不存在，请刷新后重试",
+                        })
+                    locked_source = (
+                        ModelProfileVersion.objects.select_for_update()
+                        .select_related("provider")
+                        .get(pk=source.pk)
+                    )
+                    latest = (
+                        ModelProfileVersion.objects.select_for_update()
+                        .filter(profile_key=locked_source.profile_key)
+                        .order_by("-version", "-pk")
+                        .first()
+                    )
+                    if latest is None or latest.pk != locked_source.pk:
+                        return _conflict(
+                            "源模型版本已不是当前最高版本；请刷新后从最新版本重试",
+                            code="model_profile_source_stale",
+                        )
+                    if locked_source.status == ModelProfileVersion.Status.DRAFT:
+                        return _conflict(
+                            "当前最高版本已是草稿；请继续编辑该草稿，不要重复创建",
+                            code="model_profile_draft_already_exists",
+                        )
+                    try:
+                        source_specification = verified_model_profile_specification(
+                            locked_source,
+                        )
+                        allowed_legacy_capabilities = model_capability_values(
+                            source_specification,
+                        )
+                        source_model_family = model_family_value(
+                            source_specification,
+                        )
+                    except DjangoValidationError:
+                        return _conflict(
+                            "源模型版本规格完整性校验失败；请先修复服务端事实",
+                            code="model_profile_source_contract_invalid",
+                        )
+                    provider = overrides.get("provider", locked_source.provider)
+                    payload = {
+                        "profile_key": locked_source.profile_key,
+                        "provider": str(provider.pk),
+                        "model_identifier": overrides.get(
+                            "model_identifier",
+                            locked_source.model_identifier,
+                        ),
+                        "modality": overrides.get(
+                            "modality",
+                            locked_source.modality,
+                        ),
+                        "specification": overrides.get(
+                            "specification",
+                            source_specification,
+                        ),
+                    }
+                    serializer = self.get_serializer(
+                        data=payload,
+                        context={
+                            **self.get_serializer_context(),
+                            "allowed_legacy_capabilities": (
+                                allowed_legacy_capabilities
+                            ),
+                            "allowed_model_families": (
+                                (source_model_family,)
+                                if source_model_family else ()
+                            ),
+                        },
+                    )
+                    serializer.is_valid(raise_exception=True)
+                    instance = serializer.save(version=locked_source.version + 1)
+                    self._record_lifecycle(
+                        instance,
+                        action="create",
+                        reason_default="api.create_next_version",
+                        after=lifecycle_summary(instance),
+                    )
+                return Response(
+                    self.get_serializer(instance).data,
+                    status=status.HTTP_201_CREATED,
+                )
+            except IntegrityError:
+                if attempt == 3:
+                    return _conflict(
+                        "并发创建模型版本未能完成，请刷新后重试",
+                        code="model_profile_version_allocation_conflict",
+                    )
+        raise AssertionError("unreachable model profile allocation loop")
+
+    @extend_schema(
+        request=None,
+        responses={
+            200: ModelProfileRegistryOptionsSerializer,
+            403: ConfigurationErrorResponseSerializer,
+        },
+    )
+    @action(detail=False, methods=("get",), url_path="options")
+    def registry_options(self, request):
+        return Response(model_profile_registry_options())
 
     @extend_schema(request=None, responses={
         200: ModelProfileVersionSerializer,
@@ -505,11 +1541,10 @@ class ModelProfileVersionViewSet(StaffPlatformModelViewSet):
             if profile.status != ModelProfileVersion.Status.DRAFT:
                 raise ValidationError("只有 draft model profile version 可以发布")
             try:
-                verify_json_contract(
-                    profile.specification,
-                    schema_version=profile.specification_schema_version,
-                    size_bytes=profile.specification_size_bytes,
-                    sha256=profile.specification_sha256,
+                specification = verified_model_profile_specification(profile)
+                validate_model_profile_media_capabilities(
+                    specification,
+                    modality=profile.modality,
                 )
                 validate_version_configuration_defaults(
                     model_profile_version=profile,
@@ -518,6 +1553,20 @@ class ModelProfileVersionViewSet(StaffPlatformModelViewSet):
                 validate_prompt_normalization_model_profile(profile)
                 validate_script_generation_model_profile(profile)
                 validate_script_structure_model_profile(profile)
+                validate_visual_rules_model_profile(profile)
+                # Freeze the exact artifact closure while the profile row is
+                # locked.  Artifact CRUD follows the same profile -> artifact
+                # lock order, so no file declaration can cross the immutable
+                # publish boundary.
+                locked_artifacts = list(
+                    ModelArtifact.objects.select_for_update()
+                    .filter(profile_version=profile)
+                    .order_by("pk")
+                )
+                validate_draft_profile_artifacts_for_publish(
+                    profile,
+                    artifacts=locked_artifacts,
+                )
             except (DjangoValidationError, ConfigurationResolutionError) as exc:
                 raise _drf_validation(exc) from exc
             profile.status = ModelProfileVersion.Status.PUBLISHED
@@ -549,8 +1598,11 @@ class ModelProfileVersionViewSet(StaffPlatformModelViewSet):
             before = lifecycle_summary(profile)
             if profile.status != ModelProfileVersion.Status.PUBLISHED:
                 raise ValidationError("只有 published model profile version 可以退役")
-            if profile.deployments.filter(status=ModelDeployment.Status.ACTIVE).exists():
-                return _conflict("仍有 active deployment 引用该模型版本，请先停用部署")
+            if profile.deployments.filter(status__in=(
+                ModelDeployment.Status.ACTIVE,
+                ModelDeployment.Status.ERROR,
+            )).exists():
+                return _conflict("仍有 active/error deployment 引用该模型版本，请先停用或修复部署")
             if profile.workflow_versions.filter(
                 status=WorkflowTemplateVersion.Status.PUBLISHED,
                 is_current=True,
@@ -574,6 +1626,23 @@ class PromptFieldDefinitionViewSet(StaffPlatformModelViewSet):
     filterset_fields = ("category", "value_type", "is_required", "is_active")
     search_fields = ("key", "label", "description", "impact")
 
+    @extend_schema(
+        request=PromptFieldDefinitionCreateInputSerializer,
+        responses={201: PromptFieldDefinitionSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        # Serializing the append operation prevents concurrent creates from
+        # receiving the same presentation order without making that order a
+        # user-entered business field.
+        with registry_reference_write_guard():
+            serializer.validated_data["is_active"] = prompt_field_system_defaults()[
+                "is_active"
+            ]
+            super().perform_create(serializer)
+
     def _frozen_reference_exists(self, definition) -> bool:
         return definition.profile_rules.filter(
             profile_version__status__in=(
@@ -583,18 +1652,36 @@ class PromptFieldDefinitionViewSet(StaffPlatformModelViewSet):
         ).exists()
 
     def update(self, request, *args, **kwargs):
-        if self._frozen_reference_exists(self.get_object()):
-            raise ValidationError(
-                "字段已被 published/retired PromptProfile 冻结引用；请新建字段与 PromptProfile 版本",
+        with registry_reference_write_guard():
+            definition = PromptFieldDefinition.objects.select_for_update().get(
+                pk=self.get_object().pk,
             )
-        return super().update(request, *args, **kwargs)
+            if self._frozen_reference_exists(definition):
+                raise ValidationError(
+                    "字段已被 published/retired PromptProfile 冻结引用；请新建字段与 PromptProfile 版本",
+                )
+            return super().update(request, *args, **kwargs)
 
-    def destroy(self, request, *args, **kwargs):
-        definition = self.get_object()
-        if definition.profile_rules.exists():
-            raise ValidationError("字段仍被 PromptProfile 规则引用，不能删除")
-        return super().destroy(request, *args, **kwargs)
-
+    @extend_schema(request=None, responses=PromptFieldDefinitionOptionsSerializer)
+    @action(detail=False, methods=("get",), url_path="options")
+    def registry_options(self, request):
+        categories = sorted(set(
+            PromptFieldDefinition.objects.exclude(category="")
+            .values_list("category", flat=True)
+        ))
+        data = {
+            "value_types": [
+                {"value": value, "label": label}
+                for value, label in PromptFieldDefinition.ValueType.choices
+            ],
+            "categories": [
+                {"value": value, "label": value}
+                for value in categories
+            ],
+            "custom_entry_fields": ["category"],
+            "system_defaults": prompt_field_system_defaults(),
+        }
+        return Response(PromptFieldDefinitionOptionsSerializer(data).data)
 
 class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
     serializer_class = PromptProfileVersionSerializer
@@ -606,21 +1693,43 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
             field_rule_count=Count("field_rules"),
         )
 
-    def update(self, request, *args, **kwargs):
-        if self.get_object().status in {
-            PromptProfileVersion.Status.PUBLISHED,
-            PromptProfileVersion.Status.RETIRED,
-        }:
-            raise ValidationError("published/retired PromptProfile 不可修改；请创建新版本")
-        return super().update(request, *args, **kwargs)
+    @extend_schema(
+        request=PromptProfileVersionCreateInputSerializer,
+        responses={201: PromptProfileVersionSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
 
-    def destroy(self, request, *args, **kwargs):
-        profile = self.get_object()
-        if profile.status != PromptProfileVersion.Status.DRAFT:
-            raise ValidationError("published/retired PromptProfile 不可删除")
-        if profile.bindings.exists() or profile.prompt_artifacts.exists() or profile.generation_attempts.exists():
-            raise ValidationError("PromptProfile 已被运行事实引用，不能删除")
-        return super().destroy(request, *args, **kwargs)
+    def perform_create(self, serializer):
+        profile_key = serializer.validated_data["profile_key"]
+        with registry_reference_write_guard():
+            if PromptProfileVersion.objects.filter(profile_key=profile_key).exists():
+                raise ValidationError({
+                    "profile_key": (
+                        "该 Profile Key 已有历史版本；请从最新不可变版本创建后继草稿"
+                    ),
+                })
+            serializer.validated_data["version"] = 1
+            serializer.validated_data["review_state"] = (
+                PromptProfileVersion.ReviewState.NEEDS_REVIEW
+            )
+            super().perform_create(serializer)
+
+    def update(self, request, *args, **kwargs):
+        if "version" in request.data:
+            raise ValidationError({
+                "version": "版本号由服务端分配，不能通过普通编辑修改",
+            })
+        with registry_reference_write_guard():
+            profile = PromptProfileVersion.objects.select_for_update().get(
+                pk=self.get_object().pk,
+            )
+            if profile.status in {
+                PromptProfileVersion.Status.PUBLISHED,
+                PromptProfileVersion.Status.RETIRED,
+            }:
+                raise ValidationError("published/retired PromptProfile 不可修改；请创建新版本")
+            return super().update(request, *args, **kwargs)
 
     @extend_schema(
         request=None,
@@ -629,9 +1738,15 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
     @action(detail=True, methods=("post",))
     def publish(self, request, pk=None):
         try:
-            with transaction.atomic():
-                profile = self.get_object()
+            with registry_reference_write_guard():
+                profile = PromptProfileVersion.objects.select_for_update().get(
+                    pk=self.get_object().pk,
+                )
                 before = lifecycle_summary(profile)
+                refresh_prompt_profile_contract(
+                    profile,
+                    schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+                )
                 published = publish_prompt_profile(profile, actor=request.user)
                 self._record_lifecycle(
                     published,
@@ -651,8 +1766,10 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
     @action(detail=True, methods=("post",))
     def retire(self, request, pk=None):
         try:
-            with transaction.atomic():
-                profile = self.get_object()
+            with registry_reference_write_guard():
+                profile = PromptProfileVersion.objects.select_for_update().get(
+                    pk=self.get_object().pk,
+                )
                 before = lifecycle_summary(profile)
                 retired = retire_prompt_profile(profile)
                 self._record_lifecycle(
@@ -667,35 +1784,88 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
         return Response(self.get_serializer(retired).data)
 
     @extend_schema(
+        request=PromptProfileCloneSuccessorInputSerializer,
+        responses={
+            201: PromptProfileVersionSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=("post",), url_path="clone-successor")
+    def clone_successor(self, request, pk=None):
+        input_serializer = PromptProfileCloneSuccessorInputSerializer(
+            data=request.data,
+        )
+        input_serializer.is_valid(raise_exception=True)
+        source_id = self.get_object().pk
+        try:
+            with registry_reference_write_guard():
+                source = self.get_queryset().get(pk=source_id)
+                target = clone_prompt_profile_successor(
+                    source,
+                    **input_serializer.validated_data,
+                )
+                self._record_lifecycle(
+                    target,
+                    action="clone_successor",
+                    reason_default="api.clone_successor",
+                    after=lifecycle_summary(target),
+                )
+                target = self.get_queryset().get(pk=target.pk)
+        except DjangoValidationError as exc:
+            code = str(getattr(exc, "code", None) or "")
+            if code in {
+                "prompt_profile_clone_draft_exists",
+                "prompt_profile_clone_source_not_latest",
+                "prompt_profile_clone_source_stale",
+                "prompt_profile_clone_source_contract_invalid",
+            }:
+                messages = getattr(exc, "messages", None) or [str(exc)]
+                return _conflict(str(messages[0]), code=code)
+            raise _drf_validation(exc) from exc
+        return Response(self.get_serializer(target).data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
         request=PromptProfilePreviewInputSerializer,
-        responses={200: PromptProfilePreviewSerializer, 400: ConfigurationErrorResponseSerializer},
+        responses={
+            200: PromptProfilePreviewSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
     )
     @action(detail=True, methods=("post",))
     def preview(self, request, pk=None):
         input_serializer = PromptProfilePreviewInputSerializer(data=request.data)
         input_serializer.is_valid(raise_exception=True)
         profile = self.get_object()
+        candidate = input_serializer.validated_data.get("candidate")
+        if candidate is not None and (
+            input_serializer.validated_data["expected_base_contract_sha256"]
+            != profile.contract_sha256
+        ):
+            return Response({
+                "code": "prompt_profile_preview_base_stale",
+                "detail": "基础提示词策略合同已变化；请重新读取页面后再预览",
+            }, status=status.HTTP_409_CONFLICT)
         try:
-            if profile.status == PromptProfileVersion.Status.DRAFT:
-                refresh_prompt_profile_contract(profile)
-            preview = assemble_prompt_profile(
+            preview = preview_prompt_profile(
                 profile,
                 sources=input_serializer.validated_data["sources"],
-                allow_draft=True,
+                candidate=candidate,
             )
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(PromptProfilePreviewSerializer(preview).data)
 
     @extend_schema(request=None, responses=PromptProfileOptionsSerializer)
-    @action(detail=False, methods=("get",))
-    def options(self, request):
+    @action(detail=False, methods=("get",), url_path="options")
+    def registry_options(self, request):
         operations = sorted(set(KNOWN_PROMPT_OPERATIONS) | set(
             PromptProfileVersion.objects.values_list("operation", flat=True),
         ))
         model_rows = list(ModelProfileVersion.objects.filter(
             status=ModelProfileVersion.Status.PUBLISHED,
-        ).select_related("provider").order_by("profile_key", "-version")[:200])
+        ).select_related("provider").order_by("profile_key", "-version"))
         model_families = set(KNOWN_MODEL_FAMILIES) | set(
             PromptProfileVersion.objects.values_list("model_family", flat=True)
         )
@@ -707,12 +1877,45 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
                 # registry but are not offered as a new PromptProfile selector.
                 continue
         families = sorted(model_families)
-        modes = sorted(set(Shot.H3Mode.values) | set(
+        modes = sorted(set(
             PromptProfileVersion.objects.exclude(mode="").values_list("mode", flat=True),
         ))
 
         def choices(enum):
             return [{"value": value, "label": label} for value, label in enum.choices]
+
+        context_selector_descriptions = {
+            PromptProfileFieldRule.GenerationContextSelector.PROJECT_CORE: (
+                "项目标题、梗概、语言、画幅与连续性摘要；不包含视觉风格。 / "
+                "Project identity, story, language, aspect ratio, and continuity summary; excludes style."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.PROJECT_STYLE: (
+                "项目已确认的视觉风格、正向与负向风格说明。 / Reviewed project visual style facts."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_CORE: (
+                "仅当前镜头的叙事、动作、镜头、声景等核心事实；不包含任何对白正文。 / "
+                "Target-shot core facts only; excludes all authored dialogue text."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_DIALOGUE_METADATA: (
+                "仅当前镜头的说话人、语气、起止时间与画外音标记；不包含对白正文。 / "
+                "Target-shot speaker, delivery, timing, and voiceover metadata; excludes authored text."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_DIALOGUE_AUTHORED_TEXT: (
+                "显式允许模型读取当前镜头已经确认的对白正文。 / Explicitly exposes reviewed target-shot dialogue text."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_LINKED_BIBLE: (
+                "仅当前镜头关联的人物、场景和道具 Bible；不包含外镜事实或对白。 / "
+                "Bible entities linked to the target shot only; excludes other-shot facts and dialogue."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.ADJACENT_SHOTS_CORE: (
+                "显式允许读取前后相邻镜头核心事实；仍不包含相邻镜头对白正文。 / "
+                "Explicitly exposes adjacent-shot core facts; still excludes adjacent authored dialogue."
+            ),
+            PromptProfileFieldRule.GenerationContextSelector.ALL_SHOTS_CORE: (
+                "显式允许读取全剧镜头核心事实；仍不包含任何镜头对白正文。 / "
+                "Explicitly exposes all-shot core facts; still excludes authored dialogue text."
+            ),
+        }
 
         models = [
             {
@@ -728,11 +1931,91 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
             "operations": operations,
             "model_families": families,
             "modes": modes,
-            "source_selectors": choices(PromptProfileFieldRule.SourceSelector),
+            "field_value_types": [
+                {"value": value, "label": label}
+                for value, label in PromptFieldDefinition.ValueType.choices
+            ],
+            "field_categories": [
+                {"value": value, "label": value}
+                for value in sorted(set(
+                    PromptFieldDefinition.objects.exclude(category="")
+                    .values_list("category", flat=True)
+                ))
+            ],
+            "custom_entry_fields": [
+                "field_category",
+                "operation",
+                "mode",
+                "language_policy",
+            ],
+            "field_system_defaults": prompt_field_system_defaults(),
+            "rule_system_defaults": prompt_rule_system_defaults(),
+            "source_selectors": [
+                {"value": value, "label": label}
+                for value, label in PromptProfileFieldRule.SourceSelector.choices
+                if value in SUPPORTED_FIELD_SOURCE_SELECTORS
+            ],
             "channels": choices(PromptProfileFieldRule.Channel),
             "label_styles": choices(PromptProfileFieldRule.LabelStyle),
             "separators": choices(PromptProfileFieldRule.Separator),
+            "generation_modes": choices(PromptProfileFieldRule.GenerationMode),
+            "generation_output_semantics": choices(
+                PromptProfileFieldRule.GenerationOutputSemantics,
+            ),
+            "source_projection_keys": [
+                {
+                    "value": DIRECT_SOURCE_PROJECTION_KEY,
+                    "label": "直接字段装配 / Direct field assembly",
+                },
+                {
+                    "value": DECLARATIVE_SOURCE_PROJECTION_KEY,
+                    "label": "声明式原语组合 / Declarative primitive composition",
+                },
+            ],
+            "source_projection_primitives": source_projection_primitive_options(),
+            "reference_rendering_fields": rendering_options(),
+            "language_policies": [
+                {"value": "inherit", "label": "继承运行上下文 / Inherit context"},
+                {
+                    "value": "preserve_source",
+                    "label": "保留来源语言 / Preserve source",
+                },
+                {"value": "any", "label": "不限语言 / Any language"},
+                {"value": "en", "label": "英文 / English"},
+                {"value": "zh-Hans", "label": "简体中文 / Simplified Chinese"},
+                {"value": "zh-Hant", "label": "繁体中文 / Traditional Chinese"},
+                {
+                    "value": "bilingual:zh-Hans+en",
+                    "label": "中英双语 / Chinese and English",
+                },
+            ],
+            "length_units": choices(PromptProfileFieldRule.LengthUnit),
+            "generation_validators": choices(
+                PromptProfileFieldRule.GenerationValidator,
+            ),
+            "generation_context_selectors": [
+                {
+                    "value": value,
+                    "label": label,
+                    "description": context_selector_descriptions[value],
+                }
+                for value, label in (
+                    PromptProfileFieldRule.GenerationContextSelector.choices
+                )
+            ],
+            "generation_source_selectors": prompt_generation_source_options(),
             "model_profile_versions": models,
+            "effective_limits": {
+                "field_text_max_characters": boundary_int(
+                    "security.prompt_profile.field_text_max_characters"
+                ),
+                "max_validators": boundary_int(
+                    "security.contract_complexity.prompt_profile.max_validators"
+                ),
+                "max_context_selectors": boundary_int(
+                    "security.contract_complexity.prompt_profile.max_context_selectors"
+                ),
+            },
         }
         return Response(PromptProfileOptionsSerializer(data).data)
 
@@ -742,27 +2025,39 @@ class PromptProfileFieldRuleViewSet(StaffPlatformModelViewSet):
         "profile_version", "field_definition",
     )
     serializer_class = PromptProfileFieldRuleSerializer
-    filterset_fields = ("profile_version", "field_definition", "channel", "source_selector")
+    filterset_fields = (
+        "profile_version", "field_definition", "channel", "source_selector",
+        "generation_mode", "length_unit",
+    )
 
-    def destroy(self, request, *args, **kwargs):
-        rule = self.get_object()
-        if rule.profile_version.status != PromptProfileVersion.Status.DRAFT:
-            raise ValidationError("published/retired PromptProfile 的字段规则不可删除")
-        with transaction.atomic():
-            profile = PromptProfileVersion.objects.select_for_update().get(
-                pk=rule.profile_version_id,
+    @staticmethod
+    def _require_draft_profile(profile_id):
+        profile = PromptProfileVersion.objects.select_for_update().get(
+            pk=profile_id,
+        )
+        if profile.status != PromptProfileVersion.Status.DRAFT:
+            raise ValidationError(
+                "字段规则只能写入草稿 PromptProfile；已发布版本合同不可变化",
             )
-            before = lifecycle_summary(rule)
-            self._record_lifecycle(
-                rule,
-                action="delete",
-                reason_default="api.delete",
-                before=before,
-            )
-            rule.delete()
-            refresh_prompt_profile_contract(profile)
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return profile
 
+    def perform_create(self, serializer):
+        with registry_reference_write_guard():
+            profile = self._require_draft_profile(
+                serializer.validated_data["profile_version"].pk,
+            )
+            serializer.save(profile_version=profile)
+
+    def perform_update(self, serializer):
+        with registry_reference_write_guard():
+            locked_rule = PromptProfileFieldRule.objects.select_for_update().get(
+                pk=serializer.instance.pk,
+            )
+            profile = self._require_draft_profile(
+                locked_rule.profile_version_id,
+            )
+            serializer.instance = locked_rule
+            serializer.save(profile_version=profile)
 
 class PromptProfileBindingViewSet(StaffPlatformModelViewSet):
     queryset = PromptProfileBinding.objects.select_related(
@@ -784,7 +2079,18 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
     filterset_fields = ("status", "runtime_host", "profile_version", "is_default")
     search_fields = ("key", "name")
 
+    def update(self, request, *args, **kwargs):
+        if self.get_object().status == ModelDeployment.Status.RETIRED:
+            raise ValidationError(
+                "retired deployment 不可修改；请创建新部署记录",
+            )
+        return super().update(request, *args, **kwargs)
+
     def _save_with_host_lock(self, serializer, *, action: str):
+        target_profile = serializer.validated_data.get(
+            "profile_version",
+            getattr(serializer.instance, "profile_version", None),
+        )
         target_host = serializer.validated_data.get(
             "runtime_host",
             getattr(serializer.instance, "runtime_host", None),
@@ -794,6 +2100,10 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
             getattr(serializer.instance, "status", ModelDeployment.Status.ACTIVE),
         )
         with transaction.atomic():
+            locked_provider = ProviderProfile.objects.select_for_update().get(
+                pk=target_profile.provider_id,
+            )
+            target_profile.provider = locked_provider
             if target_host is not None:
                 locked_host = RuntimeHost.objects.select_for_update().get(pk=target_host.pk)
                 if (
@@ -807,6 +2117,21 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
                 self._persisted_summary(serializer.instance, for_update=True)
                 if serializer.instance else None
             )
+            candidate = serializer.instance or ModelDeployment()
+            for field, value in serializer.validated_data.items():
+                setattr(candidate, field, value)
+            candidate.profile_version = target_profile
+            if target_status == ModelDeployment.Status.ACTIVE:
+                try:
+                    validate_deployment_execution_contract(candidate)
+                except (
+                    DjangoValidationError,
+                    ProviderDriverError,
+                    RuntimeError,
+                ) as exc:
+                    raise ValidationError({
+                        "runtime_config": "Deployment 执行合同无效",
+                    }) from exc
             instance = serializer.save()
             self._record_lifecycle(
                 instance,
@@ -822,20 +2147,47 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
     def perform_update(self, serializer):
         self._save_with_host_lock(serializer, action="update")
 
-    @extend_schema(responses={
-        204: None,
+    @extend_schema(request=None, responses={
+        200: ModelDeploymentSerializer,
         400: ConfigurationErrorResponseSerializer,
         403: ConfigurationErrorResponseSerializer,
         404: ConfigurationErrorResponseSerializer,
         409: ConfigurationErrorResponseSerializer,
     })
-    def destroy(self, request, *args, **kwargs):
-        deployment = self.get_object()
-        if deployment.status != ModelDeployment.Status.DISABLED:
-            raise ValidationError("请先停用 deployment，再删除未被引用且没有证据的记录")
-        if _recipe_reference_exists(deployment.id):
-            return _conflict("草稿或已发布配方仍引用该 deployment")
-        return super().destroy(request, *args, **kwargs)
+    @action(detail=True, methods=("post",))
+    def retire(self, request, pk=None):
+        with transaction.atomic():
+            deployment = ModelDeployment.objects.select_for_update().get(
+                pk=self.get_object().pk,
+            )
+            if deployment.status != ModelDeployment.Status.DISABLED:
+                raise ValidationError("只有 disabled deployment 可以退役")
+            if recipe_reference_exists(
+                deployment.id,
+                statuses=(ProductionRecipeVersion.Status.DRAFT, ProductionRecipeVersion.Status.PUBLISHED),
+            ):
+                return _conflict(
+                    "草稿或已发布配方仍引用该 deployment，请先发布替代配方或退役配方",
+                )
+            if deployment.validated_workflow_versions.filter(
+                status=WorkflowTemplateVersion.Status.PUBLISHED,
+                is_current=True,
+            ).exists():
+                return _conflict(
+                    "当前已发布工作流仍以该 deployment 作为验证依据，请先发布替代工作流",
+                )
+            before = lifecycle_summary(deployment)
+            deployment.status = ModelDeployment.Status.RETIRED
+            deployment.is_default = False
+            deployment.save(update_fields=("status", "is_default", "updated_at"))
+            self._record_lifecycle(
+                deployment,
+                action="retire",
+                reason_default="api.retire",
+                before=before,
+                after=lifecycle_summary(deployment),
+            )
+        return Response(self.get_serializer(deployment).data)
 
     @extend_schema(request=None, responses=ModelDeploymentCapabilitySnapshotSerializer)
     @action(detail=True, methods=("post",), url_path="probe")
@@ -850,7 +2202,10 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
 
     @extend_schema(
         request=DeploymentProbeInputSerializer,
-        responses={202: ModelDeploymentSmokeAttemptSerializer},
+        responses={
+            202: ModelDeploymentSmokeAttemptSerializer,
+            400: ConfigurationErrorResponseSerializer,
+        },
         description=(
             "Create or reuse one durable deployment smoke attempt. All supported "
             "text and media operations return HTTP 202; workers submit only after "
@@ -878,6 +2233,7 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
         try:
             attempt, _created = enqueue_deployment_smoke(
                 self.get_object(), operation=operation,
+                prompt_profile_binding_id=serializer.validated_data.get("prompt_profile_binding_id"),
             )
         except DjangoValidationError as exc:
             details = getattr(exc, "message_dict", None) or {}
@@ -887,6 +2243,28 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
                 return _conflict(
                     f"已有 {operation} smoke 提交状态不确定，必须先人工消歧",
                     code="unresolved_smoke_submission",
+                )
+            preflight_codes = {
+                "prompt_normalization_smoke_capacity_exceeded",
+                "prompt_normalization_smoke_contract_invalid",
+            }
+            raw_codes = details.get("code") if isinstance(details, dict) else None
+            preflight_code = (
+                raw_codes[0]
+                if isinstance(raw_codes, list) and len(raw_codes) == 1
+                else None
+            )
+            if preflight_code in preflight_codes:
+                raw_detail = details.get("detail")
+                safe_detail = (
+                    raw_detail[0]
+                    if isinstance(raw_detail, list) and len(raw_detail) == 1
+                    else "prompt.normalize smoke 提交前合同校验失败"
+                )
+                return api_error_response(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    code=preflight_code,
+                    details={"detail": safe_detail},
                 )
             raise _drf_validation(exc) from exc
         location = reverse(
@@ -939,6 +2317,157 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
         )
 
     @extend_schema(
+        request=ComfySavedWorkflowPreviewInputSerializer,
+        responses={
+            200: ComfySavedWorkflowPreviewResponseSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Analyze one already-managed immutable candidate against live object_info. "
+            "With no primary output selected the response only lists candidates; with "
+            "one primary output selected the server creates or reuses an immutable "
+            "ComfyWorkflowContractDraft. Unresolved interpretation is persisted as "
+            "candidate_only instead of deleting or rejecting the safe candidate. Raw "
+            "canvas values and converted graphs are never returned to the browser."
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="saved-workflows/preview")
+    @security_boundary_resolution_cache()
+    @saved_workflow_directory_resolution_cache()
+    def saved_workflow_preview(self, request, pk=None):
+        serializer = ComfySavedWorkflowPreviewInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = preview_saved_workflow(
+                self.get_object(),
+                actor=request.user,
+                **serializer.validated_data,
+            )
+        except (DjangoValidationError, ProviderDriverError) as exc:
+            raise _drf_validation(exc) from exc
+        payload = {
+            **payload,
+            "effective_limits": _saved_workflow_effective_limits(),
+        }
+        response = Response(ComfySavedWorkflowPreviewResponseSerializer(payload).data)
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(
+        request=ComfyDraftArtifactAttestationInputSerializer,
+        parameters=[OpenApiParameter(
+            "Location",
+            OpenApiTypes.URI,
+            OpenApiParameter.HEADER,
+            description="Durable RuntimeHostProbeAttempt detail URL.",
+            response=[202],
+        )],
+        responses={
+            202: RuntimeHostProbeAttemptSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Re-read and reconvert one saved workflow, derive its exact reachable model "
+            "dependencies server-side, create/reuse declared artifacts on a same-provider "
+            "draft profile, and enqueue durable loopback size/hash attestation. The request "
+            "never trusts client-provided filenames or hashes and never submits a GPU prompt. "
+            "Requires the source-scope schema version/hash returned by discover and rejects "
+            "source_scope_changed before re-reading or mutating source state."
+        ),
+    )
+    @action(
+        detail=True,
+        methods=("post",),
+        url_path="saved-workflows/attest-model-artifacts",
+    )
+    def attest_saved_workflow_model_artifacts(self, request, pk=None):
+        serializer = ComfyDraftArtifactAttestationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        deployment = self.get_object()
+        before = lifecycle_summary(deployment)
+        try:
+            attempt, created = enqueue_draft_model_artifact_attestation(
+                deployment,
+                actor=request.user,
+                **serializer.validated_data,
+            )
+        except DraftArtifactAttestationConflict as exc:
+            return _conflict(
+                str(exc),
+                code=DraftArtifactAttestationConflict.code,
+            )
+        except SavedWorkflowImportError as exc:
+            return api_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code=exc.code,
+                details={
+                    "detail": _safe_projected_error(
+                        exc,
+                        fallback="ComfyUI 工作流结构不满足平台安全导入合同",
+                    ),
+                },
+            )
+        except (DjangoValidationError, ProviderDriverError) as exc:
+            raise _drf_validation(exc) from exc
+        if created:
+            self._record_lifecycle(
+                deployment,
+                action="attest_model_artifacts",
+                reason_default="api.attest_model_artifacts",
+                before=before,
+                after=lifecycle_summary(deployment),
+            )
+        location = reverse(
+            "runtime-host-probe-attempt-detail",
+            kwargs={"pk": attempt.pk},
+            request=request,
+        )
+        return Response(
+            RuntimeHostProbeAttemptSerializer(attempt).data,
+            status=status.HTTP_202_ACCEPTED,
+            headers={"Location": location, "Cache-Control": "private, no-store"},
+        )
+
+    @extend_schema(
+        request=ComfySavedWorkflowBatchInputSerializer,
+        responses={
+            200: ComfySavedWorkflowBatchResponseSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Commit independently isolated saved-workflow actions. candidate, ignored, "
+            "and execution_snapshot items read the controlled source and verify its exact "
+            "hash. template_version items instead consume the selected immutable candidate "
+            "and ContractDraft, never re-read mutable local userdata, and create only a "
+            "draft WorkflowTemplateVersion. Per-item failures remain explicit and do not "
+            "roll back successful siblings. Live Validate, real Smoke, and publication are "
+            "separate later lifecycle actions."
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="saved-workflows/batch-import")
+    @security_boundary_resolution_cache()
+    @saved_workflow_directory_resolution_cache()
+    def saved_workflow_batch_import(self, request, pk=None):
+        serializer = ComfySavedWorkflowBatchInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = batch_import_saved_workflows(
+                self.get_object(),
+                items=serializer.validated_data["items"],
+                actor=request.user,
+            )
+        except (DjangoValidationError, ProviderDriverError) as exc:
+            raise _drf_validation(exc) from exc
+        return Response(ComfySavedWorkflowBatchResponseSerializer(payload).data)
+
+    @extend_schema(
         parameters=[
             OpenApiParameter("probe_kind", OpenApiTypes.STR, OpenApiParameter.QUERY),
             OpenApiParameter("status", OpenApiTypes.STR, OpenApiParameter.QUERY),
@@ -967,29 +2496,229 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
         return Response(serializer.data)
 
 
+class ComfyWorkflowSourceViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = (IsAdminUser,)
+    pagination_class = StandardPageNumberPagination
+    serializer_class = ComfyWorkflowSourceSerializer
+    queryset = ComfyWorkflowSource.objects.select_related(
+        "source_deployment", "workflow_version", "generated_workflow",
+        "generation_task", "imported_by",
+    ).order_by("-created_at")
+    filterset_fields = (
+        "source_deployment", "source_scope_sha256", "import_kind", "workflow_version",
+        "generated_workflow", "generation_task", "source_sha256",
+    )
+    search_fields = ("source_path", "source_workflow_id")
+
+    @extend_schema(
+        request=None,
+        responses={
+            200: ComfySavedWorkflowDiscoveryResponseSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Scan every distinct active ComfyUI source once, using the system-configured "
+            "userdata-relative saved-workflow directory. "
+            "The server chooses an internal transport deployment, derives output and "
+            "model-profile candidates from live object_info plus registry evidence, "
+            "and returns explicit matched/ambiguous/unmatched/blocked results. The "
+            "operation is read-only and never submits a ComfyUI prompt."
+        ),
+    )
+    @action(detail=False, methods=("get",), url_path="discover")
+    @security_boundary_resolution_cache()
+    @saved_workflow_directory_resolution_cache()
+    def discover(self, request):
+        try:
+            payload = discover_saved_workflows()
+        except SavedWorkflowRequestBudgetExceeded as exc:
+            return api_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code=exc.code,
+                details={"detail": str(exc)},
+            )
+        payload = {
+            **payload,
+            "effective_limits": _saved_workflow_effective_limits(),
+        }
+        response = Response(
+            ComfySavedWorkflowDiscoveryResponseSerializer(payload).data,
+        )
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+
+class ComfyWorkflowContractDraftViewSet(viewsets.ReadOnlyModelViewSet):
+    permission_classes = (IsAdminUser,)
+    pagination_class = StandardPageNumberPagination
+    serializer_class = ComfyWorkflowContractDraftSerializer
+    queryset = ComfyWorkflowContractDraft.objects.select_related(
+        "candidate_source", "model_profile_version",
+        "projector_version__projector", "created_by",
+    ).order_by("-created_at")
+    filterset_fields = (
+        "candidate_source", "model_profile_version", "projector_version",
+        "admission_tier", "actionability",
+    )
+    search_fields = (
+        "candidate_source__source_path", "projector_version__projector__key",
+    )
+
+
 class ModelArtifactViewSet(StaffPlatformModelViewSet):
     queryset = ModelArtifact.objects.select_related("profile_version")
     serializer_class = ModelArtifactSerializer
     filterset_fields = ("profile_version", "role", "status")
     search_fields = ("logical_name", "filename", "sha256")
 
-    @extend_schema(responses={
-        204: None,
-        400: ConfigurationErrorResponseSerializer,
-        403: ConfigurationErrorResponseSerializer,
-        404: ConfigurationErrorResponseSerializer,
-        409: ConfigurationErrorResponseSerializer,
-    })
-    def destroy(self, request, *args, **kwargs):
-        artifact = self.get_object()
-        if artifact.profile_version.status in {
-            ModelProfileVersion.Status.PUBLISHED,
-            ModelProfileVersion.Status.RETIRED,
-        }:
-            raise ValidationError(
-                "绑定 published model profile version 的 artifact 不可删除；请创建新版本",
+    _VERIFICATION_INPUT_FIELDS = (
+        "profile_version",
+        "role",
+        "filename",
+        "storage_uri",
+        "inventory_folder",
+        "inventory_node_type",
+        "inventory_input_name",
+        "sha256",
+        "size_bytes",
+        "status",
+    )
+
+    @classmethod
+    def _verification_input_changed(cls, artifact, validated_data) -> bool:
+        for field in cls._VERIFICATION_INPUT_FIELDS:
+            if field not in validated_data:
+                continue
+            current = getattr(artifact, field)
+            candidate = validated_data[field]
+            current_value = getattr(current, "pk", current)
+            candidate_value = getattr(candidate, "pk", candidate)
+            if current_value != candidate_value:
+                return True
+        return False
+
+    @staticmethod
+    def _lock_draft_profiles(profile_ids) -> dict:
+        normalized_ids = sorted({str(profile_id) for profile_id in profile_ids})
+        profiles = list(
+            ModelProfileVersion.objects.select_for_update()
+            .select_related("provider")
+            .filter(pk__in=normalized_ids)
+            .order_by("pk")
+        )
+        if len(profiles) != len(normalized_ids):
+            raise ValidationError({
+                "profile_version": "model profile version 已不存在，请刷新后重试",
+            })
+        for profile in profiles:
+            if profile.status != ModelProfileVersion.Status.DRAFT:
+                raise ValidationError({
+                    "profile_version": (
+                        "published/retired model profile version 不再接受 artifact 变更；"
+                        "请创建新版本"
+                    ),
+                })
+        return {profile.pk: profile for profile in profiles}
+
+    def create(self, request, *args, **kwargs):
+        # The first validation only discovers the target FK.  It is repeated
+        # after locking so a concurrent publish cannot make the validated
+        # profile stale before the insert.
+        discovery = self.get_serializer(data=request.data)
+        discovery.is_valid(raise_exception=True)
+        target_profile_id = discovery.validated_data["profile_version"].pk
+        with transaction.atomic():
+            locked_profiles = self._lock_draft_profiles((target_profile_id,))
+            serializer = self.get_serializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            locked_target = locked_profiles[target_profile_id]
+            if serializer.validated_data["profile_version"].pk != locked_target.pk:
+                return _conflict(
+                    "model artifact 的目标 profile 已变化，请刷新后重试",
+                    code="model_artifact_profile_changed",
+                )
+            instance = serializer.save(profile_version=locked_target)
+            self._record_lifecycle(
+                instance,
+                action="create",
+                reason_default="api.create",
+                after=lifecycle_summary(instance),
             )
-        return super().destroy(request, *args, **kwargs)
+        headers = self.get_success_headers(serializer.data)
+        return Response(serializer.data, status=status.HTTP_201_CREATED, headers=headers)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        observed = self.get_object()
+        observed_profile_id = observed.profile_version_id
+        discovery = self.get_serializer(
+            observed,
+            data=request.data,
+            partial=partial,
+        )
+        discovery.is_valid(raise_exception=True)
+        target_profile_id = discovery.validated_data.get(
+            "profile_version",
+            observed.profile_version,
+        ).pk
+        with transaction.atomic():
+            locked_profiles = self._lock_draft_profiles(
+                (observed_profile_id, target_profile_id),
+            )
+            locked = ModelArtifact.objects.select_for_update().get(pk=observed.pk)
+            if locked.profile_version_id != observed_profile_id:
+                return _conflict(
+                    "model artifact 的 profile 已被并发修改，请刷新后重试",
+                    code="model_artifact_profile_changed",
+                )
+            serializer = self.get_serializer(
+                locked,
+                data=request.data,
+                partial=partial,
+            )
+            serializer.is_valid(raise_exception=True)
+            confirmed_target_id = serializer.validated_data.get(
+                "profile_version",
+                locked.profile_version,
+            ).pk
+            if confirmed_target_id != target_profile_id:
+                return _conflict(
+                    "model artifact 的目标 profile 已变化，请刷新后重试",
+                    code="model_artifact_profile_changed",
+                )
+            before = lifecycle_summary(locked)
+            verification_changed = self._verification_input_changed(
+                locked,
+                serializer.validated_data,
+            )
+            save_overrides = {
+                "profile_version": locked_profiles[confirmed_target_id],
+            }
+            if verification_changed:
+                # This updates only the registered locator/contract.  It never
+                # moves or deletes the real model file.  Existing availability
+                # rows remain immutable history, while readiness must wait for
+                # a fresh attestation of the new declaration.
+                save_overrides.update({
+                    "status": ModelArtifact.Status.DECLARED,
+                    "verified_snapshot": None,
+                    "verified_at": None,
+                    "verified_by": None,
+                })
+            instance = serializer.save(**save_overrides)
+            self._record_lifecycle(
+                instance,
+                action="update",
+                reason_default="api.update",
+                before=before,
+                after=lifecycle_summary(instance),
+            )
+        return Response(serializer.data)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs["partial"] = True
+        return self.update(request, *args, **kwargs)
 
     @extend_schema(
         request=ModelArtifactVerificationInputSerializer,
@@ -1019,6 +2748,7 @@ class ModelArtifactViewSet(StaffPlatformModelViewSet):
                 schema_version=snapshot.details_schema_version,
                 size_bytes=snapshot.details_size_bytes,
                 sha256=snapshot.details_sha256,
+                max_bytes=_stage_snapshot_max_bytes(),
             )
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
@@ -1057,8 +2787,311 @@ class ModelArtifactViewSet(StaffPlatformModelViewSet):
         return Response(self.get_serializer(artifact).data)
 
 
-class WorkflowTemplateVersionViewSet(StaffPlatformModelViewSet):
-    http_method_names = ("get", "post", "delete", "head", "options")
+class WorkflowProjectorViewSet(StaffPlatformModelViewSet):
+    permission_classes = (IsSuperUser,)
+    queryset = WorkflowProjector.objects.all().order_by("key")
+    serializer_class = WorkflowProjectorSerializer
+    filterset_fields = ("is_active",)
+    search_fields = ("key", "name", "description")
+
+
+class WorkflowProjectorVersionViewSet(
+    PlatformLifecycleAuditMixin,
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    mixins.UpdateModelMixin,
+    viewsets.GenericViewSet,
+):
+    permission_classes = (IsSuperUser,)
+    pagination_class = StandardPageNumberPagination
+    serializer_class = WorkflowProjectorVersionSerializer
+    queryset = WorkflowProjectorVersion.objects.select_related(
+        "projector", "published_by",
+    ).order_by("projector__key", "-version")
+    filterset_fields = (
+        "projector", "status", "is_current", "engine_key",
+        "provider_driver_type", "operation", "output_kind",
+    )
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        projector = serializer.validated_data["projector"]
+        try:
+            with transaction.atomic():
+                locked = WorkflowProjector.objects.select_for_update().get(pk=projector.pk)
+                if WorkflowProjectorVersion.objects.filter(projector=locked).exists():
+                    raise ValidationError({
+                        "projector": "该方案已有版本；请从最新版本创建后继草稿",
+                    })
+                instance = serializer.save(projector=locked, version=1)
+                self._record_lifecycle(
+                    instance,
+                    action="create",
+                    reason_default="api.create",
+                    after=lifecycle_summary(instance),
+                )
+        except IntegrityError as exc:
+            raise ValidationError({"projector": "方案版本已被并发创建，请刷新"}) from exc
+        return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status != WorkflowProjectorVersion.Status.DRAFT:
+            raise ValidationError("published/retired 工作流合同方案版本不可修改")
+        forbidden = {"version", "status", "is_current", "published_at", "published_by"}
+        if forbidden & set(request.data):
+            raise ValidationError("版本号与生命周期字段只能由服务端动作维护")
+        return super().update(request, *args, **kwargs)
+
+    @extend_schema(
+        request=None,
+        responses={200: WorkflowProjectorOptionsSerializer},
+    )
+    @action(detail=False, methods=("get",), url_path="options")
+    def options(self, request):
+        return Response({
+            "definition_schema_version": WORKFLOW_PROJECTOR_DEFINITION_SCHEMA_VERSION,
+            "engines": workflow_projector_engine_options(),
+            **workflow_projector_configuration_options(),
+        })
+
+    @extend_schema(
+        request=WorkflowProjectorRecommendationInputSerializer,
+        responses={
+            200: WorkflowProjectorRecommendationSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Build an evidence-bound Generic Projector recommendation from one "
+            "already-managed immutable ComfyUI candidate plus fresh object_info. "
+            "The response contains only an unsaved draft suggestion and safe graph "
+            "catalogs; it never creates or publishes a Projector, submits a prompt, "
+            "or returns source literals."
+        ),
+    )
+    @action(detail=False, methods=("post",), url_path="recommendation")
+    @security_boundary_resolution_cache()
+    def recommendation(self, request):
+        serializer = WorkflowProjectorRecommendationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            payload = recommend_workflow_projector_from_candidate(
+                **serializer.validated_data,
+            )
+        except (DjangoValidationError, ProviderDriverError) as exc:
+            raise _drf_validation(exc) from exc
+        response = Response(WorkflowProjectorRecommendationSerializer(payload).data)
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(
+        request=WorkflowProjectorVersionCloneSerializer,
+        responses={201: WorkflowProjectorVersionSerializer},
+    )
+    @action(detail=True, methods=("post",), url_path="draft-next")
+    def draft_next(self, request, pk=None):
+        source = self.get_object()
+        input_serializer = WorkflowProjectorVersionCloneSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        overrides = input_serializer.validated_data
+        try:
+            with transaction.atomic():
+                projector = WorkflowProjector.objects.select_for_update().get(
+                    pk=source.projector_id,
+                )
+                latest = WorkflowProjectorVersion.objects.select_for_update().filter(
+                    projector=projector,
+                ).order_by("-version", "-pk").first()
+                if latest is None or latest.pk != source.pk:
+                    return _conflict(
+                        "源方案版本已不是最高版本，请刷新后从最新版本重试",
+                        code="workflow_projector_source_stale",
+                    )
+                if latest.status == WorkflowProjectorVersion.Status.DRAFT:
+                    return _conflict(
+                        "当前最高版本已经是草稿，请继续编辑该草稿",
+                        code="workflow_projector_draft_exists",
+                    )
+                payload = {
+                    "projector": str(projector.pk),
+                    "engine_key": overrides.get("engine_key", latest.engine_key),
+                    "engine_version": overrides.get("engine_version", latest.engine_version),
+                    "provider_driver_type": overrides.get(
+                        "provider_driver_type", latest.provider_driver_type,
+                    ),
+                    "operation": overrides.get("operation", latest.operation),
+                    "output_kind": overrides.get("output_kind", latest.output_kind),
+                    "definition": overrides.get("definition", deepcopy(latest.definition)),
+                }
+                serializer = self.get_serializer(data=payload)
+                serializer.is_valid(raise_exception=True)
+                instance = serializer.save(version=latest.version + 1)
+                self._record_lifecycle(
+                    instance,
+                    action="create",
+                    reason_default="api.create_next_version",
+                    after=lifecycle_summary(instance),
+                )
+        except IntegrityError as exc:
+            return _conflict(
+                "并发创建方案版本未能完成，请刷新后重试",
+                code="workflow_projector_version_conflict",
+            )
+        return Response(self.get_serializer(instance).data, status=status.HTTP_201_CREATED)
+
+    @extend_schema(request=None, responses={200: WorkflowProjectorVersionSerializer})
+    @action(detail=True, methods=("post",))
+    def publish(self, request, pk=None):
+        with transaction.atomic():
+            # Serialize catalog publication so two different families cannot
+            # both pass the overlap check against a stale peer snapshot.
+            list(
+                WorkflowProjector.objects.select_for_update()
+                .order_by("pk")
+                .values_list("pk", flat=True)
+            )
+            version = WorkflowProjectorVersion.objects.select_for_update().select_related(
+                "projector",
+            ).get(pk=self.get_object().pk)
+            if version.status != WorkflowProjectorVersion.Status.DRAFT:
+                raise ValidationError("只有 draft 工作流合同方案版本可以发布")
+            before = lifecycle_summary(version)
+            try:
+                validate_workflow_projector_definition(
+                    version.definition,
+                    engine_key=version.engine_key,
+                    engine_version=version.engine_version,
+                )
+                verify_json_contract(
+                    version.definition,
+                    schema_version=version.definition_schema_version,
+                    size_bytes=version.definition_size_bytes,
+                    sha256=version.definition_sha256,
+                    max_bytes=_stage_snapshot_max_bytes(),
+                )
+                validate_workflow_projector_publish_conflicts(version)
+            except DjangoValidationError as exc:
+                raise _drf_validation(exc) from exc
+            WorkflowProjectorVersion.objects.select_for_update().filter(
+                projector=version.projector,
+                is_current=True,
+            ).exclude(pk=version.pk).update(is_current=False)
+            version.status = WorkflowProjectorVersion.Status.PUBLISHED
+            version.is_current = True
+            version.published_at = timezone.now()
+            version.published_by = request.user
+            version.save(update_fields=(
+                "status", "is_current", "published_at", "published_by", "updated_at",
+            ))
+            self._record_lifecycle(
+                version,
+                action="publish",
+                reason_default="api.publish",
+                before=before,
+                after=lifecycle_summary(version),
+            )
+        return Response(self.get_serializer(version).data)
+
+    @extend_schema(
+        request=None,
+        responses={
+            204: None,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Discard only the latest, unreferenced draft Projector version. "
+            "Published/current/retired versions and historical workflow facts "
+            "remain immutable."
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="discard")
+    def discard(self, request, pk=None):
+        requested = self.get_object()
+        try:
+            with transaction.atomic():
+                projector = WorkflowProjector.objects.select_for_update().get(
+                    pk=requested.projector_id,
+                )
+                version = get_object_or_404(
+                    WorkflowProjectorVersion.objects.select_for_update().select_related(
+                        "projector",
+                    ),
+                    pk=requested.pk,
+                )
+                if (
+                    version.status != WorkflowProjectorVersion.Status.DRAFT
+                    or version.is_current
+                ):
+                    raise ValidationError(
+                        "只有未发布且非 current 的 Projector 草稿可以放弃",
+                    )
+                latest = WorkflowProjectorVersion.objects.select_for_update().filter(
+                    projector=projector,
+                ).order_by("-version", "-pk").first()
+                if latest is None or latest.pk != version.pk:
+                    return _conflict(
+                        "该草稿已不是方案族的最高版本，不能留下版本缺口",
+                        code="workflow_projector_draft_not_latest",
+                    )
+                if version.contract_drafts.exists():
+                    return _conflict(
+                        "该草稿已被工作流合同草稿引用，不能放弃",
+                        code="workflow_projector_draft_referenced",
+                    )
+                before = lifecycle_summary(version)
+                self._record_lifecycle(
+                    version,
+                    action="discard",
+                    reason_default="api.discard_draft",
+                    before=before,
+                )
+                version.discard()
+        except ProtectedError:
+            return _conflict(
+                "该草稿已被工作流合同草稿引用，不能放弃",
+                code="workflow_projector_draft_referenced",
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @extend_schema(request=None, responses={200: WorkflowProjectorVersionSerializer})
+    @action(detail=True, methods=("post",))
+    def retire(self, request, pk=None):
+        with transaction.atomic():
+            version = WorkflowProjectorVersion.objects.select_for_update().get(
+                pk=self.get_object().pk,
+            )
+            if version.status != WorkflowProjectorVersion.Status.PUBLISHED:
+                raise ValidationError("只有 published 工作流合同方案版本可以停用")
+            before = lifecycle_summary(version)
+            version.status = WorkflowProjectorVersion.Status.RETIRED
+            version.is_current = False
+            version.save(update_fields=("status", "is_current", "updated_at"))
+            self._record_lifecycle(
+                version,
+                action="retire",
+                reason_default="api.retire",
+                before=before,
+                after=lifecycle_summary(version),
+            )
+        return Response(self.get_serializer(version).data)
+
+
+class WorkflowTemplateVersionViewSet(
+    PlatformLifecycleAuditMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    viewsets.GenericViewSet,
+):
+    http_method_names = ("get", "post", "head", "options")
+    permission_classes = (IsAdminUser,)
+    pagination_class = StandardPageNumberPagination
     queryset = WorkflowTemplateVersion.objects.select_related(
         "template", "provider", "model_profile_version", "published_by",
     ).annotate(
@@ -1070,46 +3103,21 @@ class WorkflowTemplateVersionViewSet(StaffPlatformModelViewSet):
         "validation_state", "smoke_test_state", "is_current",
     )
 
+    def get_queryset(self):
+        queryset = super().get_queryset()
+        if self.action == "list":
+            # Relations use a bounded batch projection; no graph/contract/evidence
+            # or related profile payload belongs in the ordinary list query.
+            queryset = queryset.select_related(None).select_related("template").defer(
+                "graph", "input_contract", "validation_evidence", "smoke_test_evidence",
+                "template__definition", "template__input_schema", "template__description",
+            )
+        return queryset
+
     def get_serializer_class(self):
-        if self.action == "create":
-            return WorkflowTemplateVersionImportSerializer
         if self.action == "retrieve":
             return WorkflowTemplateVersionDetailSerializer
         return WorkflowTemplateVersionListSerializer
-
-    @extend_schema(
-        request=WorkflowTemplateVersionImportSerializer,
-        responses={201: WorkflowTemplateVersionDetailSerializer},
-    )
-    def create(self, request, *args, **kwargs):
-        serializer = self.get_serializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
-            version = serializer.save()
-            self._record_lifecycle(
-                version,
-                action="create",
-                reason_default="api.create",
-                after=lifecycle_summary(version),
-            )
-        output = WorkflowTemplateVersionDetailSerializer(version, context=self.get_serializer_context())
-        return Response(output.data, status=status.HTTP_201_CREATED)
-
-    def update(self, request, *args, **kwargs):
-        raise ValidationError("workflow version 不支持原地更新；请导入新版本")
-
-    @extend_schema(responses={
-        204: None,
-        400: ConfigurationErrorResponseSerializer,
-        403: ConfigurationErrorResponseSerializer,
-        404: ConfigurationErrorResponseSerializer,
-        409: ConfigurationErrorResponseSerializer,
-    })
-    def destroy(self, request, *args, **kwargs):
-        version = self.get_object()
-        if version.status != WorkflowTemplateVersion.Status.DRAFT:
-            raise ValidationError("只有未使用的 draft workflow version 可以删除")
-        return super().destroy(request, *args, **kwargs)
 
     def _deployment(self, request):
         serializer = DeploymentActionSerializer(data=request.data)
@@ -1228,14 +3236,29 @@ class WorkflowTemplateVersionViewSet(StaffPlatformModelViewSet):
 
     @extend_schema(
         request=DeploymentActionSerializer,
-        responses=WorkflowValidationResponseSerializer,
+        responses={
+            200: WorkflowValidationResponseSerializer,
+            400: ConfigurationErrorResponseSerializer,
+        },
     )
     @action(detail=True, methods=("post",))
     def validate(self, request, pk=None):
+        version = self.get_object()
+        deployment = self._deployment(request)
         try:
             version, report = validate_workflow_version(
-                self.get_object(),
-                deployment=self._deployment(request),
+                version,
+                deployment=deployment,
+            )
+        except WorkflowModelEvidenceUnavailable as exc:
+            return api_error_response(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                code=exc.reason_code,
+                details=_workflow_model_evidence_recovery(
+                    exc,
+                    version=version,
+                    deployment=deployment,
+                ),
             )
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
@@ -1245,17 +3268,31 @@ class WorkflowTemplateVersionViewSet(StaffPlatformModelViewSet):
         })
 
     @extend_schema(
-        request=DeploymentActionSerializer,
-        responses={202: WorkflowSmokeAttemptSerializer},
+        request=WorkflowSmokeActionSerializer,
+        responses={
+            202: WorkflowSmokeAttemptSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
     )
     @action(detail=True, methods=("post",), url_path="smoke-test")
     def smoke_test(self, request, pk=None):
+        payload = WorkflowSmokeActionSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        deployment = get_object_or_404(
+            ModelDeployment.objects.select_related("profile_version__provider"),
+            pk=payload.validated_data["deployment_id"],
+            status=ModelDeployment.Status.ACTIVE,
+        )
         try:
             attempt, _created = enqueue_workflow_smoke(
                 self.get_object(),
-                deployment=self._deployment(request),
+                deployment=deployment,
                 created_by=request.user,
+                fixture=payload.validated_data["fixture"],
             )
+        except WorkflowSmokeFixtureConflict as exc:
+            return _conflict(str(exc), code=exc.code)
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         location = reverse(
@@ -1310,7 +3347,10 @@ class WorkflowTemplateVersionViewSet(StaffPlatformModelViewSet):
             before = lifecycle_summary(version)
             if version.status != WorkflowTemplateVersion.Status.PUBLISHED:
                 raise ValidationError("只有 published workflow version 可以退役")
-            if _recipe_reference_exists(version.id):
+            if recipe_reference_exists(
+                version.id,
+                statuses=(ProductionRecipeVersion.Status.DRAFT, ProductionRecipeVersion.Status.PUBLISHED),
+            ):
                 return _conflict("草稿或已发布配方仍引用该 workflow version")
             version.status = WorkflowTemplateVersion.Status.RETIRED
             version.is_current = False
@@ -1326,10 +3366,88 @@ class WorkflowTemplateVersionViewSet(StaffPlatformModelViewSet):
 
 
 class ConfigDefinitionViewSet(StaffPlatformModelViewSet):
-    queryset = ConfigDefinition.objects.all()
+    queryset = ConfigDefinition.objects.annotate(
+        config_value_count=Count("values", distinct=True),
+    )
     serializer_class = ConfigDefinitionSerializer
     filterset_fields = ("domain", "value_type", "is_required", "is_secret", "is_active")
     search_fields = ("key", "description")
+
+    @extend_schema(
+        request=ConfigDefinitionCreateInputSerializer,
+        responses={201: ConfigDefinitionSerializer},
+    )
+    def create(self, request, *args, **kwargs):
+        return super().create(request, *args, **kwargs)
+
+    def perform_create(self, serializer):
+        defaults = config_definition_system_defaults()
+        serializer.validated_data["is_active"] = defaults["is_active"]
+        serializer.validated_data["needs_review"] = defaults["needs_review"]
+        serializer.validated_data["review_reason"] = ""
+        super().perform_create(serializer)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        # Config revisions use the same advisory guard.  Hold it across row
+        # locking, serializer validation and save so a first ConfigValue cannot
+        # appear between the immutable-contract check and the update.
+        with registry_reference_write_guard():
+            visible = self.get_object()
+            definition = ConfigDefinition.objects.select_for_update().get(
+                pk=visible.pk,
+            )
+            serializer = self.get_serializer(
+                definition,
+                data=request.data,
+                partial=partial,
+            )
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+            if getattr(definition, "_prefetched_objects_cache", None):
+                definition._prefetched_objects_cache = {}
+            return Response(serializer.data)
+
+    @extend_schema(request=None, responses=ConfigDefinitionOptionsSerializer)
+    @action(detail=False, methods=("get",), url_path="options")
+    def registry_options(self, request):
+        definitions = list(ConfigDefinition.objects.all().only(
+            "domain", "unit", "impact_modules",
+        ))
+        domains = sorted({item.domain for item in definitions if item.domain})
+        units = sorted({item.unit for item in definitions if item.unit})
+        modules = sorted({
+            str(module).strip()
+            for item in definitions
+            for module in (item.impact_modules if isinstance(item.impact_modules, list) else [])
+            if str(module).strip()
+        })
+        data = {
+            "configuration_classes": [
+                {"value": value, "label": label}
+                for value, label in ConfigDefinition.ConfigurationClass.choices
+            ],
+            "value_types": [
+                {"value": value, "label": label}
+                for value, label in ConfigDefinition.ValueType.choices
+            ],
+            "scopes": [
+                {"value": value, "label": label}
+                for value, label in ConfigRevision.ScopeType.choices
+            ],
+            "default_sources": [
+                {"value": value, "label": label}
+                for value, label in CONFIG_DEFAULT_SOURCE_CHOICES
+            ],
+            "domains": [{"value": value, "label": value} for value in domains],
+            "units": [{"value": value, "label": value} for value in units],
+            "impact_modules": [
+                {"value": value, "label": value} for value in modules
+            ],
+            "custom_entry_fields": ["domain", "unit", "impact_modules"],
+            "system_defaults": config_definition_system_defaults(),
+        }
+        return Response(ConfigDefinitionOptionsSerializer(data).data)
 
     @extend_schema(responses={
         200: ConfigResourceOptionSerializer(many=True),
@@ -1345,20 +3463,6 @@ class ConfigDefinitionViewSet(StaffPlatformModelViewSet):
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(ConfigResourceOptionSerializer(rows, many=True).data)
-
-    @extend_schema(responses={
-        204: None,
-        400: ConfigurationErrorResponseSerializer,
-        403: ConfigurationErrorResponseSerializer,
-        404: ConfigurationErrorResponseSerializer,
-        409: ConfigurationErrorResponseSerializer,
-    })
-    def destroy(self, request, *args, **kwargs):
-        definition = self.get_object()
-        if definition.values.exists():
-            raise ValidationError("已有 revision 使用该配置定义，不能删除；请停用")
-        return super().destroy(request, *args, **kwargs)
-
 
 class ConfigRevisionViewSet(
     PlatformLifecycleAuditMixin,
@@ -1558,7 +3662,7 @@ class ProjectConfigView(APIView):
         snapshot["sha256"] = json_contract({
             "values": snapshot["values"],
             "sources": snapshot["sources"],
-        }).sha256
+        }, max_bytes=_stage_snapshot_max_bytes()).sha256
         return snapshot
 
     @extend_schema(
@@ -1803,7 +3907,7 @@ class RuntimeHostViewSet(PlatformLifecycleAuditMixin, viewsets.ReadOnlyModelView
                 deployment=deployment,
                 search=query.validated_data["search"],
                 offset=query.validated_data["offset"],
-                limit=query.validated_data["limit"],
+                limit=query.validated_data.get("limit"),
             )
         except (DjangoValidationError, ProviderDriverError) as exc:
             raise _drf_validation(exc) from exc
@@ -1817,7 +3921,7 @@ class RuntimeHostProbeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     queryset = RuntimeHostProbeAttempt.objects.select_related(
         "host", "created_by", "final_snapshot",
     ).order_by("-created_at")
-    filterset_fields = ("host", "status", "trigger")
+    filterset_fields = ("host", "status", "trigger", "probe_kind")
 
     @extend_schema(
         request=None,
@@ -1919,23 +4023,37 @@ class ScriptSourceViewSet(
         responses={201: ScriptSourceCreateResponseSerializer},
     )
     def create(self, request, *args, **kwargs):
+        input_serializer = ScriptSourceCreateInputSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        input_data = input_serializer.validated_data
         project = get_object_or_404(
             SeriesProject.objects.filter(owner=request.user) if not request.user.is_staff else SeriesProject.objects.all(),
-            pk=request.data.get("project_id"),
+            pk=input_data["project_id"],
         )
         try:
-            if request.FILES.get("file") is not None:
+            if input_data.get("asset_id") is not None:
+                assets = Asset.objects.filter(is_active=True)
+                if not request.user.is_staff:
+                    assets = assets.filter(
+                        Q(owner=request.user) | Q(owner__isnull=True),
+                    )
+                source, revision = create_script_source_from_asset(
+                    project=project,
+                    user=request.user,
+                    asset=get_object_or_404(assets, pk=input_data["asset_id"]),
+                )
+            elif input_data.get("file") is not None:
                 source, revision = create_uploaded_script_source(
                     project=project,
                     user=request.user,
-                    uploaded_file=request.FILES["file"],
+                    uploaded_file=input_data["file"],
                 )
             else:
                 source, revision = create_pasted_script_source(
                     project=project,
                     user=request.user,
-                    content=str(request.data.get("content") or ""),
-                    source_format=str(request.data.get("source_format") or ScriptSource.SourceFormat.PLAIN),
+                    content=str(input_data.get("content") or ""),
+                    source_format=str(input_data.get("source_format") or ScriptSource.SourceFormat.PLAIN),
                     source_type=ScriptSource.SourceType.PASTE,
                 )
         except ScriptSourceValidationError as exc:
@@ -2020,6 +4138,35 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
     permission_classes = (IsStaffOrReadOnly,)
     filterset_fields = ("recipe_key", "status")
 
+    def perform_create(self, serializer):
+        with registry_reference_write_guard():
+            recipe_key = serializer.validated_data["recipe_key"]
+            if ProductionRecipeVersion.objects.filter(recipe_key=recipe_key).exists():
+                raise ValidationError({
+                    "recipe_key": (
+                        "该 Recipe Key 已有历史版本；请从最新不可变版本创建后继草稿"
+                    ),
+                })
+            try:
+                validate_recipe_registry_references(
+                    serializer.validated_data.get("definition", {}),
+                )
+            except DjangoValidationError as exc:
+                raise _drf_validation(exc) from exc
+            serializer.validated_data["version"] = 1
+            super().perform_create(serializer)
+
+    def perform_update(self, serializer):
+        with registry_reference_write_guard():
+            definition = serializer.validated_data.get(
+                "definition", serializer.instance.definition,
+            )
+            try:
+                validate_recipe_registry_references(definition)
+            except DjangoValidationError as exc:
+                raise _drf_validation(exc) from exc
+            super().perform_update(serializer)
+
     def get_queryset(self):
         queryset = super().get_queryset()
         if getattr(self, "swagger_fake_view", False):
@@ -2029,12 +4176,113 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
         return queryset
 
     def update(self, request, *args, **kwargs):
-        if self.get_object().status in {
-            ProductionRecipeVersion.Status.PUBLISHED,
-            ProductionRecipeVersion.Status.RETIRED,
-        }:
-            raise ValidationError("published/retired recipe 不可修改；请创建新版本")
-        return super().update(request, *args, **kwargs)
+        if "version" in request.data:
+            raise ValidationError({
+                "version": "版本号由服务端分配，不能通过普通编辑修改",
+            })
+        with registry_reference_write_guard():
+            recipe = ProductionRecipeVersion.objects.select_for_update().get(
+                pk=self.get_object().pk,
+            )
+            if recipe.status in {
+                ProductionRecipeVersion.Status.PUBLISHED,
+                ProductionRecipeVersion.Status.RETIRED,
+            }:
+                raise ValidationError("published/retired recipe 不可修改；请创建新版本")
+            return super().update(request, *args, **kwargs)
+
+    @extend_schema(request=None, responses=ProductionRecipeEditorOptionsSerializer)
+    @action(detail=False, methods=("get",), url_path="options")
+    def editor_options(self, request):
+        return Response(ProductionRecipeEditorOptionsSerializer(
+            production_recipe_editor_options(),
+        ).data)
+
+    @extend_schema(
+        request=ProductionRecipeCloneSuccessorInputSerializer,
+        responses={
+            201: ProductionRecipeVersionSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+    )
+    @action(detail=True, methods=("post",), url_path="clone-successor")
+    def clone_successor(self, request, pk=None):
+        input_serializer = ProductionRecipeCloneSuccessorInputSerializer(
+            data=request.data,
+        )
+        input_serializer.is_valid(raise_exception=True)
+        source_id = self.get_object().pk
+        expected_hash = input_serializer.validated_data[
+            "expected_definition_sha256"
+        ]
+        with registry_reference_write_guard():
+            source = ProductionRecipeVersion.objects.get(pk=source_id)
+            family = list(
+                ProductionRecipeVersion.objects.select_for_update()
+                .filter(recipe_key=source.recipe_key)
+                .order_by("version", "pk")
+            )
+            locked_source = next(
+                (item for item in family if item.pk == source_id),
+                None,
+            )
+            if (
+                locked_source is None
+                or locked_source.definition_sha256 != expected_hash
+            ):
+                return _conflict(
+                    "来源配方已变化；请刷新并重新确认精确版本与 SHA-256",
+                    code="recipe_successor_source_stale",
+                )
+            try:
+                verify_json_contract(
+                    locked_source.definition,
+                    schema_version=locked_source.definition_schema_version,
+                    size_bytes=locked_source.definition_size_bytes,
+                    sha256=locked_source.definition_sha256,
+                    max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+                )
+            except DjangoValidationError:
+                return _conflict(
+                    "来源配方正文与持久化摘要不一致；请先修复合同再创建后继草稿",
+                    code="recipe_successor_source_contract_invalid",
+                )
+            if locked_source.status not in {
+                ProductionRecipeVersion.Status.PUBLISHED,
+                ProductionRecipeVersion.Status.RETIRED,
+            }:
+                raise ValidationError("只能从 published/retired 配方创建后继草稿")
+            latest = family[-1]
+            if latest.pk != locked_source.pk:
+                if latest.status == ProductionRecipeVersion.Status.DRAFT:
+                    return _conflict(
+                        f"该配方已存在 v{latest.version} 草稿；请继续编辑现有草稿",
+                        code="recipe_successor_draft_exists",
+                    )
+                return _conflict(
+                    f"来源不是最新版本；请从 v{latest.version} 创建后继草稿",
+                    code="recipe_successor_source_not_latest",
+                )
+            serializer = self.get_serializer(data={
+                "recipe_key": locked_source.recipe_key,
+                "name": locked_source.name,
+                "definition": deepcopy(locked_source.definition),
+            })
+            serializer.is_valid(raise_exception=True)
+            target = serializer.save(version=latest.version + 1)
+            self._record_lifecycle(
+                target,
+                action="clone_successor",
+                reason_default="api.clone_successor",
+                after=lifecycle_summary(target),
+            )
+        return Response(
+            self.get_serializer(target).data,
+            status=status.HTTP_201_CREATED,
+        )
 
     @extend_schema(
         request=None,
@@ -2047,22 +4295,15 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
             payload = production_recipe_media_route_options(recipe)
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
+        payload = {
+            **payload,
+            "effective_limits": {
+                "max_routing_routes": boundary_int(
+                    "security.production.max_routing_routes"
+                ),
+            },
+        }
         return Response(ProductionRecipeMediaRouteOptionsSerializer(payload).data)
-
-    @extend_schema(responses={
-        204: None,
-        400: ConfigurationErrorResponseSerializer,
-        403: ConfigurationErrorResponseSerializer,
-        404: ConfigurationErrorResponseSerializer,
-        409: ConfigurationErrorResponseSerializer,
-    })
-    def destroy(self, request, *args, **kwargs):
-        if self.get_object().status in {
-            ProductionRecipeVersion.Status.PUBLISHED,
-            ProductionRecipeVersion.Status.RETIRED,
-        }:
-            raise ValidationError("published/retired recipe 不可删除；请保留历史版本")
-        return super().destroy(request, *args, **kwargs)
 
     @extend_schema(request=None, responses={
         200: ProductionRecipeVersionSerializer,
@@ -2073,7 +4314,7 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
     })
     @action(detail=True, methods=("post",), permission_classes=(IsAdminUser,))
     def publish(self, request, pk=None):
-        with transaction.atomic():
+        with registry_reference_write_guard():
             recipe = ProductionRecipeVersion.objects.select_for_update().get(pk=self.get_object().pk)
             before = lifecycle_summary(recipe)
             if recipe.status != ProductionRecipeVersion.Status.DRAFT:
@@ -2107,7 +4348,7 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
     })
     @action(detail=True, methods=("post",), permission_classes=(IsAdminUser,))
     def retire(self, request, pk=None):
-        with transaction.atomic():
+        with registry_reference_write_guard():
             recipe = ProductionRecipeVersion.objects.select_for_update().get(
                 pk=self.get_object().pk,
             )
@@ -2143,7 +4384,11 @@ class ProductionRunViewSet(
         queryset = self.queryset
         if getattr(self, "swagger_fake_view", False):
             return queryset.none()
-        return queryset if self.request.user.is_staff else queryset.filter(owner=self.request.user)
+        return (
+            queryset
+            if self.request.user.is_staff
+            else queryset.filter(project__owner=self.request.user)
+        )
 
     def get_serializer_class(self):
         if self.action == "create":
@@ -2170,7 +4415,6 @@ class ProductionRunViewSet(
         recipe = get_object_or_404(
             ProductionRecipeVersion,
             pk=data.pop("recipe_version_id"),
-            status=ProductionRecipeVersion.Status.PUBLISHED,
         )
         revision_id = data.pop("script_revision_id", None)
         script_revision = None
@@ -2201,7 +4445,16 @@ class ProductionRunViewSet(
                 code=exc.code,
                 details=details,
             )
-        except (DjangoValidationError, ProductionRunConflict) as exc:
+        except ProductionRunConflict as exc:
+            details = getattr(exc, "message_dict", None) or {
+                "detail": "; ".join(exc.messages),
+            }
+            return api_error_response(
+                status_code=status.HTTP_409_CONFLICT,
+                code=exc.code,
+                details=details,
+            )
+        except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(
             ProductionRunDetailSerializer(run).data,
@@ -2223,6 +4476,41 @@ class ProductionRunViewSet(
             run = decide_stage(self.get_object(), user=request.user, **serializer.validated_data)
         except ProductionRunConflict as exc:
             details = getattr(exc, "message_dict", None) or {"detail": "; ".join(exc.messages)}
+            return api_error_response(
+                status_code=status.HTTP_409_CONFLICT,
+                code=exc.code,
+                details=details,
+            )
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(ProductionRunDetailSerializer(run).data)
+
+    @extend_schema(
+        request=BibleImageRegenerationInputSerializer,
+        responses={
+            200: ProductionRunDetailSerializer,
+            409: ProductionRunConflictResponseSerializer,
+        },
+        description=(
+            "在 bible_image_review 待人工审核时，使用本 ProductionRun 已冻结的 "
+            "Bible 模型、PromptProfile 与 route 为指定实体追加一个新候选。"
+            "旧候选与正式 Bible 绑定均不会被覆盖。"
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="regenerate-bible-images")
+    def regenerate_bible_images(self, request, pk=None):
+        serializer = BibleImageRegenerationInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            run = regenerate_bible_image_candidates(
+                self.get_object(),
+                user=request.user,
+                **serializer.validated_data,
+            )
+        except ProductionRunConflict as exc:
+            details = getattr(exc, "message_dict", None) or {
+                "detail": "; ".join(exc.messages),
+            }
             return api_error_response(
                 status_code=status.HTTP_409_CONFLICT,
                 code=exc.code,
@@ -2351,6 +4639,15 @@ class ProductionRunViewSet(
                 user=request.user,
                 **serializer.validated_data,
             )
+        except ProductionRunConflict as exc:
+            details = getattr(exc, "message_dict", None) or {
+                "detail": "; ".join(exc.messages),
+            }
+            return api_error_response(
+                status_code=status.HTTP_409_CONFLICT,
+                code=exc.code,
+                details=details,
+            )
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(ProductionRunDetailSerializer(run).data)
@@ -2371,7 +4668,9 @@ class GenerationAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         ).order_by("-created_at")
         if self.request.user.is_staff:
             return queryset
-        return queryset.filter(stage_run__production_run__owner=self.request.user)
+        return queryset.filter(
+            stage_run__production_run__project__owner=self.request.user,
+        )
 
 
 class WorkflowSmokeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
@@ -2379,7 +4678,7 @@ class WorkflowSmokeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = WorkflowSmokeAttemptSerializer
     queryset = WorkflowSmokeAttempt.objects.select_related(
         "workflow_version", "deployment", "created_by",
-    ).order_by("-created_at")
+    ).prefetch_related("asset_bindings", "resolutions__decided_by").order_by("-created_at")
     filterset_fields = ("workflow_version", "deployment", "status")
 
     @extend_schema(request=None, responses={202: WorkflowSmokeAttemptSerializer})
@@ -2392,6 +4691,43 @@ class WorkflowSmokeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
         return Response(
             self.get_serializer(attempt).data,
             status=status.HTTP_202_ACCEPTED,
+        )
+
+    @extend_schema(
+        request=WorkflowSmokeResolutionInputSerializer,
+        responses={
+            200: WorkflowSmokeResolutionSerializer,
+            201: WorkflowSmokeResolutionSerializer,
+            400: ConfigurationErrorResponseSerializer,
+            403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
+        },
+        description=(
+            "Append immutable operator evidence resolving an uncertain workflow "
+            "smoke. This never creates passed smoke evidence or replays the provider."
+        ),
+    )
+    @action(detail=True, methods=("post",), url_path="resolve-uncertain")
+    def resolve_uncertain(self, request, pk=None):
+        serializer = WorkflowSmokeResolutionInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            resolution, created = resolve_workflow_smoke_attempt(
+                self.get_object(),
+                user=request.user,
+                **serializer.validated_data,
+            )
+        except WorkflowSmokeResolutionConflict as exc:
+            return _conflict(str(exc), code=exc.code)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(
+            WorkflowSmokeResolutionSerializer(resolution).data,
+            status=(
+                status.HTTP_201_CREATED
+                if created else status.HTTP_200_OK
+            ),
         )
 
 
@@ -2428,7 +4764,8 @@ class GeneratedArtifactViewSet(viewsets.ReadOnlyModelViewSet):
         "variant_group",
     )
     queryset = GeneratedArtifact.objects.select_related(
-        "production_run__owner", "stage_run", "generation_attempt", "generation_task", "asset",
+        "production_run__owner", "production_run__project__owner", "stage_run",
+        "generation_attempt", "generation_task", "asset",
     )
 
     def get_queryset(self):
@@ -2437,7 +4774,7 @@ class GeneratedArtifactViewSet(viewsets.ReadOnlyModelViewSet):
             return queryset.none()
         if self.request.user.is_staff:
             return queryset
-        return queryset.filter(production_run__owner=self.request.user)
+        return queryset.filter(production_run__project__owner=self.request.user)
 
     def get_serializer_class(self):
         return (

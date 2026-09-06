@@ -46,7 +46,7 @@ onBeforeUnmount(() => { window.removeEventListener('cineforge:unauthorized', una
     <main class="main-area">
       <header class="topbar">
         <button class="mobile-menu" @click="mobileOpen=true"><PanelLeftOpen :size="19"/></button>
-        <div class="title-block"><span>AI FILM STUDIO</span><h1>{{ pageTitle }}</h1></div>
+        <div class="title-block"><span>AI 影视制作工作室 / AI FILM STUDIO</span><h1>{{ pageTitle }}</h1></div>
         <div class="top-actions">
           <RouterLink v-if="!['projects','dashboard','project-new'].includes(String(route.name))" to="/projects/new" class="button primary small"><Plus :size="16"/>新建连续剧</RouterLink>
           <div class="user-avatar" :title="auth.user?.email">{{ (auth.user?.name || '创').slice(0,1).toUpperCase() }}</div>

@@ -1,6 +1,8 @@
-export type AssetType = 'character' | 'scene' | 'prop' | 'image' | 'video' | 'audio'
-export type Ref2VAReferenceCategory = 'character' | 'scene' | 'prop'
-export type H3Mode = 'T2VA' | 'I2VA' | 'FL2VA' | 'L2VA' | 'Ref2VA'
+import type { WorkflowExecutionInputSchema } from '@/services/platformTypes'
+
+export type AssetType = 'character' | 'scene' | 'prop' | 'image' | 'video' | 'audio' | 'script'
+export type ReferenceEntityCategory = 'character' | 'scene' | 'prop'
+export type ConditioningMode = string
 export type ProjectStatus = 'draft' | 'writing' | 'producing' | 'paused' | 'completed' | 'archived'
 export type WorkflowStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed'
 
@@ -30,6 +32,8 @@ export interface Asset {
   description: string
   /** Saved visual anchor used by metadata-driven Bible drafting. */
   promptHint?: string
+  /** Server-authored human-readable source summary; lineage remains server-side. */
+  sourceInfo?: string
   /** Server-issued content digest used to reject stale draft requests. */
   checksum?: string
   /** Null identifies a read-only global library item. */
@@ -43,8 +47,92 @@ export interface Asset {
   backendKind?: string
   mimeType?: string
   mediaUrl?: string
+  downloadUrl?: string
   metadata?: Record<string, unknown>
   hasEmbeddedAudio?: boolean
+}
+
+export type AssetGenerationJobType = 'prompt' | 'asset'
+export type AssetGenerationMediaType = 'image' | 'video' | 'audio' | 'script'
+export type AssetGenerationStatus = 'queued' | 'submitting' | 'submitted' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'cancelled' | 'uncertain'
+export type AssetGenerationResolutionOutcome = 'confirmed_not_submitted' | 'confirmed_remote_failed' | 'confirmed_remote_cancelled' | 'confirmed_remote_succeeded'
+
+export type AssetGenerationExecutionKind = 'deployment' | 'comfy_workflow'
+
+interface AssetGenerationRouteOptionBase {
+  targetId: string
+  key: string
+  name: string
+  modelDeploymentId: string
+  modelDeploymentName: string
+  modelIdentifier: string
+  operation: string
+  isExternal: boolean
+  smokeEvidenceId: string
+  requestSchema: Record<string, unknown> | null
+  parameterDefaults: Record<string, unknown>
+  workflowInputSchema: WorkflowExecutionInputSchema | null
+  acceptsNegativePrompt: boolean
+}
+
+export interface AssetGenerationDeploymentRouteOption extends AssetGenerationRouteOptionBase {
+  targetKind: 'deployment'
+  smokeExpiresAt: string
+  workflowVersionId: ''
+  workflowName: ''
+  workflowVersion: null
+}
+
+export interface AssetGenerationComfyRouteOption extends AssetGenerationRouteOptionBase {
+  targetKind: 'comfy_workflow'
+  smokeExpiresAt: null
+  workflowVersionId: string
+  workflowName: string
+  workflowVersion: number
+}
+
+export type AssetGenerationRouteOption = AssetGenerationDeploymentRouteOption | AssetGenerationComfyRouteOption
+
+export interface AssetGenerationJob {
+  id: string
+  jobType: AssetGenerationJobType
+  mediaType: AssetGenerationMediaType
+  imageCategory: '' | 'character' | 'scene' | 'prop' | 'reference'
+  name: string
+  description: string
+  prompt: string
+  negativePrompt: string
+  parameters: Record<string, unknown>
+  styleId: string
+  executionKind: AssetGenerationExecutionKind
+  modelDeploymentId: string
+  modelDeploymentName: string
+  workflowVersionId: string
+  workflowName: string
+  workflowVersion: number | null
+  outputAsset: Asset | null
+  status: AssetGenerationStatus
+  operation: string
+  isExternal: boolean
+  allowExternalCalls: boolean
+  budgetLimit: string | null
+  estimatedCost: string | null
+  actualCost: string | null
+  costCurrency: string
+  resultText: string
+  remoteStatus: string
+  providerRequestIdSha256: string
+  pollCount: number
+  errorCode: string
+  errorMessage: string
+  ignoreLateResult: boolean
+  submissionStartedAt: string
+  cancelRequestedAt: string
+  cancelSubmittedAt: string
+  createdAt: string
+  updatedAt: string
+  submittedAt: string
+  finishedAt: string
 }
 
 export type BibleDraftEntityType = 'character' | 'scene' | 'prop'
@@ -71,39 +159,11 @@ export interface VisualRulesColorDesign {
 
 
 export interface GeneratedImageAssetTarget {
-  referenceCategory: Ref2VAReferenceCategory
+  referenceCategory: ReferenceEntityCategory
   entityId: string
 }
 
 export type BibleImageEntityType = 'character' | 'scene' | 'prop'
-export type BibleImageGenerationPurpose = 'bible_image_candidate'
-export type BibleImageTaskStatus = 'queued' | 'running' | 'succeeded' | 'failed' | 'cancel_requested' | 'cancelled' | 'incomplete'
-
-export interface BibleImagePromptConfig {
-  schemaVersion: 1
-  stylePrompt: string
-  styleNegativePrompt: string
-  compositionRules: Record<BibleImageEntityType, string>
-  negativeRules: Record<BibleImageEntityType, string>
-  qualitySuffix: string
-}
-
-export interface BibleImagePromptInput {
-  key: string
-  label: string
-  value: string
-  role: 'positive' | 'negative'
-  source: string
-  editable: boolean
-}
-
-export interface BibleImagePromptInputs {
-  schemaVersion: 1
-  positive: BibleImagePromptInput[]
-  negative: BibleImagePromptInput[]
-  finalPromptText: string
-  negativePrompt: string
-}
 
 export interface BibleImageAssetSummary {
   id: string
@@ -113,47 +173,40 @@ export interface BibleImageAssetSummary {
   previewUrl: string
 }
 
-export interface BibleImageQualityIssue {
-  code: string
-  severity: string
-  path: string
-  message: string
-}
-
-export interface BibleImageCandidateQuality {
-  policyId?: string
-  status?: string
-  advisoryOnly?: boolean
-  wouldBlockEnqueue?: boolean
-  issues: BibleImageQualityIssue[]
-  warnings: string[]
-  raw: Record<string, unknown>
-}
-
 export interface BibleImageLatestCandidate {
-  promptArtifactId: string
-  generatedWorkflowId: string | null
+  artifactId: string
+  productionRunId: string
+  stageRunId: string
+  generationAttemptId: string | null
   generationTaskId: string | null
-  taskStatus: BibleImageTaskStatus
-  createdAt: string
-  idempotencyKey: string
-  requestFingerprint: string
-  sourceFingerprint: string
+  promptArtifactId: string | null
+  workflowVersionId: string | null
+  modelProfileVersionId: string | null
+  modelIdentifier: string
+  promptProfileVersionId: string | null
+  promptProfileBindingKey: string
+  promptProfileContractSha256: string
+  sourceSnapshotSha256: string
   sourceCurrent: boolean
-  quality: BibleImageCandidateQuality
-  promptInputs: BibleImagePromptInputs
-  outputMedia: TaskOutputMedia[]
-  promotedAssets: BibleImageAssetSummary[]
-  reviewRequired: boolean
-  persistedAsAsset: boolean
+  integrityStatus: 'valid' | 'invalid'
+  integrityErrorCode: string
+  variantGroup: string
+  variantIndex: number
+  status: 'available' | 'selected' | 'rejected' | 'invalid' | 'legacy_missing'
+  bindingRole: 'anchor' | 'reference' | 'unbound'
+  materializedAsset: BibleImageAssetSummary | null
+  previewUrl: string
+  downloadUrl: string
+  sha256: string
+  sizeBytes: number
+  mimeType: string
+  createdAt: string
 }
 
 export interface BibleImageCandidateProjection {
   entityType: BibleImageEntityType
   entityId: string
   entityName: string
-  sourceFingerprint: string
-  currentPromptInputs: BibleImagePromptInputs
   anchorAsset: BibleImageAssetSummary | null
   referenceAssets: BibleImageAssetSummary[]
   latestCandidate: BibleImageLatestCandidate | null
@@ -162,7 +215,6 @@ export interface BibleImageCandidateProjection {
 
 export interface BibleImageCandidatesResult {
   projectId: string
-  promptConfig: BibleImagePromptConfig
   candidates: BibleImageCandidateProjection[]
   counts: {
     characters: number
@@ -171,14 +223,6 @@ export interface BibleImageCandidatesResult {
     total: number
     withCandidate: number
   }
-}
-
-export interface BibleImageFrozenTarget {
-  schemaVersion: 1
-  referenceCategory: BibleImageEntityType
-  entityId: string
-  entityName: string
-  sourceFingerprint: string
 }
 
 export type DeferredFrameSlot = 'first_frame' | 'last_frame'
@@ -199,8 +243,8 @@ export interface DeferredGenerationRequest {
   sourceOutputRole: 'primary_video'
   targetShotId: string
   frameSlot: DeferredFrameSlot
-  targetTemplateId: string
-  targetTemplateHash: string
+  targetWorkflowVersionId: string
+  targetWorkflowSnapshotSha256: string
   idempotencyKey: string
   requestFingerprint: string
   targetInputFingerprint: string
@@ -272,40 +316,39 @@ export interface ShotAudio {
   music: string
 }
 
-export interface H3ReferenceEntityBinding {
+export interface ReferenceEntityBinding {
   entityId: string
   assetId: string
 }
 
-export type H3ReferenceVideoPurpose = 'motion_camera_reference' | 'video_editing' | 'video_continuation'
-export type H3ReferenceAudioPurpose = 'audio_reference' | 'audio_reuse'
+export type ReferencePurpose = string
 
-export interface H3ReferenceVideoBinding {
+export interface ReferenceVideoBinding {
   assetId: string
-  purpose: H3ReferenceVideoPurpose
+  purpose: ReferencePurpose
   useEmbeddedAudio: boolean
   audioAssetId?: string
-  audioPurpose?: H3ReferenceAudioPurpose
+  audioPurpose?: ReferencePurpose
 }
 
-export interface H3ReferenceAudioBinding {
+export interface ReferenceAudioBinding {
   assetId: string
-  purpose: H3ReferenceAudioPurpose
+  purpose: ReferencePurpose
 }
 
 /**
  * Typed material bindings persisted with a shot. Asset IDs always come from
  * the platform material library; the UI never accepts a local filesystem path.
  */
-export interface H3ReferenceBindings {
+export interface ReferenceBindings {
   firstFrameAssetId?: string
   lastFrameAssetId?: string
   firstFrameReferenceAssetId?: string
-  characters: H3ReferenceEntityBinding[]
-  scene?: H3ReferenceEntityBinding
-  props: H3ReferenceEntityBinding[]
-  videos: H3ReferenceVideoBinding[]
-  audios: H3ReferenceAudioBinding[]
+  characters: ReferenceEntityBinding[]
+  scene?: ReferenceEntityBinding
+  props: ReferenceEntityBinding[]
+  videos: ReferenceVideoBinding[]
+  audios: ReferenceAudioBinding[]
 }
 
 export interface Shot {
@@ -314,29 +357,27 @@ export interface Shot {
   title: string
   mediaType: 'video' | 'image'
   duration: number
-  mode: H3Mode
+  mode: ConditioningMode
   framing: string
   camera: string
   action: string
   /**
-   * Optional long-form, manually reviewed director description produced by the
-   * single-shot detail draft flow.  It is the only long-form source that the
-   * H3 compiler may prefer over the compact storyboard fields.
+   * Optional long-form, manually reviewed director description from the formal
+   * `Shot.detailed_description` field. A configured prompt adapter may prefer
+   * it over the compact storyboard fields.
    */
   detailedDescription?: string
   continuityDirection?: string
   prompt: string
-  generatedPrompt?: H3PromptPayload
+  generatedPrompt?: PromptArtifactPayload
   /** Ephemeral editor hint; never persisted by the shot sync payload. */
   promptRefreshReason?: 'compiler_updated' | 'translations_changed' | 'inputs_changed'
-  /** Backend-authoritative eligibility for the guarded legacy recovery action. */
-  legacyNegativePromptRepairEligible?: boolean
   negativePrompt: string
   characterIds: string[]
   sceneId?: string
   propIds: string[]
   referenceAssetIds: string[]
-  referenceBindings?: H3ReferenceBindings
+  referenceBindings?: ReferenceBindings
   /** Continuity intent only; concrete frame assets remain in referenceBindings. */
   requiresFirstFrameContinuity: boolean
   requiresLastFrameContinuity: boolean
@@ -383,14 +424,14 @@ export interface SeriesProject {
   coverUrl?: string
   continuitySummary?: string
   translationGlossary?: Record<string, string>
-  bibleImagePromptConfig: BibleImagePromptConfig
   styleId: string
   status: ProjectStatus
-  aspectRatio: '9:16' | '16:9' | '1:1'
+  language: string
+  aspectRatio: string
   resolution: '720p' | '1080p' | '4K'
   width?: number
   height?: number
-  defaultMode: H3Mode
+  defaultMode: ConditioningMode
   bible: ContinuityBible
   episodes: Episode[]
   /** List endpoints provide aggregate counts without loading every episode and shot. */
@@ -403,7 +444,29 @@ export interface SeriesProject {
   updatedAt: string
 }
 
-export interface H3PromptPayload {
+export interface PromptWritingGuideFieldRule {
+  fieldKey: string
+  fieldLabel?: string
+  sourceSelector: string
+  channel: string
+  position: number
+  labelStyle: string
+  separator: string
+  maxChars: number
+  generationMode?: string
+  generationOutputSemantics?: string
+}
+
+export interface PromptWritingGuideProfile {
+  profileKey: string
+  name: string
+  version: number
+  sourceProjectionKey: string
+  officialReference?: string
+  fieldRules: PromptWritingGuideFieldRule[]
+}
+
+export interface PromptArtifactPayload {
   /** Backend-authoritative compiler compatibility for persisted artifacts. */
   compiler_current?: boolean
   /** Immutable PromptArtifact metadata used only for preview freshness checks. */
@@ -412,9 +475,14 @@ export interface H3PromptPayload {
   artifact_created_at?: string
   model: string
   mediaType: 'video' | 'image'
-  mode?: H3Mode
-  effective_conditioning_mode?: H3Mode | 'TEXT_ONLY'
+  /** Immutable PromptArtifact.include_audio fact. */
+  includeAudio: boolean
+  /** Immutable PromptArtifact.is_multi_shot fact. */
+  isMultiShot: boolean
+  mode?: ConditioningMode
+  effective_conditioning_mode?: ConditioningMode
   prompt_template_key?: string
+  prompt_profile_guide?: PromptWritingGuideProfile
   reference_bindings?: Array<Record<string, unknown>>
   duration?: number
   /** Exact text persisted in PromptArtifact.prompt_text and injected into ComfyUI. */
@@ -437,17 +505,6 @@ export interface H3PromptPayload {
     detailed_description_word_count?: number
     warnings: string[]
     fields_requiring_english_rewrite: string[]
-    source_fields_optimized?: string[]
-    optimizer?: {
-      status: 'optimized' | 'not_required' | 'disabled' | 'misconfigured' | 'failed_request' | 'failed_validation' | 'not_configured'
-      enabled: boolean
-      provider: string
-      model: string
-      transport: 'local' | 'remote'
-      failure_mode: 'warn' | 'block'
-      message: string
-      validation_errors: string[]
-    }
     production_language_gate?: {
       mode: 'block' | 'warn'
       would_block_enqueue: boolean
@@ -502,10 +559,6 @@ export interface ShotTranslationPromotionResult {
   shotId: string
   promotedFields: PromptTranslationPromotedField[]
   entries: PromptTranslationEntry[]
-  shotPatch: {
-    metadata?: Record<string, unknown>
-    updatedAt?: string
-  }
 }
 
 export interface PromptNormalizationDeployment {
@@ -653,7 +706,7 @@ export interface TaskInputPrompt {
   promptArtifactId?: string
   promptType?: string
   model?: string
-  h3Mode?: string
+  conditioningMode?: string
   effectiveConditioningMode?: string
   promptTemplateKey?: string
   contentHash?: string
@@ -661,6 +714,7 @@ export interface TaskInputPrompt {
   negativePrompt: string
   promptCharacterCount: number
   negativePromptCharacterCount: number
+  negativePromptSubmitted: boolean
   promptSource?: string
   negativePromptSource?: string
 }
@@ -675,6 +729,8 @@ export interface WorkflowTimelineEvent {
 
 export type WorkflowProgressSource = 'none' | 'submission' | 'comfyui' | 'terminal'
 export type WorkflowProgressTelemetryState = 'unknown' | 'connected' | 'receiving' | 'unavailable'
+export type WorkflowInputContractStatus = 'available' | 'unavailable'
+export type WorkflowInputContractCode = '' | 'legacy_schema_unsupported' | 'frozen_contract_invalid'
 
 export interface Workflow {
   id: string
@@ -692,10 +748,10 @@ export interface Workflow {
   effectiveFrames?: number
   effectiveDurationMs?: number
   inputParameters?: Record<string, unknown>
-  generationPurpose?: BibleImageGenerationPurpose
-  bibleImageTarget?: BibleImageFrozenTarget
-  referenceAssets?: TaskReferenceAssetSummary[]
-  continuityAssets?: TaskReferenceAssetSummary[]
+  inputContractStatus?: WorkflowInputContractStatus
+  inputContractCode?: WorkflowInputContractCode
+  referenceAssets: TaskReferenceAssetSummary[]
+  continuityAssets: TaskReferenceAssetSummary[]
   promptAvailable?: boolean
   promptCharacterCount?: number
   negativePromptCharacterCount?: number
@@ -745,6 +801,8 @@ export interface Workflow {
   shotVersionLabel?: string
   batchSlots?: WorkflowBatchSlot[]
   batchTaskIds?: string[]
+  productionRunId?: string
+  productionVariantNumber?: number
   isVirtualProductionUnit?: boolean
   virtualProductionUnitKind?: 'deferred_first_frame_continuity' | 'waiting_for_deferred_first_frame_source' | 'waiting_for_deferred_first_frame_chain'
   deferredGenerationRequestId?: string

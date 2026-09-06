@@ -14,7 +14,6 @@ from studio.models import (
     CharacterBible,
     ConsistencyLock,
     Episode,
-    EpisodeCreativeDraft,
     GeneratedWorkflow,
     GenerationTask,
     PromptArtifact,
@@ -24,9 +23,6 @@ from studio.models import (
     SceneBible,
     SeriesProject,
     Shot,
-    ShotDetailDraft,
-    ShotDetailDraftBatch,
-    ShotDetailDraftBatchItem,
 )
 from studio.services.dialogue import parse_delivery_annotation
 from studio.services.script_bible import (
@@ -46,8 +42,8 @@ SHOT_RE = re.compile(
     re.IGNORECASE,
 )
 DIALOGUE_RE = re.compile(
-    r"^\s*(?P<name>[^：:（）()\n]{1,160}?)\s*"
-    r"(?:[（(]\s*(?P<delivery>[^）)\n]{1,500}?)\s*[）)])?\s*"
+    r"^\s*(?P<name>[^：:（）()\n]+?)\s*"
+    r"(?:[（(]\s*(?P<delivery>[^）)\n]+?)\s*[）)])?\s*"
     r"[：:]\s*(?P<text>.+?)\s*$"
 )
 DIRECTIVE_RE = re.compile(r"^[【\[]\s*(?P<body>[^】\]]+)\s*[】\]]\s*")
@@ -71,27 +67,36 @@ DIALOGUE_LABEL_RE = re.compile(r"^\s*(?:对白|DIALOGUE)\s*[:：]\s*", re.IGNORE
 
 _TRUE_VALUES = {"1", "true", "yes", "on", "是", "需要", "连续"}
 _FALSE_VALUES = {"0", "false", "no", "off", "否", "不需要", "无"}
+_TRAILING_CJK_NAME_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]+$")
+SCRIPT_PROP_ALIAS_POLICY_KEYS = frozenset({
+    "schema_version",
+    "minimum_core_characters",
+    "maximum_prefix_trim_characters",
+    "generic_aliases",
+})
 
 
 @dataclass
 class BreakdownResult:
     episodes: list[Episode]
     warnings: list[str] = field(default_factory=list)
-    method: str = "deterministic-script-breakdown-v3"
+    method: str = "deterministic-script-breakdown-v4"
 
 
-def project_default_h3_mode(project: SeriesProject) -> str:
-    """Return the exact H3 mode future deterministic storyboard shots will use."""
+def normalize_default_conditioning_mode(value: object) -> str:
+    """Normalize one model-agnostic conditioning mode key."""
 
-    configured_mode = (project.production_settings or {}).get("default_h3_mode")
-    return (
-        configured_mode
-        if configured_mode in {
-            Shot.H3Mode.T2VA,
-            Shot.H3Mode.FL2VA,
-            Shot.H3Mode.REF2VA,
-        }
-        else Shot.H3Mode.T2VA
+    configured_mode = str(value or "").strip()
+    if re.fullmatch(r"[A-Za-z][A-Za-z0-9_.-]{0,63}", configured_mode) is None:
+        raise ValueError("项目缺少有效的 default_conditioning_mode")
+    return configured_mode
+
+
+def project_default_conditioning_mode(project: SeriesProject) -> str:
+    """Return the current project setting when starting a new execution contract."""
+
+    return normalize_default_conditioning_mode(
+        (project.production_settings or {}).get("default_conditioning_mode"),
     )
 
 
@@ -227,10 +232,6 @@ def discard_rebuildable_production(
             "assembly_jobs": 0,
             "prompt_artifacts": 0,
             "generated_workflows": 0,
-            "creative_drafts": 0,
-            "shot_detail_drafts": 0,
-            "shot_detail_batches": 0,
-            "shot_detail_batch_items": 0,
             "prompt_field_translations": 0,
             "draft_release_bundles": 0,
             "physical_outputs_retained": True,
@@ -254,21 +255,6 @@ def discard_rebuildable_production(
         AssemblyJob.objects.select_for_update().filter(
             Q(episode_id__in=episode_ids) | Q(source_tasks__id__in=task_ids),
         ).distinct()
-    )
-    detail_batch_ids = list(
-        project.shot_detail_batches.filter(
-            episode_id__in=episode_ids,
-        ).values_list("id", flat=True)
-    )
-    detail_batches = list(
-        ShotDetailDraftBatch.objects.select_for_update().filter(
-            id__in=detail_batch_ids,
-        ).order_by("id")
-    )
-    detail_items = list(
-        ShotDetailDraftBatchItem.objects.select_for_update().filter(
-            batch_id__in=detail_batch_ids,
-        ).order_by("batch_id", "id")
     )
     release_bundles = list(project.release_bundles.select_for_update())
 
@@ -295,20 +281,6 @@ def discard_rebuildable_production(
         job.status in {AssemblyJob.Status.QUEUED, AssemblyJob.Status.RUNNING}
         for job in assemblies
     )
-    active_detail_batches = sum(
-        batch.generation_status in {
-            ShotDetailDraftBatch.GenerationStatus.QUEUED,
-            ShotDetailDraftBatch.GenerationStatus.RUNNING,
-        }
-        for batch in detail_batches
-    )
-    active_detail_items = sum(
-        item.status in {
-            ShotDetailDraftBatchItem.Status.PENDING,
-            ShotDetailDraftBatchItem.Status.RUNNING,
-        }
-        for item in detail_items
-    )
     protected_release_bundles = sum(
         bundle.status != ReleaseBundle.Status.DRAFT for bundle in release_bundles
     )
@@ -316,8 +288,6 @@ def discard_rebuildable_production(
         "active_generation_tasks": active_generation_tasks,
         "unresolved_remote_tasks": unresolved_remote_tasks,
         "active_assembly_jobs": active_assembly_jobs,
-        "active_shot_detail_batches": active_detail_batches,
-        "active_shot_detail_items": active_detail_items,
         "protected_release_bundles": protected_release_bundles,
     }
     if any(conflict_details.values()):
@@ -337,10 +307,6 @@ def discard_rebuildable_production(
         "assembly_jobs": len(assemblies),
         "prompt_artifacts": len(prompt_ids),
         "generated_workflows": len(workflow_ids),
-        "creative_drafts": EpisodeCreativeDraft.objects.filter(project=project).count(),
-        "shot_detail_drafts": ShotDetailDraft.objects.filter(project=project).count(),
-        "shot_detail_batches": len(detail_batches),
-        "shot_detail_batch_items": len(detail_items),
         "prompt_field_translations": translations.count(),
         "draft_release_bundles": sum(
             bundle.status == ReleaseBundle.Status.DRAFT for bundle in release_bundles
@@ -354,9 +320,6 @@ def discard_rebuildable_production(
             "assembly_jobs",
             "prompt_artifacts",
             "generated_workflows",
-            "creative_drafts",
-            "shot_detail_drafts",
-            "shot_detail_batches",
             "prompt_field_translations",
             "draft_release_bundles",
         )
@@ -426,6 +389,54 @@ def _format_time_ms(value: int) -> str:
 
 def _canonical_timed_action(start_ms: int, end_ms: int, text: str) -> str:
     return f"[{_format_time_ms(start_ms)}s–{_format_time_ms(end_ms)}s] {text.strip()}"
+
+
+def _shot_prompt_fact_scaffold(
+    *,
+    scene,
+    characters,
+    props,
+    narrative: str,
+    dialogue: list[dict],
+) -> tuple[str, str, str]:
+    """Materialize grounded layer-one facts for later H3 field generation."""
+
+    character_names = "、".join(
+        item.name for item in sorted(characters, key=lambda value: (value.slug, str(value.id)))
+    ) or "无已绑定人物"
+    prop_names = "、".join(
+        item.name for item in sorted(props, key=lambda value: (value.slug, str(value.id)))
+    ) or "无已绑定道具"
+    scene_name = scene.name if scene is not None else "未指定场景"
+    scene_facts = []
+    if scene is not None:
+        scene_facts = [
+            str(getattr(scene, field, "") or "").strip()
+            for field in ("location", "time_of_day", "lighting", "color_palette")
+        ]
+    scene_detail = "；".join(value for value in scene_facts if value) or "以场景 Bible 为准"
+    spoken = sum(1 for item in dialogue if not bool(item.get("voiceover")))
+    voiceover = sum(1 for item in dialogue if bool(item.get("voiceover")))
+    dialogue_fact = (
+        f"结构化对白 {spoken} 条、画外音 {voiceover} 条；原文、说话人和时间窗由对白字段单独锁定"
+        if dialogue else "本镜头无结构化对白或画外音"
+    )
+    detail = "\n".join((
+        f"场景与光线事实：{scene_name}；{scene_detail}。",
+        f"主体与道具事实：人物={character_names}；道具={prop_names}。",
+        f"动作时间线与末态事实：{narrative}",
+        f"声音与对白事实：{dialogue_fact}。",
+        "连续性事实：动作按正向时间发展，呈现初态、连续中间过程和可衔接的稳定末态。",
+    ))
+    sound = (
+        "依据当前场景和可见动作生成同步画内声景：保留环境底噪、人物移动、衣料、脚步和道具接触声；"
+        "对白或画外音出现时不得用音效遮盖人声。"
+    )
+    music = (
+        "非画内音乐只依据已确认的全剧风格和本镜头动作节奏配置；不得新增剧情信息，不得遮盖对白、"
+        "画外音或同步画内声；剧本未明确要求音乐时保持克制，并允许近乎无配乐。"
+    )
+    return detail, sound, music
 
 
 def _parse_shot_header(
@@ -651,10 +662,114 @@ def _entity_name_pairs(
     return list(by_name.values())
 
 
+def _validated_prop_alias_policy(value: object) -> dict:
+    if not isinstance(value, dict) or set(value) != SCRIPT_PROP_ALIAS_POLICY_KEYS:
+        raise ValueError("production.script_prop_alias_policy 合同字段无效")
+    if value.get("schema_version") != 1:
+        raise ValueError("production.script_prop_alias_policy schema_version 无效")
+    minimum = value.get("minimum_core_characters")
+    maximum_trim = value.get("maximum_prefix_trim_characters")
+    generic = value.get("generic_aliases")
+    if (
+        type(minimum) is not int
+        or minimum < 1
+        or type(maximum_trim) is not int
+        or maximum_trim < 0
+        or not isinstance(generic, (list, tuple, frozenset))
+        or any(not isinstance(item, str) or not item.strip() for item in generic)
+    ):
+        raise ValueError("production.script_prop_alias_policy 合同值无效")
+    return {
+        "schema_version": 1,
+        "minimum_core_characters": minimum,
+        "maximum_prefix_trim_characters": maximum_trim,
+        "generic_aliases": frozenset(
+            normalize_script_bible_name(item) for item in generic
+        ),
+    }
+
+
+def _prop_core_alias_candidates(
+    name: object,
+    policy: dict,
+) -> tuple[str, ...]:
+    """Derive conservative Chinese prop short names from a reviewed full name.
+
+    The inferred form may remove only the configured number of leading
+    modifier characters from the final CJK span (``发光怀表`` -> ``怀表``), or
+    use a trailing CJK span that follows an explicit non-CJK boundary
+    (``USB-钥匙`` -> ``钥匙``).  This deliberately avoids arbitrary suffix
+    matching such as treating ``录音机`` as ``音机``.
+    """
+
+    normalized = normalize_script_bible_name(name)
+    match = _TRAILING_CJK_NAME_RE.search(normalized)
+    if match is None:
+        return ()
+    cjk_name = match.group(0)
+    validated = _validated_prop_alias_policy(policy)
+    minimum_core_characters = validated["minimum_core_characters"]
+    offsets: set[int] = set()
+    if match.start() > 0:
+        offsets.add(0)
+    modifier_chars = min(
+        validated["maximum_prefix_trim_characters"],
+        len(cjk_name) - minimum_core_characters,
+    )
+    if modifier_chars > 0:
+        offsets.add(modifier_chars)
+    candidates = {
+        cjk_name[offset:]
+        for offset in offsets
+        if (
+            len(cjk_name[offset:]) >= minimum_core_characters
+            and cjk_name[offset:] != normalized
+            and cjk_name[offset:] not in validated["generic_aliases"]
+        )
+    }
+    return tuple(sorted(candidates, key=lambda value: (-len(value), value)))
+
+
+def _prop_name_pairs(
+    rows: list[PropBible],
+    aliases: Mapping[str, PropBible],
+    policy: dict,
+) -> list[tuple[str, PropBible]]:
+    """Add only project-unique, non-conflicting inferred prop short names."""
+
+    pairs = _entity_name_pairs(rows, aliases)
+    exact_owners = {
+        normalize_script_bible_name(name): row
+        for name, row in pairs
+        if normalize_script_bible_name(name)
+    }
+    inferred_owners: dict[str, dict[object, PropBible]] = {}
+    for row in rows:
+        identity = getattr(row, "pk", None) or id(row)
+        for alias in _prop_core_alias_candidates(row.name, policy):
+            inferred_owners.setdefault(alias, {})[identity] = row
+    for alias in sorted(inferred_owners, key=lambda value: (-len(value), value)):
+        owners = inferred_owners[alias]
+        if len(owners) != 1:
+            continue
+        owner = next(iter(owners.values()))
+        exact_owner = exact_owners.get(alias)
+        if exact_owner is not None:
+            # An explicit current/reviewed name always wins. Reusing the same
+            # alias for another row would turn a short mention into a guess.
+            continue
+        pairs.append((alias, owner))
+    return pairs
+
+
 def breakdown_script(
     project: SeriesProject,
     script: str,
-    *, episode_count_hint: int = 1,
+    *,
+    episode_count_hint: int,
+    multi_shot: bool,
+    include_audio: bool,
+    default_shot_media_type: str,
     default_shot_duration_ms: int | None = None,
     default_first_frame_continuity: bool | None = None,
     default_last_frame_continuity: bool | None = None,
@@ -662,10 +777,15 @@ def breakdown_script(
     video_shot_max_duration_ms: int | None = None,
     auto_split_trigger_chars: int | None = None,
     auto_split_target_chars: int | None = None,
-    multi_shot: bool = True,
-    include_audio: bool = True,
+    default_conditioning_mode: str | None = None,
     confirmed_bible_aliases: ConfirmedScriptBibleAliases | None = None,
+    prop_alias_policy: dict | None = None,
 ) -> BreakdownResult:
+    if default_shot_media_type not in {
+        Shot.MediaType.VIDEO,
+        Shot.MediaType.IMAGE,
+    }:
+        raise ValueError("default_shot_media_type 必须来自项目创建策略")
     required_config = (
         "production.default_shot_duration_ms",
         "production.default_first_frame_continuity",
@@ -711,6 +831,12 @@ def breakdown_script(
     scenes = list(project.scenes.order_by("name"))
     props = list(project.props.order_by("name"))
     aliases = confirmed_bible_aliases or ConfirmedScriptBibleAliases()
+    if prop_alias_policy is None:
+        prop_alias_policy = resolve_configuration(
+            project=project,
+            required_keys=("production.script_prop_alias_policy",),
+        ).values["production.script_prop_alias_policy"]
+    prop_alias_policy = _validated_prop_alias_policy(prop_alias_policy)
     character_name_pairs = _entity_name_pairs(characters, aliases.characters)
     character_names = {
         normalize_script_bible_name(name): (name, item)
@@ -726,14 +852,20 @@ def breakdown_script(
     })
     character_name_pairs = list(character_names.values())
     scene_name_pairs = _entity_name_pairs(scenes, aliases.scenes)
-    prop_name_pairs = _entity_name_pairs(props, aliases.props)
-    default_h3_mode = project_default_h3_mode(project)
+    prop_name_pairs = _prop_name_pairs(props, aliases.props, prop_alias_policy)
+    default_conditioning_mode = (
+        project_default_conditioning_mode(project)
+        if default_conditioning_mode is None
+        else normalize_default_conditioning_mode(default_conditioning_mode)
+    )
     character_by_name = {
         normalize_script_bible_name(name): item
         for name, item in character_name_pairs
     }
     warnings = []
     created = []
+    episode_title_max_length = Episode._meta.get_field("title").max_length
+    shot_title_max_length = Shot._meta.get_field("title").max_length
     next_episode_number = (project.episodes.order_by("-number").values_list("number", flat=True).first() or 0) + 1
     for title, shot_blocks in sections:
         if not shot_blocks:
@@ -742,13 +874,15 @@ def breakdown_script(
         episode = Episode.objects.create(
             project=project,
             number=next_episode_number + len(created),
-            title=title[:200],
-            synopsis=shot_blocks[0][:500],
+            # Titles are display identifiers and must fit the database schema;
+            # all authored text remains lossless in synopsis/script/narrative.
+            title=title[:episode_title_max_length],
+            synopsis=shot_blocks[0],
             script="\n\n".join(shot_blocks),
             prompt_settings={
                 "multi_shot": multi_shot, "include_audio": include_audio,
-                "default_h3_mode": default_h3_mode,
-                "breakdown_method": "deterministic-script-breakdown-v3",
+                "default_conditioning_mode": default_conditioning_mode,
+                "breakdown_method": "deterministic-script-breakdown-v4",
                 "default_shot_duration_ms": default_shot_duration_ms,
                 "default_first_frame_continuity": default_first_frame_continuity,
                 "default_last_frame_continuity": default_last_frame_continuity,
@@ -845,70 +979,44 @@ def breakdown_script(
                 fallback = f"{names or '人物'}在当前场景完成对白与反应。"
                 narrative = _canonical_timed_action(0, shot_duration_ms, fallback)
                 plain_narrative_lines.append(fallback)
+            detailed_description, sound_effects, music = _shot_prompt_fact_scaffold(
+                scene=scene,
+                characters=bound_characters,
+                props=bound_props,
+                narrative=narrative,
+                dialogue=dialogue,
+            )
             shot = Shot.objects.create(
                 episode=episode,
                 number=shot_index,
-                title=(" ".join(plain_narrative_lines) or parsed_block or block).replace("\n", " ")[:80],
+                title=(" ".join(plain_narrative_lines) or parsed_block or block).replace(
+                    "\n", " ",
+                )[:shot_title_max_length],
                 narrative=narrative,
+                detailed_description=detailed_description,
                 camera="cinematic continuity-aware framing and motivated camera movement",
+                action=" ".join(plain_narrative_lines).strip(),
                 dialogue=dialogue,
+                sound_effects=sound_effects,
+                music=music,
                 duration_ms=shot_duration_ms,
-                h3_mode=default_h3_mode,
-                include_audio=include_audio,
+                media_type=default_shot_media_type,
+                conditioning_mode=(
+                    default_conditioning_mode
+                    if default_shot_media_type == Shot.MediaType.VIDEO
+                    else ""
+                ),
+                include_audio=(
+                    include_audio
+                    if default_shot_media_type == Shot.MediaType.VIDEO
+                    else False
+                ),
                 scene=scene,
                 requires_first_frame_continuity=first_frame_continuity,
                 requires_last_frame_continuity=last_frame_continuity,
             )
             shot.characters.set(bound_characters)
             shot.props.set(bound_props)
-            if default_h3_mode == Shot.H3Mode.REF2VA:
-                bindings = {"characters": [], "props": []}
-                reference_assets = []
-
-                def bind_entity(entity, category: str):
-                    asset = entity.anchor_asset or entity.reference_assets.order_by(
-                        "kind", "name", "id",
-                    ).first()
-                    if not asset:
-                        warnings.append(
-                            f"{title} 分镜 {shot_index}: 默认 Ref2VA 尚缺{category}“{entity.name}”参考图；"
-                            "将使用 continuity Bible 文字定义，也可稍后补充分类参考图"
-                        )
-                        return None
-                    reference_assets.append(asset)
-                    return {"entity_id": str(entity.id), "asset_id": str(asset.id)}
-
-                bindings["characters"] = [item for item in (
-                    bind_entity(item, "人物")
-                    for item in sorted(bound_characters, key=lambda value: value.stable_speaker_id)
-                ) if item]
-                if scene:
-                    scene_binding = bind_entity(scene, "场景")
-                    if scene_binding:
-                        bindings["scene"] = scene_binding
-                bindings["props"] = [
-                    item for item in (bind_entity(value, "道具") for value in bound_props) if item
-                ]
-                bindings = {key: value for key, value in bindings.items() if value}
-                if not bindings:
-                    warnings.append(
-                        f"{title} 分镜 {shot_index}: 默认 Ref2VA 暂无可用分类参考图；"
-                        "将使用零参考图文字模式，也可在分镜编辑器补图"
-                    )
-                asset_ids = [str(item.id) for item in reference_assets]
-                if len(asset_ids) != len(set(asset_ids)):
-                    warnings.append(
-                        f"{title} 分镜 {shot_index}: 自动参考图有重复，已清空以避免错误分类；请手动绑定"
-                    )
-                    bindings, reference_assets = {}, []
-                if len(reference_assets) > 9:
-                    warnings.append(
-                        f"{title} 分镜 {shot_index}: 自动参考图超过 9 张，已清空；请精简后手动绑定"
-                    )
-                    bindings, reference_assets = {}, []
-                shot.reference_bindings = bindings
-                shot.save(update_fields=("reference_bindings", "updated_at"))
-                shot.reference_assets.set(reference_assets)
         created.append(episode)
     if not created:
         raise ValueError("没有创建任何有效剧集")

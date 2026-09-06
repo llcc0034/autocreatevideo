@@ -192,16 +192,6 @@ export const adaptShotTranslationPromotionResult = (raw: Raw): ShotTranslationPr
   entries: Array.isArray(raw.entries)
     ? raw.entries.filter((entry): entry is Raw => Boolean(entry && typeof entry === 'object')).map(adaptTranslationEntry)
     : [],
-  shotPatch: raw.shot_patch && typeof raw.shot_patch === 'object'
-    ? {
-        ...((raw.shot_patch as Raw).metadata && typeof (raw.shot_patch as Raw).metadata === 'object'
-          ? { metadata: { ...((raw.shot_patch as Raw).metadata as Record<string, unknown>) } }
-          : {}),
-        ...(String((raw.shot_patch as Raw).updated_at || '')
-          ? { updatedAt: String((raw.shot_patch as Raw).updated_at) }
-          : {}),
-      }
-    : {},
 })
 
 /** Patch only the formal fields returned by the promotion transaction. */
@@ -230,21 +220,6 @@ export const applyPromotedFieldsToShot = (
   }
   if (dialogueChanged && dialogue) shot.audio.dialogue = formatDialogueLines(dialogue)
   return applied
-}
-
-/**
- * Apply only the backend-authoritative metadata patch returned by the guarded
- * legacy recovery transaction. No other local Shot edits are replaced.
- */
-export const applyShotTranslationPatch = (
-  shot: Shot,
-  patch: ShotTranslationPromotionResult['shotPatch'],
-): boolean => {
-  if (!patch.metadata) return false
-  shot.metadata = { ...patch.metadata }
-  shot.negativePrompt = String(patch.metadata.negative_prompt || '')
-  shot.legacyNegativePromptRepairEligible = false
-  return true
 }
 
 export const translationFieldIdentity = (field: Pick<PromptTranslationField, 'fieldKey' | 'scopeType' | 'scopeId'>) => (

@@ -11,7 +11,7 @@ const props = withDefaults(defineProps<{
 const profiles: Record<PromptImpactKind, { label: string; description: string }> = {
   label: { label: '仅标识', description: '用于名称、检索或任务识别，不直接改变生成内容。' },
   indirect: { label: '间接影响', description: '用于初始化、拆解或管理上下文，不会原样写入当前生成提示词。' },
-  prompt: { label: '进入提示词', description: '会进入 MiniMax H3 的正向导演提示词；负面字段是否仅作审计以该字段自己的说明为准。' },
+  prompt: { label: '进入提示词', description: '会按当前已发布提示词策略进入模型输入；字段通道、顺序和负面内容是否提交以冻结合同为准。' },
   continuity: { label: '连续性参考', description: '参与人物、场景、道具或跨镜头一致性约束。' },
   production: { label: '生产参数', description: '控制工作流、尺寸、时长、音频或节点输入。' },
   audit: { label: '质量审计', description: '用于提交前检查、生成快照或结果审计。' }

@@ -13,6 +13,7 @@ from studio.models import (
     StageRun,
 )
 from studio.services.json_contracts import json_contract, verify_json_contract
+from studio.services.security_boundaries import boundary_int
 from studio.services.script_sources import confirm_script_revision
 
 
@@ -20,9 +21,6 @@ REVIEW_PAYLOAD_KINDS = frozenset({
     "generated_script_preview",
     "structured_script_preview",
 })
-MAX_SCRIPT_REVIEW_SNAPSHOT_BYTES = 8 * 1024 * 1024
-
-
 def _text_sha256(value: object) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8")).hexdigest()
 
@@ -33,7 +31,7 @@ def _verified_snapshot(stage: StageRun) -> dict[str, Any]:
         schema_version=stage.output_snapshot_schema_version,
         size_bytes=stage.output_snapshot_size_bytes,
         sha256=stage.output_snapshot_sha256,
-        max_bytes=MAX_SCRIPT_REVIEW_SNAPSHOT_BYTES,
+        max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
     ).value
     if not isinstance(value, dict):
         raise ValidationError("剧本候选阶段输出快照必须是对象")
@@ -133,7 +131,8 @@ def approve_frozen_script_candidate(
             raise ValidationError("冻结剧本候选正文 hash 或大小已漂移")
         candidate_title = str(payload.get("title") or "")
         candidate_logline = str(payload.get("logline") or "")
-        if not candidate_title or len(candidate_title) > 200 or len(candidate_logline) > 2_000:
+        project_title_max = project._meta.get_field("title").max_length
+        if not candidate_title or len(candidate_title) > project_title_max:
             raise ValidationError("冻结剧本候选 title/logline 无效")
         artifact = GeneratedArtifact.objects.select_for_update().filter(
             pk=payload.get("artifact_id"),
@@ -148,7 +147,7 @@ def approve_frozen_script_candidate(
             schema_version=artifact.manifest_schema_version,
             size_bytes=artifact.manifest_metadata_size_bytes,
             sha256=artifact.manifest_metadata_sha256,
-            max_bytes=MAX_SCRIPT_REVIEW_SNAPSHOT_BYTES,
+            max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
         ).value
         if (
             not isinstance(manifest, dict)
@@ -250,4 +249,7 @@ def approve_frozen_script_candidate(
             "logline": logline_evidence,
         },
     }
-    return json_contract(evidence).value
+    return json_contract(
+        evidence,
+        max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
+    ).value

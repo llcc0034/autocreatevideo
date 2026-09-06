@@ -24,6 +24,14 @@ from studio.models import (
     SeriesProject,
 )
 from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
+from studio.services.content_contracts import (
+    CANONICAL_CONTEXT_POLICY_KEY,
+    CANONICAL_NAME_POLICY_KEY,
+    canonical_context_policy,
+    canonical_glossary_max_entities,
+    canonical_glossary_max_runtime_items,
+    canonical_name_policy,
+)
 from studio.services.prompt_normalization import DEFAULT_DEPLOYMENT_CONFIG_KEY
 from studio.services.prompt_translation import (
     CanonicalTargetCollisionError,
@@ -104,7 +112,7 @@ def _snapshot(scope_type: str, entity) -> CanonicalTarget:
         scope_type=scope_type,
         scope_id=entity.pk,
         name=str(entity.name or "").strip(),
-        description=str(entity.description or "")[:800],
+        description=str(entity.description or ""),
         # This is the authoritative translation source.  Do not truncate it:
         # PromptFieldTranslation source hashes must match resolve_current_source.
         visual_identity=str(entity.visual_identity or ""),
@@ -114,10 +122,12 @@ def _snapshot(scope_type: str, entity) -> CanonicalTarget:
 def _proper_name_context(
     target: CanonicalTarget, glossary: dict[str, str],
 ) -> str:
-    # Keep the reference context bounded before it enters the isolated runtime.
+    # Authored Bible/glossary facts stay complete.  Advisory capacities are
+    # audited separately; the signed request-byte security boundary remains the
+    # only size fail-closed guard before Provider submission.
     existing = {
-        str(source)[:160]: str(value)[:160]
-        for source, value in list(sorted(glossary.items()))[:40]
+        str(source): str(value)
+        for source, value in sorted(glossary.items())
     }
     return json.dumps({
         "purpose": "canonical English proper-name glossary",
@@ -125,7 +135,7 @@ def _proper_name_context(
         "entity": {
             "source_name": target.name,
             "description": target.description,
-            "visual_identity": target.visual_identity[:800],
+            "visual_identity": target.visual_identity,
         },
         "existing_canonical_glossary": existing,
         "rules": [
@@ -149,8 +159,8 @@ def _visual_inference_context(
     visual prose.
     """
     existing = {
-        str(source)[:160]: str(value)[:160]
-        for source, value in list(sorted(glossary.items()))[:80]
+        str(source): str(value)
+        for source, value in sorted(glossary.items())
     }
     rules = [
         "Translate only invariant visible appearance, silhouette, wardrobe, material, color, surface, and identifying marks.",
@@ -166,7 +176,7 @@ def _visual_inference_context(
         "purpose": "English Bible visual-identity review candidate",
         "entity_type": target.scope_type,
         "entity_name_source": target.name,
-        "entity_description_reference": target.description[:800],
+        "entity_description_reference": target.description,
         "canonical_glossary_at_inference": existing,
         "canonical_identity_tokens": [
             {"source": source, "token": token, "count": count}
@@ -253,13 +263,164 @@ def _finalize_visual_result(
     )
 
 
-def validate_canonical_english(value: str) -> str:
+def _capacity_advisory(
+    *, code: str, policy_key: str, field: str,
+    actual: int, advisory: int, affected_items: int | None = None,
+) -> dict | None:
+    if actual <= advisory:
+        return None
+    row = {
+        "severity": "warning",
+        "code": code,
+        "policy_key": policy_key,
+        "field": field,
+        "actual": int(actual),
+        "advisory": int(advisory),
+    }
+    if affected_items is not None:
+        row["affected_items"] = int(affected_items)
+    return row
+
+
+def _canonical_context_advisories(
+    *,
+    request_targets: list[CanonicalTarget],
+    model_context_targets: list[CanonicalTarget],
+    glossary: dict[str, str],
+    runtime_item_count: int,
+    proper_name_context_count: int,
+    visual_context_count: int,
+    ensure_visual_identity_translation: bool,
+    name_policy: dict[str, int],
+    context_policy: dict[str, int],
+) -> list[dict]:
+    """Return compact, content-free advisory facts for operator audit."""
+
+    advisories: list[dict] = []
+
+    def add(row: dict | None) -> None:
+        if row is not None:
+            advisories.append(row)
+
+    entity_field = (
+        "max_entities_with_visual_identity_translation"
+        if ensure_visual_identity_translation
+        else "max_entities_per_request"
+    )
+    add(_capacity_advisory(
+        code="canonical_entity_count_above_advisory",
+        policy_key=CANONICAL_NAME_POLICY_KEY,
+        field=entity_field,
+        actual=len(request_targets),
+        advisory=name_policy[entity_field],
+    ))
+    add(_capacity_advisory(
+        code="canonical_runtime_item_count_above_advisory",
+        policy_key=CANONICAL_NAME_POLICY_KEY,
+        field="max_runtime_items_per_request",
+        actual=runtime_item_count,
+        advisory=name_policy["max_runtime_items_per_request"],
+    ))
+    if proper_name_context_count:
+        add(_capacity_advisory(
+            code="proper_name_glossary_entries_above_advisory",
+            policy_key=CANONICAL_CONTEXT_POLICY_KEY,
+            field="proper_name_glossary_advisory_entries",
+            actual=len(glossary),
+            advisory=context_policy["proper_name_glossary_advisory_entries"],
+        ))
+    if visual_context_count:
+        add(_capacity_advisory(
+            code="visual_identity_glossary_entries_above_advisory",
+            policy_key=CANONICAL_CONTEXT_POLICY_KEY,
+            field="visual_identity_glossary_advisory_entries",
+            actual=len(glossary),
+            advisory=context_policy["visual_identity_glossary_advisory_entries"],
+        ))
+
+    unique_targets = list({
+        target.key: target for target in model_context_targets
+    }.values())
+    descriptions = [len(target.description) for target in unique_targets]
+    description_advisory = context_policy["description_advisory_characters"]
+    add(_capacity_advisory(
+        code="description_characters_above_advisory",
+        policy_key=CANONICAL_CONTEXT_POLICY_KEY,
+        field="description_advisory_characters",
+        actual=max(descriptions, default=0),
+        advisory=description_advisory,
+        affected_items=sum(value > description_advisory for value in descriptions),
+    ))
+
+    visual_identities = [
+        len(target.visual_identity) for target in unique_targets
+    ]
+    visual_advisory = context_policy["visual_identity_advisory_characters"]
+    add(_capacity_advisory(
+        code="visual_identity_characters_above_advisory",
+        policy_key=CANONICAL_CONTEXT_POLICY_KEY,
+        field="visual_identity_advisory_characters",
+        actual=max(visual_identities, default=0),
+        advisory=visual_advisory,
+        affected_items=sum(value > visual_advisory for value in visual_identities),
+    ))
+
+    glossary_term_lengths = [
+        max(len(str(source)), len(str(value)))
+        for source, value in glossary.items()
+    ] if model_context_targets else []
+    glossary_term_advisory = context_policy["glossary_term_advisory_characters"]
+    add(_capacity_advisory(
+        code="glossary_term_characters_above_advisory",
+        policy_key=CANONICAL_CONTEXT_POLICY_KEY,
+        field="glossary_term_advisory_characters",
+        actual=max(glossary_term_lengths, default=0),
+        advisory=glossary_term_advisory,
+        affected_items=sum(
+            value > glossary_term_advisory for value in glossary_term_lengths
+        ),
+    ))
+    return advisories
+
+
+def _attach_canonical_policy_audit(
+    result: TranslationResult | PromptTranslationError,
+    *,
+    name_policy: dict[str, int],
+    context_policy: dict[str, int],
+    policy_resolution_sha256: str,
+    advisories: list[dict],
+) -> TranslationResult | PromptTranslationError:
+    metadata = {
+        **(getattr(result, "metadata", {}) or {}),
+        "canonical_name_policy": {"schema_version": 1, **name_policy},
+        "canonical_context_policy": {"schema_version": 1, **context_policy},
+        "canonical_policy_resolution_sha256": policy_resolution_sha256,
+        "canonical_context_advisories": list(advisories),
+    }
+    if isinstance(result, TranslationResult):
+        return TranslationResult(
+            text=result.text,
+            provider=result.provider,
+            model=result.model,
+            metadata=metadata,
+        )
+    result.metadata = metadata
+    return result
+
+
+def validate_canonical_english(value: str, *, policy: dict[str, int] | None = None) -> str:
     """Fail closed on prose, mixed language and internal technical identifiers."""
     candidate = " ".join(str(value or "").strip().split())
     if not candidate:
         raise TranslationValidationError("canonical English 不能为空")
-    if len(candidate) > 80 or len(candidate.split()) > 8:
-        raise TranslationValidationError("canonical English 必须是 1 至 8 个词的短专名")
+    policy = policy or canonical_name_policy()
+    max_characters = int(policy["max_characters"])
+    max_words = int(policy["max_words"])
+    if len(candidate) > max_characters or len(candidate.split()) > max_words:
+        raise TranslationValidationError(
+            f"canonical English 必须是 1 至 {max_words} 个词且不超过 {max_characters} 个字符的短专名"
+        )
     if _CJK_RE.search(candidate) or "\n" in str(value) or "\r" in str(value):
         raise TranslationValidationError("canonical English 必须是单行纯英文专名")
     if not _CANONICAL_ENGLISH_RE.fullmatch(candidate):
@@ -625,15 +786,20 @@ def ensure_canonical_glossary(
         project, selectors, include_all_missing=include_all_missing,
         ensure_visual_identity_translation=ensure_visual_identity_translation,
     )
+    policy_resolution = resolve_configuration(
+        project=project,
+        required_keys=(CANONICAL_NAME_POLICY_KEY, CANONICAL_CONTEXT_POLICY_KEY),
+    )
+    name_policy = canonical_name_policy(values=policy_resolution.values)
+    context_policy = canonical_context_policy(values=policy_resolution.values)
+    security_entity_limit = canonical_glossary_max_entities()
+    if len(targets) > security_entity_limit:
+        raise CanonicalGlossaryCapacityError(
+            f"本次 Bible 实体数超过安全边界 {security_entity_limit}；请分批补全"
+        )
     # Refuse to spend one local-model load while the current authoritative
     # identity map is already ambiguous.
     ensure_no_canonical_target_collisions(project)
-    entity_limit = 50 if ensure_visual_identity_translation else 100
-    if len(targets) > entity_limit:
-        suffix = "（含视觉锚点英文候选）" if ensure_visual_identity_translation else ""
-        raise CanonicalGlossaryCapacityError(
-            f"单次最多处理 {entity_limit} 个 Bible 实体{suffix}；请分批补全"
-        )
     initial_glossary = _glossary(project)
     names_to_translate: list[str] = []
     target_by_name: dict[str, CanonicalTarget] = {}
@@ -692,10 +858,29 @@ def ensure_canonical_glossary(
             )
 
     runtime_item_count = len(names_to_translate) + len(visual_runtime_items)
-    if runtime_item_count > 100:
+    security_runtime_limit = canonical_glossary_max_runtime_items()
+    if runtime_item_count > security_runtime_limit:
         raise CanonicalGlossaryCapacityError(
-            "本次需要生成的英文名称与视觉锚点候选超过 100 项；请分批补全"
+            "本次需要生成的英文名称与视觉锚点候选超过 canonical glossary "
+            f"安全边界 {security_runtime_limit}；请分批补全"
         )
+
+    translation_targets = [target_by_name[name] for name in names_to_translate]
+    model_context_targets = [
+        *translation_targets,
+        *(item.target for item in visual_runtime_items),
+    ]
+    advisories = _canonical_context_advisories(
+        request_targets=targets,
+        model_context_targets=model_context_targets,
+        glossary=initial_glossary,
+        runtime_item_count=runtime_item_count,
+        proper_name_context_count=len(translation_targets),
+        visual_context_count=len(visual_runtime_items),
+        ensure_visual_identity_translation=ensure_visual_identity_translation,
+        name_policy=name_policy,
+        context_policy=context_policy,
+    )
 
     results_by_name: dict[str, TranslationResult | PromptTranslationError] = {}
     visual_results: dict[
@@ -707,9 +892,12 @@ def ensure_canonical_glossary(
         "model_deployment_id": None,
         "provider": "",
         "data_egress": False,
+        "canonical_name_policy": {"schema_version": 1, **name_policy},
+        "canonical_context_policy": {"schema_version": 1, **context_policy},
+        "canonical_policy_resolution_sha256": policy_resolution.sha256,
+        "canonical_context_advisories": advisories,
     }
     if names_to_translate or visual_runtime_items:
-        translation_targets = [target_by_name[name] for name in names_to_translate]
         texts = [*names_to_translate, *(
             item.inference_source for item in visual_runtime_items
         )]
@@ -758,6 +946,16 @@ def ensure_canonical_glossary(
             translated = [error for _ in texts]
         except PromptTranslationError as error:
             translated = [error for _ in texts]
+        translated = [
+            _attach_canonical_policy_audit(
+                result,
+                name_policy=name_policy,
+                context_policy=context_policy,
+                policy_resolution_sha256=policy_resolution.sha256,
+                advisories=advisories,
+            )
+            for result in translated
+        ]
         for result in translated:
             metadata = getattr(result, "metadata", {}) or {}
             if metadata.get("model_deployment_id"):

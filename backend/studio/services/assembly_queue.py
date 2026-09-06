@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import timedelta
+import math
 import os
 from pathlib import Path
 import socket
@@ -127,12 +128,17 @@ def _run_ffmpeg(command: list[str], *, heartbeat) -> subprocess.CompletedProcess
     separate worker to distinguish a live long encode from an abandoned claim.
     """
 
-    timeout_seconds = max(1.0, float(resolve_configuration(
-        required_keys=("delivery.assembly_timeout_seconds",),
-    ).values["delivery.assembly_timeout_seconds"]))
-    heartbeat_seconds = max(
-        0.25, float(getattr(settings, "ASSEMBLY_HEARTBEAT_SECONDS", 5)),
-    )
+    runtime = resolve_configuration(required_keys=(
+        "delivery.assembly_timeout_seconds",
+        "runtime.task_heartbeat_seconds",
+    )).values
+    timeout_seconds = float(runtime["delivery.assembly_timeout_seconds"])
+    heartbeat_seconds = float(runtime["runtime.task_heartbeat_seconds"])
+    if any(
+        not math.isfinite(value) or value <= 0
+        for value in (timeout_seconds, heartbeat_seconds)
+    ):
+        raise AssemblyError("组装超时与心跳配置必须是正有限秒数")
     process = subprocess.Popen(
         command,
         stdout=subprocess.PIPE,
@@ -294,16 +300,16 @@ def recover_stale_assemblies(
     """
 
     now = timezone.now()
-    threshold = now - timedelta(minutes=max(0.0, float(stale_minutes)))
+    stale_minutes = float(stale_minutes)
+    if not math.isfinite(stale_minutes) or stale_minutes < 0:
+        raise AssemblyError("组装陈旧任务回收阈值必须是非负有限分钟数")
+    threshold = now - timedelta(minutes=stale_minutes)
     counts = {"succeeded": 0, "requeued": 0, "failed": 0}
     completed: list[AssemblyJob] = []
     stale_temporary_paths: list[Path] = []
     stale_jobs = (
         AssemblyJob.objects.filter(dry_run=False)
-        .filter(
-            Q(status=AssemblyJob.Status.RUNNING)
-            | Q(status=AssemblyJob.Status.PLANNED)
-        )
+        .filter(status=AssemblyJob.Status.RUNNING)
         .filter(
             Q(heartbeat_at__lte=threshold)
             | Q(heartbeat_at__isnull=True, updated_at__lte=threshold)
@@ -343,34 +349,6 @@ def recover_stale_assemblies(
                 completed.append(job)
                 counts["succeeded"] += 1
                 schedule_assembly_job_run_advance(job.pk)
-            elif job.status == AssemblyJob.Status.PLANNED:
-                # Legacy synchronous versions could be interrupted after the
-                # command was persisted but before status changed to RUNNING.
-                # A complete plan is safe to adopt into the durable queue;
-                # an incomplete one cannot be reconstructed from the row.
-                if job.output_path and job.ffmpeg_command:
-                    job.status = AssemblyJob.Status.QUEUED
-                    job.queued_at = now
-                    job.worker_id = ""
-                    job.claim_token = None
-                    job.heartbeat_at = None
-                    job.finished_at = None
-                    job.error_message = f"{reason}; legacy prepared job was queued"[-4000:]
-                    job.save(update_fields=(
-                        "status", "queued_at", "worker_id", "claim_token", "heartbeat_at",
-                        "finished_at", "error_message", "updated_at",
-                    ))
-                    counts["requeued"] += 1
-                else:
-                    job.status = AssemblyJob.Status.FAILED
-                    job.finished_at = now
-                    job.heartbeat_at = now
-                    job.error_message = f"{reason}; legacy job has no executable command"[-4000:]
-                    job.save(update_fields=(
-                        "status", "finished_at", "heartbeat_at", "error_message", "updated_at",
-                    ))
-                    counts["failed"] += 1
-                    schedule_assembly_job_run_advance(job.pk)
             elif job.attempts < job.max_attempts:
                 job.status = AssemblyJob.Status.QUEUED
                 job.queued_at = now

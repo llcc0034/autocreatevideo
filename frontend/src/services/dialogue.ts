@@ -12,10 +12,6 @@ export interface DialogueLinePayload {
   end_ms?: number
 }
 
-const MAX_DIALOGUE_LINES = 64
-const MAX_SPEAKER_ID_LENGTH = 16
-const MAX_TEXT_LENGTH = 2_000
-const MAX_DELIVERY_LENGTH = 500
 const SPEAKER_ID_RE = /^S[1-9]\d*$/
 const VOICEOVER_TOKEN_RE = /(^|[^A-Za-z0-9_])voiceover(?=$|[^A-Za-z0-9_])/i
 const TIMING_PREFIX_RE = /^\s*[【[]\s*(-?(?:\d+:\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:ms|毫秒|s|秒)?)\s*(?:-|–|—|~|～|至|到)\s*(-?(?:\d+:\d{1,2}(?:\.\d+)?|\d+(?:\.\d+)?)\s*(?:ms|毫秒|s|秒)?)\s*[】\]]\s*/i
@@ -58,7 +54,6 @@ export const parseDialogueText = (
 ): DialogueLinePayload[] | undefined => {
   if (!value.trim()) return []
   const lines = value.split(/\r?\n/).map((item) => item.trim()).filter(Boolean)
-  if (lines.length > MAX_DIALOGUE_LINES) return undefined
   const result: DialogueLinePayload[] = []
   for (const line of lines) {
     const timing = line.match(TIMING_PREFIX_RE)
@@ -68,17 +63,16 @@ export const parseDialogueText = (
       return undefined
     }
     const body = timing ? line.slice(timing[0].length) : line
-    const match = body.match(/^([^：:（）()\n]{1,160}?)(?:\s*[（(]([^）)\n]{1,500})[）)])?\s*[：:]\s*(.+)$/)
+    const match = body.match(/^([^：:（）()\n]+?)(?:\s*[（(]([^）)\n]+)[）)])?\s*[：:]\s*(.+)$/)
     if (!match) return undefined
     const label = match[1].trim()
     const character = characters.find((item) => item.stableSpeakerId === label || item.name === label)
     const speakerId = SPEAKER_ID_RE.test(label) ? label : character?.stableSpeakerId
     const text = match[3].trim()
-    if (!speakerId || speakerId.length > MAX_SPEAKER_ID_LENGTH || !text || text.length > MAX_TEXT_LENGTH) {
+    if (!speakerId || !text) {
       return undefined
     }
     const annotation = parseDeliveryAnnotation((match[2] || '').trim())
-    if (annotation.delivery && annotation.delivery.length > MAX_DELIVERY_LENGTH) return undefined
     result.push({
       speaker_id: speakerId,
       text,

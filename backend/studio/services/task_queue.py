@@ -20,6 +20,7 @@ from django.utils.dateparse import parse_datetime
 
 from studio.models import (
     Asset,
+    AssetGenerationJob,
     GenerationTask,
     HostCapabilitySnapshot,
     ModelDeployment,
@@ -27,18 +28,35 @@ from studio.models import (
     WorkflowSmokeAttempt,
     WorkerLease,
 )
-from studio.services.comfyui import ComfyUIClient, ComfyUIError, ComfyUIExecutionError
+from studio.services.comfyui import (
+    ComfyUIClient,
+    ComfyUIError,
+    ComfyUIExecutionError,
+    ComfyUIHTTPError,
+    ComfyUIPreSubmitResourceReleaseError,
+)
 from studio.services.comfyui_contract import (
     ComfyUIContractError,
     ComfyUIContractUnavailable,
     preflight_comfyui_workflow,
 )
 from studio.services.reference_media import (
-    H3_REFERENCE_FPS,
     ReferenceMediaNormalizationError,
+    inspect_passthrough_reference_video,
     inspect_reference_video,
     normalize_paired_audio,
     normalize_reference_video,
+    passthrough_reference_audio_metadata,
+    passthrough_reference_video_metadata,
+)
+from studio.services.reference_bindings import (
+    ReferenceBindingError,
+    authorized_asset_source,
+)
+from studio.services.media_processing_profiles import (
+    REFERENCE_PROFILE_KEY,
+    MediaProcessingProfileError,
+    verify_media_processing_profile,
 )
 from studio.services.provenance import ProvenanceError, persist_task_provenance, sha256_file
 from studio.services.distribution import prepare_all_task_distributions
@@ -50,40 +68,103 @@ from studio.services.json_contracts import canonical_json_bytes, json_contract
 from studio.services.provider_registry import credential_binding_sha256, validate_endpoint
 from studio.services.runtime_platform import verify_host_snapshot
 from studio.services.configuration import resolve_configuration
+from studio.services.security_boundaries import boundary_int, boundary_number, boundary_values
 from studio.services.execution_deadlines import (
     expired_kind,
     initial_deadlines,
     meaningful_deadline_updates,
 )
+from studio.services.execution_monitoring import (
+    idle_timeout_for_node,
+    verify_frozen_execution_monitoring_contract,
+)
 from studio.services.production_run_auto_advance import schedule_generation_task_run_advance
 from studio.services.workflow import WorkflowBuildError, validate_comfy_graph
+from studio.services.workflow_smoke_resolution import (
+    unresolved_workflow_smoke_attempts,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-def _execution_capacity(task: GenerationTask) -> dict:
-    """Return the verified frozen pool policy for a platform task.
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
-    Historical non-ProductionRun tasks remain governed only by the current
-    deployment ceiling. New platform tasks must carry an integrity-protected
-    snapshot; a missing or altered snapshot is never treated as a default.
-    """
+
+def _workflow_graph_max_bytes() -> int:
+    return boundary_int("security.workflow.max_graph_bytes")
+
+
+def _validated_comfy_timeout(value) -> float:
+    timeout_ceiling = boundary_number(
+        "security.runtime.max_timeout_seconds",
+        minimum=0.001,
+    )
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not 0 < float(value) <= timeout_ceiling
+    ):
+        raise ComfyUIError("任务缺少冻结的有效 ComfyUI timeout")
+    return float(value)
+
+
+def _inspect_cfr_video_adapter(path: Path, contract: dict, media_profile: dict):
+    limits = boundary_values(
+        "security.media.max_fps",
+        "security.media.max_duration_ms",
+    )
+    maximum_fps = limits["security.media.max_fps"]
+    maximum_duration_ms = limits["security.media.max_duration_ms"]
+    target_fps = contract.get("target_fps")
+    if (
+        isinstance(target_fps, bool)
+        or not isinstance(target_fps, int)
+        or type(maximum_fps) is not int
+        or not 1 <= target_fps <= maximum_fps
+    ):
+        raise ReferenceMediaNormalizationError(
+            "cfr_video_v1 必须在冻结合同中声明 target_fps"
+        )
+    return inspect_reference_video(
+        path,
+        target_fps=target_fps,
+        minimum_duration_ms=contract["minimum_duration_ms"],
+        maximum_duration_ms=contract["maximum_duration_ms"],
+        security_max_fps=maximum_fps,
+        security_max_duration_ms=maximum_duration_ms,
+        media_profile=media_profile,
+    )
+
+
+def _inspect_passthrough_video_adapter(path: Path, contract: dict, media_profile: dict):
+    if contract.get("target_fps") is not None:
+        raise ReferenceMediaNormalizationError(
+            "passthrough_video_v1 的 target_fps 必须为 null"
+        )
+    return inspect_passthrough_reference_video(
+        path,
+        minimum_duration_ms=contract["minimum_duration_ms"],
+        maximum_duration_ms=contract["maximum_duration_ms"],
+        requires_source_fps=bool(contract.get("requires_source_fps")),
+        security_max_duration_ms=boundary_int("security.media.max_duration_ms"),
+        media_profile=media_profile,
+    )
+
+
+_REFERENCE_VIDEO_INSPECTORS = {
+    "cfr_video_v1": _inspect_cfr_video_adapter,
+    "passthrough_video_v1": _inspect_passthrough_video_adapter,
+}
+_PAIRED_AUDIO_ADAPTERS = frozenset({"aligned_audio_v1"})
+_REFERENCE_AUDIO_ADAPTERS = frozenset({"passthrough_audio_v1"})
+
+
+def _execution_capacity(task: GenerationTask) -> dict:
+    """Return the integrity-protected capacity frozen by the production route."""
 
     snapshot = task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
-    has_platform_relation = task.platform_attempts.exists()
-    has_platform_marker = bool(str(snapshot.get("production_run_id") or "").strip())
-    if not has_platform_relation and not has_platform_marker:
-        runtime = resolve_configuration(required_keys=(
-            "production.task_timeout_seconds",
-            "runtime.task_idle_timeout_seconds",
-        )).values
-        return {
-            "legacy": True,
-            "effective_concurrency": int(settings.TASK_MAX_CONCURRENT),
-            "effective_task_timeout_seconds": float(runtime["production.task_timeout_seconds"]),
-            "task_idle_timeout_seconds": float(runtime["runtime.task_idle_timeout_seconds"]),
-        }
     capacity = snapshot.get("execution_capacity")
     digest = str(snapshot.get("execution_capacity_sha256") or "")
     try:
@@ -217,16 +298,97 @@ def task_wait_timeout(task: GenerationTask, requested_timeout: float | None = No
     return max(0.0, (task.hard_deadline_at - timezone.now()).total_seconds())
 
 
-def _task_idle_seconds(task: GenerationTask) -> float:
-    return float(_execution_capacity(task)["task_idle_timeout_seconds"])
+def _task_execution_monitoring(task: GenerationTask) -> dict:
+    """Verify the same immutable monitoring contract at workflow and task layers."""
+
+    snapshot = (
+        task.capability_snapshot
+        if isinstance(task.capability_snapshot, dict)
+        else {}
+    )
+    contract = snapshot.get("execution_monitoring")
+    digest = snapshot.get("execution_monitoring_sha256")
+    if contract is None or not digest:
+        raise ComfyUIError("GenerationTask 缺少冻结 execution monitoring 合同/hash")
+    try:
+        task_contract = verify_frozen_execution_monitoring_contract(
+            contract,
+            sha256=digest,
+        )
+    except ValidationError as exc:
+        raise ComfyUIError("任务冻结 execution monitoring 合同校验失败") from exc
+    injected = (
+        task.generated_workflow.injected_values
+        if isinstance(task.generated_workflow.injected_values, dict)
+        else {}
+    )
+    execution_metadata = injected.get("execution_metadata")
+    try:
+        metadata_sha256 = (
+            json_contract(
+                execution_metadata,
+                max_bytes=_stage_snapshot_max_bytes(),
+            ).sha256
+            if isinstance(execution_metadata, dict)
+            else ""
+        )
+    except (TypeError, ValueError, ValidationError):
+        metadata_sha256 = ""
+    if (
+        not isinstance(execution_metadata, dict)
+        or metadata_sha256 != injected.get("execution_metadata_sha256")
+    ):
+        raise ComfyUIError("GeneratedWorkflow 缺少完整冻结执行元数据")
+    workflow_contract = execution_metadata.get("execution_monitoring")
+    workflow_digest = execution_metadata.get("execution_monitoring_sha256")
+    if workflow_contract is None or not workflow_digest:
+        raise ComfyUIError("GeneratedWorkflow 缺少冻结 execution monitoring 合同/hash")
+    try:
+        verified_workflow_contract = verify_frozen_execution_monitoring_contract(
+            workflow_contract,
+            sha256=workflow_digest,
+        )
+    except ValidationError as exc:
+        raise ComfyUIError(
+            "GeneratedWorkflow 冻结 execution monitoring 合同校验失败"
+        ) from exc
+    if (
+        str(digest) != str(workflow_digest)
+        or task_contract != verified_workflow_contract
+    ):
+        raise ComfyUIError("GenerationTask/GeneratedWorkflow execution monitoring 合同漂移")
+    return task_contract
 
 
-def _mark_task_meaningful_progress(task: GenerationTask, marker: str, *, now=None) -> bool:
+def _task_node_type(task: GenerationTask, node_id: str) -> str:
+    graph = getattr(task.generated_workflow, "workflow_json", None)
+    node = graph.get(str(node_id)) if isinstance(graph, dict) else None
+    return str(node.get("class_type") or "").strip() if isinstance(node, dict) else ""
+
+
+def _task_idle_seconds(task: GenerationTask, *, node_id: str = "") -> float:
+    contract = _task_execution_monitoring(task)
+    frozen_runtime_idle = float(_execution_capacity(task)["task_idle_timeout_seconds"])
+    return idle_timeout_for_node(
+        contract,
+        node_id=node_id,
+        node_type=_task_node_type(task, node_id) if node_id else "",
+        frozen_runtime_idle_timeout_seconds=frozen_runtime_idle,
+    )
+
+
+def _mark_task_meaningful_progress(
+    task: GenerationTask,
+    marker: str,
+    *,
+    now=None,
+    node_id: str = "",
+) -> bool:
     observed = now or timezone.now()
     updates = meaningful_deadline_updates(
         task,
         marker=marker,
-        idle_seconds=_task_idle_seconds(task),
+        idle_seconds=_task_idle_seconds(task, node_id=node_id),
         now=observed,
     )
     if not updates:
@@ -242,9 +404,13 @@ def _ensure_task_deadlines(task: GenerationTask) -> GenerationTask:
         return task
     capacity = _execution_capacity(task)
     observed = timezone.now()
+    hard_seconds = float(capacity["effective_task_timeout_seconds"])
     deadlines = initial_deadlines(
-        idle_seconds=capacity["task_idle_timeout_seconds"],
-        hard_seconds=capacity["effective_task_timeout_seconds"],
+        # A monitoring window is an upper bound on silence, never authority to
+        # enlarge the immutable task hard limit.  Initial creation mirrors the
+        # already-capped node-transition renewal path.
+        idle_seconds=min(_task_idle_seconds(task), hard_seconds),
+        hard_seconds=hard_seconds,
         now=observed,
         marker="phase:claimed",
     )
@@ -262,16 +428,14 @@ def _ensure_task_deadlines(task: GenerationTask) -> GenerationTask:
 
 def comfy_client_for_task(
     task: GenerationTask,
-    *,
-    fallback: ComfyUIClient | None = None,
 ) -> ComfyUIClient:
-    """Resolve a task's immutable platform deployment, or use the legacy client."""
+    """Resolve the immutable deployment frozen by the versioned production route."""
 
     raw_snapshot = getattr(task, "capability_snapshot", {})
     snapshot = raw_snapshot if isinstance(raw_snapshot, dict) else {}
     deployment_id = str(snapshot.get("model_deployment_id") or "").strip()
     if not deployment_id:
-        return fallback or ComfyUIClient()
+        raise ComfyUIError("任务缺少冻结 ModelDeployment；未版本化任务不能执行")
     deployment = ModelDeployment.objects.select_related(
         "profile_version__provider",
     ).filter(
@@ -315,9 +479,8 @@ def comfy_client_for_task(
                 "任务缺少冻结 deployment 摘要或配置已漂移；为防止未授权外发，已停止提交"
             )
         timeout = snapshot.get("effective_timeout_seconds")
-        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0.5 <= float(timeout) <= 3600:
-            raise ComfyUIError("任务缺少冻结的有效 ComfyUI timeout")
-        configured_timeout = float(config.get("timeout_seconds", 60))
+        timeout = _validated_comfy_timeout(timeout)
+        configured_timeout = float(config["timeout_seconds"])
         if float(timeout) != configured_timeout:
             raise ComfyUIError("任务冻结 timeout 与执行配置不一致")
     except Exception as exc:
@@ -326,7 +489,69 @@ def comfy_client_for_task(
         base_url=endpoint,
         timeout=timeout,
         endpoint_prevalidated=True,
+        pre_submit_resource_release_policy=config.get(
+            "pre_submit_resource_release",
+        ),
     )
+
+
+def _persist_pre_submit_resource_release_audit(
+    task: GenerationTask,
+    audit: dict,
+) -> None:
+    """Append one bounded, checksum-bound pre-submit release observation."""
+
+    snapshot = (
+        dict(task.capability_snapshot)
+        if isinstance(task.capability_snapshot, dict)
+        else {}
+    )
+    previous = snapshot.get("comfyui_pre_submit_resource_release_attempts")
+    attempts = list(previous) if isinstance(previous, list) else []
+    row = {
+        **dict(audit or {}),
+        "generation_task_id": str(task.id),
+        "model_deployment_id": str(snapshot.get("model_deployment_id") or ""),
+        "submission_token_persisted": bool(
+            task.submission_token or task.comfy_prompt_id
+        ),
+    }
+    row["audit_sha256"] = json_contract(
+        row,
+        max_bytes=_stage_snapshot_max_bytes(),
+    ).sha256
+    # A task has a finite max_attempts contract. Refuse corrupted/unbounded
+    # history rather than silently dropping an earlier audit fact.
+    if (
+        isinstance(task.max_attempts, bool)
+        or not isinstance(task.max_attempts, int)
+        or task.max_attempts < 1
+    ):
+        raise ComfyUIError("任务冻结 max_attempts 无效")
+    if len(attempts) >= task.max_attempts:
+        raise ComfyUIError("提交前资源释放审计次数超过任务冻结尝试上限")
+    attempts.append(row)
+    task.capability_snapshot = {
+        **snapshot,
+        "comfyui_pre_submit_resource_release_attempts": attempts,
+    }
+    task.save(update_fields=("capability_snapshot", "updated_at"))
+
+
+def _release_resources_for_new_submission(
+    task: GenerationTask,
+    client: ComfyUIClient,
+) -> None:
+    release = getattr(client, "release_resources_before_submit", None)
+    if not callable(release):
+        return
+    try:
+        audit = release()
+    except ComfyUIPreSubmitResourceReleaseError as exc:
+        _persist_pre_submit_resource_release_audit(task, exc.audit)
+        raise
+    if audit is not None:
+        _persist_pre_submit_resource_release_audit(task, audit)
 
 
 def claim_next_task() -> GenerationTask | None:
@@ -336,6 +561,21 @@ def claim_next_task() -> GenerationTask | None:
         # A single durable mutex row serializes count + claim across every
         # PostgreSQL worker, so TASK_MAX_CONCURRENT=1 cannot be raced.
         WorkerLease.objects.select_for_update().get(key="generation-claim")
+        if unresolved_workflow_smoke_attempts().exists():
+            return None
+        if AssetGenerationJob.objects.filter(
+            execution_kind=AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW,
+        ).filter(
+            Q(status__in=(
+                AssetGenerationJob.Status.SUBMITTING,
+                AssetGenerationJob.Status.SUBMITTED,
+                AssetGenerationJob.Status.RUNNING,
+                AssetGenerationJob.Status.CANCEL_REQUESTED,
+                AssetGenerationJob.Status.UNCERTAIN,
+            ))
+            | Q(status=AssetGenerationJob.Status.QUEUED, claim_token__isnull=False),
+        ).exists():
+            return None
         if WorkflowSmokeAttempt.objects.filter(
             status__in=(
                 WorkflowSmokeAttempt.Status.QUEUED,
@@ -406,7 +646,10 @@ def claim_next_task() -> GenerationTask | None:
                 .only("id", "capability_snapshot", "created_at")
             )
             running_count = len(running_tasks)
-            hard_ceiling = int(settings.TASK_MAX_CONCURRENT)
+            hard_ceiling = min(
+                int(settings.TASK_MAX_CONCURRENT),
+                boundary_int("security.production.max_concurrency"),
+            )
             if running_count >= hard_ceiling:
                 return None
             running_limits = [hard_ceiling]
@@ -431,6 +674,10 @@ def claim_next_task() -> GenerationTask | None:
             )
             for queued in candidates:
                 try:
+                    # Validate the frozen monitoring layer before selecting a
+                    # task. Corrupt modern snapshots are terminal pre-submit
+                    # failures; historical absence is classified explicitly.
+                    _task_execution_monitoring(queued)
                     candidate_limit = min(
                         hard_ceiling,
                         active_pool_limit,
@@ -459,9 +706,10 @@ def claim_next_task() -> GenerationTask | None:
         capacity = _execution_capacity(candidate)
         deadline_updates = {}
         if candidate.deadline_started_at is None:
+            hard_seconds = float(capacity["effective_task_timeout_seconds"])
             deadlines = initial_deadlines(
-                idle_seconds=capacity["task_idle_timeout_seconds"],
-                hard_seconds=capacity["effective_task_timeout_seconds"],
+                idle_seconds=min(_task_idle_seconds(candidate), hard_seconds),
+                hard_seconds=hard_seconds,
                 now=claim_time,
                 marker="phase:claimed",
             )
@@ -556,6 +804,10 @@ def _collect_staged_tokens(value) -> set[str]:
 
 class SubmissionUncertain(ComfyUIError):
     """Remote acceptance cannot be proven; never auto-submit a second time."""
+
+
+class SubmissionRejected(ComfyUIError):
+    """ComfyUI returned an HTTP response proving the prompt was rejected."""
 
 
 class RemoteExecutionStalled(ComfyUIExecutionError):
@@ -663,27 +915,21 @@ def _wait_for_task_completion(
     client: ComfyUIClient,
     prompt_id: str,
     *,
-    timeout: float | None = None,
     progress_socket=None,
 ) -> dict:
     """Poll ComfyUI while persisting heartbeats and honoring durable cancellation.
 
-    Production clients expose ``history``/``is_queued``/``health``.  The small
-    compatibility fallback keeps third-party test clients working while the
-    durable path is used for every real ComfyUI submission.
+    Every production client must expose the durable history/queue contract.
+    Missing methods are a programming/configuration error, not authority to
+    enter a second polling path with different defaults.
     """
     history_method = getattr(client, "history", None)
     queued_method = getattr(client, "is_queued", None)
     if not callable(history_method) or not callable(queued_method):
-        _record_runtime_state(task, GenerationTask.RemoteState.RUNNING, remote_error="")
-        task.refresh_from_db(fields=("hard_deadline_at", "idle_deadline_at"))
-        now = timezone.now()
-        limits = [
-            (value - now).total_seconds()
-            for value in (task.hard_deadline_at, task.idle_deadline_at)
-            if value is not None
-        ]
-        return client.wait_for_completion(prompt_id, timeout=max(0.0, min(limits)))
+        raise ComfyUIError("ComfyUI client 缺少 durable history/is_queued 合同")
+    event_reader = getattr(client, "read_progress_event", None)
+    if progress_socket is not None and not callable(event_reader):
+        raise ComfyUIError("ComfyUI client 缺少 read_progress_event 进度合同")
 
     runtime = resolve_configuration(required_keys=(
         "runtime.task_remote_poll_seconds",
@@ -693,12 +939,12 @@ def _wait_for_task_completion(
         "runtime.task_remote_missing_grace_seconds",
         "runtime.task_cancel_grace_seconds",
     )).values
-    poll_seconds = max(0.05, float(runtime["runtime.task_remote_poll_seconds"]))
-    heartbeat_seconds = max(0.05, float(runtime["runtime.task_heartbeat_seconds"]))
-    health_interval = max(0.0, float(runtime["runtime.task_health_check_interval_seconds"]))
-    health_failure_limit = max(1, int(runtime["runtime.task_health_failure_limit"]))
-    missing_grace = max(0.0, float(runtime["runtime.task_remote_missing_grace_seconds"]))
-    cancel_grace = max(0.0, float(runtime["runtime.task_cancel_grace_seconds"]))
+    poll_seconds = float(runtime["runtime.task_remote_poll_seconds"])
+    heartbeat_seconds = float(runtime["runtime.task_heartbeat_seconds"])
+    health_interval = float(runtime["runtime.task_health_check_interval_seconds"])
+    health_failure_limit = int(runtime["runtime.task_health_failure_limit"])
+    missing_grace = float(runtime["runtime.task_remote_missing_grace_seconds"])
+    cancel_grace = float(runtime["runtime.task_cancel_grace_seconds"])
     next_heartbeat = 0.0
     next_health_check = 0.0
     consecutive_health_failures = 0
@@ -711,86 +957,68 @@ def _wait_for_task_completion(
         nonlocal progress_socket
         if progress_socket is None:
             return
-        event_reader = getattr(client, "read_progress_event", None)
-        observation = None
-        if callable(event_reader):
-            try:
-                observation = event_reader(
-                    progress_socket, prompt_id, timeout=min(0.05, poll_seconds),
-                )
-            except Exception as exc:
-                _record_progress_telemetry(
+        try:
+            observation = event_reader(
+                progress_socket, prompt_id, timeout=min(0.05, poll_seconds),
+            )
+        except Exception as exc:
+            _record_progress_telemetry(
+                task,
+                GenerationTask.ProgressTelemetryState.UNAVAILABLE,
+                error=f"ComfyUI progress WebSocket read failed: {exc}",
+            )
+            _close_task_progress_socket(progress_socket)
+            progress_socket = None
+            return
+        if observation is None:
+            return
+        telemetry_state = str(getattr(observation, "telemetry_state", "connected") or "connected")
+        telemetry_error = str(getattr(observation, "error", "") or "")
+        event_type = str(getattr(observation, "event_type", "") or "")
+        node_id = str(getattr(observation, "node_id", "") or "")
+        fraction = getattr(observation, "fraction", None)
+        observed_at = timezone.now()
+        if telemetry_state == GenerationTask.ProgressTelemetryState.UNAVAILABLE:
+            _record_progress_telemetry(
+                task,
+                GenerationTask.ProgressTelemetryState.UNAVAILABLE,
+                error=telemetry_error or "ComfyUI progress WebSocket became unavailable",
+                node_id=node_id or None,
+            )
+            _close_task_progress_socket(progress_socket)
+            progress_socket = None
+            return
+        if fraction is None:
+            invalidates_quantitative_progress = event_type in {
+                "executing", "progress", "progress_state",
+            }
+            meaningful = bool(node_id and node_id != task.progress_node_id)
+            _record_progress_telemetry(
+                task,
+                GenerationTask.ProgressTelemetryState.CONNECTED,
+                source=(
+                    GenerationTask.ProgressSource.NONE
+                    if invalidates_quantitative_progress else None
+                ),
+                clear_comfy_progress=invalidates_quantitative_progress,
+                node_id=node_id or None,
+                observed_at=observed_at if meaningful else None,
+            )
+            if meaningful:
+                _mark_task_meaningful_progress(
                     task,
-                    GenerationTask.ProgressTelemetryState.UNAVAILABLE,
-                    error=f"ComfyUI progress WebSocket read failed: {exc}",
+                    f"node:{node_id}",
+                    now=observed_at,
+                    node_id=node_id,
                 )
-                _close_task_progress_socket(progress_socket)
-                progress_socket = None
-                return
-            if observation is None:
-                return
-            telemetry_state = str(getattr(observation, "telemetry_state", "connected") or "connected")
-            telemetry_error = str(getattr(observation, "error", "") or "")
-            event_type = str(getattr(observation, "event_type", "") or "")
-            node_id = str(getattr(observation, "node_id", "") or "")
-            fraction = getattr(observation, "fraction", None)
-            observed_at = timezone.now()
-            if telemetry_state == GenerationTask.ProgressTelemetryState.UNAVAILABLE:
-                _record_progress_telemetry(
-                    task,
-                    GenerationTask.ProgressTelemetryState.UNAVAILABLE,
-                    error=telemetry_error or "ComfyUI progress WebSocket became unavailable",
-                    node_id=node_id or None,
-                )
-                _close_task_progress_socket(progress_socket)
-                progress_socket = None
-                return
-            if fraction is None:
-                invalidates_quantitative_progress = event_type in {
-                    "executing", "progress", "progress_state",
-                }
-                meaningful = bool(node_id and node_id != task.progress_node_id)
-                _record_progress_telemetry(
-                    task,
-                    GenerationTask.ProgressTelemetryState.CONNECTED,
-                    source=(
-                        GenerationTask.ProgressSource.NONE
-                        if invalidates_quantitative_progress else None
-                    ),
-                    clear_comfy_progress=invalidates_quantitative_progress,
-                    node_id=node_id or None,
-                    observed_at=observed_at if meaningful else None,
-                )
-                if meaningful:
-                    _mark_task_meaningful_progress(task, f"node:{node_id}", now=observed_at)
-                return
-        else:
-            # Compatibility with small third-party/test clients that still
-            # implement the original fraction-only method.
-            reader = getattr(client, "read_progress_socket", None)
-            if not callable(reader):
-                return
-            try:
-                fraction = reader(progress_socket, prompt_id, timeout=min(0.05, poll_seconds))
-            except Exception as exc:
-                _record_progress_telemetry(
-                    task,
-                    GenerationTask.ProgressTelemetryState.UNAVAILABLE,
-                    error=f"ComfyUI progress WebSocket read failed: {exc}",
-                )
-                _close_task_progress_socket(progress_socket)
-                progress_socket = None
-                return
-            if fraction is None:
-                return
-            node_id = ""
-            observed_at = timezone.now()
+            return
 
         raw_percent = max(0, min(100, int(round(float(fraction) * 100))))
         previous_percent = task.comfy_progress
         previous_node = task.progress_node_id
-        meaningful = (
-            (node_id and node_id != previous_node)
+        node_changed = bool(node_id and node_id != previous_node)
+        telemetry_advanced = (
+            node_changed
             or previous_percent is None
             or raw_percent > previous_percent
         )
@@ -800,13 +1028,17 @@ def _wait_for_task_completion(
             source=GenerationTask.ProgressSource.COMFYUI,
             comfy_progress=raw_percent,
             node_id=node_id or None,
-            observed_at=observed_at if meaningful else None,
+            observed_at=observed_at if telemetry_advanced else None,
         )
-        if meaningful:
+        # Quantitative sampler updates remain visible telemetry, but do not
+        # create an unbounded sliding deadline. A configured node receives its
+        # idle window exactly once when execution enters that node.
+        if node_changed:
             _mark_task_meaningful_progress(
                 task,
-                f"node:{node_id or '-'}:progress:{raw_percent}",
+                f"node:{node_id}",
                 now=observed_at,
+                node_id=node_id,
             )
         # 0-10% covers validation/upload/queue submission; keep 96-99% for
         # decode, mux, provenance and final output verification after sampling.
@@ -832,10 +1064,12 @@ def _wait_for_task_completion(
     while True:
         task.refresh_from_db()
         current = time.monotonic()
+        # Consume a pending node-transition event before deciding that idle
+        # expired. Repeated events for the same node cannot renew the window.
+        sampler_progress()
         deadline_kind = expired_kind(task) or ""
         if deadline_kind:
             break
-        sampler_progress()
 
         if task.status in {
             GenerationTask.Status.CANCEL_REQUESTED,
@@ -1018,58 +1252,148 @@ def _close_task_progress_socket(progress_socket) -> None:
 
 def _authorized_asset_source(task: GenerationTask, asset_id: str) -> tuple[Asset, Path]:
     try:
-        asset = Asset.objects.get(pk=asset_id, is_active=True)
-    except (Asset.DoesNotExist, ValueError) as exc:
-        raise ComfyUIError(f"参考素材不存在或已停用: {asset_id}") from exc
-    if asset.owner_id not in (None, task.owner_id):
-        raise ComfyUIError(f"参考素材不属于当前任务租户: {asset_id}")
+        return authorized_asset_source(owner=task.owner, asset_id=asset_id)
+    except ReferenceBindingError as exc:
+        raise ComfyUIError(f"{exc}: {asset_id}") from exc
 
-    asset_root = Path(settings.ASSET_LIBRARY_ROOT).resolve()
-    media_root = Path(settings.MEDIA_ROOT).resolve()
-    if asset.owner_id is None:
-        if not asset.local_path or asset.file:
-            raise ComfyUIError(f"全局参考素材必须来自只读素材库: {asset_id}")
-        path = Path(asset.local_path).resolve()
-        allowed_root = asset_root
-    elif asset.file:
-        try:
-            path = Path(asset.file.path).resolve()
-        except (NotImplementedError, ValueError, OSError) as exc:
-            raise ComfyUIError(f"用户参考素材不是可读取的本地上传: {asset_id}") from exc
-        allowed_root = (media_root / "assets" / str(task.owner_id)).resolve()
-    elif task.owner.is_staff and asset.local_path:
-        path = Path(asset.local_path).resolve()
-        if path.is_relative_to(asset_root):
-            allowed_root = asset_root
-        else:
-            allowed_root = media_root
-    else:
-        raise ComfyUIError(f"普通用户参考素材必须由上传接口写入租户目录: {asset_id}")
-    try:
-        allowed = path.is_relative_to(allowed_root)
-    except (OSError, ValueError):
-        allowed = False
-    if not allowed:
-        raise ComfyUIError(f"参考素材路径越出租户授权目录: {asset_id}")
-    if not path.is_file():
-        raise ComfyUIError(f"参考素材文件不存在: {asset_id}")
-    recorded_checksum = str(asset.checksum or "").casefold()
-    actual_checksum = sha256_file(path)
-    if (
-        len(recorded_checksum) != 64
-        or any(character not in "0123456789abcdef" for character in recorded_checksum)
-        or actual_checksum != recorded_checksum
-    ):
-        raise ComfyUIError(
-            f"参考素材内容哈希与已确认的素材记录不一致，已在提交 ComfyUI 前阻断: {asset_id}"
+
+def _reference_preprocessing_slot(reference: dict, asset_id: str) -> str | None:
+    category = str(reference.get("category") or "")
+    if category == "video":
+        if str(reference.get("asset_id") or "") == asset_id:
+            return "videos"
+        if str(reference.get("audio_asset_id") or "") == asset_id:
+            return "paired_video_audios"
+    if category == "audio" and str(reference.get("asset_id") or "") == asset_id:
+        return "reference_audios"
+    return None
+
+
+def _requires_reference_preprocessing(
+    snapshot: dict,
+    reference_records: list[dict],
+) -> bool:
+    """Identify a frozen dynamic-reference execution, never a fixed media slot.
+
+    Generic ``asset.video.*`` and ``asset.audio.*`` bindings are uploaded as-is.
+    Dynamic preprocessing is selected by the immutable conditioning contract;
+    the semantic prefix is retained only as a fail-closed corruption signal if
+    those contract fields were removed from an older/incomplete snapshot.
+    """
+
+    if any(
+        snapshot.get(key) not in (None, "", {})
+        for key in (
+            "conditioning_contract",
+            "conditioning_contract_sha256",
+            "conditioning_mode_contract",
+            "conditioning_mode_contract_sha256",
         )
-    return asset, path
+    ):
+        return True
+    return any(
+        isinstance(row, dict)
+        and str(row.get("semantic_key") or "").startswith("asset.reference.")
+        for row in reference_records
+    )
+
+
+def _frozen_reference_preprocessing(task: GenerationTask) -> tuple[dict, str]:
+    """Verify and return the selected mode's immutable preprocessing contract."""
+
+    snapshot = task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
+    conditioning = snapshot.get("conditioning_contract")
+    conditioning_sha256 = str(snapshot.get("conditioning_contract_sha256") or "")
+    selected = snapshot.get("conditioning_mode_contract")
+    selected_sha256 = str(snapshot.get("conditioning_mode_contract_sha256") or "")
+    if (
+        not isinstance(conditioning, dict)
+        or json_contract(
+            conditioning,
+            max_bytes=_stage_snapshot_max_bytes(),
+        ).sha256 != conditioning_sha256
+    ):
+        raise ComfyUIError("任务冻结的 conditioning contract 缺失或 hash 不一致")
+    if not isinstance(selected, dict) or json_contract(
+        selected,
+        max_bytes=_stage_snapshot_max_bytes(),
+    ).sha256 != selected_sha256:
+        raise ComfyUIError("任务冻结的 conditioning mode contract 缺失或 hash 不一致")
+    expected_mode = str(
+        snapshot.get("effective_conditioning_mode")
+        or snapshot.get("conditioning_mode")
+        or ""
+    )
+    if selected.get("key") != expected_mode:
+        raise ComfyUIError("任务冻结的 conditioning mode 与执行模式不一致")
+    matches = [
+        row for row in (conditioning.get("modes") or [])
+        if isinstance(row, dict) and row.get("key") == expected_mode
+    ]
+    if len(matches) != 1 or matches[0] != selected:
+        raise ComfyUIError("任务冻结的 conditioning mode 不是完整合同中的唯一声明")
+    topology = selected.get("dynamic_reference_topology")
+    preprocessing = topology.get("preprocessing") if isinstance(topology, dict) else None
+    if not isinstance(preprocessing, dict) or set(preprocessing) != {
+        "videos", "paired_video_audios", "reference_audios",
+    }:
+        raise ComfyUIError("任务冻结模式缺少动态参考素材预处理合同")
+    return preprocessing, selected_sha256
+
+
+def _preprocessing_contract(
+    preprocessing: dict,
+    *,
+    slot: str,
+) -> tuple[dict, str]:
+    contract = preprocessing.get(slot)
+    if not isinstance(contract, dict):
+        raise ComfyUIError(f"动态参考素材槽位 {slot} 未声明预处理 adapter")
+    adapter_key = str(contract.get("adapter_key") or "")
+    registry = {
+        "videos": _REFERENCE_VIDEO_INSPECTORS,
+        "paired_video_audios": _PAIRED_AUDIO_ADAPTERS,
+        "reference_audios": _REFERENCE_AUDIO_ADAPTERS,
+    }[slot]
+    if adapter_key not in registry:
+        raise ComfyUIError(
+            f"动态参考素材槽位 {slot} 使用了未注册 adapter: {adapter_key or '(empty)'}"
+        )
+    return contract, json_contract(
+        contract,
+        max_bytes=_stage_snapshot_max_bytes(),
+    ).sha256
+
+
+def _frozen_reference_media_profile(task: GenerationTask) -> tuple[dict, str]:
+    snapshot = task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
+    profile = snapshot.get("reference_media_profile")
+    sha256 = str(snapshot.get("reference_media_profile_sha256") or "")
+    try:
+        verified = verify_media_processing_profile(
+            REFERENCE_PROFILE_KEY,
+            profile,
+            sha256=sha256,
+        )
+    except MediaProcessingProfileError as exc:
+        raise ComfyUIError(
+            "任务缺少有效的冻结参考媒体处理 profile"
+        ) from exc
+    return verified, sha256
 
 
 def _staged_record_is_safe(
-    record: dict, reference: dict, asset_id: str, staged_records: list[dict],
+    record: dict,
+    reference: dict,
+    asset_id: str,
+    staged_records: list[dict],
+    *,
+    preprocessing_contract: dict | None,
+    preprocessing_contract_sha256: str,
+    conditioning_mode_contract_sha256: str,
+    media_processing_profile_sha256: str,
 ) -> bool:
-    """Reject legacy staged Ref2VA media that has no proven timing contract."""
+    """Reuse only inputs staged under the exact frozen preprocessing contract."""
     if not record.get("token") or not record.get("comfy_path"):
         return False
     # A retry may reuse a previously uploaded ComfyUI input only when both the
@@ -1079,13 +1403,35 @@ def _staged_record_is_safe(
         digest = str(record.get(key) or "").casefold()
         if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest):
             return False
-    if reference.get("category") != "video":
+    slot = (
+        _reference_preprocessing_slot(reference, asset_id)
+        if conditioning_mode_contract_sha256 else None
+    )
+    if slot is None:
         return True
+    if (
+        not isinstance(preprocessing_contract, dict)
+        or record.get("preprocessing_adapter_key")
+        != preprocessing_contract.get("adapter_key")
+        or record.get("preprocessing_contract_sha256")
+        != preprocessing_contract_sha256
+        or record.get("conditioning_mode_contract_sha256")
+        != conditioning_mode_contract_sha256
+        or record.get("media_processing_profile_sha256")
+        != media_processing_profile_sha256
+    ):
+        return False
     if str(reference.get("asset_id")) == asset_id:
+        if preprocessing_contract.get("adapter_key") == "cfr_video_v1":
+            return (
+                record.get("media_role") == "reference_video"
+                and record.get("effective_fps") == preprocessing_contract.get("target_fps")
+                and record.get("cfr_guaranteed") is True
+                and record.get("original_asset_preserved") is True
+            )
         return (
             record.get("media_role") == "reference_video"
-            and record.get("effective_fps") == H3_REFERENCE_FPS
-            and record.get("cfr_guaranteed") is True
+            and record.get("source_bytes_submitted") is True
             and record.get("original_asset_preserved") is True
         )
     if str(reference.get("audio_asset_id")) == asset_id:
@@ -1093,7 +1439,9 @@ def _staged_record_is_safe(
             row for row in staged_records
             if str(row.get("asset_id")) == str(reference.get("asset_id"))
             and row.get("media_role") == "reference_video"
-            and row.get("cfr_guaranteed") is True
+            and row.get("conditioning_mode_contract_sha256")
+            == conditioning_mode_contract_sha256
+            and row.get("original_asset_preserved") is True
         ), None)
         return (
             record.get("media_role") == "paired_reference_audio"
@@ -1101,6 +1449,12 @@ def _staged_record_is_safe(
             and record.get("duration_aligned") is True
             and video_record is not None
             and record.get("effective_duration_ms") == video_record.get("effective_duration_ms")
+        )
+    if slot == "reference_audios":
+        return (
+            record.get("media_role") == "reference_audio"
+            and record.get("source_bytes_submitted") is True
+            and record.get("original_asset_preserved") is True
         )
     return True
 
@@ -1165,52 +1519,80 @@ def _safe_normalization_error(exc: Exception, *paths: Path) -> str:
 
 def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
     workflow = deepcopy(task.generated_workflow.workflow_json)
-    template = task.generated_workflow.template
     semantic_compiled = bool(
         task.generated_workflow.workflow_template_version_id
         and task.generated_workflow.compiler_id
         and (task.capability_snapshot or {}).get("workflow_contract_sha256")
     )
+    if not semantic_compiled:
+        raise ComfyUIError("未版本化 GeneratedWorkflow 已退役，不能提交执行")
     if semantic_compiled:
         snapshot = task.capability_snapshot or {}
-        if json_contract(workflow).sha256 != task.generated_workflow.content_hash:
+        if json_contract(
+            workflow,
+            max_bytes=_workflow_graph_max_bytes(),
+        ).sha256 != task.generated_workflow.content_hash:
             raise ComfyUIError("冻结 compiled workflow hash 不一致")
         if snapshot.get("workflow_hash") != task.generated_workflow.content_hash:
             raise ComfyUIError("任务 workflow hash 与 GeneratedWorkflow 不一致")
         if snapshot.get("workflow_contract_sha256") != task.generated_workflow.workflow_contract_sha256:
             raise ComfyUIError("任务 workflow execution contract hash 不一致")
-    if not semantic_compiled and (not template.is_active or (
-        not task.owner.is_staff and (template.owner_id is not None or not template.is_system)
-    )):
-        raise ComfyUIError("任务引用的 WorkflowTemplate 不再允许该用户执行")
     try:
         validate_comfy_graph(workflow)
     except WorkflowBuildError as exc:
         raise ComfyUIError(str(exc)) from exc
     required_tokens = _collect_staged_tokens(workflow)
+    snapshot = task.capability_snapshot or {}
+    injected = task.generated_workflow.injected_values or {}
+    frozen_asset_bindings = snapshot.get("asset_bindings")
+    frozen_asset_bindings_sha256 = str(snapshot.get("asset_bindings_sha256") or "")
+    if (
+        not isinstance(frozen_asset_bindings, list)
+        or frozen_asset_bindings != injected.get("asset_bindings")
+        or not frozen_asset_bindings_sha256
+        or json_contract(
+            frozen_asset_bindings,
+            max_bytes=_stage_snapshot_max_bytes(),
+        ).sha256
+        != frozen_asset_bindings_sha256
+        or frozen_asset_bindings_sha256
+        != task.generated_workflow.asset_bindings_sha256
+    ):
+        raise ComfyUIError("任务冻结的 asset_bindings 合同缺失、漂移或哈希不一致")
     if not required_tokens:
         return workflow
     prompt_assets = {}
-    frozen_asset_bindings = (task.capability_snapshot or {}).get("asset_bindings")
-    if frozen_asset_bindings is not None:
-        if not isinstance(frozen_asset_bindings, list):
-            raise ComfyUIError("任务冻结的 asset_bindings manifest 无效")
-        if json_contract(frozen_asset_bindings).sha256 != (
-            task.capability_snapshot or {}
-        ).get("asset_bindings_sha256"):
-            raise ComfyUIError("任务冻结的 asset_bindings hash 不一致")
-        reference_records = frozen_asset_bindings
-    else:
-        reference_records = task.generated_workflow.prompt_artifact.structured_payload.get(
-            "reference_bindings",
-            task.generated_workflow.prompt_artifact.structured_payload.get("reference_assets", []),
-        )
+    reference_records = frozen_asset_bindings
     for item in reference_records:
         if not isinstance(item, dict):
             continue
         for key in ("asset_id", "id", "audio_asset_id"):
             if item.get(key):
                 prompt_assets[str(item[key])] = item
+    dynamic_preprocessing = _requires_reference_preprocessing(
+        snapshot,
+        reference_records,
+    )
+    media_slots = {
+        slot
+        for token in required_tokens
+        if (reference := prompt_assets.get(token.split(":", 1)[1])) is not None
+        if dynamic_preprocessing
+        if (slot := _reference_preprocessing_slot(
+            reference, token.split(":", 1)[1],
+        )) is not None
+    }
+    preprocessing: dict = {}
+    conditioning_mode_contract_sha256 = ""
+    reference_media_profile: dict = {}
+    reference_media_profile_sha256 = ""
+    if media_slots:
+        preprocessing, conditioning_mode_contract_sha256 = (
+            _frozen_reference_preprocessing(task)
+        )
+        reference_media_profile, reference_media_profile_sha256 = (
+            _frozen_reference_media_profile(task)
+        )
     mapping = {}
     staged_records = [
         row for row in (task.staged_inputs or []) if isinstance(row, dict)
@@ -1221,8 +1603,25 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
             continue
         asset_id = token.split(":", 1)[1]
         reference = prompt_assets.get(asset_id)
+        slot = (
+            _reference_preprocessing_slot(reference, asset_id)
+            if dynamic_preprocessing and isinstance(reference, dict) else None
+        )
+        preprocessing_contract = None
+        preprocessing_contract_sha256 = ""
+        if slot is not None:
+            preprocessing_contract, preprocessing_contract_sha256 = (
+                _preprocessing_contract(preprocessing, slot=slot)
+            )
         if reference and _staged_record_is_safe(
-            staged, reference, asset_id, staged_records,
+            staged,
+            reference,
+            asset_id,
+            staged_records,
+            preprocessing_contract=preprocessing_contract,
+            preprocessing_contract_sha256=preprocessing_contract_sha256,
+            conditioning_mode_contract_sha256=conditioning_mode_contract_sha256,
+            media_processing_profile_sha256=reference_media_profile_sha256,
         ):
             _verify_reusable_staged_input(task, client, staged, asset_id, reference)
             mapping[token] = staged["comfy_path"]
@@ -1253,31 +1652,56 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
             "media_role": item.get("category") or "image",
         }
         related_paths = [path]
+        slot = (
+            _reference_preprocessing_slot(item, asset_id)
+            if dynamic_preprocessing else None
+        )
+        contract = None
+        contract_sha256 = ""
+        if slot is not None:
+            contract, contract_sha256 = _preprocessing_contract(
+                preprocessing, slot=slot,
+            )
         try:
-            with tempfile.TemporaryDirectory(prefix="autoprompt-ref2va-") as temp_dir:
+            with tempfile.TemporaryDirectory(prefix="autoprompt-reference-") as temp_dir:
                 temp_root = Path(temp_dir)
-                if item.get("category") == "video" and str(item.get("asset_id")) == asset_id:
+                if slot == "videos":
                     plan = video_plans.get(asset_id)
                     if plan is None:
-                        plan = inspect_reference_video(path)
+                        adapter_key = str(contract.get("adapter_key") or "")
+                        plan = _REFERENCE_VIDEO_INSPECTORS[adapter_key](
+                            path, contract, reference_media_profile,
+                        )
                         video_plans[asset_id] = plan
-                    staged_path = temp_root / f"{asset_id}-cfr24.mp4"
-                    staged_metadata = normalize_reference_video(
-                        path,
-                        staged_path,
-                        include_embedded_audio=bool(item.get("use_embedded_audio")),
-                        plan=plan,
-                    )
-                elif (
-                    item.get("category") == "video"
-                    and str(item.get("audio_asset_id")) == asset_id
-                ):
+                    if contract["adapter_key"] == "cfr_video_v1":
+                        staged_path = temp_root / f"{asset_id}-cfr.mp4"
+                        staged_metadata = normalize_reference_video(
+                            path,
+                            staged_path,
+                            include_embedded_audio=bool(item.get("use_embedded_audio")),
+                            plan=plan,
+                            media_profile=reference_media_profile,
+                        )
+                    else:
+                        staged_metadata = passthrough_reference_video_metadata(
+                            plan=plan,
+                            include_embedded_audio=bool(item.get("use_embedded_audio")),
+                            media_profile=reference_media_profile,
+                        )
+                elif slot == "paired_video_audios":
                     video_asset_id = str(item.get("asset_id"))
                     _, video_path = _authorized_asset_source(task, video_asset_id)
                     related_paths.append(video_path)
                     plan = video_plans.get(video_asset_id)
                     if plan is None:
-                        plan = inspect_reference_video(video_path)
+                        video_contract, _video_contract_sha256 = _preprocessing_contract(
+                            preprocessing,
+                            slot="videos",
+                        )
+                        video_adapter_key = str(video_contract.get("adapter_key") or "")
+                        plan = _REFERENCE_VIDEO_INSPECTORS[video_adapter_key](
+                            video_path, video_contract, reference_media_profile,
+                        )
                         video_plans[video_asset_id] = plan
                     staged_path = temp_root / f"{asset_id}-paired.wav"
                     staged_metadata = normalize_paired_audio(
@@ -1285,8 +1709,32 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
                         staged_path,
                         paired_video_asset_id=video_asset_id,
                         effective_duration_seconds=plan.effective_duration_seconds,
+                        effective_fps=(
+                            getattr(plan, "target_fps", None)
+                            or getattr(plan, "source_fps", None)
+                        ),
+                        minimum_duration_ms=contract["minimum_duration_ms"],
+                        maximum_duration_ms=contract["maximum_duration_ms"],
+                        security_max_duration_ms=boundary_int(
+                            "security.media.max_duration_ms"
+                        ),
+                        media_profile=reference_media_profile,
                     )
-                upload = getattr(client, "upload_input_file", None) or getattr(client, "upload_image")
+                elif slot == "reference_audios":
+                    staged_metadata = passthrough_reference_audio_metadata(
+                        path,
+                        minimum_duration_ms=contract["minimum_duration_ms"],
+                        maximum_duration_ms=contract["maximum_duration_ms"],
+                        security_max_duration_ms=boundary_int(
+                            "security.media.max_duration_ms"
+                        ),
+                        media_profile=reference_media_profile,
+                    )
+                upload = getattr(client, "upload_input_file", None)
+                if not callable(upload):
+                    raise ComfyUIError(
+                        "ComfyUI client 缺少 upload_input_file 参考素材上传合同"
+                    )
                 submitted_sha256 = sha256_file(staged_path)
                 response = upload(
                     staged_path,
@@ -1295,13 +1743,12 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
                 )
         except ReferenceMediaNormalizationError as exc:
             raise ComfyUIError(
-                "Ref2VA reference media failed CFR24/duration normalization; "
+                "Reference media failed frozen preprocessing contract; "
                 "the task was blocked before ComfyUI submission: "
                 f"{_safe_normalization_error(exc, *related_paths)}"
             ) from exc
         comfy_path = "/".join(filter(None, (response.get("subfolder", ""), response["name"])))
-        # Replace a legacy unnormalized mapping for the same token.  Retries
-        # must never silently select the old ComfyUI input.
+        # Replace an input staged under any different preprocessing contract.
         task.staged_inputs = [
             row for row in staged_records if row.get("token") != token
         ]
@@ -1310,6 +1757,9 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
             "checksum": source_sha256,
             "source_sha256": source_sha256,
             "submitted_sha256": submitted_sha256,
+            "preprocessing_contract_sha256": contract_sha256,
+            "conditioning_mode_contract_sha256": conditioning_mode_contract_sha256,
+            "media_processing_profile_sha256": reference_media_profile_sha256,
             **staged_metadata,
         })
         staged_records = task.staged_inputs
@@ -1325,10 +1775,8 @@ def prepare_workflow(task: GenerationTask, client: ComfyUIClient) -> dict:
 
 def process_task(
     task: GenerationTask,
-    client: ComfyUIClient | None = None,
-    wait_timeout: float | None = None,
+    client: ComfyUIClient,
 ) -> GenerationTask:
-    client = client or ComfyUIClient()
     task.refresh_from_db()
     task = _ensure_task_deadlines(task)
     if task.status in {GenerationTask.Status.CANCEL_REQUESTED, GenerationTask.Status.CANCELLED}:
@@ -1382,8 +1830,7 @@ def process_task(
                 progress_socket = _open_task_progress_socket(task, client)
                 try:
                     history = _wait_for_task_completion(
-                        task, client, prompt_id, timeout=wait_timeout,
-                        progress_socket=progress_socket,
+                        task, client, prompt_id, progress_socket=progress_socket,
                     )
                 finally:
                     _close_task_progress_socket(progress_socket)
@@ -1421,6 +1868,11 @@ def process_task(
                 },
             }
             task.save(update_fields=("capability_snapshot", "updated_at"))
+            # This is process-global ComfyUI state and therefore runs only for
+            # a genuinely new submission: after uploads/live preflight, but
+            # before any prompt token is persisted or POST /prompt is called.
+            # Recovery paths with an existing token never enter this branch.
+            _release_resources_for_new_submission(task, client)
             prompt_id = str(uuid.uuid4())
             task.submission_token = prompt_id
             task.comfy_prompt_id = prompt_id
@@ -1437,6 +1889,12 @@ def process_task(
                     queue_result = client.queue_prompt(
                         executable_workflow, task.client_id, prompt_id=prompt_id,
                     )
+                except ComfyUIHTTPError as exc:
+                    # An HTTP response is definitive evidence that /prompt
+                    # rejected this request.  Keep the frozen token for audit,
+                    # but do not send it through the uncertain-submission path:
+                    # no remote reconciliation is needed before a safe retry.
+                    raise SubmissionRejected(str(exc)) from exc
                 except ComfyUIError as exc:
                     raise SubmissionUncertain(
                         "ComfyUI /prompt 返回前连接中断，远端是否已接受未知；"
@@ -1464,8 +1922,7 @@ def process_task(
                 )
                 _record_runtime_state(task, GenerationTask.RemoteState.SUBMITTED, remote_error="")
                 history = _wait_for_task_completion(
-                    task, client, prompt_id, timeout=wait_timeout,
-                    progress_socket=progress_socket,
+                    task, client, prompt_id, progress_socket=progress_socket,
                 )
             finally:
                 _close_task_progress_socket(progress_socket)
@@ -1592,6 +2049,21 @@ def process_task(
             "error_message", "finished_at", "heartbeat_at", "progress", "status",
             "remote_state", "remote_error", "updated_at",
         ))
+    except SubmissionRejected as exc:
+        task.refresh_from_db()
+        now = timezone.now()
+        task.error_message = str(exc)
+        task.finished_at = now
+        task.heartbeat_at = now
+        task.progress = 0
+        task.submission_state = GenerationTask.SubmissionState.TERMINAL_FAILED
+        task.status = GenerationTask.Status.FAILED
+        task.remote_state = GenerationTask.RemoteState.FAILED
+        task.remote_error = str(exc)
+        task.save(update_fields=(
+            "error_message", "finished_at", "heartbeat_at", "progress",
+            "submission_state", "status", "remote_state", "remote_error", "updated_at",
+        ))
     except SubmissionUncertain as exc:
         task.refresh_from_db()
         now = timezone.now()
@@ -1637,6 +2109,23 @@ def process_task(
             "error_message", "finished_at", "heartbeat_at", "progress", "submission_state",
             "status", "remote_state", "remote_error", "stalled_at", "updated_at",
         ))
+    except ComfyUIPreSubmitResourceReleaseError as exc:
+        # The release endpoint is separate from /prompt.  Its failure is a
+        # definitive fail-closed pre-submit fact, never a missing/uncertain
+        # remote generation and never an automatic retry.
+        task.refresh_from_db()
+        now = timezone.now()
+        task.error_message = str(exc)
+        task.finished_at = now
+        task.heartbeat_at = now
+        task.progress = 0
+        task.status = GenerationTask.Status.FAILED
+        task.remote_state = GenerationTask.RemoteState.DEGRADED
+        task.remote_error = str(exc)
+        task.save(update_fields=(
+            "error_message", "finished_at", "heartbeat_at", "progress", "status",
+            "remote_state", "remote_error", "updated_at",
+        ))
     except ComfyUIError as exc:
         task.refresh_from_db()
         now = timezone.now()
@@ -1671,8 +2160,7 @@ def process_task(
 
 
 def recover_stale_tasks(
-    older_than_minutes: int = 30,
-    client: ComfyUIClient | None = None,
+    older_than_minutes: float | None = None,
 ) -> int:
     """Recover abandoned claims using heartbeat freshness and remote evidence.
 
@@ -1680,13 +2168,22 @@ def recover_stale_tasks(
     prompt still exists in ComfyUI queue/history.  It is never converted into a
     fresh POST, preventing duplicate GPU work after a worker crash.
     """
+    if older_than_minutes is None:
+        older_than_minutes = resolve_configuration(required_keys=(
+            "runtime.worker_stale_recovery_minutes",
+        )).values["runtime.worker_stale_recovery_minutes"]
+    if (
+        isinstance(older_than_minutes, bool)
+        or not isinstance(older_than_minutes, (int, float))
+        or older_than_minutes <= 0
+    ):
+        raise ValidationError("陈旧任务回收阈值必须是正分钟数")
     current_time = timezone.now()
     threshold = current_time - timedelta(minutes=older_than_minutes)
     cancel_grace = float(resolve_configuration(
         required_keys=("runtime.task_cancel_grace_seconds",),
     ).values["runtime.task_cancel_grace_seconds"])
     cancel_threshold = current_time - timedelta(seconds=max(0.0, cancel_grace))
-    client = client or ComfyUIClient()
     reconcilable_submission_states = (
         GenerationTask.SubmissionState.PREPARED,
         GenerationTask.SubmissionState.SUBMITTED,
@@ -1720,9 +2217,18 @@ def recover_stale_tasks(
     recovered = 0
     for task in candidates:
         try:
-            task_client = comfy_client_for_task(task, fallback=client)
+            task_client = comfy_client_for_task(task)
         except ComfyUIError as exc:
-            changed = GenerationTask.objects.filter(pk=task.pk).update(
+            changed = GenerationTask.objects.filter(pk=task.pk).filter(
+                Q(status__in=(
+                    GenerationTask.Status.RUNNING,
+                    GenerationTask.Status.CANCEL_REQUESTED,
+                ))
+                | Q(
+                    status=GenerationTask.Status.FAILED,
+                    submission_state__in=reconcilable_submission_states,
+                )
+            ).update(
                 status=GenerationTask.Status.FAILED,
                 heartbeat_at=timezone.now(),
                 finished_at=task.finished_at or timezone.now(),
@@ -1869,7 +2375,7 @@ def recover_stale_tasks(
                 finished_at=task.finished_at or now,
                 heartbeat_at=now,
                 stalled_at=task.stalled_at or now,
-                submission_state=GenerationTask.SubmissionState.TERMINAL_CANCELLED,
+                submission_state=GenerationTask.SubmissionState.TERMINAL_FAILED,
                 remote_state=GenerationTask.RemoteState.MISSING,
                 remote_error="Persisted prompt is absent from ComfyUI queue and history",
                 error_message=(

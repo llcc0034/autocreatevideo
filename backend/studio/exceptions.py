@@ -21,6 +21,26 @@ def api_error_response(*, status_code: int, code: str, details) -> Response:
     )
 
 
+def _specific_detail_code(details) -> str | None:
+    codes: set[str] = set()
+
+    def collect(value) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                collect(item)
+            return
+        code = str(getattr(value, "code", "") or "")
+        if code and code not in {"invalid", "error"}:
+            codes.add(code)
+
+    collect(details)
+    return next(iter(codes)) if len(codes) == 1 else None
+
+
 def api_exception_handler(exc, context):
     if isinstance(exc, ProtectedError):
         return api_error_response(
@@ -36,9 +56,13 @@ def api_exception_handler(exc, context):
     response = exception_handler(exc, context)
     if response is None:
         return None
+    code = (
+        _specific_detail_code(response.data)
+        or getattr(exc, "default_code", "error")
+    )
     response.data = api_error_envelope(
         status_code=response.status_code,
-        code=getattr(exc, "default_code", "error"),
+        code=code,
         details=response.data,
     )
     return response

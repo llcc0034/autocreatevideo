@@ -1,26 +1,19 @@
-"""Review-only project text proposals for the pre-project creation screen.
+"""Strict series-script contract for versioned text deployments.
 
-The model owns only a compact structured proposal.  Django deterministically
-renders the accepted structure into the one master-script syntax understood by
-``script_breakdown.py``.  Nothing in this service creates or updates a project,
-episode, shot, or Bible row.
+This module freezes provider-neutral request plans, validates detached model
+results, and deterministically renders the accepted structure into the one
+master-script syntax understood by ``script_breakdown.py``. Provider execution,
+cost accounting, persistence, and review remain in the ProductionRun pipeline.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import unicodedata
+from copy import deepcopy
 from typing import Any
 
-from django.conf import settings
-
-from studio.services.creative_drafts import (
-    CreativeDraftError,
-    CreativeValidationError,
-    _run_provider_runtime,
-    creative_provider_config,
-    normalise_creative_provider,
-)
+from studio.services.model_profile_contracts import CHAT_REQUEST_OPTIONS_KEY
 from studio.services.script_bible import (
     ScriptBibleParseError,
     normalize_script_bible_name,
@@ -28,32 +21,50 @@ from studio.services.script_bible import (
     render_script_bible,
     validate_script_bible_ir,
 )
+from studio.services.text_field_contracts import (
+    SERIES_CONCEPT_FIELD_KEYS,
+    text_field_rule,
+    validate_text_field_contract,
+)
 
 
 SERIES_CONCEPT_DRAFT_OPERATION = "series_concept_draft"
-SERIES_CONCEPT_DRAFT_SCHEMA_VERSION = 2
-SERIES_CONCEPT_TEMPLATE_ID = "deterministic-script-breakdown-v3"
-SERIES_CONCEPT_MAX_IDEA_CHARS = 6_000
-SERIES_CONCEPT_MAX_STYLE_HINT_CHARS = 2_000
-SERIES_CONCEPT_OUTPUT_BASE_TOKENS = 512
-SERIES_CONCEPT_OUTPUT_TOKENS_PER_SHOT = 200
-SERIES_CONCEPT_MIN_OUTPUT_TOKENS = 1_024
-SERIES_CONCEPT_PROTOCOL_OVERHEAD_CHARS = 2_048
-SERIES_CONCEPT_BUDGET_WARNING_PERCENT = 80
+SERIES_CONCEPT_DRAFT_SCHEMA_VERSION = 3
+SERIES_CONCEPT_TEMPLATE_ID = "deterministic-script-breakdown-v4"
+SERIES_CONCEPT_RESOURCE_ADVISORY_KEYS = frozenset({
+    "schema_version",
+    "input_protocol_overhead_chars",
+    "output_base_units",
+    "output_units_per_shot",
+    "minimum_output_units",
+    "output_hint_warning_percent",
+    "script_breakdown_reference_chars",
+})
+DIALOGUE_IR_KEYS = frozenset({
+    "speaker", "delivery", "text", "start_ms", "end_ms",
+})
 
 
-def series_concept_draft_limits() -> dict[str, int]:
-    """Return the one public, count-unbounded product policy snapshot."""
+class SeriesConceptDraftError(RuntimeError):
+    """A caller-safe failure in the current detached script contract."""
 
-    return {
-        "max_idea_chars": SERIES_CONCEPT_MAX_IDEA_CHARS,
-        "max_style_hint_chars": SERIES_CONCEPT_MAX_STYLE_HINT_CHARS,
-        "default_episode_duration_seconds": int(
-            settings.SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS
-        ),
-        "minimum_shot_duration_ms": int(settings.LEGACY_VIDEO_SHOT_MIN_DURATION_MS),
-        "maximum_shot_duration_ms": int(settings.LEGACY_VIDEO_SHOT_MAX_DURATION_MS),
-    }
+    def __init__(self, message: str, *, code: str = "series_concept_invalid_candidate"):
+        super().__init__(message)
+        self.code = str(code)
+
+
+class SeriesConceptDraftValidationError(SeriesConceptDraftError):
+    """Invalid operator input or frozen production policy."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "series_concept_validation_failed",
+        public_context: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.public_context = dict(public_context or {})
 
 
 def _source_fingerprint(
@@ -88,6 +99,45 @@ def _format_seconds(milliseconds: int) -> str:
     return f"{milliseconds / 1_000:.3f}".rstrip("0").rstrip(".")
 
 
+def validate_dialogue_clock_contract(
+    dialogue: object,
+    *,
+    duration_ms: int,
+) -> tuple[int, int] | None:
+    """Validate the model-neutral one-line dialogue timing contract.
+
+    Every dialogue object has one shape.  A silent shot uses three empty
+    strings and the explicit ``0/0`` sentinel.  A spoken line must carry its
+    authored integer-millisecond window inside the shot.  Missing clocks are
+    deliberately rejected: silently inventing a midpoint here would erase the
+    timing decision made by the text-model contract.
+    """
+
+    if not isinstance(dialogue, dict) or set(dialogue) != DIALOGUE_IR_KEYS:
+        raise ValueError("dialogue 必须包含统一的文本与 start_ms/end_ms 字段")
+    speaker = dialogue.get("speaker")
+    delivery = dialogue.get("delivery")
+    text = dialogue.get("text")
+    if not all(isinstance(value, str) for value in (speaker, delivery, text)):
+        raise ValueError("dialogue 文本字段必须是字符串")
+    start_ms = dialogue.get("start_ms")
+    end_ms = dialogue.get("end_ms")
+    if type(start_ms) is not int or type(end_ms) is not int:
+        raise ValueError("dialogue.start_ms/end_ms 必须是整数毫秒")
+    has_dialogue = bool(text)
+    if bool(speaker) != has_dialogue or bool(delivery) != has_dialogue:
+        raise ValueError("dialogue 人物、语气与正文必须同时为空或同时非空")
+    if not has_dialogue:
+        if start_ms != 0 or end_ms != 0:
+            raise ValueError("空对白必须显式使用 start_ms=0、end_ms=0")
+        return None
+    if not 0 <= start_ms < end_ms <= duration_ms:
+        raise ValueError(
+            "有声对白必须满足 0 <= start_ms < end_ms <= shot.duration_ms"
+        )
+    return start_ms, end_ms
+
+
 def render_compatible_master_script(
     bible: dict[str, list[dict[str, str]]],
     episodes: list[dict[str, Any]],
@@ -109,16 +159,18 @@ def render_compatible_master_script(
                 f"【尾帧连续={last_continuity}】：{shot['setting']}"
             )
             dialogue = shot["dialogue"]
-            if dialogue["text"]:
-                split_ms = max(1, min(shot_duration_ms - 1, shot_duration_ms // 2))
-                split = _format_seconds(split_ms)
-                lines.append(f"[0-{split}秒] 动作：{shot['action']}")
+            dialogue_clock = validate_dialogue_clock_contract(
+                dialogue,
+                duration_ms=shot_duration_ms,
+            )
+            lines.append(f"[0-{duration}秒] 动作：{shot['action']}")
+            if dialogue_clock is not None:
+                dialogue_start_ms, dialogue_end_ms = dialogue_clock
                 lines.append(
-                    f"[{split}-{duration}秒] {dialogue['speaker']}"
+                    f"[{_format_seconds(dialogue_start_ms)}-"
+                    f"{_format_seconds(dialogue_end_ms)}秒] {dialogue['speaker']}"
                     f"（{dialogue['delivery']}）：{dialogue['text']}"
                 )
-            else:
-                lines.append(f"[0-{duration}秒] 动作：{shot['action']}")
             if shot_index < len(shots):
                 lines.append("")
         blocks.append("\n".join(lines))
@@ -133,9 +185,11 @@ def _validated_candidate(
     shots_per_episode: int,
     minimum_shot_duration_ms: int,
     maximum_shot_duration_ms: int,
+    field_contract: dict[str, Any],
+    require_all_bible_entities_used: bool = False,
 ) -> dict[str, Any]:
     def invalid_candidate(path: str = "result") -> None:
-        raise CreativeDraftError(
+        raise SeriesConceptDraftError(
             f"模型候选字段 {path} 不符合已发布的剧本结构合同。",
             code="series_concept_invalid_candidate",
         )
@@ -143,17 +197,20 @@ def _validated_candidate(
     def safe_line(
         value: Any,
         *,
-        maximum: int,
-        required: bool = False,
+        contract_field: str,
         path: str,
     ) -> str:
+        rule = text_field_rule(field_contract, contract_field)
         if not isinstance(value, str):
             invalid_candidate(path)
         normalized = value.strip()
         if (
-            (required and not normalized)
-            or len(normalized) > maximum
-            or any(character in normalized for character in "\r\n\t")
+            (rule["required"] and not normalized)
+            or len(normalized) > int(rule["max_chars"])
+            or (
+                rule["single_line"]
+                and any(character in normalized for character in "\r\n\t")
+            )
             or any(
                 unicodedata.category(character) in {"Cc", "Cf"}
                 for character in normalized
@@ -165,7 +222,7 @@ def _validated_candidate(
     echoed = str(payload.get("source_fingerprint") or "")
     result = payload.get("result")
     if echoed != fingerprint or not isinstance(result, dict):
-        raise CreativeDraftError(
+        raise SeriesConceptDraftError(
             "模型未返回与当前创作想法匹配的结构化候选。",
             code="series_concept_invalid_candidate",
         )
@@ -174,14 +231,17 @@ def _validated_candidate(
         or type(result.get("schema_version")) is not int
         or result["schema_version"] != SERIES_CONCEPT_DRAFT_SCHEMA_VERSION
     ):
-        raise CreativeDraftError(
+        raise SeriesConceptDraftError(
             "模型候选的结构版本无效。",
             code="series_concept_invalid_candidate",
         )
-    title = safe_line(result.get("title"), maximum=60, required=True, path="result.title")
-    logline = safe_line(result.get("logline"), maximum=500, required=True, path="result.logline")
+    title = safe_line(result.get("title"), contract_field="title", path="result.title")
+    logline = safe_line(result.get("logline"), contract_field="logline", path="result.logline")
     try:
-        bible = validate_script_bible_ir(result.get("bible"))
+        bible = validate_script_bible_ir(
+            result.get("bible"),
+            field_contract=field_contract,
+        )
     except ScriptBibleParseError:
         invalid_candidate("result.bible")
     episodes = result.get("episodes")
@@ -197,7 +257,7 @@ def _validated_candidate(
         if not isinstance(episode, dict) or set(episode) != {"title", "shots"}:
             invalid_candidate(episode_path)
         episode_title = safe_line(
-            episode.get("title"), maximum=80, required=True,
+            episode.get("title"), contract_field="episode.title",
             path=f"{episode_path}.title",
         )
         shots = episode.get("shots")
@@ -224,14 +284,14 @@ def _validated_candidate(
             dialogue = shot.get("dialogue")
             if (
                 not isinstance(dialogue, dict)
-                or set(dialogue) != {"speaker", "delivery", "text"}
+                or set(dialogue) != DIALOGUE_IR_KEYS
             ):
                 invalid_candidate(f"{shot_path}.dialogue")
-            setting = safe_line(shot.get("setting"), maximum=200, required=True, path=f"{shot_path}.setting")
-            action = safe_line(shot.get("action"), maximum=500, required=True, path=f"{shot_path}.action")
-            speaker = safe_line(dialogue.get("speaker"), maximum=80, path=f"{shot_path}.dialogue.speaker")
-            delivery = safe_line(dialogue.get("delivery"), maximum=120, path=f"{shot_path}.dialogue.delivery")
-            dialogue_text = safe_line(dialogue.get("text"), maximum=240, path=f"{shot_path}.dialogue.text")
+            setting = safe_line(shot.get("setting"), contract_field="shot.setting", path=f"{shot_path}.setting")
+            action = safe_line(shot.get("action"), contract_field="shot.action", path=f"{shot_path}.action")
+            speaker = safe_line(dialogue.get("speaker"), contract_field="shot.dialogue.speaker", path=f"{shot_path}.dialogue.speaker")
+            delivery = safe_line(dialogue.get("delivery"), contract_field="shot.dialogue.delivery", path=f"{shot_path}.dialogue.delivery")
+            dialogue_text = safe_line(dialogue.get("text"), contract_field="shot.dialogue.text", path=f"{shot_path}.dialogue.text")
             if (
                 any(character in speaker for character in "()（）[]【】<>:：")
                 or bool(speaker) != bool(dialogue_text)
@@ -244,20 +304,60 @@ def _validated_candidate(
                 or ")" in delivery
             ):
                 invalid_candidate(f"{shot_path}.dialogue")
+            normalized_dialogue = {
+                "speaker": speaker,
+                "delivery": delivery,
+                "text": dialogue_text,
+                "start_ms": dialogue.get("start_ms"),
+                "end_ms": dialogue.get("end_ms"),
+            }
+            try:
+                validate_dialogue_clock_contract(
+                    normalized_dialogue,
+                    duration_ms=duration_ms,
+                )
+            except ValueError:
+                invalid_candidate(f"{shot_path}.dialogue")
             validated_shots.append({
                 "setting": setting,
                 "action": action,
                 "duration_ms": duration_ms,
-                "dialogue": {
-                    "speaker": speaker,
-                    "delivery": delivery,
-                    "text": dialogue_text,
-                },
+                "dialogue": normalized_dialogue,
             })
         validated_episodes.append({
             "title": episode_title,
             "shots": validated_shots,
         })
+    if require_all_bible_entities_used:
+        normalized_shot_text = normalize_script_bible_name(" ".join(
+            value
+            for episode in validated_episodes
+            for shot in episode["shots"]
+            for value in (
+                shot["setting"],
+                shot["action"],
+                shot["dialogue"]["speaker"],
+                shot["dialogue"]["text"],
+            )
+            if value
+        ))
+        unused: list[str] = []
+        for collection, label in (
+            ("characters", "人物"),
+            ("scenes", "场景"),
+            ("props", "道具"),
+        ):
+            for item in bible[collection]:
+                canonical_name = normalize_script_bible_name(item["name"])
+                if canonical_name and canonical_name not in normalized_shot_text:
+                    unused.append(f"{label}“{item['name']}”")
+        if unused:
+            raise SeriesConceptDraftError(
+                "模型候选未在任一镜头中使用全部已声明的 Bible 规范名称："
+                + "、".join(unused)
+                + "。全自动生产禁止把同义改写猜测为同一实体。",
+                code="series_concept_bible_entity_unused",
+            )
     return {
         "title": title,
         "logline": logline,
@@ -286,7 +386,7 @@ def _fit_episode_duration_budgets(
 
         minimum_total = len(shots) * minimum_shot_duration_ms
         if minimum_total > episode_duration_ms:
-            raise CreativeValidationError(
+            raise SeriesConceptDraftValidationError(
                 "单集时长不足以容纳请求的镜头数和生产系统最短镜头时长。",
                 code="series_concept_episode_duration_infeasible",
             )
@@ -294,7 +394,7 @@ def _fit_episode_duration_budgets(
         weights = [duration - minimum_shot_duration_ms for duration in proposed]
         total_weight = sum(weights)
         if total_weight <= 0:
-            raise CreativeDraftError(
+            raise SeriesConceptDraftError(
                 "模型镜头时长无法在单集预算内安全分配。",
                 code="series_concept_invalid_candidate",
             )
@@ -312,17 +412,59 @@ def _fit_episode_duration_budgets(
             allocated[index] += 1
 
         for shot, duration_ms in zip(shots, allocated):
+            previous_duration_ms = int(shot["duration_ms"])
+            dialogue = shot["dialogue"]
+            dialogue_clock = validate_dialogue_clock_contract(
+                dialogue,
+                duration_ms=previous_duration_ms,
+            )
+            if dialogue_clock is not None and duration_ms != previous_duration_ms:
+                start_ms, end_ms = dialogue_clock
+                scaled_start_ms = start_ms * duration_ms // previous_duration_ms
+                scaled_end_ms = (
+                    end_ms * duration_ms + previous_duration_ms - 1
+                ) // previous_duration_ms
+                scaled_end_ms = min(duration_ms, max(scaled_start_ms + 1, scaled_end_ms))
+                dialogue["start_ms"] = scaled_start_ms
+                dialogue["end_ms"] = scaled_end_ms
             shot["duration_ms"] = duration_ms
         adjusted_episode_count += 1
         episode_totals.append(sum(allocated))
     return episode_totals, adjusted_episode_count
 
 
-def _estimated_output_tokens(shot_count: int) -> int:
+def _validated_resource_advisory(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict) or set(value) != SERIES_CONCEPT_RESOURCE_ADVISORY_KEYS:
+        raise SeriesConceptDraftValidationError(
+            "series concept resource advisory 合同字段无效",
+            code="series_concept_resource_advisory_invalid",
+        )
+    if value.get("schema_version") != 1:
+        raise SeriesConceptDraftValidationError(
+            "series concept resource advisory schema_version 无效",
+            code="series_concept_resource_advisory_invalid",
+        )
+    normalized: dict[str, int] = {"schema_version": 1}
+    for key in sorted(SERIES_CONCEPT_RESOURCE_ADVISORY_KEYS - {"schema_version"}):
+        item = value.get(key)
+        minimum = 0 if key in {
+            "input_protocol_overhead_chars", "output_base_units",
+            "output_units_per_shot",
+        } else 1
+        if type(item) is not int or item < minimum:
+            raise SeriesConceptDraftValidationError(
+                f"series concept resource advisory.{key} 无效",
+                code="series_concept_resource_advisory_invalid",
+            )
+        normalized[key] = item
+    return normalized
+
+
+def _estimated_output_tokens(shot_count: int, advisory: dict[str, int]) -> int:
     return max(
-        SERIES_CONCEPT_MIN_OUTPUT_TOKENS,
-        SERIES_CONCEPT_OUTPUT_BASE_TOKENS
-        + shot_count * SERIES_CONCEPT_OUTPUT_TOKENS_PER_SHOT,
+        advisory["minimum_output_units"],
+        advisory["output_base_units"]
+        + shot_count * advisory["output_units_per_shot"],
     )
 
 
@@ -332,19 +474,26 @@ def _resource_estimate(
     style_hint: str,
     total_shots: int,
     configured_output_token_hint: int,
+    resource_advisory: dict[str, int],
 ) -> dict[str, int]:
-    estimated_output_tokens = _estimated_output_tokens(total_shots)
+    advisory = _validated_resource_advisory(resource_advisory)
+    estimated_output_tokens = _estimated_output_tokens(total_shots, advisory)
     utilization_percent = (
         estimated_output_tokens * 100 + configured_output_token_hint - 1
     ) // configured_output_token_hint
     return {
         "total_shots": total_shots,
         "estimated_input_chars": (
-            len(idea) + len(style_hint) + SERIES_CONCEPT_PROTOCOL_OVERHEAD_CHARS
+            len(idea) + len(style_hint)
+            + advisory["input_protocol_overhead_chars"]
         ),
         "estimated_output_tokens": estimated_output_tokens,
         "configured_output_token_hint": configured_output_token_hint,
         "output_hint_utilization_percent": utilization_percent,
+        "output_hint_warning_percent": advisory["output_hint_warning_percent"],
+        "script_breakdown_reference_chars": advisory[
+            "script_breakdown_reference_chars"
+        ],
     }
 
 
@@ -380,11 +529,12 @@ def _runtime_warnings(
     if adjusted_episode_count:
         warnings.append(
             f"{adjusted_episode_count} 集的模型建议镜头时长超过单集预算；"
-            "服务端已按各镜建议时长的相对比例压缩，且保留每镜生产最短时长。"
+            "服务端已按各镜建议时长的相对比例压缩，保留每镜生产最短时长，"
+            "并将有声对白时间窗按所在镜头的同比例同步缩放。"
         )
     if (
         resource_estimate["output_hint_utilization_percent"]
-        >= SERIES_CONCEPT_BUDGET_WARNING_PERCENT
+        >= resource_estimate["output_hint_warning_percent"]
     ):
         warnings.append(
             "本次完整候选预计需要 "
@@ -395,10 +545,11 @@ def _runtime_warnings(
             "实际能否完成由所选模型和运行时决定，"
             "耗时、内存或上游费用可能较高。"
         )
-    if script_char_count > settings.SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS:
+    reference_chars = resource_estimate["script_breakdown_reference_chars"]
+    if script_char_count > reference_chars:
         warnings.append(
             f"完整母稿共 {script_char_count} 字符，超过当前拆解服务配置的 "
-            f"{settings.SCRIPT_BREAKDOWN_MAX_SOURCE_CHARS} 字符参考预算；"
+            f"{reference_chars} 字符参考预算；"
             "候选已完整返回，未截断、未分批。"
             "人工确认后若要自动分集分镜，请先由管理员调整拆解服务预算。"
         )
@@ -475,8 +626,12 @@ def build_series_concept_plan(
     maximum_shot_duration_ms: int,
     model_identifier: str,
     timeout_seconds: float,
+    chat_request_options: dict[str, Any],
     configured_output_token_hint: int,
+    field_contract: dict[str, Any],
+    resource_advisory: dict[str, Any],
     attempt: int = 1,
+    require_all_bible_entities_used: bool = False,
 ) -> dict[str, Any]:
     """Build the deterministic series protocol without selecting a runtime.
 
@@ -485,36 +640,46 @@ def build_series_concept_plan(
     writes so the exact request can be persisted before a worker submits it.
     """
 
+    frozen_field_contract = validate_text_field_contract(
+        field_contract,
+        fields=SERIES_CONCEPT_FIELD_KEYS,
+        label="series_concept",
+    )
     idea = str(idea or "").strip()
     style_hint = str(style_hint or "").strip()
-    if not idea:
-        raise CreativeValidationError("请先输入创作想法", code="series_concept_idea_required")
-    if len(idea) > SERIES_CONCEPT_MAX_IDEA_CHARS:
-        raise CreativeValidationError(
-            f"创作想法不能超过 {SERIES_CONCEPT_MAX_IDEA_CHARS} 字符",
-            code="series_concept_idea_too_long",
-        )
-    if len(style_hint) > SERIES_CONCEPT_MAX_STYLE_HINT_CHARS:
-        raise CreativeValidationError(
-            f"风格提示不能超过 {SERIES_CONCEPT_MAX_STYLE_HINT_CHARS} 字符",
-            code="series_concept_style_hint_too_long",
-        )
+    for value, field, label, required_code, length_code in (
+        (idea, "idea", "创作想法", "series_concept_idea_required", "series_concept_idea_too_long"),
+        (style_hint, "style_hint", "风格提示", "series_concept_style_hint_required", "series_concept_style_hint_too_long"),
+    ):
+        rule = text_field_rule(frozen_field_contract, field)
+        if rule["required"] and not value:
+            raise SeriesConceptDraftValidationError(f"{label}不能为空", code=required_code)
+        if len(value) > int(rule["max_chars"]):
+            raise SeriesConceptDraftValidationError(
+                f"{label}不能超过 {int(rule['max_chars'])} 字符",
+                code=length_code,
+            )
+        if rule["single_line"] and any(character in value for character in "\r\n\t"):
+            raise SeriesConceptDraftValidationError(
+                f"{label}必须是单行文本",
+                code=length_code,
+            )
     for value, label, code in (
         (episode_count, "计划集数", "series_concept_episode_count_invalid"),
         (shots_per_episode, "每集镜数", "series_concept_shots_per_episode_invalid"),
         (episode_duration_seconds, "单集时长", "series_concept_episode_duration_invalid"),
     ):
         if type(value) is not int or value < 1:
-            raise CreativeValidationError(f"{label}必须是正整数。", code=code)
+            raise SeriesConceptDraftValidationError(f"{label}必须是正整数。", code=code)
     if not (1 <= minimum_shot_duration_ms <= maximum_shot_duration_ms):
-        raise CreativeValidationError(
+        raise SeriesConceptDraftValidationError(
             "冻结的镜头时长范围无效。", code="series_concept_duration_policy_invalid",
         )
     total_shots = episode_count * shots_per_episode
     episode_duration_ms = episode_duration_seconds * 1_000
     minimum_episode_duration_ms = shots_per_episode * minimum_shot_duration_ms
     if minimum_episode_duration_ms > episode_duration_ms:
-        raise CreativeValidationError(
+        raise SeriesConceptDraftValidationError(
             "单集时长不足以容纳请求的镜头数；请增加单集时长或减少每集镜头数。",
             code="series_concept_episode_duration_infeasible",
             public_context={
@@ -534,12 +699,23 @@ def build_series_concept_plan(
         minimum_shot_duration_ms=minimum_shot_duration_ms,
         maximum_shot_duration_ms=maximum_shot_duration_ms,
     )
-    normalized_attempt = max(1, min(int(attempt), 100))
+    if type(attempt) is not int or attempt < 1:
+        raise SeriesConceptDraftValidationError(
+            "剧本候选 attempt 必须是正整数。",
+            code="series_concept_attempt_invalid",
+        )
+    if type(configured_output_token_hint) is not int or configured_output_token_hint < 1:
+        raise SeriesConceptDraftValidationError(
+            "模型输出建议量必须是正整数。",
+            code="series_concept_output_hint_invalid",
+        )
+    normalized_attempt = attempt
     resource_estimate = _resource_estimate(
         idea=idea,
         style_hint=style_hint,
         total_shots=total_shots,
-        configured_output_token_hint=max(1, int(configured_output_token_hint)),
+        configured_output_token_hint=configured_output_token_hint,
+        resource_advisory=resource_advisory,
     )
     request = {
         "operation": SERIES_CONCEPT_DRAFT_OPERATION,
@@ -558,6 +734,7 @@ def build_series_concept_plan(
         "seed": int(fingerprint[:8], 16) + normalized_attempt,
         "model_id": str(model_identifier),
         "timeout_seconds": float(timeout_seconds),
+        CHAT_REQUEST_OPTIONS_KEY: deepcopy(chat_request_options),
     }
     return {
         "schema_version": 1,
@@ -568,6 +745,8 @@ def build_series_concept_plan(
         "episode_duration_seconds": episode_duration_seconds,
         "minimum_shot_duration_ms": minimum_shot_duration_ms,
         "maximum_shot_duration_ms": maximum_shot_duration_ms,
+        "field_contract": frozen_field_contract,
+        "require_all_bible_entities_used": bool(require_all_bible_entities_used),
         "resource_estimate": resource_estimate,
     }
 
@@ -578,6 +757,11 @@ def finalize_series_concept_draft(
     """Strictly validate one provider result and deterministically render it."""
 
     fingerprint = str(plan["source_fingerprint"])
+    field_contract = validate_text_field_contract(
+        plan.get("field_contract"),
+        fields=SERIES_CONCEPT_FIELD_KEYS,
+        label="series_concept frozen plan",
+    )
     candidate = _validated_candidate(
         runtime_payload,
         fingerprint=fingerprint,
@@ -585,6 +769,10 @@ def finalize_series_concept_draft(
         shots_per_episode=int(plan["shots_per_episode"]),
         minimum_shot_duration_ms=int(plan["minimum_shot_duration_ms"]),
         maximum_shot_duration_ms=int(plan["maximum_shot_duration_ms"]),
+        field_contract=field_contract,
+        require_all_bible_entities_used=bool(
+            plan.get("require_all_bible_entities_used")
+        ),
     )
     episode_duration_ms = int(plan["episode_duration_seconds"]) * 1_000
     episode_totals, adjusted_episode_count = _fit_episode_duration_budgets(
@@ -630,192 +818,4 @@ def finalize_series_concept_draft(
         },
         "resource_estimate": dict(plan["resource_estimate"]),
         "warnings": warnings,
-    }
-
-
-def generate_series_concept_draft(
-    *,
-    idea: str,
-    provider: str,
-    episode_count: int,
-    shots_per_episode: int,
-    episode_duration_seconds: int | None = None,
-    style_hint: str = "",
-    attempt: int = 1,
-) -> dict[str, Any]:
-    """Generate one detached candidate; all authoritative rows remain untouched."""
-
-    idea = str(idea or "").strip()
-    style_hint = str(style_hint or "").strip()
-    if not idea:
-        raise CreativeValidationError("请先输入创作想法", code="series_concept_idea_required")
-    if len(idea) > SERIES_CONCEPT_MAX_IDEA_CHARS:
-        raise CreativeValidationError(
-            f"创作想法不能超过 {SERIES_CONCEPT_MAX_IDEA_CHARS} 字符",
-            code="series_concept_idea_too_long",
-        )
-    if len(style_hint) > SERIES_CONCEPT_MAX_STYLE_HINT_CHARS:
-        raise CreativeValidationError(
-            f"风格提示不能超过 {SERIES_CONCEPT_MAX_STYLE_HINT_CHARS} 字符",
-            code="series_concept_style_hint_too_long",
-        )
-    if type(episode_count) is not int or episode_count < 1:
-        raise CreativeValidationError(
-            "计划集数必须是正整数。",
-            code="series_concept_episode_count_invalid",
-        )
-    if type(shots_per_episode) is not int or shots_per_episode < 1:
-        raise CreativeValidationError(
-            "每集镜数必须是正整数。",
-            code="series_concept_shots_per_episode_invalid",
-        )
-    if episode_duration_seconds is None:
-        episode_duration_seconds = int(
-            settings.SERIES_CONCEPT_DEFAULT_EPISODE_DURATION_SECONDS
-        )
-    if type(episode_duration_seconds) is not int or episode_duration_seconds < 1:
-        raise CreativeValidationError(
-            "单集时长必须是正整数秒。",
-            code="series_concept_episode_duration_invalid",
-        )
-
-    minimum_shot_duration_ms = int(settings.LEGACY_VIDEO_SHOT_MIN_DURATION_MS)
-    maximum_shot_duration_ms = int(settings.LEGACY_VIDEO_SHOT_MAX_DURATION_MS)
-    episode_duration_ms = episode_duration_seconds * 1_000
-    total_shots = episode_count * shots_per_episode
-    minimum_episode_duration_ms = shots_per_episode * minimum_shot_duration_ms
-    if minimum_episode_duration_ms > episode_duration_ms:
-        raise CreativeValidationError(
-            "单集时长不足以容纳请求的镜头数；请增加单集时长或减少每集镜头数。",
-            code="series_concept_episode_duration_infeasible",
-            public_context={
-                "episode_count": episode_count,
-                "shots_per_episode": shots_per_episode,
-                "total_shots": total_shots,
-                "episode_duration_seconds": episode_duration_seconds,
-                "minimum_episode_duration_seconds": (
-                    minimum_episode_duration_ms + 999
-                ) // 1_000,
-            },
-        )
-    selected_provider = normalise_creative_provider(provider)
-    config = creative_provider_config(selected_provider)
-    configured_output_token_hint = (
-        int(config["series_concept_max_tokens"])
-        if selected_provider == "deepseek_api"
-        else int(config["max_output_tokens"])
-    )
-    resource_estimate = _resource_estimate(
-        idea=idea,
-        style_hint=style_hint,
-        total_shots=total_shots,
-        configured_output_token_hint=configured_output_token_hint,
-    )
-    fingerprint = _source_fingerprint(
-        idea=idea,
-        style_hint=style_hint,
-        episode_count=episode_count,
-        shots_per_episode=shots_per_episode,
-        episode_duration_seconds=episode_duration_seconds,
-        minimum_shot_duration_ms=minimum_shot_duration_ms,
-        maximum_shot_duration_ms=maximum_shot_duration_ms,
-    )
-    normalized_attempt = max(1, min(int(attempt), 100))
-    request: dict[str, Any] = {
-        "operation": SERIES_CONCEPT_DRAFT_OPERATION,
-        "request_id": f"{fingerprint[:20]}-{normalized_attempt}",
-        "source_fingerprint": fingerprint,
-        "idea": idea,
-        "style_hint": style_hint,
-        "options": {
-            "episode_count": episode_count,
-            "shots_per_episode": shots_per_episode,
-            "minimum_duration_ms": minimum_shot_duration_ms,
-            "maximum_duration_ms": maximum_shot_duration_ms,
-            "episode_duration_ms": episode_duration_ms,
-        },
-        "attempt": normalized_attempt,
-        "seed": int(fingerprint[:8], 16) + normalized_attempt,
-        "model_id": config["model_id"],
-        "timeout_seconds": (
-            config["series_concept_timeout_seconds"]
-            if selected_provider == "deepseek_api"
-            else config["timeout_seconds"]
-        ),
-    }
-    if "model_dir" in config:
-        # Context size is the operator-selected physical runtime capacity.  The
-        # series protocol deliberately omits max_new_tokens, so llama-cpp may
-        # use every remaining token in that context instead of an estimate- or
-        # product-derived output cap.
-        request.update({
-            "model_dir": str(config["model_dir"]),
-            "device": config["device"],
-            "gpu_layers": config["gpu_layers"],
-            "context_size": int(config["context_size"]),
-        })
-    runtime_payload = _run_provider_runtime(request, config, selected_provider)
-    candidate = _validated_candidate(
-        runtime_payload,
-        fingerprint=fingerprint,
-        episode_count=episode_count,
-        shots_per_episode=shots_per_episode,
-        minimum_shot_duration_ms=minimum_shot_duration_ms,
-        maximum_shot_duration_ms=maximum_shot_duration_ms,
-    )
-    episode_totals, adjusted_episode_count = _fit_episode_duration_budgets(
-        candidate["episodes"],
-        episode_duration_ms=episode_duration_ms,
-        minimum_shot_duration_ms=minimum_shot_duration_ms,
-    )
-    master_script = render_compatible_master_script(
-        candidate["bible"], candidate["episodes"],
-    )
-    candidate_warnings = _candidate_quality_warnings(
-        candidate, master_script=master_script,
-    )
-    has_dialogue = any(
-        bool(shot["dialogue"]["text"])
-        for episode in candidate["episodes"]
-        for shot in episode["shots"]
-    )
-    shot_durations_ms = [
-        [shot["duration_ms"] for shot in episode["shots"]]
-        for episode in candidate["episodes"]
-    ]
-    return {
-        "source_fingerprint": fingerprint,
-        "candidate": {
-            "title": candidate["title"],
-            "logline": candidate["logline"],
-            "master_script": master_script,
-            "bible": candidate["bible"],
-        },
-        "format": {
-            "schema_version": SERIES_CONCEPT_DRAFT_SCHEMA_VERSION,
-            "template_id": SERIES_CONCEPT_TEMPLATE_ID,
-            "compatible": True,
-            "episode_count": episode_count,
-            "shot_count": total_shots,
-            "episode_duration_seconds": episode_duration_seconds,
-            "total_duration_ms": sum(episode_totals),
-            "shot_durations_ms": shot_durations_ms,
-        },
-        "resource_estimate": resource_estimate,
-        "warnings": _runtime_warnings(
-            runtime_payload,
-            has_dialogue=has_dialogue,
-            adjusted_episode_count=adjusted_episode_count,
-            resource_estimate=resource_estimate,
-            script_char_count=len(master_script),
-            candidate_warnings=candidate_warnings,
-        ),
-        "runtime": {
-            "provider": selected_provider,
-            "model": str(config["model_id"]),
-            "transport": "remote_api" if selected_provider == "deepseek_api" else "local_process",
-            "elapsed_ms": runtime_payload.get("elapsed_ms"),
-            "review_required": True,
-            "persisted": False,
-        },
     }

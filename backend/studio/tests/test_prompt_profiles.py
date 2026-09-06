@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from studio.tests.reference_rendering_fixtures import LEGACY_H3_SELECTOR_TO_PRIMITIVE
+
 import hashlib
 import json
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
@@ -10,6 +13,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from studio.tests.reference_rendering_fixtures import FRAME_POLICY
 from studio.models import (
     Asset,
     CharacterBible,
@@ -25,17 +29,38 @@ from studio.models import (
     ProviderProfile,
     Shot,
 )
+from studio.platform_serializers import PromptProfileFieldRuleSerializer
+from studio.services.configuration import (
+    create_config_revision,
+    publish_config_revision,
+)
 from studio.services.json_contracts import assign_json_contract
 from studio.services.production_pipeline import compile_prompt_input
+from studio.services.prompt_generation_sources import (
+    PROMPT_GENERATION_SOURCE_VALUES,
+)
 from studio.services.prompt_profiles import (
+    CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
+    DECLARATIVE_SOURCE_PROJECTION_KEY,
+    PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
     PromptProfileError,
     PromptProfileResolutionError,
     assemble_prompt_profile,
     media_profile_sources,
     model_family_for_profile,
     publish_prompt_profile,
+    prompt_profile_contract_payload,
     refresh_prompt_profile_contract,
+    require_prompt_profile_binding,
     resolve_prompt_profile_binding,
+    validate_prompt_profile_binding,
+    validate_prompt_profile_source_projection,
+    validate_profile_rule,
+    verify_frozen_profile_reference,
+    verify_prompt_profile_contract,
+)
+from studio.services.source_projection_primitives import (
+    REFERENCE_CONTEXT_ENGINE_KEY,
 )
 from studio.services.prompt_quality_gate import evaluate_prompt_language_gate
 from studio.services.prompt_translation import (
@@ -46,7 +71,111 @@ from studio.services.prompt_translation import (
 )
 from studio.services.series_concept_drafts import build_series_concept_plan
 from studio.services.text_generation_queue import provider_payload
-from studio.tests.factories import build_story
+from studio.tests.factories import (
+    H3_REF2VA_OFFICIAL_RULE_SPECS,
+    build_story,
+    conditioning_contract,
+    series_concept_field_contract,
+    series_concept_resource_advisory,
+)
+
+
+def _video_conditioning_contract() -> dict:
+    modes = [
+        conditioning_contract("T2VA")["modes"][0],
+        conditioning_contract(
+            "I2VA", input_kind="frame_slots", first_frame=(0, 1),
+        )["modes"][0],
+        conditioning_contract(
+            "L2VA", input_kind="frame_slots", last_frame=(0, 1),
+        )["modes"][0],
+        conditioning_contract(
+            "FL2VA", input_kind="frame_slots",
+            first_frame=(0, 1), last_frame=(0, 1),
+        )["modes"][0],
+        conditioning_contract(
+            "Ref2VA",
+            input_kind="classified_references",
+            requires_bible=True,
+            entity_images=(0, 9),
+            reference_videos=(0, 3),
+            paired_video_audios=(0, 3),
+            reference_audios=(0, 3),
+        )["modes"][0],
+    ]
+    return {
+        "schema_version": 1,
+        "adapter_key": "media_conditioning_v1",
+        "modes": modes,
+    }
+
+
+def _static_reference_config_v2() -> dict:
+    return {
+        "schema_version": 2,
+        "static_reference_policy": {
+            "snapshot_selector": "initial",
+            "default_target_kind": "character",
+            "allow_context": {"default": False, "target_overrides": {}},
+            "context_source_selectors": ["request.environment"],
+            "transition_markers": [" changes to "],
+            "transition_patterns": [],
+            "context_clause_policy": {
+                "delimiters": [",", ";"],
+                "discard_markers": [],
+            },
+            "negative_token_exclusions": {},
+            "forbidden_markers": {
+                "always": [],
+                "when_context_disallowed": [],
+            },
+            "violation_action": "block",
+            "initial_snapshot_clause_policy": {
+                "delimiters": [",", ";"],
+                "initial_state_markers": [" initially ", " at first "],
+                "continuity_source_selector": "request.action",
+                "trailing_clause_action": "relocate_to_continuity",
+            },
+        },
+    }
+
+
+def _h3_quality_projection_config() -> dict:
+    return {
+        "schema_version": 1,
+        "classified_reference_context_policy": {
+            "retention_analysis": {
+                "include_subject_shot_usage": True,
+                "assignment_separator": " - ",
+            },
+            "detailed_description": {
+                "style_opening_placement": "before_first_shot",
+                "style_opening_max_sentences": 2,
+                "subject_reference_placement": "first_clear_appearance",
+            },
+        },
+        "quality_advisories": {
+            "schema_version": 1,
+            "positive_negative_token_overlap": {
+                "minimum_shared_tokens": 6,
+                "minimum_overlap_ratio": 0.65,
+            },
+            "short_shot_action_density": {
+                "maximum_duration_ms": 5_500,
+                "maximum_action_characters": 420,
+                "minimum_clause_separators": 6,
+            },
+            "motion_camera_reference_guidance": {
+                "minimum_english_words": 5,
+                "generic_values": ["reference video", "workflow smoke fixture"],
+            },
+        },
+    }
+
+
+def _h3_declarative_projection_config() -> dict:
+    from studio.tests.reference_rendering_fixtures import rendering_config
+    return rendering_config()
 
 
 class PromptProfileServiceTests(TestCase):
@@ -84,6 +213,7 @@ class PromptProfileServiceTests(TestCase):
         family="minimax_h3",
         operation="video.generate",
         mode="T2VA",
+        source_projection_key="direct_v1",
         review_state=PromptProfileVersion.ReviewState.READY,
     ):
         profile = PromptProfileVersion.objects.create(
@@ -93,6 +223,7 @@ class PromptProfileServiceTests(TestCase):
             model_family=family,
             operation=operation,
             mode=mode,
+            source_projection_key=source_projection_key,
             review_state=review_state,
         )
         refresh_prompt_profile_contract(profile)
@@ -111,6 +242,7 @@ class PromptProfileServiceTests(TestCase):
             profile_version=profile,
             field_definition=definition,
             source_selector=selector,
+            generation_source_selector=selector,
             channel=channel,
             position=position,
             max_chars=4000,
@@ -169,7 +301,36 @@ class PromptProfileServiceTests(TestCase):
         )
         assign_json_contract(model, "specification", {
             "schema_version": 1,
+            "model_family": "deepseek",
             "capabilities": list(capabilities),
+        })
+        model.save()
+        return model
+
+    def _video_model_profile(self):
+        provider = ProviderProfile(
+            key="qa-explicit-video-provider",
+            name="QA Explicit Video Provider",
+            driver_type=ProviderProfile.DriverType.COMFYUI,
+            modalities="video",
+            operations="health,object_info,submit,poll,cancel,collect",
+            is_active=True,
+        )
+        assign_json_contract(provider, "driver_config", {})
+        provider.save()
+        model = ModelProfileVersion(
+            profile_key="qa-explicit-video-model",
+            version=1,
+            provider=provider,
+            model_identifier="qa-configured-video-v1",
+            modality=ModelProfileVersion.Modality.VIDEO,
+            status=ModelProfileVersion.Status.PUBLISHED,
+        )
+        assign_json_contract(model, "specification", {
+            "schema_version": 1,
+            "model_family": "minimax_h3",
+            "capabilities": ["video.generate"],
+            "conditioning_contract": _video_conditioning_contract(),
         })
         model.save()
         return model
@@ -224,6 +385,351 @@ class PromptProfileServiceTests(TestCase):
         with self.assertRaisesRegex(ValidationError, "未授权 selector"):
             assemble_prompt_profile(profile, sources={"__class__": "unsafe"})
 
+    def test_custom_operation_publish_requires_capability_and_exact_binding(self):
+        operation = "storyboard.render_v2"
+        family = "fictional_story_model"
+        definition = self._field(key="qa_custom_operation_theme")
+        profile = self._profile(
+            "qa.fictional.storyboard-render",
+            family=family,
+            operation=operation,
+            mode="",
+        )
+        self._rule(profile, definition)
+
+        with self.assertRaises(PromptProfileError) as missing_evidence:
+            self._publish(profile)
+        self.assertEqual(
+            missing_evidence.exception.code,
+            "prompt_profile_operation_evidence_missing",
+        )
+
+        model = self._model_profile(capabilities=(operation,))
+        assign_json_contract(model, "specification", {
+            "schema_version": 1,
+            "model_family": family,
+            "capabilities": [operation],
+        })
+        model.save()
+        profile = self._publish(profile)
+
+        generic_binding = PromptProfileBinding(
+            key="qa.fictional.storyboard-render.generic",
+            name="Unsafe generic custom binding",
+            operation=operation,
+            model_family=family,
+            mode="",
+            prompt_profile_version=profile,
+            is_active=True,
+        )
+        with self.assertRaises(PromptProfileError) as generic_rejected:
+            validate_prompt_profile_binding(generic_binding)
+        self.assertEqual(
+            generic_rejected.exception.code,
+            "prompt_profile_custom_operation_exact_model_required",
+        )
+
+        exact_binding = PromptProfileBinding.objects.create(
+            key="qa.fictional.storyboard-render.exact",
+            name="Exact custom binding",
+            operation=operation,
+            model_family=family,
+            mode="",
+            model_profile_version=model,
+            prompt_profile_version=profile,
+            is_active=True,
+        )
+        validate_prompt_profile_binding(exact_binding)
+        self.assertIsNone(resolve_prompt_profile_binding(
+            operation=operation,
+            model_family=family,
+        ))
+        self.assertEqual(
+            require_prompt_profile_binding(
+                operation=operation,
+                model_family=family,
+                model_profile_version=model,
+            ).binding.pk,
+            exact_binding.pk,
+        )
+
+    def test_provider_description_is_not_evidence_but_registered_driver_capability_is(self):
+        operation = "narrative.direct_v1"
+        provider = ProviderProfile(
+            key="qa-operation-evidence-provider",
+            name="QA operation evidence provider",
+            driver_type=ProviderProfile.DriverType.DEEPSEEK_API,
+            modalities="text",
+            operations=operation,
+            is_active=True,
+        )
+        assign_json_contract(provider, "driver_config", {})
+        provider.save()
+        profile = self._profile(
+            "qa.provider-operation-evidence",
+            family="fictional_provider_family",
+            operation=operation,
+            mode="",
+        )
+        self._rule(profile, self._field(key="qa_provider_operation_theme"))
+
+        with self.assertRaises(PromptProfileError) as descriptive_only:
+            self._publish(profile)
+        self.assertEqual(
+            descriptive_only.exception.code,
+            "prompt_profile_operation_evidence_missing",
+        )
+
+        registered_driver = SimpleNamespace(
+            capabilities=lambda: {
+                "schema_version": 1,
+                "operations": [operation],
+            },
+        )
+        with patch(
+            "studio.services.provider_registry.driver_for",
+            return_value=registered_driver,
+        ):
+            published = self._publish(profile)
+        self.assertEqual(published.status, PromptProfileVersion.Status.PUBLISHED)
+
+    def test_classified_projection_is_read_only_and_cannot_be_executed_or_published(self):
+        subject = self._field(key="qa_ref2va_subject")
+        profile = self._profile(
+            "qa.minimax.ref2va.context-ir",
+            mode="Ref2VA",
+            source_projection_key="classified_reference_context_ir_v1",
+        )
+        self._rule(profile, subject, selector="request.subject", position=1)
+
+        with self.assertRaises(PromptProfileError) as missing:
+            validate_prompt_profile_source_projection(profile)
+        self.assertEqual(
+            missing.exception.code,
+            "prompt_profile_source_projection_unregistered",
+        )
+
+        profile.field_rules.all().delete()
+        for position, (selector, field_key, label_style) in enumerate(
+            H3_REF2VA_OFFICIAL_RULE_SPECS,
+            start=1,
+        ):
+            definition = PromptFieldDefinition.objects.get(key=field_key)
+            PromptProfileFieldRule.objects.create(
+                profile_version=profile,
+                field_definition=definition,
+                source_selector=selector,
+                channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+                position=position,
+                label_style=label_style,
+                separator=PromptProfileFieldRule.Separator.NEWLINE,
+                required=True,
+                omit_if_empty=False,
+                max_chars=7000,
+            )
+        refresh_prompt_profile_contract(profile)
+
+        with self.assertRaises(PromptProfileError) as unavailable:
+            validate_prompt_profile_source_projection(profile)
+        self.assertEqual(unavailable.exception.code, "prompt_profile_source_projection_unregistered")
+        with self.assertRaises(PromptProfileError) as runtime_only:
+            self._publish(profile)
+        self.assertEqual(
+            runtime_only.exception.code,
+            "prompt_profile_source_projection_runtime_only",
+        )
+
+    def test_declarative_projection_final_shape_and_generation_split_are_configured(self):
+        profile = self._profile(
+            "qa.configured.declarative-context",
+            mode="Ref2VA",
+            source_projection_key=DECLARATIVE_SOURCE_PROJECTION_KEY,
+        )
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = _h3_declarative_projection_config()
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+        configured = list(reversed(H3_REF2VA_OFFICIAL_RULE_SPECS))
+        projected_values: dict[str, str] = {}
+        for position, (selector, _canonical_key, _canonical_label) in enumerate(
+            configured,
+            start=1,
+        ):
+            field_key = f"qa_configured_section_{position}"
+            definition = self._field(key=field_key, label=f"Configured {position}")
+            model_generated = position in {1, 4}
+            PromptProfileFieldRule.objects.create(
+                profile_version=profile,
+                field_definition=definition,
+                source_selector=(
+                    PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
+                ),
+                projection_primitive=(
+                    LEGACY_H3_SELECTOR_TO_PRIMITIVE[selector]
+                ),
+                channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+                position=position,
+                label_style=(
+                    PromptProfileFieldRule.LabelStyle.BRACKETED
+                    if position % 2 else PromptProfileFieldRule.LabelStyle.NONE
+                ),
+                separator=(
+                    PromptProfileFieldRule.Separator.SEMICOLON
+                    if position % 2 else PromptProfileFieldRule.Separator.SPACE
+                ),
+                required=position != 2,
+                omit_if_empty=position == 2,
+                max_chars=7000,
+                generation_mode=(
+                    PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
+                    if model_generated
+                    else PromptProfileFieldRule.GenerationMode.SERVER_LOCKED
+                ),
+                generation_source_selector=(
+                    "shot.narrative"
+                    if model_generated
+                    else PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
+                ),
+                generation_instruction=(
+                    "Return this configured field from the frozen source facts."
+                    if model_generated else ""
+                ),
+                generation_output_semantics=(
+                    PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+                ),
+                generation_required=model_generated,
+                language_policy="any",
+            )
+            projected_values[field_key] = f"VALUE-{position}"
+
+        first_rule = profile.field_rules.get(position=1)
+        first_rule.generation_output_semantics = (
+            PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
+        )
+        first_rule.generation_source_selector = (
+            PromptProfileFieldRule.SourceSelector.REQUEST_THEME
+        )
+        first_rule.save(update_fields=(
+            "generation_output_semantics",
+            "generation_source_selector",
+            "updated_at",
+        ))
+        with self.assertRaises(PromptProfileError) as unsupported:
+            validate_prompt_profile_source_projection(profile)
+        self.assertEqual(
+            unsupported.exception.code,
+            "prompt_profile_projection_contribution_unsupported",
+        )
+        first_rule.generation_output_semantics = (
+            PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+        )
+        first_rule.generation_source_selector = "shot.narrative"
+        first_rule.save(update_fields=(
+            "generation_output_semantics",
+            "generation_source_selector",
+            "updated_at",
+        ))
+        refresh_prompt_profile_contract(profile)
+
+        published = self._publish(profile)
+        assembled = assemble_prompt_profile(
+            published,
+            sources={
+                PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT: (
+                    projected_values
+                ),
+            },
+        )
+
+        self.assertEqual(
+            [row["field_key"] for row in assembled["trace"]],
+            [f"qa_configured_section_{index}" for index in range(1, 7)],
+        )
+        self.assertTrue(assembled["channels"]["positive_prompt"].startswith(
+            "[qa_configured_section_1] VALUE-1",
+        ))
+        self.assertIn("VALUE-2", assembled["channels"]["positive_prompt"])
+        self.assertEqual(
+            list(assembled["structured_fields"]),
+            [f"qa_configured_section_{index}" for index in range(1, 7)],
+        )
+
+    def test_direct_projection_rejects_contribution_rule_before_publish(self):
+        profile = self._profile("qa.direct.contribution")
+        rule = self._rule(profile, self._field(key="qa_direct_contribution"))
+        rule.generation_output_semantics = (
+            PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
+        )
+
+        with self.assertRaises(PromptProfileError) as blocked:
+            validate_profile_rule(rule)
+
+        self.assertEqual(
+            blocked.exception.code,
+            "prompt_profile_source_projection_semantics_invalid",
+        )
+
+    def test_ref2va_context_ir_guard_does_not_affect_other_modes_or_operations(self):
+        video_field = self._field(key="qa_other_video_mode_subject")
+        t2va = self._profile("qa.minimax.other-mode", mode="T2VA")
+        self._rule(t2va, video_field, selector="request.subject")
+
+        image_field = self._field(key="qa_other_operation_theme")
+        image = self._profile(
+            "qa.sdxl.other-operation",
+            family="sdxl",
+            operation="image.generate",
+            mode="",
+        )
+        self._rule(image, image_field, selector="request.theme")
+
+        self.assertEqual(
+            self._publish(t2va).status,
+            PromptProfileVersion.Status.PUBLISHED,
+        )
+        self.assertEqual(
+            self._publish(image).status,
+            PromptProfileVersion.Status.PUBLISHED,
+        )
+
+    def test_historical_ref2va_profile_remains_auditable_and_binding_can_deactivate(self):
+        subject = self._field(key="qa_historical_ref2va_subject")
+        profile = self._profile(
+            "qa.minimax.historical-ref2va",
+            mode="Ref2VA",
+            source_projection_key="classified_reference_context_ir_v1",
+        )
+        self._rule(profile, subject, selector="request.subject")
+        profile.status = PromptProfileVersion.Status.PUBLISHED
+        profile.save(update_fields=("status", "updated_at"))
+        binding = PromptProfileBinding.objects.create(
+            key="qa.minimax.historical-ref2va",
+            name="Historical Ref2VA binding",
+            operation="video.generate",
+            model_family="minimax_h3",
+            mode="Ref2VA",
+            prompt_profile_version=profile,
+            is_active=True,
+        )
+
+        verify_frozen_profile_reference(
+            profile,
+            binding_key=binding.key,
+            contract_sha256=profile.contract_sha256,
+        )
+        with self.assertRaises(PromptProfileError) as incompatible:
+            validate_prompt_profile_binding(binding)
+        self.assertEqual(
+            incompatible.exception.code,
+            "prompt_profile_source_projection_unregistered",
+        )
+
+        binding.is_active = False
+        validate_prompt_profile_binding(binding)
+
     def test_model_channels_use_stable_keys_not_localized_display_labels(self):
         theme = self._field(
             key="qa_localized_cinematic_theme",
@@ -240,6 +746,7 @@ class PromptProfileServiceTests(TestCase):
             profile_version=profile,
             field_definition=theme,
             source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+            generation_source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
             channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
             position=1,
             label_style=PromptProfileFieldRule.LabelStyle.LABEL_COLON,
@@ -248,6 +755,7 @@ class PromptProfileServiceTests(TestCase):
             profile_version=profile,
             field_definition=negative,
             source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+            generation_source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
             channel=PromptProfileFieldRule.Channel.NEGATIVE_PROMPT,
             position=2,
             label_style=PromptProfileFieldRule.LabelStyle.BRACKETED,
@@ -298,6 +806,901 @@ class PromptProfileServiceTests(TestCase):
             "[qa_label_invariant_camera_movement] slow lateral tracking shot",
         )
 
+    def test_schema_v5_contract_hash_includes_generation_context_and_projection_policy(self):
+        definition = self._field(key="qa_generation_contract")
+        profile = self._profile("qa.generic.generation-contract")
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.channel_limits = {
+            "positive_prompt": {"max_chars": 7000, "warn_at_chars": 6200},
+        }
+        rule = PromptProfileFieldRule.objects.create(
+            profile_version=profile,
+            field_definition=definition,
+            source_selector=PromptProfileFieldRule.SourceSelector.SHOT_DETAIL,
+            channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+            position=1,
+            generation_mode=PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
+            generation_source_selector="shot.narrative",
+            generation_instruction="Expand the frozen narrative into visible shot prose.",
+            generation_required=True,
+            language_policy="en",
+            length_unit=PromptProfileFieldRule.LengthUnit.ENGLISH_WORDS,
+            generation_min=140,
+            generation_max=220,
+            generation_validator_keys=[
+                PromptProfileFieldRule.GenerationValidator.NON_EMPTY,
+                PromptProfileFieldRule.GenerationValidator.NO_CONTROL_CHARACTERS,
+            ],
+            generation_context_selectors=[
+                PromptProfileFieldRule.GenerationContextSelector.PROJECT_STYLE,
+                PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_CORE,
+            ],
+        )
+        validate_profile_rule(rule)
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        first_hash = profile.contract_sha256
+        payload = prompt_profile_contract_payload(profile)
+
+        self.assertEqual(
+            payload["schema_version"],
+            PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        self.assertEqual(payload["source_projection_config"], {})
+        self.assertEqual(
+            payload["channel_limits"]["positive_prompt"],
+            {"max_chars": 7000, "warn_at_chars": 6200},
+        )
+        self.assertEqual(
+            payload["rules"][0]["generation_mode"],
+            "model_generated",
+        )
+        self.assertEqual(
+            payload["rules"][0]["generation_validator_keys"],
+            ["non_empty", "no_control_characters"],
+        )
+        self.assertEqual(
+            payload["rules"][0]["generation_context_selectors"],
+            ["project.style", "target_shot.core"],
+        )
+
+        rule.generation_max = 240
+        rule.save(update_fields=("generation_max", "updated_at"))
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        self.assertNotEqual(profile.contract_sha256, first_hash)
+
+        second_hash = profile.contract_sha256
+        rule.generation_context_selectors = ["target_shot.core"]
+        rule.save(update_fields=("generation_context_selectors", "updated_at"))
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        self.assertNotEqual(profile.contract_sha256, second_hash)
+
+    def test_quality_advisories_are_strict_and_change_frozen_contract_hash(self):
+        profile = self._profile(
+            "qa.minimax.ref2va-quality-advisories",
+            mode="Ref2VA",
+            source_projection_key=CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
+        )
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = _h3_quality_projection_config()
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+        refresh_prompt_profile_contract(profile)
+        first_hash = profile.contract_sha256
+        payload = prompt_profile_contract_payload(profile)
+        self.assertEqual(
+            payload["source_projection_config"]["quality_advisories"],
+            _h3_quality_projection_config()["quality_advisories"],
+        )
+
+        profile.source_projection_config[
+            "quality_advisories"
+        ]["short_shot_action_density"]["maximum_action_characters"] = 421
+        profile.save(update_fields=("source_projection_config", "updated_at"))
+        refresh_prompt_profile_contract(profile)
+        self.assertNotEqual(profile.contract_sha256, first_hash)
+
+        profile.source_projection_config[
+            "quality_advisories"
+        ]["short_shot_action_density"]["unknown_threshold"] = 1
+        with self.assertRaises(PromptProfileError) as unknown:
+            refresh_prompt_profile_contract(profile)
+        self.assertEqual(
+            unknown.exception.code,
+            "prompt_profile_source_projection_config_invalid",
+        )
+
+        profile.source_projection_config = _h3_quality_projection_config()
+        profile.source_projection_config[
+            "quality_advisories"
+        ]["positive_negative_token_overlap"]["minimum_overlap_ratio"] = "0.65"
+        with self.assertRaises(PromptProfileError) as invalid_type:
+            refresh_prompt_profile_contract(profile)
+        self.assertEqual(
+            invalid_type.exception.code,
+            "prompt_profile_source_projection_config_invalid",
+        )
+
+    def test_generation_instruction_has_no_arbitrary_field_limit_but_contract_is_bounded(self):
+        definition = self._field(key="qa_long_generation_instruction")
+        profile = self._profile("qa.generic.long-generation-instruction")
+        long_instruction = (
+            "Use only the frozen source facts and preserve every declared constraint. "
+            + " ".join(
+                ["Describe the requested field deterministically."] * 110,
+            )
+        )
+        self.assertGreater(len(long_instruction), 4_000)
+        payload = {
+            "profile_version": profile.pk,
+            "field_definition": definition.pk,
+            "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
+            "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+            "position": 1,
+            "label_style": PromptProfileFieldRule.LabelStyle.LABEL_BLOCK,
+            "separator": PromptProfileFieldRule.Separator.NEWLINE,
+            "required": True,
+            "omit_if_empty": False,
+            "max_chars": 7_000,
+            "generation_mode": PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
+            "generation_source_selector": "shot.detailed_description",
+            "generation_instruction": long_instruction,
+            "generation_output_semantics": (
+                PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+            ),
+            "generation_required": True,
+            "language_policy": "en",
+            "length_unit": PromptProfileFieldRule.LengthUnit.NONE,
+            "generation_min": None,
+            "generation_max": None,
+            "generation_validator_keys": [
+                PromptProfileFieldRule.GenerationValidator.NON_EMPTY,
+            ],
+            "generation_context_selectors": [],
+        }
+        serializer = PromptProfileFieldRuleSerializer(data=payload)
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        rule = serializer.save()
+        rule.full_clean()
+        profile.refresh_from_db()
+
+        self.assertEqual(rule.generation_instruction, long_instruction)
+        self.assertGreater(profile.contract_size_bytes, 4_000)
+        self.assertLessEqual(
+            profile.contract_size_bytes,
+            64 * 1024,
+        )
+        verify_prompt_profile_contract(profile)
+
+        oversized_definition = self._field(
+            key="qa_oversized_generation_instruction",
+        )
+        oversized_profile = self._profile(
+            "qa.generic.oversized-generation-instruction",
+        )
+        oversized_payload = {
+            **payload,
+            "profile_version": oversized_profile.pk,
+            "field_definition": oversized_definition.pk,
+            "generation_instruction": "A" * (64 * 1024),
+        }
+        oversized_serializer = PromptProfileFieldRuleSerializer(
+            data=oversized_payload,
+        )
+        self.assertTrue(oversized_serializer.is_valid(), oversized_serializer.errors)
+        with self.assertRaisesRegex(ValidationError, "JSON 载荷超过 65536 字节上限"):
+            oversized_serializer.save()
+        self.assertFalse(
+            PromptProfileFieldRule.objects.filter(
+                profile_version=oversized_profile,
+            ).exists(),
+        )
+
+    def test_channel_limits_warn_and_block_in_generic_final_assembler(self):
+        definition = self._field(key="qa_channel_limit")
+        profile = self._profile("qa.generic.channel-limit")
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.channel_limits = {
+            "positive_prompt": {"max_chars": 100, "warn_at_chars": 20},
+        }
+        profile.save(update_fields=(
+            "contract_schema_version", "channel_limits", "updated_at",
+        ))
+        rule = self._rule(profile, definition)
+        rule.generation_mode = PromptProfileFieldRule.GenerationMode.PASSTHROUGH
+        rule.generation_source_selector = rule.source_selector
+        rule.generation_required = True
+        rule.language_policy = "any"
+        rule.length_unit = PromptProfileFieldRule.LengthUnit.NONE
+        rule.save(update_fields=(
+            "generation_mode", "generation_source_selector",
+            "generation_required", "language_policy", "length_unit", "updated_at",
+        ))
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+
+        assembled = assemble_prompt_profile(
+            profile,
+            sources={"request.theme": "x" * 25},
+            allow_draft=True,
+        )
+        audit = assembled["channel_audit"]["positive_prompt"]
+        self.assertEqual(audit["status"], "warning")
+        self.assertEqual(audit["max_chars"], 100)
+        self.assertEqual(len(assembled["warnings"]), 1)
+
+        profile.channel_limits = {
+            "positive_prompt": {"max_chars": 10, "warn_at_chars": 8},
+        }
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        with self.assertRaises(PromptProfileError) as blocked:
+            assemble_prompt_profile(
+                profile,
+                sources={"request.theme": "x" * 25},
+                allow_draft=True,
+            )
+        self.assertEqual(blocked.exception.code, "prompt_profile_channel_too_long")
+
+    def test_channel_limits_reject_unknown_channel_and_invalid_warning(self):
+        profile = self._profile("qa.generic.channel-limit-invalid")
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.channel_limits = {
+            "vendor_prompt": {"max_chars": 100, "warn_at_chars": 90},
+        }
+        with self.assertRaises(PromptProfileError) as unknown:
+            refresh_prompt_profile_contract(
+                profile,
+                schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+            )
+        self.assertEqual(
+            unknown.exception.code,
+            "prompt_profile_channel_limits_channel_unknown",
+        )
+
+        profile.channel_limits = {
+            "positive_prompt": {"max_chars": 100, "warn_at_chars": 101},
+        }
+        with self.assertRaises(PromptProfileError) as warning:
+            refresh_prompt_profile_contract(
+                profile,
+                schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+            )
+        self.assertEqual(
+            warning.exception.code,
+            "prompt_profile_channel_limit_warning_invalid",
+        )
+
+    def test_static_reference_policy_selects_initial_snapshot_and_target_context(self):
+        profile = self._profile(
+            "qa.image.static-reference",
+            family="qa-image",
+            operation="image.generate",
+            mode="",
+        )
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = {
+            "schema_version": 1,
+            "static_reference_policy": {
+                "snapshot_selector": "initial",
+                "default_target_kind": "character",
+                "allow_context": {
+                    "default": False,
+                    "target_overrides": {"scene": True},
+                },
+                "context_source_selectors": [
+                    "request.environment",
+                    "request.lighting",
+                    "request.color_palette",
+                ],
+                "transition_markers": [
+                    " and changes to ",
+                    " and changes once to ",
+                    "→",
+                ],
+                "transition_patterns": [{
+                    "kind": "from_to",
+                    "from_marker": " changes from ",
+                    "to_marker": " to ",
+                }],
+                "context_clause_policy": {
+                    "delimiters": [",", ";"],
+                    "discard_markers": [" held in ", " holding "],
+                },
+                "negative_token_exclusions": {
+                    "request.negative_constraints": ["readable text", "text"],
+                },
+                "forbidden_markers": {
+                    "always": [" both states "],
+                    "when_context_disallowed": [" holding ", " inside "],
+                },
+                "violation_action": "block",
+            },
+        }
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+        for position, (key, selector) in enumerate((
+            ("qa_static_subject", "request.subject"),
+            ("qa_static_environment", "request.environment"),
+            ("qa_static_lighting", "request.lighting"),
+            ("qa_static_color", "request.color_palette"),
+            ("qa_static_negative", "request.negative_constraints"),
+        ), start=1):
+            rule = self._rule(
+                profile,
+                self._field(key=key),
+                selector=selector,
+                position=position,
+            )
+            rule.generation_mode = PromptProfileFieldRule.GenerationMode.PASSTHROUGH
+            rule.generation_source_selector = selector
+            rule.generation_output_semantics = (
+                PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+            )
+            rule.language_policy = "inherit"
+            rule.length_unit = PromptProfileFieldRule.LengthUnit.NONE
+            if selector == "request.negative_constraints":
+                rule.channel = PromptProfileFieldRule.Channel.NEGATIVE_PROMPT
+            rule.save(update_fields=(
+                "channel",
+                "generation_mode",
+                "generation_source_selector",
+                "generation_output_semantics",
+                "language_policy",
+                "length_unit",
+                "updated_at",
+            ))
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        sources = {
+            "request.subject": (
+                "worn black access card, held in Zhou Lan's right hand; "
+                "one red numeral that begins as 03 and changes once to 02"
+            ),
+            "request.environment": "rainy office elevator",
+            "request.lighting": "cold white ceiling light",
+            "request.color_palette": "slate blue and red",
+            "request.negative_constraints": (
+                "readable text, subtitles, watermark, logo, text"
+            ),
+        }
+
+        prop = assemble_prompt_profile(
+            profile,
+            sources=sources,
+            projection_context={
+                "purpose": "static_reference",
+                "target_kind": "prop",
+            },
+            allow_draft=True,
+        )
+        self.assertEqual(
+            prop["structured_fields"],
+            {
+                "qa_static_subject": (
+                    "worn black access card; one red numeral that begins as 03"
+                ),
+                "qa_static_negative": "subtitles, watermark, logo",
+            },
+        )
+        self.assertEqual(
+            prop["source_projection"]["trimmed_selectors"],
+            ["request.subject"],
+        )
+        self.assertEqual(
+            prop["source_projection"]["removed_context_clauses"],
+            {"request.subject": ["held in"]},
+        )
+        self.assertEqual(
+            prop["source_projection"]["removed_negative_tokens"],
+            {"request.negative_constraints": ["readable text", "text"]},
+        )
+        self.assertEqual(
+            prop["source_projection"]["dropped_context_selectors"],
+            [
+                "request.environment",
+                "request.lighting",
+                "request.color_palette",
+            ],
+        )
+
+        scene = assemble_prompt_profile(
+            profile,
+            sources=sources,
+            projection_context={
+                "purpose": "static_reference",
+                "target_kind": "scene",
+            },
+            allow_draft=True,
+        )
+        self.assertTrue(scene["source_projection"]["context_allowed"])
+        self.assertEqual(
+            scene["structured_fields"]["qa_static_environment"],
+            "rainy office elevator",
+        )
+        self.assertNotIn("02", scene["channels"]["positive_prompt"])
+        self.assertEqual(
+            prompt_profile_contract_payload(profile)["source_projection_config"],
+            profile.source_projection_config,
+        )
+
+        from_to = assemble_prompt_profile(
+            profile,
+            sources={
+                **sources,
+                "request.subject": (
+                    "one red numeral that changes from '03' to '02'"
+                ),
+            },
+            projection_context={"target_kind": "prop"},
+            allow_draft=True,
+        )
+        self.assertIn("'03'", from_to["channels"]["positive_prompt"])
+        self.assertNotIn("'02'", from_to["channels"]["positive_prompt"])
+
+    def test_static_reference_policy_blocks_unresolved_relation_without_retrying(self):
+        profile = self._profile(
+            "qa.image.static-reference-block",
+            family="qa-image",
+            operation="image.generate",
+            mode="",
+        )
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = {
+            "schema_version": 1,
+            "static_reference_policy": {
+                "snapshot_selector": "initial",
+                "default_target_kind": "character",
+                "allow_context": {"default": False, "target_overrides": {}},
+                "context_source_selectors": ["request.environment"],
+                "transition_markers": [" changes to "],
+                "transition_patterns": [],
+                "context_clause_policy": {
+                    "delimiters": [",", ";"],
+                    "discard_markers": [],
+                },
+                "negative_token_exclusions": {},
+                "forbidden_markers": {
+                    "always": [],
+                    "when_context_disallowed": [" holding "],
+                },
+                "violation_action": "block",
+            },
+        }
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+        subject_rule = self._rule(
+            profile,
+            self._field(key="qa_static_block_subject"),
+            selector="request.subject",
+            position=1,
+        )
+        environment_rule = self._rule(
+            profile,
+            self._field(key="qa_static_block_environment"),
+            selector="request.environment",
+            position=2,
+        )
+        for rule in (subject_rule, environment_rule):
+            rule.generation_mode = PromptProfileFieldRule.GenerationMode.PASSTHROUGH
+            rule.generation_source_selector = rule.source_selector
+            rule.generation_output_semantics = (
+                PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+            )
+            rule.language_policy = "inherit"
+            rule.length_unit = PromptProfileFieldRule.LengthUnit.NONE
+            rule.save(update_fields=(
+                "generation_mode",
+                "generation_source_selector",
+                "generation_output_semantics",
+                "language_policy",
+                "length_unit",
+                "updated_at",
+            ))
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+
+        with self.assertRaises(PromptProfileError) as blocked:
+            assemble_prompt_profile(
+                profile,
+                sources={
+                    "request.subject": "engineer holding an access card",
+                    "request.environment": "rainy elevator",
+                },
+                projection_context={"target_kind": "character"},
+                allow_draft=True,
+            )
+        self.assertEqual(
+            blocked.exception.code,
+            "static_reference_semantic_validation_failed",
+        )
+        self.assertIn("不会再次调用模型或无限重试", str(blocked.exception))
+
+    def test_static_reference_initial_clause_is_relocated_to_continuity_fact(self):
+        profile = self._profile(
+            "qa.image.static-reference-initial-clause",
+            family="qa-image",
+            operation="image.generate",
+            mode="",
+        )
+        for position, (key, selector) in enumerate((
+            ("qa_static_clause_subject", "request.subject"),
+            ("qa_static_clause_environment", "request.environment"),
+        ), start=1):
+            rule = self._rule(
+                profile,
+                self._field(key=key),
+                selector=selector,
+                position=position,
+            )
+            rule.generation_mode = PromptProfileFieldRule.GenerationMode.PASSTHROUGH
+            rule.generation_source_selector = selector
+            rule.generation_output_semantics = (
+                PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+            )
+            rule.language_policy = "inherit"
+            rule.length_unit = PromptProfileFieldRule.LengthUnit.NONE
+            rule.save(update_fields=(
+                "generation_mode",
+                "generation_source_selector",
+                "generation_output_semantics",
+                "language_policy",
+                "length_unit",
+                "updated_at",
+            ))
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = _static_reference_config_v2()
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        sources = {
+            "request.subject": (
+                "Palm-sized cyan-green seed pod, initially dark, "
+                "pulses once with glow"
+            ),
+            "request.environment": "underground seed vault",
+            "request.action": "carried through the second shot",
+        }
+
+        result = assemble_prompt_profile(
+            profile,
+            sources=sources,
+            projection_context={
+                "purpose": "static_reference",
+                "target_kind": "prop",
+            },
+            allow_draft=True,
+        )
+
+        self.assertEqual(
+            result["structured_fields"]["qa_static_clause_subject"],
+            "Palm-sized cyan-green seed pod; initially dark",
+        )
+        self.assertNotIn("pulses once", result["channels"]["positive_prompt"])
+        self.assertEqual(
+            sources["request.subject"],
+            "Palm-sized cyan-green seed pod, initially dark, pulses once with glow",
+        )
+        projection = result["source_projection"]
+        self.assertEqual(projection["trimmed_selectors"], ["request.subject"])
+        self.assertEqual(
+            projection["continuity_facts"],
+            {
+                "request.action": (
+                    "carried through the second shot; pulses once with glow"
+                ),
+            },
+        )
+        self.assertEqual(
+            projection["initial_clause_projections"],
+            {
+                "request.subject": {
+                    "matched_initial_markers": [" initially "],
+                    "relocated_clause_count": 1,
+                    "continuity_source_selector": "request.action",
+                    "continuity_facts": ["pulses once with glow"],
+                    "continuity_facts_sha256": projection[
+                        "initial_clause_projections"
+                    ]["request.subject"]["continuity_facts_sha256"],
+                },
+            },
+        )
+        self.assertRegex(
+            projection["initial_clause_projections"]["request.subject"][
+                "continuity_facts_sha256"
+            ],
+            r"^[0-9a-f]{64}$",
+        )
+
+    def test_static_reference_profile_cannot_consume_continuity_fact_selector(self):
+        profile = self._profile(
+            "qa.image.static-reference-continuity-consumer",
+            family="qa-image",
+            operation="image.generate",
+            mode="",
+        )
+        for position, (key, selector) in enumerate((
+            ("qa_static_consumer_subject", "request.subject"),
+            ("qa_static_consumer_environment", "request.environment"),
+            ("qa_static_consumer_action", "request.action"),
+        ), start=1):
+            rule = self._rule(
+                profile,
+                self._field(key=key),
+                selector=selector,
+                position=position,
+            )
+            rule.generation_mode = PromptProfileFieldRule.GenerationMode.PASSTHROUGH
+            rule.generation_source_selector = selector
+            rule.generation_output_semantics = (
+                PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+            )
+            rule.language_policy = "inherit"
+            rule.length_unit = PromptProfileFieldRule.LengthUnit.NONE
+            rule.save(update_fields=(
+                "generation_mode",
+                "generation_source_selector",
+                "generation_output_semantics",
+                "language_policy",
+                "length_unit",
+                "updated_at",
+            ))
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = _static_reference_config_v2()
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        with self.assertRaises(PromptProfileError) as blocked:
+            validate_prompt_profile_source_projection(profile)
+        self.assertEqual(
+            blocked.exception.code,
+            (
+                "prompt_profile_source_projection_config_"
+                "continuity_selector_consumed"
+            ),
+        )
+
+    def test_generation_contract_rejects_unsafe_source_and_unknown_validator(self):
+        definition = self._field(key="qa_generation_rejection")
+        profile = self._profile("qa.generic.generation-rejection")
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        rule = PromptProfileFieldRule(
+            profile_version=profile,
+            field_definition=definition,
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
+            channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+            position=1,
+            generation_mode=PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
+            generation_source_selector="shot.items[*].text",
+            generation_instruction="Expand the frozen narrative into visible shot prose.",
+            generation_required=True,
+            language_policy="en",
+            length_unit=PromptProfileFieldRule.LengthUnit.CHARACTERS,
+            generation_max=500,
+            generation_validator_keys=["non_empty"],
+        )
+        with self.assertRaises(PromptProfileError) as unsafe:
+            validate_profile_rule(rule)
+        self.assertEqual(unsafe.exception.code, "prompt_profile_generation_source_invalid")
+
+        rule.generation_source_selector = "shot.unregistered_source"
+        with self.assertRaises(PromptProfileError) as unregistered:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            unregistered.exception.code,
+            "prompt_profile_generation_source_unknown",
+        )
+
+        rule.generation_source_selector = "shot.narrative"
+        profile.operation = "script.generate"
+        with self.assertRaises(PromptProfileError) as unsupported_operation:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            unsupported_operation.exception.code,
+            "prompt_profile_generation_mode_operation_unsupported",
+        )
+        profile.operation = "video.generate"
+
+        rule.generation_mode = PromptProfileFieldRule.GenerationMode.SERVER_LOCKED
+        with self.assertRaises(PromptProfileError) as locked_mismatch:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            locked_mismatch.exception.code,
+            "prompt_profile_generation_source_mismatch",
+        )
+
+        rule.generation_mode = PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
+        rule.generation_context_selectors = "project.core"
+        with self.assertRaises(PromptProfileError) as bad_context_type:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            bad_context_type.exception.code,
+            "prompt_profile_generation_context_selectors_invalid",
+        )
+
+        rule.generation_context_selectors = ["project.core", "project.core"]
+        with self.assertRaises(PromptProfileError) as duplicate_context:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            duplicate_context.exception.code,
+            "prompt_profile_generation_context_selectors_invalid",
+        )
+
+        rule.generation_context_selectors = ["target_shot.everything"]
+        with self.assertRaises(PromptProfileError) as unknown_context:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            unknown_context.exception.code,
+            "prompt_profile_generation_context_selector_unknown",
+        )
+
+        rule.generation_context_selectors = []
+        rule.generation_validator_keys = ["custom_regex"]
+        with self.assertRaises(PromptProfileError) as unknown:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            unknown.exception.code,
+            "prompt_profile_generation_validator_unknown",
+        )
+
+        rule.generation_validator_keys = [
+            "protected_tokens_preserve_count",
+            "protected_tokens_at_least_once",
+        ]
+        with self.assertRaises(PromptProfileError) as conflicting:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            conflicting.exception.code,
+            "prompt_profile_generation_validators_inconsistent",
+        )
+
+        rule.generation_validator_keys = ["length_advisory"]
+        rule.length_unit = PromptProfileFieldRule.LengthUnit.NONE
+        rule.generation_min = None
+        rule.generation_max = None
+        with self.assertRaises(PromptProfileError) as advisory_without_range:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            advisory_without_range.exception.code,
+            "prompt_profile_generation_validators_inconsistent",
+        )
+
+        # Direct ORM writes cannot bypass the release gate: publication
+        # revalidates the complete frozen combination and fails closed.
+        rule.generation_validator_keys = ["custom_regex"]
+        rule.save()
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        with self.assertRaises(PromptProfileError) as publish_error:
+            publish_prompt_profile(profile, actor=self.actor)
+        self.assertEqual(
+            publish_error.exception.code,
+            "prompt_profile_generation_validator_unknown",
+        )
+
+    def test_contribution_requires_projection_output_and_compatible_primitive(self):
+        definition = self._field(key="qa_projection_contribution")
+        profile = self._profile(
+            "qa.configured.contribution-guard",
+            mode="Ref2VA",
+            source_projection_key=DECLARATIVE_SOURCE_PROJECTION_KEY,
+        )
+        profile.contract_schema_version = PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        profile.source_projection_config = _h3_declarative_projection_config()
+        profile.save(update_fields=(
+            "contract_schema_version",
+            "source_projection_config",
+            "updated_at",
+        ))
+        rule = PromptProfileFieldRule(
+            profile_version=profile,
+            field_definition=definition,
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
+            channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+            position=1,
+            max_chars=4000,
+            generation_mode=PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
+            generation_source_selector="shot.detailed_description",
+            generation_instruction="Produce the reviewed detailed direction contribution.",
+            generation_output_semantics=(
+                PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
+            ),
+            generation_required=True,
+            language_policy="en",
+            length_unit=PromptProfileFieldRule.LengthUnit.CHARACTERS,
+            generation_max=2000,
+            generation_validator_keys=["non_empty"],
+        )
+
+        with self.assertRaises(PromptProfileError) as missing_consumer:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            missing_consumer.exception.code,
+            "prompt_profile_projection_contribution_requires_projection_output",
+        )
+
+        rule.source_selector = PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
+        rule.projection_primitive = "reference_context.detailed_description"
+        rule.generation_source_selector = "shot.music"
+        with self.assertRaises(PromptProfileError) as incompatible_source:
+            validate_profile_rule(rule)
+        self.assertEqual(
+            incompatible_source.exception.code,
+            "prompt_profile_projection_contribution_unsupported",
+        )
+
+        rule.generation_source_selector = "shot.detailed_description"
+        validate_profile_rule(rule)
+
+    def test_legacy_draft_is_runtime_readable_but_current_write_and_publish_are_strict(self):
+        definition = self._field(key="qa_legacy_generation_source")
+        profile = self._profile("qa.legacy.generation-source")
+        self.assertLess(
+            profile.contract_schema_version,
+            PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        rule = self._rule(profile, definition)
+        rule.generation_source_selector = ""
+        rule.save(update_fields=("generation_source_selector", "updated_at"))
+
+        validate_profile_rule(rule)
+        with self.assertRaises(PromptProfileError) as current_write:
+            validate_profile_rule(
+                rule,
+                enforce_current_generation_source=True,
+            )
+        self.assertEqual(
+            current_write.exception.code,
+            "prompt_profile_generation_source_mismatch",
+        )
+
+        with self.assertRaises(PromptProfileError) as publish_error:
+            self._publish(profile)
+        self.assertEqual(
+            publish_error.exception.code,
+            "prompt_profile_generation_source_mismatch",
+        )
+
     def test_localized_display_label_does_not_block_english_media_prompt(self):
         _user, project, _character, _scene, _episode, shot, _shot2 = build_story(
             username="prompt-profile-localized-label-gate",
@@ -320,7 +1723,7 @@ class PromptProfileServiceTests(TestCase):
             name="localized display label gate",
             operation="video.generate",
             model_family="minimax_h3",
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             prompt_profile_version=profile,
         )
 
@@ -328,9 +1731,10 @@ class PromptProfileServiceTests(TestCase):
             project=project,
             shots=[shot],
             prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             include_audio=True,
             language_gate_mode="block",
+            model_profile_version=self._video_model_profile(),
         )
         report = evaluate_prompt_language_gate(SimpleNamespace(
             prompt_type=compiled.prompt_type,
@@ -384,7 +1788,13 @@ class PromptProfileServiceTests(TestCase):
             maximum_shot_duration_ms=6000,
             model_identifier="deepseek-test",
             timeout_seconds=30,
+            chat_request_options={
+                "temperature": 0.3,
+                "response_format": {"type": "json_object"},
+            },
             configured_output_token_hint=4096,
+            field_contract=series_concept_field_contract(),
+            resource_advisory=series_concept_resource_advisory(),
         )
         plan["prompt_profile_assembly"] = {
             "channels": {
@@ -513,18 +1923,39 @@ class PromptProfileServiceTests(TestCase):
 
         self.assertEqual(model_family_for_profile(model), "vendor_next_video")
 
+    def test_model_family_never_infers_from_vendor_or_model_identifier(self):
+        model = self._model_profile()
+        assign_json_contract(model, "specification", {
+            "schema_version": 1,
+            "capabilities": ["script.generate"],
+        })
+        model.save(update_fields=(
+            "specification", "specification_schema_version",
+            "specification_size_bytes", "specification_sha256", "updated_at",
+        ))
+
+        with self.assertRaises(PromptProfileResolutionError) as context:
+            model_family_for_profile(model)
+
+        self.assertEqual(
+            context.exception.code,
+            "prompt_profile_model_family_required",
+        )
+
     def test_media_compile_requires_binding_and_profile_is_the_only_semantic_path(self):
         user, project, _character, _scene, _episode, shot, _shot2 = build_story(
             username="prompt-profile-story",
         )
+        model = self._video_model_profile()
         with self.assertRaises(PromptProfileResolutionError) as context:
             compile_prompt_input(
                 project=project,
                 shots=[shot],
                 prompt_type="video",
-                mode=Shot.H3Mode.T2VA,
+                mode="T2VA",
                 include_audio=True,
                 language_gate_mode="warn",
+                model_profile_version=model,
             )
         self.assertEqual(context.exception.code, "prompt_profile_binding_missing")
 
@@ -544,9 +1975,10 @@ class PromptProfileServiceTests(TestCase):
             project=project,
             shots=[shot],
             prompt_type="video",
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             include_audio=True,
             language_gate_mode="warn",
+            model_profile_version=model,
         )
         self.assertEqual(compiled.prompt_profile_version.id, profile.id)
         self.assertEqual(compiled.prompt_profile_binding_key, binding.key)
@@ -557,6 +1989,162 @@ class PromptProfileServiceTests(TestCase):
         self.assertEqual(
             compiled.structured_payload["prompt_profile"]["contract_sha256"],
             profile.contract_sha256,
+        )
+
+    def test_ref2va_profile_compiles_official_context_ir_with_dialogue_and_voiceover(self):
+        _user, project, character, scene, _episode, shot, _shot2 = build_story(
+            username="prompt-profile-official-ref2va",
+        )
+        project.style.visual_prompt = "restrained rain-soaked detective noir"
+        project.style.save(update_fields=("visual_prompt", "updated_at"))
+        character.visual_identity = "a short-haired female detective with a mole below her left eye"
+        character.wardrobe = "a charcoal trench coat"
+        character.voice_profile = "a calm, low voice"
+        character.save(update_fields=(
+            "visual_identity", "wardrobe", "voice_profile", "updated_at",
+        ))
+        scene.visual_identity = "a narrow archive room with tall shelves and drifting dust"
+        scene.lighting = "a green desk lamp and intermittent lightning"
+        scene.ambient_sound = "rain against glass and a ticking wall clock"
+        scene.save(update_fields=(
+            "visual_identity", "lighting", "ambient_sound", "updated_at",
+        ))
+        shot.narrative = "The detective unfolds a burned letter on the desk."
+        shot.camera = "A slow overhead move settles into a close view of her face."
+        shot.sound_effects = "Dry paper scraping across the wooden desk."
+        shot.music = "Low restrained strings."
+        shot.conditioning_mode = "Ref2VA"
+        shot.dialogue = [
+            {
+                "speaker_id": "S1",
+                "text": "别碰那封信。",
+                "delivery": "in a controlled low whisper",
+                "voiceover": False,
+                "start_ms": 300,
+                "end_ms": 1500,
+            },
+            {
+                "speaker_id": "S1",
+                "text": "那晚的火并非意外。",
+                "delivery": "in a measured, reflective tone",
+                "voiceover": True,
+                "start_ms": 1800,
+                "end_ms": 3300,
+            },
+        ]
+        shot.save(update_fields=(
+            "narrative", "camera", "sound_effects", "music", "conditioning_mode", "dialogue",
+            "updated_at",
+        ))
+
+        profile = self._profile(
+            "qa.minimax.official-ref2va",
+            mode="Ref2VA",
+            source_projection_key=DECLARATIVE_SOURCE_PROJECTION_KEY,
+        )
+        profile.source_projection_config = _h3_declarative_projection_config()
+        profile.save(update_fields=("source_projection_config", "updated_at"))
+        for position, (selector, field_key, label_style) in enumerate(
+            H3_REF2VA_OFFICIAL_RULE_SPECS,
+            start=1,
+        ):
+            PromptProfileFieldRule.objects.create(
+                profile_version=profile,
+                field_definition=PromptFieldDefinition.objects.get(key=field_key),
+                source_selector=(
+                    PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
+                ),
+                projection_primitive=(
+                    LEGACY_H3_SELECTOR_TO_PRIMITIVE[selector]
+                ),
+                channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+                position=position,
+                label_style=label_style,
+                separator=PromptProfileFieldRule.Separator.NEWLINE,
+                required=True,
+                omit_if_empty=False,
+                max_chars=7000,
+                generation_mode=(
+                    PromptProfileFieldRule.GenerationMode.SERVER_LOCKED
+                ),
+                generation_source_selector=(
+                    PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
+                ),
+                generation_output_semantics=(
+                    PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+                ),
+                generation_required=True,
+                language_policy="any",
+            )
+        refresh_prompt_profile_contract(profile)
+        profile = self._publish(profile)
+        PromptProfileBinding.objects.create(
+            key="qa.minimax.official-ref2va",
+            name="official Ref2VA",
+            operation="video.generate",
+            model_family="minimax_h3",
+            mode="Ref2VA",
+            prompt_profile_version=profile,
+        )
+
+        resolved_character_binding = {
+            "category": "character",
+            "entity_id": str(character.id),
+            "entity_name": character.name,
+            "asset_id": str(character.anchor_asset_id),
+            "id": str(character.anchor_asset_id),
+            "name": "reviewed canonical portrait",
+            "description": "",
+            "prompt_hint": "",
+            "media_metadata": {},
+            "local_path": "C:/fixtures/lin.png",
+            "checksum": "fixture-lin",
+            "input_slot": 1,
+            "input_label": "<Picture 1>",
+            "project_slot": 1,
+            "entity_label": "<Subject 1>",
+        }
+        with patch(
+            "studio.services.production_pipeline.resolve_group_reference_bindings",
+            return_value=[resolved_character_binding],
+        ):
+            compiled = compile_prompt_input(
+                project=project,
+                shots=[shot],
+                prompt_type=PromptArtifact.PromptType.VIDEO,
+                mode="Ref2VA",
+                include_audio=True,
+                language_gate_mode="warn",
+                model_profile_version=self._video_model_profile(),
+                frozen_frame_policy=FRAME_POLICY,
+            )
+
+        expected_headers = [
+            "subject_definitions:",
+            "summary:",
+            "retention_analysis:",
+            "detailed_description:",
+            "overall_soundscape:",
+            "non_diegetic_music:",
+        ]
+        positions = [compiled.prompt_text.index(header) for header in expected_headers]
+        self.assertEqual(positions, sorted(positions))
+        for fact in ("<Subject 1> (S1)", "300–1500 ms", "1800–3300 ms",
+                     "a controlled low whisper", "a measured, reflective tone",
+                     "<d>[Chinese] 别碰那封信。</d>", "<d>[Chinese] 那晚的火并非意外。</d>",
+                     "Off-screen voiceover", "No on-screen lip movement",
+                     "rain against glass and a ticking wall clock",
+                     "Dry paper scraping across the wooden desk.", "Low restrained strings."):
+            self.assertIn(fact, compiled.prompt_text)
+        self.assertEqual(compiled.negative_prompt, "")
+        self.assertEqual(
+            compiled.structured_payload["model_prompt_contract"]["format"],
+            "reference_context_ir_v2",
+        )
+        self.assertFalse(
+            compiled.structured_payload["model_prompt_contract"][
+                "negative_prompt_submitted"
+            ]
         )
 
     def test_media_compile_uses_exact_selected_model_across_different_families(self):
@@ -586,6 +2174,7 @@ class PromptProfileServiceTests(TestCase):
             assign_json_contract(row, "specification", {
                 "schema_version": 1,
                 "model_family": family,
+                "conditioning_contract": _video_conditioning_contract(),
             })
             row.save()
             return row
@@ -605,7 +2194,7 @@ class PromptProfileServiceTests(TestCase):
                 name=key,
                 operation="video.generate",
                 model_family=family,
-                mode=Shot.H3Mode.T2VA,
+                mode="T2VA",
                 model_profile_version=selected_model,
                 prompt_profile_version=profile,
             )
@@ -616,7 +2205,7 @@ class PromptProfileServiceTests(TestCase):
                 project=project,
                 shots=[shot],
                 prompt_type="video",
-                mode=Shot.H3Mode.T2VA,
+                mode="T2VA",
                 include_audio=True,
                 language_gate_mode="warn",
                 model_profile_version=selected_model,
@@ -769,7 +2358,7 @@ class PromptProfileServiceTests(TestCase):
             name="subject language gate",
             operation="video.generate",
             model_family="minimax_h3",
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             prompt_profile_version=profile,
             priority=10_000,
         )
@@ -777,9 +2366,10 @@ class PromptProfileServiceTests(TestCase):
             project=project,
             shots=[shot],
             prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             include_audio=True,
             language_gate_mode="block",
+            model_profile_version=self._video_model_profile(),
         )
         report = evaluate_prompt_language_gate(SimpleNamespace(
             prompt_type=PromptArtifact.PromptType.VIDEO,
@@ -883,6 +2473,7 @@ class PromptProfileServiceTests(TestCase):
                 profile_version=profile,
                 field_definition=definition,
                 source_selector=selector,
+                generation_source_selector=selector,
                 channel=channel,
                 position=position,
                 label_style=PromptProfileFieldRule.LabelStyle.NONE,
@@ -896,7 +2487,7 @@ class PromptProfileServiceTests(TestCase):
             name="single semantic path",
             operation="video.generate",
             model_family="minimax_h3",
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             prompt_profile_version=profile,
         )
 
@@ -904,10 +2495,11 @@ class PromptProfileServiceTests(TestCase):
             project=project,
             shots=[shot],
             prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode=Shot.H3Mode.T2VA,
+            mode="T2VA",
             include_audio=True,
             extra_direction="PROFILE-FIRST",
             language_gate_mode="warn",
+            model_profile_version=self._video_model_profile(),
         )
 
         self.assertEqual(compiled.prompt_text, "PROFILE-FIRST\nPROFILE-SECOND")
@@ -968,9 +2560,9 @@ class PromptProfileServiceTests(TestCase):
             mime_type="image/png",
         )
         self.addCleanup(first_frame.file.delete, False)
-        shot.h3_mode = Shot.H3Mode.I2VA
+        shot.conditioning_mode = "I2VA"
         shot.reference_bindings = {"first_frame_asset_id": str(first_frame.id)}
-        shot.save(update_fields=("h3_mode", "reference_bindings", "updated_at"))
+        shot.save(update_fields=("conditioning_mode", "reference_bindings", "updated_at"))
         shot.reference_assets.set([first_frame])
 
         reference_field = self._field(
@@ -978,7 +2570,7 @@ class PromptProfileServiceTests(TestCase):
             label="Reference",
             value_type=PromptFieldDefinition.ValueType.STRING_LIST,
         )
-        profile = self._profile("qa.minimax.reference", mode=Shot.H3Mode.I2VA)
+        profile = self._profile("qa.minimax.reference", mode="I2VA")
         rule = self._rule(
             profile,
             reference_field,
@@ -993,7 +2585,7 @@ class PromptProfileServiceTests(TestCase):
             name="reference binding",
             operation="video.generate",
             model_family="minimax_h3",
-            mode=Shot.H3Mode.I2VA,
+            mode="I2VA",
             prompt_profile_version=profile,
         )
 
@@ -1001,9 +2593,10 @@ class PromptProfileServiceTests(TestCase):
             project=project,
             shots=[shot],
             prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode=Shot.H3Mode.I2VA,
+            mode="I2VA",
             include_audio=True,
             language_gate_mode="warn",
+            model_profile_version=self._video_model_profile(),
         )
 
         self.assertIn("<Picture 1>", compiled.prompt_text)
@@ -1028,7 +2621,141 @@ class PromptProfileApiTests(TestCase):
         self.client = APIClient()
         self.client.force_authenticate(self.admin)
 
+    def test_preview_candidate_uses_unsaved_rules_without_database_writes(self):
+        field = PromptFieldDefinition.objects.create(
+            key="preview_theme",
+            label="Preview theme",
+            category="preview",
+            description="Preview-only theme value",
+            impact="Changes final prompt text",
+            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
+        )
+        profile = PromptProfileVersion.objects.create(
+            profile_key="preview.candidate",
+            version=1,
+            name="Preview candidate",
+            model_family="minimax_h3",
+            operation="video.generate",
+            mode="T2VA",
+            source_projection_key="direct_v1",
+            source_projection_config={},
+            channel_limits={
+                "positive_prompt": {
+                    "max_chars": 1000,
+                    "warn_at_chars": 900,
+                },
+            },
+            contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        rule = PromptProfileFieldRule.objects.create(
+            profile_version=profile,
+            field_definition=field,
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_THEME,
+            channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
+            position=1,
+            label_style=PromptProfileFieldRule.LabelStyle.LABEL_COLON,
+            separator=PromptProfileFieldRule.Separator.NEWLINE,
+            required=True,
+            omit_if_empty=True,
+            max_chars=500,
+            generation_mode=PromptProfileFieldRule.GenerationMode.PASSTHROUGH,
+            generation_source_selector=(
+                PromptProfileFieldRule.SourceSelector.REQUEST_THEME
+            ),
+            generation_output_semantics=(
+                PromptProfileFieldRule.GenerationOutputSemantics.FINAL
+            ),
+            generation_required=True,
+            language_policy="inherit",
+            length_unit=PromptProfileFieldRule.LengthUnit.NONE,
+            generation_validator_keys=[
+                PromptProfileFieldRule.GenerationValidator.NON_EMPTY,
+            ],
+            generation_context_selectors=[],
+        )
+        refresh_prompt_profile_contract(profile)
+        profile.refresh_from_db()
+        base_hash = profile.contract_sha256
+        base_updated_at = profile.updated_at
+        candidate = {
+            "model_family": profile.model_family,
+            "operation": profile.operation,
+            "mode": profile.mode,
+            "source_projection_key": profile.source_projection_key,
+            "source_projection_config": {},
+            "channel_limits": profile.channel_limits,
+            "field_rules": [{
+                "id": str(rule.id),
+                "field_definition": str(field.id),
+                "source_selector": rule.source_selector,
+                "projection_primitive": "",
+                "channel": rule.channel,
+                "position": 1,
+                "label_style": "bracketed",
+                "separator": "newline",
+                "required": True,
+                "omit_if_empty": True,
+                "max_chars": 500,
+                "generation_mode": rule.generation_mode,
+                "generation_source_selector": rule.generation_source_selector,
+                "generation_context_selectors": [],
+                "generation_instruction": "",
+                "generation_output_semantics": rule.generation_output_semantics,
+                "generation_required": True,
+                "language_policy": "inherit",
+                "length_unit": "none",
+                "generation_min": None,
+                "generation_max": None,
+                "generation_validator_keys": ["non_empty"],
+            }],
+        }
+
+        response = self.client.post(
+            f"/api/v1/prompt-profile-versions/{profile.id}/preview/",
+            {
+                "expected_base_contract_sha256": base_hash,
+                "candidate": candidate,
+                "sources": {"request.theme": "fog harbor"},
+            },
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(
+            response.data["channels"]["positive_prompt"],
+            "[preview_theme] fog harbor",
+        )
+        self.assertTrue(response.data["ephemeral"])
+        self.assertEqual(response.data["preview_scope"], "sample_final_assembly")
+        self.assertFalse(response.data["executed_stages"]["field_generation"])
+        self.assertFalse(response.data["executed_stages"]["source_projection"])
+        self.assertTrue(response.data["executed_stages"]["final_assembly"])
+        self.assertEqual(response.data["base_contract_sha256"], base_hash)
+        self.assertNotEqual(response.data["contract_sha256"], base_hash)
+        profile.refresh_from_db()
+        self.assertEqual(profile.contract_sha256, base_hash)
+        self.assertEqual(profile.updated_at, base_updated_at)
+        self.assertEqual(profile.field_rules.count(), 1)
+
+        stale = self.client.post(
+            f"/api/v1/prompt-profile-versions/{profile.id}/preview/",
+            {
+                "expected_base_contract_sha256": "0" * 64,
+                "candidate": candidate,
+                "sources": {"request.theme": "fog harbor"},
+            },
+            format="json",
+        )
+        self.assertEqual(stale.status_code, 409, stale.data)
+        self.assertEqual(stale.data["code"], "prompt_profile_preview_base_stale")
+
     def test_crud_preview_publish_binding_and_retire_lifecycle(self):
+        previous_display_order = (
+            PromptFieldDefinition.objects.order_by("-display_order")
+            .values_list("display_order", flat=True)
+            .first()
+            or 0
+        )
         created_field = self.client.post("/api/v1/prompt-field-definitions/", {
             "key": "api_theme",
             "label": "API Theme",
@@ -1039,24 +2766,64 @@ class PromptProfileApiTests(TestCase):
             "default_value": None,
             "value_options": [],
             "is_required": False,
-            "is_active": True,
-            "display_order": 1,
+            "is_active": False,
+            "display_order": 999,
         }, format="json")
         self.assertEqual(created_field.status_code, 201, created_field.data)
+        self.assertEqual(
+            created_field.data["display_order"], previous_display_order + 1,
+        )
+        self.assertTrue(created_field.data["is_active"])
+        self.assertEqual(
+            created_field.data["preview_example"],
+            "A neutral example used only to preview the configured prompt structure.",
+        )
+        self.assertIsNone(created_field.data["default_value"])
 
         created_profile = self.client.post("/api/v1/prompt-profile-versions/", {
             "profile_key": "api.minimax.t2va",
-            "version": 1,
+            "version": 99,
             "name": "API MiniMax T2VA",
             "description": "API managed strategy",
             "model_family": "minimax_h3",
             "operation": "video.generate",
-            "mode": "T2VA",
+            "mode": "vendor_x_v1",
+            "source_projection_key": "direct_v1",
+            "source_projection_config": {},
             "official_reference": "",
-            "review_state": "needs_review",
+            "channel_limits": {
+                "positive_prompt": {
+                    "max_chars": 7000,
+                    "warn_at_chars": 6200,
+                },
+            },
+            "review_state": "ready",
         }, format="json")
         self.assertEqual(created_profile.status_code, 201, created_profile.data)
+        self.assertEqual(created_profile.data["version"], 1)
+        self.assertEqual(created_profile.data["review_state"], "needs_review")
         profile_id = created_profile.data["id"]
+        duplicate_profile = self.client.post(
+            "/api/v1/prompt-profile-versions/",
+            {
+                "profile_key": "api.minimax.t2va",
+                "version": 100,
+                "name": "Must use successor",
+                "model_family": "minimax_h3",
+                "operation": "video.generate",
+                "mode": "vendor_x_v1",
+                "source_projection_key": "direct_v1",
+                "review_state": "needs_review",
+            },
+            format="json",
+        )
+        self.assertEqual(duplicate_profile.status_code, 400, duplicate_profile.data)
+        version_edit = self.client.patch(
+            f"/api/v1/prompt-profile-versions/{profile_id}/",
+            {"version": 42},
+            format="json",
+        )
+        self.assertEqual(version_edit.status_code, 400, version_edit.data)
 
         created_rule = self.client.post("/api/v1/prompt-profile-field-rules/", {
             "profile_version": profile_id,
@@ -1069,8 +2836,25 @@ class PromptProfileApiTests(TestCase):
             "required": True,
             "omit_if_empty": True,
             "max_chars": 4000,
+            "generation_mode": "passthrough",
+            "generation_source_selector": "request.theme",
+            "generation_instruction": "",
+            "generation_output_semantics": "final",
+            "generation_required": True,
+            "language_policy": "inherit",
+            "length_unit": "none",
+            "generation_min": None,
+            "generation_max": None,
+            "generation_validator_keys": ["non_empty"],
+            "generation_context_selectors": [],
         }, format="json")
         self.assertEqual(created_rule.status_code, 201, created_rule.data)
+        self.assertEqual(created_rule.data["generation_mode"], "passthrough")
+        self.assertEqual(
+            created_profile.data["contract_schema_version"],
+            PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        self.assertEqual(created_profile.data["source_projection_config"], {})
 
         blocked_publish = self.client.post(
             f"/api/v1/prompt-profile-versions/{profile_id}/publish/", {}, format="json",
@@ -1088,6 +2872,10 @@ class PromptProfileApiTests(TestCase):
             preview.data["channels"]["positive_prompt"],
             "api_theme: fog harbor",
         )
+        self.assertEqual(
+            preview.data["channel_audit"]["positive_prompt"]["max_chars"],
+            7000,
+        )
 
         ready = self.client.patch(
             f"/api/v1/prompt-profile-versions/{profile_id}/",
@@ -1100,13 +2888,57 @@ class PromptProfileApiTests(TestCase):
         )
         self.assertEqual(published.status_code, 200, published.data)
         self.assertEqual(published.data["status"], "published")
+        frozen_contract_sha256 = published.data["contract_sha256"]
+        late_patch = self.client.patch(
+            f"/api/v1/prompt-profile-field-rules/{created_rule.data['id']}/",
+            {"max_chars": 3999},
+            format="json",
+        )
+        self.assertEqual(late_patch.status_code, 400, late_patch.data)
+        late_field = self.client.post("/api/v1/prompt-field-definitions/", {
+            "key": "api_theme_late",
+            "label": "Late API theme",
+            "category": "api",
+            "description": "Must not enter a frozen profile",
+            "impact": "Would change the published contract",
+            "value_type": "long_text",
+        }, format="json")
+        self.assertEqual(late_field.status_code, 201, late_field.data)
+        late_rule = self.client.post("/api/v1/prompt-profile-field-rules/", {
+            "profile_version": profile_id,
+            "field_definition": late_field.data["id"],
+            "source_selector": "request.text",
+            "channel": "positive_prompt",
+            "position": 2,
+            "label_style": "label_colon",
+            "separator": "newline",
+            "required": False,
+            "omit_if_empty": True,
+            "max_chars": 2000,
+            "generation_mode": "passthrough",
+            "generation_source_selector": "request.text",
+            "generation_instruction": "",
+            "generation_output_semantics": "final",
+            "generation_required": False,
+            "language_policy": "inherit",
+            "length_unit": "none",
+            "generation_min": None,
+            "generation_max": None,
+            "generation_validator_keys": [],
+            "generation_context_selectors": [],
+        }, format="json")
+        self.assertEqual(late_rule.status_code, 400, late_rule.data)
+        self.assertEqual(
+            PromptProfileVersion.objects.get(pk=profile_id).contract_sha256,
+            frozen_contract_sha256,
+        )
 
         binding = self.client.post("/api/v1/prompt-profile-bindings/", {
             "key": "api.minimax.t2va",
             "name": "API binding",
             "operation": "video.generate",
             "model_family": "minimax_h3",
-            "mode": "T2VA",
+            "mode": "vendor_x_v1",
             "model_profile_version": None,
             "prompt_profile_version": profile_id,
             "priority": 0,
@@ -1114,13 +2946,92 @@ class PromptProfileApiTests(TestCase):
         }, format="json")
         self.assertEqual(binding.status_code, 201, binding.data)
 
+        listing = self.client.get("/api/v1/prompt-profile-bindings/", {
+            "model_family": "minimax_h3", "page_size": 50,
+        })
+        self.assertEqual(listing.status_code, 200, listing.data)
+        associated = next(row for row in listing.data["results"] if row["id"] == binding.data["id"])
+        self.assertEqual(associated["prompt_profile_name"], published.data["name"])
+        self.assertEqual(associated["prompt_profile_version_number"], published.data["version"])
+        self.assertEqual(associated["prompt_profile_status"], "published")
+        self.assertEqual(associated["prompt_profile_contract_sha256"], frozen_contract_sha256)
+
         options = self.client.get("/api/v1/prompt-profile-versions/options/")
         self.assertEqual(options.status_code, 200, options.data)
         self.assertIn("video.generate", options.data["operations"])
         self.assertIn("minimax_h3", options.data["model_families"])
-        self.assertIn("T2VA", options.data["modes"])
+        self.assertIn("vendor_x_v1", options.data["modes"])
+        self.assertIn("long_text", {
+            item["value"] for item in options.data["field_value_types"]
+        })
+        self.assertIn("api", {
+            item["value"] for item in options.data["field_categories"]
+        })
+        self.assertEqual(
+            options.data["field_system_defaults"]["display_order"],
+            "append",
+        )
+        self.assertEqual(
+            options.data["rule_system_defaults"]["max_chars"],
+            2000,
+        )
+        self.assertIn("operation", options.data["custom_entry_fields"])
+        field_options = self.client.get("/api/v1/prompt-field-definitions/options/")
+        self.assertEqual(field_options.status_code, 200, field_options.data)
+        self.assertIn("long_text", {
+            item["value"] for item in field_options.data["value_types"]
+        })
+        self.assertIn("api", {
+            item["value"] for item in field_options.data["categories"]
+        })
+        self.assertEqual(field_options.data["custom_entry_fields"], ["category"])
+        self.assertEqual(
+            created_profile.data["source_projection_key"],
+            "direct_v1",
+        )
         self.assertTrue(any(
             item["value"] == "request.theme" for item in options.data["source_selectors"]
+        ))
+        self.assertTrue(any(
+            item["value"] == "model_generated"
+            for item in options.data["generation_modes"]
+        ))
+        self.assertTrue(any(
+            item["value"] == "english_words"
+            for item in options.data["length_units"]
+        ))
+        self.assertTrue(any(
+            item["value"] == "non_empty"
+            for item in options.data["generation_validators"]
+        ))
+        context_options = options.data["generation_context_selectors"]
+        self.assertEqual(
+            {item["value"] for item in context_options},
+            set(PromptProfileFieldRule.GenerationContextSelector.values),
+        )
+        self.assertTrue(all(
+            item.get("label") and item.get("description")
+            for item in context_options
+        ))
+        generation_source_options = options.data["generation_source_selectors"]
+        self.assertEqual(
+            {item["value"] for item in generation_source_options},
+            set(PROMPT_GENERATION_SOURCE_VALUES),
+        )
+        self.assertEqual(len(generation_source_options), 35)
+        self.assertTrue(all(
+            item.get("label")
+            and item.get("scope_type")
+            and item.get("group")
+            and item.get("group_label")
+            and item.get("description")
+            and item.get("availability")
+            and item.get("scope")
+            and item.get("status") == "active"
+            and item.get("generation_modes") == [
+                "model_generated", "translate_only",
+            ]
+            for item in generation_source_options
         ))
 
         blocked_retire = self.client.post(
@@ -1137,6 +3048,31 @@ class PromptProfileApiTests(TestCase):
         )
         self.assertEqual(retired.status_code, 200, retired.data)
         self.assertEqual(retired.data["status"], "retired")
+        successor = self.client.post(
+            f"/api/v1/prompt-profile-versions/{profile_id}/clone-successor/",
+            {
+                "expected_source_contract_sha256": retired.data["contract_sha256"],
+                "name": "API MiniMax T2VA successor",
+            },
+            format="json",
+        )
+        self.assertEqual(successor.status_code, 201, successor.data)
+        self.assertEqual(successor.data["version"], 2)
+        self.assertEqual(successor.data["status"], "draft")
+        self.assertEqual(successor.data["review_state"], "needs_review")
+        successor_conflict = self.client.post(
+            f"/api/v1/prompt-profile-versions/{profile_id}/clone-successor/",
+            {
+                "expected_source_contract_sha256": retired.data["contract_sha256"],
+                "name": "Must reuse existing successor",
+            },
+            format="json",
+        )
+        self.assertEqual(successor_conflict.status_code, 409, successor_conflict.data)
+        self.assertEqual(
+            successor_conflict.data["error"]["code"],
+            "prompt_profile_clone_draft_exists",
+        )
         frozen_field_update = self.client.patch(
             f"/api/v1/prompt-field-definitions/{created_field.data['id']}/",
             {"label": "Must not rewrite retired contract"},
@@ -1161,6 +3097,244 @@ class PromptProfileApiTests(TestCase):
             403,
         )
 
+    def test_prompt_profile_api_uses_current_effective_limits(self):
+        definition = PromptFieldDefinition.objects.create(
+            key="api_effective_limit_text",
+            label="API effective limit text",
+            category="api",
+            description="Exercises runtime-owned PromptProfile limits",
+            impact="Changes one prompt field",
+            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
+        )
+        profile = PromptProfileVersion.objects.create(
+            profile_key="api.effective-limits",
+            version=1,
+            name="API effective limits",
+            model_family="vendor_next_video",
+            operation="video.generate",
+            mode="custom_mode",
+            contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        lowered = create_config_revision(
+            scope_type="system",
+            values={
+                "security.prompt_profile.field_text_max_characters": 40_000,
+                "security.contract_complexity.prompt_profile.max_validators": 1,
+                "security.contract_complexity.prompt_profile.max_context_selectors": 1,
+            },
+            created_by=self.admin,
+        )
+        publish_config_revision(lowered, published_by=self.admin)
+        options = self.client.get("/api/v1/prompt-profile-versions/options/")
+        self.assertEqual(options.status_code, 200, options.data)
+        self.assertEqual(options.data["effective_limits"], {
+            "field_text_max_characters": 40_000,
+            "max_validators": 1,
+            "max_context_selectors": 1,
+        })
+        payload = {
+            "profile_version": str(profile.id),
+            "field_definition": str(definition.id),
+            "source_selector": "request.text",
+            "channel": "positive_prompt",
+            "position": 1,
+            "label_style": "label_colon",
+            "separator": "newline",
+            "required": True,
+            "omit_if_empty": False,
+            "max_chars": 35_000,
+            "generation_mode": "passthrough",
+            "generation_source_selector": "request.text",
+            "generation_instruction": "",
+            "generation_output_semantics": "final",
+            "generation_required": True,
+            "language_policy": "inherit",
+            "length_unit": "characters",
+            "generation_min": 1,
+            "generation_max": 35_000,
+            "generation_validator_keys": ["non_empty", "single_line"],
+            "generation_context_selectors": ["project.core", "project.style"],
+        }
+        rejected = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+
+        raised = create_config_revision(
+            scope_type="system",
+            values={
+                "security.contract_complexity.prompt_profile.max_validators": 16,
+                "security.contract_complexity.prompt_profile.max_context_selectors": 8,
+            },
+            created_by=self.admin,
+        )
+        publish_config_revision(raised, published_by=self.admin)
+        accepted = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            payload,
+            format="json",
+        )
+        self.assertEqual(accepted.status_code, 201, accepted.data)
+        self.assertEqual(accepted.data["generation_max"], 35_000)
+
+    def test_profile_draft_accepts_new_safe_operation_key_but_rejects_code_like_input(self):
+        payload = {
+            "profile_key": "api.future.operation",
+            "version": 1,
+            "name": "Future operation profile",
+            "description": "Draft registration does not grant execution",
+            "model_family": "fictional_story_model",
+            "operation": "storyboard.render_v2",
+            "mode": "custom_mode",
+            "source_projection_key": "direct_v1",
+            "official_reference": "",
+            "review_state": "needs_review",
+        }
+
+        created = self.client.post(
+            "/api/v1/prompt-profile-versions/", payload, format="json",
+        )
+        self.assertEqual(created.status_code, 201, created.data)
+        self.assertEqual(created.data["operation"], "storyboard.render_v2")
+        options = self.client.get("/api/v1/prompt-profile-versions/options/")
+        self.assertEqual(options.status_code, 200, options.data)
+        self.assertIn("storyboard.render_v2", options.data["operations"])
+
+        rejected = self.client.post(
+            "/api/v1/prompt-profile-versions/",
+            {
+                **payload,
+                "profile_key": "api.future.operation.invalid",
+                "operation": "__import__('os').system",
+            },
+            format="json",
+        )
+        self.assertEqual(rejected.status_code, 400, rejected.data)
+        self.assertIn("operation", str(rejected.data))
+
+    def test_generation_contract_api_rejects_omission_unknown_keys_and_bad_combinations(self):
+        definition = PromptFieldDefinition.objects.create(
+            key="api_generation_contract",
+            label="Generation contract",
+            category="api",
+            description="Generic Layer-2 field contract",
+            impact="Constrains a generated field before deterministic assembly",
+            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
+        )
+        profile = PromptProfileVersion.objects.create(
+            profile_key="api.generic.generation-contract",
+            version=1,
+            name="API generic generation contract",
+            model_family="vendor_next_video",
+            operation="video.generate",
+            mode="custom_mode",
+            contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        refresh_prompt_profile_contract(
+            profile,
+            schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        base = {
+            "profile_version": str(profile.id),
+            "field_definition": str(definition.id),
+            "source_selector": "request.text",
+            "channel": "positive_prompt",
+            "position": 1,
+            "label_style": "label_colon",
+            "separator": "newline",
+            "required": True,
+            "omit_if_empty": False,
+            "max_chars": 4000,
+            "generation_mode": "model_generated",
+            "generation_source_selector": "shot.narrative",
+            "generation_instruction": "Expand the frozen narrative into visible shot prose.",
+            "generation_output_semantics": "final",
+            "generation_required": True,
+            "language_policy": "en",
+            "length_unit": "english_words",
+            "generation_min": 120,
+            "generation_max": 240,
+            "generation_validator_keys": ["non_empty"],
+            "generation_context_selectors": [
+                "project.style",
+                "target_shot.core",
+            ],
+        }
+
+        omitted = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {key: value for key, value in base.items() if key != "generation_mode"},
+            format="json",
+        )
+        self.assertEqual(omitted.status_code, 400, omitted.data)
+        self.assertIn("generation_mode", str(omitted.data))
+
+        context_omitted = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {
+                key: value for key, value in base.items()
+                if key != "generation_context_selectors"
+            },
+            format="json",
+        )
+        self.assertEqual(context_omitted.status_code, 400, context_omitted.data)
+        self.assertIn("generation_context_selectors", str(context_omitted.data))
+
+        unknown_context = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {**base, "generation_context_selectors": ["target_shot.everything"]},
+            format="json",
+        )
+        self.assertEqual(unknown_context.status_code, 400, unknown_context.data)
+        self.assertIn("target_shot.everything", str(unknown_context.data))
+
+        unknown = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {**base, "generation_validator_keys": ["custom_regex"]},
+            format="json",
+        )
+        self.assertEqual(unknown.status_code, 400, unknown.data)
+        self.assertIn("custom_regex", str(unknown.data))
+
+        inconsistent = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {
+                **base,
+                "length_unit": "none",
+                "generation_min": 120,
+                "generation_max": 240,
+            },
+            format="json",
+        )
+        self.assertEqual(inconsistent.status_code, 400, inconsistent.data)
+        self.assertIn("length_unit=none", str(inconsistent.data))
+
+        unsafe = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {**base, "generation_source_selector": "shot.items[*].text"},
+            format="json",
+        )
+        self.assertEqual(unsafe.status_code, 400, unsafe.data)
+        self.assertIn("generation_source_selector", str(unsafe.data))
+
+        unregistered = self.client.post(
+            "/api/v1/prompt-profile-field-rules/",
+            {**base, "generation_source_selector": "shot.unregistered_source"},
+            format="json",
+        )
+        self.assertEqual(unregistered.status_code, 400, unregistered.data)
+        self.assertEqual(
+            unregistered.data["error"]["code"],
+            "prompt_profile_generation_source_unknown",
+        )
+        self.assertIn("generation_source_selectors", str(unregistered.data))
+
     def test_exact_binding_cannot_be_active_without_declared_model_capability(self):
         provider = ProviderProfile(
             key="api-capability-provider",
@@ -1182,6 +3356,7 @@ class PromptProfileApiTests(TestCase):
         )
         assign_json_contract(model, "specification", {
             "schema_version": 1,
+            "model_family": "deepseek",
             "capabilities": ["script.generate", "prompt.normalize"],
         })
         model.save()
@@ -1205,6 +3380,7 @@ class PromptProfileApiTests(TestCase):
             profile_version=profile,
             field_definition=definition,
             source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_THEME,
+            generation_source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_THEME,
             channel=PromptProfileFieldRule.Channel.STRUCTURED_INPUT,
             position=1,
         )

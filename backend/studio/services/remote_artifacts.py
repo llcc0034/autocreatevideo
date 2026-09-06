@@ -15,7 +15,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
 
-from studio.models import GeneratedArtifact, GenerationAttempt
+from studio.models import GeneratedArtifact, GenerationAttempt, PromptArtifact
 from studio.services.generated_artifacts import (
     _artifact_limit,
     build_comparison_parameters,
@@ -23,9 +23,16 @@ from studio.services.generated_artifacts import (
 )
 from studio.services.json_contracts import json_contract
 from studio.services.provider_registry import ProviderDriverError, _peer_address
+from studio.services.security_boundaries import boundary_int
+from studio.services.bible_reference_contract import (
+    BIBLE_IMAGE_GENERATION_STAGE_KEY,
+    parse_bible_candidate_unit_key,
+    validate_bible_prompt_target,
+)
 
 
-MAX_REMOTE_ARTIFACTS = 8
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 
 
 def _global_allowed_hosts() -> set[str]:
@@ -93,7 +100,13 @@ def _download_one(
     heartbeat=None,
 ) -> dict:
     safe_url, addresses = _validated_artifact_url(url, provider_config)
-    timeout = float(provider_config.get("timeout_seconds", 60))
+    try:
+        timeout = float(provider_config["timeout_seconds"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProviderDriverError(
+            "远端产物下载缺少已冻结 timeout_seconds",
+            code="provider_config_invalid",
+        ) from exc
     target.parent.mkdir(parents=True, exist_ok=True)
     handle = tempfile.NamedTemporaryFile(
         mode="wb",
@@ -185,15 +198,29 @@ def _download_one(
             handle.close()
 
 
+def download_remote_artifact(**kwargs) -> dict:
+    """Public restricted downloader for non-ProductionRun asset jobs."""
+
+    return _download_one(**kwargs)
+
+
 def _variant(attempt: GenerationAttempt) -> tuple[str, int]:
     grouped = attempt.unit_key
     variant = 1
     if ":variant:" in grouped:
         grouped, raw = grouped.rsplit(":variant:", 1)
         try:
-            variant = max(1, int(raw))
-        except ValueError:
-            variant = 1
+            variant = int(raw)
+        except ValueError as exc:
+            raise ProviderDriverError(
+                "远端产物 variant identity 无效",
+                code="artifact_variant_identity_invalid",
+            ) from exc
+        if variant < 1:
+            raise ProviderDriverError(
+                "远端产物 variant identity 必须是正整数",
+                code="artifact_variant_identity_invalid",
+            )
     return grouped, variant
 
 
@@ -206,8 +233,12 @@ def verify_remote_artifacts_for_smoke(
     max_bytes: int,
 ) -> list[dict]:
     """Download and validate smoke outputs without making them production artifacts."""
-    if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= MAX_REMOTE_ARTIFACTS:
-        raise ProviderDriverError("烟测产物数量必须为 1 到 8", code="artifact_manifest_invalid")
+    max_artifacts = boundary_int("security.remote.max_artifacts")
+    if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= max_artifacts:
+        raise ProviderDriverError(
+            f"烟测产物数量必须为 1 到当前安全边界 {max_artifacts}",
+            code="artifact_manifest_invalid",
+        )
     root = Path(settings.MEDIA_ROOT).resolve()
     probe_id = uuid.uuid4()
     base = (root / ".deployment-smoke" / str(deployment_id) / str(probe_id)).resolve()
@@ -248,13 +279,26 @@ def archive_remote_artifacts(
     expected_kind: str,
     heartbeat=None,
 ) -> list[GeneratedArtifact]:
-    if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= MAX_REMOTE_ARTIFACTS:
-        raise ProviderDriverError("远端产物数量必须为 1 到 8", code="artifact_manifest_invalid")
+    max_artifacts = boundary_int("security.remote.max_artifacts")
+    if not isinstance(artifacts, list) or not 1 <= len(artifacts) <= max_artifacts:
+        raise ProviderDriverError(
+            f"远端产物数量必须为 1 到当前安全边界 {max_artifacts}",
+            code="artifact_manifest_invalid",
+        )
+    is_bible_candidate = (
+        attempt.stage_run.stage_key == BIBLE_IMAGE_GENERATION_STAGE_KEY
+    )
+    if is_bible_candidate and (expected_kind != "image" or len(artifacts) != 1):
+        raise ProviderDriverError(
+            "Bible 参考图 attempt 必须且只能归档一个图片 primary output",
+            code="artifact_response_invalid",
+        )
     run = attempt.stage_run.production_run
     max_bytes = _artifact_limit(run)
     root = Path(settings.MEDIA_ROOT).resolve()
+    tenant_owner_id = run.project.owner_id
     base = (
-        root / "generated-artifacts" / str(run.owner_id) / str(run.project_id)
+        root / "generated-artifacts" / str(tenant_owner_id) / str(run.project_id)
         / "async" / str(attempt.id)
     ).resolve()
     if not base.is_relative_to(root):
@@ -313,7 +357,15 @@ def archive_remote_artifacts(
             # left bytes behind, so cancellation/failure must remove it.
             downloaded.append((ordinal, item, facts, target))
         grouped, variant = _variant(attempt)
-        variant_group = f"stage:{attempt.stage_run_id}:unit:{grouped}"
+        bible_identity = (
+            parse_bible_candidate_unit_key(attempt.unit_key)
+            if is_bible_candidate else None
+        )
+        variant_group = (
+            bible_identity["variant_group"]
+            if bible_identity is not None
+            else f"stage:{attempt.stage_run_id}:unit:{grouped}"
+        )
         created: list[GeneratedArtifact] = []
         with transaction.atomic():
             locked = GenerationAttempt.objects.select_for_update().select_related(
@@ -325,13 +377,57 @@ def archive_remote_artifacts(
                 metadata = {
                     "schema_version": 1,
                     "source": "restricted_async_rest",
+                    "tenant_owner_id": str(tenant_owner_id),
                     "generation_attempt_id": str(locked.id),
+                    "production_run_id": str(run.id),
+                    "stage_run_id": str(locked.stage_run_id),
                     "provider_request_id": locked.provider_request_id,
                     "remote_artifact_id": str(item.get("artifact_id") or "")[:191],
                     "ordinal": ordinal,
                     "request_sha256": locked.request_sha256,
                 }
-                contract = json_contract(metadata)
+                if bible_identity is not None:
+                    request_snapshot = (
+                        locked.request_snapshot
+                        if isinstance(locked.request_snapshot, dict) else {}
+                    )
+                    prompt = PromptArtifact.objects.filter(
+                        pk=request_snapshot.get("prompt_artifact_id"),
+                    ).first()
+                    options = (
+                        prompt.request_options
+                        if prompt is not None and isinstance(prompt.request_options, dict)
+                        else {}
+                    )
+                    target_contract = validate_bible_prompt_target(options.get("target"))
+                    if (
+                        target_contract["entity_type"] != bible_identity["entity_type"]
+                        or target_contract["entity_id"] != bible_identity["entity_id"]
+                    ):
+                        raise ProviderDriverError(
+                            "Bible 参考图 attempt 与 Prompt target 不一致",
+                            code="artifact_manifest_invalid",
+                        )
+                    metadata.update({
+                        "generation_purpose": "bible_reference_image",
+                        "target": target_contract,
+                        "prompt_artifact_id": str(prompt.id),
+                        "prompt_content_hash": prompt.content_hash,
+                        "prompt_profile_version_id": (
+                            str(prompt.prompt_profile_version_id)
+                            if prompt.prompt_profile_version_id else None
+                        ),
+                        "prompt_profile_binding_key": prompt.prompt_profile_binding_key,
+                        "prompt_profile_binding_id": str(
+                            options.get("prompt_profile_binding_id") or ""
+                        ),
+                        "prompt_profile_contract_sha256": prompt.prompt_profile_contract_sha256,
+                        "source_snapshot_sha256": target_contract["source_snapshot_sha256"],
+                    })
+                contract = json_contract(
+                    metadata,
+                    max_bytes=_stage_snapshot_max_bytes(),
+                )
                 comparison_parameters = build_comparison_parameters(
                     attempt=locked,
                     stage_run=locked.stage_run,
@@ -344,7 +440,11 @@ def archive_remote_artifacts(
                         "stage_run": locked.stage_run,
                         "generation_attempt": locked,
                         "kind": expected_kind,
-                        "role": "primary_generation_output" if ordinal == 1 else "generation_output",
+                        "role": (
+                            "bible_reference_candidate"
+                            if bible_identity is not None
+                            else "primary_generation_output" if ordinal == 1 else "generation_output"
+                        ),
                         "variant_group": variant_group,
                         "variant_index": (variant * 10_000) + ((locked.attempt_number - 1) * 100) + ordinal,
                         # Cost reconciliation and cancellation are still open at

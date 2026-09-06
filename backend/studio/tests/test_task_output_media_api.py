@@ -3,20 +3,22 @@ import json
 import tempfile
 
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.test import TestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from studio.media_signing import signed_media_token
-from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
-from studio.services.h3_prompts import (
-    H3PromptOptions,
-    build_consistent_image_prompt,
-    build_h3_video_prompt,
+from studio.models import ConfigRevision, GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
+from studio.services.configuration import create_config_revision, publish_config_revision
+from studio.tests.media_prompt_fixtures import (
+    MediaPromptOptions,
+    build_test_image_prompt,
+    build_test_video_prompt,
 )
 from studio.services.provenance import persist_task_provenance, task_manifest_path
-from studio.tests.factories import build_story
+from studio.tests.factories import build_story, freeze_current_task_contract
 
 
 class GenerationTaskOutputMediaAPITests(TestCase):
@@ -33,6 +35,10 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.addCleanup(self.override.disable)
 
         self.user, self.project, _, _, self.episode, self.shot, _ = build_story()
+        self.superadmin = get_user_model().objects.create_superuser(
+            username="task-output-superadmin",
+            password="x",
+        )
         self.shot.duration_ms = 5000
         self.shot.save(update_fields=("duration_ms", "updated_at"))
         self.client = APIClient()
@@ -44,15 +50,17 @@ class GenerationTaskOutputMediaAPITests(TestCase):
 
     def _task(self, outputs, *, kind="video"):
         result = (
-            build_consistent_image_prompt(self.project, self.shot)
+            build_test_image_prompt(self.project, self.shot)
             if kind == "image"
-            else build_h3_video_prompt(
-                self.project, [self.shot], H3PromptOptions(language_gate_mode="warn"),
+            else build_test_video_prompt(
+                self.project, [self.shot], MediaPromptOptions(
+                    model_identifier="minimax-h3-test", language_gate_mode="warn",
+                ),
             )
         )
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=self.project, episode=self.episode, shot=self.shot, created_by=self.user,
-            prompt_type=kind, h3_mode="T2VA", prompt_text=result.text,
+            prompt_type=kind, conditioning_mode="T2VA", prompt_text=result.text,
             total_duration_ms=result.total_duration_ms, structured_payload=result.payload,
             consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
             request_options={"shot_ids": [str(self.shot.id)]},
@@ -69,11 +77,11 @@ class GenerationTaskOutputMediaAPITests(TestCase):
             template=template, created_by=self.user,
             workflow_json=template.definition, content_hash="a" * 64,
         )
-        return GenerationTask.objects.create(
+        return freeze_current_task_contract(GenerationTask.objects.create(
             owner=self.user, project=self.project, episode=self.episode,
             generated_workflow=workflow, kind=kind, status=GenerationTask.Status.SUCCEEDED,
-            progress=100, outputs=outputs,
-        )
+            progress=100, outputs=outputs, max_attempts=3,
+        ))
 
     def test_persisted_mp4_is_previewable_and_downloadable_even_when_kind_is_images(self):
         path = self.output_root / "episode-1" / "shot-01.mp4"
@@ -128,6 +136,42 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(download.status_code, 200)
         self.assertTrue(download["Content-Disposition"].startswith("attachment;"))
         download.close()
+
+    def test_signed_media_uses_its_own_database_rate_without_consuming_anonymous_api_quota(self):
+        revision = create_config_revision(
+            scope_type=ConfigRevision.ScopeType.SYSTEM,
+            values={
+                "access.throttle_anon_rate": "1/hour",
+                "access.throttle_signed_media_rate": "2/hour",
+            },
+            created_by=self.superadmin,
+            clone_published=True,
+        )
+        publish_config_revision(revision, published_by=self.superadmin)
+        cache.clear()
+        path = self.output_root / "independent-media-rate.png"
+        path.write_bytes(b"signed-media-rate")
+        task = self._task([{
+            "kind": "images",
+            "filename": path.name,
+            "subfolder": "",
+            "type": "output",
+        }], kind="image")
+        preview_url = self.client.get(f"/api/v1/tasks/{task.id}/").data[
+            "output_media"
+        ][0]["preview_url"]
+        anonymous = APIClient()
+
+        first = anonymous.get(preview_url)
+        second = anonymous.get(preview_url)
+        throttled = anonymous.get(preview_url)
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(throttled.status_code, 429)
+        first.close()
+        second.close()
+        self.assertEqual(anonymous.get("/api/v1/auth/register/").status_code, 200)
 
     @override_settings(DEPLOYMENT_PROFILE="production")
     def test_production_master_remains_preview_only_until_distribution_is_ready(self):

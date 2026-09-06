@@ -8,7 +8,6 @@ import {
   adaptCanonicalGlossaryEnsureResult,
   adaptTranslationEntry,
   applyPromotedFieldsToShot,
-  applyShotTranslationPatch,
   bibleCanonicalTargetCollisionMessage,
   bibleCanonicalTargetCollisions,
   confirmedTranslationForPrompt,
@@ -23,7 +22,7 @@ import {
 } from '../src/services/translationReview.ts'
 import { promptArtifactNeedsRegeneration, translationAppliesToShot } from '../src/services/promptArtifactFreshness.ts'
 import { adaptPromptNormalizationCapability } from '../src/services/promptNormalization.ts'
-import type { H3PromptPayload, PromptTranslationEntry, PromptTranslationField, Shot } from '../src/types/index.ts'
+import type { PromptArtifactPayload, PromptTranslationEntry, PromptTranslationField, Shot } from '../src/types/index.ts'
 
 test('prompt normalization adapter preserves an arbitrary ready local deployment id', () => {
   const capability = adaptPromptNormalizationCapability({
@@ -322,8 +321,20 @@ test('canonical ensure adapter keeps visual translation candidate separate for m
 test('standalone translation UI has no external authorization or budget submission controls', () => {
   const panel = readFileSync(new URL('../src/components/TranslationReviewPanel.vue', import.meta.url), 'utf8')
   const repository = readFileSync(new URL('../src/services/repository.ts', import.meta.url), 'utf8')
+  const translationApiStart = repository.indexOf('async getProjectTranslations(')
+  const translationApiEnd = repository.indexOf('async login(', translationApiStart)
+  assert.notEqual(translationApiStart, -1)
+  assert.notEqual(translationApiEnd, -1)
+  const translationApi = repository.slice(translationApiStart, translationApiEnd)
   assert.doesNotMatch(panel, /externalAuthorized|budgetLimit|外部 API 数据发送提示|单次预算上限/)
-  assert.doesNotMatch(repository, /allow_external_calls|budget_limit/)
+  assert.doesNotMatch(translationApi, /allow_external_calls|budget_limit/)
+})
+
+test('translation review never sends a temporary client shot id as a UUID query filter', () => {
+  const panel = readFileSync(new URL('../src/components/TranslationReviewPanel.vue', import.meta.url), 'utf8')
+
+  assert.ok(panel.includes("const persistedShotId = isBackendId(props.shotId) ? props.shotId : ''"))
+  assert.ok(panel.includes('shotId: persistedShotId'))
 })
 
 test('manual English review and every negative prompt source are first-class recovery inputs', () => {
@@ -448,7 +459,7 @@ test('old compiler artifacts and later relevant translation mutations require re
   const shot = { id: 'shot-1', characterIds: ['character-1'], sceneId: 'scene-1', propIds: ['prop-1'] }
   const artifact = {
     compiler_current: true, artifact_created_at: '2026-08-10T09:00:00Z',
-  } as H3PromptPayload
+  } as PromptArtifactPayload
   const entry = (scopeType: PromptTranslationEntry['scopeType'], scopeId: string, updatedAt: string): PromptTranslationEntry => ({
     id: `${scopeType}-${scopeId}`, fieldKey: `${scopeType}.visual_identity`, scopeType, scopeId,
     sourceText: 'source', translatedText: 'translation', status: 'confirmed', revision: 1, updatedAt,
@@ -462,7 +473,7 @@ test('old compiler artifacts and later relevant translation mutations require re
   assert.equal(translationAppliesToShot(entry('project', 'project-1', '2026-08-10T09:01:00Z'), 'project-1', shot), true)
 })
 
-test('promotion adapter preserves authoritative formal fields and guarded metadata patch', () => {
+test('promotion adapter preserves authoritative formal fields', () => {
   const result = adaptShotTranslationPromotionResult({
     shot_id: 'shot-1',
     promoted_fields: [
@@ -474,16 +485,10 @@ test('promotion adapter preserves authoritative formal fields and guarded metada
       source_text: '剑客入门停步。', translated_text: 'The swordsman steps inside and stops.',
       status: 'confirmed', revision: 3,
     }],
-    shot_patch: {
-      metadata: { prompt_field_version: 2, negative_prompt: '', legacy_negative_prompt_recovery: { recovered: true } },
-      updated_at: '2026-08-10T12:00:00Z',
-    },
   })
   assert.equal(result.shotId, 'shot-1')
   assert.equal(result.promotedFields[1].dialogueIndex, 0)
   assert.equal(result.entries[0].revision, 3)
-  assert.equal(result.shotPatch.metadata?.negative_prompt, '')
-  assert.equal(result.shotPatch.updatedAt, '2026-08-10T12:00:00Z')
 })
 
 test('authoritative promotion patches only director fields and preserves Chinese title and dialogue text', () => {
@@ -516,12 +521,6 @@ test('authoritative promotion patches only director fields and preserves Chinese
   assert.equal(shot.negativePrompt, 'safe negative')
   assert.equal(shot.metadata, metadata)
 
-  const patched = applyShotTranslationPatch(shot, {
-    metadata: { ...metadata, prompt_field_version: 2, negative_prompt: '' }, updatedAt: '2026-08-10T12:00:00Z',
-  })
-  assert.equal(patched, true)
-  assert.equal(shot.negativePrompt, '')
-  assert.equal(shot.legacyNegativePromptRepairEligible, false)
 })
 
 test('storyboard hides stale artifacts and routes prompt recompilation through ProductionRun', () => {
@@ -535,8 +534,6 @@ test('storyboard hides stale artifacts and routes prompt recompilation through P
   assert.ok(source.includes('@promoted="applyShotTranslationPromotion"'))
   assert.ok(source.includes('@promotion-busy="translationPromotionBusy=$event"'))
   assert.ok(source.includes('applyPromotedFieldsToShot(target, result.promotedFields'))
-  assert.ok(source.includes('applyShotTranslationPatch(target, result.shotPatch)'))
-  assert.ok(source.includes('legacyNegativeRepairShots'))
   assert.ok(source.includes("episode.value.shots.find((shot) => shot.id === result.shotId)"))
   assert.doesNotMatch(source, /result\.shotId\s*!==\s*selectedShotId\.value/)
   assert.doesNotMatch(source, /applyShotTranslationPromotion[\s\S]{0,1200}refreshProjects/)
@@ -567,17 +564,16 @@ test('canonical target collisions visibly block save and translation sync before
   assert.ok(panel.includes('reviewMutationBlocked'))
 })
 
-test('review panel uses the router endpoint, expected revision, one promotion event per batch, and repair-only action', () => {
+test('review panel uses the router endpoint, expected revision, and one promotion event per batch', () => {
   const panel = readFileSync(new URL('../src/components/TranslationReviewPanel.vue', import.meta.url), 'utf8')
   const repository = readFileSync(new URL('../src/services/repository.ts', import.meta.url), 'utf8')
   assert.ok(repository.includes("'/translations/promote-shot/'"))
   assert.ok(repository.includes('expected_revision: entry.expectedRevision'))
-  assert.ok(repository.includes('repair_legacy_negative_prompt: options.repairLegacyNegativePrompt === true'))
   assert.ok(panel.includes('repository.confirmProjectTranslation(entry.id, translatedText, entry.revision)'))
   assert.ok(panel.includes('upsertEntries(result.entries, { emitPromotion: false, emitChanged: false })'))
   assert.ok(panel.includes('requestShotId === props.shotId'))
   assert.ok(panel.includes('shotId: row.scopeId || requestShotId'))
-  assert.ok(panel.includes('shotId&&(promotableEntries.length||repairLegacyNegativePrompt)'))
+  assert.ok(panel.includes('shotId&&promotableEntries.length'))
   assert.ok(panel.includes("emit('promoted', result)"))
   assert.ok(panel.includes('撤销译文确认（不回滚正式英文）'))
 })

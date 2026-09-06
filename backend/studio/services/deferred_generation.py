@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from django.conf import settings
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.core.files import File
 from django.db import IntegrityError, transaction
 from django.db.models import Q
@@ -27,17 +28,20 @@ from studio.models import (
     PromptArtifact,
     SeriesProject,
     Shot,
-    WorkflowTemplate,
+    WorkflowTemplateVersion,
 )
-from studio.services.h3_prompts import PromptBuildError, capture_consistency_snapshot
+from studio.services.consistency import capture_consistency_snapshot
+from studio.services.prompt_compiler_contract import PromptBuildError
+from studio.services.media_capabilities import (
+    conditioning_mode_contract,
+    resolve_conditioning_contract,
+)
 from studio.services.production_pipeline import (
-    ProductionQueueConfirmationRequired,
-    assert_queue_capacity,
+    capture_queue_capacity_advisory,
     compile_prompt_input,
+    materialize_compiled_workflow_version,
     materialize_compiled_prompt,
-    materialize_generated_workflow,
     materialize_generation_task,
-    workflow_template_contract_sha256,
 )
 from studio.services.production_batch_slots import effective_batch_snapshot_for_task
 from studio.services.shot_versions import (
@@ -53,12 +57,17 @@ from studio.services.provenance import (
     sha256_file,
 )
 from studio.services.prompt_profiles import PromptProfileResolutionError
+from studio.services.model_profile_contracts import (
+    verified_model_profile_specification,
+)
 from studio.services.workflow import WorkflowBuildError
+from studio.services.workflow_compiler import compile_frozen_workflow
+from studio.services.workflow_versions import workflow_version_execution_snapshot
+from studio.services.security_boundaries import boundary_int
+from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
 
 
 DEFERRED_GENERATION_REQUEST_SCHEMA_VERSION = 1
-DEFERRED_PROVISIONAL_PROMPT_MAX_CHARS = 65_536
-DEFERRED_FRAME_EXTRACT_TIMEOUT_SECONDS = 120
 DEFERRED_GENERATION_PURPOSE = "deferred_generation"
 
 
@@ -93,7 +102,9 @@ def _canonical_sha256(payload: dict) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _ref2va_picture_count_after_first_frame_reservation(target_shot: Shot) -> int:
+def _classified_reference_picture_count_after_first_frame_reservation(
+    target_shot: Shot,
+) -> int:
     bindings = target_shot.reference_bindings if isinstance(target_shot.reference_bindings, dict) else {}
     return (
         1
@@ -103,17 +114,53 @@ def _ref2va_picture_count_after_first_frame_reservation(target_shot: Shot) -> in
     )
 
 
-def _frame_slot_compatible(target_shot: Shot, frame_slot: str) -> bool:
+def _workflow_mode_contract(
+    workflow_version: WorkflowTemplateVersion,
+    target_shot: Shot,
+) -> dict[str, Any]:
+    model_specification = (
+        verified_model_profile_specification(
+            workflow_version.model_profile_version,
+        )
+        if workflow_version.model_profile_version_id else None
+    )
+    contract = resolve_conditioning_contract(
+        workflow_input_contract=workflow_version.input_contract,
+        model_specification=model_specification,
+        output_kind=Shot.MediaType.VIDEO,
+        required=True,
+    )
+    row = conditioning_mode_contract(contract, target_shot.conditioning_mode)
+    assert row is not None
+    return row
+
+
+def _frame_slot_compatible(
+    target_shot: Shot,
+    frame_slot: str,
+    mode_contract: dict[str, Any],
+) -> bool:
     if target_shot.media_type != Shot.MediaType.VIDEO:
         return False
+    inputs = mode_contract.get("inputs") if isinstance(mode_contract, dict) else {}
     if frame_slot == DeferredGenerationRequest.FrameSlot.FIRST_FRAME:
-        return target_shot.h3_mode in {Shot.H3Mode.I2VA, Shot.H3Mode.FL2VA} or (
-            target_shot.h3_mode == Shot.H3Mode.REF2VA
-            and target_shot.requires_first_frame_continuity
-            and _ref2va_picture_count_after_first_frame_reservation(target_shot) <= 9
-        )
+        first_frame = inputs.get("first_frame") if isinstance(inputs, dict) else {}
+        maximum = int((first_frame or {}).get("maximum_items") or 0)
+        if maximum <= 0:
+            return False
+        if mode_contract.get("input_kind") == "classified_references":
+            total_images = inputs.get("total_images") or {}
+            return (
+                target_shot.requires_first_frame_continuity
+                and _classified_reference_picture_count_after_first_frame_reservation(
+                    target_shot,
+                )
+                <= int(total_images.get("maximum_items") or 0)
+            )
+        return True
     if frame_slot == DeferredGenerationRequest.FrameSlot.LAST_FRAME:
-        return target_shot.h3_mode in {Shot.H3Mode.L2VA, Shot.H3Mode.FL2VA}
+        last_frame = inputs.get("last_frame") if isinstance(inputs, dict) else {}
+        return int((last_frame or {}).get("maximum_items") or 0) > 0
     return False
 
 
@@ -130,43 +177,44 @@ def _source_extraction_slot_for_target(frame_slot: str) -> str:
     return frame_slot
 
 
-def _select_deferred_target_template(
+def _select_deferred_target_workflow_version(
     *,
     project: SeriesProject,
     target_shot: Shot,
-    preferred_template: WorkflowTemplate | None = None,
-) -> WorkflowTemplate:
-    queryset = WorkflowTemplate.objects.select_for_update().filter(
-        provider="comfyui",
-        output_kind=WorkflowTemplate.OutputKind.VIDEO,
-        is_active=True,
+    preferred_workflow_version: WorkflowTemplateVersion | None = None,
+) -> WorkflowTemplateVersion:
+    queryset = WorkflowTemplateVersion.objects.select_for_update().select_related(
+        "template", "provider", "model_profile_version__provider",
     ).filter(
-        # Global system templates plus tenant templates owned by the project
-        # owner.  Staff-only hidden templates are intentionally not guessed.
-        Q(owner__isnull=True) | Q(owner_id=project.owner_id),
+        status=WorkflowTemplateVersion.Status.PUBLISHED,
+        is_current=True,
+        template__output_kind="video",
+        template__is_active=True,
+        provider__driver_type="comfyui",
+    ).filter(
+        Q(template__owner__isnull=True) | Q(template__owner_id=project.owner_id),
     )
     candidates = []
-    for template in queryset:
-        schema = template.input_schema if isinstance(template.input_schema, dict) else {}
-        modes = schema.get("h3_modes") or []
-        if modes and target_shot.h3_mode not in modes:
+    for version in queryset:
+        try:
+            _workflow_mode_contract(version, target_shot)
+        except DjangoValidationError:
             continue
-        candidates.append(template)
+        candidates.append(version)
     if not candidates:
         raise DeferredGenerationUnavailable(
-            code="deferred_target_template_unavailable",
-            detail=f"没有 active ComfyUI 视频模板支持目标分镜模式 {target_shot.h3_mode}。",
+            code="deferred_target_workflow_unavailable",
+            detail=f"没有已发布的 ComfyUI 工作流版本支持目标分镜模式 {target_shot.conditioning_mode}。",
         )
-    if preferred_template is not None:
+    if preferred_workflow_version is not None:
         for candidate in candidates:
-            if candidate.pk == preferred_template.pk:
+            if candidate.pk == preferred_workflow_version.pk:
                 return candidate
     candidates.sort(key=lambda item: (
-        not bool((item.input_schema or {}).get("h3_modes")),
-        not bool((item.input_schema or {}).get("is_default")),
-        item.owner_id is not None,
+        not bool((item.input_contract or {}).get("is_default")),
+        item.template.owner_id is not None,
         -item.version,
-        item.slug,
+        item.template.slug,
     ))
     return candidates[0]
 
@@ -174,30 +222,17 @@ def _select_deferred_target_template(
 def _execution_overrides_from_source_task(
     *,
     source_task: GenerationTask,
-    target_template: WorkflowTemplate,
+    target_workflow_version: WorkflowTemplateVersion,
 ) -> dict[str, Any]:
-    """Rebuild safe execution overrides from a source task's frozen snapshot."""
+    """Copy only semantic values declared by the selected workflow version."""
 
     snapshot = source_task.capability_snapshot
     if not isinstance(snapshot, dict):
         return {}
     overrides: dict[str, Any] = {}
-    profile = snapshot.get("resolution_profile")
-    if isinstance(profile, str) and profile:
-        overrides["RESOLUTION_PROFILE"] = profile
-    for snapshot_key, override_key in (
-        ("resolution_multiple", "RESOLUTION_MULTIPLE"),
-        ("width", "WIDTH"),
-        ("height", "HEIGHT"),
-    ):
-        value = snapshot.get(snapshot_key)
-        if isinstance(value, bool):
-            continue
-        if isinstance(value, int) and value > 0:
-            overrides[override_key] = value
     workflow_parameters = snapshot.get("workflow_parameters")
     parameter_definitions = (
-        (target_template.input_schema or {}).get("user_parameters") or {}
+        (target_workflow_version.input_contract or {}).get("parameters") or {}
     )
     if isinstance(workflow_parameters, dict) and isinstance(parameter_definitions, dict):
         for key in parameter_definitions:
@@ -209,12 +244,12 @@ def _execution_overrides_from_source_task(
 def _deferred_target_workflow_overrides(
     *,
     source_task: GenerationTask,
-    target_template: WorkflowTemplate,
+    target_workflow_version: WorkflowTemplateVersion,
     selected_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     inherited = _execution_overrides_from_source_task(
         source_task=source_task,
-        target_template=target_template,
+        target_workflow_version=target_workflow_version,
     )
     if selected_overrides is None:
         return inherited
@@ -242,52 +277,42 @@ def _source_task_has_primary_video_contract(source_task: GenerationTask) -> bool
 
 
 def _compile_deferred_target_model_profile(
-    source_task: GenerationTask,
+    target_workflow_version: WorkflowTemplateVersion,
 ) -> ModelProfileVersion:
-    source_prompt = source_task.generated_workflow.prompt_artifact
-    request_options = (
-        source_prompt.request_options
-        if isinstance(source_prompt.request_options, dict) else {}
-    )
-    model_profile_id = str(request_options.get("model_profile_version_id") or "").strip()
-    if not model_profile_id:
+    model_profile = target_workflow_version.model_profile_version
+    if model_profile is None:
         raise DeferredGenerationUnavailable(
             code="deferred_prompt_profile_route_missing",
-            detail=(
-                "上游任务没有冻结 model_profile_version，不能通过未版本化提示词路径创建延迟生产任务。"
-            ),
+            detail="目标工作流版本没有绑定 ModelProfileVersion。",
         )
-    try:
-        model_profile = ModelProfileVersion.objects.select_related("provider").get(
-            pk=model_profile_id,
-        )
-    except (ModelProfileVersion.DoesNotExist, ValueError) as exc:
+    if model_profile.status != ModelProfileVersion.Status.PUBLISHED:
         raise DeferredGenerationUnavailable(
             code="deferred_prompt_profile_route_missing",
-            detail="上游任务冻结的 model_profile_version 不存在，不能创建延迟生产任务。",
-        ) from exc
+            detail="目标工作流绑定的 ModelProfileVersion 未发布。",
+        )
     return model_profile
 
 
 def _compile_deferred_target(
-    *, project: SeriesProject, target_shot: Shot, source_task: GenerationTask,
+    *,
+    project: SeriesProject,
+    target_shot: Shot,
+    target_workflow_version: WorkflowTemplateVersion,
 ):
-    model_profile = _compile_deferred_target_model_profile(source_task)
+    model_profile = _compile_deferred_target_model_profile(target_workflow_version)
     snapshot = capture_consistency_snapshot(project)
-    provisional_mode = (
-        Shot.H3Mode.FL2VA
-        if target_shot.h3_mode in {Shot.H3Mode.I2VA, Shot.H3Mode.L2VA}
-        else target_shot.h3_mode
-    )
     return compile_prompt_input(
         project=project,
         shots=[target_shot],
         prompt_type=PromptArtifact.PromptType.VIDEO,
-        mode=provisional_mode,
+        mode=target_shot.conditioning_mode,
         include_audio=target_shot.include_audio,
         duration_overrides={str(target_shot.id): target_shot.duration_ms},
         consistency_snapshot=snapshot,
         model_profile_version=model_profile,
+        frozen_frame_policy=deepcopy(
+            (target_workflow_version.input_contract or {}).get("frame_policy")
+        ),
     )
 
 
@@ -297,8 +322,8 @@ def _request_fingerprint(
     source_task: GenerationTask,
     target_shot: Shot,
     frame_slot: str,
-    target_template: WorkflowTemplate,
-    target_template_hash: str,
+    target_workflow_version: WorkflowTemplateVersion,
+    target_workflow_snapshot_sha256: str,
     target_input_fingerprint: str,
     target_workflow_overrides: dict[str, Any],
     priority: int,
@@ -312,8 +337,8 @@ def _request_fingerprint(
         "source_output_role": DeferredGenerationRequest.SOURCE_OUTPUT_ROLE_PRIMARY_VIDEO,
         "target_shot_id": str(target_shot.id),
         "frame_slot": frame_slot,
-        "target_template_id": str(target_template.id),
-        "target_template_hash": target_template_hash,
+        "target_workflow_version_id": str(target_workflow_version.id),
+        "target_workflow_snapshot_sha256": target_workflow_snapshot_sha256,
         "target_input_fingerprint": target_input_fingerprint,
         "target_workflow_overrides": target_workflow_overrides,
         "priority": priority,
@@ -330,10 +355,10 @@ def create_deferred_generation_request(
     target_shot: Shot,
     frame_slot: str,
     idempotency_key: str,
-    preferred_template: WorkflowTemplate | None = None,
+    preferred_workflow_version: WorkflowTemplateVersion | None = None,
     target_workflow_overrides: dict[str, Any] | None = None,
     priority: int = 0,
-    max_attempts: int = 3,
+    max_attempts: int | None = None,
     extended_generation_confirmed: bool = False,
 ) -> tuple[DeferredGenerationRequest, bool]:
     """Create or replay one deferred first/last-frame dependency.
@@ -343,6 +368,33 @@ def create_deferred_generation_request(
     the source video output has a verified signed manifest.
     """
 
+    runtime = resolve_configuration(project=project, required_keys=(
+        "runtime.deferred_generation_retry_backoff_seconds",
+        "production.task_max_attempts",
+    )).values
+    retry_backoff_seconds = runtime["runtime.deferred_generation_retry_backoff_seconds"]
+    if (
+        isinstance(retry_backoff_seconds, bool)
+        or not isinstance(retry_backoff_seconds, int)
+        or retry_backoff_seconds < 1
+    ):
+        raise DeferredGenerationUnavailable(
+            code="deferred_retry_backoff_invalid",
+            detail="冻结的 deferred 重试退避策略无效",
+        )
+    if max_attempts is None:
+        max_attempts = runtime["production.task_max_attempts"]
+    if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+        raise DeferredGenerationUnavailable(
+            code="deferred_max_attempts_invalid",
+            detail="延迟生成总尝试次数必须是正整数",
+        )
+    retry_ceiling = boundary_int("security.production.max_automatic_retries") + 1
+    if max_attempts > retry_ceiling:
+        raise DeferredGenerationUnavailable(
+            code="deferred_max_attempts_exceeded",
+            detail="延迟生成总尝试次数超过当前自动重试安全上限",
+        )
     with transaction.atomic():
         project = SeriesProject.objects.select_for_update().get(pk=project.pk)
         if not user.is_staff and project.owner_id != user.id:
@@ -381,29 +433,37 @@ def create_deferred_generation_request(
                 code="deferred_generation_source_contract_missing",
                 detail="上游任务缺少冻结 primary_video 输出契约；请重新创建上游任务。",
             )
-        if not _frame_slot_compatible(target_shot, frame_slot):
+        target_workflow_version = _select_deferred_target_workflow_version(
+            project=project,
+            target_shot=target_shot,
+            preferred_workflow_version=preferred_workflow_version,
+        )
+        mode_contract = _workflow_mode_contract(target_workflow_version, target_shot)
+        if not _frame_slot_compatible(target_shot, frame_slot, mode_contract):
             raise DeferredGenerationConflict(
                 code="deferred_generation_target_incompatible",
                 detail="目标分镜模式不支持所选首帧/尾帧槽位；系统不会自动改模式。",
             )
-        target_template = _select_deferred_target_template(
-            project=project,
-            target_shot=target_shot,
-            preferred_template=preferred_template,
+        target_workflow_snapshot = workflow_version_execution_snapshot(
+            target_workflow_version,
         )
-        target_template_hash = workflow_template_contract_sha256(target_template)
+        target_workflow_snapshot_sha256 = _canonical_sha256(target_workflow_snapshot)
         target_workflow_overrides = _deferred_target_workflow_overrides(
             source_task=source_task,
-            target_template=target_template,
+            target_workflow_version=target_workflow_version,
             selected_overrides=target_workflow_overrides,
         )
         try:
             compiled = _compile_deferred_target(
-                project=project, target_shot=target_shot, source_task=source_task,
+                project=project,
+                target_shot=target_shot,
+                target_workflow_version=target_workflow_version,
             )
         except (PromptBuildError, PromptProfileResolutionError) as exc:
             raise ValidationError({"target_shot_id": str(exc)}) from exc
-        if len(compiled.prompt_text) > DEFERRED_PROVISIONAL_PROMPT_MAX_CHARS:
+        if len(compiled.prompt_text) > boundary_int(
+            "security.deferred.provisional_prompt_max_characters",
+        ):
             raise ValidationError({
                 "target_shot_id": (
                     "目标分镜临时提示词超过 64KiB；请缩短分镜或 Bible 描述。"
@@ -414,8 +474,8 @@ def create_deferred_generation_request(
             source_task=source_task,
             target_shot=target_shot,
             frame_slot=frame_slot,
-            target_template=target_template,
-            target_template_hash=target_template_hash,
+            target_workflow_version=target_workflow_version,
+            target_workflow_snapshot_sha256=target_workflow_snapshot_sha256,
             target_input_fingerprint=compiled.input_fingerprint,
             target_workflow_overrides=target_workflow_overrides,
             priority=priority,
@@ -452,8 +512,9 @@ def create_deferred_generation_request(
                 source_task=source_task,
                 target_shot=target_shot,
                 frame_slot=frame_slot,
-                target_template=target_template,
-                target_template_hash=target_template_hash,
+                target_workflow_version=target_workflow_version,
+                target_workflow_snapshot=target_workflow_snapshot,
+                target_workflow_snapshot_sha256=target_workflow_snapshot_sha256,
                 idempotency_key=idempotency_key,
                 request_fingerprint=request_fingerprint,
                 target_input_fingerprint=compiled.input_fingerprint,
@@ -466,6 +527,7 @@ def create_deferred_generation_request(
                 ).hexdigest(),
                 priority=priority,
                 max_attempts=max_attempts,
+                retry_backoff_seconds=retry_backoff_seconds,
                 extended_generation_confirmed=extended_generation_confirmed,
                 next_attempt_at=timezone.now(),
             )
@@ -480,13 +542,23 @@ def create_deferred_generation_request(
 def target_requires_deferred_first_frame(target_shot: Shot) -> bool:
     """Return whether target generation must wait for a previous-shot tail frame."""
 
-    return bool(
-        target_shot.media_type == Shot.MediaType.VIDEO
-        and target_shot.requires_first_frame_continuity
-        and _frame_slot_compatible(
-            target_shot,
-            DeferredGenerationRequest.FrameSlot.FIRST_FRAME,
+    if (
+        target_shot.media_type != Shot.MediaType.VIDEO
+        or not target_shot.requires_first_frame_continuity
+    ):
+        return False
+    try:
+        workflow_version = _select_deferred_target_workflow_version(
+            project=target_shot.episode.project,
+            target_shot=target_shot,
         )
+        mode_contract = _workflow_mode_contract(workflow_version, target_shot)
+    except (DeferredGenerationUnavailable, DjangoValidationError):
+        return False
+    return _frame_slot_compatible(
+        target_shot,
+        DeferredGenerationRequest.FrameSlot.FIRST_FRAME,
+        mode_contract,
     )
 
 
@@ -589,10 +661,10 @@ def ensure_auto_first_frame_deferred(
     source_task: GenerationTask,
     target_shot: Shot,
     priority: int = 0,
-    max_attempts: int = 3,
+    max_attempts: int | None = None,
     extended_generation_confirmed: bool = False,
     request_key: str = "",
-    preferred_template: WorkflowTemplate | None = None,
+    preferred_workflow_version: WorkflowTemplateVersion | None = None,
     target_workflow_overrides: dict[str, Any] | None = None,
 ) -> tuple[DeferredGenerationRequest, bool]:
     """Create or reuse the first-frame deferred request for one target shot."""
@@ -619,7 +691,7 @@ def ensure_auto_first_frame_deferred(
             target_shot=target_shot,
             request_key=request_key,
         ),
-        preferred_template=preferred_template,
+        preferred_workflow_version=preferred_workflow_version,
         target_workflow_overrides=target_workflow_overrides,
         priority=priority,
         max_attempts=max_attempts,
@@ -912,7 +984,9 @@ def extract_last_decodable_frame(
             command,
             capture_output=True,
             text=True,
-            timeout=DEFERRED_FRAME_EXTRACT_TIMEOUT_SECONDS,
+            timeout=boundary_int(
+                "security.deferred.frame_extract_timeout_max_seconds"
+            ),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -972,10 +1046,20 @@ def claim_next_deferred_request(worker_id: str) -> DeferredGenerationRequest | N
         return request
 
 
-def recover_stale_deferred_requests(minutes: int = 30) -> int:
+def recover_stale_deferred_requests(minutes: float | None = None) -> int:
     """Release lost worker claims without touching completed requests."""
 
-    cutoff = timezone.now() - timedelta(minutes=max(1, int(minutes)))
+    if minutes is None:
+        values = resolve_configuration(required_keys=(
+            "runtime.worker_stale_recovery_minutes",
+        )).values
+        minutes = values["runtime.worker_stale_recovery_minutes"]
+    if isinstance(minutes, bool) or not isinstance(minutes, (int, float)) or minutes <= 0:
+        raise ConfigurationResolutionError(
+            "陈旧 deferred 请求回收阈值必须是正分钟数",
+            code="stale_recovery_policy_invalid",
+        )
+    cutoff = timezone.now() - timedelta(minutes=float(minutes))
     with transaction.atomic():
         queryset = DeferredGenerationRequest.objects.select_for_update().filter(
             status__in=(
@@ -1032,6 +1116,12 @@ def _mark_deferred_retryable_failure(
     code: str,
     message: str,
 ) -> DeferredGenerationRequest:
+    backoff_seconds = request.retry_backoff_seconds
+    if isinstance(backoff_seconds, bool) or not isinstance(backoff_seconds, int) or backoff_seconds < 1:
+        raise DeferredGenerationUnavailable(
+            code="deferred_retry_backoff_invalid",
+            detail="冻结的 deferred 重试退避策略无效",
+        )
     with transaction.atomic():
         locked = DeferredGenerationRequest.objects.select_for_update().get(pk=request.pk)
         terminal = locked.attempts >= locked.max_attempts
@@ -1045,7 +1135,7 @@ def _mark_deferred_retryable_failure(
         locked.worker_id = ""
         locked.claimed_at = None
         locked.heartbeat_at = timezone.now()
-        locked.next_attempt_at = timezone.now() + timedelta(seconds=30)
+        locked.next_attempt_at = timezone.now() + timedelta(seconds=backoff_seconds)
         if terminal:
             locked.finished_at = timezone.now()
         locked.save(update_fields=(
@@ -1078,6 +1168,10 @@ def _create_derived_frame_asset(
             "仅作为下游镜头首/尾帧参考。"
         ),
         prompt_hint=f"Use this generated frame as the strict {request.frame_slot} continuity anchor.",
+        source_info=(
+            f"延迟连续生成请求 {request.id} · "
+            f"上游生成任务 {request.source_task_id} · 自动{slot_label}"
+        ),
         mime_type=mimetypes.guess_type(frame_path.name)[0] or "image/png",
         checksum=artifact_sha256,
         metadata={
@@ -1111,10 +1205,11 @@ def _create_derived_frame_asset(
 
 def _deferred_bindings_with_asset(
     *, target_shot: Shot, frame_slot: str, asset: Asset,
+    mode_contract: dict[str, Any],
 ) -> dict:
     bindings = deepcopy(target_shot.reference_bindings or {})
     if (
-        target_shot.h3_mode == Shot.H3Mode.REF2VA
+        mode_contract.get("input_kind") == "classified_references"
         and frame_slot == DeferredGenerationRequest.FrameSlot.FIRST_FRAME
     ):
         field = "first_frame_reference_asset_id"
@@ -1184,7 +1279,8 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
         "project__style",
         "source_task__generated_workflow__template",
         "target_shot__episode__project",
-        "target_template",
+        "target_workflow_version__template",
+        "target_workflow_version__model_profile_version__provider",
     ).get(pk=request.pk)
     if request.source_task.status == GenerationTask.Status.FAILED:
         return _finalize_deferred(
@@ -1212,7 +1308,7 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
         )
         with _DerivedFrameFileGuard() as file_guard, transaction.atomic():
             # Keep the same high-level lock order used by production builds:
-            # Project -> Shot -> Deferred request -> source Task -> Template.
+            # Project -> Shot -> Deferred request -> source Task -> WorkflowVersion.
             # The frame extraction above is deliberately outside this section.
             project = SeriesProject.objects.select_for_update().get(pk=request.project_id)
             target_shot = Shot.objects.select_for_update().select_related(
@@ -1221,21 +1317,35 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
             locked = DeferredGenerationRequest.objects.select_for_update().select_related(
                 "owner",
                 "source_task",
-                "target_template",
+                "target_workflow_version__template",
+                "target_workflow_version__model_profile_version__provider",
             ).get(pk=request.pk)
             if locked.status != DeferredGenerationRequest.Status.EXTRACTING:
                 return locked
             if locked.project_id != project.id or locked.target_shot_id != target_shot.id:
                 raise ValueError("延迟生成请求的项目或目标分镜已损坏。")
             source_task = GenerationTask.objects.select_for_update().get(pk=locked.source_task_id)
-            target_template = WorkflowTemplate.objects.select_for_update().get(pk=locked.target_template_id)
+            target_workflow_version = (
+                WorkflowTemplateVersion.objects.select_for_update()
+                .select_related("template", "model_profile_version__provider")
+                .get(pk=locked.target_workflow_version_id)
+            )
             locked.status = DeferredGenerationRequest.Status.MATERIALIZING
             locked.heartbeat_at = timezone.now()
             locked.save(update_fields=("status", "heartbeat_at", "updated_at"))
-            if workflow_template_contract_sha256(target_template) != locked.target_template_hash:
+            frozen_snapshot = locked.target_workflow_snapshot
+            frozen_snapshot_sha256 = _canonical_sha256(frozen_snapshot)
+            current_snapshot = workflow_version_execution_snapshot(target_workflow_version)
+            if (
+                frozen_snapshot_sha256 != locked.target_workflow_snapshot_sha256
+                or current_snapshot != frozen_snapshot
+                or target_workflow_version.status
+                != WorkflowTemplateVersion.Status.PUBLISHED
+                or not target_workflow_version.is_current
+            ):
                 locked.status = DeferredGenerationRequest.Status.STALE
-                locked.error_code = "deferred_target_template_changed"
-                locked.error_message = "目标模板契约已变化，请重新创建延迟请求。"
+                locked.error_code = "deferred_target_workflow_changed"
+                locked.error_message = "目标工作流版本或冻结快照已变化，请重新创建延迟请求。"
                 locked.claim_token = ""
                 locked.finished_at = timezone.now()
                 locked.save(update_fields=(
@@ -1246,7 +1356,7 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
             compiled_without_frame = _compile_deferred_target(
                 project=project,
                 target_shot=target_shot,
-                source_task=source_task,
+                target_workflow_version=target_workflow_version,
             )
             if compiled_without_frame.input_fingerprint != locked.target_input_fingerprint:
                 locked.status = DeferredGenerationRequest.Status.STALE
@@ -1269,22 +1379,31 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
                 target_shot=target_shot,
                 frame_slot=locked.frame_slot,
                 asset=derived_asset,
+                mode_contract=_workflow_mode_contract(
+                    target_workflow_version,
+                    target_shot,
+                ),
             )
             asset_pool = list(target_shot.reference_assets.all()) + [derived_asset]
             compiled_with_frame = compile_prompt_input(
                 project=project,
                 shots=[target_shot],
                 prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode=target_shot.h3_mode,
+                mode=target_shot.conditioning_mode,
                 include_audio=target_shot.include_audio,
                 duration_overrides={str(target_shot.id): target_shot.duration_ms},
                 single_shot_reference_bindings=bindings,
                 single_shot_reference_assets=asset_pool,
-                model_profile_version=_compile_deferred_target_model_profile(source_task),
+                model_profile_version=_compile_deferred_target_model_profile(
+                    target_workflow_version,
+                ),
+                frozen_frame_policy=deepcopy(
+                    (target_workflow_version.input_contract or {}).get("frame_policy")
+                ),
             )
             target_workflow_overrides = _deferred_target_workflow_overrides(
                 source_task=source_task,
-                target_template=target_template,
+                target_workflow_version=target_workflow_version,
                 selected_overrides=locked.target_workflow_overrides,
             )
             prompt = materialize_compiled_prompt(
@@ -1310,17 +1429,24 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
                     },
                 },
             )
-            workflow = materialize_generated_workflow(
-                user=locked.owner,
-                template=target_template,
+            compiled_workflow = compile_frozen_workflow(
+                workflow_snapshot=frozen_snapshot,
                 prompt=prompt,
+                project=project,
                 overrides=target_workflow_overrides,
             )
-            assert_queue_capacity(
+            workflow = materialize_compiled_workflow_version(
+                user=locked.owner,
+                workflow_version=target_workflow_version,
+                prompt=prompt,
+                compiled=compiled_workflow,
+                route_snapshot_sha256=frozen_snapshot_sha256,
+                workflow_snapshot=frozen_snapshot,
+            )
+            queue_guidance = capture_queue_capacity_advisory(
                 locked.owner,
                 additional=1,
                 project=project,
-                extended_generation_confirmed=locked.extended_generation_confirmed,
             )
             batch_overrides = _deferred_batch_capability_overrides(
                 source_task=source_task,
@@ -1332,6 +1458,7 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
                 priority=locked.priority,
                 max_attempts=locked.max_attempts,
                 capability_snapshot_overrides={
+                    "queue_guidance": queue_guidance,
                     "extended_generation_confirmed": bool(
                         locked.extended_generation_confirmed
                     ),
@@ -1374,12 +1501,6 @@ def process_deferred_request(request: DeferredGenerationRequest) -> DeferredGene
                 "claimed_at", "heartbeat_at", "finished_at", "updated_at",
             ))
             return locked
-    except ProductionQueueConfirmationRequired as exc:
-        return _mark_deferred_retryable_failure(
-            request,
-            code="production_queue_confirmation_required",
-            message=str(exc.detail.get("detail") if isinstance(exc.detail, dict) else exc),
-        )
     except (ProvenanceError, FileNotFoundError) as exc:
         return _finalize_deferred(
             request,

@@ -12,11 +12,72 @@ from studio.models import (
     WorkflowTemplate,
 )
 from studio.tests.factories import build_story
+from studio.services.configuration import project_creation_policy
+from studio.services.security_boundaries import boundary_int
 
 
 class SeriesProjectManagementAPITests(TestCase):
     def setUp(self):
         self.client = APIClient()
+
+    def test_create_from_page_resolves_server_owned_runtime_defaults(self):
+        owner = get_user_model().objects.create_user(username="creation-policy-owner")
+        self.client.force_authenticate(owner)
+        policy = project_creation_policy()
+        payload = {
+            "title": "独立创建验收",
+            "language": policy["default_language"],
+            "aspect_ratio": policy["default_aspect_ratio"],
+            "width": policy["width"],
+            "height": policy["height"],
+        }
+        response = self.client.post("/api/v1/projects/", payload, format="json")
+        self.assertEqual(response.status_code, 201, response.data)
+        project = SeriesProject.objects.get(pk=response.data["id"])
+        self.assertEqual(project.owner, owner)
+        for field in ("fps", "default_shot_duration_ms"):
+            self.assertEqual(getattr(project, field), policy[field])
+        seed = project.continuity_seed
+        self.assertGreater(seed, 0)
+        if policy["continuity_seed_policy"]["mode"] == "explicit":
+            self.assertEqual(seed, policy["continuity_seed_policy"]["value"])
+        changed = self.client.patch(
+            f"/api/v1/projects/{project.id}/", {"logline": "只改说明"}, format="json",
+        )
+        self.assertEqual(changed.status_code, 200, changed.data)
+        project.refresh_from_db()
+        self.assertEqual(project.fps, policy["fps"])
+        self.assertEqual(project.continuity_seed, seed)
+
+    def test_create_rejects_explicit_invalid_runtime_values(self):
+        owner = get_user_model().objects.create_user(username="creation-invalid-owner")
+        self.client.force_authenticate(owner)
+        policy = project_creation_policy()
+        payload = {
+            "title": "无效创建",
+            "language": policy["default_language"],
+            "aspect_ratio": policy["default_aspect_ratio"],
+            "width": policy["width"],
+            "height": policy["height"],
+        }
+        for field, value in (("fps", 0), ("fps", boundary_int("security.media.max_fps") + 1), ("continuity_seed", "invalid")):
+            with self.subTest(field=field, value=value):
+                response = self.client.post("/api/v1/projects/", {**payload, field: value}, format="json")
+                self.assertEqual(response.status_code, 400, response.data)
+                self.assertIn(field, str(response.data))
+        self.assertFalse(SeriesProject.objects.filter(owner=owner).exists())
+
+    def test_create_resolves_missing_dimensions_from_selected_aspect(self):
+        owner = get_user_model().objects.create_user(username="creation-aspect-owner")
+        self.client.force_authenticate(owner)
+        policy = project_creation_policy()
+        for option in policy["aspect_ratio_options"]:
+            response = self.client.post("/api/v1/projects/", {
+                "title": "画幅默认值验收", "aspect_ratio": option["value"],
+            }, format="json")
+            self.assertEqual(response.status_code, 201, response.data)
+            self.assertEqual(response.data["width"], option["width"])
+            self.assertEqual(response.data["height"], option["height"])
 
     def _create_generation_task(
         self,
@@ -29,9 +90,10 @@ class SeriesProjectManagementAPITests(TestCase):
         submission_token="",
         remote_state=GenerationTask.RemoteState.UNKNOWN,
     ):
-        artifact = PromptArtifact.objects.create(
+        artifact = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=project,
             created_by=user,
+            total_duration_ms=project.default_shot_duration_ms,
             prompt_text=f"project delete {suffix}",
             content_hash=suffix.encode("utf-8").hex().ljust(64, "0")[:64],
         )
@@ -54,6 +116,7 @@ class SeriesProjectManagementAPITests(TestCase):
             generated_workflow=workflow,
             kind=GenerationTask.Kind.VIDEO,
             status=task_status,
+            max_attempts=3,
             submission_state=submission_state,
             submission_token=submission_token,
             comfy_prompt_id=submission_token,
@@ -68,7 +131,7 @@ class SeriesProjectManagementAPITests(TestCase):
         other = get_user_model().objects.create_user(
             username="favorite-other", password="StrongPass123!",
         )
-        project = SeriesProject.objects.create(owner=owner, title="待收藏连续剧")
+        project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=owner, title="待收藏连续剧", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
 
         self.client.force_authenticate(owner)
         response = self.client.patch(
@@ -147,7 +210,7 @@ class SeriesProjectManagementAPITests(TestCase):
         other = get_user_model().objects.create_user(
             username="delete-other", password="StrongPass123!",
         )
-        project = SeriesProject.objects.create(owner=owner, title="不可跨租户删除")
+        project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=owner, title="不可跨租户删除", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
         self.client.force_authenticate(other)
 
         response = self.client.delete(f"/api/v1/projects/{project.id}/")
@@ -157,9 +220,10 @@ class SeriesProjectManagementAPITests(TestCase):
 
     def test_active_generation_tasks_block_project_delete(self):
         user, project, *_ = build_story("project-delete-generation")
-        artifact = PromptArtifact.objects.create(
+        artifact = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=project,
             created_by=user,
+            total_duration_ms=project.default_shot_duration_ms,
             prompt_text="delete guard",
             content_hash="a" * 64,
         )
@@ -181,6 +245,7 @@ class SeriesProjectManagementAPITests(TestCase):
             project=project,
             generated_workflow=workflow,
             kind=GenerationTask.Kind.VIDEO,
+            max_attempts=3,
         )
         self.client.force_authenticate(user)
 
@@ -285,9 +350,10 @@ class SeriesProjectManagementAPITests(TestCase):
 
     def test_nonterminal_remote_token_blocks_project_delete_after_local_failure_or_cancel(self):
         user, project, *_ = build_story("project-delete-unresolved-remote")
-        artifact = PromptArtifact.objects.create(
+        artifact = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=project,
             created_by=user,
+            total_duration_ms=project.default_shot_duration_ms,
             prompt_text="unresolved remote delete guard",
             content_hash="c" * 64,
         )
@@ -309,6 +375,7 @@ class SeriesProjectManagementAPITests(TestCase):
             project=project,
             generated_workflow=workflow,
             kind=GenerationTask.Kind.VIDEO,
+            max_attempts=3,
             submission_token="2f270fa3-9715-448e-a499-57ad82ae152a",
             comfy_prompt_id="2f270fa3-9715-448e-a499-57ad82ae152a",
             submission_state=GenerationTask.SubmissionState.SUBMITTED,
@@ -336,6 +403,7 @@ class SeriesProjectManagementAPITests(TestCase):
             owner=user,
             project=project,
             scope=AssemblyJob.Scope.SERIES,
+            max_attempts=3,
         )
         self.client.force_authenticate(user)
 

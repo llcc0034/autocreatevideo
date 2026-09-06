@@ -27,8 +27,19 @@ from studio.models import (
 )
 from studio.services.generated_artifacts import verified_local_media_facts
 from studio.services.json_contracts import verify_json_contract
+from studio.services.media_processing_profiles import (
+    MediaProcessingProfileError,
+    ResolvedMediaProcessingProfile,
+    resolve_assembly_media_profile,
+    validate_assembly_profile,
+)
 from studio.services.provenance import ProvenanceError, sha256_file, verified_assembly_manifest
-from studio.services.configuration import resolve_configuration
+from studio.services.security_boundaries import boundary_int
+from studio.services.delivery_disclosure import (
+    DeliveryDisclosureError,
+    resolve_delivery_disclosure,
+)
+from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
 
 
 class AssemblyError(ValueError):
@@ -38,10 +49,11 @@ class AssemblyError(ValueError):
 
 
 def _delivery_disclosure() -> tuple[bool, str]:
-    values = resolve_configuration(required_keys=(
-        "delivery.ai_label_enabled", "delivery.ai_label_text",
-    )).values
-    return bool(values["delivery.ai_label_enabled"]), str(values["delivery.ai_label_text"])
+    try:
+        disclosure = resolve_delivery_disclosure()
+    except DeliveryDisclosureError as exc:
+        raise AssemblyError(str(exc)) from exc
+    return disclosure.visible_label_enabled, disclosure.base_label
 
 
 @dataclass(frozen=True)
@@ -63,7 +75,7 @@ class Clip:
     media_kind: str = Shot.MediaType.VIDEO
 
 
-_ASSEMBLY_SIGNATURE_VERSION = 3
+_ASSEMBLY_SIGNATURE_VERSION = 4
 _ASSEMBLY_SIGNATURE_RE = re.compile(r"\.source-([0-9a-f]{64})\.ffconcat$")
 
 
@@ -139,6 +151,7 @@ def _artifact_prompt(artifact: GeneratedArtifact) -> PromptArtifact:
         schema_version=attempt.request_snapshot_schema_version,
         size_bytes=attempt.request_snapshot_size_bytes,
         sha256=attempt.request_snapshot_sha256,
+        max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
     )
     prompt_id = (
         attempt.request_snapshot.get("prompt_artifact_id")
@@ -283,14 +296,14 @@ def _ordered_frozen_sources_for_episode(
             selections.append(TaskSelection(shot=shot, task=task))
             continue
         artifact = GeneratedArtifact.objects.select_related(
-            "production_run", "generation_attempt",
+            "production_run__project", "generation_attempt",
         ).filter(pk=reference["generated_artifact_id"]).first()
         if (
             artifact is None
             or artifact.kind != shot.media_type
             or artifact.production_run is None
-            or artifact.production_run.owner_id != episode.project.owner_id
             or artifact.production_run.project_id != episode.project_id
+            or artifact.production_run.project.owner_id != episode.project.owner_id
         ):
             raise AssemblyError(f"分镜 {shot.number} 的冻结 GeneratedArtifact 不属于当前项目")
         prompt = _artifact_prompt(artifact)
@@ -332,7 +345,11 @@ def _ffprobe_binary() -> str:
     return str(ffmpeg.with_name(f"ffprobe{suffix}"))
 
 
-def _probe_media_streams(path: Path) -> frozenset[str]:
+def _probe_media_streams(
+    path: Path,
+    *,
+    media_profile: dict | None = None,
+) -> frozenset[str]:
     """Return streams actually present in a persisted input media file.
 
     Prompt intent is not evidence that ComfyUI emitted an audio stream.  A
@@ -341,6 +358,9 @@ def _probe_media_streams(path: Path) -> frozenset[str]:
     """
 
     try:
+        profile = validate_assembly_profile(media_profile) if media_profile is not None else (
+            resolve_assembly_media_profile().value
+        )
         result = subprocess.run(
             [
                 _ffprobe_binary(), "-v", "error",
@@ -349,9 +369,9 @@ def _probe_media_streams(path: Path) -> frozenset[str]:
             check=False,
             capture_output=True,
             text=True,
-            timeout=float(getattr(settings, "ASSEMBLY_PROBE_TIMEOUT_SECONDS", 30)),
+            timeout=profile["probe_timeout_seconds"],
         )
-    except (OSError, subprocess.SubprocessError) as exc:
+    except (OSError, subprocess.SubprocessError, MediaProcessingProfileError) as exc:
         raise AssemblyError(f"无法探测输入媒体 {path.name}: {exc}") from exc
     if result.returncode != 0:
         detail = (result.stderr or result.stdout or "ffprobe exited with an error").strip()
@@ -373,13 +393,15 @@ def _probe_media_streams(path: Path) -> frozenset[str]:
 def _resolve_output(
     selection: TaskSelection,
     stream_cache: dict[Path, frozenset[str]] | None = None,
+    *,
+    media_profile: dict | None = None,
 ) -> Clip:
     task = selection.task
     if selection.artifact is not None:
         artifact = selection.artifact
         candidate, _facts = _managed_artifact_path(artifact)
         prompt = _artifact_prompt(artifact)
-        duration_seconds = max(0.1, selection.shot.duration_ms / 1000)
+        duration_seconds = selection.shot.duration_ms / 1000
         if artifact.kind == GeneratedArtifact.Kind.IMAGE:
             return Clip(
                 None, candidate, False, duration_seconds,
@@ -387,7 +409,7 @@ def _resolve_output(
             )
         streams = stream_cache.get(candidate) if stream_cache is not None else None
         if streams is None:
-            streams = _probe_media_streams(candidate)
+            streams = _probe_media_streams(candidate, media_profile=media_profile)
             if stream_cache is not None:
                 stream_cache[candidate] = streams
         if "video" not in streams:
@@ -421,12 +443,12 @@ def _resolve_output(
     if is_image:
         return Clip(
             task, candidate, False,
-            max(0.1, selection.shot.duration_ms / 1000),
+            selection.shot.duration_ms / 1000,
             media_kind=Shot.MediaType.IMAGE,
         )
     streams = stream_cache.get(candidate) if stream_cache is not None else None
     if streams is None:
-        streams = _probe_media_streams(candidate)
+        streams = _probe_media_streams(candidate, media_profile=media_profile)
         if stream_cache is not None:
             stream_cache[candidate] = streams
     if "video" not in streams:
@@ -437,12 +459,12 @@ def _resolve_output(
         start_seconds, _source_window_seconds = _multi_shot_window(selection)
         return Clip(
             task, candidate, has_audio,
-            max(0.1, selection.shot.duration_ms / 1000),
-            max(0, start_seconds), True, media_kind=Shot.MediaType.VIDEO,
+            selection.shot.duration_ms / 1000,
+            start_seconds, True, media_kind=Shot.MediaType.VIDEO,
         )
     return Clip(
         task, candidate, has_audio,
-        max(0.1, selection.shot.duration_ms / 1000),
+        selection.shot.duration_ms / 1000,
         media_kind=Shot.MediaType.VIDEO,
     )
 
@@ -489,11 +511,28 @@ def _resolve_ai_label_fontfile() -> str:
     return ""
 
 
-def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) -> list[str]:
+def _ffmpeg_command(
+    clips: list[Clip], output: Path, width: int, height: int, fps: int,
+    *,
+    media_profile: dict | None = None,
+) -> list[str]:
+    try:
+        profile = validate_assembly_profile(media_profile) if media_profile is not None else (
+            resolve_assembly_media_profile().value
+        )
+    except MediaProcessingProfileError as exc:
+        raise AssemblyError(str(exc)) from exc
+    maximum_fps = boundary_int("security.media.max_fps")
+    if (
+        isinstance(fps, bool)
+        or not isinstance(fps, int)
+        or not 1 <= fps <= maximum_fps
+    ):
+        raise AssemblyError(f"交付帧率必须是 1–{maximum_fps} 的整数")
     command = [settings.FFMPEG_BINARY, "-hide_banner", "-loglevel", "error", "-y"]
     for clip in clips:
         if clip.media_kind == Shot.MediaType.IMAGE:
-            command.extend(("-loop", "1", "-framerate", "24"))
+            command.extend(("-loop", "1", "-framerate", str(fps)))
         command.extend(("-i", str(clip.path)))
     filters = []
     concat_inputs = []
@@ -505,7 +544,8 @@ def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) ->
         filters.append(
             f"[{index}:v:0]{video_trim}tpad=stop_mode=clone:stop_duration={clip.duration_seconds:.3f},"
             f"trim=duration={clip.duration_seconds:.3f},scale={width}:{height}:force_original_aspect_ratio=decrease,"
-            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps=24,format=yuv420p,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:black,fps={fps},"
+            f"format={profile['pixel_format']},"
             f"setpts=PTS-STARTPTS[v{index}]"
         )
         concat_inputs.append(f"[v{index}]")
@@ -515,14 +555,15 @@ def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) ->
                 if clip.trim_to_shot else ""
             )
             filters.append(
-                f"[{index}:a:0]{audio_trim}aresample=48000,"
+                f"[{index}:a:0]{audio_trim}aresample={profile['audio_sample_rate_hz']},"
                 f"aformat=sample_fmts=fltp:channel_layouts=stereo,"
                 f"apad=pad_dur={clip.duration_seconds:.3f},atrim=duration={clip.duration_seconds:.3f},"
                 f"asetpts=PTS-STARTPTS[a{index}]"
             )
         else:
             filters.append(
-                f"anullsrc=r=48000:cl=stereo,atrim=duration={clip.duration_seconds:.3f},"
+                f"anullsrc=r={profile['audio_sample_rate_hz']}:cl=stereo,"
+                f"atrim=duration={clip.duration_seconds:.3f},"
                 f"asetpts=PTS-STARTPTS[a{index}]"
             )
         concat_inputs.append(f"[a{index}]")
@@ -532,10 +573,14 @@ def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) ->
     filters.append("".join(concat_inputs) + f"concat=n={len(clips)}:v=1:a=1[{concat_video_label}][aout]")
     if label_enabled:
         fontfile = _resolve_ai_label_fontfile()
+        overlay = profile["overlay"]
         drawtext = (
             f"drawtext=text='{_drawtext_value(label_text)}':"
-            "fontcolor=white:fontsize=h/40:box=1:boxcolor=black@0.62:boxborderw=10:"
-            "x=w-tw-24:y=h-th-24"
+            f"fontcolor={overlay['font_color']}:"
+            f"fontsize=h/{overlay['font_size_divisor']}:box=1:"
+            f"boxcolor={overlay['box_color']}@{overlay['box_opacity']}:"
+            f"boxborderw={overlay['box_border_width_px']}:"
+            f"x=w-tw-{overlay['margin_x_px']}:y=h-th-{overlay['margin_y_px']}"
         )
         if fontfile:
             drawtext = (
@@ -545,13 +590,19 @@ def _ffmpeg_command(clips: list[Clip], output: Path, width: int, height: int) ->
         filters.append(f"[vconcat]{drawtext}[vout]")
     command.extend((
         "-filter_complex", ";".join(filters), "-map", "[vout]",
-        "-map", "[aout]", "-c:a", "aac", "-b:a", "192k",
+        "-map", "[aout]", "-c:a", profile["audio_codec"],
+        "-b:a", f"{profile['audio_bitrate_kbps']}k",
     ))
-    command.extend(("-c:v", "libx264", "-preset", "medium", "-crf", "18"))
+    command.extend((
+        "-c:v", profile["video_codec"],
+        "-preset", profile["video_preset"],
+        "-crf", str(profile["video_crf"]),
+        "-pix_fmt", profile["pixel_format"],
+    ))
     if label_text:
         command.extend((
             "-metadata", f"comment={label_text}",
-            "-metadata", "description=AI-generated content produced with MiniMax H3",
+            "-metadata", f"description={label_text}",
         ))
     command.extend(("-movflags", "+faststart", str(output)))
     return command
@@ -573,6 +624,7 @@ def _normalized_requested_output_name(output_name: str) -> str:
 def _assembly_source_signature(
     *, owner, project: SeriesProject, episode: Episode | None,
     selections: list[TaskSelection], clips: list[Clip], output_name: str,
+    media_profile: ResolvedMediaProcessingProfile,
 ) -> str:
     sources = []
     for selection, clip in zip(selections, clips, strict=True):
@@ -604,10 +656,10 @@ def _assembly_source_signature(
             "requested_name": output_name,
             "width": project.width,
             "height": project.height,
-            "fps": 24,
-            "video_codec": "libx264",
-            "crf": 18,
-            "audio_codec": "aac",
+            "fps": project.fps,
+            "media_profile_key": media_profile.key,
+            "media_profile_sha256": media_profile.sha256,
+            "media_profile": media_profile.value,
             "ai_label_enabled": label_enabled,
             "ai_label_text": label_text,
             "ai_label_fontfile": str(settings.ASSEMBLY_AI_LABEL_FONTFILE or ""),
@@ -697,6 +749,10 @@ def create_assembly(
     task_ids_by_shot: dict[str, str] | None = None,
     source_refs_by_shot: dict[str, dict[str, str]] | None = None,
 ) -> AssemblyJob:
+    try:
+        media_profile = resolve_assembly_media_profile(project=project)
+    except MediaProcessingProfileError as exc:
+        raise AssemblyError(str(exc)) from exc
     scope = AssemblyJob.Scope.EPISODE if episode else AssemblyJob.Scope.SERIES
     episodes = [episode] if episode else list(project.episodes.order_by("number"))
     if not episodes:
@@ -720,7 +776,14 @@ def create_assembly(
             }
             selections.extend(_ordered_frozen_sources_for_episode(item, episode_mapping))
     stream_cache: dict[Path, frozenset[str]] = {}
-    clips = [_resolve_output(selection, stream_cache) for selection in selections]
+    clips = [
+        _resolve_output(
+            selection,
+            stream_cache,
+            media_profile=media_profile.value,
+        )
+        for selection in selections
+    ]
     normalized_output_name = _normalized_requested_output_name(output_name)
     source_signature = _assembly_source_signature(
         owner=owner,
@@ -729,6 +792,7 @@ def create_assembly(
         selections=selections,
         clips=clips,
         output_name=normalized_output_name,
+        media_profile=media_profile,
     )
     # Source tasks are an audit set; clips intentionally keep repeated multi-shot
     # tasks because each occurrence is trimmed to a different shot boundary.
@@ -760,11 +824,20 @@ def create_assembly(
                     _mark_scope_complete(project, episode)
                 return reusable
 
+        try:
+            max_attempts = resolve_configuration(project=project, required_keys=(
+                "delivery.assembly_max_attempts",
+            )).values["delivery.assembly_max_attempts"]
+        except ConfigurationResolutionError as exc:
+            raise AssemblyError(str(exc)) from exc
+        if isinstance(max_attempts, bool) or not isinstance(max_attempts, int) or max_attempts < 1:
+            raise AssemblyError("冻结的组装重试上限无效")
         job = AssemblyJob.objects.create(
             owner=owner, project=project, episode=episode, scope=scope,
             status=AssemblyJob.Status.PLANNED, dry_run=dry_run,
             source_signature=source_signature,
             source_contract_version=_ASSEMBLY_SIGNATURE_VERSION,
+            max_attempts=max_attempts,
             # Every assembled MP4 has an AAC track.  Source clips without an audio
             # stream receive duration-matched silence in ``_ffmpeg_command``.
             has_audio=True,
@@ -815,7 +888,14 @@ def create_assembly(
                 raise AssemblyError("目标输出正在被另一个组装任务使用；请换一个 output_name")
             if output.exists():
                 raise AssemblyError("目标输出已存在；为避免覆盖，请换一个 output_name")
-            command = _ffmpeg_command(clips, output, project.width, project.height)
+            command = _ffmpeg_command(
+                clips,
+                output,
+                project.width,
+                project.height,
+                project.fps,
+                media_profile=media_profile.value,
+            )
             manifest = output_dir / f"{job.id}.source-{source_signature}.ffconcat"
             manifest_lines = ["ffconcat version 1.0"]
             for selection, clip in zip(selections, clips, strict=True):

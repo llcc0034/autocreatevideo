@@ -1,6 +1,7 @@
 import hashlib
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.shortcuts import get_object_or_404
 from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import OpenApiParameter, extend_schema, inline_serializer
@@ -11,9 +12,113 @@ from rest_framework import status
 from rest_framework.views import APIView
 
 from studio.services.prompt_normalization import prompt_normalization_capability
-from studio.models import GenerationTask, SeriesProject
-from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
+from studio.models import (
+    GenerationTask,
+    ModelDeployment,
+    SeriesProject,
+    WorkflowTemplateVersion,
+)
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    project_creation_policy,
+    resolve_configuration,
+)
 from studio.services.json_contracts import canonical_json_bytes
+from studio.services.media_capabilities import (
+    merge_conditioning_contract_modes,
+    resolve_conditioning_contract,
+)
+from studio.services.model_profile_contracts import (
+    verified_model_profile_specification,
+)
+from studio.services.production_pipeline import queue_capacity_advisories
+from studio.services.security_boundaries import boundary_resolution
+
+
+QueueCapacityAdvisoryResponse = inline_serializer(
+    name="QueueCapacityAdvisory",
+    fields={
+        "schema_version": serializers.IntegerField(min_value=1),
+        "code": serializers.ChoiceField(choices=(
+            "recommended_max_pending_exceeded",
+            "recommended_max_active_per_user_exceeded",
+        )),
+        "severity": serializers.ChoiceField(choices=("warning",)),
+        "scope": serializers.ChoiceField(choices=("platform", "user")),
+        "measured": serializers.IntegerField(min_value=0),
+        "recommended_maximum": serializers.IntegerField(min_value=1),
+    },
+)
+
+
+ProductionEffectiveLimitsResponse = inline_serializer(
+    name="ProductionEffectiveLimits",
+    fields={
+        "max_variants": serializers.IntegerField(min_value=1),
+        "max_routing_routes": serializers.IntegerField(min_value=1),
+        "max_episodes": serializers.IntegerField(min_value=1),
+        "max_shots_per_episode": serializers.IntegerField(min_value=1),
+        "max_total_shots": serializers.IntegerField(min_value=1),
+        "max_generation_tasks": serializers.IntegerField(min_value=1),
+        "max_reference_bindings": serializers.IntegerField(min_value=1),
+        "max_bible_candidates_per_entity": serializers.IntegerField(min_value=1),
+        "max_bible_reference_assets_per_entity": serializers.IntegerField(
+            min_value=1,
+        ),
+        "max_bible_regeneration_entities_per_request": serializers.IntegerField(
+            min_value=1,
+        ),
+        "dialogue_max_entries": serializers.IntegerField(min_value=1),
+        "dialogue_speaker_id_max_characters": serializers.IntegerField(
+            min_value=1,
+        ),
+        "dialogue_text_max_characters": serializers.IntegerField(min_value=1),
+        "dialogue_delivery_max_characters": serializers.IntegerField(
+            min_value=1,
+        ),
+        "execution_monitoring_max_node_type_overrides": serializers.IntegerField(
+            min_value=1,
+        ),
+        "execution_monitoring_max_node_overrides": serializers.IntegerField(
+            min_value=1,
+        ),
+        "execution_monitoring_max_idle_timeout_seconds": serializers.IntegerField(
+            min_value=1,
+        ),
+        "prompt_review_max_candidates": serializers.IntegerField(min_value=1),
+        "prompt_review_max_advisories": serializers.IntegerField(min_value=1),
+        "prompt_review_max_input_bytes": serializers.IntegerField(min_value=1),
+        "prompt_review_max_field_characters": serializers.IntegerField(
+            min_value=1,
+        ),
+        "prompt_review_max_usage_count": serializers.IntegerField(min_value=1),
+        "audit_note_min_characters": serializers.IntegerField(min_value=1),
+        "audit_note_max_characters": serializers.IntegerField(min_value=1),
+    },
+)
+
+
+ProductionCreationDefaultsResponse = inline_serializer(
+    name="ProductionCreationDefaults",
+    fields={
+        "episode_count": serializers.IntegerField(min_value=1),
+        "shots_per_episode": serializers.IntegerField(min_value=1),
+        "episode_duration_seconds": serializers.IntegerField(min_value=1),
+        "max_generation_tasks": serializers.IntegerField(min_value=1),
+        "fps": serializers.IntegerField(min_value=1),
+        "width": serializers.IntegerField(min_value=1),
+        "height": serializers.IntegerField(min_value=1),
+        "default_language": serializers.CharField(),
+        "default_aspect_ratio": serializers.CharField(),
+        "aspect_ratio_options": serializers.ListField(
+            child=serializers.DictField(),
+        ),
+        "default_shot_media_type": serializers.ChoiceField(
+            choices=("video", "image"),
+        ),
+        "default_include_audio": serializers.BooleanField(),
+    },
+)
 
 
 ProductionCapabilityResponse = inline_serializer(
@@ -36,12 +141,20 @@ ProductionCapabilityResponse = inline_serializer(
         "script_breakdown_auto_split_target_chars": serializers.IntegerField(min_value=1),
         "active_task_count": serializers.IntegerField(min_value=0),
         "user_active_task_count": serializers.IntegerField(min_value=0),
-        "confirmation_required": serializers.BooleanField(),
+        "queue_guidance_enforcement": serializers.ChoiceField(choices=("advisory",)),
+        "queue_advisories": serializers.ListField(
+            child=QueueCapacityAdvisoryResponse,
+        ),
         "business_volume_limited": serializers.BooleanField(),
+        "conditioning_modes": serializers.ListField(child=serializers.DictField()),
+        "conditioning_contract_sha256": serializers.RegexField(r"^[0-9a-f]{64}$"),
+        "default_conditioning_mode": serializers.CharField(allow_blank=True),
         "configuration_public_sha256": serializers.RegexField(r"^[0-9a-f]{64}$"),
         "configuration_sources": serializers.DictField(
             child=serializers.CharField(),
         ),
+        "effective_limits": ProductionEffectiveLimitsResponse,
+        "creation_defaults": ProductionCreationDefaultsResponse,
     },
 )
 
@@ -145,7 +258,82 @@ class ProductionCapabilityView(APIView):
         "production.default_last_frame_continuity",
         "production.script_auto_split_trigger_chars",
         "production.script_auto_split_target_chars",
+        "production.project_creation_policy",
+        "production.default_resolution_width",
+        "production.default_resolution_height",
+        "production.default_include_audio",
     )
+
+    @staticmethod
+    def _conditioning_capability(project: SeriesProject | None) -> tuple[list[dict], str, str]:
+        """Return modes from executable published video routes.
+
+        This is a catalog projection only.  A ProductionRun still freezes and
+        validates the exact recipe route contract before it can execute.
+        """
+
+        contracts: list[dict] = []
+        deployments = ModelDeployment.objects.select_related(
+            "profile_version__provider",
+        ).filter(
+            status=ModelDeployment.Status.ACTIVE,
+            profile_version__status="published",
+            profile_version__provider__is_active=True,
+            profile_version__modality__in=("video", "multimodal"),
+        ).order_by("-is_default", "-priority", "key")
+        for deployment in deployments:
+            profile = deployment.profile_version
+            model_specification = verified_model_profile_specification(profile)
+            workflows = WorkflowTemplateVersion.objects.select_related(
+                "template",
+            ).filter(
+                validated_deployment=deployment,
+                template__output_kind="video",
+                status=WorkflowTemplateVersion.Status.PUBLISHED,
+                is_current=True,
+                smoke_test_state=WorkflowTemplateVersion.ValidationState.PASSED,
+            ).order_by("template__name", "version")
+            for workflow in workflows:
+                try:
+                    contracts.append(resolve_conditioning_contract(
+                        workflow_input_contract=workflow.input_contract,
+                        workflow_compiler_id=workflow.compiler_id,
+                        model_specification=model_specification,
+                        output_kind="video",
+                        required=True,
+                    ))
+                except ValidationError:
+                    # Invalid routes stay unavailable and are reported by the
+                    # recipe route-options endpoint; they cannot widen this
+                    # platform-level creation catalog.
+                    continue
+            if profile.provider.driver_type == "async_rest":
+                try:
+                    contracts.append(resolve_conditioning_contract(
+                        model_specification=model_specification,
+                        output_kind="video",
+                        required=True,
+                    ))
+                except ValidationError:
+                    continue
+        modes = merge_conditioning_contract_modes(contracts)
+        contract_sha256 = hashlib.sha256(canonical_json_bytes({
+            "schema_version": 1,
+            "modes": modes,
+        })).hexdigest()
+        settings_value = project.production_settings if project is not None else {}
+        default_mode = ""
+        if isinstance(settings_value, dict):
+            default_mode = str(
+                settings_value.get("default_conditioning_mode") or ""
+            ).strip()
+        if default_mode and default_mode not in {item["key"] for item in modes}:
+            raise ValidationError({
+                "default_conditioning_mode": (
+                    f"项目默认模式 {default_mode} 不在已发布条件输入能力合同中"
+                ),
+            })
+        return modes, contract_sha256, default_mode
 
     @extend_schema(
         parameters=[
@@ -174,6 +362,33 @@ class ProductionCapabilityView(APIView):
                 project=project,
                 required_keys=self.CONFIG_KEYS,
             )
+            security_resolution = boundary_resolution((
+                "security.production.max_variants",
+                "security.production.max_routing_routes",
+                "security.production.max_episodes",
+                "security.production.max_shots_per_episode",
+                "security.production.max_total_shots",
+                "security.production.max_generation_tasks",
+                "security.reference.max_bindings",
+                "security.production.max_bible_candidates_per_entity",
+                "security.production.max_bible_reference_assets_per_entity",
+                "security.production.max_bible_regeneration_entities_per_request",
+                "security.dialogue.max_entries",
+                "security.dialogue.speaker_id_max_characters",
+                "security.dialogue.text_max_characters",
+                "security.dialogue.delivery_max_characters",
+                "security.execution.max_type_overrides",
+                "security.execution.max_node_overrides",
+                "security.execution.max_idle_timeout_seconds",
+                "security.prompt_normalization.batch_max_items",
+                "security.prompt_normalization.advisory_max_items",
+                "security.prompt_normalization.request_max_bytes",
+                "security.prompt_normalization.text_max_characters",
+                "security.prompt.max_usage_count",
+                "security.audit_note.minimum_characters",
+                "security.audit_note.maximum_characters",
+            ))
+            security_limits = security_resolution.values
         except ConfigurationResolutionError as exc:
             return Response({
                 "code": exc.code,
@@ -192,12 +407,6 @@ class ProductionCapabilityView(APIView):
         default_duration = int(values["production.default_shot_duration_ms"])
         split_trigger = int(values["production.script_auto_split_trigger_chars"])
         split_target = int(values["production.script_auto_split_target_chars"])
-        if recommended_user > recommended_pending:
-            return Response({
-                "code": "production_config_invalid",
-                "detail": "单用户活跃任务建议阈值不能超过总待处理建议阈值",
-                "missing_keys": [],
-            }, status=status.HTTP_409_CONFLICT)
         if not minimum_duration <= default_duration <= maximum_duration:
             return Response({
                 "code": "production_config_invalid",
@@ -210,16 +419,171 @@ class ProductionCapabilityView(APIView):
                 "detail": "自动分段目标字符数不能超过触发字符数",
                 "missing_keys": [],
             }, status=status.HTTP_409_CONFLICT)
+        try:
+            conditioning_modes, conditioning_sha256, default_conditioning_mode = (
+                self._conditioning_capability(project)
+            )
+        except ValidationError as exc:
+            detail = getattr(exc, "message_dict", None) or {
+                "conditioning_contract": exc.messages,
+            }
+            return Response({
+                "code": "production_conditioning_contract_invalid",
+                "detail": str(detail),
+                "missing_keys": [],
+            }, status=status.HTTP_409_CONFLICT)
         public_sources = {
             key: str((resolved.sources.get(key) or {}).get("source") or "")
             for key in self.CONFIG_KEYS
         }
+        public_sources.update({
+            key: str((security_resolution.sources.get(key) or {}).get("source") or "")
+            for key in security_limits
+        })
+        effective_limits = {
+            "max_variants": int(
+                security_limits["security.production.max_variants"]
+            ),
+            "max_routing_routes": int(
+                security_limits["security.production.max_routing_routes"]
+            ),
+            "max_episodes": int(
+                security_limits["security.production.max_episodes"]
+            ),
+            "max_shots_per_episode": int(
+                security_limits["security.production.max_shots_per_episode"]
+            ),
+            "max_total_shots": int(
+                security_limits["security.production.max_total_shots"]
+            ),
+            "max_generation_tasks": int(
+                security_limits["security.production.max_generation_tasks"]
+            ),
+            "max_reference_bindings": int(
+                security_limits["security.reference.max_bindings"]
+            ),
+            "max_bible_candidates_per_entity": int(
+                security_limits[
+                    "security.production.max_bible_candidates_per_entity"
+                ]
+            ),
+            "max_bible_reference_assets_per_entity": int(
+                security_limits[
+                    "security.production.max_bible_reference_assets_per_entity"
+                ]
+            ),
+            "max_bible_regeneration_entities_per_request": int(
+                security_limits[
+                    "security.production.max_bible_regeneration_entities_per_request"
+                ]
+            ),
+            "dialogue_max_entries": int(
+                security_limits["security.dialogue.max_entries"]
+            ),
+            "dialogue_speaker_id_max_characters": int(
+                security_limits[
+                    "security.dialogue.speaker_id_max_characters"
+                ]
+            ),
+            "dialogue_text_max_characters": int(
+                security_limits["security.dialogue.text_max_characters"]
+            ),
+            "dialogue_delivery_max_characters": int(
+                security_limits[
+                    "security.dialogue.delivery_max_characters"
+                ]
+            ),
+            "execution_monitoring_max_node_type_overrides": int(
+                security_limits["security.execution.max_type_overrides"]
+            ),
+            "execution_monitoring_max_node_overrides": int(
+                security_limits["security.execution.max_node_overrides"]
+            ),
+            "execution_monitoring_max_idle_timeout_seconds": int(
+                security_limits[
+                    "security.execution.max_idle_timeout_seconds"
+                ]
+            ),
+            "prompt_review_max_candidates": int(
+                security_limits[
+                    "security.prompt_normalization.batch_max_items"
+                ]
+            ),
+            "prompt_review_max_advisories": int(
+                security_limits[
+                    "security.prompt_normalization.advisory_max_items"
+                ]
+            ),
+            "prompt_review_max_input_bytes": int(
+                security_limits[
+                    "security.prompt_normalization.request_max_bytes"
+                ]
+            ),
+            "prompt_review_max_field_characters": int(
+                security_limits[
+                    "security.prompt_normalization.text_max_characters"
+                ]
+            ),
+            "prompt_review_max_usage_count": int(
+                security_limits["security.prompt.max_usage_count"]
+            ),
+            "audit_note_min_characters": int(
+                security_limits["security.audit_note.minimum_characters"]
+            ),
+            "audit_note_max_characters": int(
+                security_limits["security.audit_note.maximum_characters"]
+            ),
+        }
+        if effective_limits["audit_note_min_characters"] > effective_limits[
+            "audit_note_max_characters"
+        ]:
+            return Response({
+                "code": "production_config_invalid",
+                "detail": "审计说明的有效最小字符数不能超过最大字符数",
+                "missing_keys": [],
+            }, status=status.HTTP_409_CONFLICT)
+        try:
+            creation_policy = project_creation_policy(values=values)
+            creation_defaults = {
+                "episode_count": creation_policy["default_episode_count"],
+                "shots_per_episode": creation_policy["default_shots_per_episode"],
+                "episode_duration_seconds": creation_policy[
+                    "default_episode_duration_seconds"
+                ],
+                "max_generation_tasks": creation_policy[
+                    "default_max_generation_tasks"
+                ],
+                "fps": creation_policy["fps"],
+                "width": creation_policy["width"],
+                "height": creation_policy["height"],
+                "default_language": creation_policy["default_language"],
+                "default_aspect_ratio": creation_policy[
+                    "default_aspect_ratio"
+                ],
+                "aspect_ratio_options": creation_policy[
+                    "aspect_ratio_options"
+                ],
+                "default_shot_media_type": creation_policy[
+                    "default_shot_media_type"
+                ],
+                "default_include_audio": creation_policy[
+                    "default_include_audio"
+                ],
+            }
+        except ConfigurationResolutionError as exc:
+            return Response({
+                "code": exc.code,
+                "detail": str(exc),
+                "missing_keys": list(exc.missing_keys),
+            }, status=status.HTTP_409_CONFLICT)
         public_sha = hashlib.sha256(canonical_json_bytes({
             "values": {key: values[key] for key in self.CONFIG_KEYS},
             "sources": public_sources,
             "deployment_limits": {
                 "max_concurrent": deployment_concurrency,
             },
+            "effective_limits": effective_limits,
+            "creation_defaults": creation_defaults,
         })).hexdigest()
         active_statuses = (
             GenerationTask.Status.QUEUED,
@@ -227,6 +591,8 @@ class ProductionCapabilityView(APIView):
             GenerationTask.Status.CANCEL_REQUESTED,
         )
         active = GenerationTask.objects.filter(status__in=active_statuses)
+        active_count = active.count()
+        user_active_count = active.filter(owner=request.user).count()
         return Response({
             "recommended_max_pending": recommended_pending,
             "recommended_max_active_per_user": recommended_user,
@@ -247,10 +613,22 @@ class ProductionCapabilityView(APIView):
             ),
             "script_breakdown_auto_split_trigger_chars": split_trigger,
             "script_breakdown_auto_split_target_chars": split_target,
-            "active_task_count": active.count(),
-            "user_active_task_count": active.filter(owner=request.user).count(),
-            "confirmation_required": True,
+            "active_task_count": active_count,
+            "user_active_task_count": user_active_count,
+            "queue_guidance_enforcement": "advisory",
+            "queue_advisories": queue_capacity_advisories(
+                active_task_count=active_count,
+                user_active_task_count=user_active_count,
+                requested_task_count=0,
+                recommended_max_pending=recommended_pending,
+                recommended_max_active_per_user=recommended_user,
+            ),
             "business_volume_limited": False,
+            "conditioning_modes": conditioning_modes,
+            "conditioning_contract_sha256": conditioning_sha256,
+            "default_conditioning_mode": default_conditioning_mode,
             "configuration_public_sha256": public_sha,
             "configuration_sources": public_sources,
+            "effective_limits": effective_limits,
+            "creation_defaults": creation_defaults,
         })

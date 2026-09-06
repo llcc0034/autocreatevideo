@@ -2,6 +2,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { isAxiosError } from 'axios'
 import { useAuthStore } from '@/stores/auth'
 import AppShell from '@/layouts/AppShell.vue'
+import { settingsPrimaryNavigation } from '@/content/settingsSectionCatalog'
 import {
   clearRouteModuleFailure,
   clearRouteModuleRecovery,
@@ -23,12 +24,14 @@ const router = createRouter({
       { path: 'projects/new', name: 'project-new', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '新建连续剧' } },
       { path: 'projects/:projectId', name: 'project-detail', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '连续剧工作室' } },
       { path: 'projects/:projectId/production', name: 'production-run', component: () => import('@/views/ProductionRunView.vue'), meta: { title: '项目一键生产' } },
-      { path: 'projects/:projectId/production/:runId', name: 'production-run-detail', component: () => import('@/views/ProductionRunView.vue'), meta: { title: 'ProductionRun' } },
+      { path: 'projects/:projectId/production/:runId', name: 'production-run-detail', component: () => import('@/views/ProductionRunView.vue'), meta: { title: '生产运行详情（ProductionRun）' } },
       { path: 'projects/:projectId/episodes/:episodeId/storyboard', name: 'storyboard', component: () => import('@/views/StoryboardView.vue'), meta: { title: '可视化分镜' } },
       { path: 'workflows', name: 'workflows', component: () => import('@/views/WorkflowView.vue'), meta: { title: '生产工作流' } },
       { path: 'manual', name: 'production-manual', component: () => import('@/views/ProductionManualView.vue'), meta: { title: '视频制作操作手册' } },
+      { path: 'manual/settings', name: 'system-settings-guide', component: () => import('@/views/SystemSettingsGuideView.vue'), meta: { title: '系统设置新手图文指南' } },
       { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue'), meta: { title: '系统设置', requiresStaff: true } },
-      { path: 'settings/workflows/:workflowVersionId', name: 'workflow-version-editor', component: () => import('@/views/WorkflowVersionEditorView.vue'), meta: { title: '工作流版本编辑', requiresStaff: true } },
+      { path: 'settings/acceptance-smoke', name: 'acceptance-smoke-center', component: () => import('@/views/AcceptanceSmokeCenterView.vue'), meta: { title: settingsPrimaryNavigation.find(item=>item.id==='acceptance-smoke')!.label, requiresStaff: true } },
+      { path: 'settings/workflows/:workflowVersionId', name: 'workflow-version-editor', component: () => import('@/views/WorkflowVersionEditorView.vue'), meta: { title: '工作流版本验收', requiresStaff: true } },
       { path: 'permissions', name: 'permissions', component: () => import('@/views/PermissionManagementView.vue'), meta: { title: '权限管理', requiresSuperuser: true } }
     ] },
     { path: '/:pathMatch(.*)*', redirect: '/' }

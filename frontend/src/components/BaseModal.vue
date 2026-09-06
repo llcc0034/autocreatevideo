@@ -2,7 +2,10 @@
 import { X } from 'lucide-vue-next'
 import { nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 
-const props = defineProps<{ open: boolean; title?: string; eyebrow?: string; width?: string; dismissible?: boolean }>()
+const props = withDefaults(
+  defineProps<{ open: boolean; title?: string; eyebrow?: string; width?: string; dismissible?: boolean }>(),
+  { dismissible: true },
+)
 const emit = defineEmits<{ close: [] }>()
 
 const dialogRef = ref<HTMLElement | null>(null)
@@ -40,7 +43,7 @@ const restoreFocus = () => {
   returnFocusElement = null
 }
 
-const close = () => { if (props.dismissible !== false) emit('close') }
+const close = () => { if (props.dismissible) emit('close') }
 
 const onKeydown = (event: KeyboardEvent) => {
   const dialog = dialogRef.value
@@ -105,7 +108,7 @@ onBeforeUnmount(restoreFocus)
           tabindex="-1"
           :style="{ maxWidth: width || '620px' }"
         >
-          <header class="modal-header"><div><span v-if="eyebrow" class="eyebrow">{{ eyebrow }}</span><h2 :id="titleId">{{ title }}</h2></div><button class="icon-btn" :disabled="dismissible===false" aria-label="关闭" @click="close"><X :size="18" /></button></header>
+          <header class="modal-header"><div><span v-if="eyebrow" class="eyebrow">{{ eyebrow }}</span><h2 :id="titleId">{{ title }}</h2></div><button type="button" class="icon-btn" :disabled="!dismissible" aria-label="关闭" @click="close"><X :size="18" /></button></header>
           <div class="modal-body"><slot /></div>
           <footer v-if="$slots.footer" class="modal-footer"><slot name="footer" /></footer>
         </section>

@@ -30,12 +30,6 @@ SCRIPT_BIBLE_ENTITY_COLLECTIONS = {
     "scene": "scenes",
     "prop": "props",
 }
-SCRIPT_BIBLE_FIELD_LIMITS = {
-    "name": 160,
-    "description": 2_000,
-    "visual_identity_en": 3_000,
-}
-
 _ENTITY_LINE_RE = re.compile(r"^【(?P<label>人物|场景|道具)】(?P<body>.*)$")
 _DIALOGUE_LINE_RE = re.compile(
     r"^\s*(?:\[[^\]]+\]\s*)?(?P<name>[^：:（）()\n]{1,160}?)\s*"
@@ -92,7 +86,26 @@ def _safe_field(
     field: str,
     line: int | None = None,
     required: bool = False,
+    field_contract: dict[str, Any] | None = None,
 ) -> str:
+    contract_rule: dict[str, Any] | None = None
+    if field_contract is not None:
+        contract_key = f"bible.entity.{field}"
+        candidate_rule = field_contract.get(contract_key)
+        if (
+            not isinstance(candidate_rule, dict)
+            or type(candidate_rule.get("max_chars")) is not int
+            or candidate_rule["max_chars"] < 1
+            or type(candidate_rule.get("required")) is not bool
+            or candidate_rule.get("single_line") is not True
+        ):
+            raise ScriptBibleParseError(
+                f"冻结字段合同缺少有效的 {contract_key} 规则。",
+                code="script_bible_field_contract_invalid",
+                line=line,
+            )
+        contract_rule = candidate_rule
+        required = candidate_rule["required"]
     if not isinstance(value, str):
         raise ScriptBibleParseError(
             f"{field} 必须是字符串。",
@@ -120,9 +133,9 @@ def _safe_field(
             code="script_bible_field_required",
             line=line,
         )
-    if len(result) > SCRIPT_BIBLE_FIELD_LIMITS[field]:
+    if contract_rule is not None and len(result) > contract_rule["max_chars"]:
         raise ScriptBibleParseError(
-            f"{field} 超过 {SCRIPT_BIBLE_FIELD_LIMITS[field]} 字符。",
+            f"{field} 超过冻结合同 {contract_rule['max_chars']} 字符。",
             code="script_bible_field_too_long",
             line=line,
         )
@@ -172,6 +185,7 @@ def _validated_entity(
     *,
     entity_type: str,
     line: int | None = None,
+    field_contract: dict[str, Any] | None = None,
 ) -> dict[str, str]:
     if not isinstance(value, dict) or set(value) != {
         "name", "description", "visual_identity_en",
@@ -185,12 +199,15 @@ def _validated_entity(
         "entity_type": entity_type,
         "name": _safe_field(
             value["name"], field="name", line=line, required=True,
+            field_contract=field_contract,
         ),
         "description": _safe_field(
             value["description"], field="description", line=line,
+            field_contract=field_contract,
         ),
         "visual_identity_en": _safe_field(
             value["visual_identity_en"], field="visual_identity_en", line=line,
+            field_contract=field_contract,
         ),
     }
     return {
@@ -200,7 +217,11 @@ def _validated_entity(
     }
 
 
-def validate_script_bible_ir(value: object) -> dict[str, list[dict[str, str]]]:
+def validate_script_bible_ir(
+    value: object,
+    *,
+    field_contract: dict[str, Any] | None = None,
+) -> dict[str, list[dict[str, str]]]:
     """Validate the only structured IR accepted by the deterministic renderer."""
 
     if not isinstance(value, dict) or set(value) != {"characters", "scenes", "props"}:
@@ -224,7 +245,11 @@ def validate_script_bible_ir(value: object) -> dict[str, list[dict[str, str]]]:
                 code="script_bible_ir_collection_invalid",
             )
         for row in rows:
-            candidate = _validated_entity(row, entity_type=entity_type)
+            candidate = _validated_entity(
+                row,
+                entity_type=entity_type,
+                field_contract=field_contract,
+            )
             normalized = normalize_script_bible_name(candidate["name"])
             if normalized in normalized_names:
                 raise ScriptBibleParseError(

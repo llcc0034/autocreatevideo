@@ -257,8 +257,8 @@ try {
         $databaseDestination = Join-AutoPromptContainedPath -Root $backupRoot -RelativePath $databaseBackupRelative -Purpose 'SQLite backup path'
         New-Item -ItemType Directory -Path (Split-Path -Parent $databaseDestination) -Force | Out-Null
         $python = Get-AutoPromptPython -BackendRoot $settings.BackendRoot
-        $sqliteBackupCode = "import sqlite3,sys; src=sqlite3.connect(sys.argv[1]); dst=sqlite3.connect(sys.argv[2]); src.backup(dst); result=dst.execute('PRAGMA integrity_check').fetchone()[0]; dst.close(); src.close(); raise SystemExit(0 if result=='ok' else 'SQLite integrity_check failed: '+str(result))"
-        Invoke-AutoPromptNative -Executable $python -Arguments @('-c', $sqliteBackupCode, $database.Path, $databaseDestination) -Step 'SQLite online backup'
+        $sqliteMaintenance = Join-Path $PSScriptRoot 'sqlite_maintenance.py'
+        Invoke-AutoPromptNative -Executable $python -Arguments @($sqliteMaintenance, 'backup', $database.Path, $databaseDestination) -Step 'SQLite online backup'
         Register-BackupFile -DestinationFile $databaseDestination -Category 'database'
     } elseif ($databaseIncluded -and $database.Kind -eq 'postgresql') {
         $databaseBackupRelative = 'data/database/postgresql.dump'

@@ -12,7 +12,7 @@ from studio.models import (
     WorkflowTemplate,
 )
 from studio.services.configuration import create_config_revision, publish_config_revision
-from studio.tests.factories import build_story
+from studio.tests.factories import build_story, freeze_current_task_contract
 
 
 class GenerationTaskTimelineAPITests(TestCase):
@@ -35,12 +35,13 @@ class GenerationTaskTimelineAPITests(TestCase):
             definition={"1": {"class_type": "Mock", "inputs": {}}},
             is_system=True,
         )
-        self.prompt = PromptArtifact.objects.create(
+        self.prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=self.project,
             episode=self.episode,
             shot=self.shot,
             created_by=self.user,
             prompt_type="video",
+            total_duration_ms=self.shot.duration_ms,
             prompt_text="timeline fixture",
             structured_payload={},
             consistency_snapshot={},
@@ -63,9 +64,10 @@ class GenerationTaskTimelineAPITests(TestCase):
             "episode": self.episode,
             "generated_workflow": self.workflow,
             "kind": GenerationTask.Kind.VIDEO,
+            "max_attempts": 3,
         }
         values.update(overrides)
-        return GenerationTask.objects.create(**values)
+        return freeze_current_task_contract(GenerationTask.objects.create(**values))
 
     def test_completed_task_exposes_persisted_times_durations_and_full_timeline(self):
         task = self.create_task()

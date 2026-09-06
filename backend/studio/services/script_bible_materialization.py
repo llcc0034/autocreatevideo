@@ -8,7 +8,7 @@ from django.db import IntegrityError, transaction
 from django.utils.text import slugify
 
 from studio.models import CharacterBible, PropBible, SceneBible
-from studio.services.h3_prompts import sync_consistency_locks
+from studio.services.consistency import sync_consistency_locks
 from studio.services.json_contracts import canonical_json_bytes
 from studio.services.script_bible import (
     SCRIPT_BIBLE_METADATA_KEY,
@@ -67,9 +67,9 @@ def _stable_slug(candidate: dict, used: set[str]) -> str:
 
 
 @transaction.atomic
-def apply_frozen_script_bible(*, project, frozen: dict) -> dict:
+def apply_frozen_script_bible(*, project, source_content: str, frozen: dict) -> dict:
     project = type(project).objects.select_for_update().get(pk=project.pk)
-    current = freeze_script_bible_candidates(project.master_script)
+    current = freeze_script_bible_candidates(source_content)
     if current["source_fingerprint"] != frozen.get("source_fingerprint"):
         raise ValidationError("SCRIPT_BIBLE_V1 来源已漂移")
     if current["candidate_sha256"] != frozen.get("candidate_sha256"):

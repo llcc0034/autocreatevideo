@@ -42,7 +42,10 @@ test('timed dialogue round-trips in milliseconds without changing the text', () 
   assert.equal(parseDialogueText('[4-2秒] S1：倒序。', characters), undefined)
 })
 
-test('rejects unknown speakers and overlong dialogue text', () => {
+test('rejects unknown speakers but delegates content limits to the server', () => {
   assert.equal(parseDialogueText('陌生人：台词', characters), undefined)
-  assert.equal(parseDialogueText(`S1：${'字'.repeat(2001)}`, characters), undefined)
+  assert.deepEqual(parseDialogueText(`S1：${'字'.repeat(2001)}`, characters), [{
+    speaker_id: 'S1',
+    text: '字'.repeat(2001),
+  }])
 })

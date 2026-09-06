@@ -9,16 +9,12 @@ from studio.capability_views import (
     ProductionCapabilityView,
     PromptNormalizationCapabilityView,
 )
-from studio.creative_views import ProjectCreativeDraftListView
-from studio.shot_detail_draft_views import (
-    ProjectShotDetailDraftListView,
-)
-from studio.shot_detail_batch_views import (
-    ProjectShotDetailDraftBatchListView,
-    ShotDetailDraftBatchDetailView,
-)
 from studio.health_views import ReadinessView
+from studio.registry_relation_views import RegistryRelationsView
 from studio.platform_views import (
+    AcceptanceSmokeView,
+    ComfyWorkflowContractDraftViewSet,
+    ComfyWorkflowSourceViewSet,
     ConfigDefinitionViewSet,
     ConfigRevisionViewSet,
     GeneratedArtifactViewSet,
@@ -33,6 +29,8 @@ from studio.platform_views import (
     PromptProfileFieldRuleViewSet,
     PromptProfileVersionViewSet,
     ProductionReadinessView,
+    RegistryDeletionExecuteView,
+    RegistryDeletionPreviewView,
     ProductionRecipeVersionViewSet,
     ProductionRunViewSet,
     ProjectConfigView,
@@ -45,6 +43,8 @@ from studio.platform_views import (
     SecretAuditEventViewSet,
     SecretBindingViewSet,
     WorkflowTemplateVersionViewSet,
+    WorkflowProjectorViewSet,
+    WorkflowProjectorVersionViewSet,
     WorkflowSmokeAttemptViewSet,
 )
 from studio.bible_image_candidate_views import ProjectBibleImageCandidatesView
@@ -72,10 +72,16 @@ from studio.views import (
     StyleViewSet,
     WorkflowTemplateViewSet,
 )
+from studio.asset_generation_views import AssetGenerationJobViewSet
 
 router = DefaultRouter()
 router.register("styles", StyleViewSet, basename="style")
 router.register("assets", AssetViewSet, basename="asset")
+router.register(
+    "asset-generation-jobs",
+    AssetGenerationJobViewSet,
+    basename="asset-generation-job",
+)
 router.register("projects", SeriesProjectViewSet, basename="project")
 router.register("characters", CharacterBibleViewSet, basename="character")
 router.register("scenes", SceneBibleViewSet, basename="scene")
@@ -129,6 +135,26 @@ router.register(
 )
 router.register("model-artifacts", ModelArtifactViewSet, basename="model-artifact")
 router.register(
+    "comfy-workflow-sources",
+    ComfyWorkflowSourceViewSet,
+    basename="comfy-workflow-source",
+)
+router.register(
+    "comfy-workflow-contract-drafts",
+    ComfyWorkflowContractDraftViewSet,
+    basename="comfy-workflow-contract-draft",
+)
+router.register(
+    "workflow-projectors",
+    WorkflowProjectorViewSet,
+    basename="workflow-projector",
+)
+router.register(
+    "workflow-projector-versions",
+    WorkflowProjectorVersionViewSet,
+    basename="workflow-projector-version",
+)
+router.register(
     "workflow-template-versions",
     WorkflowTemplateVersionViewSet,
     basename="workflow-template-version",
@@ -177,6 +203,22 @@ urlpatterns = [
         name="production-readiness",
     ),
     path(
+        "acceptance-smoke/",
+        AcceptanceSmokeView.as_view(),
+        name="acceptance-smoke",
+    ),
+    path("registry-relations/", RegistryRelationsView.as_view(), name="registry-relations"),
+    path(
+        "registry-deletion-preview/",
+        RegistryDeletionPreviewView.as_view(),
+        name="registry-deletion-preview",
+    ),
+    path(
+        "registry-deletion-execute/",
+        RegistryDeletionExecuteView.as_view(),
+        name="registry-deletion-execute",
+    ),
+    path(
         "projects/<uuid:project_id>/config/",
         ProjectConfigView.as_view(),
         name="project-config",
@@ -190,26 +232,6 @@ urlpatterns = [
         "capabilities/production/",
         ProductionCapabilityView.as_view(),
         name="production-capability",
-    ),
-    path(
-        "projects/<uuid:project_id>/creative-drafts/",
-        ProjectCreativeDraftListView.as_view(),
-        name="project-creative-draft-list",
-    ),
-    path(
-        "projects/<uuid:project_id>/shot-detail-drafts/",
-        ProjectShotDetailDraftListView.as_view(),
-        name="project-shot-detail-draft-list",
-    ),
-    path(
-        "projects/<uuid:project_id>/shot-detail-draft-batches/",
-        ProjectShotDetailDraftBatchListView.as_view(),
-        name="project-shot-detail-draft-batch-list",
-    ),
-    path(
-        "shot-detail-draft-batches/<uuid:batch_id>/",
-        ShotDetailDraftBatchDetailView.as_view(),
-        name="shot-detail-draft-batch-detail",
     ),
     path(
         "projects/<uuid:id>/bible-image-candidates/",

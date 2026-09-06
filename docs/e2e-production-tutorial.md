@@ -315,7 +315,7 @@ H3 T2VA v2 把每个 Shot 自己的 `shot.narrative` 纳入必填 conditioning�
 - `prompt_language_gate_blocked`：核对 PromptProfile 装配结果、canonical overlay 和实际字段来源，修复源头，不降低语言门禁。
 - `duplicate_shot_conditioning`：在已审核策略中加入 `shot.narrative`、`shot.action` 或其他逐镜语义后创建新运行，不能绕过门禁提交相同 conditioning。
 - 创作事实真实漂移：保持 fail closed，从受审的重新创建或重跑路径生成新快照。
-- 本地任务失败：从所属 ProductionRun 查看失败原因和有序 fallback；“生产工作流”页面只做任务诊断。
+- 短剧本地任务失败：从所属 ProductionRun 查看失败原因和有序 fallback；“生产工作流”中的短剧 Task 详情只做诊断。素材 AssetGenerationJob 另有明确的取消、失败/已取消重试和管理员人工消歧入口，不得套用到短剧 Task。
 - 产物质量差：执行成功不等于可交付，必须经过人工选片和 ReleaseBundle gate。
 
 问题、修复状态与未覆盖边界统一记录在 [端到端生产修复与回归台账](e2e-production-findings-20260823.md)。

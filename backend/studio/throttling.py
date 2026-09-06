@@ -37,6 +37,7 @@ class DatabaseScopedRateThrottle(ScopedRateThrottle):
     CONFIG_KEYS = {
         "registration": "access.throttle_registration_rate",
         "asset_upload": "access.throttle_asset_upload_rate",
+        "signed_media": "access.throttle_signed_media_rate",
     }
 
     def get_rate(self):

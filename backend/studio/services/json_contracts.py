@@ -9,6 +9,9 @@ from typing import Any
 from django.core.exceptions import ValidationError
 
 
+# Bootstrap/internal-only fallback. Persistent or runtime business contracts
+# must pass the matching configured security boundary explicitly so changing a
+# boundary never leaves a hidden 64 KiB write/read gate behind.
 DEFAULT_JSON_LIMIT_BYTES = 64 * 1024
 SENSITIVE_KEY_PARTS = (
     "api_key",

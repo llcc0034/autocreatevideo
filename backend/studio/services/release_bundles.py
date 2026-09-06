@@ -12,7 +12,7 @@ from django.conf import settings
 from django.core import signing
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.utils import timezone
 
 from studio.models import (
@@ -33,12 +33,20 @@ from studio.services.provenance import (
     verified_task_manifest,
 )
 from studio.services.distribution import DistributionError, verified_distribution_manifest
+from studio.services.delivery_disclosure import (
+    DeliveryDisclosureError,
+    resolve_delivery_disclosure,
+)
+from studio.services.security_boundaries import boundary_int
 
 
 RELEASE_BUNDLE_SCHEMA = "autoprompt-release-bundle-v1"
 PRODUCTION_RELEASE_BUNDLE_SCHEMA = "autoprompt-production-release-bundle-v2"
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
 RELEASE_BUNDLE_SIGNING_SALT = "autoprompt.release-bundle.v1"
-MAX_RELEASE_SHOTS = 10_000
 
 
 class ReleaseBundleError(ValueError):
@@ -126,7 +134,7 @@ def normalize_release_selection(value: object) -> dict:
     episode_rows = value.get("episodes") or []
     if not isinstance(shot_rows, list) or not isinstance(episode_rows, list):
         raise ReleaseBundleError("shots 与 episodes 必须是数组")
-    if len(shot_rows) > MAX_RELEASE_SHOTS:
+    if len(shot_rows) > boundary_int("security.release.max_shots"):
         raise ReleaseBundleError("发行分镜数量超过安全上限")
 
     shots: list[dict] = []
@@ -194,6 +202,7 @@ def _artifact_task_output_index(artifact: GeneratedArtifact) -> int:
         schema_version=artifact.manifest_schema_version,
         size_bytes=artifact.manifest_metadata_size_bytes,
         sha256=artifact.manifest_metadata_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
     output_index = artifact.manifest_metadata.get("output_index")
     if isinstance(output_index, bool) or not isinstance(output_index, int) or output_index < 0:
@@ -229,6 +238,7 @@ def _artifact_binds_shot(artifact: GeneratedArtifact, shot: Shot) -> tuple[dict 
         schema_version=attempt.request_snapshot_schema_version,
         size_bytes=attempt.request_snapshot_size_bytes,
         sha256=attempt.request_snapshot_sha256,
+        max_bytes=_stage_snapshot_max_bytes(),
     )
     prompt_id = (
         attempt.request_snapshot.get("prompt_artifact_id")
@@ -253,8 +263,10 @@ def propose_release_selection(project: SeriesProject) -> dict:
     )
     artifacts = list(GeneratedArtifact.objects.filter(
         production_run__project=project,
-        production_run__owner=project.owner,
         status=GeneratedArtifact.Status.SELECTED,
+    ).filter(
+        Q(kind=GeneratedArtifact.Kind.ASSEMBLY)
+        | Q(stage_run__stage_key="media_generation"),
     ).select_related(
         "generation_attempt", "generation_task", "production_run",
     ).order_by("-created_at"))
@@ -322,8 +334,8 @@ def validate_release_selection(
     artifact_objects = {
         str(artifact.id): artifact
         for artifact in GeneratedArtifact.objects.filter(id__in=all_artifact_ids).select_related(
-            "production_run", "generation_attempt__stage_run__production_run",
-            "generation_attempt__model_deployment", "generation_task",
+            "production_run__project", "generation_attempt__stage_run__production_run",
+            "generation_attempt__model_deployment__profile_version", "generation_task",
         )
     }
     artifacts: list[dict] = []
@@ -340,8 +352,8 @@ def validate_release_selection(
             reasons.append("artifact_not_selected")
         elif (
             artifact.production_run is None
-            or artifact.production_run.owner_id != owner.id
             or artifact.production_run.project_id != project.id
+            or artifact.production_run.project.owner_id != owner.id
             or (production_run is not None and artifact.production_run_id != production_run.id)
         ):
             reasons.append("artifact_unavailable")
@@ -384,15 +396,22 @@ def validate_release_selection(
                         ],
                     }
                 else:
+                    deployment = artifact.generation_attempt.model_deployment
+                    profile = deployment.profile_version
+                    disclosure = resolve_delivery_disclosure(
+                        model=profile.model_identifier,
+                        model_key=f"{profile.profile_key}:v{profile.version}",
+                        media_kind=artifact.kind,
+                    )
                     artifact_row = {
                         "artifact_sha256": artifact.sha256,
                         "provenance_sha256": artifact.manifest_metadata_sha256,
                         "source_artifact_sha256": artifact.sha256,
                         "source_provenance_sha256": artifact.manifest_metadata_sha256,
                         "distribution_release_id": "",
-                        "distribution_model_key": "restricted_async_rest",
-                        "distribution_model": artifact.generation_attempt.model_deployment.key,
-                        "distribution_label": "AI-generated",
+                        "distribution_model_key": disclosure.model_key,
+                        "distribution_model": disclosure.model,
+                        "distribution_label": disclosure.label,
                         "distribution_version": "managed-original-v1",
                         "source_media": [],
                     }
@@ -403,7 +422,7 @@ def validate_release_selection(
                     "generated_artifact_id": str(artifact.id),
                     **artifact_row,
                 })
-            except DistributionError:
+            except (DistributionError, DeliveryDisclosureError):
                 reasons.append("managed_distribution_invalid")
             except (
                 ReleaseBundleError, ProvenanceError, ValidationError,
@@ -455,6 +474,7 @@ def validate_release_selection(
                     schema_version=master.manifest_schema_version,
                     size_bytes=master.manifest_metadata_size_bytes,
                     sha256=master.manifest_metadata_sha256,
+                    max_bytes=_stage_snapshot_max_bytes(),
                 )
                 job = AssemblyJob.objects.select_related("episode").filter(
                     pk=master.manifest_metadata.get("assembly_job_id"),
@@ -470,8 +490,8 @@ def validate_release_selection(
             master.status != GeneratedArtifact.Status.SELECTED
             or master.kind != GeneratedArtifact.Kind.ASSEMBLY
             or master.production_run is None
-            or master.production_run.owner_id != owner.id
             or master.production_run.project_id != project.id
+            or master.production_run.project.owner_id != owner.id
             or (production_run is not None and master.production_run_id != production_run.id)
         ):
             reasons.append("assembly_artifact_unavailable")

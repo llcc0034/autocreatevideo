@@ -17,6 +17,25 @@ from studio.services.reference_media import (
 )
 
 
+REFERENCE_MEDIA_PROFILE = {
+    "schema_version": 1,
+    "probe_timeout_seconds": 45,
+    "video_normalize_timeout_seconds": 180,
+    "audio_normalize_timeout_seconds": 120,
+    "video_codec": "libx264",
+    "video_preset": "medium",
+    "video_crf": 12,
+    "pixel_format": "yuv420p",
+    "embedded_audio_codec": "aac",
+    "embedded_audio_bitrate_kbps": 192,
+    "paired_audio_codec": "pcm_s16le",
+    "audio_sample_rate_hz": 48_000,
+    "video_duration_tolerance_ms": 60,
+    "embedded_audio_duration_tolerance_ms": 80,
+    "paired_audio_duration_tolerance_ms": 50,
+}
+
+
 class ReferenceMediaValidationTests(SimpleTestCase):
     def test_unknown_source_fps_is_explicitly_blocked(self):
         with patch("studio.services.reference_media.probe_media", return_value={
@@ -29,7 +48,38 @@ class ReferenceMediaValidationTests(SimpleTestCase):
             with self.assertRaisesRegex(
                 ReferenceMediaNormalizationError, "无法可靠确定参考视频源 FPS",
             ):
-                inspect_reference_video("ignored-by-mock.mp4")
+                inspect_reference_video(
+                    "ignored-by-mock.mp4",
+                    target_fps=24,
+                    minimum_duration_ms=2000,
+                    maximum_duration_ms=15000,
+                    security_max_fps=480,
+                    security_max_duration_ms=86_400_000,
+                )
+
+    def test_fictional_model_contract_controls_target_fps_and_duration(self):
+        with patch("studio.services.reference_media.probe_media", return_value={
+            "streams": [{
+                "codec_type": "video",
+                "duration": "1.2",
+                "avg_frame_rate": "30/1",
+                "r_frame_rate": "30/1",
+            }],
+            "format": {"duration": "1.2"},
+        }):
+            plan = inspect_reference_video(
+                "fictional-video.mp4",
+                target_fps=25,
+                minimum_duration_ms=800,
+                maximum_duration_ms=2400,
+                security_max_fps=480,
+                security_max_duration_ms=86_400_000,
+                media_profile=REFERENCE_MEDIA_PROFILE,
+            )
+
+        self.assertEqual(plan.target_fps, 25)
+        self.assertEqual(plan.effective_frames, 30)
+        self.assertEqual(plan.effective_duration_seconds, 1.2)
 
 
 @override_settings(FFMPEG_BINARY="ffmpeg", FFPROBE_BINARY="ffprobe")
@@ -67,18 +117,32 @@ class ReferenceMediaFFmpegIntegrationTests(SimpleTestCase):
             ])
             original_digest = hashlib.sha256(source_video.read_bytes()).hexdigest()
 
-            plan = inspect_reference_video(source_video)
+            plan = inspect_reference_video(
+                source_video,
+                target_fps=24,
+                minimum_duration_ms=2000,
+                maximum_duration_ms=15000,
+                security_max_fps=480,
+                security_max_duration_ms=86_400_000,
+                media_profile=REFERENCE_MEDIA_PROFILE,
+            )
             video_metadata = normalize_reference_video(
                 source_video,
                 normalized_video,
                 include_embedded_audio=True,
                 plan=plan,
+                media_profile=REFERENCE_MEDIA_PROFILE,
             )
             audio_metadata = normalize_paired_audio(
                 source_audio,
                 normalized_audio,
                 paired_video_asset_id="video-asset-id",
                 effective_duration_seconds=plan.effective_duration_seconds,
+                effective_fps=plan.target_fps,
+                minimum_duration_ms=2000,
+                maximum_duration_ms=15000,
+                security_max_duration_ms=86_400_000,
+                media_profile=REFERENCE_MEDIA_PROFILE,
             )
 
             self.assertAlmostEqual(plan.source_fps, 30.0, places=4)
@@ -104,7 +168,10 @@ class ReferenceMediaFFmpegIntegrationTests(SimpleTestCase):
             )
             self.assertEqual(hashlib.sha256(source_video.read_bytes()).hexdigest(), original_digest)
 
-            output_probe = probe_media(normalized_video)
+            output_probe = probe_media(
+                normalized_video,
+                media_profile=REFERENCE_MEDIA_PROFILE,
+            )
             output_video = next(
                 item for item in output_probe["streams"] if item.get("codec_type") == "video"
             )

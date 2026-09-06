@@ -30,7 +30,7 @@ const submit = async () => {
       <div class="auth-grain"></div><div class="auth-orbit one"></div><div class="auth-orbit two"></div>
       <div class="auth-visual-top"><BrandMark /></div>
       <div class="auth-statement">
-        <span class="eyebrow"><Sparkles :size="13"/> REVIEWED PRODUCTION PIPELINE</span>
+        <span class="eyebrow"><Sparkles :size="13"/> 审核式生产流程 / REVIEWED PRODUCTION PIPELINE</span>
         <h1>把一个故事，<br><em>锻造成一整部电影。</em></h1>
         <p>从脚本、Bible 与连续分镜，到语义工作流、受管产物和逐集交付，每个关键阶段都保留人工门禁。</p>
         <div class="auth-capabilities">
@@ -39,7 +39,7 @@ const submit = async () => {
           <div><Workflow :size="18"/><span><strong>门禁式生产</strong><small>语义工作流、异步执行与逐集母版均显式验证</small></span></div>
         </div>
       </div>
-      <div class="auth-frame-card"><div class="frame-image"><span>SCENE 07 · SHOT 03</span><i></i></div><div><strong>听雨不归人</strong><span>角色一致性 98.4%</span></div></div>
+      <div class="auth-frame-card"><div class="frame-image"><span>场景 07 · 镜头 03 / SCENE · SHOT</span><i></i></div><div><strong>听雨不归人</strong><span>角色一致性 98.4%</span></div></div>
       <footer>AutoPrompt Studio</footer>
     </section>
     <section class="auth-panel">

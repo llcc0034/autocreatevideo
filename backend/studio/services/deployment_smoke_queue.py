@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import hashlib
+import math
 import uuid
 
 from django.core.exceptions import ValidationError
@@ -13,6 +14,8 @@ from studio.models import (
     ModelDeployment,
     ModelDeploymentCapabilitySnapshot,
     ModelDeploymentSmokeAttempt,
+    PromptProfileBinding,
+    PromptProfileVersion,
     ProviderProfile,
 )
 from studio.services.async_media_contract import (
@@ -24,11 +27,19 @@ from studio.services.async_media_contract import (
 )
 from studio.services.configuration import resolve_configuration
 from studio.services.deployment_smoke import (
+    async_media_smoke_max_poll_interval_seconds,
+    async_media_smoke_max_poll_seconds,
     execute_script_generation_smoke_request,
     execute_script_structure_smoke_request,
+    execute_visual_rules_smoke_request,
     prepare_script_generation_smoke_request,
     prepare_script_structure_smoke_request,
+    prepare_visual_rules_smoke_request,
     record_deployment_capability_snapshot,
+    smoke_artifact_max_bytes,
+)
+from studio.services.security_boundaries import (
+    boundary_int, boundary_number, security_boundary_resolution_cache,
 )
 from studio.services.deployment_smoke_contract import (
     DEPLOYMENT_SMOKE_OPERATIONS,
@@ -44,8 +55,13 @@ from studio.services.execution_deadlines import (
     meaningful_deadline_updates,
 )
 from studio.services.json_contracts import json_contract
-from studio.services.provider_registry import ProviderDriverError, driver_for
+from studio.services.provider_registry import (
+    ProviderDriverError,
+    driver_for,
+    restricted_async_rest_runtime_budget,
+)
 from studio.services.prompt_normalization import (
+    prompt_normalization_smoke_snapshot_max_bytes,
     execute_prompt_normalization_smoke_request,
     prepare_prompt_normalization_smoke_request,
 )
@@ -53,6 +69,14 @@ from studio.services.prompt_normalization_contract import PROMPT_NORMALIZE_OPERA
 from studio.services.remote_artifacts import verify_remote_artifacts_for_smoke
 from studio.services.script_generation_contract import SCRIPT_GENERATE_OPERATION
 from studio.services.script_structure import SCRIPT_STRUCTURE_OPERATION
+from studio.services.production_visual_rules import VISUAL_RULES_OPERATION
+from studio.services.prompt_profiles import (
+    validate_frozen_prompt_profile_binding_reference,
+)
+from studio.services.registry_reference_lock import registry_reference_writer
+from studio.services.deployment_smoke_profiles import (
+    profile_columns, select_smoke_profile, smoke_profile_reference, verify_smoke_profile,
+)
 
 
 ACTIVE = (
@@ -63,6 +87,18 @@ ACTIVE = (
 )
 
 
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
+
+
+def _deployment_smoke_payload_max_bytes(operation: str) -> int:
+    if operation == PROMPT_NORMALIZE_OPERATION:
+        return prompt_normalization_smoke_snapshot_max_bytes()
+    if operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS:
+        return boundary_int("security.snapshot.text_provider_request_max_bytes")
+    return _stage_snapshot_max_bytes()
+
+
 def _config(deployment):
     return {
         **(deployment.profile_version.provider.driver_config or {}),
@@ -70,36 +106,134 @@ def _config(deployment):
     }
 
 
-def _prepare_text_smoke(deployment: ModelDeployment, operation: str) -> dict:
+def _prepare_text_smoke(deployment: ModelDeployment, operation: str, binding_id) -> dict:
     if operation == SCRIPT_GENERATE_OPERATION:
-        return prepare_script_generation_smoke_request(deployment)
+        return prepare_script_generation_smoke_request(deployment, prompt_profile_binding_id=binding_id)
     if operation == PROMPT_NORMALIZE_OPERATION:
-        return prepare_prompt_normalization_smoke_request(deployment)
+        return prepare_prompt_normalization_smoke_request(deployment, prompt_profile_binding_id=binding_id)
     if operation == SCRIPT_STRUCTURE_OPERATION:
-        return prepare_script_structure_smoke_request(deployment)
+        return prepare_script_structure_smoke_request(deployment, prompt_profile_binding_id=binding_id)
+    if operation == VISUAL_RULES_OPERATION:
+        return prepare_visual_rules_smoke_request(deployment, prompt_profile_binding_id=binding_id)
     raise ValidationError({"operation": "deployment 未声明该文本烟测能力"})
 
 
 def _deadline_seconds(deployment: ModelDeployment, operation: str) -> float:
     config = _config(deployment)
     if operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS:
-        return max(1.0, float(config.get("timeout_seconds", 60)))
-    return max(10.0, float(config.get("max_poll_seconds", 3600)))
+        raw_timeout = config.get("timeout_seconds")
+        timeout_ceiling = boundary_number(
+            "security.runtime.max_timeout_seconds",
+            minimum=0.001,
+        )
+        if (
+            isinstance(raw_timeout, bool)
+            or not isinstance(raw_timeout, (int, float))
+            or not 0 < float(raw_timeout) <= timeout_ceiling
+        ):
+            raise ValidationError({
+                "runtime_config": (
+                    "文本烟测 timeout_seconds 必须显式配置为大于 0 且不超过 "
+                    f"{timeout_ceiling} 的数值"
+                ),
+            })
+        return float(raw_timeout)
+    runtime_budget = restricted_async_rest_runtime_budget(config)
+    return float(min(
+        async_media_smoke_max_poll_seconds(),
+        int(runtime_budget["max_poll_seconds"]),
+    ))
 
 
-@transaction.atomic
-def enqueue_deployment_smoke(
-    deployment: ModelDeployment,
+def _lock_active_prompt_binding_reference(
+    reference: dict,
     *,
-    operation: str,
-) -> tuple[ModelDeploymentSmokeAttempt, bool]:
-    deployment = ModelDeployment.objects.select_for_update().select_related(
-        "profile_version__provider",
-    ).get(pk=deployment.pk)
+    contract_sha256: str,
+    label: str,
+) -> PromptProfileBinding:
+    binding_id = str(reference.get("prompt_profile_binding_id") or "")
+    binding_key = str(reference.get("prompt_profile_binding_key") or "")
+    profile_id = str(reference.get("prompt_profile_version_id") or "")
+    if not binding_id or not binding_key or not profile_id or not contract_sha256:
+        raise ValidationError(f"prompt.normalize smoke 缺少冻结{label} Binding 身份")
+    try:
+        profile = PromptProfileVersion.objects.get(pk=profile_id)
+    except (PromptProfileVersion.DoesNotExist, ValueError) as exc:
+        raise ValidationError(f"prompt.normalize smoke 冻结{label} PromptProfile 不存在") from exc
+    binding = validate_frozen_prompt_profile_binding_reference(
+        binding_key=binding_key,
+        prompt_profile_version=profile,
+        contract_sha256=contract_sha256,
+    )
+    if binding is None or str(binding.id) != binding_id:
+        raise ValidationError(f"prompt.normalize smoke 冻结{label} Binding 身份不一致")
+    if not binding.is_active:
+        raise ValidationError(f"prompt.normalize smoke {label} PromptProfile Binding 已停用")
+    return binding
+
+
+def _lock_prompt_normalization_smoke_bindings(
+    request_snapshot: dict,
+) -> tuple[PromptProfileBinding, PromptProfileBinding]:
+    """Lock both semantic Bindings frozen by a prompt.normalize smoke."""
+
+    representative = request_snapshot.get("representative_contract")
+    payload = request_snapshot.get("payload")
+    target_contract = (
+        payload.get("target_prompt_contract")
+        if isinstance(payload, dict)
+        else None
+    )
+    profiles = (
+        target_contract.get("profiles")
+        if isinstance(target_contract, dict)
+        else None
+    )
+    if (
+        not isinstance(representative, dict)
+        or not isinstance(profiles, list)
+        or len(profiles) != 1
+        or not isinstance(profiles[0], dict)
+    ):
+        raise ValidationError("prompt.normalize smoke 缺少冻结代表性 Binding 身份")
+    profile_snapshot = profiles[0]
+    representative_reference = {
+        "prompt_profile_binding_id": representative.get("prompt_profile_binding_id"),
+        "prompt_profile_binding_key": representative.get("prompt_profile_binding_key"),
+        "prompt_profile_version_id": representative.get("prompt_profile_version_id"),
+    }
+    if (
+        profile_snapshot.get("binding_key")
+        != representative_reference["prompt_profile_binding_key"]
+        or str(profile_snapshot.get("prompt_profile_version_id") or "")
+        != str(representative_reference["prompt_profile_version_id"] or "")
+    ):
+        raise ValidationError("prompt.normalize smoke 冻结代表性 Binding 身份不一致")
+    representative_binding = _lock_active_prompt_binding_reference(
+        representative_reference,
+        contract_sha256=str(profile_snapshot.get("contract_sha256") or ""),
+        label="代表性",
+    )
+    assembly_reference = representative.get("assembly_prompt_profile")
+    if not isinstance(assembly_reference, dict):
+        raise ValidationError("prompt.normalize smoke 缺少冻结组装 Binding 身份")
+    assembly_binding = _lock_active_prompt_binding_reference(
+        assembly_reference,
+        contract_sha256=str(
+            assembly_reference.get("prompt_profile_contract_sha256") or "",
+        ),
+        label="组装",
+    )
+    return representative_binding, assembly_binding
+
+
+def _existing_smoke_or_validate(deployment, operation, binding_id=None):
     existing = ModelDeploymentSmokeAttempt.objects.filter(
         deployment=deployment, operation=operation, status__in=ACTIVE,
     ).order_by("created_at").first()
     if existing is not None:
+        if str(existing.prompt_profile_binding_id or "") != str(binding_id or ""):
+            raise ValidationError({"prompt_profile_binding_id": "该能力已有另一条策略的烟测任务，请等待完成；不会复用不同策略的任务"})
         return existing, False
     unresolved = unresolved_deployment_smoke_attempt(
         deployment,
@@ -114,7 +248,37 @@ def enqueue_deployment_smoke(
         })
     if deployment.status != ModelDeployment.Status.ACTIVE:
         raise ValidationError("只有 active deployment 可以执行烟测")
-    attempt_id = uuid.uuid4()
+    return None
+
+
+def enqueue_deployment_smoke(
+    deployment: ModelDeployment,
+    *,
+    operation: str,
+    prompt_profile_binding_id=None,
+) -> tuple[ModelDeploymentSmokeAttempt, bool]:
+    # Preparing immutable request data must not hold the SQLite writer lock
+    # (BEGIN IMMEDIATE), or prevent registry edits for the duration of assembly.
+    with security_boundary_resolution_cache():
+        deployment = ModelDeployment.objects.select_related(
+            "profile_version__provider",
+        ).get(pk=deployment.pk)
+        if operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS:
+            select_smoke_profile(deployment, operation, prompt_profile_binding_id)
+        elif prompt_profile_binding_id:
+            raise ValidationError({"prompt_profile_binding_id": "该媒体烟测使用模型的 smoke_inputs 合同，不接受文本策略"})
+        existing = _existing_smoke_or_validate(deployment, operation, prompt_profile_binding_id)
+        if existing is not None:
+            return existing
+        target_sha256 = deployment_target_sha256(deployment)
+        attempt_id = uuid.uuid4()
+        prepared = _prepare_deployment_smoke(deployment, operation, attempt_id, prompt_profile_binding_id)
+        if prepared["target_sha256"] != target_sha256:
+            raise ValidationError("烟测准备期间模型实例配置已变化，请重新提交")
+    return _commit_deployment_smoke(deployment.pk, operation, attempt_id, prepared)
+
+
+def _prepare_deployment_smoke(deployment, operation, attempt_id, binding_id=None):
     idempotency_key = f"deployment-smoke:{attempt_id}"
     if operation in ASYNC_MEDIA_OPERATIONS:
         if deployment.provider.driver_type != ProviderProfile.DriverType.ASYNC_REST:
@@ -139,22 +303,49 @@ def enqueue_deployment_smoke(
                 "operation": operation,
                 "output_kind": contract["output_kind"],
                 "payload": payload,
-            }).value,
-            "request_sha256": json_contract(payload).sha256,
+            }, max_bytes=_stage_snapshot_max_bytes()).value,
+            "request_sha256": json_contract(
+                payload,
+                max_bytes=_deployment_smoke_payload_max_bytes(operation),
+            ).sha256,
             "target_sha256": deployment_target_sha256(deployment),
             "estimated_cost": estimate.get("amount"),
             "cost_currency": str(estimate.get("currency") or "")[:12],
         }
     elif operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS:
         try:
-            prepared = _prepare_text_smoke(deployment, operation)
+            prepared = _prepare_text_smoke(deployment, operation, binding_id)
         except ProviderDriverError as exc:
             raise ValidationError({
                 "operation": f"文本烟测提交前校验失败: {exc.code}",
             }) from exc
     else:
         raise ValidationError({"operation": "deployment smoke operation 不受支持"})
-    config = _config(deployment)
+    return prepared
+
+
+@registry_reference_writer
+@security_boundary_resolution_cache()
+def _commit_deployment_smoke(deployment_id, operation, attempt_id, prepared):
+    # Revalidate after taking the registry/deployment locks. A concurrent
+    # submit reuses its active attempt; changed/deleted references fail closed.
+    deployment = ModelDeployment.objects.select_for_update().select_related(
+        "profile_version__provider",
+    ).get(pk=deployment_id)
+    reference = prepared["request_snapshot"].get("prompt_profile")
+    binding_id = (reference or {}).get("prompt_profile_binding_id")
+    existing = _existing_smoke_or_validate(deployment, operation, binding_id)
+    if existing is not None:
+        return existing
+    idempotency_key = f"deployment-smoke:{attempt_id}"
+    if operation == PROMPT_NORMALIZE_OPERATION:
+        _lock_prompt_normalization_smoke_bindings(prepared["request_snapshot"])
+    if operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS:
+        selected = select_smoke_profile(deployment, operation, binding_id, lock=True)
+        if smoke_profile_reference(deployment, operation, selected) != reference:
+            raise ValidationError({"prompt_profile_binding_id": "烟测准备期间策略绑定已变更，请重新选择"})
+    if prepared["target_sha256"] != deployment_target_sha256(deployment):
+        raise ValidationError("烟测准备期间模型实例配置已变化，请重新提交")
     hard_seconds = _deadline_seconds(deployment, operation)
     configured_idle = float(resolve_configuration(required_keys=(
         "runtime.task_idle_timeout_seconds",
@@ -167,28 +358,31 @@ def enqueue_deployment_smoke(
         marker="phase:queued",
     )
     try:
-        attempt = ModelDeploymentSmokeAttempt.objects.create(
-            id=attempt_id,
-            deployment=deployment,
-            operation=operation,
-            status=ModelDeploymentSmokeAttempt.Status.QUEUED,
-            request_sha256=prepared["request_sha256"],
-            target_sha256=prepared["target_sha256"],
-            estimated_cost=prepared.get("estimated_cost"),
-            cost_currency=str(prepared.get("cost_currency") or "")[:12],
-            idempotency_key=idempotency_key,
-            request_snapshot=prepared["request_snapshot"],
-            submission_started_at=now,
-            deadline_started_at=deadlines.started_at,
-            hard_deadline_at=deadlines.hard_deadline_at,
-            idle_deadline_at=deadlines.idle_deadline_at,
-            last_meaningful_progress_at=deadlines.last_meaningful_progress_at,
-            progress_marker=deadlines.progress_marker,
-        )
+        with transaction.atomic():
+            attempt = ModelDeploymentSmokeAttempt.objects.create(
+                **profile_columns(reference),
+                id=attempt_id,
+                deployment=deployment,
+                operation=operation,
+                status=ModelDeploymentSmokeAttempt.Status.QUEUED,
+                request_sha256=prepared["request_sha256"],
+                target_sha256=prepared["target_sha256"],
+                estimated_cost=prepared.get("estimated_cost"),
+                cost_currency=str(prepared.get("cost_currency") or "")[:12],
+                idempotency_key=idempotency_key,
+                request_snapshot=prepared["request_snapshot"],
+                submission_started_at=now,
+                deadline_started_at=deadlines.started_at,
+                hard_deadline_at=deadlines.hard_deadline_at,
+                idle_deadline_at=deadlines.idle_deadline_at,
+                last_meaningful_progress_at=deadlines.last_meaningful_progress_at,
+                progress_marker=deadlines.progress_marker,
+            )
     except IntegrityError:
-        return ModelDeploymentSmokeAttempt.objects.get(
-            deployment=deployment, operation=operation, status__in=ACTIVE,
-        ), False
+        existing = _existing_smoke_or_validate(deployment, operation, binding_id)
+        if existing is None:
+            raise
+        return existing
     return attempt, True
 
 
@@ -231,6 +425,11 @@ def claim_next_deployment_smoke(worker_id: str) -> ModelDeploymentSmokeAttempt |
 
 def _release_schedule(attempt, claim_token, *, remote_status: str, progress_fraction=None):
     config = _config(attempt.deployment)
+    runtime_budget = restricted_async_rest_runtime_budget(config)
+    smoke_poll_seconds = min(
+        async_media_smoke_max_poll_seconds(),
+        int(runtime_budget["max_poll_seconds"]),
+    )
     with transaction.atomic():
         locked = ModelDeploymentSmokeAttempt.objects.select_for_update().get(pk=attempt.pk)
         if locked.claim_token != claim_token:
@@ -253,7 +452,7 @@ def _release_schedule(attempt, claim_token, *, remote_status: str, progress_frac
             locked,
             marker=marker,
             idle_seconds=min(
-                float(config.get("max_poll_seconds", 3600)),
+                float(smoke_poll_seconds),
                 float(resolve_configuration(required_keys=(
                     "runtime.task_idle_timeout_seconds",
                 )).values["runtime.task_idle_timeout_seconds"]),
@@ -265,7 +464,10 @@ def _release_schedule(attempt, claim_token, *, remote_status: str, progress_frac
         locked.remote_status = normalized
         locked.last_polled_at = now
         locked.poll_count += 1
-        locked.next_poll_at = now + timedelta(seconds=float(config.get("poll_interval_seconds", 2)))
+        locked.next_poll_at = now + timedelta(seconds=min(
+            async_media_smoke_max_poll_interval_seconds(),
+            float(runtime_budget["poll_interval_seconds"]),
+        ))
         locked.claim_token = None
         locked.worker_id = ""
         locked.claimed_at = None
@@ -304,7 +506,7 @@ def _finalize(
             probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
             status=snapshot_status,
             operations=[attempt.operation],
-            evidence=evidence,
+            evidence={**evidence, **({"prompt_profile": locked.request_snapshot["prompt_profile"]} if locked.request_snapshot.get("prompt_profile") else {})},
             expected_target_sha256=attempt.target_sha256,
         )
         now = timezone.now()
@@ -330,6 +532,14 @@ def _finalize(
 
 
 def _execute_text_smoke(attempt: ModelDeploymentSmokeAttempt) -> dict:
+    reference = attempt.request_snapshot.get("prompt_profile")
+    profile = verify_smoke_profile(attempt.deployment, attempt.operation, reference)
+    from studio.services.prompt_profiles import verify_frozen_profile_assembly
+    assembly = (attempt.request_snapshot.get("payload") if attempt.operation == PROMPT_NORMALIZE_OPERATION
+                else attempt.request_snapshot.get("plan")) or {}
+    verify_frozen_profile_assembly(profile, assembly.get("prompt_profile_assembly"))
+    if any(str(getattr(attempt, key)) != str(value) for key, value in profile_columns(reference).items()):
+        raise ValidationError("烟测策略索引与冻结请求不一致")
     if attempt.operation == SCRIPT_GENERATE_OPERATION:
         return execute_script_generation_smoke_request(
             attempt.deployment,
@@ -342,6 +552,11 @@ def _execute_text_smoke(attempt: ModelDeploymentSmokeAttempt) -> dict:
         )
     if attempt.operation == SCRIPT_STRUCTURE_OPERATION:
         return execute_script_structure_smoke_request(
+            attempt.deployment,
+            attempt.request_snapshot,
+        )
+    if attempt.operation == VISUAL_RULES_OPERATION:
+        return execute_visual_rules_smoke_request(
             attempt.deployment,
             attempt.request_snapshot,
         )
@@ -384,10 +599,12 @@ def process_deployment_smoke(attempt: ModelDeploymentSmokeAttempt):
     driver = driver_for(deployment.provider)
     snapshot = attempt.request_snapshot
     payload = snapshot.get("payload") if isinstance(snapshot, dict) else None
+    payload_limit = _deployment_smoke_payload_max_bytes(attempt.operation)
     if (
         not isinstance(payload, dict)
         or snapshot.get("operation") != attempt.operation
-        or json_contract(payload).sha256 != attempt.request_sha256
+        or json_contract(payload, max_bytes=payload_limit).sha256
+        != attempt.request_sha256
     ):
         return _finalize(
             attempt, claim_token,
@@ -479,11 +696,15 @@ def process_deployment_smoke(attempt: ModelDeploymentSmokeAttempt):
                 locked.provider_request_id_sha256 = hashlib.sha256(request_id.encode()).hexdigest()
                 locked.submitted_at = now
                 locked.remote_status = str(response.get("status") or "submitted")[:120]
+                runtime_budget = restricted_async_rest_runtime_budget(_config(deployment))
                 updates = meaningful_deadline_updates(
                     locked,
                     marker="phase:submitted",
                     idle_seconds=min(
-                        float(_config(deployment).get("max_poll_seconds", 3600)),
+                        float(min(
+                            async_media_smoke_max_poll_seconds(),
+                            int(runtime_budget["max_poll_seconds"]),
+                        )),
                         float(resolve_configuration(required_keys=(
                             "runtime.task_idle_timeout_seconds",
                         )).values["runtime.task_idle_timeout_seconds"]),
@@ -547,7 +768,7 @@ def process_deployment_smoke(attempt: ModelDeploymentSmokeAttempt):
             )
         collected = driver.invoke(deployment, "collect", {"request_id": attempt.provider_request_id})
         expected_kind = str(snapshot.get("output_kind") or "")
-        max_bytes = 64 * 1024 * 1024 if expected_kind == "image" else 512 * 1024 * 1024
+        max_bytes = smoke_artifact_max_bytes(expected_kind)
         facts = verify_remote_artifacts_for_smoke(
             deployment_id=deployment.id,
             artifacts=collected.get("artifacts"),
@@ -617,8 +838,15 @@ def process_deployment_smoke(attempt: ModelDeploymentSmokeAttempt):
 
 
 @transaction.atomic
-def recover_stale_deployment_smokes(minutes: int = 10) -> int:
-    cutoff = timezone.now() - timedelta(seconds=max(60, int(minutes) * 60))
+def recover_stale_deployment_smokes(minutes: float) -> int:
+    if (
+        isinstance(minutes, bool)
+        or not isinstance(minutes, (int, float))
+        or not math.isfinite(float(minutes))
+        or float(minutes) <= 0
+    ):
+        raise ValueError("deployment smoke 陈旧任务回收阈值必须是正有限分钟数")
+    cutoff = timezone.now() - timedelta(minutes=float(minutes))
     rows = list(ModelDeploymentSmokeAttempt.objects.select_for_update().filter(
         operation__in=DEPLOYMENT_SMOKE_OPERATIONS,
         status__in=ACTIVE,

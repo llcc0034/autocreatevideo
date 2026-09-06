@@ -30,7 +30,10 @@ from studio.models import (
 )
 from studio.services.json_contracts import json_contract
 from studio.services.json_contracts import canonical_json_bytes
-from studio.services.configuration import resolve_configuration
+from studio.services.configuration import (
+    ConfigurationResolutionError,
+    resolve_configuration,
+)
 from studio.services.provenance import (
     ProvenanceError,
     classify_task_output,
@@ -38,11 +41,32 @@ from studio.services.provenance import (
     resolve_task_output_path,
     verified_task_manifest,
 )
+from studio.services.bible_reference_contract import (
+    BIBLE_IMAGE_GENERATION_STAGE_KEY,
+    parse_bible_candidate_unit_key,
+    validate_bible_prompt_target,
+)
+from studio.services.security_boundaries import boundary_int
 
 
-MAX_COMPARISON_PARAMETERS_BYTES = 16 * 1024
 _MISSING = object()
 _DIGEST_RE = re.compile(r"[0-9a-fA-F]{40,128}")
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
+
+
+def _artifact_media_probe_timeout_seconds() -> float:
+    try:
+        raw = resolve_configuration(
+            required_keys=("artifact.media_probe_timeout_seconds",),
+        ).values["artifact.media_probe_timeout_seconds"]
+    except ConfigurationResolutionError as exc:
+        raise ProvenanceError("受管媒体探测超时配置不可用") from exc
+    if isinstance(raw, bool) or type(raw) not in {int, float} or float(raw) <= 0:
+        raise ProvenanceError("受管媒体探测超时配置无效")
+    return float(raw)
 _UUID_RE = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}")
 _WORKFLOW_PARAMETER_ALIASES = {
     "seed": {"seed", "sampling.seed"},
@@ -66,6 +90,82 @@ _CONFIG_PARAMETER_KEYS = {
     "production.default_last_frame_continuity": "last_frame_continuity",
     "production.default_shot_duration_ms": "default_shot_duration_ms",
 }
+
+
+def generated_artifact_storage_owner_id(artifact: GeneratedArtifact) -> str:
+    """Return the frozen tenant owner encoded by a managed artifact path.
+
+    ``ProductionRun.owner`` is the actor who started a run and can therefore be
+    a staff user acting for somebody else's project.  Managed media belongs to
+    the project tenant instead.  Older async artifacts were archived with the
+    actor in their path; those rows remain readable as immutable history, but
+    new writers must use the project owner.  This helper makes that legacy
+    distinction explicit and never guesses a directory from the current actor.
+    """
+
+    if artifact.production_run_id is None:
+        raise ProvenanceError("GeneratedArtifact 缺少 ProductionRun 归属")
+    run = artifact.production_run
+    project_id = str(run.project_id)
+    try:
+        parts = PurePosixPath(str(artifact.object_key or "")).parts
+    except (TypeError, ValueError) as exc:
+        raise ProvenanceError("GeneratedArtifact object_key 无效") from exc
+    expected_root = (
+        "assemblies" if artifact.storage_backend == "local_media"
+        else "generated-artifacts" if artifact.storage_backend == "managed_local"
+        else ""
+    )
+    if (
+        not expected_root
+        or len(parts) < 3
+        or parts[0] != expected_root
+        or parts[2] != project_id
+        or not parts[1]
+    ):
+        raise ProvenanceError("GeneratedArtifact object_key 未冻结到项目租户目录")
+    path_owner_id = str(parts[1])
+
+    if artifact.generation_task_id:
+        task_owner_id = str(artifact.generation_task.owner_id)
+        if task_owner_id != path_owner_id or artifact.generation_task.project_id != run.project_id:
+            raise ProvenanceError("Comfy GeneratedArtifact 的任务与租户目录不一致")
+        return task_owner_id
+
+    metadata = artifact.manifest_metadata if isinstance(artifact.manifest_metadata, dict) else {}
+    if artifact.storage_backend == "local_media":
+        assembly_job_id = metadata.get("assembly_job_id")
+        if not assembly_job_id:
+            raise ProvenanceError("assembly GeneratedArtifact 缺少冻结 job identity")
+        job = AssemblyJob.objects.filter(pk=assembly_job_id).only(
+            "owner_id", "project_id",
+        ).first()
+        if (
+            job is None
+            or str(job.owner_id) != path_owner_id
+            or job.project_id != run.project_id
+        ):
+            raise ProvenanceError("assembly GeneratedArtifact 的 job 与租户目录不一致")
+        return path_owner_id
+
+    tenant_owner_id = metadata.get("tenant_owner_id")
+    if tenant_owner_id is not None:
+        if str(tenant_owner_id) != path_owner_id:
+            raise ProvenanceError("async GeneratedArtifact 的冻结租户与目录不一致")
+        return path_owner_id
+
+    # Historical async rows written before tenant ownership was frozen used
+    # either the run actor or the project owner.  Accept only those two factual
+    # roots and keep this branch read-only; all current writers add tenant_owner_id.
+    project_owner_id = str(run.project.owner_id)
+    if (
+        metadata.get("source") == "restricted_async_rest"
+        and path_owner_id in {str(run.owner_id), project_owner_id}
+    ):
+        return path_owner_id
+    if path_owner_id != project_owner_id:
+        raise ProvenanceError("GeneratedArtifact 租户目录与项目所有者不一致")
+    return path_owner_id
 
 
 def _comparison_scalar(value: Any):
@@ -241,7 +341,12 @@ def build_comparison_parameters(
             _set_safe(configuration, public_key, values[source_key])
     if configuration:
         result["configuration"] = configuration
-    return json_contract(result, max_bytes=MAX_COMPARISON_PARAMETERS_BYTES).value
+    return json_contract(
+        result,
+        max_bytes=boundary_int(
+            "security.artifact.comparison_parameters_max_bytes",
+        ),
+    ).value
 
 
 def _safe_object_key(item: dict) -> str:
@@ -301,7 +406,7 @@ def verified_local_media_facts(
                 check=False,
                 capture_output=True,
                 text=True,
-                timeout=float(getattr(settings, "ASSEMBLY_PROBE_TIMEOUT_SECONDS", 30)),
+                timeout=_artifact_media_probe_timeout_seconds(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             raise ProvenanceError("视频产物无法执行 ffprobe") from exc
@@ -386,6 +491,68 @@ def verified_local_media_facts(
                     for item in streams
                 ),
             }
+    elif expected_kind == "audio":
+        probe_arguments = [
+            str(getattr(settings, "FFPROBE_BINARY", "ffprobe")),
+            "-v", "error",
+            "-show_entries", "stream=codec_type,duration:format=format_name,duration",
+            "-of", "json", str(candidate),
+        ]
+        try:
+            result = subprocess.run(
+                probe_arguments,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=_artifact_media_probe_timeout_seconds(),
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ProvenanceError("音频产物无法执行 ffprobe") from exc
+        if result.returncode != 0:
+            raise ProvenanceError("音频产物未通过 ffprobe")
+        try:
+            payload = json.loads(result.stdout or "{}")
+        except json.JSONDecodeError as exc:
+            raise ProvenanceError("ffprobe 返回无效 JSON") from exc
+        streams = payload.get("streams") if isinstance(payload, dict) else None
+        audio = next((
+            item for item in streams or []
+            if isinstance(item, dict) and item.get("codec_type") == "audio"
+        ), None)
+        if not isinstance(streams, list) or audio is None:
+            raise ProvenanceError("音频产物不包含音频流")
+        format_name = str((payload.get("format") or {}).get("format_name") or "").casefold()
+        if "wav" in format_name:
+            mime_type = "audio/wav"
+        elif "mp3" in format_name:
+            mime_type = "audio/mpeg"
+        elif "flac" in format_name:
+            mime_type = "audio/flac"
+        elif "ogg" in format_name:
+            mime_type = "audio/ogg"
+        elif "mp4" in format_name or "mov" in format_name:
+            mime_type = "audio/mp4"
+        else:
+            mime_type = "audio/" + (format_name.split(",", 1)[0] or "unknown")
+        duration_seconds = None
+        for raw_duration in (
+            audio.get("duration"), (payload.get("format") or {}).get("duration"),
+        ):
+            try:
+                candidate_duration = float(raw_duration)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if math.isfinite(candidate_duration) and candidate_duration > 0:
+                duration_seconds = candidate_duration
+                break
+        if duration_seconds is None:
+            raise ProvenanceError("音频产物无法可靠观测实际时长")
+        observed_media = {
+            "schema_version": 1,
+            "observation_source": "ffprobe",
+            "duration_ms": round(duration_seconds * 1000),
+            "has_audio": True,
+        }
     else:
         raise ProvenanceError("媒体类型不受支持")
     facts = {
@@ -393,7 +560,7 @@ def verified_local_media_facts(
         "size_bytes": size,
         "sha256": sha256_file(candidate),
     }
-    if expected_kind == "video" and include_observed_media:
+    if expected_kind in {"video", "audio"} and include_observed_media:
         facts["observed_media"] = observed_media
     return facts
 
@@ -465,6 +632,11 @@ def _archive_task_output(
         max_bytes=max_bytes,
         include_observed_media=expected_kind == "video",
     )
+    from studio.services.workflow_resolution import validate_resolved_image_output
+    try:
+        validate_resolved_image_output(source, (task.capability_snapshot or {}).get("output_contract") or {})
+    except ValidationError as exc:
+        raise ProvenanceError(str(exc)) from exc
     mime_type = source_facts["mime_type"]
     if source_facts["sha256"] != expected_sha256:
         raise ProvenanceError("实际媒体 checksum 与来源清单不一致")
@@ -535,7 +707,9 @@ def record_generation_task_artifacts(
     stage_run: StageRun | None = None,
     generation_attempt: GenerationAttempt | None = None,
 ) -> list[GeneratedArtifact]:
-    task = GenerationTask.objects.select_for_update().get(pk=task.pk)
+    task = GenerationTask.objects.select_for_update().select_related(
+        "project", "generated_workflow__prompt_artifact",
+    ).get(pk=task.pk)
     if task.status != GenerationTask.Status.SUCCEEDED:
         raise ValidationError("只有 succeeded task 可以写正式 artifact manifest")
     if generation_attempt is None:
@@ -544,19 +718,64 @@ def record_generation_task_artifacts(
         stage_run = generation_attempt.stage_run
     if production_run is None and stage_run is not None:
         production_run = stage_run.production_run
+    if generation_attempt is not None:
+        generation_attempt = GenerationAttempt.objects.select_for_update().select_related(
+            "stage_run__production_run__project",
+        ).get(pk=generation_attempt.pk)
+        if generation_attempt.generation_task_id != task.id:
+            raise ValidationError(
+                "GenerationAttempt 与 GenerationTask 不是同一冻结执行链",
+            )
+        if stage_run is None or generation_attempt.stage_run_id != stage_run.id:
+            raise ValidationError("GenerationAttempt 与 StageRun 归属不一致")
+        if (
+            production_run is None
+            or stage_run.production_run_id != production_run.id
+            or generation_attempt.stage_run.production_run_id != production_run.id
+            or task.project_id != production_run.project_id
+            or task.owner_id != production_run.project.owner_id
+        ):
+            raise ValidationError("GenerationTask/Attempt 与 ProductionRun 项目租户不一致")
+        capability = (
+            task.capability_snapshot
+            if isinstance(task.capability_snapshot, dict) else {}
+        )
+        prompt = task.generated_workflow.prompt_artifact
+        expected_capability = {
+            "production_run_id": str(production_run.id),
+            "stage_run_id": str(stage_run.id),
+            "generation_attempt_id": str(generation_attempt.id),
+            "prompt_artifact_id": str(prompt.id),
+        }
+        if any(capability.get(key) != value for key, value in expected_capability.items()):
+            raise ValidationError("GenerationTask capability execution identity 已漂移")
+        if str(generation_attempt.request_snapshot.get("prompt_artifact_id") or "") != str(prompt.id):
+            raise ValidationError("GenerationAttempt 请求与 GenerationTask Prompt 不一致")
     created: list[GeneratedArtifact] = []
     max_bytes = _artifact_limit(production_run)
     media_index = 0
     variant_number = 1
     grouped_unit_key = generation_attempt.unit_key if generation_attempt is not None else ""
-    if ":variant:" in grouped_unit_key:
+    bible_identity = None
+    if (
+        stage_run is not None
+        and stage_run.stage_key == BIBLE_IMAGE_GENERATION_STAGE_KEY
+        and generation_attempt is not None
+    ):
+        bible_identity = parse_bible_candidate_unit_key(grouped_unit_key)
+        variant_number = bible_identity["variant_number"]
+    elif ":variant:" in grouped_unit_key:
         grouped_unit_key, raw_variant = grouped_unit_key.rsplit(":variant:", 1)
         try:
-            variant_number = max(1, int(raw_variant))
-        except ValueError:
-            variant_number = 1
+            variant_number = int(raw_variant)
+        except ValueError as exc:
+            raise ValidationError("GenerationAttempt variant identity 无效") from exc
+        if variant_number < 1:
+            raise ValidationError("GenerationAttempt variant identity 必须是正整数")
     variant_group = (
-        f"stage:{stage_run.id}:unit:{grouped_unit_key}"
+        bible_identity["variant_group"]
+        if bible_identity is not None
+        else f"stage:{stage_run.id}:unit:{grouped_unit_key}"
         if stage_run is not None and generation_attempt is not None
         else f"task:{task.id}"
     )
@@ -582,8 +801,10 @@ def record_generation_task_artifacts(
             raise ProvenanceError("semantic task 的冻结 output contract 副本不一致")
         primary = frozen_contract.get("primary")
         if (
-            set(frozen_contract) != {"schema_version", "primary"}
-            or frozen_contract.get("schema_version") != 1
+            (frozen_contract.get("schema_version"), set(frozen_contract)) not in (
+                (1, {"schema_version", "primary"}),
+                (2, {"schema_version", "primary", "resolution"}),
+            )
             or not isinstance(primary, dict)
             or set(primary) != {"node_id", "kind", "required"}
             or not isinstance(primary.get("node_id"), str)
@@ -632,6 +853,17 @@ def record_generation_task_artifacts(
         metadata = {
             "schema_version": 1,
             "task_id": str(task.id),
+            "generation_attempt_id": (
+                str(generation_attempt.id) if generation_attempt is not None else None
+            ),
+            "production_run_id": (
+                str(production_run.id) if production_run is not None else None
+            ),
+            "stage_run_id": str(stage_run.id) if stage_run is not None else None,
+            "request_sha256": (
+                generation_attempt.request_sha256
+                if generation_attempt is not None else ""
+            ),
             "output_index": index,
             "node_id": str(item.get("node_id") or ""),
             "provenance_manifest_sha256": str(integrity.get("payload_sha256") or ""),
@@ -640,12 +872,40 @@ def record_generation_task_artifacts(
                 if isinstance(observed_media, dict) else {}
             ),
         }
+        if bible_identity is not None:
+            prompt = getattr(workflow, "prompt_artifact", None)
+            options = prompt.request_options if prompt and isinstance(prompt.request_options, dict) else {}
+            target = validate_bible_prompt_target(options.get("target"))
+            if (
+                target["entity_type"] != bible_identity["entity_type"]
+                or target["entity_id"] != bible_identity["entity_id"]
+            ):
+                raise ProvenanceError("Bible 参考图 task unit 与 Prompt target 不一致")
+            metadata.update({
+                "generation_purpose": "bible_reference_image",
+                "target": target,
+                "prompt_artifact_id": str(prompt.id),
+                "prompt_content_hash": prompt.content_hash,
+                "prompt_profile_version_id": (
+                    str(prompt.prompt_profile_version_id)
+                    if prompt.prompt_profile_version_id else None
+                ),
+                "prompt_profile_binding_key": prompt.prompt_profile_binding_key,
+                "prompt_profile_binding_id": str(
+                    options.get("prompt_profile_binding_id") or ""
+                ),
+                "prompt_profile_contract_sha256": prompt.prompt_profile_contract_sha256,
+                "source_snapshot_sha256": target["source_snapshot_sha256"],
+            })
         if isinstance(observed_media, dict):
             if item.get("observed_media") != observed_media:
                 item["observed_media"] = observed_media
                 outputs[index] = item
                 outputs_observed_metadata_updated = True
-        metadata_contract = json_contract(metadata)
+        metadata_contract = json_contract(
+            metadata,
+            max_bytes=_stage_snapshot_max_bytes(),
+        )
         comparison_parameters = build_comparison_parameters(
             task=task,
             attempt=generation_attempt,
@@ -659,7 +919,11 @@ def record_generation_task_artifacts(
                 "generation_attempt": generation_attempt,
                 "generation_task": task,
                 "kind": media_kind,
-                "role": "primary_generation_output" if media_index == 1 else "generation_output",
+                "role": (
+                    "bible_reference_candidate"
+                    if bible_identity is not None
+                    else "primary_generation_output" if media_index == 1 else "generation_output"
+                ),
                 "variant_group": variant_group,
                 "variant_index": (
                     (variant_number * 10_000)
@@ -668,7 +932,9 @@ def record_generation_task_artifacts(
                     if generation_attempt is not None else media_index
                 ),
                 "status": (
-                    GeneratedArtifact.Status.SELECTED
+                    GeneratedArtifact.Status.AVAILABLE
+                    if bible_identity is not None
+                    else GeneratedArtifact.Status.SELECTED
                     if media_index == 1 and production_run is not None and not existing_selection
                     else GeneratedArtifact.Status.AVAILABLE
                 ),
@@ -690,6 +956,10 @@ def record_generation_task_artifacts(
         created.append(artifact)
     if not created:
         raise ProvenanceError("成功任务没有可验证的图片或视频输出")
+    if bible_identity is not None and (
+        len(created) != 1 or created[0].kind != GeneratedArtifact.Kind.IMAGE
+    ):
+        raise ProvenanceError("Bible 参考图 attempt 必须且只能归档一个图片 primary output")
     if outputs_observed_metadata_updated:
         task.outputs = outputs
         task.save(update_fields=("outputs", "updated_at"))
@@ -735,7 +1005,10 @@ def record_assembly_artifact(
         "episode_id": str(job.episode_id) if job.episode_id else None,
         "source_signature": job.source_signature,
     }
-    metadata_contract = json_contract(metadata)
+    metadata_contract = json_contract(
+        metadata,
+        max_bytes=_stage_snapshot_max_bytes(),
+    )
     artifact, created = GeneratedArtifact.objects.get_or_create(
         manifest_key=f"assembly:{job.id}",
         defaults={
@@ -767,12 +1040,17 @@ def record_assembly_artifact(
 @transaction.atomic
 def select_artifact(artifact: GeneratedArtifact, *, user) -> GeneratedArtifact:
     artifact = GeneratedArtifact.objects.select_for_update().select_related(
-        "production_run",
+        "production_run__project", "stage_run",
     ).get(pk=artifact.pk)
     if artifact.production_run_id is None:
         raise ValidationError("历史未归属 artifact 不能通过 ProductionRun 选择")
-    if artifact.production_run.owner_id != user.id and not user.is_staff:
+    if artifact.production_run.project.owner_id != user.id and not user.is_staff:
         raise ValidationError("artifact 不属于当前用户")
+    if (
+        artifact.stage_run is not None
+        and artifact.stage_run.stage_key == BIBLE_IMAGE_GENERATION_STAGE_KEY
+    ):
+        raise ValidationError("Bible 参考图候选只能在 bible_image_review 批量选择并绑定")
     if artifact.status not in {
         GeneratedArtifact.Status.AVAILABLE,
         GeneratedArtifact.Status.SELECTED,

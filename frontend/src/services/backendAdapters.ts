@@ -5,8 +5,8 @@ import { adaptShotDetailedDescription, shotDetailedDescriptionPayload } from './
 import { visualRulesProjectPersistenceFields } from './visualRulesDraft'
 import { adaptTaskProgressTelemetry } from './taskProgress'
 import { legacyShotVersionKey, normalizeShotVersionScopeKey } from './shotVersionScope'
-import { projectDefaultH3Mode } from './projectProductionDefaults'
-import type { Asset, AssetType, BibleImageEntityType, BibleImagePromptConfig, BibleItem, Episode, EpisodeShotVersion, H3PromptPayload, H3ReferenceAudioPurpose, H3ReferenceBindings, H3ReferenceEntityBinding, H3ReferenceVideoPurpose, SeriesProject, Shot, StylePreset, TaskOutputMedia, TaskReferenceAssetSummary, Workflow, WorkflowBatchSlot, WorkflowNode } from '@/types'
+import { shotReferenceBindingsPayload } from './storyboardReferenceBindings'
+import type { Asset, AssetType, BibleItem, Episode, EpisodeShotVersion, PromptArtifactPayload, ReferenceBindings, ReferenceEntityBinding, ReferencePurpose, SeriesProject, Shot, StylePreset, TaskOutputMedia, TaskReferenceAssetSummary, Workflow, WorkflowBatchSlot, WorkflowNode } from '@/types'
 
 export { adaptPromptArtifact } from './promptArtifactAdapter'
 
@@ -18,56 +18,6 @@ const styleBySlug = new Map<string, StylePreset>()
 const projectTitleById = new Map<string, string>()
 const episodeContextById = new Map<string, { projectId: string; number: number; title: string }>()
 const shotContextById = new Map<string, { episodeId: string; number: number; title: string }>()
-
-const defaultCompositionRules: Record<BibleImageEntityType, string> = {
-  character: 'neutral full-body or three-quarter standing pose; unobstructed face; identity reference image; plain unobtrusive studio background; no other people',
-  scene: 'wide establishing view; empty environment; no people or characters; clear spatial layout and architectural continuity reference',
-  prop: 'three-quarter product view; neutral seamless background; centered; fully visible; no hands, no people, no duplicate objects',
-}
-const defaultNegativeRules: Record<BibleImageEntityType, string> = {
-  character: 'multiple people, crowd, duplicate person, obscured face, cropped head',
-  scene: 'people, person, character, crowd, portrait, close-up',
-  prop: 'hands, person, people, multiple objects, duplicate object, clutter',
-}
-export const defaultBibleImagePromptConfig = (style?: StylePreset): BibleImagePromptConfig => ({
-  schemaVersion: 1,
-  stylePrompt: style?.promptPrefix || 'cinematic production reference',
-  styleNegativePrompt: '',
-  compositionRules: { ...defaultCompositionRules },
-  negativeRules: { ...defaultNegativeRules },
-  qualitySuffix: 'high detail, consistent identity, production reference',
-})
-const normalizePromptConfigGroup = (
-  value: unknown,
-  fallback: Record<BibleImageEntityType, string>,
-): Record<BibleImageEntityType, string> => {
-  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value as Raw : {}
-  return {
-    character: typeof raw.character === 'string' ? raw.character : fallback.character,
-    scene: typeof raw.scene === 'string' ? raw.scene : fallback.scene,
-    prop: typeof raw.prop === 'string' ? raw.prop : fallback.prop,
-  }
-}
-export const adaptBibleImagePromptConfig = (value: unknown, style?: StylePreset): BibleImagePromptConfig => {
-  const fallback = defaultBibleImagePromptConfig(style)
-  const raw = value && typeof value === 'object' && !Array.isArray(value) ? value as Raw : {}
-  return {
-    schemaVersion: 1,
-    stylePrompt: typeof raw.style_prompt === 'string' ? raw.style_prompt : fallback.stylePrompt,
-    styleNegativePrompt: typeof raw.style_negative_prompt === 'string' ? raw.style_negative_prompt : fallback.styleNegativePrompt,
-    compositionRules: normalizePromptConfigGroup(raw.composition_rules, fallback.compositionRules),
-    negativeRules: normalizePromptConfigGroup(raw.negative_rules, fallback.negativeRules),
-    qualitySuffix: typeof raw.quality_suffix === 'string' ? raw.quality_suffix : fallback.qualitySuffix,
-  }
-}
-export const bibleImagePromptConfigPayload = (config?: BibleImagePromptConfig): Raw | undefined => config ? ({
-  schema_version: 1,
-  style_prompt: config.stylePrompt,
-  style_negative_prompt: config.styleNegativePrompt,
-  composition_rules: { ...config.compositionRules },
-  negative_rules: { ...config.negativeRules },
-  quality_suffix: config.qualitySuffix,
-}) : undefined
 
 export const isBackendId = (value?: string) => Boolean(value && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value))
 
@@ -124,40 +74,74 @@ const safeTaskParameterValue = (value: unknown, key = '', depth = 0): unknown =>
     .filter(([, item]) => item !== undefined)
   return Object.fromEntries(entries)
 }
-const taskInputParameters = (raw: Raw): Record<string, unknown> => {
-  const current = raw.input_parameters && typeof raw.input_parameters === 'object' && !Array.isArray(raw.input_parameters)
-    ? raw.input_parameters
-    : undefined
-  return (safeTaskParameterValue(current || {}, 'input_parameters') || {}) as Record<string, unknown>
+const taskInputContractStatus = (raw: Raw): 'available' | 'unavailable' => {
+  const status = String(raw.input_contract_status || '')
+  if (!status) return 'available'
+  if (status === 'available' || status === 'unavailable') return status
+  throw new Error(`任务 ${String(raw.id || '未知')} 的 input_contract_status 无效`)
+}
+const taskInputContractCode = (
+  raw: Raw,
+  status: 'available' | 'unavailable',
+): '' | 'legacy_schema_unsupported' | 'frozen_contract_invalid' => {
+  const code = String(raw.input_contract_code || '')
+  if (status === 'available') {
+    if (code) throw new Error(`任务 ${String(raw.id || '未知')} 的可用输入合同包含异常原因码`)
+    return ''
+  }
+  if (code === 'legacy_schema_unsupported' || code === 'frozen_contract_invalid') return code
+  throw new Error(`任务 ${String(raw.id || '未知')} 缺少稳定的输入合同不可用原因码`)
+}
+const taskInputParameters = (
+  raw: Raw,
+  status: 'available' | 'unavailable',
+): Record<string, unknown> | undefined => {
+  if (status === 'unavailable') {
+    if (raw.input_parameters !== null) {
+      throw new Error(`任务 ${String(raw.id || '未知')} 的不可用输入合同必须返回 null`)
+    }
+    return undefined
+  }
+  if (!raw.input_parameters || typeof raw.input_parameters !== 'object' || Array.isArray(raw.input_parameters)) {
+    throw new Error(`任务 ${String(raw.id || '未知')} 缺少冻结 input_parameters 合同`)
+  }
+  return (safeTaskParameterValue(raw.input_parameters, 'input_parameters') || {}) as Record<string, unknown>
 }
 const taskAssetSummaries = (
   parameters: Record<string, unknown>,
   field: 'reference_assets' | 'continuity_assets',
   fallbackLabel: string
-): TaskReferenceAssetSummary[] | undefined => {
-  if (!Object.prototype.hasOwnProperty.call(parameters, field)) return undefined
-  const rows = Array.isArray(parameters[field]) ? parameters[field] : []
+): TaskReferenceAssetSummary[] => {
+  if (!Array.isArray(parameters[field])) {
+    throw new Error(`任务 input_parameters.${field} 必须是冻结数组`)
+  }
+  const rows = parameters[field]
   const optionalNumber = (value: unknown) => value === null || value === undefined || value === '' || !Number.isFinite(Number(value)) ? undefined : Number(value)
-  return rows.filter((item): item is Raw => Boolean(item && typeof item === 'object' && !Array.isArray(item))).map((item, index) => {
-    const category = String(item.category || '')
-    const rawKind = String(item.media_kind || '').toLowerCase()
-    const mediaKind: TaskReferenceAssetSummary['mediaKind'] = rawKind === 'video' || rawKind === 'audio'
-      ? rawKind
-      : /video/i.test(category) ? 'video' : /audio/i.test(category) ? 'audio' : 'image'
+  return rows.map((item, index) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      throw new Error(`任务 input_parameters.${field}[${index}] 必须是冻结对象`)
+    }
+    const row = item as Raw
+    const category = String(row.category || '')
+    const rawKind = String(row.media_kind || '').toLowerCase()
+    if (!['image', 'video', 'audio'].includes(rawKind)) {
+      throw new Error(`任务 input_parameters.${field}[${index}].media_kind 缺失或无效`)
+    }
+    const mediaKind = rawKind as TaskReferenceAssetSummary['mediaKind']
     return {
-      assetId: relationId(item.asset_id) || undefined,
-      displayName: String(item.display_name || item.name || item.entity_label || item.entity_name || `${fallbackLabel} ${index + 1}`),
+      assetId: relationId(row.asset_id) || undefined,
+      displayName: String(row.display_name || row.name || row.entity_label || row.entity_name || `${fallbackLabel} ${index + 1}`),
       mediaKind,
-      previewUrl: String(item.preview_url || ''),
+      previewUrl: String(row.preview_url || ''),
       category: category || undefined,
-      inputLabel: String(item.input_label || '') || undefined,
-      entityLabel: String(item.entity_label || item.entity_name || '') || undefined,
-      useEmbeddedAudio: item.use_embedded_audio === true,
-      sourceFps: optionalNumber(item.source_fps),
-      effectiveFps: optionalNumber(item.effective_fps),
-      effectiveDurationMs: optionalNumber(item.effective_duration_ms),
-      cfrGuaranteed: typeof item.cfr_guaranteed === 'boolean' ? item.cfr_guaranteed : undefined,
-      pairedAudioDurationAligned: typeof item.paired_audio_duration_aligned === 'boolean' ? item.paired_audio_duration_aligned : undefined
+      inputLabel: String(row.input_label || '') || undefined,
+      entityLabel: String(row.entity_label || row.entity_name || '') || undefined,
+      useEmbeddedAudio: row.use_embedded_audio === true,
+      sourceFps: optionalNumber(row.source_fps),
+      effectiveFps: optionalNumber(row.effective_fps),
+      effectiveDurationMs: optionalNumber(row.effective_duration_ms),
+      cfrGuaranteed: typeof row.cfr_guaranteed === 'boolean' ? row.cfr_guaranteed : undefined,
+      pairedAudioDurationAligned: typeof row.paired_audio_duration_aligned === 'boolean' ? row.paired_audio_duration_aligned : undefined
     }
   })
 }
@@ -203,6 +187,7 @@ export const styleSlug = (id?: string) => id ? styleSlugById.get(id) || id : ''
 const assetType = (raw: Raw):AssetType|undefined => {
   if (['character','scene','prop'].includes(raw.kind)) return raw.kind
   const mime=String(raw.mime_type||'').toLowerCase();const source=String(raw.file||raw.local_path||raw.reference_url||'').toLowerCase()
+  if(raw.kind==='script'||mime.startsWith('text/')||/\.(txt|md|markdown|fountain)$/.test(source))return 'script'
   if(['audio','reference_audio'].includes(raw.kind)||mime.startsWith('audio/')||/\.(wav|mp3|aac|m4a|flac|ogg)$/.test(source))return 'audio'
   if(raw.kind==='output_video'||raw.kind==='reference_video'||mime.startsWith('video/')||/\.(mp4|mov|webm|mkv)$/.test(source))return 'video'
   if(raw.kind==='reference'&&['character','scene','prop'].includes(raw.metadata?.reference_category))return raw.metadata.reference_category
@@ -210,7 +195,7 @@ const assetType = (raw: Raw):AssetType|undefined => {
   return undefined
 }
 export const adaptAssets = (payload: unknown): Asset[] => asList(payload).map((raw: Raw) => ({raw,type:assetType(raw)})).filter((item):item is {raw:Raw;type:AssetType}=>Boolean(item.type)).map(({raw,type}) => ({
-  id: String(raw.id), styleId: styleSlug(String(raw.style || '')), type, backendKind:String(raw.kind||''), name: raw.name, description: raw.description || '', promptHint:String(raw.prompt_hint||''), checksum:String(raw.checksum||'')||undefined, ownerId:raw.owner===null?null:String(raw.owner||'')||undefined, updatedAt:String(raw.updated_at||'')||undefined, metadataSha256:String(raw.metadata_sha256||'')||undefined, isActive:raw.is_active!==false, thumbnail: ['character','scene','prop','image'].includes(type) ? raw.preview_url || raw.reference_url || '' : String(raw.metadata?.thumbnail_url||''), mediaUrl: raw.preview_url || raw.reference_url || '', mimeType:String(raw.mime_type||''), metadata:raw.metadata&&typeof raw.metadata==='object'?raw.metadata:{}, hasEmbeddedAudio:raw.metadata?.has_audio===true, tags: Array.isArray(raw.metadata?.tags) ? raw.metadata.tags : [raw.kind, '一致性参考'], seed: Number(raw.metadata?.seed || 0) || undefined
+  id: String(raw.id), styleId: styleSlug(String(raw.style || '')), type, backendKind:String(raw.kind||''), name: raw.name, description: raw.description || '', promptHint:String(raw.prompt_hint||''), sourceInfo:String(raw.source_info||'')||undefined, checksum:String(raw.checksum||'')||undefined, ownerId:raw.owner===null?null:String(raw.owner||'')||undefined, updatedAt:String(raw.updated_at||'')||undefined, metadataSha256:String(raw.metadata_sha256||'')||undefined, isActive:raw.is_active!==false, thumbnail: ['character','scene','prop','image'].includes(type) ? raw.preview_url || raw.reference_url || '' : String(raw.metadata?.thumbnail_url||''), mediaUrl: raw.preview_url || raw.reference_url || '', downloadUrl:String(raw.download_url||''), mimeType:String(raw.mime_type||''), metadata:raw.metadata&&typeof raw.metadata==='object'?raw.metadata:{}, hasEmbeddedAudio:raw.metadata?.has_audio===true, tags: Array.isArray(raw.metadata?.tags) ? raw.metadata.tags : [raw.kind, '一致性参考'], seed: Number(raw.metadata?.seed || 0) || undefined
 }))
 
 export const adaptBibleItem = (raw: Raw): BibleItem => ({
@@ -220,7 +205,7 @@ export const adaptBibleItem = (raw: Raw): BibleItem => ({
   material: raw.material || '', distinctiveMarks: raw.distinctive_marks || '', continuityState: raw.continuity_state || ''
 })
 
-const adaptEntityBinding = (value: unknown): H3ReferenceEntityBinding | undefined => {
+const adaptEntityBinding = (value: unknown): ReferenceEntityBinding | undefined => {
   if (!value || typeof value !== 'object') return undefined
   const raw = value as Raw
   const entityId = relationId(raw.entity_id ?? raw.entityId)
@@ -228,38 +213,31 @@ const adaptEntityBinding = (value: unknown): H3ReferenceEntityBinding | undefine
   return entityId && assetId ? { entityId, assetId } : undefined
 }
 
-const videoPurpose = (value: unknown): H3ReferenceVideoPurpose => (
-  ['motion_camera_reference', 'video_editing', 'video_continuation'].includes(String(value))
-    ? String(value) as H3ReferenceVideoPurpose
-    : 'motion_camera_reference'
-)
+const SAFE_REFERENCE_PURPOSE = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/
+const referencePurpose = (value: unknown): ReferencePurpose => {
+  const result = typeof value === 'string' ? value.trim() : ''
+  return SAFE_REFERENCE_PURPOSE.test(result) ? result : ''
+}
 
-const audioPurpose = (value: unknown): H3ReferenceAudioPurpose => (
-  ['audio_reference', 'audio_reuse'].includes(String(value))
-    ? String(value) as H3ReferenceAudioPurpose
-    : 'audio_reference'
-)
-
-const adaptReferenceBindings = (raw: Raw): H3ReferenceBindings => {
+const adaptReferenceBindings = (raw: Raw): ReferenceBindings => {
   const source = (raw.reference_bindings || raw.metadata?.reference_bindings || {}) as Raw
-  const legacyAssets = (raw.reference_assets || []).map(String)
-  const characters = Array.isArray(source.characters) ? source.characters.map(adaptEntityBinding).filter(Boolean) as H3ReferenceEntityBinding[] : []
-  const props = Array.isArray(source.props) ? source.props.map(adaptEntityBinding).filter(Boolean) as H3ReferenceEntityBinding[] : []
+  const characters = Array.isArray(source.characters) ? source.characters.map(adaptEntityBinding).filter(Boolean) as ReferenceEntityBinding[] : []
+  const props = Array.isArray(source.props) ? source.props.map(adaptEntityBinding).filter(Boolean) as ReferenceEntityBinding[] : []
   const videos = Array.isArray(source.videos) ? source.videos.map((item:Raw)=>{
     const useEmbeddedAudio=Boolean(item.use_embedded_audio??item.useEmbeddedAudio)
     const audioAssetId=relationId(item.audio_asset_id??item.audioAssetId)||undefined
     return {
       assetId:relationId(item.asset_id??item.assetId),
-      purpose:videoPurpose(item.purpose),
+      purpose:referencePurpose(item.purpose),
       useEmbeddedAudio,
       audioAssetId,
-      ...((useEmbeddedAudio||audioAssetId)?{audioPurpose:audioPurpose(item.audio_purpose??item.audioPurpose)}:{})
+      ...((useEmbeddedAudio||audioAssetId)?{audioPurpose:referencePurpose(item.audio_purpose??item.audioPurpose)}:{})
     }
   }).filter((item)=>item.assetId) : []
-  const audios = Array.isArray(source.audios) ? source.audios.map((item:Raw)=>({assetId:relationId(item.asset_id??item.assetId),purpose:audioPurpose(item.purpose)})).filter((item)=>item.assetId) : []
+  const audios = Array.isArray(source.audios) ? source.audios.map((item:Raw)=>({assetId:relationId(item.asset_id??item.assetId),purpose:referencePurpose(item.purpose)})).filter((item)=>item.assetId) : []
   return {
-    firstFrameAssetId: relationId(source.first_frame_asset_id ?? source.firstFrameAssetId) || (['I2VA', 'FL2VA'].includes(raw.h3_mode) ? legacyAssets[0] : undefined),
-    lastFrameAssetId: relationId(source.last_frame_asset_id ?? source.lastFrameAssetId) || (raw.h3_mode === 'L2VA' ? legacyAssets[0] : raw.h3_mode === 'FL2VA' ? legacyAssets[1] : undefined),
+    firstFrameAssetId: relationId(source.first_frame_asset_id ?? source.firstFrameAssetId),
+    lastFrameAssetId: relationId(source.last_frame_asset_id ?? source.lastFrameAssetId),
     firstFrameReferenceAssetId: relationId(source.first_frame_reference_asset_id ?? source.firstFrameReferenceAssetId) || undefined,
     characters,
     scene: adaptEntityBinding(source.scene),
@@ -269,65 +247,76 @@ const adaptReferenceBindings = (raw: Raw): H3ReferenceBindings => {
   }
 }
 
-export const referenceBindingsPayload = (bindings?: H3ReferenceBindings) => ({
-  ...(bindings?.firstFrameAssetId ? { first_frame_asset_id: bindings.firstFrameAssetId } : {}),
-  ...(bindings?.lastFrameAssetId ? { last_frame_asset_id: bindings.lastFrameAssetId } : {}),
-  ...(bindings?.firstFrameReferenceAssetId ? { first_frame_reference_asset_id: bindings.firstFrameReferenceAssetId } : {}),
-  ...((bindings?.characters || []).length ? { characters: bindings!.characters.map((item) => ({ entity_id: item.entityId, asset_id: item.assetId })) } : {}),
-  ...(bindings?.scene ? { scene: { entity_id: bindings.scene.entityId, asset_id: bindings.scene.assetId } } : {}),
-  ...((bindings?.props || []).length ? { props: bindings!.props.map((item) => ({ entity_id: item.entityId, asset_id: item.assetId })) } : {}),
-  ...((bindings?.videos || []).length ? { videos: bindings!.videos.map((item)=>({
-    asset_id:item.assetId,
-    purpose:videoPurpose(item.purpose),
-    use_embedded_audio:item.useEmbeddedAudio,
-    ...(item.audioAssetId?{audio_asset_id:item.audioAssetId}:{}),
-    ...((item.useEmbeddedAudio||item.audioAssetId)?{audio_purpose:audioPurpose(item.audioPurpose)}:{})
-  })) } : {}),
-  ...((bindings?.audios || []).length ? { audios: bindings!.audios.map((item)=>({asset_id:item.assetId,purpose:audioPurpose(item.purpose)})) } : {})
-})
+export const referenceBindingsPayload = (bindings?: ReferenceBindings) => shotReferenceBindingsPayload(
+  bindings ? {
+    ...bindings,
+    videos: (bindings.videos || []).map((item) => ({
+      ...item,
+      purpose: referencePurpose(item.purpose),
+      ...((item.useEmbeddedAudio || item.audioAssetId)
+        ? { audioPurpose: referencePurpose(item.audioPurpose) }
+        : { audioPurpose: undefined }),
+    })),
+    audios: (bindings.audios || []).map((item) => ({ ...item, purpose: referencePurpose(item.purpose) })),
+  } : undefined,
+)
 
 export const referenceAssetIdsForShot = (shot: Shot): string[] => {
-  // The currently verified SDXL image template is text-to-image. Bible images
-  // remain human continuity references and must not be presented or submitted
-  // as pixel-conditioned model inputs.
+  // Image-shot pixel conditioning is not declared by this Shot payload contract.
+  // Bible images remain human continuity references and must not be inferred as
+  // executable pixel inputs without an explicit selected-workflow capability.
   if (shot.mediaType === 'image') return []
   const bindings = shot.referenceBindings
-  const ordered = shot.mode === 'FL2VA'
-    ? [bindings?.firstFrameAssetId, bindings?.lastFrameAssetId]
-    : shot.mode === 'Ref2VA'
-      ? [bindings?.firstFrameReferenceAssetId, ...(bindings?.characters || []).map((item) => item.assetId), bindings?.scene?.assetId, ...(bindings?.props || []).map((item) => item.assetId), ...(bindings?.videos || []).flatMap((item)=>[item.assetId,item.audioAssetId]), ...(bindings?.audios || []).map((item)=>item.assetId)]
-      : []
+  const ordered = [
+    bindings?.firstFrameAssetId,
+    bindings?.lastFrameAssetId,
+    bindings?.firstFrameReferenceAssetId,
+    ...(bindings?.characters || []).map((item) => item.assetId),
+    bindings?.scene?.assetId,
+    ...(bindings?.props || []).map((item) => item.assetId),
+    ...(bindings?.videos || []).flatMap((item) => [item.assetId, item.audioAssetId]),
+    ...(bindings?.audios || []).map((item) => item.assetId),
+  ]
   return [...new Set(ordered.filter(Boolean).map(String))]
 }
 
 const adaptShot = (raw: Raw): Shot => {
+  const mediaType = raw.media_type
+  if (mediaType !== 'video' && mediaType !== 'image') {
+    throw new Error('服务端 Shot 缺少有效 media_type')
+  }
+  const durationMs = Number(raw.duration_ms)
+  if (!Number.isSafeInteger(durationMs) || durationMs < 1) {
+    throw new Error('服务端 Shot 缺少有效 duration_ms')
+  }
+  if (typeof raw.include_audio !== 'boolean') {
+    throw new Error('服务端 Shot 缺少有效 include_audio')
+  }
+  if (mediaType === 'image' && raw.include_audio) {
+    throw new Error('图片 Shot 不能包含音频')
+  }
   const metadata = raw.metadata && typeof raw.metadata === 'object' ? raw.metadata : {}
   const splitPromptFields = Number(metadata.prompt_field_version || 0) >= 2
-  const creativeDraftProvenance = Boolean(metadata.creative_draft_id && metadata.client_key)
   const storedNegativePrompt = normalizeNegativePrompt(metadata.negative_prompt || '')
-  const legacyNegativePromptRepairEligible = raw.legacy_negative_prompt_repair_eligible === true
   const versionNumber = Number(metadata.creative_version_shot_number || 0)
   const displayNumber = Number.isFinite(versionNumber) && versionNumber > 0 ? versionNumber : Number(raw.number || 1)
   return {
     id: String(raw.id), order: displayNumber, title: raw.title || `镜头 ${displayNumber || 1}`,
-    mediaType: raw.media_type === 'image' ? 'image' : 'video', duration: Math.max(.1, Number(raw.duration_ms || 3500) / 1000),
-    mode: raw.h3_mode || 'T2VA', framing: metadata.framing || '中景', camera: raw.camera || '',
+    mediaType, duration: durationMs / 1000,
+    mode: String(raw.conditioning_mode || '').trim(), framing: metadata.framing || '中景', camera: raw.camera || '',
     action: raw.action || raw.narrative || '',
     ...adaptShotDetailedDescription(raw),
-    continuityDirection: splitPromptFields || creativeDraftProvenance ? raw.continuity_notes || '' : '',
+    continuityDirection: splitPromptFields ? raw.continuity_notes || '' : '',
     prompt: '', negativePrompt: splitPromptFields
       ? storedNegativePrompt
-      : creativeDraftProvenance
-        ? storedNegativePrompt
-        : normalizeNegativePrompt(raw.continuity_notes || '人物身份漂移，多余肢体，文字水印，低清晰度'),
-    ...(legacyNegativePromptRepairEligible ? { legacyNegativePromptRepairEligible: true } : {}),
+      : normalizeNegativePrompt(raw.continuity_notes || '人物身份漂移，多余肢体，文字水印，低清晰度'),
     characterIds: (raw.characters || []).map(String), sceneId: raw.scene ? String(raw.scene) : undefined,
     propIds: (raw.props || []).map(String), referenceAssetIds: (raw.reference_assets || []).map(String),
     referenceBindings: adaptReferenceBindings(raw),
     requiresFirstFrameContinuity: raw.requires_first_frame_continuity === true,
     requiresLastFrameContinuity: raw.requires_last_frame_continuity === true,
     metadata,
-    audioEnabled: raw.media_type !== 'image' && raw.include_audio !== false,
+    audioEnabled: mediaType === 'video' && raw.include_audio,
     audio: { dialogue: formatDialogueLines(raw.dialogue), soundscape: raw.sound_effects || '', music: raw.music || '' },
     status: 'draft'
   }
@@ -395,7 +384,7 @@ const adaptEpisode = (raw: Raw, shotRows: Raw[], promptRows: Raw[]): Episode => 
     return { ...shot, prompt: generatedPrompt.integrated_multimodal_description, generatedPrompt, status: 'ready' as const }
   })
   const grouped = groupEpisodeShotVersions(String(raw.id), allShots)
-  return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: grouped.shots, shotVersions: grouped.shotVersions, activeShotVersionKey: grouped.activeShotVersionKey, createdAt: raw.created_at }
+  return { id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status === 'generating' ? 'rendering' : raw.status, audioEnabled: episodeAudioEnabled(raw), shots: grouped.shots, shotVersions: grouped.shotVersions, activeShotVersionKey: grouped.activeShotVersionKey, createdAt: raw.created_at }
 }
 
 export const projectStatus = (status: string): SeriesProject['status'] => {
@@ -416,9 +405,15 @@ const emptyProjectBible = () => ({ characters: [], scenes: [], props: [], negati
 export const adaptProjectSummary = (raw: Raw, detailLoaded = false): SeriesProject => {
   projectTitleById.set(String(raw.id), raw.title)
   const projectStyleId = styleSlug(String(raw.style || ''))
-  const style = styleBySlug.get(projectStyleId)
+  const language = typeof raw.language === 'string' ? raw.language.trim() : ''
+  const aspectRatio = typeof raw.aspect_ratio === 'string' ? raw.aspect_ratio.trim() : ''
+  const width = Number(raw.width)
+  const height = Number(raw.height)
+  if (!language || !aspectRatio || !Number.isSafeInteger(width) || width < 1 || !Number.isSafeInteger(height) || height < 1) {
+    throw new Error('服务端 Project 缺少有效 language、aspect_ratio 或尺寸事实')
+  }
   return {
-    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, bibleImagePromptConfig: adaptBibleImagePromptConfig(raw.production_settings?.bible_image_prompt_config, style), styleId: projectStyleId, status: projectStatus(raw.status), aspectRatio: raw.aspect_ratio || '9:16', resolution: inferResolution(raw), width: Number(raw.width || 0) || undefined, height: Number(raw.height || 0) || undefined, defaultMode: projectDefaultH3Mode(raw.production_settings?.default_h3_mode),
+    id: String(raw.id), title: raw.title, logline: raw.logline || '', masterScript: raw.master_script || '', isFavorite: raw.is_favorite === true, coverAssetId: relationId(raw.cover_asset) || undefined, coverUrl: String(raw.cover_url || '') || undefined, continuitySummary: raw.continuity_summary || '', translationGlossary: raw.production_settings?.translation_glossary && typeof raw.production_settings.translation_glossary === 'object' ? Object.fromEntries(Object.entries(raw.production_settings.translation_glossary).filter(([source, target]) => source.trim() && String(target).trim()).map(([source, target]) => [source, String(target)])) : {}, styleId: projectStyleId, status: projectStatus(raw.status), language, aspectRatio, resolution: inferResolution(raw), width, height, defaultMode: String(raw.production_settings?.default_conditioning_mode || '').trim(),
     bible: emptyProjectBible(), episodes: [], episodeCount: Number(raw.episode_count || 0), completedEpisodeCount: Number(raw.completed_episode_count || 0), totalDurationSeconds: Number(raw.total_duration_ms || 0) / 1000, detailLoaded, createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''),
   }
 }
@@ -464,22 +459,18 @@ export const adaptProject = async (raw: Raw): Promise<SeriesProject> => {
   }
 }
 
-const dimensions = (ratio: SeriesProject['aspectRatio'], resolution: SeriesProject['resolution']) => {
-  const portrait = resolution === '4K' ? [2176, 3840] : resolution === '1080p' ? [1088, 1920] : [768, 1344]
-  if (ratio === '16:9') return { width: portrait[1], height: portrait[0] }
-  if (ratio === '1:1') return { width: portrait[0], height: portrait[0] }
-  return { width: portrait[0], height: portrait[1] }
-}
-
 export const projectPayload = (project: Partial<SeriesProject>) => {
   const visualRules = visualRulesProjectPersistenceFields(project)
-  const style = project.styleId ? styleBySlug.get(styleSlug(project.styleId)) : undefined
-  const bibleImagePromptConfig = bibleImagePromptConfigPayload(
-    project.bibleImagePromptConfig || defaultBibleImagePromptConfig(style),
-  )
+  const language = typeof project.language === 'string' ? project.language.trim() : ''
+  const aspectRatio = typeof project.aspectRatio === 'string' ? project.aspectRatio.trim() : ''
+  const width = Number(project.width)
+  const height = Number(project.height)
+  if (!language || !aspectRatio || !Number.isSafeInteger(width) || width < 1 || !Number.isSafeInteger(height) || height < 1) {
+    throw new Error('项目创建或保存必须包含服务端声明的语言、画幅和宽高事实')
+  }
   return {
-    title: project.title, logline: project.logline || '', master_script: project.masterScript || '', status: backendStatus(project.status || 'draft'), style: backendStyleId(project.styleId), target_model: 'minimax-h3', language: 'Chinese', aspect_ratio: project.aspectRatio || '9:16', ...(project.width && project.height ? { width: project.width, height: project.height } : dimensions(project.aspectRatio || '9:16', project.resolution || '720p')), fps: 24,
-    production_settings: { default_h3_mode: projectDefaultH3Mode(project.defaultMode), negative_prompt: visualRules.negativePrompt, color_script: visualRules.colorScript, translation_glossary: project.translationGlossary || {}, bible_image_prompt_config: bibleImagePromptConfig }, continuity_summary: visualRules.continuitySummary,
+    title: project.title, logline: project.logline || '', master_script: project.masterScript || '', status: backendStatus(project.status || 'draft'), style: backendStyleId(project.styleId), target_model: '', language, aspect_ratio: aspectRatio, width, height,
+    production_settings: { default_conditioning_mode: String(project.defaultMode || '').trim(), negative_prompt: visualRules.negativePrompt, color_script: visualRules.colorScript, translation_glossary: project.translationGlossary || {} }, continuity_summary: visualRules.continuitySummary,
     ...(project.id && project.updatedAt ? { expected_updated_at: project.updatedAt } : {}),
   }
 }
@@ -538,19 +529,24 @@ export const persistBibleEntities = async (project: SeriesProject) => {
   )
 }
 
-export const adaptCreatedEpisode = (raw: Raw): Episode => ({ id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status, audioEnabled: raw.prompt_settings?.include_audio !== false, shots: [], createdAt: raw.created_at })
+const episodeAudioEnabled = (raw: Raw): boolean => {
+  const promptSettings = raw.prompt_settings
+  if (!promptSettings || typeof promptSettings !== 'object' || Array.isArray(promptSettings) || typeof promptSettings.include_audio !== 'boolean') {
+    throw new Error('服务端 Episode 缺少有效 prompt_settings.include_audio')
+  }
+  return promptSettings.include_audio
+}
+
+export const adaptCreatedEpisode = (raw: Raw): Episode => ({ id: String(raw.id), number: Number(raw.number), title: raw.title, synopsis: raw.synopsis || '', script: raw.script || '', status: raw.status, audioEnabled: episodeAudioEnabled(raw), shots: [], createdAt: raw.created_at })
 
 export const dialoguePayload = (value: string, project: SeriesProject): Raw[] | undefined => (
   parseDialogueText(value, project.bible.characters)
 )
 
 export const shotPersistencePayload = (project: SeriesProject, shot: Shot): Raw => {
-  if (shot.legacyNegativePromptRepairEligible) {
-    throw new Error(`分镜“${shot.title}”的负面约束与创作草稿连续性字段来源匹配；请先点击“审计并恢复负面约束”，或人工改为真实的英文缺陷排除词后再保存。`)
-  }
   const isVideo = shot.mediaType !== 'image'
   if (!isBackendId(shot.id) && !shot.action.trim()) {
-    throw new Error(`新增分镜“${shot.title}”需要先填写动作与画面描述；镜头标题只用于标识，不会替代 H3 导演描述。`)
+    throw new Error(`新增分镜“${shot.title}”需要先填写动作与画面描述；镜头标题只用于标识，不会替代目标模型所需的导演描述。`)
   }
   const duration = Number(shot.duration)
   if (!Number.isFinite(duration) || duration <= 0) {
@@ -603,7 +599,7 @@ export const shotPersistencePayload = (project: SeriesProject, shot: Shot): Raw 
     ...shotDetailedDescriptionPayload(shot),
     dialogue,
     sound_effects: isVideo ? shot.audio.soundscape : '', music: isVideo ? shot.audio.music : '', duration_ms: Math.round(duration * 1000),
-    media_type: shot.mediaType, h3_mode: shot.mode, include_audio: isVideo && shot.audioEnabled,
+    media_type: shot.mediaType, conditioning_mode: shot.mode, include_audio: isVideo && shot.audioEnabled,
     scene: isBackendId(shot.sceneId) ? shot.sceneId : null, characters: shot.characterIds.filter(isBackendId), props: shot.propIds.filter(isBackendId),
     reference_assets: referenceAssets.filter(isBackendId), reference_bindings: referenceBindings,
     requires_first_frame_continuity: shot.requiresFirstFrameContinuity,
@@ -658,29 +654,6 @@ export const adaptTaskOutputMedia = (value: unknown, position = 0): TaskOutputMe
     publicLabel: String(media.public_label || '') || undefined,
     publicVersion: String(media.public_version || '') || undefined,
     promotedAssetId: String(media.promoted_asset_id || '') || undefined,
-  }
-}
-
-const adaptBibleImageFrozenTarget = (value: unknown): Workflow['bibleImageTarget'] => {
-  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
-  const target = value as Raw
-  const referenceCategory = String(target.reference_category || '')
-  const entityId = String(target.entity_id || '')
-  const entityName = String(target.entity_name || '')
-  const sourceFingerprint = String(target.source_fingerprint || '')
-  if (
-    Number(target.schema_version) !== 1
-    || !['character', 'scene', 'prop'].includes(referenceCategory)
-    || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(entityId)
-    || !entityName
-    || !/^[0-9a-f]{64}$/.test(sourceFingerprint)
-  ) return undefined
-  return {
-    schemaVersion: 1,
-    referenceCategory: referenceCategory as 'character' | 'scene' | 'prop',
-    entityId,
-    entityName,
-    sourceFingerprint,
   }
 }
 
@@ -750,6 +723,10 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
   const batchIndex = Number(raw.batch_index || 0) || undefined
   const batchSize = Number(raw.batch_size || 0) || undefined
   const batchKind = String(raw.batch_kind || '') || undefined
+  const rawProductionVariantNumber = Number(raw.production_variant_number || 0)
+  const productionVariantNumber = Number.isInteger(rawProductionVariantNumber) && rawProductionVariantNumber > 0
+    ? rawProductionVariantNumber
+    : undefined
   const batchSlots = adaptTaskBatchSlots(raw.batch_slots)
   const projectName = projectTitleById.get(projectId) || String(raw.project_title || '') || `项目 ${projectId.slice(0, 8)}`
   const episodeLabel = episodeNumber ? `第${episodeNumber}集` : episodeTitle
@@ -767,9 +744,15 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
   const createdAt = String(raw.created_at || raw.queued_at || '')
   const queuedAt = String(raw.queued_at || raw.created_at || '') || undefined
   const finishedAt = String(raw.finished_at || raw.completed_at || '') || undefined
-  const inputParameters = taskInputParameters(raw)
-  const referenceAssets = taskAssetSummaries(inputParameters, 'reference_assets', '参考输入')
-  const continuityAssets = taskAssetSummaries(inputParameters, 'continuity_assets', '一致性素材')
+  const inputContractStatus = taskInputContractStatus(raw)
+  const inputContractCode = taskInputContractCode(raw, inputContractStatus)
+  const inputParameters = taskInputParameters(raw, inputContractStatus)
+  const referenceAssets = inputParameters
+    ? taskAssetSummaries(inputParameters, 'reference_assets', '参考输入')
+    : []
+  const continuityAssets = inputParameters
+    ? taskAssetSummaries(inputParameters, 'continuity_assets', '一致性素材')
+    : []
   return {
     id: String(raw.id), taskId: String(raw.id), kind: raw.kind === 'image' ? 'image' : 'video', backendStatus: String(raw.status || ''),
     generatedWorkflowId: relationId(raw.generated_workflow) || undefined,
@@ -779,12 +762,12 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
     backend: String(raw.backend || '') || undefined, modelProfile: String(raw.model_profile || '') || undefined,
     workflowVersion: Number(raw.workflow_version || 0) || undefined, seed: Number(raw.seed || 0),
     effectiveFrames: Number(raw.effective_frames || 0), effectiveDurationMs: Number(raw.effective_duration_ms || 0),
-    inputParameters, referenceAssets, continuityAssets,
-    generationPurpose: raw.generation_purpose === 'bible_image_candidate' ? 'bible_image_candidate' : undefined,
-    bibleImageTarget: adaptBibleImageFrozenTarget(raw.bible_target),
-    promptAvailable: typeof inputParameters.prompt_available === 'boolean' ? inputParameters.prompt_available : undefined,
-    promptCharacterCount: Number(inputParameters.prompt_character_count || 0),
-    negativePromptCharacterCount: Number(inputParameters.negative_prompt_character_count || 0),
+    inputParameters, inputContractStatus, inputContractCode, referenceAssets, continuityAssets,
+    promptAvailable: inputContractStatus === 'unavailable'
+      ? false
+      : typeof inputParameters?.prompt_available === 'boolean' ? inputParameters.prompt_available : undefined,
+    promptCharacterCount: Number(inputParameters?.prompt_character_count || 0),
+    negativePromptCharacterCount: Number(inputParameters?.negative_prompt_character_count || 0),
     errorMessage: String(raw.error_message || '') || undefined, outputs: Array.isArray(raw.outputs) ? raw.outputs : [], outputMedia,
     queuedAt, startedAt: raw.started_at || undefined, finishedAt,
     submissionPreparedAt: raw.submission_prepared_at || undefined, submissionSubmittedAt: raw.submission_submitted_at || undefined,
@@ -797,6 +780,8 @@ export const adaptTasks = (payload: unknown): Workflow[] => asList(payload).map(
     currentStep, nodes: taskNode(raw.kind, status, progress), createdAt,
     eta: status === 'running' ? '计算中' : undefined, attempts: Number(raw.attempts || 0), maxAttempts: Number(raw.max_attempts || 0),
     batchId, batchIndex, batchSize, batchKind,
+    productionRunId: relationId(raw.production_run_id) || undefined,
+    productionVariantNumber,
     shotVersionKey: String(raw.shot_version_key || '') || undefined,
     shotVersionLabel: String(raw.shot_version_label || '') || undefined,
     batchSlots, episodeId: episodeId || undefined, episodeNumber, episodeTitle,

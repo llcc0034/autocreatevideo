@@ -338,8 +338,8 @@ function Restore-VerifiedFile {
 
 if ($null -ne $databaseEntry -and $database.Kind -eq 'sqlite') {
     $python = Get-AutoPromptPython -BackendRoot $settings.BackendRoot
-    $sqliteValidateCode = "import sqlite3,sys; db=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro', uri=True); result=db.execute('PRAGMA integrity_check').fetchone()[0]; db.close(); raise SystemExit(0 if result=='ok' else 'SQLite integrity_check failed: '+str(result))"
-    Invoke-AutoPromptNative -Executable $python -Arguments @('-c', $sqliteValidateCode, $databaseEntry.file_path) -Step 'SQLite restore source validation'
+    $sqliteMaintenance = Join-Path $PSScriptRoot 'sqlite_maintenance.py'
+    Invoke-AutoPromptNative -Executable $python -Arguments @($sqliteMaintenance, 'validate', $databaseEntry.file_path) -Step 'SQLite restore source validation'
     Restore-VerifiedFile -SourceFile $databaseEntry.file_path -ExpectedHash $databaseEntry.sha256 -TargetFile $database.Path -Purpose 'SQLite restore'
 } elseif ($null -ne $databaseEntry -and $database.Kind -eq 'postgresql') {
     $pgRestore = (Get-Command pg_restore -ErrorAction Stop).Source

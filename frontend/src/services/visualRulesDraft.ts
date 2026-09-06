@@ -40,7 +40,7 @@ export const visualRulesColorDesignErrors = (payload: unknown): string[] => {
   if (unexpected.length) errors.push(`color_design 含未知字段：${unexpected.join(', ')}`)
   if (missing.length) errors.push(`color_design 缺少字段：${missing.join(', ')}`)
   const baseColors = Array.isArray(raw.base_colors) ? raw.base_colors.map(String) : []
-  if (baseColors.length < 1 || baseColors.length > 3) errors.push('主色必须选择 1–3 个')
+  if (!Array.isArray(raw.base_colors)) errors.push('主色必须是数组')
   if (new Set(baseColors).size !== baseColors.length) errors.push('主色不能重复')
   const invalidBase = baseColors.filter((value) => !VISUAL_RULE_COLORS.includes(value as VisualRulesColor))
   if (invalidBase.length) errors.push(`主色含未知枚举：${invalidBase.join(', ')}`)

@@ -6,7 +6,7 @@ from django.test import TestCase
 from rest_framework.test import APIClient
 
 from studio.models import GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
-from studio.services.h3_prompts import H3PromptOptions, build_h3_video_prompt
+from studio.tests.media_prompt_fixtures import MediaPromptOptions, build_test_video_prompt
 from studio.tests.factories import build_story
 
 
@@ -43,15 +43,18 @@ class GenerationTaskWorkflowExportAPITests(TestCase):
 
     def setUp(self):
         user, project, _, _, episode, shot, _ = build_story()
-        prompt_result = build_h3_video_prompt(
-            project, [shot], H3PromptOptions(language_gate_mode="warn"),
+        prompt_result = build_test_video_prompt(
+            project, [shot], MediaPromptOptions(
+                model_identifier="minimax-h3-test", language_gate_mode="warn",
+            ),
         )
-        prompt = PromptArtifact.objects.create(
+        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
             project=project,
             episode=episode,
             shot=shot,
             created_by=user,
             prompt_type="video",
+            total_duration_ms=prompt_result.total_duration_ms,
             prompt_text=prompt_result.text,
             structured_payload=prompt_result.payload,
             consistency_snapshot=prompt_result.consistency_snapshot,
@@ -95,6 +98,7 @@ class GenerationTaskWorkflowExportAPITests(TestCase):
             status=GenerationTask.Status.RUNNING,
             workflow_version=template.version,
             attempts=1,
+            max_attempts=3,
             progress=37,
             submission_token="persisted-token",
             submission_state=GenerationTask.SubmissionState.SUBMITTED,

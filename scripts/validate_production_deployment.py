@@ -262,20 +262,10 @@ def main() -> None:
         re.search(r"(?mi)^\s*VITE_(?:USE_)?MOCK", frontend_env) is None,
         "frontend environment example must not expose mock controls",
     )
-    retired_local_process_env = (
-        "QWEN_TRANSLATION_RUNTIME_PYTHON", "QWEN_TRANSLATION_DEVICE",
-        "QWEN_CREATIVE_RUNTIME_PYTHON", "QWEN_CREATIVE_DEVICE",
-        "QWEN_GPU_LAYERS",
-    )
-    for setting in retired_local_process_env:
-        checks.require(
-            re.search(rf"(?m)^\s*{re.escape(setting)}\s*=", local_env) is None,
-            f"retired local-process setting {setting} must not remain in the backend environment example",
-        )
     forbidden_business_env = (
         "ALLOW_PUBLIC_REGISTRATION", "ASSET_UPLOAD_MAX_BYTES",
         "COMFYUI_BASE_URL", "COMFYUI_TIMEOUT_SECONDS", "COMFYUI_CLIENT_ID",
-        "MINIMAX_H3_MODEL", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
+        "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL",
         "H3_PROMPT_OPTIMIZER_ENABLED", "TASK_MAX_PENDING",
         "TASK_RECOMMENDED_MAX_PENDING", "ASSEMBLY_TIMEOUT_SECONDS",
     )

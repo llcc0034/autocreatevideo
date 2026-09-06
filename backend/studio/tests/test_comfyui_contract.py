@@ -1,6 +1,6 @@
 from copy import deepcopy
 
-from django.test import SimpleTestCase
+from django.test import TestCase
 
 from studio.services.comfyui import ComfyUIError
 from studio.services.comfyui_contract import (
@@ -22,7 +22,7 @@ class _OfflineClient:
         raise AssertionError("preflight must never submit")
 
 
-class ComfyUIContractTests(SimpleTestCase):
+class ComfyUIContractTests(TestCase):
     CONFIRMED_UPLOADS = {
         "autoprompt/task/person.png",
         "autoprompt/task/motion.mp4",
@@ -248,9 +248,9 @@ class ComfyUIContractTests(SimpleTestCase):
             self.validate(graph)
 
         detail = str(caught.exception)
-        self.assertIn("not-installed.safetensors", detail)
-        self.assertIn("largest", detail)
-        self.assertIn("实时 /object_info 枚举", detail)
+        self.assertNotIn("not-installed.safetensors", detail)
+        self.assertNotIn("largest", detail)
+        self.assertIn("实时 /object_info 受控枚举", detail)
 
     def test_rejects_invalid_source_slot_and_link_type(self):
         graph = self.graph()
@@ -274,18 +274,34 @@ class ComfyUIContractTests(SimpleTestCase):
 
         self.assertIn("依赖环", str(caught.exception))
 
-    def test_rejects_non_contiguous_and_out_of_range_autogrow_slots(self):
+    def test_accepts_sparse_optional_autogrow_slot_and_rejects_out_of_range(self):
         graph = self.graph()
         del graph["9"]["inputs"]["ref_images.ref_image_0"]
         graph["9"]["inputs"]["ref_images.ref_image_2"] = ["5", 0]
+
+        report = self.validate(graph)
+        self.assertEqual(report.node_count, 9)
+
         graph["9"]["inputs"]["ref_images.ref_image_9"] = ["5", 0]
 
         with self.assertRaises(ComfyUIContractError) as caught:
             self.validate(graph)
 
         detail = str(caught.exception)
-        self.assertIn("必须从 0 连续编号", detail)
         self.assertIn("超过 autogrow 最大槽位 8", detail)
+
+    def test_autogrow_minimum_requires_the_first_declared_slots(self):
+        object_info = self.object_info()
+        group = object_info["MiniMaxH3ReferenceToVideo"]["input"]["optional"]["ref_images"]
+        group[1]["template"]["min"] = 1
+        graph = self.graph()
+        del graph["9"]["inputs"]["ref_images.ref_image_0"]
+        graph["9"]["inputs"]["ref_images.ref_image_2"] = ["5", 0]
+
+        with self.assertRaises(ComfyUIContractError) as caught:
+            self.validate(graph, object_info)
+
+        self.assertIn("ref_images.ref_image_0", str(caught.exception))
 
     def test_rejects_required_input_numeric_range_and_unstaged_placeholder(self):
         graph = self.graph()
@@ -317,6 +333,28 @@ class ComfyUIContractTests(SimpleTestCase):
             self.validate(graph)
 
         self.assertIn("本任务已确认的上传结果", str(caught.exception))
+
+    def test_source_canvas_structural_mode_accepts_only_safe_unverified_upload_names(self):
+        graph = self.graph()
+        graph["6"]["inputs"]["file"] = "legacy/source-video.mp4"
+
+        report = validate_comfyui_api_contract(
+            graph,
+            self.object_info(),
+            uploaded_paths=self.CONFIRMED_UPLOADS,
+            allow_unverified_upload_names=True,
+        )
+
+        self.assertEqual(report.node_count, 9)
+        graph["6"]["inputs"]["file"] = "../outside.mp4"
+        with self.assertRaises(ComfyUIContractError) as caught:
+            validate_comfyui_api_contract(
+                graph,
+                self.object_info(),
+                uploaded_paths=self.CONFIRMED_UPLOADS,
+                allow_unverified_upload_names=True,
+            )
+        self.assertIn("安全相对路径", str(caught.exception))
 
     def test_rejects_dynamic_node_missing_from_live_server(self):
         object_info = self.object_info()
@@ -367,5 +405,5 @@ class ComfyUIContractTests(SimpleTestCase):
                 graph, self.sdxl_object_info(), uploaded_paths=set(),
             )
 
-        self.assertIn("missing.safetensors", str(caught.exception))
-        self.assertIn("实时 /object_info 枚举", str(caught.exception))
+        self.assertNotIn("missing.safetensors", str(caught.exception))
+        self.assertIn("实时 /object_info 受控枚举", str(caught.exception))

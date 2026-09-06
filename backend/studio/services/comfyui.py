@@ -1,20 +1,39 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import ipaddress
 import json
-from pathlib import Path
+import math
+from pathlib import Path, PurePosixPath
 import re
 import time
+import unicodedata
 import uuid
 from urllib.parse import quote, urlparse
 
 from django.conf import settings
+from django.utils import timezone
 import requests
+
+from studio.services.security_boundaries import boundary_int, boundary_number
 
 
 class ComfyUIError(RuntimeError):
     pass
+
+
+class ComfyUIHTTPError(ComfyUIError):
+    """A definitive HTTP response returned by ComfyUI.
+
+    Unlike a transport timeout, a 4xx response proves that ComfyUI received
+    and rejected the request; callers may safely mark it failed instead of
+    leaving an idempotent submission in an uncertain state.
+    """
+
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = int(status_code)
+        super().__init__(f"ComfyUI HTTP {self.status_code}: {detail}")
 
 
 class ComfyUITimeout(ComfyUIError):
@@ -29,11 +48,88 @@ class ComfyUIExecutionError(ComfyUIError):
         self.remote_status = remote_status or {}
 
 
+class ComfyUIPreSubmitResourceReleaseError(ComfyUIError):
+    """A definitive failure before ``POST /prompt`` is attempted.
+
+    ComfyUI's ``/free`` endpoint changes process-global accelerator state.  A
+    configured release therefore runs only while the platform media worker is
+    exclusive.  Any failure is fail-closed and carries a bounded audit record;
+    callers must never classify it as an uncertain prompt submission.
+    """
+
+    def __init__(self, code: str, message: str, *, audit: dict):
+        self.code = str(code or "comfyui_pre_submit_resource_release_failed")
+        self.audit = dict(audit or {})
+        super().__init__(f"[{self.code}] {message}")
+
+
+PRE_SUBMIT_RESOURCE_RELEASE_KEY = "pre_submit_resource_release"
+_PRE_SUBMIT_RESOURCE_RELEASE_FIELDS = frozenset({
+    "schema_version", "enabled", "unload_models", "free_memory",
+})
+
+
+def _stage_snapshot_max_bytes() -> int:
+    return boundary_int("security.snapshot.stage_max_bytes")
+
+
+def validate_pre_submit_resource_release_policy(value) -> dict | None:
+    """Validate the generic deployment-owned ComfyUI release policy.
+
+    Absence means no release request.  Presence is deliberately explicit: the
+    four fields have no hidden defaults, so a copied deployment behaves the
+    same on another host and a disabled policy cannot retain dormant actions.
+    """
+
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ComfyUIError("pre_submit_resource_release 必须是 JSON 对象")
+    unknown = sorted(set(value) - _PRE_SUBMIT_RESOURCE_RELEASE_FIELDS)
+    missing = sorted(_PRE_SUBMIT_RESOURCE_RELEASE_FIELDS - set(value))
+    if unknown:
+        raise ComfyUIError(
+            "pre_submit_resource_release 包含未知字段: " + ", ".join(unknown),
+        )
+    if missing:
+        raise ComfyUIError(
+            "pre_submit_resource_release 缺少字段: " + ", ".join(missing),
+        )
+    if value.get("schema_version") != 1:
+        raise ComfyUIError("pre_submit_resource_release.schema_version 只支持 1")
+    for key in ("enabled", "unload_models", "free_memory"):
+        if type(value.get(key)) is not bool:
+            raise ComfyUIError(f"pre_submit_resource_release.{key} 必须是布尔值")
+    enabled = value["enabled"]
+    unload_models = value["unload_models"]
+    free_memory = value["free_memory"]
+    if enabled and not (unload_models or free_memory):
+        raise ComfyUIError("启用 pre_submit_resource_release 时至少选择一项释放动作")
+    if not enabled and (unload_models or free_memory):
+        raise ComfyUIError("停用 pre_submit_resource_release 时释放动作必须同时为 false")
+    return {
+        "schema_version": 1,
+        "enabled": enabled,
+        "unload_models": unload_models,
+        "free_memory": free_memory,
+    }
+
+
 @dataclass(frozen=True)
 class QueueResult:
     prompt_id: str
     number: int | None
     node_errors: dict
+
+
+@dataclass(frozen=True)
+class SavedWorkflowDocument:
+    """One immutable observation from ComfyUI's managed workflow library."""
+
+    source_path: str
+    sha256: str
+    size_bytes: int
+    workflow: dict
 
 
 @dataclass(frozen=True)
@@ -78,12 +174,14 @@ def default_comfyui_runtime_config() -> dict:
             schema_version=provider.driver_config_schema_version,
             size_bytes=provider.driver_config_size_bytes,
             sha256=provider.driver_config_sha256,
+            max_bytes=_stage_snapshot_max_bytes(),
         ).value
         deployment_config = verify_json_contract(
             deployment.runtime_config,
             schema_version=deployment.runtime_config_schema_version,
             size_bytes=deployment.runtime_config_size_bytes,
             sha256=deployment.runtime_config_sha256,
+            max_bytes=_stage_snapshot_max_bytes(),
         ).value
     except Exception as exc:
         raise ComfyUIError("默认 ComfyUI deployment 配置合同无效") from exc
@@ -93,8 +191,44 @@ def default_comfyui_runtime_config() -> dict:
     return config
 
 
+class _SecurityBoundaryInt:
+    def __init__(self, key: str):
+        self.key = key
+
+    def __get__(self, instance, owner) -> int:
+        return boundary_int(self.key)
+
+
 class ComfyUIClient:
     """Small API abstraction compatible with a local or remote ComfyUI server."""
+
+    SAVED_WORKFLOW_MAX_BYTES = _SecurityBoundaryInt(
+        "security.comfy.client.saved_graph_max_bytes",
+    )
+    SAVED_WORKFLOW_LIST_MAX_BYTES = _SecurityBoundaryInt(
+        "security.comfy.client.list_response_max_bytes",
+    )
+    SAVED_WORKFLOW_LIST_MAX_ITEMS = _SecurityBoundaryInt(
+        "security.comfy.client.list_max_items",
+    )
+    TEXT_OUTPUT_MAX_BYTES = _SecurityBoundaryInt(
+        "security.comfy.client.text_response_max_bytes",
+    )
+    OBJECT_INFO_MAX_BYTES = _SecurityBoundaryInt(
+        "security.comfy.client.object_info_max_bytes",
+    )
+    OBJECT_INFO_MAX_DEPTH = _SecurityBoundaryInt(
+        "security.comfy.client.object_info_max_depth",
+    )
+    OBJECT_INFO_MAX_VALUES = _SecurityBoundaryInt(
+        "security.comfy.client.object_info_max_entries",
+    )
+    MODEL_LIST_MAX_BYTES = _SecurityBoundaryInt(
+        "security.comfy.client.model_list_max_bytes",
+    )
+    MODEL_LIST_MAX_ITEMS = _SecurityBoundaryInt(
+        "security.comfy.client.model_list_max_items",
+    )
 
     def __init__(
         self,
@@ -103,6 +237,7 @@ class ComfyUIClient:
         session=None,
         *,
         endpoint_prevalidated: bool = False,
+        pre_submit_resource_release_policy: dict | None = None,
     ):
         database_config = default_comfyui_runtime_config() if base_url is None else {}
         self.base_url = str(base_url or database_config.get("base_url") or "").rstrip("/")
@@ -117,8 +252,29 @@ class ComfyUIClient:
                 pass
             if not is_loopback:
                 raise ComfyUIError("出于 SSRF 安全考虑，默认只允许 loopback ComfyUI；远程地址需显式授权")
-        self.timeout = timeout or float(database_config.get("timeout_seconds") or 30)
+        configured_timeout = (
+            timeout if timeout is not None else database_config.get("timeout_seconds")
+        )
+        timeout_ceiling = boundary_number(
+            "security.runtime.max_timeout_seconds",
+            minimum=0.001,
+        )
+        if (
+            isinstance(configured_timeout, bool)
+            or not isinstance(configured_timeout, (int, float))
+            or not math.isfinite(float(configured_timeout))
+            or not 0 < float(configured_timeout) <= timeout_ceiling
+        ):
+            raise ComfyUIError(
+                "ComfyUIClient 必须显式取得当前安全边界内的 timeout_seconds",
+            )
+        self.timeout = float(configured_timeout)
         self.session = session or requests.Session()
+        self.pre_submit_resource_release_policy = (
+            validate_pre_submit_resource_release_policy(
+                pre_submit_resource_release_policy,
+            )
+        )
 
     def _request(self, method: str, path: str, **kwargs):
         try:
@@ -126,6 +282,19 @@ class ComfyUIClient:
             response = self.session.request(method, f"{self.base_url}{path}", timeout=self.timeout, **kwargs)
             response.raise_for_status()
             return response
+        except requests.HTTPError as exc:
+            response = exc.response
+            status_code = int(getattr(response, "status_code", 0) or 0)
+            try:
+                detail = str(getattr(response, "text", "") or "").strip()
+            except Exception:
+                detail = ""
+            if not detail:
+                try:
+                    detail = str(response.json()) if response is not None else ""
+                except Exception:
+                    detail = ""
+            raise ComfyUIHTTPError(status_code, detail[:4000] or "request rejected") from exc
         except requests.RequestException as exc:
             raise ComfyUIError(f"ComfyUI 请求失败: {exc}") from exc
 
@@ -133,7 +302,21 @@ class ComfyUIClient:
         return self._request("GET", "/system_stats").json()
 
     def object_info(self) -> dict:
-        return self._request("GET", "/object_info").json()
+        response = self._request("GET", "/object_info", stream=True)
+        value, _payload = self._bounded_json_response(
+            response,
+            max_bytes=self.OBJECT_INFO_MAX_BYTES,
+            label="object_info",
+        )
+        if not isinstance(value, dict):
+            raise ComfyUIError("ComfyUI object_info 顶层必须是对象")
+        self._assert_bounded_json_structure(
+            value,
+            max_depth=self.OBJECT_INFO_MAX_DEPTH,
+            max_values=self.OBJECT_INFO_MAX_VALUES,
+            label="object_info",
+        )
+        return value
 
     def features(self) -> dict:
         return self._request("GET", "/features").json()
@@ -141,8 +324,173 @@ class ComfyUIClient:
     def models(self, folder: str) -> list[str]:
         if folder not in {"checkpoints", "diffusion_models", "text_encoders", "vae", "loras"}:
             raise ComfyUIError("不支持的模型目录")
-        data = self._request("GET", f"/models/{folder}").json()
-        return data if isinstance(data, list) else []
+        response = self._request("GET", f"/models/{folder}", stream=True)
+        data, _payload = self._bounded_json_response(
+            response,
+            max_bytes=self.MODEL_LIST_MAX_BYTES,
+            label=f"models/{folder}",
+        )
+        if not isinstance(data, list) or len(data) > self.MODEL_LIST_MAX_ITEMS:
+            raise ComfyUIError("ComfyUI models 库存列表合同无效")
+        from studio.services.comfyui_artifacts import safe_model_relative_filename
+
+        values = set()
+        for item in data:
+            if not isinstance(item, str):
+                raise ComfyUIError("ComfyUI models 库存含非字符串文件名")
+            normalized = safe_model_relative_filename(item)
+            if normalized is not None:
+                values.add(normalized)
+        return sorted(values, key=lambda item: (item.casefold(), item))
+
+    @staticmethod
+    def _saved_workflow_path(value: str) -> str:
+        raw = unicodedata.normalize("NFC", str(value or "").strip())
+        if (
+            not raw
+            or len(raw) > 500
+            or "\\" in raw
+            or ":" in raw
+            or raw.startswith("/")
+            or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+        ):
+            raise ComfyUIError("ComfyUI workflow source_path 无效")
+        parts = raw.split("/")
+        if (
+            not parts
+            or any(part in {"", ".."} or len(part) > 255 for part in parts)
+            or parts[0].casefold() == "workflows"
+        ):
+            raise ComfyUIError("ComfyUI workflow source_path 越过已配置扫描目录")
+        normalized = str(PurePosixPath(*parts))
+        if not normalized.casefold().endswith(".json"):
+            raise ComfyUIError("ComfyUI workflow source_path 必须是 JSON 文件")
+        return normalized
+
+    @staticmethod
+    def _bounded_json_response(
+        response,
+        *,
+        max_bytes: int,
+        label: str = "userdata",
+    ):
+        content_type = str((getattr(response, "headers", {}) or {}).get("Content-Type") or "")
+        if content_type and "json" not in content_type.casefold():
+            raise ComfyUIError(f"ComfyUI {label} 响应不是 JSON")
+        length_header = str((getattr(response, "headers", {}) or {}).get("Content-Length") or "").strip()
+        if length_header:
+            try:
+                length = int(length_header)
+                if length < 0:
+                    raise ValueError
+                if length > max_bytes:
+                    raise ComfyUIError(f"ComfyUI {label} 响应超过大小上限")
+            except ValueError as exc:
+                raise ComfyUIError(f"ComfyUI {label} Content-Length 无效") from exc
+        payload = bytearray()
+        iterator = getattr(response, "iter_content", None)
+        chunks = iterator(chunk_size=64 * 1024) if callable(iterator) else (getattr(response, "content", b""),)
+        for chunk in chunks:
+            if not chunk:
+                continue
+            payload.extend(chunk)
+            if len(payload) > max_bytes:
+                raise ComfyUIError(f"ComfyUI {label} 响应超过大小上限")
+        try:
+            value = json.loads(bytes(payload).decode("utf-8"))
+        except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+            raise ComfyUIError(f"ComfyUI {label} JSON 无效") from exc
+        return value, bytes(payload)
+
+    @staticmethod
+    def _assert_bounded_json_structure(
+        value,
+        *,
+        max_depth: int,
+        max_values: int,
+        label: str,
+    ) -> None:
+        stack = [(value, 1)]
+        observed = 0
+        while stack:
+            child, depth = stack.pop()
+            observed += 1
+            if observed > max_values:
+                raise ComfyUIError(f"ComfyUI {label} JSON 成员数超过上限")
+            if depth > max_depth:
+                raise ComfyUIError(f"ComfyUI {label} JSON 嵌套深度超过上限")
+            if isinstance(child, dict):
+                stack.extend((item, depth + 1) for item in child.values())
+            elif isinstance(child, list):
+                stack.extend((item, depth + 1) for item in child)
+
+    def list_saved_workflows(self, directory: str) -> list[str]:
+        """List JSON files relative to one validated ComfyUI userdata directory."""
+
+        from studio.services.comfyui_workflow_library import (
+            SavedWorkflowDirectoryError,
+            normalize_saved_workflow_directory,
+        )
+
+        try:
+            normalized_directory = normalize_saved_workflow_directory(directory)
+        except SavedWorkflowDirectoryError as exc:
+            raise ComfyUIError(str(exc)) from exc
+
+        response = self._request(
+            "GET",
+            "/api/userdata",
+            params={
+                "dir": normalized_directory,
+                "recurse": "true",
+                "split": "false",
+            },
+            stream=True,
+        )
+        value, _payload = self._bounded_json_response(
+            response, max_bytes=self.SAVED_WORKFLOW_LIST_MAX_BYTES,
+        )
+        if not isinstance(value, list) or len(value) > self.SAVED_WORKFLOW_LIST_MAX_ITEMS:
+            raise ComfyUIError("ComfyUI workflow library 列表合同无效")
+        paths = []
+        for item in value:
+            if not isinstance(item, str):
+                raise ComfyUIError("ComfyUI workflow library 列表含非字符串路径")
+            paths.append(self._saved_workflow_path(item))
+        return sorted(set(paths), key=lambda item: (item.casefold(), item))
+
+    def read_saved_workflow(
+        self,
+        source_path: str,
+        directory: str,
+    ) -> SavedWorkflowDocument:
+        """Read one configured-root workflow and bind it to its raw byte hash."""
+
+        from studio.services.comfyui_workflow_library import (
+            SavedWorkflowDirectoryError,
+            normalize_saved_workflow_directory,
+        )
+
+        normalized = self._saved_workflow_path(source_path)
+        try:
+            normalized_directory = normalize_saved_workflow_directory(directory)
+        except SavedWorkflowDirectoryError as exc:
+            raise ComfyUIError(str(exc)) from exc
+        encoded_path = quote(f"{normalized_directory}/{normalized}", safe="")
+        response = self._request("GET", f"/userdata/{encoded_path}", stream=True)
+        workflow, payload = self._bounded_json_response(
+            response, max_bytes=self.SAVED_WORKFLOW_MAX_BYTES,
+        )
+        from studio.services.comfyui_canvas import is_comfyui_ui_workflow
+
+        if not isinstance(workflow, dict) or not is_comfyui_ui_workflow(workflow):
+            raise ComfyUIError("ComfyUI userdata 文件不是受支持的 UI workflow canvas")
+        return SavedWorkflowDocument(
+            source_path=normalized,
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size_bytes=len(payload),
+            workflow=workflow,
+        )
 
     def open_progress_socket(self, client_id: str, *, timeout: float = 0.1):
         """Open ComfyUI's documented low-level progress WebSocket."""
@@ -313,12 +661,6 @@ class ComfyUIClient:
                 prompt_id=str(prompt_id),
             )
 
-    @classmethod
-    def read_progress_socket(cls, progress_socket, prompt_id: str, *, timeout: float = 0.05) -> float | None:
-        """Backward-compatible fraction-only wrapper for older callers."""
-        observation = cls.read_progress_event(progress_socket, prompt_id, timeout=timeout)
-        return observation.fraction if observation is not None else None
-
     def save_autoprompt_workflow(self, workflow: dict, *, filename: str) -> dict:
         """Persist an importable UI canvas in ComfyUI's user workflow library.
 
@@ -331,7 +673,7 @@ class ComfyUIClient:
         if not re.fullmatch(r"autoprompt-task-[0-9a-f-]{36}-comfyui-ui\.json", filename):
             raise ComfyUIError("ComfyUI 工作流文件名不符合平台固定格式")
         payload = json.dumps(workflow, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        if len(payload) > 5 * 1024 * 1024:
+        if len(payload) > self.SAVED_WORKFLOW_MAX_BYTES:
             raise ComfyUIError("ComfyUI UI 画布超过 5 MiB 同步上限")
         relative_path = f"workflows/autoprompt/{filename}"
         encoded_path = quote(relative_path, safe="")
@@ -371,10 +713,6 @@ class ComfyUIClient:
             raise ComfyUIError(f"ComfyUI 上传参考输入失败: {response}")
         return response
 
-    def upload_image(self, path: str | Path, *, subfolder: str, filename: str | None = None) -> dict:
-        """Backward-compatible alias for older callers/tests."""
-        return self.upload_input_file(path, subfolder=subfolder, filename=filename)
-
     def queue_prompt(
         self, workflow: dict, client_id: str | None = None, prompt_id: str | None = None,
     ) -> QueueResult:
@@ -391,6 +729,83 @@ class ComfyUIClient:
         if not returned_prompt_id:
             raise ComfyUIError(f"ComfyUI 未返回 prompt_id: {data}")
         return QueueResult(returned_prompt_id, data.get("number"), data.get("node_errors", {}))
+
+    def release_resources_before_submit(self) -> dict | None:
+        """Run one configured global release immediately before a new submit.
+
+        This method never calls ``/prompt``.  It is safe only with the
+        database-backed single media-worker gate; a wider concurrency setting
+        fails before touching ComfyUI so one submit cannot unload another.
+        """
+
+        policy = self.pre_submit_resource_release_policy
+        if not policy or not policy["enabled"]:
+            return None
+        from studio.services.json_contracts import json_contract
+
+        attempted_at = timezone.now()
+        policy_sha256 = json_contract(
+            policy,
+            max_bytes=_stage_snapshot_max_bytes(),
+        ).sha256
+
+        def audit(*, status: str, code: str = "", http_status: int | None = None) -> dict:
+            return {
+                "schema_version": 1,
+                "status": status,
+                "policy_sha256": policy_sha256,
+                "unload_models": policy["unload_models"],
+                "free_memory": policy["free_memory"],
+                "attempted_at": attempted_at.isoformat(),
+                "completed_at": timezone.now().isoformat(),
+                "error_code": code,
+                "http_status": http_status,
+            }
+
+        if int(settings.TASK_MAX_CONCURRENT) != 1:
+            result = audit(
+                status="failed",
+                code="comfyui_resource_release_exclusive_worker_required",
+            )
+            raise ComfyUIPreSubmitResourceReleaseError(
+                result["error_code"],
+                "全局显存释放要求 TASK_MAX_CONCURRENT=1；未调用 ComfyUI /free 或 /prompt",
+                audit=result,
+            )
+        try:
+            response = self._request(
+                "POST",
+                "/free",
+                json={
+                    "unload_models": policy["unload_models"],
+                    "free_memory": policy["free_memory"],
+                },
+            )
+        except ComfyUIHTTPError as exc:
+            result = audit(
+                status="failed",
+                code="comfyui_resource_release_rejected",
+                http_status=exc.status_code,
+            )
+            raise ComfyUIPreSubmitResourceReleaseError(
+                result["error_code"],
+                "ComfyUI 明确拒绝提交前资源释放；未调用 /prompt",
+                audit=result,
+            ) from exc
+        except ComfyUIError as exc:
+            result = audit(
+                status="failed",
+                code="comfyui_resource_release_unconfirmed",
+            )
+            raise ComfyUIPreSubmitResourceReleaseError(
+                result["error_code"],
+                "无法确认 ComfyUI 提交前资源释放；未调用 /prompt",
+                audit=result,
+            ) from exc
+        return audit(
+            status="succeeded",
+            http_status=int(getattr(response, "status_code", 200) or 200),
+        )
 
     def history(self, prompt_id: str) -> dict | None:
         data = self._request("GET", f"/history/{prompt_id}").json()
@@ -412,7 +827,35 @@ class ComfyUIClient:
                     return True
         return False
 
-    def wait_for_completion(self, prompt_id: str, timeout: float = 900, poll_interval: float = 1.0) -> dict:
+    def wait_for_completion(
+        self,
+        prompt_id: str,
+        *,
+        timeout: float,
+        poll_interval: float,
+    ) -> dict:
+        timeout_ceiling = boundary_number(
+            "security.runtime.max_timeout_seconds",
+            minimum=0.001,
+        )
+        interval_ceiling = boundary_number(
+            "security.runtime.max_interval_seconds",
+            minimum=0.001,
+        )
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not math.isfinite(float(timeout))
+            or not 0 < float(timeout) <= timeout_ceiling
+        ):
+            raise ComfyUIError("wait_for_completion.timeout 必须是安全边界内的有限正数")
+        if (
+            isinstance(poll_interval, bool)
+            or not isinstance(poll_interval, (int, float))
+            or not math.isfinite(float(poll_interval))
+            or not 0 < float(poll_interval) <= interval_ceiling
+        ):
+            raise ComfyUIError("wait_for_completion.poll_interval 必须是安全边界内的有限正数")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             history = self.history(prompt_id)
@@ -424,13 +867,42 @@ class ComfyUIClient:
                         f"ComfyUI 执行失败: {messages}", remote_status=status,
                     )
                 return history
-            time.sleep(max(0.1, poll_interval))
+            time.sleep(float(poll_interval))
         raise ComfyUITimeout(f"等待 ComfyUI 任务 {prompt_id} 超时")
 
     @staticmethod
     def extract_outputs(history: dict) -> list[dict]:
         found = []
         for node_id, node_outputs in (history.get("outputs") or {}).items():
+            if not isinstance(node_outputs, dict):
+                continue
+            text_values: list[str] = []
+            text_contract_present = False
+            for key in ("text", "strings"):
+                if key not in node_outputs:
+                    continue
+                text_contract_present = True
+                value = node_outputs.get(key)
+                if isinstance(value, str):
+                    text_values.append(value)
+                elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+                    text_values.extend(value)
+                else:
+                    raise ComfyUIError("ComfyUI text 输出合同无效")
+            if text_contract_present:
+                text = "\n".join(text_values).strip()
+                payload = text.encode("utf-8")
+                if not payload:
+                    raise ComfyUIError("ComfyUI text 输出为空")
+                if len(payload) > ComfyUIClient.TEXT_OUTPUT_MAX_BYTES:
+                    raise ComfyUIError("ComfyUI text 输出超过 64 KiB 上限")
+                found.append({
+                    "node_id": str(node_id),
+                    "kind": "text",
+                    "text": text,
+                    "size_bytes": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                })
             for kind in ("images", "gifs", "videos", "audio"):
                 for item in node_outputs.get(kind, []) or []:
                     if isinstance(item, dict):

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- No HTTP connections or real media. Only loopback Vite HMR may use WebSocket. -->
+  <meta http-equiv="Content-Security-Policy" content="connect-src ws://127.0.0.1:* ws://localhost:*; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src data:; media-src data:; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>素材引用任务导航 · 隔离夹具</title>
+  <style>
+    .fixture-shell{max-width:1180px;margin:20px auto;padding:12px;min-width:0}
+    .fixture-shell h1{font-size:22px}.fixture-shell p{line-height:1.6;overflow-wrap:anywhere}
+    .fixture-choices{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+    .fixture-choices button{min-height:40px;white-space:normal;text-align:left}
+    .fixture-choices [aria-pressed=true]{outline:2px solid var(--accent);outline-offset:2px}
+    .fixture-query{white-space:pre-wrap;overflow-wrap:anywhere;min-width:0;padding:12px}
+    @media(max-width:480px){.fixture-shell{margin:0 auto;padding:10px}.fixture-choices{display:grid;grid-template-columns:minmax(0,1fr)}}
+  </style>
+</head>
+<body><div id="app"></div><script type="module" src="./asset-reference-task-navigation.ts"></script></body>
+</html>

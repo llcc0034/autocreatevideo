@@ -386,22 +386,19 @@ class PromptNormalizationChatOptionsMigrationTests(_MigrationTestCase):
             for row in Recipe.objects.all()
         }
 
-        from studio.models import ModelDeployment as RuntimeDeployment
-        from studio.services.async_media_contract import deployment_target_sha256
-
-        runtime_deployment = RuntimeDeployment.objects.get(
-            pk=self.deployments["deepseek-visual-rules-v7-prod"]["id"],
-        )
+        deployment_id = self.deployments["deepseek-visual-rules-v7-prod"]["id"]
         operations = ["prompt.normalize"]
         evidence = {"schema_version": 1, "execution_submitted": True}
         operation_size, operation_sha = self._contract(operations)
         evidence_size, evidence_sha = self._contract(evidence)
-        self.old_smoke_target_sha256 = deployment_target_sha256(runtime_deployment)
+        # Stored historical evidence, not a current-runtime smoke fixture.
+        # The migration must preserve its bytes without reinterpreting them.
+        self.old_smoke_target_sha256 = "c" * 64
         previous = Snapshot.objects.filter(
-            deployment_id=runtime_deployment.id,
+            deployment_id=deployment_id,
         ).order_by("-revision").first()
         old_smoke = Snapshot.objects.create(
-            deployment_id=runtime_deployment.id,
+            deployment_id=deployment_id,
             revision=(previous.revision + 1) if previous else 1,
             probe_kind="smoke",
             status="passed",
@@ -532,12 +529,10 @@ class PromptNormalizationChatOptionsMigrationTests(_MigrationTestCase):
         self.assertEqual(old_smoke.target_sha256, self.old_smoke_target_sha256)
 
         from studio.models import ModelDeployment
-        from studio.services.async_media_contract import fresh_smoke_snapshot
 
         current = ModelDeployment.objects.get(
             pk=self.deployments["deepseek-visual-rules-v7-prod"]["id"],
         )
-        self.assertIsNone(fresh_smoke_snapshot(current, "prompt.normalize"))
 
     def test_v10_historical_snapshot_keeps_one_successor_binding_closure(self):
         Deployment = self.apps.get_model("studio", "ModelDeployment")

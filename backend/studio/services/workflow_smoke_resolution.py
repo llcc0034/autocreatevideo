@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from decimal import Decimal
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
@@ -98,10 +99,19 @@ def resolve_workflow_smoke_attempt(
         raise ValidationError({
             "provider_request_id": "确认远端终态必须提供或复用冻结 request id",
         })
-    elif effective_request_id != str(attempt.submission_token):
-        raise ValidationError({
-            "provider_request_id": "provider request id 不属于该 workflow smoke attempt",
-        })
+    from studio.models import ExecutionPreparation
+    from studio.services.execution_smoke_evidence import read_prepared_smoke_context
+    try:
+        prep = ExecutionPreparation.objects.select_for_update().get(workflow_smoke=attempt)
+    except ExecutionPreparation.DoesNotExist as exc:
+        raise ValidationError("烟测缺少原始执行准备，不能人工消歧") from exc
+    detail, identity = read_prepared_smoke_context(attempt, prep)
+    expected_token = detail.prepared_request["transport"]["idempotency_key"]
+    prepared_identity = {"scope": attempt.scope, "preparation_id": str(prep.pk),
+        "execution_instance_version_id": identity.version_id,
+        "prepared_request_sha256": prep.request_sha256, "definition_sha256": identity.definition_sha256}
+    if effective_request_id and effective_request_id != expected_token:
+        raise ValidationError({"provider_request_id": "provider request id 不属于该次冻结请求的 submission token"})
 
     request_hash = (
         hashlib.sha256(effective_request_id.encode("utf-8")).hexdigest()
@@ -134,6 +144,7 @@ def resolve_workflow_smoke_attempt(
         "provider_request_id_sha256": request_hash,
         "outcome": outcome,
         "resolved_at": timezone.now().isoformat(),
+        **prepared_identity,
     }
     contract = json_contract(
         evidence,
@@ -152,4 +163,9 @@ def resolve_workflow_smoke_attempt(
         note=normalized_note,
         decided_by=user,
     )
+    if outcome == WorkflowSmokeAttemptResolution.Outcome.CONFIRMED_NOT_SUBMITTED:
+        # This is an explicit operator conclusion, not an estimated settlement.
+        # The original uncertain result is retained, while its held cost is zero.
+        attempt.actual_cost = Decimal("0")
+        attempt.save(update_fields=("actual_cost", "updated_at"))
     return resolution, True

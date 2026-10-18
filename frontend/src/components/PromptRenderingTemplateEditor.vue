@@ -6,6 +6,7 @@ const props = defineProps<{ item: ReferenceRenderingOption; modelValue: string; 
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 const textarea = ref<HTMLTextAreaElement | null>(null)
 const id = useId()
+defineExpose({ focus: () => { textarea.value?.scrollIntoView({ block: 'center' }); textarea.value?.focus() } })
 const insert = async (token: string) => {
   if (props.disabled || !props.item.placeholders.includes(token)) return
   const target = textarea.value
@@ -24,6 +25,7 @@ const insert = async (token: string) => {
     <label :id="`${id}-label`" :for="`${id}-template`">{{ item.label }} <small>{{ item.key }}</small></label>
     <p>{{ item.description }}</p>
     <p class="requirement">{{ item.requirement }}</p>
+    <slot name="usage" />
     <textarea :id="`${id}-template`" ref="textarea" :value="modelValue" :disabled="disabled" rows="3" :aria-describedby="`${id}-hint`" @input="emit('update:modelValue', ($event.target as HTMLTextAreaElement).value)" />
     <p :id="`${id}-hint`">写普通句子，点击下方按钮在光标处插入动态内容。只修改括号外的文字，不要翻译或改写括号内的英文标识。</p>
     <div class="rendering-placeholders" v-if="item.placeholders.length">

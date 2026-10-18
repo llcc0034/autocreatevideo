@@ -1,3 +1,4 @@
+from studio.models import FieldDefinitionVersion
 import re
 
 from django.conf import settings
@@ -5,6 +6,433 @@ from django.test import SimpleTestCase
 from drf_spectacular.generators import SchemaGenerator
 
 class OpenApiEnumNamingTests(SimpleTestCase):
+    def test_video_catalog_is_separate_from_production_configuration(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        models = schema["components"]["schemas"]
+        production = models["ProductionCapability"]
+        for key in ("conditioning_modes", "conditioning_contract_sha256"):
+            self.assertNotIn(key, production["properties"])
+            self.assertNotIn(key, production["required"])
+        self.assertEqual(set(models["VideoConditioningCapability"]["required"]),
+            {"conditioning_modes", "conditioning_contract_sha256"})
+        operation = schema["paths"]["/api/v1/capabilities/video-conditioning/"]["get"]
+        self.assertEqual(set(operation["responses"]), {"200", "409"})
+
+    def test_shot_crud_exposes_explicit_roles_without_the_mixed_character_pool(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        models = schema["components"]["schemas"]
+        for name in ("Shot", "ShotRequest", "PatchedShotRequest"):
+            for field in ("narrative", "detailed_description", "camera", "action", "sound_effects", "music", "continuity_notes"):
+                self.assertNotIn(field, models[name]["properties"])
+            self.assertNotIn("characters",models[name]["properties"])
+            self.assertNotIn("reference_bindings", models[name]["properties"])
+            self.assertNotIn("reference_assets", models[name]["properties"])
+            self.assertEqual(models[name]["properties"]["character_relations"]["type"],"array")
+        for retired in ("ReferenceBindingsSchema", "ReferenceBindingsSchemaRequest",
+                "ReferenceEntityBindingSchema", "ReferenceEntityBindingSchemaRequest"):
+            self.assertNotIn(retired, models)
+        for name in ("ShotCharacterRelationValue", "ShotCharacterRelationValueRequest"):
+            self.assertEqual(set(models[name]["required"]),{"role","position","character_id"})
+        self.assertEqual(models["ShotCharacterRelationValueRoleEnum"]["enum"],["visible","speaker"])
+
+    def test_single_shot_selection_keeps_original_command_payload_and_separate_read_baseline(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        models = schema["components"]["schemas"]
+        query = schema["paths"]["/api/v1/production-runs/{id}/manual-shot-references/"]["get"]
+        self.assertEqual({row["name"] for row in query["parameters"] if row.get("required")}, {"id", "shot_id"})
+        self.assertEqual(query["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ManualShotReferenceDetail")
+        command = models["ProductionManualActionInputRequest"]
+        self.assertIn("payload", command["required"])
+        self.assertIn("storyboard_review/select", command["properties"]["payload"]["description"])
+        action_enum = command["properties"]["action"]["$ref"].split("/")[-1]
+        self.assertIn("select", models[action_enum]["enum"])
+        self.assertIn("editability", models["ManualShotReferenceDetail"]["required"])
+
+    def test_material_fulfillment_gateway_pins_requirement_and_returns_only_original_selection(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths, models = schema["paths"], schema["components"]["schemas"]
+        context = paths["/api/v1/production-runs/{id}/material-fulfillment-context/"]["get"]
+        self.assertEqual({row["name"] for row in context["parameters"] if row.get("required")},
+            {"id", "stage_run_id", "unit_key"})
+        action = paths["/api/v1/production-runs/{id}/fulfill-material/"]["post"]
+        self.assertEqual(set(action["responses"]), {"200", "201", "400", "403", "404"})
+        body = models["RecipeMaterialFulfillmentInputRequest"]
+        self.assertEqual(set(body["required"]), {"stage_run_id", "unit_key", "requirement_key",
+            "expected_run_plan_sha256"})
+        self.assertEqual(body["properties"]["reference_version_id"]["format"], "uuid")
+        self.assertIn("互斥", body["properties"]["reference_version_id"]["description"])
+        self.assertEqual(body["properties"]["source"]["$ref"], "#/components/schemas/AssetReferenceInputSourceEnum")
+        source_mode = models["RecipeMaterialFulfillmentContext"]["properties"]["source_mode"]["$ref"].split("/")[-1]
+        self.assertEqual(models[source_mode]["enum"], ["generate", "existing", "upload"])
+        self.assertIn("source_mode", models["RecipeMaterialFulfillmentContext"]["required"])
+        self.assertIn("material_source_options", models["ProductionRecipeEditorOptions"]["required"])
+        self.assertIn("material_selection_options", models["ProductionRecipeEditorOptions"]["required"])
+        result = models["RecipeMaterialFulfillmentReceipt"]["properties"]
+        self.assertEqual(result["selected_by_id"]["type"], "integer")
+        self.assertTrue(result["selected_by_id"]["nullable"])
+        mode = result["selection_mode"]["$ref"].split("/")[-1]
+        self.assertEqual(models[mode]["enum"], ["manual", "automatic"])
+        self.assertEqual(set(result), {"id", "reference_version_id", "series_id", "asset_id", "source",
+            "target_sha256", "selection_mode", "selected_by_id", "created_at"})
+
+    def test_material_selection_context_and_observed_decision_extend_original_selection(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths, models = schema["paths"], schema["components"]["schemas"]
+        context = paths["/api/v1/production-runs/{id}/material-selection-context/"]["get"]
+        self.assertTrue(next(row for row in context["parameters"] if row["name"] == "artifact_id")["required"])
+        select = paths["/api/v1/production-runs/{id}/select-artifact/"]["post"]
+        self.assertIn("409", select["responses"])
+        key = next(row for row in select["parameters"] if row["name"] == "Idempotency-Key")
+        self.assertEqual((key["in"], key["required"]), ("header", True))
+        self.assertEqual(select["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ProductionManualActionResult")
+        self.assertIn("material_selection", models["SelectArtifactInputRequest"]["properties"])
+        baseline = models["RecipeMaterialSelectionInputRequest"]
+        self.assertEqual(baseline["required"], ["expected_decision_id"])
+        self.assertTrue(baseline["properties"]["expected_decision_id"]["nullable"])
+        self.assertEqual(models["RecipeMaterialDependency"]["properties"]["status"]["$ref"],
+            "#/components/schemas/ExecutionPreparationStatusEnum")
+
+    def test_role_route_choices_reuse_appearance_enum_and_expose_separate_stage_fact(self):
+        components = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        request = components["SelectRouteInputRequest"]
+        self.assertEqual(request["properties"]["appearance_role"]["default"], "primary")
+        self.assertEqual(request["properties"]["appearance_role"]["allOf"],
+            [{"$ref": "#/components/schemas/AppearanceRoleEnum"}])
+        self.assertEqual(set(request["required"]), {"stage_key", "route_index"})
+        stage = components["StageRun"]
+        for name in ("selected_route_index", "selected_variant_route_index"):
+            self.assertTrue(stage["properties"][name]["readOnly"])
+            self.assertTrue(stage["properties"][name]["nullable"])
+            self.assertIn(name, stage["required"])
+
+    def test_consistency_actions_describe_snapshots_and_lock_lists_not_project_writes(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths, models = schema["paths"], schema["components"]["schemas"]
+        continuity = paths["/api/v1/projects/{id}/continuity/"]["get"]
+        sync = paths["/api/v1/projects/{id}/sync-locks/"]["post"]
+        self.assertNotIn("requestBody", sync)
+        self.assertNotIn("requestBody", continuity)
+        self.assertEqual([item["name"] for item in sync["parameters"]], ["id"])
+        self.assertEqual(continuity["responses"]["200"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/ConsistencySnapshot")
+        response = sync["responses"]["200"]["content"]["application/json"]["schema"]
+        self.assertEqual(response, {"type": "array", "items": {"$ref": "#/components/schemas/ConsistencyLock"}})
+        for endpoint in (continuity, sync):
+            self.assertIn("409", endpoint["responses"])
+        for kind in ("Character", "Scene", "Prop"):
+            fields = models[f"Consistency{kind}Snapshot"]["properties"]
+            self.assertNotIn("visual_identity", fields)
+            self.assertTrue(fields["primary_setting"]["nullable"])
+        self.assertEqual(set(models["ConsistencyPrimarySetting"]["properties"]), {
+            "appearance_id", "setting_revision_id", "revision", "content_sha256", "identity_anchor", "appearance_anchor"})
+
+    def test_asset_reference_contract_keeps_associations_separate_from_generated_origins(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths, models = schema["paths"], schema["components"]["schemas"]
+        series, versions = "/api/v1/asset-reference-series/", "/api/v1/asset-reference-versions/"
+        self.assertEqual(set(paths[series]), {"get", "post"})
+        self.assertEqual(set(paths[series + "{id}/"]), {"get", "patch", "delete"})
+        self.assertEqual(set(paths[versions + "{id}/"]), {"get", "delete"})
+        self.assertEqual(set(paths[series + "{id}/bible-options/"]), {"get"})
+        for root in (series, versions):
+            self.assertEqual(set(paths[root + "{id}/removal-impact/"]), {"get"})
+        self.assertEqual(set(models["AssetReferenceRemovalImpact"]["properties"]),
+            {"target_type", "id", "name", "version_count", "asset_count", "variant_count", "dependent_version_count", "production_use_count", "can_remove"})
+        query = {item["name"]: item for item in paths[series]["get"]["parameters"]}
+        self.assertEqual(set(query["media_type"]["schema"]["enum"]), {"image", "video", "audio"})
+        self.assertEqual(query["bible_linked"]["schema"]["type"], "boolean")
+        self.assertEqual(query["asset_id"]["schema"]["format"], "uuid")
+        self.assertEqual(set(models["AssetReferenceVersionCreateRequest"]["properties"]),
+            {"series_id", "asset_id", "source", "setting_revision_id"})
+        source_ref = models["AssetReferenceVersionCreateRequest"]["properties"]["source"]["$ref"].split("/")[-1]
+        self.assertEqual(set(models[source_ref]["enum"]), {"upload", "existing"})
+        series_ref = models["AssetReferenceSeriesCreateRequest"]["properties"]["role"]["$ref"]
+        self.assertEqual(series_ref, "#/components/schemas/AppearanceRoleEnum")
+        self.assertEqual(set(models["PatchedAssetReferenceSeriesInputRequest"]["properties"]),
+            {"name", "primary_series_id", "bible_variant_id"})
+        self.assertTrue(next(p for p in paths[versions]["get"]["parameters"] if p["name"] == "series_id")["required"])
+        self.assertEqual(set(models["AssetReferenceAssetSummary"]["properties"]),
+            {"id", "name", "kind", "mime_type", "is_active"})
+        self.assertIn("200", paths[versions]["post"]["responses"])
+        self.assertIn("201", paths[versions]["post"]["responses"])
+
+    def test_artifact_selection_reports_automatic_mode_without_human_actor(self):
+        components = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        properties = components["ArtifactSelectionDecision"]["properties"]
+        self.assertTrue(properties["selected_by"]["nullable"])
+        self.assertTrue(properties["selection_mode"]["readOnly"])
+        self.assertEqual(set(components["SelectionModeEnum"]["enum"]), {"manual", "automatic"})
+
+    def test_business_output_requires_shared_structure_without_inline_schema(self):
+        components = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        self.assertIn("data_structure_version", components["OutputWriteRequest"]["required"])
+        self.assertEqual(components["OutputWriteRequest"]["properties"]["data_structure_version"]["format"], "uuid")
+        self.assertNotIn("json_schema", components["OutputWriteRequest"]["properties"])
+        self.assertNotIn("parser_contract", components["BusinessOutputList"]["properties"])
+        self.assertNotIn("nodes", components["BusinessOutputList"]["properties"])
+        self.assertTrue(components["BusinessOutput"]["properties"]["data_structure_version"]["readOnly"])
+
+    def test_content_source_requires_structure_and_separates_summary_from_verified_detail(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        components = schema["components"]["schemas"]
+        self.assertIn("data_structure_version", components["SourceWriteRequest"]["required"])
+        self.assertEqual(components["SourceWriteRequest"]["properties"]["data_structure_version"]["format"], "uuid")
+        self.assertNotIn("reader", components["ContentSourceSummary"]["properties"])
+        self.assertNotIn("description", components["ContentSourceSummary"]["properties"])
+        self.assertIn("reader", components["ContentSourceVersion"]["properties"])
+        self.assertTrue(components["ContentSourceVersion"]["properties"]["data_structure_version"]["readOnly"])
+        self.assertNotIn("json_schema", components["SourceWriteRequest"]["properties"])
+
+    def test_structure_contract_is_one_summary_detail_and_read_only_projection(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        root = "/api/v1/data-structure-versions/"
+        self.assertEqual(set(schema["paths"][root]), {"get", "post"})
+        self.assertEqual(set(schema["paths"][root + "{id}/"]), {"get", "put", "patch"})
+        self.assertEqual(set(schema["paths"][root + "{id}/schema-preview/"]), {"get"})
+        self.assertEqual(set(schema["paths"][root + "authoring-options/"]), {"get"})
+        self.assertEqual(set(schema["paths"][root + "mapping-options/"]), {"get"})
+        components = schema["components"]["schemas"]
+        self.assertEqual(set(components["StructureMappingAuthoringOptions"]["properties"]), {"schema_version", "nodes", "scopes"})
+        authoring = schema["paths"][root + "authoring-options/"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        self.assertEqual(authoring, {"$ref": "#/components/schemas/DataStructureAuthoringOptions"})
+        self.assertEqual(set(components["DataStructureAuthoringOptions"]["properties"]), {"node_defaults", "statuses", "constraint_schemas", "value_schemas"})
+        summary = components["DataStructureSummary"]["properties"]
+        self.assertNotIn("nodes", summary)
+        self.assertNotIn("description", summary)
+        request = components["DataStructureVersionRequest"]["properties"]
+        self.assertEqual(set(request), {"name", "description", "nodes", "source_version"})
+        self.assertEqual(set(components["DataStructurePreview"]["properties"]), {"valid", "json_schema", "errors"})
+
+    def test_field_enum_override_resolves_the_definition_version_model(self):
+        from django.utils.module_loading import import_string
+        from studio.models import FieldDefinition
+
+        path = settings.SPECTACULAR_SETTINGS["ENUM_NAME_OVERRIDES"]["FieldDefinitionValueTypeEnum"]
+        self.assertEqual(path, "studio.models.FieldDefinitionVersion.ValueType")
+        owner_path, member = path.rsplit(".", 1)
+        self.assertEqual(getattr(import_string(owner_path), member), FieldDefinitionVersion.ValueType)
+        schemas = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        self.assertEqual(schemas["FieldDefinitionValueTypeEnum"]["enum"], list(FieldDefinitionVersion.ValueType.values))
+        self.assertNotIn("value_type", schemas["FieldDefinition"]["properties"])
+
+    def test_bible_variant_contract_separates_summary_detail_revision_and_explicit_review(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        root = "/api/v1/bible-variants/"
+        self.assertEqual(set(schema["paths"][root]), {"get", "post"})
+        self.assertEqual(set(schema["paths"][root + "{id}/"]), {"get"})
+        for action in ("review", "revise"):
+            path = schema["paths"][root + "{id}/" + action + "/"]
+            self.assertEqual(set(path), {"post"})
+            self.assertTrue({"200", "400", "404", "409"} <= set(path["post"]["responses"]))
+        self.assertEqual(set(schema["paths"][root + "{id}/revisions/"]), {"get"})
+        source = schema["paths"][root + "{id}/source/"]
+        self.assertEqual(set(source), {"get"})
+        self.assertTrue({"200", "400", "404", "409"} <= set(source["get"]["responses"]))
+        revision = next(row for row in source["get"]["parameters"] if row["name"] == "revision")
+        self.assertTrue(revision["required"])
+        self.assertEqual(revision["schema"]["minimum"], 1)
+        components = schema["components"]["schemas"]
+        self.assertNotIn("appearance_anchor", components["BibleVariantSummary"]["properties"])
+        self.assertIn("setting", components["BibleVariantDetail"]["properties"])
+        fields = components["BibleVariantReviewInputRequest"]["properties"]
+        self.assertEqual(set(fields), {"expected_revision", "expected_sha256", "decision", "comment"})
+        revise_fields = components["BibleVariantReviseInputRequest"]["properties"]
+        self.assertNotIn("minLength", revise_fields["appearance_anchor"])
+        self.assertNotIn("primary_setting_revision_id", revise_fields)
+        self.assertNotIn("source_binding_id", revise_fields)
+
+    def test_bulk_field_review_has_explicit_preview_and_receipt_contracts(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        for action, request, response in (("preview", "ExecutionBulkFieldPreviewRequest", "ExecutionBulkFieldPreview"),
+                                         ("confirm", "ExecutionBulkFieldConfirmRequest", "ExecutionBulkFieldResult")):
+            path = schema["paths"][f"/api/v1/execution-preparations/bulk-field-{action}/"]
+            self.assertEqual(set(path), {"post"})
+            operation = path["post"]
+            self.assertTrue({"200", "400", "404", "409"} <= set(operation["responses"]))
+            self.assertIn(request, str(operation["requestBody"]))
+            self.assertIn(response, str(operation["responses"]["200"]))
+        props = schema["components"]["schemas"]["ExecutionBulkFieldReceiptRequest"]["properties"]
+        self.assertEqual(set(props), {"preparation_id", "expected_preparation_revision", "preview_sha256"})
+
+    def test_production_budget_options_are_read_only_with_typed_currency_choices(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        self.assertEqual(set(schema["paths"]["/api/v1/production-runs/budget-options/"]), {"get"})
+        self.assertIn("currencies", schema["components"]["schemas"]["ProductionBudgetOptions"]["properties"])
+        self.assertEqual(set(schema["components"]["schemas"]["ProductionBudgetCurrencyOption"]["properties"]), {"value", "label"})
+
+    def test_project_creation_capability_is_read_only_and_shares_defaults_schema(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        path = schema["paths"]["/api/v1/capabilities/project-creation/"]
+        self.assertEqual(set(path), {"get"})
+        self.assertIn("409", path["get"]["responses"])
+        props = schema["components"]["schemas"]["ProjectCreationCapability"]["properties"]
+        self.assertEqual(set(props), {"creation_defaults", "configuration_public_sha256"})
+        self.assertEqual(props["creation_defaults"]["$ref"], "#/components/schemas/ProductionCreationDefaults")
+
+    def test_current_registry_and_recommendation_contracts_have_no_retired_composition(self):
+        from studio.platform_serializers import RegistryDeletionPreviewInputSerializer
+        from studio.models import RecommendationDecision
+        choices = set(RegistryDeletionPreviewInputSerializer().fields["resource_type"].choices)
+        self.assertTrue({"model_execution_instance", "model_execution_instance_version"} <= choices)
+        self.assertNotIn("prompt_profile_binding", choices)
+        self.assertNotIn("recipe_version", {field.name for field in RecommendationDecision._meta.fields})
+        schemas = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        decision = schemas["RecommendationDecision"]["properties"]
+        self.assertNotIn("recipe_version", decision)
+        self.assertTrue({"candidate", "config_revision", "decision", "override_values"} <= set(decision))
+
+    def test_manual_review_only_state_is_part_of_the_single_api_contract(self):
+        from studio.production_manual_serializers import ManualContentReplacementSerializer
+        for code in ("review_only", "review_and_stopped", "media_review_required", "text_review_required"):
+            serializer = ManualContentReplacementSerializer(data={"allowed": True, "code": code, "reason": "逐项重新审核"})
+            self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertFalse(ManualContentReplacementSerializer(data={"allowed": True, "code": "storyboard_review_only", "reason": "旧别名"}).is_valid())
+        schemas = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        ref = schemas["ManualContentReplacement"]["properties"]["code"]["$ref"].split("/")[-1]
+        self.assertTrue({"review_only", "review_and_stopped", "media_review_required", "text_review_required"}.issubset(schemas[ref]["enum"]))
+        self.assertNotIn("storyboard_review_only", schemas[ref]["enum"])
+
+    def test_assembly_reports_frozen_media_count_not_legacy_tasks(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        fields = schema["components"]["schemas"]["AssemblyJob"]["properties"]
+        self.assertNotIn("source_tasks", fields)
+        self.assertEqual(fields["source_media_count"]["type"], "integer")
+        self.assertTrue(fields["source_media_count"]["readOnly"])
+        self.assertTrue(fields["ai_generated"]["nullable"])
+        release = schema["components"]["schemas"]["ReleaseBundle"]
+        self.assertIn("production_run", release["required"])
+        self.assertFalse(release["properties"]["production_run"].get("nullable", False))
+
+    def test_manual_bible_image_read_keeps_candidates_targets_and_review_distinct(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        self.assertEqual(set(schema["paths"]["/api/v1/production-runs/{id}/manual-bible-image-review/"]), {"get"})
+        fields = schema["components"]["schemas"]["ManualBibleImageReview"]["properties"]
+        self.assertEqual(set(fields), {"run_id", "run_plan_sha256", "candidates", "candidates_sha256", "targets",
+            "targets_sha256", "content_basis", "content_basis_sha256", "maximum_selected_images", "approval"})
+        self.assertEqual(set(schema["components"]["schemas"]["ManualBibleImageContentBasis"]["properties"]),
+            {"script_sha256", "bible_sha256", "visual_rules_sha256", "upstream_reviews_sha256"})
+        self.assertIn("changes", schema["components"]["schemas"]["ManualBibleImageDecision"]["properties"])
+
+    def test_manual_storyboard_read_is_not_a_model_or_mutation_endpoint(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        path = schema["paths"]["/api/v1/production-runs/{id}/manual-storyboard/"]
+        self.assertEqual(set(path), {"get"})
+        fields = schema["components"]["schemas"]["ManualStoryboardDetail"]["properties"]
+        self.assertEqual(set(fields), {"run_id", "run_plan_sha256", "content", "content_sha256", "adoption", "materialization"})
+        proposed = schema["components"]["schemas"]["ManualStoryboardMaterialization"]["properties"]
+        self.assertEqual(set(proposed), {"ready", "reason", "contract", "sha256"})
+
+    def test_manual_bible_read_is_typed_and_cannot_materialize(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        path = schema["paths"]["/api/v1/production-runs/{id}/bible-review/"]
+        self.assertEqual(set(path), {"get"})
+        self.assertNotIn("/api/v1/production-runs/{id}/manual-bible-review/", schema["paths"])
+        fields = schema["components"]["schemas"]["ManualBibleReview"]["properties"]
+        self.assertEqual(set(fields), {"plan_source", "run_id", "run_plan_sha256", "current_script", "source",
+            "project_bible", "project_bible_sha256", "candidates", "settings", "approval"})
+        recipe = schema["components"]["schemas"]["RecipeBibleReview"]["properties"]
+        self.assertIn("source_snapshot_sha256", recipe)
+        self.assertIn("settings", recipe)
+        approval = schema["components"]["schemas"]["ApprovalDecisionInputRequest"]["properties"]
+        confirmation_ref = approval["bible_review"]["allOf"][0]["$ref"].split("/")[-1]
+        confirmation_schema = schema["components"]["schemas"][confirmation_ref]
+        confirmation = confirmation_schema["properties"]
+        self.assertEqual(set(confirmation), {"expected_source_snapshot_sha256", "expected_project_bible_sha256",
+            "reviewed_candidate_ids", "reviewed_setting_keys", "reviewed_project_bible"})
+        self.assertEqual(set(confirmation_schema["required"]), set(confirmation))
+        source = schema["components"]["schemas"]["ManualBibleSource"]["properties"]
+        self.assertTrue({"revision", "decision_id", "snapshot_sha256", "candidate_sha256"} <= set(source))
+
+    def test_manual_reference_review_is_readonly_and_distinct_from_instance_execution(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        path = schema["paths"]["/api/v1/production-runs/{id}/manual-storyboard-review/"]
+        self.assertEqual(set(path), {"get"})
+        fields = schema["components"]["schemas"]["ManualStoryboardReview"]["properties"]
+        self.assertEqual(set(fields), {"run_id", "run_plan_sha256", "ready", "reason", "contract",
+            "contract_sha256", "references", "source_options", "approval", "display"})
+        self.assertTrue(fields["contract"]["nullable"])
+        self.assertEqual(fields["references"]["type"], "array")
+        self.assertIn("ShotReferenceUse", fields["references"]["description"])
+        self.assertEqual(fields["source_options"]["type"], "array")
+        self.assertIn("reference_source_options", fields["source_options"]["description"])
+
+    def test_task_observations_are_paginated_typed_readonly_checks(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        path = schema["paths"]["/api/v1/tasks/{id}/observations/"]
+        self.assertEqual(set(path), {"get"})
+        response = path["get"]["responses"]["200"]["content"]["application/json"]["schema"]
+        self.assertIn("PaginatedGenerationTaskObservation", str(response))
+        fields = schema["components"]["schemas"]["GenerationTaskObservation"]["properties"]
+        self.assertTrue({"claim_number", "request_sha256", "status", "node_count", "policy_sha256", "http_status"}.issubset(fields))
+        self.assertTrue(all(field.get("readOnly") for field in fields.values()))
+        self.assertFalse({"capability_snapshot", "payload", "prepared_request"} & fields.keys())
+
+    def test_execution_field_api_separates_explicit_actions_from_dispatch(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths = schema["paths"]
+        base = "/api/v1/execution-field-values/"
+        self.assertEqual(set(paths[base]), {"get", "post"})
+        self.assertEqual(set(paths[base + "{id}/"]), {"get"})
+        for action in ("confirm", "reject"):
+            self.assertEqual(set(paths[base + "{id}/" + action + "/"]), {"post"})
+        self.assertEqual(set(paths["/api/v1/execution-preparations/{id}/"]), {"get"})
+        components = schema["components"]["schemas"]
+        self.assertNotIn("text", components["ExecutionFieldSummary"]["properties"])
+        self.assertIn("text", components["ExecutionFieldDetail"]["properties"])
+        create = components["ExecutionFieldCreateRequest"]
+        self.assertNotIn("origin_kind", create["properties"])
+        self.assertNotIn("approval_kind", create["properties"])
+        confirm = components["ExecutionFieldConfirmRequest"]
+        self.assertFalse(confirm["properties"]["select_for_execution"]["default"])
+        self.assertTrue({"expected_text_sha256", "expected_source_sha256", "expected_preparation_revision"}.issubset(confirm["required"]))
+
+    def test_execution_registry_is_typed_and_keeps_prompt_purpose_readonly(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths = schema["paths"]
+        base = "/api/v1/model-execution-instance-versions/"
+        self.assertEqual(set(paths[base]), {"get", "post"})
+        self.assertEqual(set(paths[base + "{id}/"]), {"get", "patch"})
+        self.assertIn(base + "{id}/clone-successor/", paths)
+        self.assertEqual(set(paths[base + "{id}/input-contract/"]), {"get"})
+        self.assertEqual(set(paths[base + "{id}/authoring-options/"]), {"get"})
+        for action in ("publish", "retire"):
+            self.assertEqual(set(paths[base + "{id}/" + action + "/"]), {"post"})
+        components = schema["components"]["schemas"]
+        create = components["ExecutionVersionCreateRequest"]
+        self.assertTrue({"instance_id", "expected_revision", "deployment_id", "operation", "mode", "prompt_mode",
+                         "prompt_profile_version_id", "workflow_version_id"}.issubset(create["required"]))
+        self.assertNotIn("prompt_operation", create["properties"])
+        self.assertTrue(components["ExecutionVersion"]["properties"]["prompt_operation"]["readOnly"])
+        self.assertNotIn("configuration", components["ExecutionVersion"]["properties"])
+        self.assertIn("configuration", components["ExecutionVersionDetail"]["properties"])
+        self.assertIn("seed_policy", components["ExecutionParameterSpecRequest"]["required"])
+        self.assertEqual(components["ExecutionSeedPolicyEnum"]["enum"], ["fixed", "generate_once"])
+        self.assertEqual(components["ExecutionSubjectKindEnum"]["enum"], ["character", "scene", "prop", "external"])
+        self.assertEqual(components["ExecutionSubjectCategoryEnum"]["enum"], ["character", "scene", "prop"])
+        subject = components["ExecutionSubjectFactRequest"]
+        self.assertEqual(set(subject["required"]), {"id", "category", "name", "description"})
+        self.assertIn("ExecutionSubjectCategoryEnum", str(subject["properties"]["category"]))
+        self.assertEqual(components["ExecutionSmokeFixtureRequest"]["properties"]["subject_facts"]["items"]["$ref"],
+                         "#/components/schemas/ExecutionSubjectFactRequest")
+        for name in ("ExecutionInputContract", "ResourceSmokeContract"):
+            self.assertEqual(components[name]["properties"]["subject_categories"]["items"]["$ref"],
+                             "#/components/schemas/ExecutionSubjectCategoryOption")
+        self.assertEqual(components["ExecutionScopeKindEnum"]["enum"], ["request", "shot", "episode", "project"])
+        semantics = components["ExecutionInputSemanticRequest"]["properties"]
+        self.assertEqual(semantics["allowed_subject_kinds"]["items"]["$ref"], "#/components/schemas/ExecutionSubjectKindEnum")
+        self.assertEqual(semantics["allowed_scope_kinds"]["items"]["$ref"], "#/components/schemas/ExecutionScopeKindEnum")
+        self.assertEqual(components["ExecutionVersionStatusEnum"]["enum"], ["draft", "published", "retired"])
+        self.assertTrue({"expected_revision", "expected_definition_sha256"}.issubset(components["ExecutionCloneRequest"]["required"]))
+        self.assertEqual(set(components["ExecutionPublishRequest"]["required"]), {"expected_revision", "expected_definition_sha256"})
+        self.assertEqual(set(components["ExecutionRetireRequest"]["required"]), {"expected_revision", "expected_definition_sha256", "reason"})
+        detail = components["ExecutionInputContract"]["properties"]
+        self.assertTrue({"version_id", "revision", "frozen", "schema_version", "size_bytes", "sha256", "target_fingerprint", "definition"} <= detail.keys())
+        self.assertTrue(detail["definition"]["readOnly"])
+        self.assertNotIn("can_submit", detail)
+        self.assertNotIn("definition", components["ExecutionAuthoringOptions"]["properties"])
+
     def test_platform_decision_enums_have_stable_component_names(self):
         overrides = settings.SPECTACULAR_SETTINGS["ENUM_NAME_OVERRIDES"]
         self.assertEqual(
@@ -43,6 +471,13 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             schema["components"]["securitySchemes"]["jwtAuth"],
             {"type": "http", "scheme": "bearer", "bearerFormat": "JWT"},
         )
+
+    def test_reviewed_visual_sources_include_the_original_producer_review_contract(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        component = schema['components']['schemas']['ReviewedVisualSources']
+        self.assertIn('review_contract', component['required'])
+        self.assertIn('原生产请求冻结', component['properties']['review_contract']['description'])
+        self.assertIn('/api/v1/production-runs/{id}/reviewed-visual-sources/', schema['paths'])
 
     def test_workflow_projector_options_publish_typed_editor_contract(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -156,6 +591,7 @@ class OpenApiEnumNamingTests(SimpleTestCase):
                 "active_generation_tasks",
                 "unresolved_remote_tasks",
                 "active_assembly_jobs",
+                "active_translation_jobs",
             },
         )
 
@@ -202,22 +638,12 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "#/components/schemas/PromptTranslationConflictErrorResponse",
         )
 
-    def test_translation_promotion_exposes_only_current_contract_fields(self):
-        components = SchemaGenerator().get_schema(
-            request=None, public=True,
-        )["components"]["schemas"]
-
-        self.assertEqual(
-            set(components["PromptTranslationPromoteShotRequest"]["properties"]),
-            {"shot_id", "entries"},
-        )
-        self.assertEqual(
-            set(components["PromptTranslationPromoteShotResponse"]["properties"]),
-            {"shot_id", "promoted_fields", "entries"},
-        )
-        self.assertFalse(
-            any(name.startswith("legacy_") for name in components["Shot"]["properties"]),
-        )
+    def test_translation_review_has_no_shot_writeback_contract(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        self.assertNotIn("/api/v1/translations/promote-shot/", schema["paths"])
+        components = schema["components"]["schemas"]
+        self.assertNotIn("promoted_fields", components["PromptFieldTranslation"]["properties"])
+        self.assertFalse(any(name.startswith("PromptTranslationPromot") for name in components))
 
     def test_retired_draft_graph_is_absent_from_the_api_contract(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -253,6 +679,10 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         paths = schema["paths"]
 
         self.assertNotIn("/api/v1/projects/{id}/build-production/", paths)
+        for resource in ("prompts", "workflows", "deferred-generation-requests"):
+            self.assertFalse(any(path.startswith(f"/api/v1/{resource}/") for path in paths))
+        for name in ("PromptArtifact", "GeneratedWorkflow", "DeferredGenerationRequest"):
+            self.assertNotIn(name, schema["components"]["schemas"])
         self.assertNotIn("/api/v1/prompts/generate/", paths)
         self.assertNotIn("/api/v1/workflows/generate/", paths)
 
@@ -274,78 +704,26 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         request_ref = create["requestBody"]["content"]["application/json"]["schema"]["$ref"]
         request = schema["components"]["schemas"][request_ref.rsplit("/", 1)[-1]]
         self.assertTrue({
-            "project_id", "recipe_version_id", "idempotency_key",
+            "project_id", "plan_source", "idempotency_key",
         }.issubset(request["required"]))
         self.assertTrue({
-            "allow_external_calls", "budget_limit", "max_generation_tasks",
-            "config_overrides", "workflow_selection",
-            "bible_image_prompt_profile_binding_id",
+            "allow_external_calls",
+            "config_overrides", "recipe_version_id", "manual_plan",
         }.issubset(request["properties"]))
-        workflow_selection = schema["components"]["schemas"][
-            request["properties"]["workflow_selection"]["allOf"][0]["$ref"].rsplit("/", 1)[-1]
-        ]
-        self.assertEqual(
-            workflow_selection["properties"]["schema_version"],
-            {"type": "integer", "maximum": 2, "minimum": 2},
-        )
-        self.assertTrue({"schema_version", "mode"}.issubset(workflow_selection["required"]))
-        self.assertNotIn(
-            "maximum",
-            workflow_selection["properties"]["route_index"],
-        )
-        workflow_mode_ref = workflow_selection["properties"]["mode"]["$ref"]
-        self.assertEqual(
-            set(schema["components"]["schemas"][workflow_mode_ref.rsplit("/", 1)[-1]]["enum"]),
-            {"uniform", "per_shot"},
-        )
-        shot_route_ref = workflow_selection["properties"]["shot_routes"]["items"]["$ref"]
-        shot_route = schema["components"]["schemas"][shot_route_ref.rsplit("/", 1)[-1]]
-        self.assertEqual(
-            set(shot_route["required"]),
-            {"shot_id", "route_index", "prompt_profile_binding_id"},
-        )
-        profile_selection_ref = workflow_selection["properties"][
-            "prompt_profile_selections"
-        ]["items"]["$ref"]
-        profile_selection = schema["components"]["schemas"][
-            profile_selection_ref.rsplit("/", 1)[-1]
-        ]
-        self.assertEqual(
-            set(profile_selection["required"]),
-            {"operation", "prompt_profile_binding_id"},
-        )
-        route_options = paths[
-            "/api/v1/production-recipes/{id}/media-route-options/"
-        ]["get"]
-        route_options_ref = route_options["responses"]["200"]["content"][
-            "application/json"
-        ]["schema"]["$ref"]
-        route_options_schema = schema["components"]["schemas"][
-            route_options_ref.rsplit("/", 1)[-1]
-        ]
-        self.assertTrue({
-            "schema_version", "recipe_version_id", "recipe_definition_sha256",
-            "routes", "bible_image_generation", "effective_limits",
-        }.issubset(route_options_schema["required"]))
-        self.assertEqual(
-            route_options_schema["properties"]["schema_version"],
-            {"type": "integer", "maximum": 2, "minimum": 2},
-        )
-        route_limits_ref = route_options_schema["properties"][
-            "effective_limits"
-        ]["allOf"][0]["$ref"]
-        route_limits = schema["components"]["schemas"][
-            route_limits_ref.rsplit("/", 1)[-1]
-        ]
-        self.assertEqual(
-            route_limits["properties"]["max_routing_routes"]["minimum"],
-            1,
-        )
-        route_option_ref = route_options_schema["properties"]["routes"]["items"]["$ref"]
-        route_option_schema = schema["components"]["schemas"][
-            route_option_ref.rsplit("/", 1)[-1]
-        ]
-        self.assertIn("prompt_profile_requirements", route_option_schema["required"])
+        self.assertNotIn("recipe_version_id", request["required"])
+        self.assertTrue({"workflow_selection", "bible_image_prompt_profile_binding_id", "reference_inputs", "budget_limit", "max_generation_tasks"}.isdisjoint(request["properties"]))
+        manual_ref = request["properties"]["manual_plan"]["$ref"]
+        manual = schema["components"]["schemas"][manual_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(manual["required"]), {"stage_catalog_key", "expected_stage_catalog_sha256", "scope", "delivery", "initial_content"})
+        targets = paths["/api/v1/production-runs/{id}/targets/"]
+        self.assertEqual(set(targets), {"get"})
+        self.assertEqual({row["name"] for row in targets["get"]["parameters"]}, {"id", "kind", "page", "page_size"})
+        target_ref = targets["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        target_page = schema["components"]["schemas"][target_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(target_page["required"]), {"count", "next", "previous", "results", "run_id", "run_plan_sha256"})
+        self.assertEqual(set(schema["components"]["schemas"]["ManualRegisteredAction"]["required"]),
+            {"stage_key", "action", "operation", "output_kinds", "scope_kinds"})
+        self.assertNotIn("/api/v1/production-recipes/{id}/media-route-options/", paths)
 
         capability = paths["/api/v1/capabilities/production/"]["get"]
         capability_ref = capability["responses"]["200"]["content"][
@@ -381,11 +759,6 @@ class OpenApiEnumNamingTests(SimpleTestCase):
                 "execution_monitoring_max_node_type_overrides",
                 "execution_monitoring_max_node_overrides",
                 "execution_monitoring_max_idle_timeout_seconds",
-                "prompt_review_max_candidates",
-                "prompt_review_max_advisories",
-                "prompt_review_max_input_bytes",
-                "prompt_review_max_field_characters",
-                "prompt_review_max_usage_count",
                 "audit_note_min_characters",
                 "audit_note_max_characters",
             },
@@ -408,8 +781,7 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         approve = paths["/api/v1/production-runs/{id}/approve/"]["post"]
         approve_ref = approve["requestBody"]["content"]["application/json"]["schema"]["$ref"]
         approve_request = schema["components"]["schemas"][approve_ref.rsplit("/", 1)[-1]]
-        self.assertIn("adopt_generated_metadata", approve_request["properties"])
-        self.assertFalse(approve_request["properties"]["adopt_generated_metadata"]["default"])
+        self.assertNotIn("adopt_generated_metadata", approve_request["properties"])
         self.assertNotIn("/api/v1/script-structure/", paths)
         self.assertNotIn("/api/v1/script-structure/preview/", paths)
 
@@ -476,7 +848,7 @@ class OpenApiEnumNamingTests(SimpleTestCase):
 
         self.assertEqual(
             set(paths["/api/v1/workflow-template-versions/{id}/smoke-test/"]["post"]["responses"]),
-            {"202", "400", "409"},
+            {"200", "202", "400", "403", "404", "409"},
         )
         components = schema["components"]["schemas"]
         self.assertEqual(
@@ -493,9 +865,22 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             {"provider", "model_identifier", "modality", "specification"},
         )
         registry_options = components["ModelProfileRegistryOptions"]
+        preview_path = paths["/api/v1/business-output-versions/preview-visual-rules-output/"]
+        self.assertEqual(set(preview_path), {"post"})
+        self.assertEqual(set(preview_path["post"]["responses"]), {"200", "400", "403"})
+        self.assertEqual(set(components["VisualRulesOutputPreviewInputRequest"]["properties"]),
+            {"response_text", "quality_advisories", "allowed_values", "field_sources", "response_keys",
+             "output_version_id", "expected_revision"})
+        output_layout = components["OutputWriteRequest"]["properties"]["response_keys"]
+        self.assertEqual(output_layout["additionalProperties"]["type"], "string")
+        self.assertIn("最多4层", output_layout["description"])
+        self.assertIn("从0连续完整声明的整数下标", output_layout["description"])
+        self.assertIn("preview_only", components["VisualRulesOutputPreviewResponse"]["properties"])
+        self.assertIn("response_example", components["VisualRulesOutputEditorOptions"]["properties"])
         self.assertTrue({
             "specification_schema_version", "provider_drivers", "modalities",
             "artifact_roles", "capabilities", "model_families",
+            "media_constraints", "execution_monitoring", "visual_rules_output",
         }.issubset(registry_options["required"]))
         workflow_export = paths[
             "/api/v1/workflow-template-versions/{id}/comfyui-workflow/"
@@ -550,25 +935,13 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         smoke_request = schema["components"]["schemas"][
             smoke_request_ref.rsplit("/", 1)[-1]
         ]
-        operation_refs = smoke_request["properties"]["operation"]["oneOf"]
-        operation_enum_ref = next(
-            item["$ref"] for item in operation_refs
-            if item["$ref"].rsplit("/", 1)[-1] != "NullEnum"
-        )
-        self.assertEqual(
-            set(schema["components"]["schemas"][
-                operation_enum_ref.rsplit("/", 1)[-1]
-            ]["enum"]),
-            {
-                "image.text_to_image",
-                "video.text_to_video",
-                "audio.text_to_audio",
-                "prompt.normalize",
-                "script.generate",
-                "script.structure",
-                "visual_rules.generate",
-            },
-        )
+        selection_ref = smoke_request["properties"]["selection"]["$ref"]
+        selection = schema["components"]["schemas"][selection_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(selection["properties"]), {"operation", "mode", "prompt_mode", "prompt_profile_version_id", "output_version_id"})
+        self.assertEqual(selection["properties"]["operation"]["type"], "string")
+        self.assertEqual(selection["properties"]["operation"]["maxLength"], 100)
+        self.assertNotIn("enum", selection["properties"]["operation"])
+        self.assertEqual(set(paths["/api/v1/model-deployments/{id}/smoke-options/"]), {"get"})
 
         node_metadata = paths["/api/v1/runtime-hosts/node-metadata/"]["get"]
         self.assertEqual(
@@ -586,9 +959,10 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         generation_attempt = schema["components"]["schemas"]["GenerationAttempt"]["properties"]
         self.assertTrue({
             "provider_request_id_sha256", "provider_request_id_suffix",
-            "repair_of_attempt_id", "retry_feedback_sha256",
+            "preparation", "parent_preparation", "role", "execution_instance_version",
             "request_snapshot_sha256", "request_snapshot_size_bytes",
         }.issubset(generation_attempt))
+        self.assertTrue({"repair_of_attempt_id", "retry_feedback_sha256"}.isdisjoint(generation_attempt))
 
     def test_saved_comfy_workflow_import_and_attestation_contract_is_explicit(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -838,37 +1212,35 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "schema"
         ]["$ref"]
         request = components[request_ref.rsplit("/", 1)[-1]]
-        self.assertEqual(set(request["required"]), {"deployment_id", "fixture"})
-        self.assertEqual(set(request["properties"]), {"deployment_id", "fixture"})
+        fields = {"selection", "expected_definition_sha256", "fixture", "field_values", "allow_external_calls"}
+        self.assertEqual(set(request["required"]), fields)
+        self.assertEqual(set(request["properties"]), fields)
+        selection_ref = request["properties"]["selection"]["$ref"]
+        selection = components[selection_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(selection["properties"]), {"operation", "mode", "prompt_mode", "prompt_profile_version_id", "output_version_id"})
+        self.assertEqual(set(selection["required"]), {"operation", "mode", "prompt_mode", "prompt_profile_version_id"})
+        self.assertEqual(selection["properties"]["output_version_id"]["format"], "uuid")
+        self.assertTrue(selection["properties"]["output_version_id"]["nullable"])
+        self.assertTrue(any(row["name"] == "Idempotency-Key" and row["in"] == "header" and row["required"]
+            for row in operation["parameters"]))
 
         fixture_ref = request["properties"]["fixture"]["$ref"]
         fixture = components[fixture_ref.rsplit("/", 1)[-1]]
         self.assertEqual(
             set(fixture["properties"]),
-            {"schema_version", "values", "assets", "references"},
+            {"inputs", "parameters", "manual_channels", "subject_facts", "source_language", "target_language"},
         )
-        self.assertEqual(
-            fixture["properties"]["schema_version"],
-            {"type": "integer", "maximum": 2, "minimum": 2, "default": 2},
-        )
-        self.assertEqual(
-            {row["type"] for row in fixture["properties"]["values"][
-                "additionalProperties"
-            ]["oneOf"]},
-            {"string", "integer", "number", "boolean"},
-        )
-        fixture_asset_ref = fixture["properties"]["assets"]["items"]["$ref"]
-        fixture_asset = components[fixture_asset_ref.rsplit("/", 1)[-1]]
-        self.assertEqual(set(fixture_asset["required"]), {"semantic_key", "asset_id"})
-        self.assertEqual(set(fixture_asset["properties"]), {"semantic_key", "asset_id"})
-        reference_ref = fixture["properties"]["references"]["$ref"]
-        references = components[reference_ref.rsplit("/", 1)[-1]]
-        self.assertEqual(set(references["properties"]), {"pictures", "videos", "audios"})
+        self.assertEqual(set(fixture["required"]), set(fixture["properties"]))
 
         response_ref = operation["responses"]["202"]["content"]["application/json"][
             "schema"
         ]["$ref"]
-        attempt = components[response_ref.rsplit("/", 1)[-1]]
+        created = components[response_ref.rsplit("/", 1)[-1]]
+        self.assertEqual(set(created["properties"]), {"attempt_kind", "attempt_id", "status", "preparation"})
+        self.assertEqual(set(created["required"]), set(created["properties"]))
+        self.assertEqual(operation["responses"]["200"]["content"]["application/json"]["schema"]["$ref"], response_ref)
+        attempt_ref = schema["paths"]["/api/v1/workflow-smoke-attempts/{id}/"]["get"]["responses"]["200"]["content"]["application/json"]["schema"]["$ref"]
+        attempt = components[attempt_ref.rsplit("/", 1)[-1]]
         self.assertNotIn("fixture_values", attempt["properties"])
         self.assertTrue({
             "fixture_values_schema_version", "fixture_values_size_bytes",
@@ -921,10 +1293,9 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         schema = SchemaGenerator().get_schema(request=None, public=True)
         paths = schema["paths"]
         collections = (
-            "/api/v1/prompt-field-definitions/",
+            "/api/v1/field-definitions/",
             "/api/v1/prompt-profile-versions/",
             "/api/v1/prompt-profile-field-rules/",
-            "/api/v1/prompt-profile-bindings/",
         )
         for path in collections:
             with self.subTest(path=path):
@@ -949,9 +1320,11 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "source_projection_key", "channel_limits", "contract_sha256",
             "field_rule_count",
         }.issubset(profile))
-        field_definition = components["PromptFieldDefinition"]["properties"]
-        self.assertIn("preview_example", field_definition)
-        self.assertIs(field_definition["preview_example"]["readOnly"], True)
+        field_definition = components["FieldDefinition"]["properties"]
+        self.assertNotIn("preview_example", field_definition)
+        definition_version = components["FieldDefinitionVersion"]["properties"]
+        self.assertIn("preview_example", definition_version)
+        self.assertIs(definition_version["preview_example"]["readOnly"], True)
         preview = components["PromptProfilePreview"]["properties"]
         self.assertTrue({
             "channels", "channel_limits", "channel_audit", "warnings",
@@ -1098,14 +1471,12 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         )
         generation_attempt = components["GenerationAttempt"]["properties"]
         self.assertTrue({
-            "prompt_profile_version", "prompt_profile_binding_key",
-            "prompt_profile_contract_sha256",
+            "execution_instance_version", "preparation", "prompt_profile_version",
+            "prompt_profile_contract_sha256", "role",
         }.issubset(generation_attempt))
-        prompt_artifact = components["PromptArtifact"]["properties"]
-        self.assertTrue({
-            "prompt_profile_version", "prompt_profile_binding_key",
-            "prompt_profile_contract_sha256",
-        }.issubset(prompt_artifact))
+        self.assertNotIn("PromptArtifact", components)
+        self.assertNotIn("/api/v1/prompts/", paths)
+        self.assertIn("/api/v1/tasks/{id}/input-prompt/", paths)
         self.assertTrue({
             "provider_request_id", "request_snapshot", "result", "error_message",
         }.isdisjoint(generation_attempt))
@@ -1138,10 +1509,9 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "/api/v1/workflow-template-versions/{id}/",
             "/api/v1/config-definitions/{id}/",
             "/api/v1/production-recipes/{id}/",
-            "/api/v1/prompt-field-definitions/{id}/",
+            "/api/v1/field-definitions/{id}/",
             "/api/v1/prompt-profile-versions/{id}/",
             "/api/v1/prompt-profile-field-rules/{id}/",
-            "/api/v1/prompt-profile-bindings/{id}/",
         )
         action_paths = (
             "/api/v1/model-profile-versions/{id}/publish/",
@@ -1332,10 +1702,31 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         paths = schema["paths"]
         components = schema["components"]["schemas"]
 
+        assembly_schema = components["ProductionRecipeEditorOptions"]["properties"]["assembly_output_schema"]
+        self.assertEqual(assembly_schema["type"], "object")
+        self.assertTrue(assembly_schema["readOnly"])
+        timing_schema = components["ProductionRecipeEditorOptions"]["properties"]["assembly_timing_schema"]
+        self.assertEqual(timing_schema["type"], "object")
+        self.assertTrue(timing_schema["readOnly"])
+        media_schema = components["ProductionRecipeEditorOptions"]["properties"]["assembly_media_schema"]
+        self.assertEqual(media_schema["type"], "object")
+        self.assertTrue(media_schema["readOnly"])
+        delivery_schema = components["ProductionRecipeEditorOptions"]["properties"]["delivery_metadata_schema"]
+        self.assertEqual(delivery_schema["type"], "object")
+        self.assertTrue(delivery_schema["readOnly"])
+        for component in ("ProductionRecipeVersionRequest", "PatchedProductionRecipeVersionRequest"):
+            description = components[component]["properties"]["definition"]["description"]
+            self.assertIn("assembly_output", description)
+            self.assertIn("assembly_timing", description)
+            self.assertIn("assembly_media", description)
+            self.assertIn("delivery_metadata", description)
+            self.assertIn("episode_start_ms", description)
+            self.assertIn("expected_contract_sha256", description)
+
         option_paths = {
             "/api/v1/production-recipes/options/": "ProductionRecipeEditorOptions",
             "/api/v1/prompt-profile-versions/options/": "PromptProfileOptions",
-            "/api/v1/prompt-field-definitions/options/": "PromptFieldDefinitionOptions",
+            "/api/v1/field-definitions/options/": "FieldDefinitionOptions",
             "/api/v1/config-definitions/options/": "ConfigDefinitionOptions",
         }
         for path, component in option_paths.items():
@@ -1381,14 +1772,14 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         ):
             self.assertNotIn("version", components[component]["properties"])
         for component in (
-            "PromptFieldDefinitionRequest",
-            "PatchedPromptFieldDefinitionRequest",
+            "FieldDefinitionRequest",
+            "PatchedFieldDefinitionRequest",
         ):
             self.assertNotIn("display_order", components[component]["properties"])
         create_contracts = (
             (
-                "/api/v1/prompt-field-definitions/",
-                "PromptFieldDefinitionCreateInputRequest",
+                "/api/v1/field-definitions/",
+                "FieldDefinitionCreateInputRequest",
                 {"is_active", "display_order"},
             ),
             (
@@ -1495,13 +1886,21 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         paths = SchemaGenerator().get_schema(request=None, public=True)["paths"]
         self.assertNotIn("/api/v1/projects/{id}/breakdown-script/", paths)
 
-    def test_script_bible_apply_and_sync_paths_are_absent(self):
-        paths = SchemaGenerator().get_schema(request=None, public=True)["paths"]
+    def test_script_bible_preview_apply_and_sync_contracts_are_absent(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        paths = schema["paths"]
+        self.assertNotIn("/api/v1/projects/{id}/script-bible-candidates/", paths)
         self.assertNotIn(
             "/api/v1/projects/{id}/script-bible-candidates/apply/",
             paths,
         )
         self.assertNotIn("/api/v1/projects/{id}/sync-bibles/", paths)
+        for name in (
+            "ScriptBibleEvidence", "ScriptBibleDiagnostic", "ScriptBibleCandidate",
+            "ScriptBibleCandidatesResponse", "ScriptBibleReviewedSelection",
+            "ScriptBibleErrorDetails", "ScriptBibleError", "ScriptBibleErrorEnvelope",
+        ):
+            self.assertNotIn(name, schema["components"]["schemas"])
 
     def test_bible_image_candidates_are_read_only_and_task_promotion_is_absent(self):
         paths = SchemaGenerator().get_schema(request=None, public=True)["paths"]
@@ -1514,16 +1913,14 @@ class OpenApiEnumNamingTests(SimpleTestCase):
 
         approval = schemas["ApprovalDecisionInputRequest"]
         self.assertIn("bible_image_bindings", approval["properties"])
-        self.assertIn("shot_reference_bindings", approval["properties"])
+        self.assertNotIn("shot_reference_bindings", approval["properties"])
+        self.assertIn("expected_selection_sha256", approval["properties"])
         self.assertIn("expected_source_snapshot_sha256", approval["properties"])
         self.assertEqual(
             approval["properties"]["bible_image_bindings"]["items"]["$ref"],
             "#/components/schemas/BibleImageBindingSelectionRequest",
         )
-        self.assertEqual(
-            approval["properties"]["shot_reference_bindings"]["items"]["$ref"],
-            "#/components/schemas/StoryboardShotReferenceSelectionRequest",
-        )
+        self.assertEqual(approval["properties"]["expected_selection_sha256"]["pattern"], "^[0-9a-f]{64}$")
 
         bible_selection = schemas["BibleImageBindingSelectionRequest"]
         self.assertEqual(
@@ -1589,23 +1986,10 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "#/components/schemas/BibleImageRegenerationEntityRequest",
         )
 
-        shot_selection = schemas["StoryboardShotReferenceSelectionRequest"]
-        self.assertEqual(set(shot_selection["required"]), {"shot_id", "reference_bindings"})
-        self.assertEqual(shot_selection["properties"]["shot_id"]["format"], "uuid")
-        self.assertEqual(
-            shot_selection["properties"]["reference_bindings"]["$ref"],
-            "#/components/schemas/StoryboardShotReferenceBindingsRequest",
-        )
-        shot_bindings = schemas["StoryboardShotReferenceBindingsRequest"]["properties"]
-        self.assertTrue(
-            {
-                "first_frame_asset_id",
-                "last_frame_asset_id",
-                "characters",
-                "scene",
-                "props",
-            }.issubset(shot_bindings)
-        )
+        self.assertNotIn("StoryboardShotReferenceSelectionRequest", schemas)
+        self.assertEqual(set(paths["/api/v1/production-runs/{id}/storyboard-reference-selection/"]), {"get"})
+        review = schemas["RecipeStoryboardReferenceSelection"]
+        self.assertEqual(set(review["required"]), {"source_snapshot_sha256", "selection_sha256", "shot_count", "selection", "display"})
 
     def test_bible_candidate_history_schema_matches_formal_artifact_projection(self):
         schemas = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
@@ -1634,13 +2018,14 @@ class OpenApiEnumNamingTests(SimpleTestCase):
                 "stage_run_id",
                 "generation_attempt_id",
                 "generation_task_id",
-                "prompt_artifact_id",
+                "preparation_id",
+                "execution_instance_version_id",
+                "execution_instance_name",
+                "request_sha256",
                 "workflow_version_id",
                 "model_profile_version_id",
                 "prompt_profile_version_id",
-                "prompt_profile_binding_key",
-                "prompt_profile_contract_sha256",
-                "source_snapshot_sha256",
+                "target_snapshot_sha256",
                 "source_current",
                 "integrity_status",
                 "integrity_error_code",
@@ -1655,35 +2040,17 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         )
         for retired_field in (
             "generated_workflow_id",
+            "prompt_artifact_id", "prompt_profile_binding_key", "prompt_profile_contract_sha256", "source_snapshot_sha256",
             "task_status",
             "promoted_assets",
             "prompt_inputs",
         ):
             self.assertNotIn(retired_field, history["properties"])
 
-    def test_deferred_generation_request_contract_is_closed_and_explicit(self):
+    def test_deferred_generation_has_no_historical_read_or_write_contract(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
-        paths = schema["paths"]
-        collection = paths["/api/v1/deferred-generation-requests/"]
-        self.assertEqual(set(collection), {"get"})
-        list_response = collection["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-        self.assertEqual(
-            list_response["$ref"],
-            "#/components/schemas/PaginatedDeferredGenerationRequestListList",
-        )
-        detail_response = schema["paths"][
-            "/api/v1/deferred-generation-requests/{id}/"
-        ]["get"]["responses"]["200"]["content"]["application/json"]["schema"]
-        self.assertEqual(
-            detail_response["$ref"],
-            "#/components/schemas/DeferredGenerationRequestDetail",
-        )
-        self.assertEqual(
-            set(paths["/api/v1/deferred-generation-requests/{id}/"]),
-            {"get"},
-        )
-        self.assertNotIn("/api/v1/deferred-generation-requests/{id}/cancel/", paths)
-        self.assertNotIn("/api/v1/deferred-generation-requests/{id}/retry/", paths)
+        self.assertFalse(any("deferred-generation" in path for path in schema["paths"]))
+        self.assertFalse(any("DeferredGeneration" in name for name in schema["components"]["schemas"]))
 
     def test_generated_artifact_contract_exposes_frozen_comparison_parameters(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -1700,15 +2067,31 @@ class OpenApiEnumNamingTests(SimpleTestCase):
             "comparison_parameters",
             components["GeneratedArtifactDetail"]["properties"],
         )
+        self.assertIn("manual_media_candidate", components["GeneratedArtifactDetail"]["properties"])
+        self.assertNotIn("manual_media_candidate", components["GeneratedArtifactList"]["properties"])
+        media = components["ManualMediaCandidate"]["properties"]
+        self.assertEqual(media["selection_revision"]["minimum"], 0)
+        self.assertTrue(media["selection_decision_id"]["nullable"])
+        self.assertIn("scope", media)
+        self.assertIn("run_plan_sha256", media)
 
     def test_generation_task_contract_exposes_safe_production_group_identity(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
         properties = schema["components"]["schemas"]["GenerationTask"]["properties"]
 
-        self.assertEqual(properties["production_run_id"]["format"], "uuid")
-        self.assertTrue(properties["production_run_id"]["nullable"])
-        self.assertEqual(properties["production_variant_number"]["type"], "integer")
-        self.assertTrue(properties["production_variant_number"]["nullable"])
+        self.assertTrue(properties["execution"]["nullable"])
+        identity = schema["components"]["schemas"]["GenerationTaskExecution"]["properties"]
+        self.assertEqual(identity["production_run_id"]["format"], "uuid")
+        self.assertEqual(identity["stage_run_id"]["format"], "uuid")
+        self.assertEqual(identity["attempt_number"]["type"], "integer")
+        self.assertEqual(identity["unit_key"]["type"], "string")
+        for retired in ("production_run_id", "production_variant_number", "batch_slots", "batch_id", "shot_id",
+                "generated_workflow", "seed", "effective_frames", "max_attempts", "staged_inputs", "outputs", "bible_target"):
+            self.assertNotIn(retired, properties)
+        self.assertNotIn("occurred_at", schema["components"]["schemas"]["GenerationTaskTimelineEvent"]["properties"])
+        filters = {item["name"] for item in schema["paths"]["/api/v1/tasks/"]["get"]["parameters"]}
+        self.assertTrue({"production_run_id", "stage_run_id", "unit_key", "preparation_id", "execution_instance_version_id"} <= filters)
+        self.assertFalse({"generated_workflow", "batch_id", "shot_id"} & filters)
 
     def test_generation_task_list_contract_marks_unavailable_inputs_explicitly(self):
         schema = SchemaGenerator().get_schema(request=None, public=True)
@@ -1728,8 +2111,60 @@ class OpenApiEnumNamingTests(SimpleTestCase):
         code_enum = schema["components"]["schemas"][code_ref.rsplit("/", 1)[-1]]
         self.assertEqual(
             set(code_enum["enum"]),
-            {"legacy_schema_unsupported", "frozen_contract_invalid"},
+            {"frozen_contract_invalid"},
         )
         self.assertIn("#/components/schemas/BlankEnum", {
             item["$ref"] for item in properties["input_contract_code"]["oneOf"]
         })
+
+    def test_manual_media_review_exposes_exact_members_and_original_approval(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        operation = schema["paths"]["/api/v1/production-runs/{id}/manual-media-review/"]["get"]
+        self.assertIn("200", operation["responses"])
+        schemas = schema["components"]["schemas"]
+        self.assertEqual(set(schemas["ManualMediaReview"]["properties"]),
+            {"run_id", "run_plan_sha256", "selection", "selection_sha256", "approval"})
+        self.assertEqual(set(schemas["ManualMediaSelectionMember"]["properties"]),
+            {"artifact_id", "kind", "artifact_sha256", "manifest_sha256", "decision_id", "decision_revision", "variant_group", "scope", "unit_key"})
+        self.assertTrue(schemas["ManualMediaApproval"]["properties"]["decision_id"]["nullable"])
+        self.assertEqual(set(schemas["ManualMediaSelection"]["properties"]),
+            {"schema_version", "run_plan_sha256", "source_stage_id", "items", "delivery_timeline", "content_basis"})
+        self.assertEqual(set(schemas["ManualMediaContentBasis"]["properties"]),
+            {"script_sha256", "storyboard_sha256", "bible_sha256", "visual_rules_sha256", "upstream_reviews_sha256"})
+        self.assertEqual(schemas["ManualMediaApproval"]["properties"]["changes"]["type"], "array")
+        self.assertEqual(set(schemas["ManualReviewTimelineShot"]["properties"]),
+            {"shot_id", "number", "title", "duration_ms", "media_kind", "episode_start_ms", "episode_end_ms"})
+
+    def test_generation_task_inputs_and_prompt_use_preparation_contract_only(self):
+        schemas = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        inputs = schemas["GenerationTaskInputParameters"]["properties"]
+        self.assertEqual(set(inputs), {"preparation_id", "attempt_id", "execution_instance_version_id", "workflow_version_id",
+            "request_sha256", "operation", "output_kind", "parameters", "media_uses", "prompt_mode",
+            "prompt_profile_version_id", "prompt_channels"})
+        media = schemas["GenerationTaskMediaUse"]["properties"]
+        self.assertTrue({"item_key", "artifact_id", "asset_id", "ports", "staging_status", "paired_to"} <= set(media))
+        self.assertNotIn("local_path", media)
+        prompt = schemas["GenerationTaskInputPrompt"]["properties"]
+        self.assertEqual(set(prompt), {"task_id", "attempt_id", "preparation_id", "execution_instance_version_id",
+            "request_sha256", "prompt_mode", "prompt_profile_version_id", "channels", "declared_reference_labels"})
+
+    def test_task_center_describes_original_system_layout_without_delivery_claim(self):
+        schemas = SchemaGenerator().get_schema(request=None, public=True)["components"]["schemas"]
+        self.assertIn("submission", schemas["TaskCenterDetail"]["required"])
+        fields = schemas["TaskSubmissionEvidence"]["properties"]
+        self.assertEqual(set(fields), {"state", "started_at", "registered_at", "identifier_state", "message", "notes"})
+        self.assertTrue(fields["started_at"]["nullable"])
+        self.assertTrue(fields["registered_at"]["nullable"])
+        self.assertIn("人工核对", fields["registered_at"]["description"])
+        self.assertIn("不返回标识", fields["identifier_state"]["description"])
+        description = schemas["TaskCenterDetail"]["properties"]["input"]["description"]
+        for value in ("system_message_trace", "system_message_layout", "字段生成/翻译", "Unicode", "start/end", "无记录不反推历史", "不证明送达", "port_routes", "edge_indexes", "最短路径", "processing_summary", "byte_identity", "shared_with", "不重新探测"):
+            self.assertIn(value, description)
+
+    def test_manual_assembly_is_readonly_inventory_with_real_job_and_contract(self):
+        schema = SchemaGenerator().get_schema(request=None, public=True)
+        operation = schema["paths"]["/api/v1/production-runs/{id}/manual-assembly/"]
+        self.assertEqual(set(operation), {"get"})
+        props = schema["components"]["schemas"]["ManualAssemblyDetail"]["properties"]
+        self.assertEqual(set(props), {"run_id", "run_plan_sha256", "contract_sha256", "frozen", "blockers", "approval", "episodes", "output"})
+        self.assertIn("job", schema["components"]["schemas"]["ManualAssemblyEpisode"]["properties"])

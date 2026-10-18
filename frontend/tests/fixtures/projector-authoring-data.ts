@@ -1,0 +1,95 @@
+const editorField = (path: string, control: string, readOnly = false) => ({
+  path, label: path, help: `Configure ${path}`, control, required: true, read_only: readOnly,
+})
+
+export const rawOptions = {
+  image_resolution: {
+    native_adapter: 'comfy.flux_kontext_image_scale/v1', configured_adapter: 'comfy.image_scale_candidates/v1',
+    algorithm: '按宽高比选择最近尺寸，Lanczos 居中裁切',
+    modes: [{value:'native',label:'跟随原节点'}, {value:'configured',label:'配置尺寸'}],
+    native_sizes: [{width:1024,height:1024}],
+    presets: [{width:512,height:512,label:'512 × 512'},{width:1024,height:1024,label:'1024 × 1024'}],
+    limits: {min_dimension:64,max_dimension:8192,multiple:16,max_pixels:16777216,max_candidates:32},
+  },
+  definition_schema_version: 1,
+  editor_schema_version: 1,
+  engines: [{
+    key: 'generic.fixed', version: 1, label: 'Generic', description: 'Reviewed generic engine',
+    projection_kind: 'generic_fixed',
+    adapter_contract: { compiler: 'generic.comfy/v1', output: 'comfy.primary/v1', dynamic: 'none/v1' },
+    locked_fields: ['schema_version', 'adapters', 'projection.kind'], projection_fields: [editorField('projection.config.capability','execution_capability'),editorField('projection.config.image_resolution','image_resolution')],
+    creation_template: {
+      provider_driver_type: 'comfyui', operation: 'workflow.import', output_kind: '',
+      definition: {
+        schema_version: 1, priority: 0,
+        detector: {fallback:false, allow_other_nodes:false, node_counts:{}, optional_node_counts:{}, input_equals:[]},
+        output_nodes:{}, model_selectors:[], node_roles:{}, required_edges:[], parameter_policies:[], asset_slots:[],
+        adapters: {compiler:'generic.comfy/v1',output:'comfy.primary/v1',dynamic:'none/v1'},
+        projection: {kind:'generic_fixed',config:{}},
+      },
+    },
+  }],
+  provider_driver_types: [{ value: 'comfyui', label: 'Local ComfyUI' }],
+  operations: [{ value: 'workflow.import', label: 'Import' }],
+  output_kinds: [{ value: '', label: 'Auto' }, { value: 'image', label: 'Image' }],
+  adapters: {
+    compiler: [{ value: 'generic.comfy/v1', label: 'generic.comfy/v1' }],
+    output: [{ value: 'comfy.primary/v1', label: 'comfy.primary/v1' }],
+    dynamic: [{ value: 'none/v1', label: 'none/v1' }],
+  },
+  definition_editor: {
+    sections: [{
+      key: 'matching', label: 'Matching', description: 'Graph matching',
+      fields: [
+        editorField('schema_version', 'readonly', true),
+        editorField('priority', 'integer'),
+        editorField('detector.fallback', 'boolean'),
+        editorField('detector.allow_other_nodes', 'boolean'),
+        editorField('detector.node_counts', 'node_count_map'),
+        editorField('detector.optional_node_counts', 'node_range_map'),
+        editorField('detector.input_equals', 'input_equals_list'),
+        editorField('output_nodes', 'output_map'),
+        editorField('model_selectors', 'model_selector_list'),
+        editorField('node_roles', 'node_role_map'),
+        editorField('required_edges', 'edge_list'),
+        editorField('parameter_policies', 'parameter_policy_list'),
+        editorField('asset_slots', 'asset_slot_list'),
+        editorField('adapters', 'adapter_contract', true),
+        editorField('projection', 'projection_config'),
+        editorField('$', 'advanced_json'),
+      ],
+    }],
+    choices: {
+      execution_capabilities: [{value:'image.text_to_image',label:'文生图'},{value:'image.image_to_image',label:'图片生图'}],
+      cardinalities: [{ value: 'one', label: 'One' }],
+      parameter_policies: [{ value: 'runtime', label: '运行时可调' }, { value: 'fixed', label: '固定值' }, { value: 'object_info', label: '节点合同' }],
+      artifact_roles: [{ value: 'other', label: 'Other' }],
+      media_kinds: [{ value: 'image', label: 'Image' }],
+      output_kinds: [{ value: 'image', label: 'Image' }],
+      contract_sources: [{ value: 'workflow', label: 'Workflow' }],
+      model_quantity_inputs: [{ value: 'total_images', label: '图片总数', media_kind: 'image' }],
+      role_selectors: [{ value: 'single', label: 'Single' }],
+      scalar_types: [{ value: 'string', label: '文本' }, { value: 'number', label: '数值' }, { value: 'boolean', label: '布尔值' }, { value: 'null', label: '空值' }],
+    },
+    limits: {
+      priority_min: 0, priority_max: 1000, node_count_max: 1000,
+      input_equals_max_items: 64, model_selectors_max_items: 128,
+      required_edges_max_items: 128, parameter_policies_max_items: 128,
+      asset_slots_max_items: 64,
+    },
+  },
+}
+
+export const definition = {
+  schema_version: 1,
+  priority: 0,
+  detector: { fallback: true, allow_other_nodes: true, node_counts: {}, optional_node_counts: {}, input_equals: [] },
+  output_nodes: { SaveImage: 'image' },
+  model_selectors: [],
+  node_roles: {},
+  required_edges: [],
+  parameter_policies: [],
+  asset_slots: [],
+  adapters: { compiler: 'generic.comfy/v1', output: 'comfy.primary/v1', dynamic: 'none/v1' },
+  projection: { kind: 'generic_fixed', config: {} },
+}

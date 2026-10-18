@@ -2,624 +2,146 @@
 
 ## 文档职责与当前状态
 
-本文是风格素材库独立素材生成能力的正式配置与操作手册，适用于图片、视频、音频、剧本以及“文本模型生成提示词”。它说明系统为什么不展示生成方案、如何通过正式页面登记 Provider、模型版本、Deployment 和 Workflow、如何建立真实 probe/smoke 证据，以及如何在素材库验证生成、下载和短剧复用入口。
+本文说明风格素材库如何配置和使用当前“模型执行实例版本”入口，适用于文本、图片、视频、音频和剧本素材。当前待办范围与验收缺口见[最新复核清单](optimization/backlog-review-2026-09-28.md)，配置与服务切换的日期化证据见[执行计划](optimization/execution-instance-unification-plan.md)；真实模型、媒体质量和页面业务验收由用户完成，代码和隔离测试不代表线上验收通过。
 
-本文只描述当前代码主路径：
+主图/变体关系管理、两类生成入口和可配置已有素材装配属于[模块计划M4/M9](optimization/backlog-review-2026-09-28.md#module-plan)，尚未完整交付。库内独立生成入口已完成M9-08开发/隔离组合验收；现用加载、配方产物组合及模块交付边界见唯一清单，不因入口存在推定全部已验。独立素材库不意味着自动短剧必须提前备库；自动链仍从本次结构化剧本产生本轮素材需求。
 
-- 系统设置入口：`/settings`，仅 staff 可进入；
-- 风格素材库入口：`/assets`，登录用户可以管理自己有权限的素材、创建本地入库或模型生成任务；任务状态与操作统一在“生产工作流” `/workflows?scope=asset` 查看；
-- 配置事实：Deployment 方案使用 `ProviderProfile → ModelProfileVersion → ModelDeployment → ModelDeploymentCapabilitySnapshot`；ComfyUI 方案使用已导入、Live validate、真实 workflow smoke 并显式发布的 `WorkflowTemplateVersion` 及其精确 `validated_deployment`；
-- 任务事实：提示词候选和剧本由 text-generation worker 执行，异步 API 图片/视频/音频由 async-media worker 执行，ComfyUI 图片/视频/音频由 generation worker 在共享 GPU 互斥门内执行；
-- API 字段、枚举和状态码仍以根目录 `openapi.yaml` 为唯一机器契约；
-- 本文中的域名、模型名、路径和费用均为结构示例，不代表已经接入某个真实供应商。
+素材库的图片生成表单选择精确实例后，可在“图片外观目标”声明主图或变体，关联设定可留空。变体须选择主图系列的确切版本，在原图片输入实际提供同一Asset，再指定原输入项和实例声明的差异来源；不是另填第二份差异正文，也不会自动把不匹配图片换成主图。当前输入键、项标识和原素材ID会完整换行展示。创建回执仅表示进入原任务准备；成功登记后在“主图、变体与版本”回看确切版本、原Asset、生成依据主图和素材生成任务。此路径复用M4原服务，不隐式创建剧本/配方，不以登记代替审核采用。
 
-当前实现不会自动下载模型、自动创建凭据、自动发布模型或工作流，也不会把配置存在、历史 smoke 通过或前端下拉出现等同于真实生成成功。
+接口字段、错误与权限以[API文档](api.md)和根目录[openapi.yaml](../openapi.yaml)为准；运行、凭据及受限Provider协议分别见[运维手册](operations.md)、[生产就绪检查](production-readiness.md)和[async REST媒体契约](api.md#async-rest-媒体契约)。本文不复制另一套Provider JSON或生成请求协议。
 
-## 1. 为什么素材库显示“没有可用方案”
+## 1. 业务用户选择什么
 
-素材库不会列出全部目录，而是通过 `GET /api/v1/asset-generation-jobs/options/` 针对任务类型和素材类型实时筛选安全生成方案。媒体素材有两类正式方案：受限异步 API Deployment 和已发布 ComfyUI Workflow；提示词候选与剧本只使用文本 Deployment。
+素材库只选择一个明确的**模型执行实例版本**。它固定运行部署、执行能力和模式，以及适用的工作流、提示词方式和输入合同；业务表单不再独立组合这些资源。
 
-Deployment 方案只有同时满足以下条件才会出现：
+- **运行部署（Deployment）**：模型版本在哪里运行，使用哪种受控API/ComfyUI驱动、主机和凭据。
+- **工作流版本（Workflow）**：ComfyUI执行哪张图，引用哪个已冻结Projector，以及参数、素材槽和输出合同；非工作流调用不需要它。
+- **提示词方式**：策略组装固定一个精确策略版本；人工完整通道由用户填写；无需提示词只适用于声明支持此方式的目标。
+- **执行实例版本**：固定上述本次业务用途的组合。不同用途新建不同版本/实例，底层资源可以共享，不复制模型文件或秘密材料。
+- **Preparation**：每次请求独立记录实际输入、参数、字段采用和费用授权；不是另一套资源配置。
 
-```text
-Provider active
-  + ModelProfileVersion published
-  + Deployment active
-  + 精确 capability / driver 合同匹配
-  + 当前 Provider、模型、Deployment、凭据 target hash 未漂移
-  + 对应 operation 有未过期且 execution_submitted=true 的 passed smoke
-  + base_url 可判定为本地或外部地址
-= 素材库可选 Deployment 方案
-```
+“目录中可选”“实例已发布”“组合烟测通过”“本次输入可以执行”是不同判断。发布不会调用模型，也不会写入通过证据；下拉出现不等于本次素材、字段和预算已满足执行条件。
 
-ComfyUI Workflow 方案只有同时满足以下条件才会出现：
+## 2. 管理员配置顺序
 
-```text
-WorkflowTemplateVersion current + published
-  + output kind 与 image/video/audio 精确匹配
-  + Live validate 绑定当前 active ComfyUI Deployment
-  + 版本 smoke_test_state=passed
-  + smoke evidence 精确绑定 succeeded attempt、fixture、compiled graph 和 execution target
-  + 当前用户有权执行模板
-  + 主输出是该媒体类型受支持的持久 Save 节点
-  + 可完整投影 workflow_input_schema
-  + validated deployment 是 loopback，且服务可访问同一 COMFYUI_OUTPUT_DIR
-= 素材库可选 ComfyUI 工作流
-```
+正式入口为“系统设置 → 执行实例”（`/settings?section=executions`）。配置页只限具备对应管理权限的用户；普通用户从素材库选择可见版本。已发布版本默认展示输入准备、模型能力调用和输出；底层资源可逐层下钻到各自唯一维护页。
 
-各下拉框使用的精确 operation 如下：
-
-| 页面用途 | 任务类型 | 素材类型 | 必需 operation | 额外门禁 |
-| --- | --- | --- | --- | --- |
-| 文本模型生成提示词 | `prompt` | 任意类型 | `script.generate` | text/multimodal 模型，完整 `series_concept` 策略，受控 chat transport |
-| 生成剧本素材 | `asset` | `script` | `script.generate` | 与提示词任务使用同一文本模型合同 |
-| 生成图片素材 | `asset` | `image` | Deployment 为 `image.text_to_image`；Workflow 使用版本声明 operation | 可选 fresh deployment smoke 的 `async_rest` Deployment，或 output kind=image 且已完成 Live validate → real workflow smoke → publish 的 ComfyUI Workflow |
-| 生成视频素材 | `asset` | `video` | Deployment 为 `video.text_to_video`；Workflow 使用版本声明 operation，例如 `video.reference_to_video` | 可选对应 `async_rest` Deployment 或 output kind=video 的合格 ComfyUI Workflow；参考输入不能降级为纯文本任务 |
-| 生成音频素材 | `asset` | `audio` | Deployment 为 `audio.text_to_audio`；Workflow 使用版本声明 operation | 可选对应 `async_rest` Deployment 或 output kind=audio 的合格 ComfyUI Workflow |
+1. 在“管理服务连接”及模型详情中核对Provider、模型能力合同、运行部署、主机和受管凭据。已有资源可原生使用时直接复用，不因改入口批量复制。
+2. 使用ComfyUI时，在“工作流”核对精确Workflow及Projector合同，沿原版本入口完成Live Validate、基础资源Smoke与发布。不需要工作流的API调用不创建占位Workflow/Projector。
+3. 使用策略组装时，先在“提示词策略”创建并复核当前合同的策略版本。普通查看使用“查看配置”和确定性预览；模型生成字段必须声明来源、要求及所需辅助能力，不依赖内置业务文案。
+4. 打开“执行实例”分区，创建实例及版本草稿，明确运行部署、执行能力/模式、适用工作流和提示词方式。
+5. 核对逻辑输入键、类型、数量、用途、配对、字段来源和参数策略。只选择实际需要的组合；缺少必需合同应补齐资源版本，不选列表第一项充当默认。
+6. 保存并查看完整合同，确认后发布精确版本。已发布版本不能原地修改；变更配置创建后继草稿。
+7. 从该版本的组合烟测入口，明确测试输入、字段、外发授权和预算，再由用户执行“新建真实烟测”。通过结果只证明该精确组合及实际测试规格，不能转移给其他策略、工作流或版本。
 
-特别注意：
+版本作者按“能力与实现 → 输入准备 → 输出约定”组织。创建后先保存组合，再读取该版本的输入目录；策略派生输入不重复接线，其他物理输入和辅助版本仍需明确选择。人工方式只声明调用时接收完整提示词，无提示词方式不增加策略要求；不需要工作流的部署不显示工作流选择。
 
-- “提示词文本模型”当前检查 `script.generate`，只有 `prompt.normalize` smoke 不能让它出现。
-- Deployment probe、Deployment operation smoke、Workflow Live validate 和 Workflow real smoke 是不同证据，不能互相替代。异步 API 方案读取 Deployment smoke；ComfyUI 方案读取 Workflow validation/smoke 证据。
-- `options.routes[]` 以 `target_kind=deployment|comfy_workflow` 区分两类方案。创建任务时必须二选一提交 `model_deployment_id` 或 `workflow_template_version_id`；客户端不能自行拼配 Workflow 与 Deployment。
-- ComfyUI 只用于 `job_type=asset` 的图片、视频和音频。提示词候选与剧本仍走 `script.generate` 文本 Deployment。
-- 选项接口会排除所有不合格方案。空列表表示当前没有满足全部条件的候选，不表示前端应自动选一个较旧或不兼容目标。
-
-### 1.1 空目录的判定顺序
+本次从精确版本创建后继后，作者显示来源及按上述三段归类的配置变更范围，包含尚未保存的修改；保存状态单独显示。此比较仅属于当前创建会话，重开已有版本不猜测来源，也不会自动更换配方引用。后继创建结果未知时先回读该实例的版本，并显式载入精确记录，不按名称或“最新版本”认领结果。
 
-空目录必须按方案类型分别定位，不能从 Provider 或历史任务存在推断可用：
+### 输入的来源范围怎么配置
 
-1. 提示词或剧本为空：核对文本模型 `script.generate` 能力、受控策略、Deployment 生命周期和 fresh operation smoke。
-2. 异步 API 媒体方案为空：核对 `async_rest` driver、精确媒体 operation、封闭请求/响应合同、Deployment target hash 和 fresh operation smoke。
-3. ComfyUI 媒体方案为空：核对版本是否 current/published、Live validate 的精确 Deployment、真实 workflow smoke attempt/evidence、output kind、持久 Save 主输出、模板执行权限，以及 `workflow_input_schema` 是否能从当前版本的参数、固定槽和 conditioning 合同完整投影。存在 required 输入本身不是排除条件。
-4. 方案曾出现后消失：重新读取 API，检查生命周期、凭据、graph、execution contract、validation evidence、fixture/compiled graph 或 target 是否漂移；不得使用浏览器旧缓存。
+实例草稿的每个输入都应核对“上下文来源与范围”。文本和结构化内容也需要声明允许范围，不只是图片、视频和音频。选项来自服务端目录；勾选“项目”或“镜头”只允许使用该范围的真实来源，不会自动替用户选项目、采用剧本或生成上下文。
 
-## 2. 权限、页面与服务前提
+- 手动填写的普通文本是否可用，由目标的来源合同决定；允许项目来源并不等于禁止手填。
+- 只接受已确认上下文/已采用上游输出的输入，必须至少开放一种与该来源类型匹配的范围，否则合同复核和发布会明确报错。例如影视规则的 `source` 需要项目范围，不能用手填 JSON 冒充确认快照。
+- 实际调用时，在“内容来源”选择相应来源，再依次选择所属项目、剧本来源和已确认修订。没有可用修订时应先完成正式导入/审核，不会自动换用旧稿或其他项目。
+- 配方使用同一份输入合同，明确映射已审核上游输出；策略的嵌套上下文同样受范围约束。修改已经发布的来源范围需创建后继版本，而不是原地改合同。
 
-### 2.1 角色分工
+基础资源Smoke固定本次明确选择的能力、策略或人工方式；组合Smoke则固定执行实例版本。两类证据不得相互伪装。ComfyUI基础资源Smoke必须先Live Validate；实例组合配置的发布不要求提前制造组合通过记录，避免发布/烟测相互等待。
 
-| 角色 | 可以执行 | 不能执行 |
-| --- | --- | --- |
-| 超级管理员 | 创建、轮换和启停 SecretBinding；为 Provider/Deployment 选择受管凭据；执行 staff 配置操作 | 读取已保存的秘密正文 |
-| 平台管理员（staff） | 管理 Provider、模型版本、Deployment、Workflow；执行 probe/smoke；处理不确定状态 | 创建或替换秘密绑定 |
-| 普通登录用户 | 在素材库创建自己的生成任务，在生产工作流查看状态、取消或重试自己的可操作任务，下载有权限的素材 | 进入系统设置或修改平台目录；处理管理员消歧 |
+日常启动和重启只使用`scripts/restart.ps1`。若只管理平台、不启动ComfyUI，使用其已有`-SkipComfyUI`参数。仓库没有独立本地停止脚本，不以临时worker命令代替正式服务管理入口。
 
-外部 API 需要凭据时，超级管理员先完成 SecretBinding 和引用绑定，平台管理员再执行 probe/smoke。不要把 API Key、Token 或签名 URL 写入 Provider JSON、模型 specification、生成参数、普通文档或审计说明。
+## 3. 素材库操作
 
-### 2.2 服务前提
+### 3.1 查看、上传与编辑素材信息
 
-日常启动和重启只使用：
+入口：“风格素材库”（`/assets`）→“查看素材”或“新增素材”。素材是可复用的内容，不是配置版本，不需要发布或创建后继。
 
-```powershell
-scripts/restart.ps1
-```
+- 详情先显示内容与创作备注，再显示媒体信息、系统来源和可查询的主图／变体系列。技术标识、摘要按需展开；展示摘要不代表本次重新校验文件。系列查询不覆盖全部项目或任务，没有系列不等于未被使用。
+- 新增和编辑按“内容与获取方式→素材信息→复核与使用”组织，可直接定位分段。名称、描述、视觉锚点属于当前素材，不是公共字段定义。编辑只保存原素材的信息，不替换文件、不改写系统来源、不自动修改其他任务的选择。
+- 视频、音频编辑可预览原媒体，剧本编辑可读取已入库正文；预览读取失败会明确提示，不拿缩略图或旧正文代替当前文件。剧本文字按正文14px显示，长行在内容区换行。
+- 媒体信息显示服务端已记录的文件大小、音视频时长、视频来源帧率／内嵌音频，以及剧本上传格式／入库处理。缺失和格式异常分别标记，不从生成参数推算，也不把缺失值当成0。
+- “本地添加”选择文件后仅作本地预览，点击“上传并入库”才提交。上传校验沿原格式及媒体探测规则；具体任务使用时再读取执行实例的时长、帧率等约束，不把某模型的范围当成素材库统一上传限制。
+- 剧本本地添加先显示所选文件；TXT／Markdown／Fountain／DOCX沿原服务端提取与UTF-8 Markdown入库流程处理，上传前不在浏览器另建DOCX解析器，不将选择文件视作解析成功。
+- 保存中显示阶段并阻止重复点击；明确字段错误保留原值并定位。关闭或离开未保存表单会提示，可继续编辑；刷新不是保存。
+- 未收到确定回执时不重复上传或保存：编辑按原素材ID只读回读；上传只能检索当前启用素材，无法据同名或空结果证明原请求成功或失败。明确选择“结束本地编辑并查看当前记录”只是查看现存记录，不补造成功回执。该提示和锁定属于当前窗口，不保证跨硬刷新或跨设备恢复；关闭后仍应核对再决定后续操作。
 
-该入口会启动 API、前端和 generation、text-generation、async-media、assembly、platform-maintenance worker。若 smoke 或生成任务长时间保持 `queued`，先检查对应 worker 是否运行及其日志；不要重复点击创建付费请求。
+### 3.2 使用执行实例生成素材
 
-仓库没有独立的本地停止脚本，不得虚构 `stop.ps1` 或用临时 worker 命令作为业务日常入口。
+入口：“风格素材库”（`/assets`）→ 目标素材类型 → “新增素材” → “模型生成”。
 
-## 3. 配置提示词与剧本文本模型
+生成表单按“选择生成能力→本次输入与处理→输出与创建任务”排列。这里填写的是本次任务的值，不维护字段定义、策略或工作流；“查看所选实例定义、实现与使用方”在同一面板只读下钻，返回保留原输入与焦点。确切版本和合同摘要按需展开，不按名称或最新版替换原选择。
 
-已有文本 Deployment 若只是 `script.generate` smoke 过期，最短恢复路径是重新建立该精确 operation 的真实 smoke：
+1. 选择与目标输出类型匹配的精确执行实例版本。提示词候选选择文本输出实例；辅助字段专用操作不作为主素材生成目标。
+2. 等待读取本版本输入合同，填写必需文本/业务事实，并从素材库选择或经正式上传创建受管素材。上传不是临时路径绕过。
+3. 按各逻辑槽位选择素材、实体、用途和必要的音视频配对。数量范围、可选类别与预处理来自合同，不由文件名或列表顺序猜测。
+4. 只调整合同开放的参数。固定值只读；范围、步长/余数与类型由后端再次核验。自动种子在首次准备中落盘，恢复同一请求不重新抽取。
+5. 提示词方式为“人工完整通道”时，填写当前合同要求的通道，提交内容不会再被另一策略重复组装；策略方式按所选策略准备字段并组装，审核与采用遵循配置，不要求一律人工填写或逐字段确认。无需提示词方式只填写合同声明的其他输入与参数。
+6. 阅读当前缺口、准入告警、预计费用并明确本次外发授权和预算。创建后可能先等待输入/字段确认，不能把等待准备误当模型正在运行。
+7. 在“任务中心”的素材生成类别（`/workflows?category=asset`）查看原任务和准备详情；按提示补充、确认或继续已授权准备。成功以后才出现正式受管产物。
 
-1. 使用平台管理员账号进入“系统设置”。
-2. 保持在“模型”分区，找到目标文本 Deployment。
-3. 点击“烟测”。
-4. 在 operation 中明确选择 `script.generate`。
-5. 阅读真实调用和费用提示后，点击“确认并执行真实烟测”。
-6. 页面先显示持久任务 `queued`，随后由 text-generation worker 领取并执行。
-7. 等待任务终态为 `succeeded`，再点击“重新读取”核对新的 smoke 到期时间和证据。
-8. 返回“风格素材库”，进入任意素材类型的“新增素材 → 模型生成”。
-
-预期结果：
-
-- “提示词文本模型”出现该文本 Deployment；
-- 剧本素材的“素材生成方案”也可出现该 Deployment；
-- 图片、视频或音频的“素材生成方案”独立判定；合格的异步 API Deployment 或 ComfyUI Workflow 均可出现。
-
-真实 smoke 会向外部文本 Provider 提交低成本请求并可能计费。本文更新没有执行该操作，不能把上面的预期结果写成本次已通过事实。
-
-### 3.1 新建文本模型时的规格要求
-
-如果不是刷新现有 Deployment，而是登记新的提示词/剧本模型，必须使用实现受控 chat completion 的文本 Provider，并在模型完整规格中声明精确能力和 `series_concept`：
-
-```json
-{
-  "schema_version": 1,
-  "capabilities": ["script.generate"],
-  "model_family": "example-text-family",
-  "series_concept": {
-    "minimum_shot_duration_ms": 1000,
-    "maximum_shot_duration_ms": 10000,
-    "max_output_tokens": 4096,
-    "timeout_seconds": 180
-  }
-}
-```
-
-字段要求：
-
-| 字段 | 要求 | 作用 |
-| --- | --- | --- |
-| `schema_version` | 必须为 `1` | 选择当前文本模型合同 |
-| `capabilities` | 必须在此数组精确声明 `script.generate` | 旧 `operations`/`protocols` 别名不会兼容 |
-| `model_family` | 提示词策略族 | 用于 PromptProfile 匹配；它不是模型记录跨版本的 `profile_key` |
-| `minimum_shot_duration_ms` | 正整数 | 最小镜头时长门禁 |
-| `maximum_shot_duration_ms` | 正整数且不小于最小值 | 最大镜头时长门禁 |
-| `max_output_tokens` | 正整数 | 文本候选输出上限 |
-| `timeout_seconds` | 0.5–3600 的数值 | 本次文本执行超时 |
-
-如同一文本模型还用于正式短剧生产，可另外声明并分别配置 `script.structure`、`prompt.normalize`。这两个 operation 必须各自执行真实 smoke，但它们不能替代素材库所需的 `script.generate` smoke。
-
-## 4. 接入图片、视频或音频 async REST Provider
-
-受限异步 REST 是媒体素材生成的一类正式方案；另一类是第 10 节的 ComfyUI Workflow。接入异步 API 前必须从真实供应商取得并确认以下外部契约：
-
-- API 根地址和健康检查路径；
-- 创建任务、轮询、取消和收集产物路径；
-- 提交响应中的 request ID 字段；
-- 轮询响应中的状态字段及成功、失败、取消终态；
-- 产物数组、URL、类型、ID 和可选 SHA-256 字段；
-- 实际费用及币种字段；
-- API 主机和所有可能的产物下载主机；
-- 标准模型参数到远端单层字段的映射；
-- 可确定的提交前计价方式。
-
-供应商只提供同步响应、嵌套字段表达式、无法受限下载的任意 URL、无法幂等提交或无法识别终态时，不能用猜测配置成 `async_rest`。
-
-### 4.1 配置全局主机白名单
-
-在目标环境的 `backend/.env` 中，把媒体 API 主机和产物下载主机加入 `AI_PROVIDER_ALLOWED_HOSTS`。只填写规范化主机名，不填写 scheme、端口、路径、凭据或通配符：
-
-```env
-AI_PROVIDER_ALLOWED_HOSTS=localhost,127.0.0.1,::1,media-api.example.test,media-cdn.example.test
-```
-
-`example.test` 仅为文档占位符，实际配置必须替换为已审查的真实主机。环境变量修改后使用 `scripts/restart.ps1` 重启；Settings 页面不能在运行期替换这道部署级 SSRF 白名单。
-
-### 4.2 创建受管凭据
-
-需要 Bearer Token 的 Provider 由超级管理员执行：
-
-1. 系统设置 →“凭据与审计”。
-2. 点击“新增受管凭据”。
-3. 填写唯一 key、显示名称、用途 `provider_credential`、秘密正文和可审计说明。
-4. 提交后核对状态为 configured。
-
-秘密正文只在创建或轮换请求中写入一次，后续页面不会回显。若 Provider 是受控本地且不需要鉴权，可以不绑定凭据；不能为消除“未配置”提示而保存假的 Token。
-
-### 4.3 新建 Provider
-
-进入系统设置 →“模型”，点击“管理服务连接”，展开后再点“新增服务连接”。常用字段如下：
-
-| 页面字段 | 图片示例 | 必填/约束 | 影响 |
-| --- | --- | --- | --- |
-| 唯一 Key | `media-image-primary` | 小写稳定 key | 被模型、Deployment 和审计引用 |
-| 显示名称 | `Media Image Primary` | 必填 | 仅用于识别 |
-| 驱动类型 | `受限异步 REST` | 必须为 `async_rest` | 决定 submit/poll/collect 协议 |
-| 支持模态 | `image` | 当前为声明字段，按注册驱动真实能力填写 | 用于展示与人工审核，不是执行能力门禁 |
-| 受控操作 | `image.text_to_image` | 当前为声明字段，需与驱动和模型 capability 保持一致 | 用于展示与人工审核；烟测候选来自模型版本 capability |
-| 启用 Provider | 开启 | 必须启用后才能进入新部署和任务路由 | 停用会保留历史但阻断新调用 |
-| 受管凭据 | 选择已配置 SecretBinding | 外部需鉴权时选择 | 只保存引用，不保存明文 |
-| 服务根地址 | `https://media-api.example.test` | 无凭据、query、fragment；主机已全局允许 | 所有远端调用根地址 |
-| 请求超时 | `60` 秒 | 必填；服务端允许 0.5–600 | 单次 health/submit/poll/cancel/collect 网络等待上限 |
-| 健康检查路径 | `/health` | 相对路径 | Deployment probe |
-| 提交路径 | `/jobs` | 相对路径 | 创建异步任务 |
-| 查询路径 | `/jobs/{request_id}` | 仅一个占位符 | poll 远端状态 |
-| 取消路径 | `/jobs/{request_id}/cancel` | 仅一个占位符 | 请求远端取消 |
-| 收集路径 | `/jobs/{request_id}` | 仅一个占位符 | 获取最终 manifest |
-| 请求 ID 字段 | `id` | 单层 JSON 字段名 | 冻结远端任务身份 |
-| 状态字段 | `status` | 单层 JSON 字段名 | 判断远端状态 |
-| 成功终态 | `succeeded` | 1–32 个且与其他终态不重叠 | 进入 collect |
-| 失败终态 | `failed` | 同上 | 形成明确失败 |
-| 取消终态 | `cancelled` | 同上 | 形成明确取消 |
-| 产物列表字段 | `artifacts` | 单层 JSON 字段名 | 读取产物数组 |
-| 产物 URL 字段 | `url` | 单层 JSON 字段名 | 受控下载 |
-| 产物类型字段 | `kind` | 单层 JSON 字段名 | 应返回 image/video/audio |
-| 产物 ID 字段 | `id` | 单层 JSON 字段名 | 远端身份审计 |
-| 产物 SHA-256 字段 | `sha256` | 单层 JSON 字段名 | 若供应商提供则核对完整性 |
-| 实际费用字段 | `actual_cost` | 单层 JSON 字段名 | 费用事实 |
-| 费用币种字段 | `currency` | 单层 JSON 字段名 | 与实际费用配对 |
-| 产物主机白名单 | `media-cdn.example.test` | 小写主机且是全局白名单子集 | 阻止任意 URL 下载 |
-| 请求字段映射 | `model→model, prompt→prompt` | model、prompt 必填；目标名唯一 | 把标准语义映射到远端请求 |
-| 幂等请求头 | `Idempotency-Key` | 合法 HTTP header 名 | 防止不确定提交后重复扣费 |
-| 轮询间隔 | `2` 秒 | 必填；0.25–300 | 外部压力和刷新延迟 |
-| 最长轮询时间 | `3600` 秒 | 必填；10–604800 的整数 | 生产任务创建时冻结的总等待硬边界 |
-| 进度字段 | `progress` | 可选单层 JSON 字段名；无可信进度时留空 | 只记录远端真实进度 |
-| 进度满值 | `100` | 配置进度字段时必须为有限正数 | 把远端数值归一化为比例，不改变终态 |
-| 能力快照有效期 | `3600` 秒 | 60–604800 | smoke 多久后必须刷新 |
-| 估算币种 | `USD` | 3–12 位大写标识 | 预算门禁 |
-| 单次固定费用 | `0.010000` | 非负数；与币种同时填写 | 提交前可确定成本 |
-
-> Provider 驱动、“支持模态 / 声明操作”都从 `GET /api/v1/model-profile-versions/options/` 构造受控选择；目录不可用时新增与编辑失败关闭，不回退任意文本。这些字段仍是说明、展示与人工审核用的运营标记；实际可执行性以注册驱动 capabilities、已发布模型版本 `specification.capabilities`、Deployment/Workflow 合同和新鲜真实 Smoke 证据共同证明。
-
-`timeout_seconds`、`poll_interval_seconds` 与 `max_poll_seconds` 是同一组有限运行预算，必须显式保存。生产任务会冻结 `max_poll_seconds`，后续 worker 不按新配置改写既有任务。真实 Smoke 另受平台 60 秒总轮询、2 秒最大轮询间隔的安全包络限制；这只约束验证作业，不会把生产预算静默改成 60 秒。
-
-页面类型化字段等价的结构示例如下。不要原样使用示例域名、状态或费用；必须按真实供应商合同逐项核对：
-
-```json
-{
-  "base_url": "https://media-api.example.test",
-  "health_path": "/health",
-  "submit_path": "/jobs",
-  "poll_path": "/jobs/{request_id}",
-  "cancel_path": "/jobs/{request_id}/cancel",
-  "collect_path": "/jobs/{request_id}",
-  "timeout_seconds": 60,
-  "request_id_field": "id",
-  "status_field": "status",
-  "terminal_success": ["succeeded"],
-  "terminal_failure": ["failed"],
-  "terminal_cancelled": ["cancelled"],
-  "artifacts_field": "artifacts",
-  "artifact_url_field": "url",
-  "artifact_kind_field": "kind",
-  "artifact_id_field": "id",
-  "artifact_sha256_field": "sha256",
-  "actual_cost_field": "actual_cost",
-  "currency_field": "currency",
-  "artifact_allowed_hosts": ["media-cdn.example.test"],
-  "request_field_map": {
-    "model": "model",
-    "prompt": "prompt",
-    "negative_prompt": "negative_prompt",
-    "width": "width",
-    "height": "height",
-    "duration_seconds": "duration_seconds",
-    "fps": "fps",
-    "seed": "seed"
-  },
-  "idempotency_header": "Idempotency-Key",
-  "poll_interval_seconds": 2,
-  "max_poll_seconds": 3600,
-  "progress_field": "progress",
-  "progress_max": 100,
-  "capability_ttl_seconds": 3600,
-  "pricing": {
-    "currency": "USD",
-    "fixed_per_request": "0.010000"
-  }
-}
-```
-
-按上述字段配置时，远端响应至少要能投影为以下结构：
-
-```json
-{
-  "submit": {"id": "remote-request-id"},
-  "poll": {"status": "succeeded", "progress": 100},
-  "collect": {
-    "status": "succeeded",
-    "artifacts": [
-      {
-        "id": "remote-artifact-id",
-        "kind": "image",
-        "url": "https://media-cdn.example.test/files/result.png",
-        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-      }
-    ],
-    "actual_cost": "0.010000",
-    "currency": "USD"
-  }
-}
-```
-
-字段值可以不同，但必须通过 Provider 的单层字段配置准确映射。平台不会执行任意 JSONPath、脚本转换或不受控响应猜测。
-
-### 4.4 新建并发布媒体模型版本
-
-点击页面主按钮“新建模型”，填写新的稳定模型版本族 key 和真实 `model_identifier`，并从服务端目录选择 Provider、主模态、能力列表与提示词策略族。首次版本固定由服务端分配为 `v1`，`specification.schema_version` 也由服务端维护，页面不接受人工版本号。模型规格发布后不可原地修改；只有当前最高版本为 published/retired 时才能从对应模型卡片点击“新建下一版本”。服务端会先校验源合同的大小与 SHA-256，再锁定模型版本族并按该族全部历史（包括 retired）原子分配下一号。若最高版本已是草稿，页面要求继续编辑该草稿；并发或旧源请求会返回冲突，不依赖浏览器计算 `max+1`。
-
-模型版本族 key（`profile_key`）与提示词策略族（`specification.model_family`）是两个概念：前者是模型记录跨版本身份，后者用于 PromptProfile 匹配。策略族选择器以 `options.model_families` 为已登记目录；新模型可在选择器中显式选择由合法 Profile Key 派生的同名新策略族，除此之外不接受自定义文本。能力列表、主模态、策略族、Provider 驱动、Provider 模态/传输操作以及 Artifact 角色都来自 `GET /api/v1/model-profile-versions/options/`；目录读取失败时正式页面失败关闭，不回退自由文本。能力选择只是版本合同声明，仍不能替代发布、Deployment/Workflow 合同与真实 Smoke。
-
-> 受控目录必须提供 `text`、`image`、`video`、`audio`、`multimodal` 五个正式主模态选项；音频模型必须选择 `audio`。任一选项缺失都视为服务端目录或前端合同不完整，页面应阻断新增/编辑，不得通过数据库或临时 CLI 旁路创建。
-
-以下是图片 `image.text_to_image` 的完整结构示例：
-
-```json
-{
-  "schema_version": 1,
-  "capabilities": ["image.text_to_image"],
-  "model_family": "example-image-family",
-  "async_media": {
-    "schema_version": 1,
-    "operations": {
-      "image.text_to_image": {
-        "output_kind": "image",
-        "request_schema": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["model", "prompt", "width", "height"],
-          "properties": {
-            "model": {"type": "string", "minLength": 1, "maxLength": 255},
-            "prompt": {"type": "string", "minLength": 1, "maxLength": 60000},
-            "negative_prompt": {"type": "string", "maxLength": 60000},
-            "width": {"type": "integer", "minimum": 64, "maximum": 4096},
-            "height": {"type": "integer", "minimum": 64, "maximum": 4096},
-            "seed": {"type": "integer", "minimum": 0}
-          }
-        },
-        "smoke_inputs": {
-          "model": "media-model-v1",
-          "prompt": "smoke test image",
-          "width": 64,
-          "height": 64
-        }
-      }
-    }
-  }
-}
-```
-
-`smoke_inputs.model` 应与本模型版本真实 `model_identifier` 一致，并选择供应商允许的最低成本有效参数。不要填入假模型名来换取页面发布成功。
-
-视频和音频使用同一封闭合同结构，但 operation、输出和典型参数不同：
-
-| 类型 | operation | `output_kind` | 常见属性 | smoke 要求 |
-| --- | --- | --- | --- | --- |
-| 图片 | `image.text_to_image` | `image` | model、prompt、negative_prompt、width、height、seed | 低分辨率但必须返回真实可探测图片 |
-| 视频 | `video.text_to_video` | `video` | 图片字段加 duration_seconds、fps | 低时长/低分辨率但必须返回真实可探测视频 |
-| 音频 | `audio.text_to_audio` | `audio` | model、prompt、duration_seconds、seed | 最短允许时长但必须返回真实可探测音频 |
-
-`request_schema` 只允许标准字段：`model`、`prompt`、`negative_prompt`、`width`、`height`、`duration_seconds`、`fps`、`seed`、`audio`。每个必填字段都必须在 `properties` 和 `smoke_inputs` 中出现；不能允许额外字段。
-
-`prompt.maxLength` 必须由这个已发布模型版本明确声明，且必须是 1–60000 的整数。60000 是平台集中维护的绝对请求文本包络，不代表每个模型都具备该容量；真实模型更小的限制应按供应商能力填写，并随 ModelProfileVersion 冻结。前端不另设同值 `maxlength` 作为第二套能力来源。
-
-保存草稿后，在模型卡片的草稿版本点击“核对并发布”，选择稳定审计原因代码并确认。远端模型没有本地文件时，“文件与证明”应保持明确的 N/A 状态，不能伪造 artifact。
-
-### 4.5 创建运行实例（Deployment）
-
-展开刚发布版本的“运行实例（Model Deployment）”，点击“新增运行实例”。模型版本会被精确预选，然后填写：
-
-- 稳定 Deployment key 和显示名称；
-- 刚发布的模型版本；
-- 远端服务选择“不绑定本地主机”；本地受控服务只绑定已 probe 为 active 的 RuntimeHost；
-- priority 和是否默认；
-- 状态 `active`；
-- 仅在该 Deployment 与 Provider 不同时填写 `runtime_config` 覆盖；空对象表示继承 Provider；
-- 如需使用与 Provider 不同的受管凭据，由超级管理员在 Deployment 上选择。
-
-运行时覆盖和凭据变化都会改变 Deployment target hash，使旧 probe/smoke 证据失效。不要为了保留旧 smoke 而建立重复 Deployment 或复制旧快照。
-
-### 4.6 本地模型路径调整、删除与退役
-
-模型卡片中具体能力版本的“文件与证明”记录的是受控 models 根下的相对文件名、库存目录、预期大小和 SHA-256，不是磁盘文件管理器。编辑或删除注册记录都不会移动、改名或删除真实文件。
-
-- 如果只移动整套 ComfyUI，且 `models/<inventory_folder>/<filename>` 与文件内容保持不变，更新 `COMFYUI_OUTPUT_DIR`/受控端点后通过 `scripts/restart.ps1` 重启，再执行 RuntimeHost probe、artifact verify 和受 target 漂移影响的 smoke/Workflow 验证；无需复制 artifact。
-- 如果相对位置或文件内容变化，draft artifact 可编辑，保存后旧核验会自动失效并回到 `declared`；published/retired 版本必须新建更高 ModelProfileVersion 和 artifact，不能覆盖旧证据。
-- 只有从未核验、没有任何主机观测和引用的 draft artifact 声明可删除。Deployment 先停用；无证据的 disabled 空记录可删除，有历史证据的记录在替换活动配方/current Workflow 后退役保留。
-
-完整迁移顺序和故障判定见 [运维文档：模型文件路径调整与注册表清理](operations.md#模型文件路径调整与注册表清理)。
-
-## 5. Deployment probe、operation smoke 与候选生效
-
-### 5.1 执行 Deployment probe
-
-对于 active `async_rest` 运行实例，展开所属模型版本的“运行实例”，在该实例“更多”中选择“探测（Probe）”：
-
-1. 点击“探测”。
-2. 平台向配置的 health path 发起受控 GET。
-3. 查看页面返回的 capability snapshot，而不是只看按钮 Toast。
-4. 失败时先修复域名白名单、DNS、TLS、凭据、路径或远端健康状态。
-
-Probe 证明目标端点当时可达，但不提交生成，不证明产物合同正确，也不让素材模型自动进入下拉框。
-
-### 5.2 执行精确 operation smoke
-
-1. 在同一运行实例行点击“真实烟测（Smoke）”。
-2. operation 必须选择当前类型的精确值，例如 `image.text_to_image`。
-3. 阅读费用说明并点击“确认并执行真实烟测”。
-4. API 先创建持久 `ModelDeploymentSmokeAttempt` 并返回 `202`；浏览器不直接占用一个长请求等待远端完成。
-5. async-media worker 领取任务后执行一次 submit，再 poll 和 collect。
-6. 等待任务终态 `succeeded`，点击“详情与证据”核对 operation、target、到期时间、请求/响应 hash 和成本事实。
-
-一个模型声明多个 operation 时必须逐项 smoke。例如图片 passed 不能证明视频，`script.generate` passed 不能证明 `prompt.normalize`。
-
-### 5.3 判定模型已进入素材库
-
-Smoke 成功后：
-
-1. 点击系统设置右上角“重新读取”。
-2. 确认 Deployment 显示 fresh smoke，而不是只显示历史 `succeeded` attempt。
-3. 进入 `/assets`。
-4. 切换到对应图片、视频、音频或剧本类型。
-5. 点击“新增素材”，选择“模型生成”。
-6. “素材生成方案”中的异步 API 条目应显示 Deployment 名称、operation、外部标记和 smoke 有效期；ComfyUI 条目按第 10 节的 Workflow 证据判定，并携带该不可变版本的 `workflow_input_schema`。
-
-若页面仍为空，按第 9 节逐项排查。不要使用浏览器缓存、数据库直接插入或本地常量绕过服务端选项目录。
-
-### 5.4 素材库与生产工作流页面分工
-
-- 素材库顶部的“风格、素材类型、图片子类、搜索、刷新、排序、生成任务、新增素材”组成固定操作区。滚动素材列表时该区域保持在页面内容顶部；风格过多时单行横向滚动，不再换成多层大卡片。
-- 素材库只负责检索、预览、下载、本地入库和创建生成任务，不再展示第二份任务历史。
-- 点击“生成任务”，或提交提示词/素材生成任务后，会进入 `/workflows?scope=asset&task=<job-id>`。生产工作流页以文字标签区分“素材任务”“短剧任务”和“独立媒体”，并保留各自的真实状态语义。
-- 短剧 Task 详情仍为只读诊断，写操作回所属 ProductionRun；素材 AssetGenerationJob 可在其详情中取消、对失败或已取消任务重试，并由 staff 对 `uncertain` 做人工消歧。
-- 成功提示词任务点击“采用并继续生成”后，系统以 `promptJob` 标识返回素材库并重新打开对应类型的模型生成表单；URL 不携带长提示词正文。成功素材任务可从工作流详情返回素材库查看，或直接使用新的受管下载地址下载。
-
-## 6. 在素材库执行一次真实生成验证
-
-只有在用户明确同意真实外部调用及可能费用后执行：
-
-1. 进入对应素材类型的“新增素材 → 模型生成”。
-2. 填写名称、基础描述、创作需求和最终提示词。
-3. 如需文本模型扩写，先选择“提示词文本模型”并创建独立提示词任务；页面会跳转到生产工作流。任务成功后人工核对并点击“采用并继续生成”返回素材库，系统不会自动串联素材扣费。
-4. 选择本类型“素材生成方案”，确认标签是“异步 API”还是“ComfyUI”，并核对其 Deployment、精确 operation 与 smoke 证据。参考生视频 Workflow 应显示自身声明的 `video.reference_to_video` 等 operation，不应被改写为 `video.text_to_video`。
-5. 只填写方案公开的可编辑输入。异步 API 参数必须符合封闭 `request_schema`；ComfyUI 页面按 `workflow_input_schema` 动态展示全部 string/integer/number/boolean/enum 标量、每个固定图片/视频/音频槽，以及按 `CONDITIONING_MODE` 切换的动态多图、多视频、音频用途和内嵌/外部音轨配对选项。多个 conditioning mode 时必须明确选择，单一 mode 可使用版本给出的唯一值。
-6. ComfyUI 创建体统一为 `workflow_inputs={schema_version:2,values,assets,references}`：`values` 保存公开标量与 `CONDITIONING_MODE`，`assets` 只保存 `{semantic_key,asset_id}`，`references` 只保存图片/视频/音频 Asset ID、用途和音轨配对意图。不得提交本地路径、checksum、上传名、ComfyUI 节点值或高级 JSON。提示词、模型、输出前缀和 `generation.batch_size=1` 由服务端注入。
-7. 只要所选文本或媒体模型是外部地址，勾选允许外发，并填写不低于本次估算费用的预算上限。
-8. 点击“创建生成任务”。服务端会在排队前重新读取 owner/global Asset，校验 required 输入、active/MIME/受管路径/SHA-256、数量、用途、互斥与音轨配对，并复用短剧的 semantic compiler、staging 和 conditioning/preprocessing adapter；任一不满足都会明确失败，不会降级丢弃参考素材。
-9. 页面会跳转到“生产工作流”的素材任务详情；在该页观察 `queued → submitting → submitted/running → succeeded`。`uncertain` 必须保持为“待核对”，由管理员核对远端终态与账单后消歧；不要用 Toast 或浏览器等待时间判断成功。
-10. 成功后打开新 Asset，核对素材类型、checksum、来源任务和预览。
-11. 点击下载前让页面重新读取 Asset 详情，使用新的短期签名 `download_url` 下载受管文件。
-12. 在短剧制作正式选择器中核对图片、视频或音频可被选择；剧本先导入目标项目形成 preview revision，再人工确认。
-
-验收结果必须分别记录：
-
-- 所选方案是 Deployment 还是 ComfyUI Workflow；
-- Deployment 方案的 probe 与精确 operation smoke 是否 passed/fresh，或 Workflow 方案的 Live validate、精确真实 smoke 和 published/current 状态是否成立；
-- AssetGenerationJob 是否 succeeded；
-- 执行产物是否已受限下载或从受控共享目录读取、探测、校验并物化为 Asset；
-- 下载是否使用新签名地址；
-- 对应短剧入口是否能读取该 Asset。
-
-若尚未进行现场验收，不得把自动化测试、已有其他 Workflow 产物或历史截图登记为本次通过。已执行的现场结果必须追加到第 11.2 节，并保留失败、重试与费用事实。
-
-## 7. 费用、外发与安全确认
-
-- Provider 或 Deployment 必须提供可确定 pricing；ComfyUI 本地方案也必须由 driver 在任务创建前返回确定估算。无法估算时，真实 smoke 或素材任务应被阻断。
-- 外部素材任务必须逐次提交 `allow_external_calls=true` 和预算上限；平台不会从上一次任务沿用授权。
-- 预算是本次上限，不是供应商账单替代品；最终以持久 actual cost 事实和 Provider 账单对账。
-- `base_url` 不得包含凭据、query 或 fragment；API 和产物主机必须在部署级全局白名单中。
-- `artifact_allowed_hosts` 必须是全局白名单的规范化子集。重定向或返回未允许主机时，下载必须失败。
-- SecretBinding 明文只允许超级管理员 write-only 创建或轮换；浏览器、普通 API、审计和本文均不回显。
-- Idempotency-Key 由持久任务冻结。网络响应丢失时先刷新同一任务，不创建“看起来一样”的第二个付费请求。
-- 产物进入本地前必须经过大小、类型、媒体探测和可选远端 SHA-256 校验；远端 URL 本身不等于受管 Asset。
-- ComfyUI 方案只接受 loopback Deployment 与受控共享 `COMFYUI_OUTPUT_DIR`；远程 ComfyUI 在没有正式受限下载合同时不会进入素材生成目录。
-
-## 8. Smoke 过期、target 漂移和 uncertain 恢复
-
-### 8.1 Smoke 过期
-
-`capability_ttl_seconds` 默认 3600 秒，允许范围为 60–604800 秒。到期后：
-
-- 历史 attempt 和 snapshot 保留；
-- 素材选项目录立即排除该 Deployment；
-- 新任务不能回退使用过期证据；
-- 管理员必须重新执行对应 operation smoke。
-
-延长 TTL 只是延长证据使用窗口，不能替代真实复验。应依据供应商稳定性、模型更新频率和费用风险设置，而不是固定设为最大值。
-
-### 8.2 Target 漂移
-
-以下变化会使旧 smoke 与当前目标不一致：
-
-- Provider driver config 改变；
-- Deployment runtime config 改变；
-- 受管凭据绑定或 SecretVersion 改变；
-- 模型 specification 或 model identifier 变更；
-- Provider/Deployment 生命周期不再 active。
-
-变更后重新 probe 和 smoke。已发布模型 specification 不可修改，应创建新模型版本和新 Deployment，不得搬运旧 snapshot。
-
-### 8.3 Deployment smoke 为 uncertain
-
-`uncertain` 表示平台无法确认一次真实 submit 是否到达远端，不表示“可以再试一次”：
-
-1. 不要创建同 operation 的新 smoke。
-2. 管理员核对 Provider 控制台、远端 request、终态和账单时间范围。
-3. 在系统设置的 Deployment 行点击“管理员消歧”。
-4. 选择“确认未提交”“确认远端已提交”或“确认远端失败”，填写至少 8 个字符的可复核说明；需要时提交 request ID 和实际费用/币种。
-5. 提交只追加不可变结论，不会把旧 attempt 改成 passed。
-6. 消歧完成后必须创建新的真实 smoke，只有新 attempt 成功才形成可用证据。
-
-### 8.4 Workflow smoke 为 uncertain
-
-Workflow smoke 与 Deployment smoke 使用不同的 attempt/action：
-
-1. 未消歧前，同一 workflow/deployment 的任何 fixture 都禁止创建新 smoke。
-2. staff 核对 ComfyUI queue/history、稳定 submission token 和终态后，通过 `WorkflowSmokeAttempt.resolve-uncertain` 追加不可变结论。
-3. 人工确认成功也不会把旧 attempt 或版本标成 passed；必须创建新的真实 attempt，重新收集并验证 fixture、compiled graph、target 和输出 evidence，再显式 publish。
-
-### 8.5 AssetGenerationJob 为 uncertain
-
-素材任务的 `uncertain` 在“生产工作流” `/workflows?scope=asset` 的素材任务详情中处理：
-
-- 普通用户不能直接重试；
-- staff 核对 Provider request ID、终态和账单后提交 `resolve-uncertain`；
-- ComfyUI 使用任务 UUID 作为冻结 submission token；maintenance/recovery 可先以该稳定 token 查询原请求，但“队列与历史均不存在”不能证明未提交，仍需 staff 证据；
-- 确认远端成功的媒体任务只恢复原 request 的 collect，不重新 submit；
-- 费用证据冲突会再次阻断，不会静默覆盖；
-- 如果任务已经记录取消意图，晚到成功只恢复费用对账，产物不会进入素材库。
-
-明确 `failed` 或 `cancelled` 后，用户才能创建新的重试任务。历史 ComfyUI 素材任务的请求快照 schema version 小于 3 时没有完整 `workflow_inputs` 冻结意图，服务端会明确拒绝自动 retry；应返回素材库，从当前发布 Workflow 重新选择输入并创建任务，不能猜测旧参数或引用素材。
-
-## 9. 常见“没有可用方案”排查表
-
-| 现象 | 核对位置 | 原因 | 正确处理 |
-| --- | --- | --- | --- |
-| 提示词模型为空 | 模型详情、Deployment smoke | 没有 `script.generate`、策略不完整或 smoke 过期 | 修复文本模型规格并重新执行 `script.generate` smoke |
-| 剧本模型为空 | 同上 | 剧本也使用 `script.generate` | 不要用 `prompt.normalize` 证据替代 |
-| ComfyUI Workflow 不出现 | Workflow 版本、validation/smoke evidence、素材 options | 版本非 current/published、output kind 不匹配、证据漂移、主输出不是受支持 Save 节点、用户无执行权限，或当前版本无法完整投影 `workflow_input_schema` | 按第 10 节从精确版本重新 validate、real smoke、publish 并修复输入合同；required 素材槽本身不是排除条件，不要补 Deployment smoke 冒充 Workflow 证据 |
-| 远程 ComfyUI Workflow 不出现 | validated deployment 与输出合同 | 当前 workflow-backed AssetGenerationJob 只允许 loopback 且共享受控输出目录 | 使用同机受控 ComfyUI，或先实现并审核远程产物下载合同 |
-| async REST 模型不出现 | ModelProfile 状态 | 模型仍是 draft/retired | 审核规格后显式发布新版本 |
-| Deployment 不出现 | 生命周期 | Provider 或 Deployment 非 active | 修复真实状态；不要只改页面展示 |
-| Smoke succeeded 仍不出现 | snapshot 详情 | 快照已过期或 target hash 漂移 | 以当前目标重新 probe/smoke |
-| Provider 保存失败 | Provider 表单、环境变量 | API/CDN 主机不在全局白名单、路径或字段不合法 | 修正部署白名单并重启，再按真实合同填写 |
-| Smoke 或生成一直 queued | worker 状态和日志 | text-generation、async-media 或 generation worker 未运行；ComfyUI GPU 互斥门仍被 workflow smoke/ProductionRun/其他 Comfy 素材任务占用 | 使用正式 restart 入口检查服务，等待同一持久任务；不要重复创建 |
-| Smoke failed | attempt 详情、Provider 日志 | 鉴权、路径、状态字段、schema、费用或产物合同错误 | 修复根因后创建新 smoke，不篡改旧证据 |
-| 素材任务提示预算错误 | Provider pricing、任务表单 | 费率未知、币种缺失或预算低于估算 | 配置确定 pricing，并明确授权足够预算 |
-| 只有 Deployment smoke passed | 方案类型 | Deployment smoke 不能让 ComfyUI Workflow 方案生效 | 对 Workflow 执行 Live validate → real workflow smoke → publish |
-| 只有 Workflow smoke passed | 工作流版本详情 | 尚未 published/current，或 evidence 未精确绑定当前 fixture/compiled graph/target | 修复版本门禁并显式发布；不要把历史 passed 文案当作当前 evidence |
-
-当前选项 API 不公开每个被排除 Deployment/Workflow 的详细原因，管理员排障必须以上述服务端事实为准，不能由普通用户从空下拉猜测凭据或内部地址。
-
-## 10. ComfyUI workflow-backed AssetGenerationJob
-
-ComfyUI Workflow 可以作为素材库图片、视频或音频的正式生成方案。上线顺序必须完整执行：
-
-1. 确认平台存在 active ComfyUI Provider、active RuntimeHost，以及绑定该主机的 active Deployment；扫描时无需人工选择来源 Deployment；
-2. 从 Settings 扫描系统配置 `workflow.comfyui_saved_workflow_directory` 指定的 ComfyUI userdata 相对目录，不接受本地 JSON 上传或粘贴；服务端按 Provider、RuntimeHost、规范化 endpoint 与有效目录去重，每个来源作用域只扫描一次；
-3. 对 `matched` 行复核服务端自动匹配结果；`ambiguous` 只从服务端候选补选，`unmatched/blocked` 按行内动作登记或证明模型、恢复实例、修复来源后重新扫描；
-4. preview、模型证明和 import 必须回传 discover 的来源作用域版本/hash；作用域漂移时丢弃旧行、重新全局扫描，再导入不可变结构合同；
-5. 在工作流版本验收页执行 Live validate，得到绑定精确 Deployment、graph、execution contract、模型依赖和 target hash 的 validation evidence；
-6. 为本次 `WorkflowSmokeAttempt` 选择参数与可选 Asset fixture，执行真实 workflow smoke；
-7. 核对 succeeded attempt、fixture hash、compiled graph hash、唯一主输出与真实媒体后显式 publish，并确保该版本为 current；
-8. 返回 `/assets`，对应媒体类型的“素材生成方案”会以 `target_kind=comfy_workflow` 展示该版本。
-
-完整操作见 [ComfyUI 已保存工作流导入、验证与发布手册](comfyui-saved-workflow-validation.md)。
-
-此管理入口的调整不创建或修改 `AssetGenerationJob`、`ProductionRun`，也不提交 prompt。两条运行链仍在各自任务创建时按 `workflow_input_schema` 冻结 `values/assets/references` 与已经校验的 Deployment。
-
-工作流版本验收页的 smoke fixture 与素材库的 `workflow_inputs` 使用同一动态输入编辑器和公共校验内核，因此目录导入识别出的提示词、标量参数、多个固定 LoadImage/LoadVideo/LoadAudio 节点，以及注册 projector 生成的 conditioning mode 与动态图片/视频/音频，会从版本 Schema 自动展示相应控件，不需要为每个模型再写一套表单。两条路径仍保持事实边界：smoke 冻结验收 fixture，可使用 staff 技术素材和 smoke 推荐值；素材生成只读取当前用户/全局的普通受管 Asset，不读取 smoke-only 默认值，并建立自己的 AssetGenerationJob 输入快照。
-
-素材库中的两类媒体方案共享 `AssetGenerationJob` 状态机，但证据和执行边界不同：
-
-| 能力 | 异步 API Deployment | ComfyUI Workflow |
-| --- | --- | --- |
-| options 身份 | `target_kind=deployment` + `target_id=<deployment UUID>`；创建时提交 `model_deployment_id` | `target_kind=comfy_workflow` + `target_id=<workflow version UUID>`；创建时提交 `workflow_template_version_id`，服务端解析精确 validated Deployment |
-| 必需证据 | fresh Deployment operation smoke | current/published + Live validation + succeeded real Workflow smoke 的精确 attempt/fixture/compiled/target evidence |
-| 参数来源 | 封闭 async `request_schema` | `workflow_input_schema` 完整投影公开标量、固定槽和按 `CONDITIONING_MODE` 切换的动态引用；提示词、模型、输出前缀和批量大小不开放覆盖 |
-| 参考素材 | 依赖正式 provider upload contract | 通过 `workflow_inputs.assets/references` 提交 Asset ID、用途和音轨配对意图；服务端复用 owner/global 授权、semantic compiler、staging 与 preprocessing，不接受路径或节点值 |
-| 执行 worker | async-media worker | generation worker；与 Workflow smoke、ProductionRun Comfy task 和其他 Comfy 素材任务共享数据库 GPU 互斥门 |
-| 产物进入平台 | 受限 URL 下载、校验后物化 Asset | 只从共享 `COMFYUI_OUTPUT_DIR` 读取冻结输出前缀下的唯一主输出，校验后复制为 Asset |
-| 支持范围 | image/video/audio | image/video/audio；剧本和提示词候选不支持 |
-
-Workflow 主输出必须是受支持的持久节点：图片 `SaveImage`/`SaveImageAdvanced`，视频 `SaveVideo`/`VHS_VideoCombine`，音频 `SaveAudioAdvanced`。任务创建时服务端冻结 workflow version、Deployment、validation/smoke/target hash、规范化输入请求、Asset facts、编译后的 bindings、conditioning mode、preprocessing/profile hash、编译图、主输出、每任务输出前缀和以任务 UUID 表示的 submission token；执行前再次复验，不允许客户端改绑 Deployment。素材任务不需要 ProductionRecipe；它只复用 ProductionRun 已使用的公共输入验证、编译和媒体准备能力，并保持独立任务事实。
-
-ComfyUI 成功只在队列/历史返回冻结主输出、文件位于受控目录、路径前缀匹配、媒体类型/大小/checksum/FFprobe 校验通过并物化 Asset 后成立。产物下载和短剧复用与异步 API Asset 使用同一正式入口；Workflow 本身不会为素材任务创建 Episode、Shot、ProductionRun、装配或交付。
-
-## 11. 现场验证与记录
-
-本文记录当前代码与操作合同，不把文档更新、单元测试、历史 workflow smoke 或目录中出现方案写成某个真实案例已经成功。现场验收必须以数据库任务、费用证据、受管 Asset 和页面复用结果为准。
-
-### 11.1 现场验收记录
-
-实际接入后按下表记录，不要用“已配置”替代真实结果：
-
-| 项目 | 记录 |
+每项媒体的“选择素材”在当前输入下展开，不另叠弹框：按合同提供已有素材、主图／变体系列和本地上传入口。系列选择保留确切版本与原Asset身份，不自动换成最新版。目录搜索须明确提交，翻页沿已提交条件；读取失败时旧结果不可继续选择。收起选材返回本项，未选择不会替换原素材。
+
+请求统一使用精确实例ID/定义摘要，以及`inputs`、`parameters`、`manual_channels`、业务事实和字段值；不提交裸Deployment/Workflow目标、节点ID、本地路径或任意图JSON。完整请求形状只在API文档维护。
+
+“文本模型生成提示词”是独立候选任务：成功正文仍需用户编辑/采用，再明确提交媒体任务；不会因为取得文本就自动进行下一次付费调用。策略字段的辅助生成同样留在本次Preparation中，不与主媒体任务的执行准备混用。
+
+策略模式在“本次输入与处理”显示本次输入→策略字段→提示词通道→主模型，并可直接查看精确策略与已绑定辅助实例，返回保留本次输入。辅助用途及目标来自该版本合同，不按模型名称寻找替代；未绑定时明确显示。配置引用不代表已经调用，缺失或待处理字段在任务的准备工作台继续。语言选择只在合同要求时填写；前端不因目标语言改写原始输入，也不预先拼出辅助生成结果。
+
+- 人工完整通道模式允许把已有候选放入**明确选中的通道**；已有正文时先显示页内替换提醒，取消保留原文，确认只替换该通道，不改参数、素材或外发授权。策略模式和无提示词模式不注入这份完整候选。
+- 切换实例或生成用途会先说明将清空哪些本次输入，可选择继续编辑。读取目录／合同失败不静默换实例；迟到的候选任务响应不会覆盖正在填写的另一表单。
+- “合同输出”与“成功结果去向”分别说明产物类型和入库／候选用途。创建后条件满足时可以实际执行；“允许外部调用”不是本地模型的暂停开关，创建回执也不是模型成功证据。
+
+## 4. 多模态和参考素材边界
+
+- 图片、视频、音频和剧本使用同一选择/准备入口，底层仍由已有text-generation、async-media或generation worker执行，不新增队列。
+- ComfyUI的固定和动态参考通过实例逻辑输入映射到已冻结工作流端口。素材身份、用途、排序和提示词标签使用同一组规范化绑定事实。
+- 通用动态组按每个已声明语义端口冻结参考角色与引用序号；重排素材会改变实际占用端口，不会按名称或列表位置猜提示词标签。端口缺少角色时仍可传原始媒体，但引用原语策略明确拒绝。已有发布合同不会被补写；若完整合同因这类接口修正发生变化，须创建后继实例并重新完成组合验收，历史成功记录不能充当新版本证据。
+- 这类投影修正也影响通用动态组的手动提示词实例及空角色映射：历史合同可读不表示新请求仍可使用旧版本。遇到“完整合同与发布定义不一致”时，从原实例创建后继并单独验收，不改绑既有请求或重发已成功调用。
+- 在“本次主体”添加独立主体时，明确选择“主体语义类别”（人物／场景／道具），再填写名称和描述，并在素材项选择该主体。类别选项来自后端，不默认选道具；只描述本次主体，不创建或采用项目Bible。普通分类图片按该类别匹配精确策略，首尾帧仍按原槽位用途；策略未支持的类别／用途在调用前明确阻断。旧准备缺少类别时保留原记录，按当前表单创建新准备，不覆盖旧输入或重用旧审核。
+- 使用输入参考视频原音且合同需要独立配套音频时，沿受管提取和配对链处理；已有独立音频直接绑定。不使用原声不提取；目标原生读取内嵌音轨时不强制重复提取。
+- 同一文件可分别作为多个明确输入项使用；配套音频按确切输入项标识指向视频，不按文件名、位置或重复Asset自动合并。移除视频先在页内列出受影响配套项；确认后保留音频及其原配对标识，明确提示原视频项不存在，须重新选择配对，不能静默转配其他视频。切换来源先说明将清除哪些本次选择；移除主体只解除本次主体关联，不删除素材库内容。
+- 当前async REST只有已登记受审协议覆盖的能力。缺少Provider上传/引用合同必须明确阻断，不丢弃参考素材降级成纯文本请求。
+- 本地文件须通过现有格式、权限、媒体探测和配额校验。具体使用时再核对实例/工作流的数量、时长、帧率与预处理合同，不以平台统一猜测值替代。
+- 成功结果必须有真实任务、输出字节、类型、大小、checksum与媒体探测证据，再物化为受管Asset；不能仅凭远端任务状态或Toast显示成功。
+
+素材生成不创建、不选择也不读取ProductionRecipe，不生成Episode、Shot或交付包。素材用于短剧时，在ProductionRun内明确采用其真实来源；剧本导入先产生预览修订并经确认，不覆盖既有确认稿。
+
+## 5. 空目录、阻断与恢复
+
+选项接口`GET /api/v1/asset-generation-jobs/options/`返回分页的精确版本目录，按任务和输出类型筛选；目录查询不运行模型、不使用历史Smoke样本充当本次输入。排查顺序：
+
+| 页面现象 | 核对与处理 |
 | --- | --- |
-| 执行方案 | `deployment` 或 `comfy_workflow`；稳定 target ID 与不可变版本 |
-| 精确 operation | Deployment 记录 `script.generate` / `image.text_to_image` / `video.text_to_video` / `audio.text_to_audio`；Workflow 记录版本声明 operation，例如 `video.reference_to_video` |
-| Workflow 输入合同 | `CONDITIONING_MODE`、公开标量、每个 semantic key 对应的 Asset ID/用途/配对意图，以及规范化输入、binding、conditioning 与 preprocessing hash；不记录本地路径 |
-| 配置门禁 | Deployment lifecycle/probe，或 Workflow import/validate/publish/current 状态 |
-| Smoke attempt | Deployment 或 Workflow attempt ID、fixture/target/compiled hash、终态、有效期（如适用）、费用 |
-| AssetGenerationJob | ID、终态、估算/实际费用、是否发生人工消歧 |
-| 产物 | Asset ID、媒体类型、大小、checksum、探测结果 |
-| 下载 | 是否重新读取签名 URL、附件是否完整 |
-| 短剧复用 | 使用页面、项目、对应选择器和确认结果 |
-| 未验证项 | 环境限制、负责人和后续动作 |
+| 没有执行实例 | 管理员先创建并发布实际需要的当前组合；共享模型存在不会自动生成业务实例 |
+| 类型下没有目标 | 查看实例输出合同及当前权限/启用状态；文本、图片、视频、音频不能仅按名称互换 |
+| 合同读取失败或配置变化 | 检查精确资源、冻结摘要和生命周期；重新读取真实配置，不用旧缓存继续提交 |
+| 本项上传被明确拒绝 | 保留文件及名称，按字段错误修正后重试；不把明确拒绝说成已入库 |
+| 本项上传结果未知 | 保留原选择并锁定再次上传，可在新窗口查看素材库；更换文件、收起或切换本项上下文不清除当前组件内的未知提示。同名／空目录不能证明原请求结果，不自动认领或重发；原错误详情可展开 |
+| 创建请求结果未知 | 保留当前表单和原请求键，点击“只读核对原请求”；先读取任务目录，再读取唯一匹配详情，核对请求键、实例、任务类别与媒体类型。空／多份／不符结果仍未知，不再次POST；也可在新窗口查看素材任务 |
+| 待输入/待字段确认 | 在该Preparation补齐必填内容，明确采用候选；不是重复创建模型请求 |
+| 未测、已知失败或目标漂移 | 查看该版本组合证据及原因；其他能力通过不能代替本组合 |
+| 证据过期或请求规格未覆盖 | 按配置中心`execution.admission.smoke_policy`及`capacity_policy`明确告警/阻断；告警放行不改写证据为通过 |
+| 排队很久 | 核对对应worker、资源容量、准备状态和阻断原因，不连续重提付费任务 |
+| 结果不确定（uncertain） | 通过原任务的正式取消/消歧入口核对远端请求，不自动重放 |
+| 下载链接失效 | 重新读取Asset详情刷新短期签名URL；纯远端引用不假称已归档文件 |
 
-只有对应方案的配置门禁、精确真实 smoke、素材任务、产物入库、下载及目标短剧入口均得到现场证据后，才能报告该图片、视频、音频或剧本案例闭环已通过。
+恢复同一请求必须遵守原幂等键与冻结身份；同key不同输入会冲突。明确失败的重试按页面动作处理；取消后晚到的成功不能自动入库。涉及远端账单、请求身份和不确定状态的处理由具备权限的管理员明确记录。
 
-### 11.2 2026-08-25 本机现场记录
+生成创建的未知结果锁定只在当前作者窗口有效：未核对前关闭表单或切换入口会保留原请求并提示，刷新／浏览器离开有提醒，但不承诺跨硬刷新或跨设备恢复。若已经离开，应先核对任务中心，不重新创建来代替核对。它与已有任务执行中的`uncertain`是不同阶段，不相互冒充。
 
-以下记录来自正式素材库 API、ComfyUI 受控输出目录和受管下载接口；没有将浏览器 Toast、目录扫描或本地文件路径作为成功依据。
+选材上传的未知提示属于当前选材组件，不承诺组件卸载、硬刷新、跨窗口或跨设备恢复；离开后应先核对素材库。收到确定的上传回执但该素材不满足当前输入时，显示已创建的素材ID和不匹配原因，不伪装成未知、不自动替换原选择。此处上传与随后创建生成任务是两个独立动作，上传成功不等于模型已调用。
 
-| 类型 | 方案与门禁 | 真实任务与产物 | 下载与短剧入口核对 |
-| --- | --- | --- | --- |
-| 图片 | ComfyUI Workflow `62f0fe23-bb6e-4ff0-b6fa-2fbd4fc06fe9`；已发布/current，成功 smoke `38f034a2-3e37-4fe9-9680-befadd787c38` | Job `eff472a1-9a23-47b6-98eb-f54abdabd037` succeeded；Asset `2dabfe46-7b73-4184-a024-0b27ec726e2f`，`scene`，PNG，101888 bytes | 新签名下载 HTTP 200，字节数和 SHA-256 一致；存在于 active `scene` 列表，供 Storyboard 首/尾帧素材选择器读取。 |
-| 视频 | ComfyUI H3 Workflow `85734ebd-4393-414c-8e2f-4550b2dc1d28`；Live validate、已发布/current，成功 smoke `aa66f353-6b34-4ae7-a924-afe10d4bce64` | Job `87d5b69f-c5fa-4dcd-870b-3790d159ab63` succeeded；Asset `8871d315-6bf2-4828-843e-c0d4552b55ce`，`reference_video`，MP4，532097 bytes，5167 ms | 新签名下载 HTTP 200，字节数和 SHA-256 一致；在 2–15 秒约束内，存在于 ProductionRun/Storyboard 参考视频选择器数据源。 |
-| 音频 | ComfyUI H3 Workflow `5a938723-75f8-41ad-a60b-cb104fcc2f12`；Live validate、已发布/current，成功 smoke `30ee3c85-0aa1-4fd1-9d22-b4ee00d15b73` | 首次 17 帧任务 `0d7e806d-ca7d-43f2-a726-6017c226cce6` 的远端产物不足 2 秒，被本地合同明确拒绝；51 帧重试 Job `3e5e4f7a-c7d3-43e1-a673-eb5e5ca1fab5` succeeded；Asset `8a52f3f0-f950-4a58-8409-f7da32565397`，`reference_audio`，MP3，40825 bytes，2325 ms | 新签名下载 HTTP 200，字节数和 SHA-256 一致；在 2–15 秒约束内，存在于 ProductionRun/Storyboard 参考音频选择器数据源。 |
-| 剧本 | DeepSeek Deployment `a49b0101-03f9-4d60-ab22-7d5c0d44b2db`；fresh `script.generate` smoke attempt `00a44d59-80e5-4038-a930-03af71ec37a2`，snapshot `2215c9e7-2911-4334-b08e-0643be8e1541`，估算 0.010000 USD | 首次 1200-token Job `ed7ffaba-c9aa-4043-8276-5187c6d53c3e` 返回空正文并准确记录 failed；默认 4096-token 重试 Job `a8bc6ce2-8f93-40ad-91f8-6b57834fb236` succeeded，actual cost 0.010000 USD；Asset `7df17a57-e516-4af0-bd32-fa7e9d1fcd43`，`script`，Markdown，2682 bytes | 新签名下载 HTTP 200，字节数和 SHA-256 一致；存在于 ProductionRun“素材库剧本”选择器数据源，选择后只会创建 preview revision，不会覆盖已有确认剧本。 |
+## 6. 用户线上验收清单
 
-H3 导入的原始 `length=124` 默认值不符合该节点声明的 17 帧倍数。素材库公开的工作流参数默认值已统一归一为 `119`；这与 smoke fixture 的归一化规则一致，避免用户保持默认值时提交一个必然被 ComfyUI 拒绝的参数。浏览器端登录会话在本次验收环境不可用，因此“选择器可见性”采用其正式 `/assets/?kind=...&is_active=true` 数据源及受控选择条件核验；素材本身没有写入任意真实项目或触发短剧生产工作流。
+下列是**需要用户完成的验收**，不是本次已有通过结论：
+
+- 分别选一个已明确配置的文本、图片、视频或音频组合，核对显示的资源和合同。
+- 覆盖策略组装与人工完整通道；检查候选采用后不重复组装、不重复外呼。
+- 覆盖实际需要的固定/动态参考、用途顺序、数量边界及参考视频原音配对。
+- 在未提交表单添加主体，检查未选类别有明确提示；切换类别后名称与描述不丢失。选“道具”不应显示为项目Bible采用，固定首尾帧不应改为普通道具参考；不支持的精确策略组合应明确阻断。
+- 验证参数合法/越界、自动种子恢复、缺字段、取消、刷新及明确失败的恢复。
+- 核对精确组合Smoke与真实素材任务，取得受管Asset、完整下载和媒体可播放证据。
+- 在无配方人工制作及schema3配方中明确复用相同实例/素材，核对逐镜来源；短剧选片、装配和封存按[生产操作手册](production-operator-manual.md)继续验收。
+
+记录执行实例版本与定义SHA、Preparation/任务ID、证据状态、参数和输入的非敏感摘要、Asset及媒体探测结果。不要记录密钥、完整私有提示词、Provider原始响应或签名URL。当前环境删除/切换事实只在统一计划台账记录，不把已清理的历史任务ID作为新入口验收凭据。

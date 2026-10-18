@@ -5,6 +5,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from uuid import uuid4
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -14,19 +15,13 @@ from django.urls import reverse
 from rest_framework.test import APIClient
 
 from studio.models import (
-    AssemblyJob,
-    ConfigRevision,
-    GeneratedWorkflow,
-    GenerationTask,
-    PromptArtifact,
-    WorkflowTemplate,
+    AssemblyJob, Asset, ConfigRevision, Episode, GeneratedArtifact, ProductionRun, SeriesProject, Shot, StageRun,
 )
 from studio.media_signing import signed_media_token
-from studio.tests.media_prompt_fixtures import MediaPromptOptions, build_test_video_prompt
 from studio.services.assembly import (
     AssemblyError,
     Clip,
-    TaskSelection,
+    MediaSelection,
     _ffmpeg_command,
     _find_reusable_assembly,
     _probe_media_streams,
@@ -35,9 +30,33 @@ from studio.services.assembly import (
     create_assembly,
 )
 from studio.services.assembly_queue import claim_next_assembly, process_assembly_job
-from studio.services.configuration import create_config_revision, publish_config_revision
+from studio.services.configuration import create_config_revision, publish_config_revision, resolve_configuration
+from studio.services.json_contracts import assign_json_contract
+from studio.services.security_boundaries import boundary_int
 from studio.services.provenance import assembly_manifest_path
-from studio.tests.factories import build_story
+from studio.tests.test_execution_context_inputs import PROJECT_CONFIG
+from studio.services.generated_artifacts import select_artifact
+
+
+def frozen_sources_for_test(episode, references):
+    """Explicit fixture authoring; production must pass its reviewed snapshot."""
+    rows = []
+    for shot in episode.shots.order_by("number", "id"):
+        if str(shot.pk) not in references:
+            continue
+        artifact = GeneratedArtifact.objects.get(pk=references[str(shot.pk)]["generated_artifact_id"])
+        decision = artifact.stage_run.artifact_selection_decisions.filter(variant_group=artifact.variant_group).order_by("-revision").first()
+        rows.append({"shot_id": str(shot.pk), "number": shot.number, "duration_ms": shot.duration_ms,
+            "media_kind": shot.media_type, "episode_start_ms": shot.episode_start_ms, "episode_end_ms": shot.episode_end_ms,
+            "source": {"generated_artifact_id": str(artifact.pk), "sha256": artifact.sha256,
+                "manifest_sha256": artifact.manifest_metadata_sha256, "decision_id": str(decision.pk),
+                "decision_revision": decision.revision}})
+    return {"schema_version": 1, "episodes": [{"episode_id": str(episode.pk), "number": episode.number, "shots": rows}]}
+
+
+def selection_for_test(shot, artifact):
+    return MediaSelection(shot=shot, artifact=artifact, duration_ms=shot.duration_ms,
+        episode_start_ms=shot.episode_start_ms, episode_end_ms=shot.episode_end_ms)
 
 
 class AssemblyTests(TestCase):
@@ -45,13 +64,12 @@ class AssemblyTests(TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         root = Path(self.temp.name)
-        self.comfy_output = root / "comfy-output"
+        self.source_root = root / "media" / "test-sources"
         self.media_root = root / "media"
         self.label_font = root / "label-font.ttf"
-        self.comfy_output.mkdir()
+        self.source_root.mkdir(parents=True)
         self.label_font.write_bytes(b"test-font")
         self.override = override_settings(
-            COMFYUI_OUTPUT_DIR=str(self.comfy_output),
             MEDIA_ROOT=self.media_root,
             FFMPEG_BINARY="ffmpeg-test",
             ASSEMBLY_AI_LABEL_FONTFILE=str(self.label_font),
@@ -74,113 +92,52 @@ class AssemblyTests(TestCase):
         )
         self.media_facts_patcher.start()
         self.addCleanup(self.media_facts_patcher.stop)
-        self.user, self.project, _, _, self.episode, self.shot1, self.shot2 = build_story()
+        self.user = get_user_model().objects.create_user(username="assembly-owner")
+        self.project = SeriesProject.objects.create(owner=self.user, title="Assembly sources", **PROJECT_CONFIG)
+        self.episode = Episode.objects.create(project=self.project, number=1, title="Reviewed episode")
+        self.shot1 = Shot.objects.create(episode=self.episode, number=1, title="First", duration_ms=5000, include_audio=True, media_type="video")
+        self.shot2 = Shot.objects.create(episode=self.episode, number=2, title="Second", duration_ms=5000, include_audio=True, media_type="video")
+        self.run = ProductionRun.objects.create(owner=self.user, project=self.project, plan_source="manual",
+            status="running", request_sha256="a" * 64, idempotency_key=str(uuid4()))
+        assign_json_contract(self.run, "config_snapshot", resolve_configuration(run=self.run).snapshot(),
+            max_bytes=boundary_int("security.snapshot.stage_max_bytes"))
+        self.run.save()
+        self.stage = StageRun.objects.create(production_run=self.run, stage_key="media_generation", ordinal=1,
+            mode="manual", status="running", idempotency_key=str(uuid4()))
+        self.sources = {}
         self.client = APIClient()
         self.client.force_authenticate(self.user)
-        self.template = WorkflowTemplate.objects.create(
-            name="assembly", slug="assembly", output_kind="video",
-            definition={"1": {"class_type": "Mock", "inputs": {}}},
-        )
+        # FFmpeg planning, queue and signed delivery use controlled bytes here.
+        # The true Preparation/adoption reader has isolated integration tests.
+        reader = patch("studio.services.execution_production_candidates.read_production_media_candidate",
+            side_effect=self._read_fixture_candidate)
+        reader.start()
+        self.addCleanup(reader.stop)
 
-    def _successful_task(self, shot, filename):
-        result = build_test_video_prompt(
-            self.project, [shot], MediaPromptOptions(
-                model_identifier="minimax-h3-test", language_gate_mode="warn",
-            ),
-        )
-        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
-            project=self.project, episode=self.episode, shot=shot, created_by=self.user,
-            prompt_type="video", conditioning_mode="T2VA", prompt_text=result.text,
-            total_duration_ms=result.total_duration_ms, structured_payload=result.payload,
-            consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
-            request_options={"shot_ids": [str(shot.id)]},
-        )
-        workflow = GeneratedWorkflow.objects.create(
-            project=self.project, episode=self.episode, prompt_artifact=prompt,
-            template=self.template, created_by=self.user,
-            workflow_json=self.template.definition, content_hash=(str(shot.id).replace("-", "") * 2)[:64],
-        )
-        task = GenerationTask.objects.create(
-            owner=self.user, project=self.project, episode=self.episode,
-            generated_workflow=workflow, kind="video", status=GenerationTask.Status.SUCCEEDED,
-            progress=100, effective_duration_ms=result.total_duration_ms,
-            max_attempts=3,
-            outputs=[{"kind": "videos", "filename": filename, "subfolder": "episode-1", "type": "output"}],
-        )
-        path = self.comfy_output / "episode-1" / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"fake-video")
-        return task
+    def _read_fixture_candidate(self, artifact, **_kwargs):
+        shot = Shot.objects.get(pk=artifact.variant_group)
+        return {"source_kind": "asset", "path": (self.media_root / artifact.object_key).resolve(),
+            "preparation_id": None, "request_sha256": None,
+            "production_unit": {"scope": {"kind": "shot", "id": str(shot.pk)},
+                "episode_id": str(shot.episode_id), "project_id": str(self.project.pk)}}
 
-    def _successful_multishot_task(self, shots, filename):
-        result = build_test_video_prompt(
-            self.project, shots, MediaPromptOptions(
-                model_identifier="minimax-h3-test", language_gate_mode="warn",
-            ),
-        )
-        prompt = PromptArtifact.objects.create(
-            project=self.project, episode=self.episode, shot=None, created_by=self.user,
-            prompt_type="video", conditioning_mode="T2VA", prompt_text=result.text,
-            is_multi_shot=True, include_audio=True,
-            total_duration_ms=result.total_duration_ms, structured_payload=result.payload,
-            consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
-            request_options={"shot_ids": [str(shot.id) for shot in shots]},
-        )
-        workflow = GeneratedWorkflow.objects.create(
-            project=self.project, episode=self.episode, prompt_artifact=prompt,
-            template=self.template, created_by=self.user,
-            workflow_json=self.template.definition, content_hash="b" * 64,
-        )
-        task = GenerationTask.objects.create(
-            owner=self.user, project=self.project, episode=self.episode,
-            generated_workflow=workflow, kind="video", status=GenerationTask.Status.SUCCEEDED,
-            progress=100, effective_duration_ms=result.total_duration_ms,
-            max_attempts=3,
-            outputs=[{"kind": "videos", "filename": filename, "subfolder": "episode-1", "type": "output"}],
-        )
-        path = self.comfy_output / "episode-1" / filename
+    def _selected_artifact(self, shot, filename, *, selected=True):
+        path = self.source_root / "episode-1" / filename
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"fake-multishot-video")
-        return task
-
-    def _successful_image_task(self, shot, filename):
-        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=False,
-            project=self.project,
-            episode=self.episode,
-            shot=shot,
-            created_by=self.user,
-            prompt_type="image",
-            prompt_text="A production still.",
-            total_duration_ms=shot.duration_ms,
-            structured_payload={"duration_ms": shot.duration_ms},
-            consistency_snapshot={},
-            content_hash=(str(shot.id).replace("-", "") * 2)[:64],
-            request_options={"shot_ids": [str(shot.id)]},
-        )
-        workflow = GeneratedWorkflow.objects.create(
-            project=self.project,
-            episode=self.episode,
-            prompt_artifact=prompt,
-            template=self.template,
-            created_by=self.user,
-            workflow_json=self.template.definition,
-            content_hash=("f" + str(shot.id).replace("-", "") * 2)[:64],
-        )
-        task = GenerationTask.objects.create(
-            owner=self.user,
-            project=self.project,
-            episode=self.episode,
-            generated_workflow=workflow,
-            kind=GenerationTask.Kind.IMAGE,
-            status=GenerationTask.Status.SUCCEEDED,
-            progress=100,
-            max_attempts=3,
-            outputs=[{"kind": "images", "filename": filename, "subfolder": "episode-1", "type": "output"}],
-        )
-        path = self.comfy_output / "episode-1" / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b"fake-image")
-        return task
+        path.write_bytes(b"isolated unit media bytes")
+        asset = Asset.objects.create(owner=self.user, name=filename, kind="reference", mime_type=(
+            "image/png" if shot.media_type == "image" else "video/mp4"), checksum=hashlib.sha256(path.read_bytes()).hexdigest())
+        artifact = GeneratedArtifact.objects.create(production_run=self.run, stage_run=self.stage, asset=asset,
+            kind=shot.media_type, role="adopted_media", storage_backend="managed_local",
+            object_key=path.relative_to(self.media_root).as_posix(), mime_type=asset.mime_type,
+            size_bytes=path.stat().st_size, sha256=asset.checksum, manifest_metadata_sha256="b" * 64,
+            variant_group=str(shot.pk), variant_index=GeneratedArtifact.objects.count() + 1,
+            manifest_key=str(uuid4()), status="available")
+        if selected:
+            select_artifact(artifact, user=self.user)
+            self.sources[str(shot.pk)] = {"generated_artifact_id": str(artifact.pk)}
+            artifact.refresh_from_db()
+        return artifact
 
     @staticmethod
     def _fake_ffmpeg(command, **kwargs):
@@ -201,6 +158,7 @@ class AssemblyTests(TestCase):
                 episode=self.episode,
                 dry_run=bool(payload.get("dry_run", True)),
                 output_name=str(payload.get("output_name") or ""),
+                frozen_sources=frozen_sources_for_test(self.episode, self.sources),
             )
         except AssemblyError as exc:
             if exc.job is not None:
@@ -220,7 +178,7 @@ class AssemblyTests(TestCase):
                 "has_audio": job.has_audio,
                 "ffmpeg_command": job.ffmpeg_command,
                 "concat_manifest_path": job.concat_manifest_path,
-                "source_tasks": list(job.source_tasks.values_list("id", flat=True)),
+                "source_artifacts": list(job.source_items.values_list("generated_artifact_id", flat=True)),
                 "output_path": job.output_path,
             },
         )
@@ -239,31 +197,28 @@ class AssemblyTests(TestCase):
         self.assertIn("stream=codec_type", run.call_args.args[0])
 
     def test_clip_audio_flag_uses_ffprobe_not_prompt_intent(self):
-        task = self._successful_task(self.shot1, "silent-shot.mp4")
-        prompt = task.generated_workflow.prompt_artifact
-        prompt.include_audio = True
-        prompt.save(update_fields=("include_audio", "updated_at"))
+        task = self._selected_artifact(self.shot1, "silent-shot.mp4")
         self.probe_mock.return_value = frozenset({"video"})
 
-        clip = _resolve_output(TaskSelection(task=task, shot=self.shot1))
+        clip = _resolve_output(selection_for_test(self.shot1, task))
 
         self.assertFalse(clip.has_audio)
 
     def test_resolve_output_preserves_the_approved_subsecond_shot_duration(self):
-        task = self._successful_task(self.shot1, "subsecond-shot.mp4")
+        task = self._selected_artifact(self.shot1, "subsecond-shot.mp4")
         self.shot1.duration_ms = 50
         self.shot1.save(update_fields=("duration_ms", "updated_at"))
 
-        clip = _resolve_output(TaskSelection(task=task, shot=self.shot1))
+        clip = _resolve_output(selection_for_test(self.shot1, task))
 
         self.assertEqual(clip.duration_seconds, 0.05)
 
     def test_mixed_audio_inputs_fill_missing_stream_with_silence(self):
-        task1 = self._successful_task(self.shot1, "audio-shot.mp4")
-        task2 = self._successful_task(self.shot2, "silent-shot.mp4")
+        task1 = self._selected_artifact(self.shot1, "audio-shot.mp4")
+        task2 = self._selected_artifact(self.shot2, "silent-shot.mp4")
         clips = [
-            Clip(task1, self.comfy_output / "episode-1" / "audio-shot.mp4", True, 5),
-            Clip(task2, self.comfy_output / "episode-1" / "silent-shot.mp4", False, 5),
+            Clip(task1, self.source_root / "episode-1" / "audio-shot.mp4", True, 5),
+            Clip(task2, self.source_root / "episode-1" / "silent-shot.mp4", False, 5),
         ]
 
         command = _ffmpeg_command(clips, self.media_root / "mixed.mp4", 768, 1344, 24)
@@ -276,11 +231,11 @@ class AssemblyTests(TestCase):
         self.assertIn("[aout]", command)
 
     def test_all_silent_inputs_are_filled_with_silent_audio(self):
-        task1 = self._successful_task(self.shot1, "silent-01.mp4")
-        task2 = self._successful_task(self.shot2, "silent-02.mp4")
+        task1 = self._selected_artifact(self.shot1, "silent-01.mp4")
+        task2 = self._selected_artifact(self.shot2, "silent-02.mp4")
         clips = [
-            Clip(task1, self.comfy_output / "episode-1" / "silent-01.mp4", False, 5),
-            Clip(task2, self.comfy_output / "episode-1" / "silent-02.mp4", False, 5),
+            Clip(task1, self.source_root / "episode-1" / "silent-01.mp4", False, 5),
+            Clip(task2, self.source_root / "episode-1" / "silent-02.mp4", False, 5),
         ]
 
         command = _ffmpeg_command(clips, self.media_root / "silent.mp4", 768, 1344, 24)
@@ -296,10 +251,10 @@ class AssemblyTests(TestCase):
         self.shot1.media_type = "image"
         self.shot1.duration_ms = 5000
         self.shot1.save(update_fields=("media_type", "duration_ms", "updated_at"))
-        task = self._successful_image_task(self.shot1, "still.png")
+        task = self._selected_artifact(self.shot1, "still.png")
         clip = Clip(
             task,
-            self.comfy_output / "episode-1" / "still.png",
+            self.source_root / "episode-1" / "still.png",
             False,
             5,
             media_kind="image",
@@ -316,8 +271,8 @@ class AssemblyTests(TestCase):
         self.assertIn("anullsrc=r=48000:cl=stereo,atrim=duration=5.000", filters)
 
     def test_silent_sources_report_audio_for_the_assembled_output(self):
-        self._successful_task(self.shot1, "silent-01.mp4")
-        self._successful_task(self.shot2, "silent-02.mp4")
+        self._selected_artifact(self.shot1, "silent-01.mp4")
+        self._selected_artifact(self.shot2, "silent-02.mp4")
         self.probe_mock.return_value = frozenset({"video"})
 
         response = self._create_episode( {
@@ -331,34 +286,21 @@ class AssemblyTests(TestCase):
         ]
         self.assertEqual(filters.count("anullsrc=r=48000:cl=stereo"), 2)
 
-    def test_media_probe_is_cached_for_repeated_multishot_source(self):
-        for shot in (self.shot1, self.shot2):
-            shot.duration_ms = 5000
-            shot.save(update_fields=("duration_ms", "updated_at"))
-        self._successful_multishot_task([self.shot1, self.shot2], "whole-source.mp4")
+    def test_media_probe_is_cached_for_repeated_explicit_source(self):
+        artifact = self._selected_artifact(self.shot1, "shared-source.mp4")
+        cache = {}
         self.probe_mock.reset_mock()
-
-        response = self._create_episode( {
-            "episode_id": str(self.episode.id), "dry_run": True,
-        }, format="json")
-
-        self.assertEqual(response.status_code, 201, response.data)
+        _resolve_output(selection_for_test(self.shot1, artifact), cache)
+        _resolve_output(selection_for_test(self.shot1, artifact), cache)
         self.probe_mock.assert_called_once()
 
-    def test_multishot_video_uses_approved_shot_duration_not_prompt_window(self):
-        for shot in (self.shot1, self.shot2):
-            shot.duration_ms = 5000
-            shot.save(update_fields=("duration_ms", "updated_at"))
-        task = self._successful_multishot_task(
-            [self.shot1, self.shot2], "approved-duration-source.mp4",
-        )
-        self.shot2.duration_ms = 3000
-        self.shot2.save(update_fields=("duration_ms", "updated_at"))
-
-        clip = _resolve_output(TaskSelection(task=task, shot=self.shot2))
-
-        self.assertEqual(clip.start_seconds, 5)
-        self.assertEqual(clip.duration_seconds, 3)
+    def test_explicit_trim_boundaries_drive_ffmpeg_not_prompt_rows(self):
+        artifact = self._selected_artifact(self.shot1, "segment.mp4")
+        clip = Clip(artifact, self.media_root / artifact.object_key, True, 3, 5, True)
+        command = _ffmpeg_command([clip], self.media_root / "trim.mp4", 768, 1344, 24)
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertIn("trim=start=5.000:duration=3.000", filters)
+        self.assertIn("atrim=start=5.000:duration=3.000", filters)
 
     def test_episode_dry_run_writes_ordered_manifest_without_completing(self):
         revision = create_config_revision(
@@ -372,8 +314,8 @@ class AssemblyTests(TestCase):
             clone_published=True,
         )
         publish_config_revision(revision, published_by=self.user)
-        task1 = self._successful_task(self.shot1, "shot-01.mp4")
-        task2 = self._successful_task(self.shot2, "shot-02.mp4")
+        task1 = self._selected_artifact(self.shot1, "shot-01.mp4")
+        task2 = self._selected_artifact(self.shot2, "shot-02.mp4")
         response = self._create_episode( {
             "episode_id": str(self.episode.id), "dry_run": True,
         }, format="json")
@@ -384,7 +326,7 @@ class AssemblyTests(TestCase):
         text = manifest.read_text(encoding="utf-8")
         self.assertLess(text.index("shot-01.mp4"), text.index("shot-02.mp4"))
         self.assertLess(text.index(str(self.shot1.id)), text.index(str(self.shot2.id)))
-        self.assertEqual({str(value) for value in response.data["source_tasks"]}, {str(task1.id), str(task2.id)})
+        self.assertEqual({str(value) for value in response.data["source_artifacts"]}, {str(task1.id), str(task2.id)})
         command = response.data["ffmpeg_command"]
         joined = " ".join(command)
         self.assertIn("drawtext=fontfile=", joined)
@@ -395,9 +337,9 @@ class AssemblyTests(TestCase):
         self.assertNotEqual(self.episode.status, "completed")
 
     def test_disabled_visible_label_keeps_mp4_metadata_without_drawtext(self):
-        task = self._successful_task(self.shot1, "clean-shot.mp4")
+        task = self._selected_artifact(self.shot1, "clean-shot.mp4")
         clips = [
-            Clip(task, self.comfy_output / "episode-1" / "clean-shot.mp4", False, 5),
+            Clip(task, self.source_root / "episode-1" / "clean-shot.mp4", False, 5),
         ]
 
         revision = create_config_revision(
@@ -426,8 +368,8 @@ class AssemblyTests(TestCase):
         self.shot2.media_type = "image"
         self.shot1.save(update_fields=("media_type", "updated_at"))
         self.shot2.save(update_fields=("media_type", "updated_at"))
-        self._successful_image_task(self.shot1, "still-30fps.png")
-        self._successful_image_task(self.shot2, "still-30fps-2.png")
+        self._selected_artifact(self.shot1, "still-30fps.png")
+        self._selected_artifact(self.shot2, "still-30fps-2.png")
 
         response = self._create_episode({
             "episode_id": str(self.episode.id),
@@ -442,8 +384,8 @@ class AssemblyTests(TestCase):
         self.assertNotIn("MiniMax", " ".join(command))
 
     def test_execute_marks_complete_only_after_nonempty_output(self):
-        self._successful_task(self.shot1, "shot-01.mp4")
-        self._successful_task(self.shot2, "shot-02.mp4")
+        self._selected_artifact(self.shot1, "shot-01.mp4")
+        self._selected_artifact(self.shot2, "shot-02.mp4")
 
         with patch("studio.services.assembly_queue._run_ffmpeg", side_effect=self._fake_ffmpeg) as run:
             response = self._create_episode( {
@@ -474,9 +416,19 @@ class AssemblyTests(TestCase):
         self.episode.refresh_from_db()
         self.assertEqual(self.episode.status, "completed")
 
+        # Preview cannot repair a missing completion seal. The queue above is
+        # the only writer; reading must leave the original job facts unchanged.
+        sidecar = assembly_manifest_path(completed)
+        sidecar.unlink()
+        snapshot = AssemblyJob.objects.filter(pk=completed.pk).values().get()
+        missing = anonymous.get(completed_response.data["output_url"])
+        self.assertEqual(missing.status_code, 404)
+        self.assertFalse(sidecar.exists())
+        self.assertEqual(AssemblyJob.objects.filter(pk=completed.pk).values().get(), snapshot)
+
     def test_assembly_provenance_is_hash_only_tenant_bound_and_detects_tampering(self):
-        task1 = self._successful_task(self.shot1, "source-01.mp4")
-        task2 = self._successful_task(self.shot2, "source-02.mp4")
+        task1 = self._selected_artifact(self.shot1, "source-01.mp4")
+        task2 = self._selected_artifact(self.shot2, "source-02.mp4")
         with patch(
             "studio.services.assembly_queue._run_ffmpeg", side_effect=self._fake_ffmpeg,
         ):
@@ -488,9 +440,20 @@ class AssemblyTests(TestCase):
         self.assertEqual(queued.status_code, 201, queued.data)
         self.assertEqual(completed.status, AssemblyJob.Status.SUCCEEDED)
 
+        from studio.views import AssemblyJobViewSet
+        from studio.serializers import AssemblyJobSerializer
+        view = AssemblyJobViewSet(); view.request = SimpleNamespace(user=self.user)
+        queryset = view.get_queryset().filter(pk=completed.pk)
+        with self.assertNumQueries(1):
+            rows = list(queryset)
+        with self.assertNumQueries(0):
+            listing = AssemblyJobSerializer(rows, many=True).data
+        self.assertEqual(listing[0]["source_media_count"], 2)
+        self.assertIsNone(listing[0]["ai_generated"])
+
         detail = self.client.get(f"/api/v1/assemblies/{completed.id}/")
         self.assertEqual(detail.status_code, 200, detail.data)
-        self.assertTrue(detail.data["ai_generated"])
+        self.assertIsNone(detail.data["ai_generated"])
         self.assertTrue(detail.data["provenance_url"].startswith("/api/v1/media/"))
         anonymous = APIClient()
         manifest_response = anonymous.get(detail.data["provenance_url"])
@@ -498,11 +461,11 @@ class AssemblyTests(TestCase):
         self.assertEqual(manifest_response.status_code, 200)
         document = manifest_response.json()
         manifest_response.close()
-        self.assertTrue(document["disclosure"]["ai_generated"])
+        self.assertIsNone(document["disclosure"]["ai_generated"])
         self.assertEqual(document["verification"]["status"], "verified")
         self.assertEqual(document["assembly"]["job_id"], str(completed.id))
         self.assertEqual(
-            {row["task_id"] for row in document["source_outputs"]},
+            {row["generated_artifact_id"] for row in document["source_outputs"]},
             {str(task1.id), str(task2.id)},
         )
         self.assertEqual(
@@ -515,9 +478,11 @@ class AssemblyTests(TestCase):
         for row in document["source_outputs"]:
             self.assertRegex(row["artifact_sha256"], r"^[0-9a-f]{64}$")
             self.assertRegex(row["manifest_sha256"], r"^[0-9a-f]{64}$")
-            self.assertRegex(row["prompt_sha256"], r"^[0-9a-f]{64}$")
+            self.assertIsNone(row["request_sha256"])
+            self.assertIsNone(row["generation_attempt_id"])
+            self.assertEqual(row["source_kind"], "asset")
         serialized = json.dumps(document, ensure_ascii=False)
-        self.assertNotIn(task1.generated_workflow.prompt_artifact.prompt_text, serialized)
+        self.assertNotIn("prompt_text", serialized)
         self.assertNotIn(str(Path(self.temp.name)), serialized)
 
         download = anonymous.get(detail.data["download_url"])
@@ -567,8 +532,8 @@ class AssemblyTests(TestCase):
         self.assertEqual(anonymous.get(detail.data["download_url"]).status_code, 404)
 
     def test_same_sources_and_trim_windows_reuse_succeeded_assembly(self):
-        task1 = self._successful_task(self.shot1, "shot-01.mp4")
-        task2 = self._successful_task(self.shot2, "shot-02.mp4")
+        task1 = self._selected_artifact(self.shot1, "shot-01.mp4")
+        task2 = self._selected_artifact(self.shot2, "shot-02.mp4")
         payload = {
             "episode_id": str(self.episode.id),
             "dry_run": False,
@@ -595,7 +560,7 @@ class AssemblyTests(TestCase):
         job = AssemblyJob.objects.get()
         self.assertIn(".source-", job.concat_manifest_path)
         self.assertEqual(
-            {str(value) for value in job.source_tasks.values_list("id", flat=True)},
+            {str(value) for value in job.source_items.values_list("generated_artifact_id", flat=True)},
             {str(task1.id), str(task2.id)},
         )
 
@@ -629,42 +594,25 @@ class AssemblyTests(TestCase):
         reusable.assert_not_called()
         self.assertEqual(AssemblyJob.objects.count(), 1)
 
-    def test_changed_multishot_trim_windows_do_not_reuse_assembly(self):
-        for shot in (self.shot1, self.shot2):
-            shot.duration_ms = 5000
-            shot.save(update_fields=("duration_ms", "updated_at"))
-        task = self._successful_multishot_task(
-            [self.shot1, self.shot2], "whole-episode.mp4",
-        )
-        payload = {"episode_id": str(self.episode.id), "dry_run": False}
-
-        with patch(
-            "studio.services.assembly_queue._run_ffmpeg", side_effect=self._fake_ffmpeg,
-        ) as ffmpeg_run:
-            first = self._create_episode( payload, format="json")
+    def test_changed_approved_duration_does_not_reuse_assembly(self):
+        self._selected_artifact(self.shot1, "shot-1.mp4")
+        self._selected_artifact(self.shot2, "shot-2.mp4")
+        with patch("studio.services.assembly_queue._run_ffmpeg", side_effect=self._fake_ffmpeg) as ffmpeg:
+            first = self._create_episode({"dry_run": False})
+            self.assertEqual(first.status_code, 201, first.data)
             self._process_next()
-            prompt = task.generated_workflow.prompt_artifact
-            structured_payload = dict(prompt.structured_payload)
-            structured_payload["shot_durations_ms"] = [4000, 6000]
-            prompt.structured_payload = structured_payload
-            prompt.save(update_fields=("structured_payload", "updated_at"))
-            second = self._create_episode( payload, format="json")
+            self.shot2.duration_ms = 3000
+            self.shot2.save(update_fields=("duration_ms",))
+            second = self._create_episode({"dry_run": False})
+            self.assertEqual(second.status_code, 201, second.data)
             self._process_next()
-
-        self.assertEqual(first.status_code, 201, first.data)
-        self.assertEqual(second.status_code, 201, second.data)
-        self.assertNotEqual(second.data["id"], first.data["id"])
-        self.assertEqual(ffmpeg_run.call_count, 2)
-        self.assertEqual(AssemblyJob.objects.count(), 2)
-        signatures = {
-            Path(value).name.split(".source-", 1)[1]
-            for value in AssemblyJob.objects.values_list("concat_manifest_path", flat=True)
-        }
-        self.assertEqual(len(signatures), 2)
+        self.assertNotEqual(first.data["id"], second.data["id"])
+        self.assertEqual(ffmpeg.call_count, 2)
+        self.assertEqual(AssemblyJob.objects.values("source_signature").distinct().count(), 2)
 
     def test_missing_assembled_output_is_not_reused(self):
-        self._successful_task(self.shot1, "shot-01.mp4")
-        self._successful_task(self.shot2, "shot-02.mp4")
+        self._selected_artifact(self.shot1, "shot-01.mp4")
+        self._selected_artifact(self.shot2, "shot-02.mp4")
         payload = {"episode_id": str(self.episode.id), "dry_run": False}
 
         with patch(
@@ -683,7 +631,7 @@ class AssemblyTests(TestCase):
         self.assertEqual(AssemblyJob.objects.count(), 2)
 
     def test_missing_successful_shot_output_is_rejected(self):
-        self._successful_task(self.shot1, "shot-01.mp4")
+        self._selected_artifact(self.shot1, "shot-01.mp4")
         response = self._create_episode( {
             "episode_id": str(self.episode.id), "dry_run": True,
         }, format="json")
@@ -696,8 +644,8 @@ class AssemblyTests(TestCase):
         self.shot2.duration_ms = 5000
         self.shot1.save(update_fields=("media_type", "duration_ms", "updated_at"))
         self.shot2.save(update_fields=("duration_ms", "updated_at"))
-        image_task = self._successful_image_task(self.shot1, "shot-01.png")
-        video_task = self._successful_task(self.shot2, "shot-02.mp4")
+        image_task = self._selected_artifact(self.shot1, "shot-01.png")
+        video_task = self._selected_artifact(self.shot2, "shot-02.mp4")
 
         response = self._create_episode( {
             "episode_id": str(self.episode.id), "dry_run": True,
@@ -705,7 +653,7 @@ class AssemblyTests(TestCase):
 
         self.assertEqual(response.status_code, 201, response.data)
         self.assertEqual(
-            {str(value) for value in response.data["source_tasks"]},
+            {str(value) for value in response.data["source_artifacts"]},
             {str(image_task.id), str(video_task.id)},
         )
         job = AssemblyJob.objects.get(pk=response.data["id"])
@@ -723,8 +671,8 @@ class AssemblyTests(TestCase):
         self.shot2.media_type = "image"
         self.shot1.save(update_fields=("media_type", "updated_at"))
         self.shot2.save(update_fields=("media_type", "updated_at"))
-        self._successful_image_task(self.shot1, "shot-01.png")
-        self._successful_image_task(self.shot2, "shot-02.png")
+        self._selected_artifact(self.shot1, "shot-01.png")
+        self._selected_artifact(self.shot2, "shot-02.png")
 
         response = self._create_episode( {
             "episode_id": str(self.episode.id), "dry_run": True,
@@ -737,69 +685,36 @@ class AssemblyTests(TestCase):
     def test_missing_selected_image_source_fails_closed(self):
         self.shot1.media_type = "image"
         self.shot1.save(update_fields=("media_type", "updated_at"))
-        self._successful_task(self.shot2, "shot-02.mp4")
+        self._selected_artifact(self.shot2, "shot-02.mp4")
 
         response = self._create_episode({
             "episode_id": str(self.episode.id), "dry_run": True,
         }, format="json")
 
         self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("分镜 1", str(response.data))
-        self.assertIn("图片", str(response.data))
+        self.assertIn("逐镜已采用媒体", str(response.data))
 
-    def test_new_single_shot_replaces_only_its_segment_from_older_multishot_video(self):
-        for shot in (self.shot1, self.shot2):
-            shot.duration_ms = 5000
-            shot.save(update_fields=("duration_ms", "updated_at"))
-        old_multishot = self._successful_multishot_task(
-            [self.shot1, self.shot2], "old-multishot.mp4",
-        )
-        new_single = self._successful_task(self.shot1, "new-shot-01.mp4")
-
-        response = self._create_episode( {
-            "episode_id": str(self.episode.id), "dry_run": True,
-        }, format="json")
-
+    def test_explicit_new_selection_replaces_only_its_own_shot(self):
+        old = self._selected_artifact(self.shot1, "old-1.mp4")
+        unchanged = self._selected_artifact(self.shot2, "old-2.mp4")
+        new = self._selected_artifact(self.shot1, "new-1.mp4")
+        response = self._create_episode({"dry_run": True})
         self.assertEqual(response.status_code, 201, response.data)
-        self.assertEqual(
-            {str(value) for value in response.data["source_tasks"]},
-            {str(old_multishot.id), str(new_single.id)},
-        )
-        command = response.data["ffmpeg_command"]
-        self.assertLess(command.index(str(self.comfy_output / "episode-1" / "new-shot-01.mp4")),
-                        command.index(str(self.comfy_output / "episode-1" / "old-multishot.mp4")))
-        filters = command[command.index("-filter_complex") + 1]
-        self.assertIn("[1:v:0]trim=start=5.000:duration=5.000", filters)
-        self.assertIn("[1:a:0]atrim=start=5.000:duration=5.000", filters)
+        self.assertEqual([str(value) for value in response.data["source_artifacts"]], [str(new.pk), str(unchanged.pk)])
+        self.assertNotIn(str(self.media_root / old.object_key), response.data["ffmpeg_command"])
 
-    def test_newer_active_shot_task_blocks_assembly_until_it_finishes(self):
-        old_task = self._successful_task(self.shot1, "old-shot-01.mp4")
-        self._successful_task(self.shot2, "old-shot-02.mp4")
-        pending = GenerationTask.objects.create(
-            owner=self.user, project=self.project, episode=self.episode,
-            generated_workflow=old_task.generated_workflow, kind="video",
-            status=GenerationTask.Status.QUEUED,
-            max_attempts=3,
-        )
-
-        blocked = self._create_episode( {
-            "episode_id": str(self.episode.id), "dry_run": True,
-        }, format="json")
-
-        self.assertEqual(blocked.status_code, 400, blocked.data)
-        self.assertIn("最新视频仍生成中", str(blocked.data))
-        self.assertEqual(AssemblyJob.objects.count(), 0)
-
-        pending.status = GenerationTask.Status.FAILED
-        pending.save(update_fields=("status", "updated_at"))
-        fallback = self._create_episode( {
-            "episode_id": str(self.episode.id), "dry_run": True,
-        }, format="json")
-        self.assertEqual(fallback.status_code, 201, fallback.data)
+    def test_unselected_newer_candidate_never_replaces_reviewed_source(self):
+        old = self._selected_artifact(self.shot1, "old-1.mp4")
+        self._selected_artifact(self.shot2, "old-2.mp4")
+        candidate = self._selected_artifact(self.shot1, "new-unreviewed.mp4", selected=False)
+        response = self._create_episode({"dry_run": True})
+        self.assertEqual(response.status_code, 201, response.data)
+        self.assertIn(str(self.media_root / old.object_key), response.data["ffmpeg_command"])
+        self.assertNotIn(str(self.media_root / candidate.object_key), response.data["ffmpeg_command"])
 
     def test_missing_configured_label_font_returns_a_clear_failure(self):
-        self._successful_task(self.shot1, "shot-01.mp4")
-        self._successful_task(self.shot2, "shot-02.mp4")
+        self._selected_artifact(self.shot1, "shot-01.mp4")
+        self._selected_artifact(self.shot2, "shot-02.mp4")
         missing = self.media_root / "missing-font.ttf"
         with override_settings(ASSEMBLY_AI_LABEL_FONTFILE=str(missing)):
             response = self._create_episode( {

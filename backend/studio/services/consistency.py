@@ -1,9 +1,16 @@
 """Model-agnostic consistency snapshots and canonical project locks."""
 from __future__ import annotations
 
-from studio.models import ConsistencyLock, SeriesProject, Shot
+from django.db import transaction
+
+from studio.models import ConsistencyLock, SeriesProject
+from studio.services.bible_setting_evidence import (
+    primary_setting_content,
+    primary_setting_content_reference,
+    read_entity_primary_settings,
+)
 from studio.services.visual_reference_policy import (
-    character_visual_reference_decision,
+    character_visual_reference_decisions,
 )
 
 
@@ -40,26 +47,37 @@ def preferred_subject_asset(subject) -> object | None:
     return subject.reference_assets.all().order_by("kind", "name", "id").first()
 
 
+def _bible_state(project):
+    """Read one entity set and its verified current primaries for this operation."""
+    entities = {}
+    for kind, section in (("character", "characters"), ("scene", "scenes"), ("prop", "props")):
+        rows = getattr(project, section).select_related("anchor_asset").prefetch_related("reference_assets")
+        entities[kind] = list(rows)
+    settings = read_entity_primary_settings(project_id=project.pk,
+        entity_keys=[(kind, str(row.pk)) for kind, rows in entities.items() for row in rows])
+    return entities, settings
+
+
 def capture_consistency_snapshot(project: SeriesProject) -> dict:
     """Capture immutable prompt-time state used to reproduce a generation."""
 
+    entities, settings = _bible_state(project)
+    visual_decisions = character_visual_reference_decisions(entities["character"], primary_settings=settings)
     characters = []
-    for item in project.characters.select_related("anchor_asset").prefetch_related(
-        "reference_assets",
-    ).all():
+    for item in entities["character"]:
         characters.append({
             "id": str(item.id),
             "slug": item.slug,
             "name": item.name,
             "speaker_id": item.stable_speaker_id,
             "age_appearance": item.age_appearance,
-            "visual_identity": item.visual_identity,
+            "primary_setting": primary_setting_content(settings[("character", str(item.pk))]),
             "face_identity": item.face_identity,
             "wardrobe": item.wardrobe,
             "voice_profile": item.voice_profile,
             "personality": item.personality,
             "visual_reference_policy": (
-                character_visual_reference_decision(item).as_dict()
+                visual_decisions[str(item.pk)].as_dict()
             ),
             "negative_constraints": item.negative_constraints,
             "anchor_asset": asset_snapshot(item.anchor_asset),
@@ -71,7 +89,7 @@ def capture_consistency_snapshot(project: SeriesProject) -> dict:
         "id": str(item.id),
         "slug": item.slug,
         "name": item.name,
-        "visual_identity": item.visual_identity,
+        "primary_setting": primary_setting_content(settings[("scene", str(item.pk))]),
         "location": item.location,
         "time_of_day": item.time_of_day,
         "lighting": item.lighting,
@@ -82,14 +100,12 @@ def capture_consistency_snapshot(project: SeriesProject) -> dict:
         "reference_assets": [
             asset_snapshot(asset) for asset in item.reference_assets.all()
         ],
-    } for item in project.scenes.select_related("anchor_asset").prefetch_related(
-        "reference_assets",
-    ).all()]
+    } for item in entities["scene"]]
     props = [{
         "id": str(item.id),
         "slug": item.slug,
         "name": item.name,
-        "visual_identity": item.visual_identity,
+        "primary_setting": primary_setting_content(settings[("prop", str(item.pk))]),
         "material": item.material,
         "distinctive_marks": item.distinctive_marks,
         "continuity_state": item.continuity_state,
@@ -98,9 +114,7 @@ def capture_consistency_snapshot(project: SeriesProject) -> dict:
         "reference_assets": [
             asset_snapshot(asset) for asset in item.reference_assets.all()
         ],
-    } for item in project.props.select_related("anchor_asset").prefetch_related(
-        "reference_assets",
-    ).all()]
+    } for item in entities["prop"]]
     locks = [{
         "scope": lock.scope,
         "target_id": str(lock.target_id) if lock.target_id else None,
@@ -143,9 +157,14 @@ def capture_consistency_snapshot(project: SeriesProject) -> dict:
     }
 
 
+@transaction.atomic
 def sync_consistency_locks(project: SeriesProject) -> list[ConsistencyLock]:
     """Create or update canonical locks from project and Bible state."""
 
+    # Match the existing setting writer's project-first serialization; failure
+    # must not leave some locks updated and others at the previous revision.
+    project = SeriesProject.objects.select_for_update().get(pk=project.pk)
+    entities, settings = _bible_state(project)
     specs: list[tuple[str, object | None, str, dict]] = [
         (ConsistencyLock.Scope.GLOBAL, None, "production_format", {
             "language": project.language,
@@ -163,26 +182,26 @@ def sync_consistency_locks(project: SeriesProject) -> list[ConsistencyLock]:
             "visual_prompt": project.style.visual_prompt,
             "negative_prompt": project.style.negative_prompt,
         }))
-    for character in project.characters.all():
+    for character in entities["character"]:
         specs.append((ConsistencyLock.Scope.CHARACTER, character.id, "identity", {
             "name": character.name,
             "speaker_id": character.stable_speaker_id,
-            "visual_identity": character.visual_identity,
+            "primary_setting_ref": primary_setting_content_reference(settings[("character", str(character.pk))]),
             "face_identity": character.face_identity,
             "wardrobe": character.wardrobe,
             "voice_profile": character.voice_profile,
         }))
-    for scene in project.scenes.all():
+    for scene in entities["scene"]:
         specs.append((ConsistencyLock.Scope.SCENE, scene.id, "identity", {
             "name": scene.name,
-            "visual_identity": scene.visual_identity,
+            "primary_setting_ref": primary_setting_content_reference(settings[("scene", str(scene.pk))]),
             "lighting": scene.lighting,
             "color_palette": scene.color_palette,
         }))
-    for prop in project.props.all():
+    for prop in entities["prop"]:
         specs.append((ConsistencyLock.Scope.PROP, prop.id, "identity", {
             "name": prop.name,
-            "visual_identity": prop.visual_identity,
+            "primary_setting_ref": primary_setting_content_reference(settings[("prop", str(prop.pk))]),
             "material": prop.material,
             "distinctive_marks": prop.distinctive_marks,
             "continuity_state": prop.continuity_state,
@@ -197,15 +216,10 @@ def sync_consistency_locks(project: SeriesProject) -> list[ConsistencyLock]:
     slot_value = dict(existing_slot_value.get("picture", {}))
     subject_value = dict(existing_slot_value.get("subject", {}))
     assets = {}
-    for bible in (*project.characters.all(), *project.scenes.all(), *project.props.all()):
+    for bible in (row for rows in entities.values() for row in rows):
         if bible.anchor_asset:
             assets[str(bible.anchor_asset_id)] = bible.anchor_asset
         for asset in bible.reference_assets.all():
-            assets[str(asset.id)] = asset
-    for shot in Shot.objects.filter(episode__project=project).prefetch_related(
-        "reference_assets",
-    ):
-        for asset in shot.reference_assets.all():
             assets[str(asset.id)] = asset
     used_numbers = {
         int(value.get("slot", 0))
@@ -227,11 +241,7 @@ def sync_consistency_locks(project: SeriesProject) -> list[ConsistencyLock]:
         if isinstance(value, dict)
     }
     next_subject_number = max(used_subject_numbers, default=0) + 1
-    for prefix, bibles in (
-        ("character", project.characters.all()),
-        ("scene", project.scenes.all()),
-        ("prop", project.props.all()),
-    ):
+    for prefix, bibles in entities.items():
         for bible in bibles:
             subject_key = f"{prefix}:{bible.id}"
             if subject_key in subject_value:

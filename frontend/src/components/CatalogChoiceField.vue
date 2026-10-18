@@ -11,6 +11,8 @@ const props = withDefaults(defineProps<{
   customLabel?: string
   customPlaceholder?: string
   pattern?: string
+  inputId?: string
+  inputLabel?: string
 }>(), {
   allowCustom: false,
   disabled: false,
@@ -53,7 +55,7 @@ const select = (event: Event) => {
 
 <template>
   <div class="catalog-choice-field">
-    <select :value="selectValue" :disabled="disabled" @change="select">
+    <select :id="inputId" :aria-label="inputLabel" :value="selectValue" :disabled="disabled" @change="select">
       <option value="">{{ emptyLabel }}</option>
       <option v-for="option in options" :key="option.value" :value="option.value" :disabled="option.disabled" :title="option.hint">{{ option.label }}</option>
       <option v-if="allowCustom" :value="CUSTOM">{{ customLabel }}</option>
@@ -65,6 +67,7 @@ const select = (event: Event) => {
       :disabled="disabled"
       :pattern="pattern"
       :placeholder="customPlaceholder"
+      :aria-label="customLabel"
       @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
     />
   </div>

@@ -1,23 +1,15 @@
 from __future__ import annotations
 
-from copy import deepcopy
-from dataclasses import replace
 import hashlib
-import re
-import time
 import uuid
-from pathlib import Path, PurePosixPath
-from types import SimpleNamespace
 from typing import Any
 
-from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
 
 from studio.models import (
-    Asset,
     HostCapabilitySnapshot,
     ModelArtifact,
     ModelDeployment,
@@ -29,8 +21,7 @@ from studio.models import (
     WorkflowTemplate,
     WorkflowTemplateVersion,
 )
-from studio.services.comfyui_contract import ComfyUIContractError, validate_comfyui_api_contract
-from studio.services.comfyui import ComfyUIClient
+from studio.services.comfyui_contract import validate_comfyui_api_contract
 from studio.services.comfyui_artifacts import (
     artifact_inventory_spec,
     exact_object_info_model_option,
@@ -52,28 +43,22 @@ from studio.services.model_profile_contracts import (
     verified_model_profile_specification,
 )
 from studio.services.media_capabilities import (
-    conditioning_mode_contract,
     resolve_conditioning_contract,
 )
 from studio.services.execution_monitoring import (
     resolve_execution_monitoring_contract,
 )
 from studio.services.provider_registry import (
-    ProviderDriverError,
-    _comfyui_failure_message,
     credential_binding_sha256,
     driver_for,
 )
 from studio.services.runtime_platform import verified_artifact_availability
-from studio.services.provenance import classify_task_output, sha256_file
-from studio.services.generated_artifacts import verified_local_media_facts
 from studio.services.workflow import (
     WorkflowBuildError,
     validate_comfy_graph,
 )
 from studio.services.workflow_compiler import (
     WorkflowCompilerError,
-    compile_frozen_workflow,
     compiler_contract_from_input,
     workflow_execution_contract,
 )
@@ -85,10 +70,6 @@ from studio.services.workflow_semantics import (
     expected_value_type,
     validate_semantic_key,
     validate_resolution_strategy,
-)
-from studio.services.workflow_smoke_fixtures import (
-    FIXTURE_SCHEMA_VERSION,
-    workflow_execution_conditioning_contract,
 )
 from studio.services.workflow_projectors import (
     validate_frozen_workflow_projector_contract,
@@ -239,26 +220,14 @@ def verify_workflow_smoke_attempt_contract(
     version: WorkflowTemplateVersion,
     deployment: ModelDeployment,
 ) -> None:
-    """Fail before submit/publish when an attempt belongs to older evidence."""
-
-    current_target_sha256 = _execution_target_sha256(version, deployment)
-    if (
-        attempt.workflow_version_id != version.id
-        or attempt.deployment_id != deployment.id
-        or version.validation_state != WorkflowTemplateVersion.ValidationState.PASSED
-        or version.validated_deployment_id != deployment.id
-        or _evidence_digest(version.validation_evidence)
-        != version.validation_evidence_sha256
-        or version.validation_evidence.get("execution_target_sha256")
-        != current_target_sha256
-        or attempt.graph_sha256 != version.graph_sha256
-        or attempt.execution_contract_sha256 != version.execution_contract_sha256
-        or attempt.validation_evidence_sha256 != version.validation_evidence_sha256
-        or attempt.target_sha256 != current_target_sha256
-    ):
-        raise ValidationError(
-            "workflow smoke attempt 不属于当前 graph/validation/deployment 合同",
-        )
+    """Base acceptance uses the original resource Preparation, not an instance."""
+    from studio.services.execution_workflow_resource_evidence import same_workflow_validation
+    from studio.services.execution_resource_smoke_definition import read_resource_smoke_definition
+    verify_workflow_live_validation(version, deployment)
+    if not same_workflow_validation(attempt, version) or attempt.deployment_id != deployment.pk:
+        raise ValidationError("workflow smoke attempt 不属于当前 graph/validation/deployment 合同")
+    # This digest is the unified prepared target, not the Live Validate digest.
+    read_resource_smoke_definition(attempt, current=True)
 
 
 def declared_workflow_operation(version: WorkflowTemplateVersion) -> str:
@@ -328,6 +297,19 @@ def _verify_current_workflow_validation_evidence(
         )
 
 
+def verify_workflow_live_validation(version, deployment):
+    """Shared prerequisite for base Smoke, without requiring its own pass."""
+    if (version.validation_state != WorkflowTemplateVersion.ValidationState.PASSED
+            or version.validated_deployment_id != deployment.pk
+            or version.model_profile_version_id != deployment.profile_version_id
+            or version.provider_id != deployment.profile_version.provider_id):
+        raise ValidationError("必须先在同一精确模型部署上通过Live Validate", code="live_validation_required")
+    verify_workflow_version_integrity(version)
+    target = workflow_execution_target_sha256(version, deployment)
+    _verify_current_workflow_validation_evidence(version, deployment, target_sha256=target)
+    return target
+
+
 def _workflow_smoke_attempt_for_evidence(
     version: WorkflowTemplateVersion,
     deployment: ModelDeployment,
@@ -347,6 +329,7 @@ def _workflow_smoke_attempt_for_evidence(
                 workflow_version=version,
                 deployment=deployment,
                 status=WorkflowSmokeAttempt.Status.SUCCEEDED,
+                scope="resource",
             )
         except (WorkflowSmokeAttempt.DoesNotExist, TypeError, ValueError) as exc:
             raise ValidationError(
@@ -359,6 +342,8 @@ def _workflow_smoke_attempt_for_evidence(
         or smoke_attempt.workflow_version_id != version.id
         or smoke_attempt.deployment_id != deployment.id
         or smoke_attempt.status != WorkflowSmokeAttempt.Status.SUCCEEDED
+        or smoke_attempt.scope != "resource"
+        or smoke_attempt.execution_instance_version_id is not None
     ):
         raise ValidationError(
             "workflow smoke evidence 未精确绑定成功的持久 attempt",
@@ -375,115 +360,24 @@ def _verify_current_workflow_smoke_evidence(
     smoke_attempt: WorkflowSmokeAttempt | None = None,
     smoke_attempt_loaded: bool = False,
 ) -> WorkflowSmokeAttempt:
+    from studio.services.execution_workflow_resource_evidence import resource_workflow_smoke_projection
     evidence = version.smoke_test_evidence
-    if not isinstance(evidence, dict) or not version.smoke_test_evidence_sha256:
-        raise ValidationError(
-            "workflow smoke 证据缺失",
-            code="workflow_smoke_evidence_invalid",
-        )
-    if _evidence_digest(evidence) != version.smoke_test_evidence_sha256:
-        raise ValidationError(
-            "workflow smoke 证据摘要无效",
-            code="workflow_smoke_evidence_invalid",
-        )
-    if (
-        evidence.get("execution_submitted") is not True
-        or str(evidence.get("deployment_id") or "") != str(deployment.id)
-        or evidence.get("graph_sha256") != version.graph_sha256
-        or evidence.get("execution_contract_sha256")
-        != version.execution_contract_sha256
-    ):
-        raise ValidationError(
-            "workflow smoke 证据不属于当前定义",
-            code="workflow_smoke_evidence_invalid",
-        )
-    if (
-        evidence.get("execution_target_sha256") != target_sha256
-        or not isinstance(evidence.get("execution_target"), dict)
-        or _evidence_digest(evidence["execution_target"]) != target_sha256
-    ):
-        raise ValidationError(
-            "workflow smoke 证据不属于当前执行目标",
-            code="workflow_smoke_target_drifted",
-        )
-    if (
-        evidence.get("output_kind") != version.template.output_kind
-        or not isinstance(evidence.get("outputs"), list)
-        or not evidence.get("outputs")
-        or evidence.get("output_count") != len(evidence["outputs"])
-    ):
-        raise ValidationError(
-            "workflow smoke 输出证据不完整",
-            code="workflow_smoke_evidence_invalid",
-        )
-
-    attempt = _workflow_smoke_attempt_for_evidence(
-        version,
-        deployment,
-        smoke_attempt=smoke_attempt,
-        smoke_attempt_loaded=smoke_attempt_loaded,
-    )
+    if (not isinstance(evidence, dict) or not version.smoke_test_evidence_sha256
+            or _evidence_digest(evidence) != version.smoke_test_evidence_sha256):
+        raise ValidationError("workflow smoke 证据缺失或摘要无效", code="workflow_smoke_evidence_invalid")
+    if evidence.get("execution_target_sha256") != target_sha256:
+        raise ValidationError("workflow smoke 证据不属于当前执行目标", code="workflow_smoke_target_drifted")
+    attempt = _workflow_smoke_attempt_for_evidence(version, deployment,
+        smoke_attempt=smoke_attempt, smoke_attempt_loaded=smoke_attempt_loaded)
     try:
-        verify_workflow_smoke_attempt_contract(
-            attempt,
-            version=version,
-            deployment=deployment,
-        )
-        verify_json_contract(
-            attempt.fixture_values,
-            schema_version=attempt.fixture_values_schema_version,
-            size_bytes=attempt.fixture_values_size_bytes,
-            sha256=attempt.fixture_values_sha256,
-            max_bytes=_workflow_smoke_fixture_max_bytes(),
-        )
+        verify_workflow_smoke_attempt_contract(attempt, version=version, deployment=deployment)
+        expected = resource_workflow_smoke_projection(attempt, version)
     except ValidationError as exc:
-        raise ValidationError(
-            "workflow smoke attempt 不属于当前完整性合同",
-            code="workflow_smoke_attempt_invalid",
-        ) from exc
-    if attempt.fixture_values_schema_version != FIXTURE_SCHEMA_VERSION:
-        raise ValidationError(
-            "workflow smoke fixture schema 已过期",
-            code="workflow_smoke_attempt_invalid",
-        )
-
-    fixture_values = attempt.fixture_values
-    result = attempt.result if isinstance(attempt.result, dict) else {}
-    reference_bindings = (
-        fixture_values.get("reference_bindings")
-        if isinstance(fixture_values, dict) else None
-    )
-    expected_reference_sha256 = (
-        json_contract(
-            reference_bindings,
-            max_bytes=_stage_snapshot_max_bytes(),
-        ).sha256
-        if isinstance(reference_bindings, list) else ""
-    )
-    expected = {
-        "smoke_attempt_id": str(attempt.id),
-        "fixture_sha256": attempt.fixture_sha256,
-        "reference_bindings_sha256": expected_reference_sha256,
-        "asset_bindings_sha256": str(
-            evidence.get("asset_bindings_sha256") or "",
-        ),
-        "materialized_graph_sha256": str(
-            fixture_values.get("materialized_graph_sha256") or "",
-        ) if isinstance(fixture_values, dict) else "",
-        "compiled_graph_sha256": str(
-            evidence.get("compiled_graph_sha256") or "",
-        ),
-    }
-    if any(
-        not value
-        or str(evidence.get(key) or "") != value
-        or str(result.get(key) or "") != value
-        for key, value in expected.items()
-    ):
-        raise ValidationError(
-            "workflow smoke fixture/materialized/compiled 证据不完整",
-            code="workflow_smoke_evidence_invalid",
-        )
+        raise ValidationError("workflow smoke 的原请求或结果证据无效", code="workflow_smoke_attempt_invalid") from exc
+    if evidence != expected:
+        raise ValidationError("workflow smoke 投影与原任务结果不一致", code="workflow_smoke_evidence_invalid")
+    if attempt.evidence_expires_at <= timezone.now():
+        raise ValidationError("Workflow Smoke 证据已过期，请重新验收", code="workflow_smoke_expired")
     return attempt
 
 
@@ -539,7 +433,7 @@ def inspect_workflow_acceptance(
         validation.update({
             "state": "evidence_invalid",
             "reason_code": "validated_deployment_missing",
-            "message": "历史通过状态缺少精确的模型实例关联。",
+            "message": "历史通过状态缺少精确的模型部署关联。",
         })
     else:
         deployment = version.validated_deployment
@@ -647,12 +541,13 @@ def inspect_workflow_acceptance(
                 "state": (
                     "drifted"
                     if code == "workflow_smoke_target_drifted"
-                    else "evidence_invalid"
+                    else "expired" if code == "workflow_smoke_expired" else "evidence_invalid"
                 ),
                 "reason_code": code,
                 "message": (
                     "历史 Workflow Smoke 已通过，但当前目标已漂移。"
                     if code == "workflow_smoke_target_drifted"
+                    else "Workflow Smoke 证据已过期，请重新验收。" if code == "workflow_smoke_expired"
                     else "Workflow Smoke 证据不完整或无法核验。"
                 ),
             })
@@ -883,11 +778,9 @@ def _validate_model_inventory(version, deployment, driver, object_info) -> dict[
             if isinstance(graph_inputs, dict)
             else None
         )
-        # The immutable graph and managed artifact use a platform-neutral model
-        # identity.  The target ComfyUI enum may spell that same safe relative
-        # path with Windows backslashes.  Validate the canonical identity here;
-        # the exact, uniquely resolved enum spelling is frozen below as
-        # submission_filename and applied to the runtime graph before submit.
+        # The compiler submits the immutable graph's exact widget spelling.
+        # File identity can be portable; the submitted enum cannot be rewritten
+        # later from mutable inventory or merely accepted as an equivalent path.
         if (
             not isinstance(graph_filename, str)
             or safe_model_relative_filename(graph_filename)
@@ -899,6 +792,11 @@ def _validate_model_inventory(version, deployment, driver, object_info) -> dict[
                     "请修正来源工作流后重新导入"
                 ),
             })
+        if graph_filename != submission_filename:
+            raise ValidationError({"model_requirements": (
+                f"{requirement.alias} 的冻结模型选项与目标运行端的精确枚举不一致；"
+                "请重新导入并发布新工作流版本"
+            )})
         checked.append({
             "requirement_id": str(requirement.id),
             "artifact_id": str(artifact.id),
@@ -975,415 +873,6 @@ def workflow_version_execution_snapshot(version: WorkflowTemplateVersion) -> dic
     }
 
 
-def _smoke_conditioning_mode(
-    version: WorkflowTemplateVersion,
-    values: dict[str, Any],
-) -> tuple[str, dict[str, Any] | None]:
-    if version.template.output_kind != "video":
-        return "", None
-    try:
-        _conditioning, mode_contract = workflow_execution_conditioning_contract(
-            version,
-            values,
-        )
-    except ValidationError as exc:
-        detail = "; ".join(exc.messages) if getattr(exc, "messages", None) else str(exc)
-        raise ValidationError({"fixture": detail}) from exc
-    mode = str((mode_contract or {}).get("key") or "")
-    if not mode:
-        raise ValidationError({"fixture": "conditioning mode 合同缺失"})
-    return mode, mode_contract
-
-
-def _smoke_audio_enabled(
-    version: WorkflowTemplateVersion,
-    values: dict[str, Any],
-) -> bool:
-    """Resolve smoke audio behavior from the frozen version contract only."""
-
-    contract = version.input_contract if isinstance(version.input_contract, dict) else {}
-    parameters = contract.get("parameters") if isinstance(contract, dict) else None
-    static = contract.get("static_semantics", {})
-    if "audio.enabled" in static:
-        value = static["audio.enabled"]
-        if type(value) is not bool or "audio.enabled" in values and values["audio.enabled"] != value:
-            raise ValidationError({"fixture": "audio.enabled 不能覆盖冻结静态语义"})
-        return value
-    if not isinstance(parameters, dict) or "audio.enabled" not in parameters:
-        # A version that does not bind audio.enabled cannot request audio
-        # topology. The absence is recorded in its frozen contract.
-        return False
-    value = values.get("audio.enabled")
-    if not isinstance(value, bool):
-        raise ValidationError({
-            "fixture": "audio.enabled 必须由冻结 workflow 参数合同明确提供布尔值",
-        })
-    return value
-
-
-def _materialize_smoke_graph(
-    version: WorkflowTemplateVersion,
-    *,
-    fixture_values: dict[str, Any],
-    fixture_reference_bindings: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
-    fixture_asset_facts: list[dict[str, Any]] | tuple[dict[str, Any], ...],
-    output_prefix: str | None = None,
-    owner_id=None,
-    require_smoke_video_timing: bool = True,
-):
-    contract = version.input_contract if isinstance(version.input_contract, dict) else {}
-    values = fixture_values if isinstance(fixture_values, dict) else None
-    if values is None:
-        raise ValidationError("workflow smoke fixture values 无效")
-    asset_facts = list(fixture_asset_facts or [])
-    reference_bindings = list(fixture_reference_bindings or [])
-    smoke_conditioning_mode, smoke_mode_contract = _smoke_conditioning_mode(
-        version,
-        values,
-    )
-    labels = [
-        str(label)
-        for item in reference_bindings
-        for label in (item.get("input_label"), item.get("audio_input_label"))
-        if label
-    ]
-    base_prompt = str(values.get("prompt.positive") or values.get("PROMPT") or "smoke test")
-    smoke_prompt = (
-        base_prompt + (" Reference inputs: " + " ".join(labels) if labels else "")
-    )
-    output_kind = str(version.template.output_kind or "")
-    raw_fps = values.get("video.fps", values.get("FPS"))
-    if require_smoke_video_timing and output_kind == WorkflowTemplate.OutputKind.VIDEO and (
-        isinstance(raw_fps, bool)
-        or not isinstance(raw_fps, (int, float))
-        or float(raw_fps) <= 0
-    ):
-        raise ValidationError({"fixture": "video smoke 必须由参数合同明确提供正数 video.fps"})
-    raw_duration_ms = values.get("video.duration_ms", values.get("DURATION_MS"))
-    if raw_duration_ms is None and output_kind == WorkflowTemplate.OutputKind.VIDEO:
-        frames = values.get("video.frames", values.get("FRAMES"))
-        if (
-            isinstance(frames, int)
-            and not isinstance(frames, bool)
-            and frames > 0
-            and isinstance(raw_fps, (int, float))
-            and not isinstance(raw_fps, bool)
-            and float(raw_fps) > 0
-        ):
-            raw_duration_ms = round(frames / float(raw_fps) * 1000)
-    if require_smoke_video_timing and output_kind == WorkflowTemplate.OutputKind.VIDEO and (
-        isinstance(raw_duration_ms, bool)
-        or not isinstance(raw_duration_ms, (int, float))
-        or int(raw_duration_ms) <= 0
-    ):
-        raise ValidationError({
-            "fixture": (
-                "video smoke 必须明确提供 video.duration_ms，或同时提供 video.frames/video.fps"
-            ),
-        })
-    is_dynamic_references = (version.compiler_id, version.compiler_version) == ("generic.comfy", 3)
-    smoke_audio_enabled = _smoke_audio_enabled(
-        version,
-        values,
-    )
-    prompt = SimpleNamespace(
-        id=version.id,
-        prompt_text=smoke_prompt,
-        negative_prompt=str(values.get("prompt.negative") or values.get("NEGATIVE_PROMPT") or ""),
-        total_duration_ms=int(raw_duration_ms or 0),
-        include_audio=smoke_audio_enabled,
-        prompt_type=output_kind,
-        conditioning_mode=smoke_conditioning_mode,
-        model=(
-            version.model_profile_version.model_identifier
-            if version.model_profile_version_id else ""
-        ),
-        structured_payload={
-            "reference_bindings": reference_bindings or asset_facts,
-            "prompt_template_key": (contract.get("prompt_template_keys") or [""])[0] if is_dynamic_references else "",
-            "effective_conditioning_mode": smoke_conditioning_mode,
-        },
-        project=SimpleNamespace(owner_id=owner_id),
-    )
-    width = values.get("image.width", values.get("WIDTH"))
-    height = values.get("image.height", values.get("HEIGHT"))
-    seed = values.get("sampling.seed", values.get("SEED"))
-    aspect_ratio = values.get("image.aspect_ratio", values.get("ASPECT_RATIO"))
-    project = SimpleNamespace(
-        id=version.id,
-        owner_id=owner_id,
-        width=int(width) if width is not None else None,
-        height=int(height) if height is not None else None,
-        fps=int(raw_fps) if raw_fps is not None else None,
-        continuity_seed=int(seed) if seed is not None else None,
-        aspect_ratio=str(aspect_ratio) if aspect_ratio is not None else None,
-    )
-    try:
-        parameters = contract.get("parameters") if isinstance(contract, dict) else {}
-        generic_overrides = {
-            key: value
-            for key, value in values.items()
-            if (
-                isinstance(parameters, dict)
-                and key in parameters
-                and not key.startswith("asset.")
-                and not key.startswith("model.")
-            )
-        }
-        if is_dynamic_references and isinstance(parameters, dict) and "prompt.positive" in parameters:
-            generic_overrides["prompt.positive"] = smoke_prompt
-        if isinstance(parameters, dict) and "output.prefix" in parameters:
-            generic_overrides["output.prefix"] = (
-                str(output_prefix or "").strip()
-                or f"autoprompt/smoke/{version.id}"
-            )
-        compiled = compile_frozen_workflow(
-            workflow_snapshot=workflow_version_execution_snapshot(version),
-            prompt=prompt, project=project, overrides=generic_overrides,
-        )
-    except (WorkflowCompilerError, WorkflowSemanticError) as exc:
-        raise ValidationError({"fixture": str(exc)}) from exc
-    # ModelRequirement filenames remain immutable, platform-neutral evidence.
-    # Actual ComfyUI widget values must use the exact spelling frozen from the
-    # validated Deployment's object_info enum (Windows backslashes included).
-    # A draft may still be structurally compiled for preview, but every
-    # validated execution fails closed without schema-v2 inventory evidence.
-    runtime_graph = deepcopy(compiled.graph)
-    runtime_values = deepcopy(compiled.resolved_semantics)
-    bindings_by_key = {
-        row.semantic_key: row
-        for row in version.semantic_bindings.all()
-    }
-    model_requirements = list(
-        version.model_requirements.select_related("artifact").all()
-    )
-    validated_execution = (
-        version.validation_state
-        == WorkflowTemplateVersion.ValidationState.PASSED
-    )
-    evidence_by_requirement: dict[str, dict[str, Any]] = {}
-    if validated_execution and any(
-        f"model.{requirement.alias}.filename" in bindings_by_key
-        for requirement in model_requirements
-    ):
-        evidence = version.validation_evidence
-        inventory = evidence.get("inventory") if isinstance(evidence, dict) else None
-        rows = inventory.get("checked_requirements") if isinstance(inventory, dict) else None
-        if (
-            not isinstance(evidence, dict)
-            or version.validation_evidence_sha256 != _evidence_digest(evidence)
-            or not isinstance(inventory, dict)
-            or inventory.get("schema_version") != 2
-            or not isinstance(rows, list)
-        ):
-            remediation = (
-                "已发布版本需新建版本后执行 live validate"
-                if version.status in {
-                    WorkflowTemplateVersion.Status.PUBLISHED,
-                    WorkflowTemplateVersion.Status.RETIRED,
-                }
-                else "请重新执行 live validate"
-            )
-            raise ValidationError({
-                "fixture": (
-                    "validated workflow 缺少目标 Deployment 的精确模型提交枚举证据；"
-                    + remediation
-                ),
-            })
-        for row in rows:
-            requirement_id = str(row.get("requirement_id") or "") if isinstance(row, dict) else ""
-            if not requirement_id or requirement_id in evidence_by_requirement:
-                raise ValidationError({
-                    "fixture": "validated workflow 模型提交枚举证据重复或无效",
-                })
-            evidence_by_requirement[requirement_id] = row
-    for requirement in model_requirements:
-        artifact = requirement.artifact
-        semantic_key = f"model.{requirement.alias}.filename"
-        binding = bindings_by_key.get(semantic_key)
-        if binding is None:
-            continue
-        if not validated_execution:
-            continue
-        if artifact is None:
-            raise ValidationError({
-                "fixture": f"{semantic_key} 缺少已证明的 ModelArtifact",
-            })
-        expected_filename = safe_model_relative_filename(requirement.expected_filename)
-        artifact_filename = safe_model_relative_filename(artifact.filename)
-        if (
-            expected_filename is None
-            or artifact_filename is None
-            or expected_filename != artifact_filename
-        ):
-            raise ValidationError({
-                "fixture": f"{semantic_key} 的 artifact/requirement 文件名已漂移",
-            })
-        evidence_row = evidence_by_requirement.get(str(requirement.id))
-        submission_filename = (
-            str(evidence_row.get("submission_filename") or "")
-            if isinstance(evidence_row, dict) else ""
-        )
-        target_node = runtime_graph.get(str(binding.node_id))
-        target_node_type = (
-            str(target_node.get("class_type") or "")
-            if isinstance(target_node, dict) else ""
-        )
-        if (
-            not isinstance(evidence_row, dict)
-            or str(evidence_row.get("artifact_id") or "") != str(artifact.id)
-            or evidence_row.get("filename") != requirement.expected_filename
-            or str(evidence_row.get("sha256") or "") != str(artifact.sha256 or "")
-            or evidence_row.get("semantic_key") != semantic_key
-            or str(evidence_row.get("node_id") or "") != str(binding.node_id)
-            or evidence_row.get("node_type") != target_node_type
-            or evidence_row.get("input_name") != binding.input_name
-            or safe_model_relative_filename(submission_filename) != expected_filename
-        ):
-            raise ValidationError({
-                "fixture": f"{semantic_key} 的精确模型提交枚举证据缺失或已漂移",
-            })
-        node = target_node
-        inputs = node.get("inputs") if isinstance(node, dict) else None
-        if not isinstance(inputs, dict) or binding.input_name not in inputs:
-            raise ValidationError({
-                "fixture": f"模型 semantic 目标不存在: {binding.node_id}.{binding.input_name}",
-            })
-        inputs[binding.input_name] = submission_filename
-        runtime_values[semantic_key] = submission_filename
-    if runtime_graph != compiled.graph:
-        compiled = replace(
-            compiled,
-            graph=runtime_graph,
-            graph_sha256=json_contract(
-                runtime_graph,
-                max_bytes=_workflow_graph_max_bytes(),
-            ).sha256,
-            resolved_semantics=runtime_values,
-            resolved_semantics_sha256=json_contract(
-                runtime_values,
-                max_bytes=_workflow_graph_max_bytes(),
-            ).sha256,
-        )
-    expected_assets = sorted(
-        (
-            str(row.get("semantic_key") or ""),
-            str(row.get("asset_id") or ""),
-            str(row.get("checksum") or "").casefold(),
-        )
-        for row in asset_facts
-    )
-    compiled_assets = []
-    for row in compiled.asset_bindings:
-        semantic_key = str(row.get("semantic_key") or "")
-        compiled_assets.append((
-            semantic_key,
-            str(row.get("asset_id") or ""),
-            str(row.get("checksum") or "").casefold(),
-        ))
-        if row.get("audio_asset_id"):
-            compiled_assets.append((
-                f"{semantic_key}.audio",
-                str(row.get("audio_asset_id") or ""),
-                str(row.get("audio_checksum") or "").casefold(),
-            ))
-    compiled_assets.sort()
-    if compiled_assets != expected_assets:
-        raise ValidationError({
-            "fixture": "具体素材未精确进入本次冻结执行图",
-        })
-    return compiled
-
-
-def materialize_workflow_execution_graph(
-    version: WorkflowTemplateVersion,
-    *,
-    values: dict[str, Any],
-    reference_bindings: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
-    asset_facts: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
-    output_prefix: str,
-    owner_id=None,
-):
-    """Compile one exact frozen WorkflowTemplateVersion for a durable execution."""
-
-    return _materialize_smoke_graph(
-        version,
-        fixture_values=values,
-        fixture_reference_bindings=reference_bindings,
-        fixture_asset_facts=asset_facts,
-        output_prefix=output_prefix,
-        owner_id=owner_id,
-        require_smoke_video_timing=False,
-    )
-
-
-def _stage_smoke_assets(*, compiled, version, deployment, driver) -> tuple[dict[str, Any], set[str]]:
-    graph = compiled.graph
-    if not compiled.asset_bindings:
-        return graph, set()
-    operations = set((driver.capabilities() or {}).get("operations") or [])
-    if "upload" not in operations:
-        raise ValidationError("i2v/media smoke-test 需要 provider upload 契约")
-    asset_root = Path(settings.ASSET_LIBRARY_ROOT).resolve()
-    replacements: dict[str, str] = {}
-    uploaded_paths: set[str] = set()
-    physical_bindings = []
-    for binding in compiled.asset_bindings:
-        physical_bindings.append({
-            "asset_id": binding.get("asset_id"),
-            "checksum": binding.get("checksum"),
-            "token": binding.get("token"),
-        })
-        if binding.get("audio_asset_id"):
-            audio_asset_id = str(binding.get("audio_asset_id") or "")
-            physical_bindings.append({
-                "asset_id": audio_asset_id,
-                "checksum": binding.get("audio_checksum"),
-                "token": f"__AUTOPROMPT_ASSET__:{audio_asset_id}",
-            })
-    seen_asset_ids: set[str] = set()
-    for binding in physical_bindings:
-        asset_id = str(binding.get("asset_id") or "")
-        if not asset_id or asset_id in seen_asset_ids:
-            raise ValidationError("compiled smoke graph 的素材 manifest 必须全局唯一")
-        seen_asset_ids.add(asset_id)
-        try:
-            asset = Asset.objects.get(pk=asset_id, is_active=True, owner__isnull=True)
-        except (Asset.DoesNotExist, ValueError) as exc:
-            raise ValidationError("smoke asset 必须是启用的全局受管资产") from exc
-        if not asset.local_path or asset.file:
-            raise ValidationError("smoke asset 必须来自只读素材库 local_path")
-        source = Path(asset.local_path).resolve()
-        if not source.is_relative_to(asset_root) or not source.is_file():
-            raise ValidationError("smoke asset 路径越过受控素材库或文件不存在")
-        digest = sha256_file(source)
-        if digest != str(binding.get("checksum") or "").casefold() or digest != str(asset.checksum or "").casefold():
-            raise ValidationError("smoke asset checksum 与冻结 manifest 不一致")
-        uploaded = driver.invoke(deployment, "upload", {
-            "source_path": str(source),
-            "subfolder": f"autoprompt/smoke/{version.id}",
-            "filename": f"{asset.id}{source.suffix.lower() or '.bin'}",
-        })
-        name = str(uploaded.get("name") or "") if isinstance(uploaded, dict) else ""
-        subfolder = str(uploaded.get("subfolder") or "") if isinstance(uploaded, dict) else ""
-        relative_path = "/".join(filter(None, (subfolder, name)))
-        if not name or not relative_path:
-            raise ValidationError("provider upload 未返回可执行相对路径")
-        replacements[str(binding["token"])] = relative_path
-        uploaded_paths.add(relative_path)
-
-    def replace(value):
-        if isinstance(value, dict):
-            return {key: replace(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [replace(item) for item in value]
-        if isinstance(value, str) and value.startswith("__AUTOPROMPT_ASSET__:"):
-            if value not in replacements:
-                raise ValidationError("compiled smoke graph 含未授权 asset token")
-            return replacements[value]
-        return value
-
-    return replace(graph), uploaded_paths
 
 
 def _validate_semantic_bindings(
@@ -1508,7 +997,14 @@ def _uses_strict_semantic_contract(compiler_id: str, compiler_version: int) -> b
     return compiler_id == "generic.comfy" and compiler_version in {1, 2, 3}
 
 
-def _validate_classified_definition(graph, contract, model_specification, bindings, requirements):
+def _validate_projector_model_definition(graph, contract, model_specification, bindings, requirements):
+    if contract.get("compiler") == {"id": "generic.comfy", "version": 2}:
+        from studio.services.workflow_asset_groups import validate_model_group_quantities, AssetGroupError
+        try:
+            validate_model_group_quantities(contract, model_specification)
+        except AssetGroupError as exc:
+            raise ValidationError({"input_contract": str(exc)}) from exc
+        return
     if contract.get("compiler") != {"id": "generic.comfy", "version": 3}:
         return
     from studio.services.workflow_classified_references import validate_frozen, ClassifiedReferenceError
@@ -1606,7 +1102,7 @@ def import_workflow_version(
     _validate_requirements(model_requirements)
     if strict_semantics:
         _validate_model_binding_coverage(input_contract, semantic_bindings, model_requirements)
-    _validate_classified_definition(graph, input_contract, model_specification, semantic_bindings, model_requirements)
+    _validate_projector_model_definition(graph, input_contract, model_specification, semantic_bindings, model_requirements)
 
     WorkflowTemplate.objects.select_for_update().get(pk=template.pk)
     next_version = (
@@ -1797,7 +1293,7 @@ def verify_workflow_version_integrity(
     _validate_requirements(requirements)
     if strict_semantics:
         _validate_model_binding_coverage(version.input_contract, bindings, requirements)
-    _validate_classified_definition(version.graph, version.input_contract, model_specification, bindings, requirements)
+    _validate_projector_model_definition(version.graph, version.input_contract, model_specification, bindings, requirements)
 
 
 def resolve_workflow_canvas_export_deployment(
@@ -2094,514 +1590,6 @@ def validate_workflow_version(
     return version, report.as_dict()
 
 
-def smoke_test_workflow_version(
-    version: WorkflowTemplateVersion,
-    *,
-    deployment: ModelDeployment,
-    fixture_values: dict[str, Any],
-    fixture_reference_bindings: list[dict[str, Any]] | tuple[dict[str, Any], ...] = (),
-    fixture_asset_facts: list[dict[str, Any]] | tuple[dict[str, Any], ...],
-    materialized_graph_sha256: str = "",
-    fixture_sha256: str,
-    smoke_attempt_id: str,
-    expected_claim_token=None,
-    submission_token: str | None = None,
-    submitted_before: bool = False,
-    on_submission_started=None,
-    on_submitted=None,
-    poll_control=None,
-) -> tuple[WorkflowTemplateVersion, dict[str, Any]]:
-    if not re.fullmatch(r"[0-9a-f]{64}", str(fixture_sha256 or "").casefold()):
-        raise ValidationError("smoke-test fixture hash 无效")
-    if not re.fullmatch(
-        r"[0-9a-f]{64}",
-        str(materialized_graph_sha256 or "").casefold(),
-    ):
-        raise ValidationError("workflow smoke 缺少冻结执行图 hash")
-    preflight_target_drifted = False
-    with transaction.atomic():
-        deployment = ModelDeployment.objects.select_for_update(of=("self",)).select_related(
-            "profile_version__provider",
-        ).get(pk=deployment.pk)
-        version = WorkflowTemplateVersion.objects.select_for_update(of=("self",)).select_related(
-            "provider", "template", "model_profile_version", "validated_deployment",
-        ).get(pk=version.pk)
-        if version.validation_state != WorkflowTemplateVersion.ValidationState.PASSED:
-            raise ValidationError("必须先通过 live validate")
-        if not version.provider_id:
-            raise ValidationError("workflow version 未绑定 provider")
-        if deployment.profile_version_id != version.model_profile_version_id:
-            raise ValidationError("deployment model profile 与 workflow 精确绑定不一致")
-        if version.validated_deployment_id != deployment.id:
-            raise ValidationError("smoke-test 必须使用通过 live validation 的同一 deployment")
-        verify_workflow_version_integrity(version)
-        expected_target_sha256 = _execution_target_sha256(version, deployment)
-        if (
-            version.validation_evidence.get("execution_target_sha256")
-            != expected_target_sha256
-        ):
-            preflight_target_drifted = True
-            version.status = WorkflowTemplateVersion.Status.DRAFT
-            version.validation_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-            version.validation_message = "validated deployment/provider/model/artifact 配置已漂移"
-            version.validated_deployment = None
-            version.validation_evidence = {}
-            version.validation_evidence_sha256 = ""
-            version.smoke_test_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-            version.smoke_test_message = "live validation 证据漂移，smoke-test 证据已失效。"
-            version.smoke_test_evidence = {}
-            version.smoke_test_evidence_sha256 = ""
-            version.save(update_fields=(
-                "status", "validation_state", "validation_message", "validated_deployment",
-                "validation_evidence", "validation_evidence_sha256", "smoke_test_state",
-                "smoke_test_message", "smoke_test_evidence", "smoke_test_evidence_sha256",
-                "updated_at",
-            ))
-        expected_graph_sha256 = version.graph_sha256
-        expected_execution_sha256 = version.execution_contract_sha256
-        expected_validation_sha256 = version.validation_evidence_sha256
-        if not preflight_target_drifted:
-            version.smoke_test_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-            version.smoke_test_message = "真实 smoke-test 执行中。"
-            version.smoke_test_evidence = {}
-            version.smoke_test_evidence_sha256 = ""
-            version.save(update_fields=(
-                "smoke_test_state", "smoke_test_message", "smoke_test_evidence",
-                "smoke_test_evidence_sha256", "updated_at",
-            ))
-    if preflight_target_drifted:
-        raise ValidationError("validated deployment/provider/model/artifact 配置已漂移")
-    driver = driver_for(version.provider)
-    request_id = ""
-    pre_submit_resource_release = None
-    structural_contract_drifted = False
-    try:
-        operations = set((driver.capabilities() or {}).get("operations") or [])
-        required_operations = {"submit", "poll", "cancel", "collect"}
-        if not required_operations <= operations:
-            raise ValidationError(
-                "provider driver 缺少真实 smoke-test submit/poll/cancel/collect 契约；版本保持 experimental",
-            )
-        configuration = resolve_configuration(required_keys=(
-            "workflow.smoke_hard_timeout_seconds", "artifact.max_bytes",
-            "workflow.smoke_poll_interval_seconds",
-        ))
-        timeout = int(configuration.values["workflow.smoke_hard_timeout_seconds"])
-        artifact_max_bytes = int(configuration.values["artifact.max_bytes"])
-        poll_interval = float(configuration.values["workflow.smoke_poll_interval_seconds"])
-        health = driver.invoke(deployment, "health", {})
-        object_info = driver.invoke(deployment, "object_info", {})
-        compiled = _materialize_smoke_graph(
-            version,
-            fixture_values=fixture_values,
-            fixture_reference_bindings=fixture_reference_bindings,
-            fixture_asset_facts=fixture_asset_facts,
-        )
-        if (
-            materialized_graph_sha256
-            and compiled.graph_sha256 != materialized_graph_sha256
-        ):
-            raise ProviderDriverError(
-                "workflow smoke 重编图与 enqueue 冻结图不一致",
-                code="workflow_smoke_contract_drifted",
-            )
-        graph, uploaded_paths = _stage_smoke_assets(
-            compiled=compiled,
-            version=version,
-            deployment=deployment,
-            driver=driver,
-        )
-        try:
-            report = validate_comfyui_api_contract(
-                graph,
-                object_info,
-                uploaded_paths=uploaded_paths,
-            )
-        except ComfyUIContractError:
-            structural_contract_drifted = True
-            raise
-        submitted_graph_sha256 = json_contract(
-            graph,
-            max_bytes=_workflow_graph_max_bytes(),
-        ).sha256
-        request_id = str(submission_token or "") if submitted_before else ""
-        if not request_id:
-            if callable(on_submission_started):
-                on_submission_started()
-            submitted = driver.invoke(deployment, "submit", {
-                "workflow": graph,
-                "client_id": f"autoprompt-smoke-{version.id}",
-                "submission_token": str(submission_token or ""),
-            })
-            request_id = str(submitted.get("request_id") or "") if isinstance(submitted, dict) else ""
-            if isinstance(submitted, dict):
-                release_audit = submitted.get("pre_submit_resource_release")
-                if isinstance(release_audit, dict):
-                    pre_submit_resource_release = release_audit
-            if callable(on_submitted):
-                on_submitted(request_id)
-        if not request_id:
-            raise ProviderDriverError("smoke submit 未返回 request_id", code="provider_response_invalid")
-        deadline = time.monotonic() + timeout
-        while True:
-            poll = driver.invoke(deployment, "poll", {"request_id": request_id})
-            remote_status = str(poll.get("status") or "") if isinstance(poll, dict) else ""
-            control = poll_control(remote_status) if callable(poll_control) else ""
-            if control:
-                try:
-                    driver.invoke(deployment, "cancel", {"request_id": request_id})
-                except Exception:
-                    pass
-                raise ProviderDriverError(
-                    f"真实 smoke-test {control} 并已请求取消",
-                    code=f"provider_smoke_{control}",
-                )
-            if remote_status == "succeeded":
-                break
-            if remote_status == "failed":
-                remote_error = (
-                    _comfyui_failure_message(poll.get("failure"), graph=graph)
-                    if isinstance(poll, dict)
-                    else ""
-                )
-                raise ProviderDriverError(
-                    remote_error or (
-                        "真实 smoke-test 远端执行失败，但执行器未返回具体节点原因。"
-                        "处理建议：在 ComfyUI History 中定位失败节点，修正后创建新的 Smoke 任务。"
-                    ),
-                    code="provider_smoke_failed",
-                )
-            if time.monotonic() >= deadline:
-                try:
-                    driver.invoke(deployment, "cancel", {"request_id": request_id})
-                except Exception:
-                    pass
-                raise ProviderDriverError("真实 smoke-test 超时并已请求取消", code="provider_smoke_timeout")
-            time.sleep(poll_interval)
-        collected = driver.invoke(deployment, "collect", {"request_id": request_id})
-        outputs = collected.get("outputs") if isinstance(collected, dict) else None
-        if not isinstance(outputs, list) or not outputs:
-            raise ProviderDriverError("真实 smoke-test 没有输出", code="provider_smoke_output_missing")
-        primary_output = compiled.output_contract.get("primary")
-        if not isinstance(primary_output, dict):
-            raise ProviderDriverError(
-                "真实 smoke-test 缺少冻结 primary output 契约",
-                code="provider_smoke_output_invalid",
-            )
-        expected_kind = str(primary_output.get("kind") or "")
-        expected_node_id = str(primary_output.get("node_id") or "")
-        matching = [
-            item for item in outputs
-            if isinstance(item, dict)
-            and (
-                (expected_kind == WorkflowTemplate.OutputKind.TEXT and item.get("kind") == "text")
-                or classify_task_output(item) == expected_kind
-            )
-            and str(item.get("node_id") or "") == expected_node_id
-        ]
-        if len(matching) != 1:
-            raise ProviderDriverError(
-                "真实 smoke-test 的声明 primary node 必须且只能产生一个匹配输出",
-                code="provider_smoke_output_invalid",
-            )
-        verified_outputs = []
-        if expected_kind == WorkflowTemplate.OutputKind.TEXT:
-            item = matching[0]
-            text = item.get("text")
-            if not isinstance(text, str) or not text.strip():
-                raise ProviderDriverError(
-                    "smoke-test text 输出为空或合同无效",
-                    code="provider_smoke_output_invalid",
-                )
-            payload = text.encode("utf-8")
-            digest = hashlib.sha256(payload).hexdigest()
-            if (
-                len(payload) > ComfyUIClient.TEXT_OUTPUT_MAX_BYTES
-                or item.get("size_bytes") != len(payload)
-                or item.get("sha256") != digest
-            ):
-                raise ProviderDriverError(
-                    "smoke-test text 输出 size/hash 无效",
-                    code="provider_smoke_output_invalid",
-                )
-            verified_outputs.append({
-                "node_id": expected_node_id,
-                "kind": "text",
-                "size_bytes": len(payload),
-                "sha256": digest,
-            })
-        else:
-            output_root_raw = str(getattr(settings, "COMFYUI_OUTPUT_DIR", "") or "").strip()
-            if not output_root_raw:
-                raise ProviderDriverError(
-                    "production smoke-test 需要可访问的 ComfyUI 输出目录",
-                    code="provider_smoke_output_unavailable",
-                )
-            output_root = Path(output_root_raw).resolve()
-            for item in matching:
-                filename = PurePosixPath(str(item.get("filename") or "").replace("\\", "/")).name
-                subfolder = str(item.get("subfolder") or "").replace("\\", "/")
-                candidate = (output_root / subfolder / filename).resolve()
-                if not filename or not candidate.is_relative_to(output_root):
-                    raise ProviderDriverError(
-                        "smoke-test 输出路径越过受控目录",
-                        code="provider_smoke_output_invalid",
-                    )
-                try:
-                    facts = verified_local_media_facts(
-                        candidate,
-                        expected_kind=expected_kind,
-                        max_bytes=artifact_max_bytes,
-                        include_observed_media=(
-                            expected_kind in {
-                                WorkflowTemplate.OutputKind.VIDEO,
-                                WorkflowTemplate.OutputKind.AUDIO,
-                            }
-                        ),
-                    )
-                except Exception as exc:
-                    raise ProviderDriverError(
-                        "smoke-test 输出真实字节校验失败",
-                        code="provider_smoke_output_invalid",
-                    ) from exc
-                if expected_kind == WorkflowTemplate.OutputKind.VIDEO:
-                    observed = facts.get("observed_media")
-                    expected_semantics = compiled.resolved_semantics
-                    mismatches: list[str] = []
-                    if not isinstance(observed, dict):
-                        mismatches.append("observed_media")
-                    else:
-                        for semantic_key, observed_key in (
-                            ("image.width", "width"),
-                            ("image.height", "height"),
-                            ("video.frames", "frames"),
-                        ):
-                            expected_value = expected_semantics.get(semantic_key)
-                            if (
-                                isinstance(expected_value, int)
-                                and not isinstance(expected_value, bool)
-                                and expected_value > 0
-                                and observed.get(observed_key) != expected_value
-                            ):
-                                mismatches.append(semantic_key)
-                        expected_fps = expected_semantics.get("video.fps")
-                        if (
-                            isinstance(expected_fps, (int, float))
-                            and not isinstance(expected_fps, bool)
-                            and float(expected_fps) > 0
-                            and float(observed.get("fps") or 0) != float(expected_fps)
-                        ):
-                            mismatches.append("video.fps")
-                        explicit_audio = expected_semantics.get("audio.enabled")
-                        if (
-                            explicit_audio is True
-                            and observed.get("has_audio") is not True
-                        ):
-                            mismatches.append("audio.enabled")
-                    if mismatches:
-                        raise ProviderDriverError(
-                            "workflow smoke 输出未满足冻结语义: "
-                            + ", ".join(sorted(set(mismatches))),
-                            code="provider_smoke_output_invalid",
-                        )
-                if compiled.output_contract.get("schema_version") == 2:
-                    from studio.services.workflow_resolution import validate_resolved_image_output
-                    try:
-                        validate_resolved_image_output(candidate, compiled.output_contract)
-                    except ValidationError as exc:
-                        # Remote collection has finished: this is a definitive
-                        # output rejection, not an uncertain remote execution.
-                        raise ProviderDriverError(
-                            str(exc), code="provider_smoke_output_invalid",
-                        ) from exc
-                verified_outputs.append(facts)
-    except Exception as exc:
-        with transaction.atomic():
-            ModelDeployment.objects.select_for_update(of=("self",)).get(
-                pk=deployment.pk,
-            )
-            failed = WorkflowTemplateVersion.objects.select_for_update(of=("self",)).get(
-                pk=version.pk,
-            )
-            claim_is_current = True
-            if expected_claim_token is not None:
-                locked_attempt = WorkflowSmokeAttempt.objects.select_for_update(
-                    of=("self",),
-                ).get(pk=smoke_attempt_id)
-                claim_is_current = (
-                    locked_attempt.claim_token == expected_claim_token
-                    and locked_attempt.status
-                    not in {
-                        WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-                        WorkflowSmokeAttempt.Status.CANCELLED,
-                    }
-                )
-            owns_validation_generation = (
-                claim_is_current
-                and
-                failed.validation_state
-                == WorkflowTemplateVersion.ValidationState.PASSED
-                and failed.validated_deployment_id == deployment.id
-                and failed.validation_evidence_sha256 == expected_validation_sha256
-            )
-            if owns_validation_generation:
-                if structural_contract_drifted:
-                    failed.status = WorkflowTemplateVersion.Status.DRAFT
-                    failed.validation_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-                    failed.validation_message = "实时 ComfyUI 节点合同已漂移，请重新 validate。"
-                    failed.validated_deployment = None
-                    failed.validation_evidence = {}
-                    failed.validation_evidence_sha256 = ""
-                failed.smoke_test_state = WorkflowTemplateVersion.ValidationState.FAILED
-                failed.smoke_test_message = str(exc)[:2000]
-                failed.smoke_test_evidence = {}
-                failed.smoke_test_evidence_sha256 = ""
-                update_fields = [
-                    "smoke_test_state", "smoke_test_message", "smoke_test_evidence",
-                    "smoke_test_evidence_sha256", "updated_at",
-                ]
-                if structural_contract_drifted:
-                    update_fields.extend((
-                        "status", "validation_state", "validation_message",
-                        "validated_deployment", "validation_evidence",
-                        "validation_evidence_sha256",
-                    ))
-                failed.save(update_fields=update_fields)
-        raise ValidationError({"detail": str(exc)}) from exc
-    smoke_drifted = False
-    smoke_superseded = False
-    smoke_worker_superseded = False
-    smoke_cancelled = False
-    with transaction.atomic():
-        current_deployment = ModelDeployment.objects.select_for_update(of=("self",)).select_related(
-            "profile_version__provider",
-        ).get(pk=deployment.pk)
-        version = WorkflowTemplateVersion.objects.select_for_update(of=("self",)).select_related(
-            "template",
-        ).get(pk=version.pk)
-        if expected_claim_token is not None:
-            locked_attempt = WorkflowSmokeAttempt.objects.select_for_update(
-                of=("self",),
-            ).get(pk=smoke_attempt_id)
-            smoke_worker_superseded = (
-                locked_attempt.claim_token != expected_claim_token
-            )
-            smoke_cancelled = locked_attempt.status in {
-                WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-                WorkflowSmokeAttempt.Status.CANCELLED,
-            }
-        if smoke_worker_superseded:
-            pass
-        elif smoke_cancelled:
-            pass
-        elif (
-            version.validation_evidence_sha256 != expected_validation_sha256
-            or version.validation_state != WorkflowTemplateVersion.ValidationState.PASSED
-            or version.validated_deployment_id != current_deployment.id
-        ):
-            smoke_superseded = True
-        elif (
-            version.graph_sha256 != expected_graph_sha256
-            or version.execution_contract_sha256 != expected_execution_sha256
-            or _execution_target_sha256(version, current_deployment) != expected_target_sha256
-        ):
-            smoke_drifted = True
-            version.status = WorkflowTemplateVersion.Status.DRAFT
-            version.validation_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-            version.validation_message = "workflow 在 smoke-test 期间已变更，请重新校验"
-            version.validated_deployment = None
-            version.validation_evidence = {}
-            version.validation_evidence_sha256 = ""
-            version.smoke_test_state = WorkflowTemplateVersion.ValidationState.FAILED
-            version.smoke_test_message = "workflow 在 smoke-test 期间已变更，请重新校验"
-            version.smoke_test_evidence = {}
-            version.smoke_test_evidence_sha256 = ""
-        else:
-            version.smoke_test_state = WorkflowTemplateVersion.ValidationState.PASSED
-            version.smoke_test_message = "真实受限执行已提交、完成并收集到声明类型输出。"
-            version.smoke_test_evidence = {
-                "schema_version": 3,
-                "execution_submitted": True,
-                "smoke_attempt_id": str(smoke_attempt_id),
-                "fixture_sha256": str(fixture_sha256),
-                "reference_bindings_sha256": json_contract(
-                    list(fixture_reference_bindings or []),
-                    max_bytes=_stage_snapshot_max_bytes(),
-                ).sha256,
-                "asset_bindings_sha256": compiled.asset_bindings_sha256,
-                "materialized_graph_sha256": compiled.graph_sha256,
-                **({"output_contract": compiled.output_contract} if compiled.output_contract.get("schema_version") == 2 else {}),
-                "compiled_graph_sha256": submitted_graph_sha256,
-                "request_id_sha256": json_contract(
-                    request_id,
-                    max_bytes=_stage_snapshot_max_bytes(),
-                ).sha256,
-                "deployment_id": str(deployment.id),
-                "graph_sha256": version.graph_sha256,
-                "execution_contract_sha256": version.execution_contract_sha256,
-                "output_kind": expected_kind,
-                "output_count": len(matching),
-                "outputs": verified_outputs,
-                "contract_schema_sha256": report.schema_sha256,
-                "execution_target": _execution_target_evidence(version, current_deployment),
-                "execution_target_sha256": expected_target_sha256,
-            }
-            if pre_submit_resource_release is not None:
-                version.smoke_test_evidence["pre_submit_resource_release"] = (
-                    pre_submit_resource_release
-                )
-            version.smoke_test_evidence_sha256 = _evidence_digest(version.smoke_test_evidence)
-        if not smoke_superseded and not smoke_worker_superseded and not smoke_cancelled:
-            version.save(update_fields=(
-                "status", "validation_state", "validation_message", "validated_deployment",
-                "validation_evidence", "validation_evidence_sha256", "smoke_test_state",
-                "smoke_test_message", "smoke_test_evidence", "smoke_test_evidence_sha256",
-                "updated_at",
-            ))
-    if smoke_worker_superseded:
-        raise ProviderDriverError(
-            "此次 smoke-test worker claim 已失效，结果未写入版本。",
-            code="workflow_smoke_worker_superseded",
-        )
-    if smoke_cancelled:
-        raise ProviderDriverError(
-            "取消请求已生效；此次 smoke-test 结果未写入版本。",
-            code="workflow_smoke_cancelled_result_discarded",
-        )
-    if smoke_superseded:
-        raise ProviderDriverError(
-            "此次 smoke-test 结果已被较新的 live validation 取代。",
-            code="workflow_smoke_superseded",
-        )
-    if smoke_drifted:
-        raise ProviderDriverError(
-            "workflow 在 smoke-test 期间已变更，请重新校验",
-            code="workflow_smoke_contract_drifted",
-        )
-    result = {
-        "schema_version": 3,
-        "execution_submitted": True,
-        "smoke_attempt_id": str(smoke_attempt_id),
-        "fixture_sha256": str(fixture_sha256),
-        "reference_bindings_sha256": json_contract(
-            list(fixture_reference_bindings or []),
-            max_bytes=_stage_snapshot_max_bytes(),
-        ).sha256,
-        "asset_bindings_sha256": compiled.asset_bindings_sha256,
-        "materialized_graph_sha256": compiled.graph_sha256,
-        **({"output_contract": compiled.output_contract} if compiled.output_contract.get("schema_version") == 2 else {}),
-        "compiled_graph_sha256": submitted_graph_sha256,
-        "health_version": (
-            (health.get("system") or {}).get("comfyui_version")
-            if isinstance(health, dict) else ""
-        ),
-        "contract": report.as_dict(),
-    }
-    if pre_submit_resource_release is not None:
-        result["pre_submit_resource_release"] = pre_submit_resource_release
-    return version, result
-
-
 @transaction.atomic
 def _publish_workflow_version_atomic(
     version: WorkflowTemplateVersion,
@@ -2623,16 +1611,15 @@ def _publish_workflow_version_atomic(
     ).get(pk=version.pk)
     if version.validated_deployment_id != deployment_id:
         raise ValidationError("validated deployment 正在变化，请刷新后重试")
+    if version.status in {
+        WorkflowTemplateVersion.Status.PUBLISHED,
+        WorkflowTemplateVersion.Status.RETIRED,
+    }:
+        raise ValidationError("已发布/停用版本不可重新发布，请导入新版本")
     target_drifted = False
-    if deployment is not None and (
-        version.validation_evidence.get("execution_target_sha256")
-        or version.smoke_test_evidence.get("execution_target_sha256")
-    ):
+    if deployment is not None and version.validation_evidence.get("execution_target_sha256"):
         current = _execution_target_sha256(version, deployment)
-        target_drifted = (
-            version.validation_evidence.get("execution_target_sha256") != current
-            or version.smoke_test_evidence.get("execution_target_sha256") != current
-        )
+        target_drifted = version.validation_evidence.get("execution_target_sha256") != current
     if target_drifted:
         version.status = WorkflowTemplateVersion.Status.DRAFT
         version.validation_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
@@ -2665,68 +1652,8 @@ def _publish_workflow_version_atomic(
         raise ValidationError("validation evidence 校验和不一致")
     if _evidence_digest(version.smoke_test_evidence) != version.smoke_test_evidence_sha256:
         raise ValidationError("smoke evidence 校验和不一致")
-    if version.smoke_test_evidence.get("execution_submitted") is not True:
-        raise ValidationError("contract-only 检查不能发布 production workflow")
-    attempt_id = version.smoke_test_evidence.get("smoke_attempt_id")
-    fixture_sha256 = str(version.smoke_test_evidence.get("fixture_sha256") or "")
-    compiled_graph_sha256 = str(
-        version.smoke_test_evidence.get("compiled_graph_sha256") or "",
-    )
-    try:
-        attempt = WorkflowSmokeAttempt.objects.select_for_update().get(
-            pk=attempt_id,
-            workflow_version=version,
-            deployment_id=version.validated_deployment_id,
-            status=WorkflowSmokeAttempt.Status.SUCCEEDED,
-        )
-    except (WorkflowSmokeAttempt.DoesNotExist, TypeError, ValueError) as exc:
-        raise ValidationError("smoke-test 证据未绑定成功的持久 attempt") from exc
-    verify_workflow_smoke_attempt_contract(
-        attempt,
-        version=version,
-        deployment=deployment,
-    )
-    if (
-        not fixture_sha256
-        or fixture_sha256 != attempt.fixture_sha256
-        or len(compiled_graph_sha256) != 64
-        or str((attempt.result or {}).get("fixture_sha256") or "") != fixture_sha256
-        or str((attempt.result or {}).get("compiled_graph_sha256") or "")
-        != compiled_graph_sha256
-    ):
-        raise ValidationError("smoke-test fixture/compiled graph 证据不完整")
-    if attempt.fixture_values_schema_version != FIXTURE_SCHEMA_VERSION:
-        raise ValidationError("smoke-test fixture schema 已退役，必须重新执行当前烟测")
-    persisted_fixture = attempt.fixture_values if isinstance(attempt.fixture_values, dict) else {}
-    materialized_graph_sha256 = str(
-        persisted_fixture.get("materialized_graph_sha256") or "",
-    )
-    reference_bindings = persisted_fixture.get("reference_bindings")
-    reference_bindings_sha256 = (
-        json_contract(
-            reference_bindings,
-            max_bytes=_stage_snapshot_max_bytes(),
-        ).sha256
-        if isinstance(reference_bindings, list) else ""
-    )
-    expected = {
-        "reference_bindings_sha256": reference_bindings_sha256,
-        "asset_bindings_sha256": str(
-            version.smoke_test_evidence.get("asset_bindings_sha256") or "",
-        ),
-        "materialized_graph_sha256": materialized_graph_sha256,
-    }
-    if any(
-        len(value) != 64
-        or str(version.smoke_test_evidence.get(key) or "") != value
-        or str((attempt.result or {}).get(key) or "") != value
-        for key, value in expected.items()
-    ):
-        raise ValidationError("smoke-test 动态引用或 materialized graph 证据不完整")
-    if version.validation_evidence.get("execution_contract_sha256") != version.execution_contract_sha256:
-        raise ValidationError("live validation 证据未绑定当前 execution contract")
-    if version.smoke_test_evidence.get("execution_contract_sha256") != version.execution_contract_sha256:
-        raise ValidationError("smoke-test 证据未绑定当前 execution contract")
+    target_sha256 = verify_workflow_live_validation(version, deployment)
+    _verify_current_workflow_smoke_evidence(version, deployment, target_sha256=target_sha256)
     if (
         deployment.status != ModelDeployment.Status.ACTIVE
         or deployment.profile_version_id != version.model_profile_version_id

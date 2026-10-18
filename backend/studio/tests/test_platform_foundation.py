@@ -23,6 +23,7 @@ from django.test import (
 from django.utils import timezone
 from rest_framework.test import APIClient
 from studio.tests.workflow_projector_fixtures import workflow_projector_reference
+from studio.tests.transaction_fixtures import SeededTransactionTestCase
 
 from studio.models import (
     Asset,
@@ -32,6 +33,8 @@ from studio.models import (
     ModelArtifact,
     ModelDeployment,
     ModelDeploymentCapabilitySnapshot,
+    ModelExecutionInstance,
+    ModelExecutionInstanceVersion,
     ModelProfileVersion,
     PlatformLifecycleAuditEvent,
     ProductionRecipeVersion,
@@ -43,7 +46,6 @@ from studio.models import (
     WorkflowTemplate,
     WorkflowTemplateVersion,
     WorkflowSmokeAttempt,
-    WorkflowSmokeAttemptResolution,
     WorkflowSmokeAssetBinding,
     WorkflowSemanticBinding,
 )
@@ -76,11 +78,6 @@ from studio.services.runtime_platform import capability_readiness
 from studio.services.security_boundaries import boundary_int
 from studio.services.secret_store import rotate_secret_binding
 from studio.services.task_queue import comfy_client_for_task
-from studio.services.workflow_smoke_queue import (
-    _failure_outcome,
-    claim_next_workflow_smoke,
-    process_workflow_smoke,
-)
 from studio.services.workflow_versions import (
     _execution_target_sha256,
     import_workflow_version,
@@ -98,69 +95,6 @@ class ConfigurationAndProviderTests(TestCase):
             password="StrongPass123!",
         )
         self.project = SeriesProject.objects.create(language="Chinese", aspect_ratio="9:16", owner=self.user, title="平台配置测试", width=768, height=1344, fps=24, default_shot_duration_ms=5000, continuity_seed=1)
-
-    def test_workflow_smoke_http_4xx_after_submit_start_is_definitive(self):
-        attempt = SimpleNamespace(
-            submission_started_at=timezone.now(),
-            submitted_at=None,
-            provider_request_id="",
-            status=WorkflowSmokeAttempt.Status.SUBMITTING,
-        )
-
-        outcome = _failure_outcome(
-            attempt,
-            ProviderDriverError(
-                "ComfyUI HTTP 400: prompt validation failed",
-                code="provider_request_rejected",
-            ),
-        )
-
-        self.assertEqual(outcome[0], WorkflowSmokeAttempt.Status.FAILED)
-        self.assertEqual(outcome[1], "provider_request_rejected")
-
-        post_submit_rejection = _failure_outcome(
-            SimpleNamespace(
-                submission_started_at=attempt.submission_started_at,
-                submitted_at=timezone.now(),
-                provider_request_id="remote-request-id",
-                status=WorkflowSmokeAttempt.Status.RUNNING,
-            ),
-            ProviderDriverError(
-                "ComfyUI HTTP 404 while polling",
-                code="provider_request_rejected",
-            ),
-        )
-        self.assertEqual(
-            post_submit_rejection[0],
-            WorkflowSmokeAttempt.Status.UNCERTAIN,
-        )
-        self.assertEqual(post_submit_rejection[1], "remote_state_uncertain")
-
-        uncertain = _failure_outcome(
-            attempt,
-            ProviderDriverError(
-                "submit transport timeout",
-                code="comfyui_operation_failed",
-                submission_uncertain=True,
-            ),
-        )
-        self.assertEqual(uncertain[0], WorkflowSmokeAttempt.Status.UNCERTAIN)
-        self.assertEqual(uncertain[1], "submission_uncertain")
-
-        release_failure = _failure_outcome(
-            attempt,
-            ProviderDriverError(
-                "resource release was not confirmed; /prompt was not called",
-                code="comfyui_resource_release_unconfirmed",
-                retryable=False,
-                submission_uncertain=False,
-            ),
-        )
-        self.assertEqual(release_failure[0], WorkflowSmokeAttempt.Status.FAILED)
-        self.assertEqual(
-            release_failure[1],
-            "comfyui_resource_release_unconfirmed",
-        )
 
     def test_comfyui_history_failure_projects_node_reason_and_recovery(self):
         failure = _comfyui_poll_failure({
@@ -209,34 +143,6 @@ class ConfigurationAndProviderTests(TestCase):
                 "messages": [["execution_error", "not-an-object"]],
             },
         }), {})
-
-    def test_workflow_smoke_failure_unwraps_coded_provider_message(self):
-        attempt = SimpleNamespace(
-            submission_started_at=timezone.now(),
-            submitted_at=timezone.now(),
-            provider_request_id="remote-request-id",
-            status=WorkflowSmokeAttempt.Status.RUNNING,
-        )
-        try:
-            try:
-                raise ProviderDriverError(
-                    "ComfyUI 节点 6 执行失败。原因：缺少参考素材。处理建议：补充素材。",
-                    code="provider_smoke_failed",
-                )
-            except ProviderDriverError as provider_error:
-                raise DjangoValidationError({
-                    "detail": str(provider_error),
-                }) from provider_error
-        except DjangoValidationError as wrapped:
-            outcome = _failure_outcome(attempt, wrapped)
-
-        self.assertEqual(outcome[0], WorkflowSmokeAttempt.Status.FAILED)
-        self.assertEqual(outcome[1], "provider_smoke_failed")
-        self.assertEqual(
-            outcome[2],
-            "ComfyUI 节点 6 执行失败。原因：缺少参考素材。处理建议：补充素材。",
-        )
-        self.assertNotIn("{'detail'", outcome[2])
 
     def test_project_revision_overrides_system_with_explicit_source(self):
         revision = create_config_revision(
@@ -385,82 +291,6 @@ class ConfigurationAndProviderTests(TestCase):
         socket_factory.assert_called_once_with(2, 1, 6)
         socket_factory.return_value.connect.assert_called_once_with(("93.184.216.34", 443))
 
-    def test_task_client_uses_frozen_config_allows_live_non_secret_drift_and_rejects_credential_drift(self):
-        profile = ModelProfileVersion.objects.get(
-            profile_key="minimax-h3-video",
-            version=1,
-        )
-        host = RuntimeHost.objects.create(key="test-local", name="Test local")
-        credential = create_test_secret(
-            key="platform.task.credential",
-            actor=self.user,
-            value="task-secret-v1",
-        )
-        deployment = ModelDeployment(
-            key="test-h3-deployment",
-            name="Test H3",
-            profile_version=profile,
-            runtime_host=host,
-            credential=credential,
-            status=ModelDeployment.Status.ACTIVE,
-        )
-        assign_json_contract(deployment, "runtime_config", {
-            "base_url": "http://127.0.0.1:8188",
-            "timeout_seconds": 12,
-            "poll_interval_seconds": 1,
-            "max_poll_seconds": 60,
-            "capability_ttl_seconds": 300,
-            "pre_submit_resource_release": {
-                "schema_version": 1,
-                "enabled": True,
-                "unload_models": True,
-                "free_memory": True,
-            },
-        })
-        deployment.save()
-        provider_config = dict(deployment.profile_version.provider.driver_config or {})
-        deployment_config = dict(deployment.runtime_config)
-        task = SimpleNamespace(capability_snapshot={
-            "model_deployment_id": str(deployment.id),
-            "model_profile_version_id": str(deployment.profile_version_id),
-            "provider_profile_id": str(deployment.profile_version.provider_id),
-            "provider_config_sha256": deployment.profile_version.provider.driver_config_sha256,
-            "deployment_config_sha256": deployment.runtime_config_sha256,
-            "provider_config": provider_config,
-            "deployment_config": deployment_config,
-            "frozen_execution_config_sha256": hashlib.sha256(canonical_json_bytes({
-                "provider_config": provider_config,
-                "deployment_config": deployment_config,
-            })).hexdigest(),
-            "effective_timeout_seconds": 12,
-            "credential_binding_sha256": credential_binding_sha256(deployment),
-            "endpoint_is_external": False,
-        })
-
-        client = comfy_client_for_task(task)
-        self.assertEqual(client.base_url, "http://127.0.0.1:8188")
-        self.assertEqual(client.timeout, 12)
-        self.assertEqual(client.pre_submit_resource_release_policy, {
-            "schema_version": 1,
-            "enabled": True,
-            "unload_models": True,
-            "free_memory": True,
-        })
-
-        deployment.runtime_config = {"base_url": "http://127.0.0.1:9999"}
-        deployment.save(update_fields=("runtime_config", "updated_at"))
-        frozen_client = comfy_client_for_task(task)
-        self.assertEqual(frozen_client.base_url, "http://127.0.0.1:8188")
-        self.assertTrue(frozen_client.pre_submit_resource_release_policy["enabled"])
-
-        rotate_secret_binding(
-            credential,
-            secret_value="task-secret-v2",
-            actor=self.user,
-            reason="test_rotation",
-        )
-        with self.assertRaises(ComfyUIError):
-            comfy_client_for_task(task)
 
 
 class PlatformCatalogLifecycleApiTests(TestCase):
@@ -614,6 +444,8 @@ class PlatformCatalogLifecycleApiTests(TestCase):
 
         self.assertEqual(response.status_code, 200, response.data)
         self.assertEqual(response.data["specification_schema_version"], 1)
+        from studio.services.production_visual_rules import visual_rules_output_editor_options
+        self.assertEqual(response.data['visual_rules_output'], visual_rules_output_editor_options())
         self.assertIn(
             "audio",
             {item["value"] for item in response.data["modalities"]},
@@ -1231,7 +1063,7 @@ class PlatformCatalogLifecycleApiTests(TestCase):
             action="retire",
         ).exists())
 
-    def test_deployment_retire_rejects_live_recipe_reference(self):
+    def test_deployment_retire_rejects_active_published_execution_instance(self):
         profile = self._profile("deployment-retire-referenced-profile")
         host = RuntimeHost.objects.create(
             key="deployment-retire-referenced-host",
@@ -1244,17 +1076,16 @@ class PlatformCatalogLifecycleApiTests(TestCase):
             host,
             status=ModelDeployment.Status.DISABLED,
         )
-        recipe = ProductionRecipeVersion(
-            recipe_key="deployment-retire-reference",
-            version=1,
-            name="Deployment retire reference",
-            status=ProductionRecipeVersion.Status.DRAFT,
+        instance = ModelExecutionInstance.objects.create(
+            key="deployment-retire-reference", name="Deployment retire reference",
         )
-        assign_json_contract(recipe, "definition", {
-            "schema_version": 1,
-            "model_deployment_id": str(deployment.id),
-        })
-        recipe.save()
+        ModelExecutionInstanceVersion.objects.create(
+            instance=instance,
+            version=1,
+            deployment=deployment, operation="image.text_to_image", mode="",
+            prompt_mode="manual", status="published",
+            published_at=timezone.now(), published_by=self.admin,
+        )
 
         response = self.client.post(
             f"/api/v1/model-deployments/{deployment.id}/retire/",
@@ -1853,9 +1684,12 @@ class WorkflowVersionApiTests(TestCase):
         )
 
     def test_recipe_editor_catalog_and_successor_are_server_owned(self):
+        definition = {"schema_version": 3, "interaction_mode": "assisted", "stages": [
+            {"key": "delivery", "mode": "existing_pipeline", "approval": "auto"},
+        ]}
         options = self.client.get("/api/v1/production-recipes/options/")
         self.assertEqual(options.status_code, 200, options.data)
-        self.assertEqual(options.data["definition_schema_version"], 1)
+        self.assertEqual(options.data["definition_schema_version"], 3)
         stage_options = {
             item["value"]: item for item in options.data["stage_options"]
         }
@@ -1878,7 +1712,7 @@ class WorkflowVersionApiTests(TestCase):
             "recipe_key": "server-owned-recipe-version",
             "version": 91,
             "name": "Server-owned recipe version",
-            "definition": {"schema_version": 1, "stages": []},
+            "definition": definition,
         }, format="json")
         self.assertEqual(created.status_code, 201, created.data)
         self.assertEqual(created.data["version"], 1)
@@ -1886,7 +1720,7 @@ class WorkflowVersionApiTests(TestCase):
             "recipe_key": "server-owned-recipe-version",
             "version": 92,
             "name": "Must use successor",
-            "definition": {"schema_version": 1, "stages": []},
+            "definition": definition,
         }, format="json")
         self.assertEqual(duplicate.status_code, 400, duplicate.data)
 
@@ -2465,12 +2299,12 @@ class WorkflowVersionApiTests(TestCase):
                     )
         self.assertEqual(WorkflowTemplateVersion.objects.count(), original_count)
 
-    def test_invalid_smoke_fixture_detail_keeps_the_current_fail_closed_schema(self):
+    def test_invalid_workflow_input_detail_keeps_the_current_fail_closed_schema(self):
         imported = self._import()
         self.assertEqual(imported.status_code, 201, imported.data)
 
         with patch(
-            "studio.platform_serializers.workflow_smoke_fixture_schema",
+            "studio.platform_serializers.workflow_execution_input_schema",
             side_effect=DjangoValidationError("invalid fixture contract"),
         ):
             response = self.client.get(
@@ -2478,10 +2312,11 @@ class WorkflowVersionApiTests(TestCase):
             )
 
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["smoke_fixture_schema"], {
+        self.assertNotIn("smoke_fixture_schema", response.data)
+        self.assertEqual(response.data["workflow_input_schema"], {
             "schema_version": 2,
             "available": False,
-            "reason_code": "workflow_fixture_contract_invalid",
+            "reason_code": "workflow_input_contract_invalid",
             "parameters": [],
             "asset_slots": [],
             "asset_groups": [],
@@ -2548,33 +2383,6 @@ class WorkflowVersionApiTests(TestCase):
                 "references": {},
             },
         }
-
-    def _claim_validated_workflow_smoke(self, worker_id):
-        imported = self._import()
-        self.assertEqual(imported.status_code, 201, imported.data)
-        version_id = imported.data["id"]
-        validation_driver = Mock()
-        validation_driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=validation_driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-        queued = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(),
-            format="json",
-        )
-        self.assertEqual(queued.status_code, 202, queued.data)
-        claimed = claim_next_workflow_smoke(worker_id)
-        self.assertIsNotNone(claimed)
-        self.assertEqual(str(claimed.id), queued.data["id"])
-        return version_id, claimed
 
     def test_saved_workflow_exports_ui_canvas_without_submitting_work(self):
         imported = self._import()
@@ -3023,7 +2831,7 @@ class WorkflowVersionApiTests(TestCase):
         self.assertIn("image.height", str(rejected.data))
         self.assertIn("image.width", str(rejected.data))
 
-    def test_smoke_requires_validated_lifecycle_status(self):
+    def test_old_smoke_envelope_is_rejected_without_creating_attempt(self):
         imported = self._import()
         self.assertEqual(imported.status_code, 201, imported.data)
         version_id = imported.data["id"]
@@ -3059,593 +2867,8 @@ class WorkflowVersionApiTests(TestCase):
                     format="json",
                 )
                 self.assertEqual(response.status_code, 400, response.data)
-                self.assertIn("validated", str(response.data))
+                self.assertIn("不支持的字段", str(response.data))
         self.assertFalse(WorkflowSmokeAttempt.objects.filter(workflow_version_id=version_id).exists())
-
-    def test_smoke_enqueue_freezes_fixture_and_is_hash_idempotent(self):
-        imported = self._import()
-        self.assertEqual(imported.status_code, 201, imported.data)
-        version_id = imported.data["id"]
-        driver = Mock()
-        driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-        self.assertEqual(
-            validated.data["version"]["status"],
-            WorkflowTemplateVersion.Status.VALIDATED,
-        )
-
-        first = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        same = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        different = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture B"}),
-            format="json",
-        )
-
-        self.assertEqual(first.status_code, 202, first.data)
-        self.assertNotIn("fixture_values", first.data)
-        self.assertEqual(len(first.data["fixture_values_sha256"]), 64)
-        self.assertEqual(same.status_code, 202, same.data)
-        self.assertEqual(same.data["id"], first.data["id"])
-        self.assertEqual(different.status_code, 409, different.data)
-        self.assertEqual(
-            different.data["error"]["code"],
-            "workflow_smoke_fixture_conflict",
-        )
-        self.assertEqual(WorkflowSmokeAttempt.objects.count(), 1)
-        attempt = WorkflowSmokeAttempt.objects.get(pk=first.data["id"])
-        self.assertEqual(attempt.fixture_values_schema_version, 2)
-        self.assertEqual(
-            attempt.fixture_values["parameters"]["prompt.positive"],
-            "fixture A",
-        )
-        self.assertEqual(len(attempt.fixture_values_sha256), 64)
-        self.assertEqual(len(attempt.fixture_sha256), 64)
-        attempt.fixture_values = {
-            **attempt.fixture_values,
-            "parameters": {
-                **attempt.fixture_values["parameters"],
-                "prompt.positive": "mutated",
-            },
-        }
-        with self.assertRaises(DjangoValidationError):
-            attempt.save(update_fields=("fixture_values", "updated_at"))
-        attempt.refresh_from_db()
-        self.assertEqual(
-            attempt.fixture_values["parameters"]["prompt.positive"],
-            "fixture A",
-        )
-        attempt.workflow_version_id = uuid.uuid4()
-        with self.assertRaises(DjangoValidationError):
-            attempt.save(update_fields=("workflow_version", "updated_at"))
-        with self.assertRaises(DjangoValidationError):
-            WorkflowSmokeAttempt.objects.filter(pk=attempt.pk).update(
-                deployment_id=uuid.uuid4(),
-            )
-
-    def test_active_smoke_from_prior_validation_is_never_reused_or_submitted(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        driver = Mock()
-        driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-        created = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        self.assertEqual(created.status_code, 202, created.data)
-
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        version.validation_evidence = {
-            **version.validation_evidence,
-            "revalidation_marker": "new-evidence",
-        }
-        version.validation_evidence_sha256 = json_contract(
-            version.validation_evidence,
-        ).sha256
-        version.save(update_fields=(
-            "validation_evidence", "validation_evidence_sha256", "updated_at",
-        ))
-
-        stale_reuse = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        self.assertEqual(stale_reuse.status_code, 409, stale_reuse.data)
-        self.assertEqual(
-            stale_reuse.data["error"]["code"],
-            "workflow_smoke_fixture_conflict",
-        )
-
-        remote_execute = Mock()
-        claimed = claim_next_workflow_smoke("stale-contract-worker")
-        self.assertIsNotNone(claimed)
-        with patch(
-            "studio.services.workflow_smoke_queue.smoke_test_workflow_version",
-            remote_execute,
-        ):
-            processed = process_workflow_smoke(claimed)
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
-        remote_execute.assert_not_called()
-        version.refresh_from_db()
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-
-    def test_pre_submission_smoke_timeout_updates_version_without_clearing_validation(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        driver = Mock()
-        driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-        created = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        self.assertEqual(created.status_code, 202, created.data)
-        expired = timezone.now() - timedelta(seconds=1)
-        WorkflowSmokeAttempt.objects.filter(pk=created.data["id"]).update(
-            hard_deadline_at=expired,
-            idle_deadline_at=expired,
-        )
-
-        claimed = claim_next_workflow_smoke("expired-smoke-worker")
-        self.assertIsNotNone(claimed)
-        processed = process_workflow_smoke(claimed)
-
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
-        self.assertIn(processed.error_code, {"hard_timeout", "idle_timeout"})
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.FAILED,
-        )
-        self.assertIn("deadline", version.smoke_test_message)
-
-    def test_workflow_smoke_cancel_preserves_validation_before_and_after_submit(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        driver = Mock()
-        driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-
-        queued = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(),
-            format="json",
-        )
-        self.assertEqual(queued.status_code, 202, queued.data)
-        cancelled = self.client.post(
-            f"/api/v1/workflow-smoke-attempts/{queued.data['id']}/cancel/",
-            {},
-            format="json",
-        )
-        self.assertEqual(cancelled.status_code, 202, cancelled.data)
-        self.assertEqual(cancelled.data["status"], WorkflowSmokeAttempt.Status.CANCELLED)
-
-        second = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(),
-            format="json",
-        )
-        self.assertEqual(second.status_code, 202, second.data)
-        running = WorkflowSmokeAttempt.objects.get(pk=second.data["id"])
-        now = timezone.now()
-        running.status = WorkflowSmokeAttempt.Status.RUNNING
-        running.submission_started_at = now
-        running.submitted_at = now
-        running.provider_request_id = str(running.submission_token)
-        running.save(update_fields=(
-            "status", "submission_started_at", "submitted_at",
-            "provider_request_id", "updated_at",
-        ))
-        requested = self.client.post(
-            f"/api/v1/workflow-smoke-attempts/{running.id}/cancel/",
-            {},
-            format="json",
-        )
-        self.assertEqual(requested.status_code, 202, requested.data)
-        self.assertEqual(
-            requested.data["status"],
-            WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-        )
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.NOT_RUN,
-        )
-
-    def test_workflow_smoke_cancel_after_claim_blocks_submission_callback(self):
-        version_id, claimed = self._claim_validated_workflow_smoke(
-            "pre-submit-cancel-worker",
-        )
-        operations = []
-        cancel_response = None
-        driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-
-        def invoke(_deployment, operation, _payload):
-            nonlocal cancel_response
-            operations.append(operation)
-            if operation == "health":
-                return {"system": {"comfyui_version": "test"}}
-            if operation == "object_info":
-                cancel_response = self.client.post(
-                    f"/api/v1/workflow-smoke-attempts/{claimed.id}/cancel/",
-                    {},
-                    format="json",
-                )
-                return self._canvas_object_info()
-            if operation == "submit":
-                raise AssertionError("cancelled pre-submit attempt reached driver submit")
-            raise AssertionError(operation)
-
-        driver.invoke.side_effect = invoke
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            processed = process_workflow_smoke(claimed)
-
-        self.assertIsNotNone(cancel_response)
-        self.assertEqual(cancel_response.status_code, 202, cancel_response.data)
-        self.assertEqual(
-            cancel_response.data["status"],
-            WorkflowSmokeAttempt.Status.CANCELLED,
-        )
-        self.assertEqual(operations, ["health", "object_info"])
-        processed.refresh_from_db()
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.CANCELLED)
-        self.assertEqual(processed.error_code, "cancelled_before_submission")
-        self.assertIsNone(processed.submission_started_at)
-        self.assertIsNone(processed.submitted_at)
-        self.assertEqual(processed.provider_request_id, "")
-        self.assertIsNone(processed.claim_token)
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.NOT_RUN,
-        )
-        self.assertEqual(version.smoke_test_evidence, {})
-
-    def test_workflow_smoke_cancel_during_submit_preserves_cancel_fact(self):
-        version_id, claimed = self._claim_validated_workflow_smoke(
-            "submit-cancel-worker",
-        )
-        request_id = str(claimed.submission_token)
-        snapshots = {}
-        operations = []
-        driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-
-        def invoke(_deployment, operation, payload):
-            operations.append(operation)
-            if operation == "health":
-                return {"system": {"comfyui_version": "test"}}
-            if operation == "object_info":
-                return self._canvas_object_info()
-            if operation == "submit":
-                submitting = WorkflowSmokeAttempt.objects.get(pk=claimed.pk)
-                snapshots["submitting_status"] = submitting.status
-                snapshots["submission_started_at"] = submitting.submission_started_at
-                response = self.client.post(
-                    f"/api/v1/workflow-smoke-attempts/{claimed.id}/cancel/",
-                    {},
-                    format="json",
-                )
-                snapshots["cancel_response"] = response
-                requested = WorkflowSmokeAttempt.objects.get(pk=claimed.pk)
-                snapshots["requested_status"] = requested.status
-                snapshots["requested_at"] = requested.cancel_requested_at
-                return {"request_id": payload["submission_token"]}
-            if operation == "poll":
-                submitted = WorkflowSmokeAttempt.objects.get(pk=claimed.pk)
-                snapshots["poll_status"] = submitted.status
-                snapshots["poll_requested_at"] = submitted.cancel_requested_at
-                snapshots["provider_request_id"] = submitted.provider_request_id
-                snapshots["submitted_at"] = submitted.submitted_at
-                return {"status": "running"}
-            if operation == "cancel":
-                cancelling = WorkflowSmokeAttempt.objects.get(pk=claimed.pk)
-                snapshots["cancel_status"] = cancelling.status
-                snapshots["cancel_requested_at"] = cancelling.cancel_requested_at
-                snapshots["cancel_request_id"] = payload["request_id"]
-                return {"cancelled": True}
-            raise AssertionError(operation)
-
-        driver.invoke.side_effect = invoke
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            processed = process_workflow_smoke(claimed)
-
-        self.assertEqual(
-            snapshots["submitting_status"],
-            WorkflowSmokeAttempt.Status.SUBMITTING,
-        )
-        self.assertIsNotNone(snapshots["submission_started_at"])
-        self.assertEqual(snapshots["cancel_response"].status_code, 202)
-        self.assertEqual(
-            snapshots["requested_status"],
-            WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-        )
-        self.assertEqual(
-            snapshots["poll_status"],
-            WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-        )
-        self.assertEqual(
-            snapshots["cancel_status"],
-            WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-        )
-        self.assertEqual(snapshots["provider_request_id"], request_id)
-        self.assertIsNotNone(snapshots["submitted_at"])
-        self.assertEqual(snapshots["cancel_request_id"], request_id)
-        self.assertEqual(snapshots["poll_requested_at"], snapshots["requested_at"])
-        self.assertEqual(snapshots["cancel_requested_at"], snapshots["requested_at"])
-        self.assertEqual(
-            operations,
-            ["health", "object_info", "submit", "poll", "cancel"],
-        )
-        processed.refresh_from_db()
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.UNCERTAIN)
-        self.assertEqual(processed.error_code, "remote_cancel_state_uncertain")
-        self.assertEqual(processed.provider_request_id, request_id)
-        self.assertEqual(processed.cancel_requested_at, snapshots["requested_at"])
-        self.assertEqual(processed.result, {})
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.NOT_RUN,
-        )
-        self.assertEqual(version.smoke_test_evidence, {})
-
-    def test_workflow_smoke_cancel_after_final_poll_discards_collected_result(self):
-        version_id, claimed = self._claim_validated_workflow_smoke(
-            "post-poll-cancel-worker",
-        )
-        operations = []
-        cancel_response = None
-        driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-
-        def invoke(_deployment, operation, payload):
-            nonlocal cancel_response
-            operations.append(operation)
-            if operation == "health":
-                return {"system": {"comfyui_version": "test"}}
-            if operation == "object_info":
-                return self._canvas_object_info()
-            if operation == "submit":
-                return {"request_id": payload["submission_token"]}
-            if operation == "poll":
-                return {"status": "succeeded"}
-            if operation == "collect":
-                cancel_response = self.client.post(
-                    f"/api/v1/workflow-smoke-attempts/{claimed.id}/cancel/",
-                    {},
-                    format="json",
-                )
-                return {"outputs": [{
-                    "node_id": "2",
-                    "filename": "smoke.png",
-                    "subfolder": "",
-                    "type": "output",
-                }]}
-            raise AssertionError(operation)
-
-        driver.invoke.side_effect = invoke
-        with tempfile.TemporaryDirectory() as output_dir:
-            Image.new("RGB", (2, 2), color="red").save(
-                Path(output_dir) / "smoke.png",
-            )
-            with override_settings(COMFYUI_OUTPUT_DIR=output_dir), patch(
-                "studio.services.workflow_versions.driver_for",
-                return_value=driver,
-            ):
-                processed = process_workflow_smoke(claimed)
-
-        self.assertIsNotNone(cancel_response)
-        self.assertEqual(cancel_response.status_code, 202, cancel_response.data)
-        self.assertEqual(
-            cancel_response.data["status"],
-            WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
-        )
-        self.assertEqual(
-            operations,
-            ["health", "object_info", "submit", "poll", "collect"],
-        )
-        processed.refresh_from_db()
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.CANCELLED)
-        self.assertEqual(
-            processed.error_code,
-            "workflow_smoke_cancelled_result_discarded",
-        )
-        self.assertEqual(processed.result, {})
-        self.assertIsNotNone(processed.cancel_requested_at)
-        self.assertIsNotNone(processed.finished_at)
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.NOT_RUN,
-        )
-        self.assertEqual(version.smoke_test_evidence, {})
-
-    def _collect_smoke_with_derived_output_contract(self, output_size):
-        from dataclasses import replace
-        from studio.services.workflow_versions import _materialize_smoke_graph
-        version_id, claimed = self._claim_validated_workflow_smoke("derived-size-smoke-worker")
-        driver = Mock()
-        driver.capabilities.return_value = {"operations": ["health", "object_info", "submit", "poll", "cancel", "collect"]}
-
-        def invoke(_deployment, operation, payload):
-            if operation == "submit":
-                return {"request_id": payload["submission_token"]}
-            return {
-                "health": {"system": {"comfyui_version": "test"}},
-                "object_info": self._canvas_object_info(),
-                "poll": {"status": "succeeded"},
-                "collect": {"outputs": [{"node_id": "2", "filename": "smoke.png", "subfolder": "", "type": "output"}]},
-            }[operation]
-
-        # Exercise the collector with the new output contract; compilation from
-        # real Asset bytes is covered independently by WorkflowResolutionTests.
-        def compile_with_size(*args, **kwargs):
-            compiled = _materialize_smoke_graph(*args, **kwargs)
-            return replace(compiled, output_contract={
-                **compiled.output_contract, "schema_version": 2,
-                "resolution": {
-                    "adapter": "comfy.flux_kontext_image_scale/v1",
-                    "source_semantic_key": "asset.image.source", "source_asset_id": "fixture",
-                    "source_checksum": "a" * 64, "source_width": 600, "source_height": 600,
-                    "width": 1024, "height": 1024,
-                },
-            })
-
-        driver.invoke.side_effect = invoke
-        with tempfile.TemporaryDirectory() as output_dir:
-            Image.new("RGB", output_size).save(Path(output_dir) / "smoke.png")
-            with (
-                override_settings(COMFYUI_OUTPUT_DIR=output_dir),
-                patch("studio.services.workflow_versions.driver_for", return_value=driver),
-                patch("studio.services.workflow_versions._materialize_smoke_graph", side_effect=compile_with_size),
-            ):
-                processed = process_workflow_smoke(claimed)
-        return WorkflowTemplateVersion.objects.get(pk=version_id), processed
-
-    def test_smoke_collector_rejects_wrong_derived_image_dimensions(self):
-        version, processed = self._collect_smoke_with_derived_output_contract((64, 64))
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
-        self.assertEqual(processed.error_code, "provider_smoke_output_invalid")
-        self.assertEqual(version.smoke_test_state, WorkflowTemplateVersion.ValidationState.FAILED)
-        self.assertIn("实际图片尺寸", processed.error_message)
-
-    def test_smoke_collector_persists_derived_size_evidence_on_success(self):
-        version, processed = self._collect_smoke_with_derived_output_contract((1024, 1024))
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.SUCCEEDED)
-        self.assertEqual(processed.result["output_contract"], version.smoke_test_evidence["output_contract"])
-        self.assertEqual(processed.result["output_contract"]["resolution"]["width"], 1024)
-
-    def test_remote_comfyui_node_failure_is_persisted_with_recovery_advice(self):
-        version_id, claimed = self._claim_validated_workflow_smoke(
-            "specific-failure-smoke-worker",
-        )
-        driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-
-        def invoke(_deployment, operation, payload):
-            if operation == "health":
-                return {"system": {"comfyui_version": "test"}}
-            if operation == "object_info":
-                return self._canvas_object_info()
-            if operation == "submit":
-                return {"request_id": payload["submission_token"]}
-            if operation == "poll":
-                return {
-                    "status": "failed",
-                    "failure": {
-                        "schema_version": 1,
-                        "kind": "execution_error",
-                        "node_id": "1",
-                        "exception_type": "ValueError",
-                        "exception_message": "required input text is missing",
-                    },
-                }
-            raise AssertionError(operation)
-
-        driver.invoke.side_effect = invoke
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            processed = process_workflow_smoke(claimed)
-
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
-        self.assertEqual(processed.error_code, "provider_smoke_failed")
-        self.assertIn("节点 1（CLIPTextEncode）", processed.error_message)
-        self.assertIn("required input text is missing", processed.error_message)
-        self.assertIn("处理建议", processed.error_message)
-        self.assertNotIn("UntrustedRemoteNodeType", processed.error_message)
-        self.assertNotIn("{'detail'", processed.error_message)
-        self.assertEqual(processed.result, {})
-
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.FAILED,
-        )
-        self.assertEqual(version.smoke_test_message, processed.error_message)
-        detail = self.client.get(
-            f"/api/v1/workflow-smoke-attempts/{processed.id}/",
-        )
-        self.assertEqual(detail.status_code, 200, detail.data)
-        self.assertEqual(detail.data["error_message"], processed.error_message)
-        self.assertEqual(detail.data["result"], {})
-        self.assertNotIn("failure", detail.data)
 
     def test_comfyui_driver_poll_projects_only_safe_execution_failure(self):
         history = {
@@ -3689,602 +2912,29 @@ class WorkflowVersionApiTests(TestCase):
         self.assertNotIn("private traceback", str(result))
         self.assertNotIn("private prompt", str(result))
 
-    def test_remote_poll_transport_failure_is_uncertain_after_submission(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        driver = Mock()
-        driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-        created = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        self.assertEqual(created.status_code, 202, created.data)
-        claimed = claim_next_workflow_smoke("uncertain-smoke-worker")
-        self.assertIsNotNone(claimed)
-
-        def fail_after_submit(*_args, **kwargs):
-            kwargs["on_submission_started"]()
-            kwargs["on_submitted"](str(claimed.submission_token))
-            newer = WorkflowTemplateVersion.objects.get(pk=version_id)
-            newer.validation_evidence = {
-                **newer.validation_evidence,
-                "generation": "newer-validation",
-            }
-            newer.validation_evidence_sha256 = json_contract(
-                newer.validation_evidence,
-            ).sha256
-            newer.validation_message = "newer validation passed"
-            newer.smoke_test_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-            newer.smoke_test_message = "newer validation requires a new smoke"
-            newer.smoke_test_evidence = {}
-            newer.smoke_test_evidence_sha256 = ""
-            newer.save(update_fields=(
-                "validation_evidence", "validation_evidence_sha256",
-                "validation_message", "smoke_test_state", "smoke_test_message",
-                "smoke_test_evidence", "smoke_test_evidence_sha256", "updated_at",
-            ))
-            provider_error = ProviderDriverError(
-                "poll transport unavailable",
-                code="comfyui_operation_failed",
-            )
-            raise DjangoValidationError({"detail": "provider unavailable"}) from provider_error
-
-        with patch(
-            "studio.services.workflow_smoke_queue.smoke_test_workflow_version",
-            side_effect=fail_after_submit,
-        ):
-            processed = process_workflow_smoke(claimed)
-
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.UNCERTAIN)
-        self.assertEqual(processed.error_code, "remote_state_uncertain")
-        self.assertEqual(
-            processed.provider_request_id,
-            str(processed.submission_token),
-        )
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.NOT_RUN,
-        )
-        self.assertEqual(version.validation_message, "newer validation passed")
-        self.assertEqual(version.smoke_test_message, "newer validation requires a new smoke")
-
-        blocked = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        self.assertEqual(blocked.status_code, 409, blocked.data)
-        self.assertEqual(
-            blocked.data["error"]["code"],
-            "unresolved_workflow_smoke_submission",
-        )
-        self.assertEqual(WorkflowSmokeAttempt.objects.count(), 1)
-
-        wrong_request = self.client.post(
-            f"/api/v1/workflow-smoke-attempts/{processed.id}/resolve-uncertain/",
-            {
-                "outcome": "confirmed_remote_failed",
-                "provider_request_id": "another-request",
-                "note": "已在 ComfyUI 历史中确认该请求失败。",
-            },
-            format="json",
-        )
-        self.assertEqual(wrong_request.status_code, 400, wrong_request.data)
-
-        resolution_payload = {
-            "outcome": "confirmed_remote_failed",
-            "note": "已在 ComfyUI 历史中确认该请求失败。",
-        }
-        resolved = self.client.post(
-            f"/api/v1/workflow-smoke-attempts/{processed.id}/resolve-uncertain/",
-            resolution_payload,
-            format="json",
-        )
-        self.assertEqual(resolved.status_code, 201, resolved.data)
-        self.assertNotIn("provider_request_id", resolved.data)
-        self.assertEqual(
-            resolved.data["provider_request_id_sha256"],
-            hashlib.sha256(str(processed.submission_token).encode("utf-8")).hexdigest(),
-        )
-        replayed_resolution = self.client.post(
-            f"/api/v1/workflow-smoke-attempts/{processed.id}/resolve-uncertain/",
-            resolution_payload,
-            format="json",
-        )
-        self.assertEqual(replayed_resolution.status_code, 200, replayed_resolution.data)
-        self.assertEqual(replayed_resolution.data["id"], resolved.data["id"])
-        conflicting_resolution = self.client.post(
-            f"/api/v1/workflow-smoke-attempts/{processed.id}/resolve-uncertain/",
-            {
-                "outcome": "confirmed_remote_succeeded",
-                "note": "已在 ComfyUI 历史中确认该请求成功。",
-            },
-            format="json",
-        )
-        self.assertEqual(conflicting_resolution.status_code, 409, conflicting_resolution.data)
-
-        still_not_publishable = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/publish/",
-            {},
-            format="json",
-        )
-        self.assertEqual(still_not_publishable.status_code, 400, still_not_publishable.data)
-
-        retry = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"prompt.positive": "fixture A"}),
-            format="json",
-        )
-        self.assertEqual(retry.status_code, 202, retry.data)
-        self.assertNotEqual(retry.data["id"], str(processed.id))
-        self.assertEqual(WorkflowSmokeAttempt.objects.count(), 2)
-
-        resolution = WorkflowSmokeAttemptResolution.objects.get(pk=resolved.data["id"])
-        resolution.note = "mutated resolution"
-        with self.assertRaises(DjangoValidationError):
-            resolution.save(update_fields=("note", "updated_at"))
-        with self.assertRaises(DjangoValidationError):
-            WorkflowSmokeAttemptResolution.objects.filter(pk=resolution.pk).update(
-                note="mutated queryset",
-            )
-
-    def test_late_smoke_success_never_overwrites_newer_validation(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        object_info = {
-            "CLIPTextEncode": {
-                "input": {"required": {"text": ["STRING", {}]}},
-                "output": [],
-                "output_name": [],
-            },
-            "SaveImage": {
-                "input": {"required": {
-                    "images": ["STRING", {}],
-                    "filename_prefix": ["STRING", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-            "EmptyLatentImage": {
-                "input": {"required": {
-                    "width": ["INT", {}], "height": ["INT", {}],
-                    "batch_size": ["INT", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-        }
-        driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-
-        newer_evidence = {"generation": "newer-validation"}
-
-        def invoke(_deployment, operation, payload):
-            if operation == "health":
-                return {"system": {"comfyui_version": "test"}}
-            if operation == "object_info":
-                return object_info
-            if operation == "submit":
-                return {"request_id": payload.get("submission_token")}
-            if operation == "poll":
-                changed_deployment = ModelDeployment.objects.get(pk=self.deployment.pk)
-                assign_json_contract(changed_deployment, "runtime_config", {
-                    "base_url": "http://127.0.0.1:8899",
-                    "timeout_seconds": 12,
-                    "poll_interval_seconds": 1,
-                    "max_poll_seconds": 60,
-                    "capability_ttl_seconds": 300,
-                })
-                changed_deployment.save(update_fields=(
-                    "runtime_config", "runtime_config_schema_version",
-                    "runtime_config_size_bytes", "runtime_config_sha256", "updated_at",
-                ))
-                newer = WorkflowTemplateVersion.objects.get(pk=version_id)
-                newer.status = WorkflowTemplateVersion.Status.VALIDATED
-                newer.validation_state = WorkflowTemplateVersion.ValidationState.PASSED
-                newer.validation_message = "newer validation passed"
-                newer.validated_deployment = self.deployment
-                newer.validation_evidence = newer_evidence
-                newer.validation_evidence_sha256 = json_contract(newer_evidence).sha256
-                newer.smoke_test_state = WorkflowTemplateVersion.ValidationState.NOT_RUN
-                newer.smoke_test_message = "newer validation requires a new smoke"
-                newer.smoke_test_evidence = {}
-                newer.smoke_test_evidence_sha256 = ""
-                newer.save(update_fields=(
-                    "status", "validation_state", "validation_message",
-                    "validated_deployment", "validation_evidence",
-                    "validation_evidence_sha256", "smoke_test_state",
-                    "smoke_test_message", "smoke_test_evidence",
-                    "smoke_test_evidence_sha256", "updated_at",
-                ))
-                return {"status": "succeeded"}
-            if operation == "collect":
-                return {"outputs": [{
-                    "node_id": "2", "filename": "smoke.png",
-                    "subfolder": "", "type": "output",
-                }]}
-            raise AssertionError(operation)
-
-        driver.invoke.side_effect = invoke
-        with tempfile.TemporaryDirectory() as output_dir:
-            Image.new("RGB", (2, 2), color="red").save(Path(output_dir) / "smoke.png")
-            with override_settings(COMFYUI_OUTPUT_DIR=output_dir), patch(
-                "studio.services.workflow_versions.driver_for",
-                return_value=driver,
-            ):
-                validated = self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                    {"deployment_id": str(self.deployment.id)},
-                    format="json",
-                )
-                self.assertEqual(validated.status_code, 200, validated.data)
-                queued = self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-                    self._smoke_action(),
-                    format="json",
-                )
-                self.assertEqual(queued.status_code, 202, queued.data)
-                processed = process_workflow_smoke(
-                    claim_next_workflow_smoke("late-smoke-worker"),
-                )
-
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
-        self.assertEqual(processed.error_code, "workflow_smoke_superseded")
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-        self.assertEqual(version.validation_evidence, newer_evidence)
-        self.assertEqual(version.validation_message, "newer validation passed")
-        self.assertEqual(
-            version.smoke_test_state,
-            WorkflowTemplateVersion.ValidationState.NOT_RUN,
-        )
-        self.assertEqual(version.smoke_test_message, "newer validation requires a new smoke")
-
-    def test_invalid_smoke_fixture_does_not_clear_live_validation(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        driver = Mock()
-        driver.invoke.return_value = self._canvas_object_info()
-        with patch(
-            "studio.services.workflow_versions.driver_for",
-            return_value=driver,
-        ):
-            validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                {"deployment_id": str(self.deployment.id)},
-                format="json",
-            )
-        self.assertEqual(validated.status_code, 200, validated.data)
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        evidence_sha = version.validation_evidence_sha256
-
-        rejected = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-            self._smoke_action(values={"parameter.not_declared": 1}),
-            format="json",
-        )
-
-        self.assertEqual(rejected.status_code, 400, rejected.data)
-        self.assertEqual(WorkflowSmokeAttempt.objects.count(), 0)
-        version.refresh_from_db()
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-        self.assertEqual(version.validation_evidence_sha256, evidence_sha)
-        self.assertEqual(
-            version.status,
-            WorkflowTemplateVersion.Status.VALIDATED,
-        )
-
-    def test_smoke_asset_drift_fails_before_provider_and_keeps_validation(self):
-        with tempfile.TemporaryDirectory() as root:
-            source = Path(root) / "reference.png"
-            source.write_bytes(b"frozen-reference")
-            checksum = hashlib.sha256(source.read_bytes()).hexdigest()
-            asset = Asset.objects.create(
-                owner=None,
-                kind=Asset.Kind.REFERENCE,
-                name="Frozen smoke reference",
-                local_path=str(source),
-                mime_type="image/png",
-                checksum=checksum,
-                is_active=True,
-            )
-            imported = self._import(
-                smoke_asset_binding={"category": "character"},
-            )
-            self.assertEqual(imported.status_code, 201, imported.data)
-            version_id = imported.data["id"]
-            driver = Mock()
-            driver.invoke.return_value = self._canvas_object_info()
-            with override_settings(ASSET_LIBRARY_ROOT=root), patch(
-                "studio.services.workflow_versions.driver_for",
-                return_value=driver,
-            ):
-                validated = self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                    {"deployment_id": str(self.deployment.id)},
-                    format="json",
-                )
-                self.assertEqual(validated.status_code, 200, validated.data)
-                version = WorkflowTemplateVersion.objects.get(pk=version_id)
-                validation_sha = version.validation_evidence_sha256
-                queued = self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-                    self._smoke_action(assets=[{
-                        "semantic_key": "asset.image.reference",
-                        "asset_id": str(asset.id),
-                    }]),
-                    format="json",
-                )
-                self.assertEqual(queued.status_code, 202, queued.data)
-                binding = WorkflowSmokeAssetBinding.objects.get(
-                    attempt_id=queued.data["id"],
-                )
-                binding.category = "mutated"
-                with self.assertRaises(DjangoValidationError):
-                    binding.save(update_fields=("category", "updated_at"))
-                source.write_bytes(b"drifted-reference")
-                provider_factory = Mock()
-                with patch(
-                    "studio.services.workflow_versions.driver_for",
-                    provider_factory,
-                ):
-                    processed = process_workflow_smoke(
-                        claim_next_workflow_smoke("asset-drift-worker"),
-                    )
-
-        self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
-        self.assertIn("漂移", processed.error_message)
-        provider_factory.assert_not_called()
-        version.refresh_from_db()
-        self.assertEqual(
-            version.validation_state,
-            WorkflowTemplateVersion.ValidationState.PASSED,
-        )
-        self.assertEqual(version.validation_evidence_sha256, validation_sha)
-
-    def test_import_validate_smoke_publish_and_list_hides_graph(self):
+    def test_import_validate_and_list_hides_graph_without_generic_patch(self):
         imported = self._import()
         self.assertEqual(imported.status_code, 201, imported.data)
         version_id = imported.data["id"]
-        object_info = {
-            "CLIPTextEncode": {
-                "input": {"required": {"text": ["STRING", {}]}},
-                "output": [],
-                "output_name": [],
-            },
-            "SaveImage": {
-                "input": {"required": {
-                    "images": ["STRING", {}],
-                    "filename_prefix": ["STRING", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-            "EmptyLatentImage": {
-                "input": {"required": {
-                    "width": ["INT", {}], "height": ["INT", {}], "batch_size": ["INT", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-        }
         driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-        def invoke(_deployment, operation, _payload):
-            return {
-                "health": {"system": {"comfyui_version": "test"}},
-                "object_info": object_info,
-                "submit": {"request_id": _payload.get("submission_token")},
-                "poll": {"status": "succeeded"},
-                "collect": {"outputs": [{
-                    "node_id": "2", "filename": "smoke.png", "subfolder": "", "type": "output",
-                }]},
-            }[operation]
-        driver.invoke.side_effect = invoke
-        with tempfile.TemporaryDirectory() as output_dir:
-            Image.new("RGB", (2, 2), color="red").save(Path(output_dir) / "smoke.png")
-            with override_settings(COMFYUI_OUTPUT_DIR=output_dir), patch(
-                "studio.services.workflow_versions.driver_for", return_value=driver,
-            ):
-                validated = self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                    {"deployment_id": str(self.deployment.id)},
-                    format="json",
-                )
-                self.assertEqual(validated.status_code, 200, validated.data)
-                smoked = self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-                    self._smoke_action(),
-                    format="json",
-                )
-                self.assertEqual(smoked.status_code, 202, smoked.data)
-                self.assertIn("Location", smoked.headers)
-                attempt = claim_next_workflow_smoke("test-worker")
-                self.assertIsNotNone(attempt)
-                processed = process_workflow_smoke(attempt)
-                self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.SUCCEEDED)
-                processed.refresh_from_db()
-                version = WorkflowTemplateVersion.objects.get(pk=version_id)
-                self.assertEqual(
-                    processed.result["fixture_sha256"],
-                    processed.fixture_sha256,
-                )
-                self.assertEqual(len(processed.result["compiled_graph_sha256"]), 64)
-                self.assertEqual(
-                    version.smoke_test_evidence["fixture_sha256"],
-                    processed.fixture_sha256,
-                )
-                self.assertEqual(
-                    version.smoke_test_evidence["compiled_graph_sha256"],
-                    processed.result["compiled_graph_sha256"],
-                )
-        published = self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/publish/",
-            {},
-            format="json",
-        )
-        self.assertEqual(published.status_code, 200, published.data)
-        self.assertEqual(published.data["status"], WorkflowTemplateVersion.Status.PUBLISHED)
-        publish_event = PlatformLifecycleAuditEvent.objects.get(
-            object_type="workflow_template_version",
-            object_id=version_id,
-            action="publish",
-        )
-        self.assertEqual(
-            publish_event.before_summary["validated_deployment_id"],
-            str(self.deployment.id),
-        )
-        self.assertEqual(
-            publish_event.after_summary["validated_deployment_id"],
-            str(self.deployment.id),
-        )
-        self.assertEqual(
-            publish_event.before_summary["status"],
-            WorkflowTemplateVersion.Status.VALIDATED,
-        )
-        self.assertEqual(
-            publish_event.after_summary["status"],
-            WorkflowTemplateVersion.Status.PUBLISHED,
-        )
-
+        driver.invoke.return_value = self._canvas_object_info()
+        with patch("studio.services.workflow_versions.driver_for", return_value=driver):
+            validated = self.client.post(
+                f"/api/v1/workflow-template-versions/{version_id}/validate/",
+                {"deployment_id": str(self.deployment.id)}, format="json",
+            )
+        self.assertEqual(validated.status_code, 200, validated.data)
         listing = self.client.get("/api/v1/workflow-template-versions/")
         self.assertEqual(listing.status_code, 200)
         row = next(item for item in listing.data["results"] if item["id"] == version_id)
         self.assertNotIn("graph", row)
         detail = self.client.get(f"/api/v1/workflow-template-versions/{version_id}/")
         self.assertIn("graph", detail.data)
-        rejected_update = self.client.patch(
-            f"/api/v1/workflow-template-versions/{version_id}/",
-            {"graph": {}},
-            format="json",
+        rejected = self.client.patch(
+            f"/api/v1/workflow-template-versions/{version_id}/", {"graph": {}}, format="json",
         )
-        self.assertEqual(rejected_update.status_code, 405)
+        self.assertEqual(rejected.status_code, 405)
 
-    def test_failed_revalidation_and_resmoke_clear_stale_passed_evidence(self):
-        imported = self._import()
-        version_id = imported.data["id"]
-        object_info = {
-            "CLIPTextEncode": {
-                "input": {"required": {"text": ["STRING", {}]}},
-                "output": [],
-                "output_name": [],
-            },
-            "SaveImage": {
-                "input": {"required": {
-                    "images": ["STRING", {}],
-                    "filename_prefix": ["STRING", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-            "EmptyLatentImage": {
-                "input": {"required": {
-                    "width": ["INT", {}],
-                    "height": ["INT", {}],
-                    "batch_size": ["INT", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-        }
-        driver = Mock()
-        driver.capabilities.return_value = {
-            "operations": ["health", "object_info", "submit", "poll", "cancel", "collect"],
-        }
-
-        def success(_deployment, operation, _payload):
-            return {
-                "health": {"system": {"comfyui_version": "test"}},
-                "object_info": object_info,
-                "submit": {"request_id": _payload.get("submission_token")},
-                "poll": {"status": "succeeded"},
-                "collect": {"outputs": [{
-                    "node_id": "2", "filename": "smoke.png", "subfolder": "",
-                }]},
-            }[operation]
-
-        with tempfile.TemporaryDirectory() as output_dir:
-            Image.new("RGB", (2, 2), color="green").save(Path(output_dir) / "smoke.png")
-            with override_settings(COMFYUI_OUTPUT_DIR=output_dir), patch(
-                "studio.services.workflow_versions.driver_for", return_value=driver,
-            ):
-                driver.invoke.side_effect = success
-                self.assertEqual(self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                    {"deployment_id": str(self.deployment.id)}, format="json",
-                ).status_code, 200)
-                driver.invoke.side_effect = ProviderDriverError("object_info unavailable")
-                self.assertEqual(self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                    {"deployment_id": str(self.deployment.id)}, format="json",
-                ).status_code, 400)
-                version = WorkflowTemplateVersion.objects.get(pk=version_id)
-                self.assertEqual(version.validation_state, "failed")
-                self.assertIsNone(version.validated_deployment_id)
-                self.assertEqual(version.validation_evidence, {})
-                self.assertEqual(version.smoke_test_evidence, {})
-
-                driver.invoke.side_effect = success
-                self.assertEqual(self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/validate/",
-                    {"deployment_id": str(self.deployment.id)}, format="json",
-                ).status_code, 200)
-                self.assertEqual(self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-                    self._smoke_action(), format="json",
-                ).status_code, 202)
-                self.assertEqual(
-                    process_workflow_smoke(
-                        claim_next_workflow_smoke("success-worker"),
-                    ).status,
-                    WorkflowSmokeAttempt.Status.SUCCEEDED,
-                )
-                driver.invoke.side_effect = ProviderDriverError("smoke unavailable")
-                self.assertEqual(self.client.post(
-                    f"/api/v1/workflow-template-versions/{version_id}/smoke-test/",
-                    self._smoke_action(), format="json",
-                ).status_code, 202)
-                self.assertEqual(
-                    process_workflow_smoke(
-                        claim_next_workflow_smoke("failure-worker"),
-                    ).status,
-                    WorkflowSmokeAttempt.Status.FAILED,
-                )
-        version = WorkflowTemplateVersion.objects.get(pk=version_id)
-        self.assertEqual(version.smoke_test_state, "failed")
-        self.assertEqual(version.smoke_test_evidence, {})
-        self.assertEqual(version.validation_state, "passed")
-        self.assertEqual(version.validated_deployment_id, self.deployment.id)
-        self.assertTrue(version.validation_evidence)
-        self.assertEqual(self.client.post(
-            f"/api/v1/workflow-template-versions/{version_id}/publish/", {}, format="json",
-        ).status_code, 400)
     def test_collection_post_is_not_a_workflow_creation_entry(self):
         original_count = WorkflowTemplateVersion.objects.count()
         response = self.client.post(
@@ -4350,55 +3000,23 @@ class WorkflowVersionApiTests(TestCase):
         self.assertEqual(response.status_code, 400, response.data)
         self.assertIn("必须属于", str(response.data))
 
-    def test_contract_only_driver_cannot_publish(self):
+    def test_live_validation_alone_cannot_publish(self):
         imported = self._import()
         self.assertEqual(imported.status_code, 201, imported.data)
-        object_info = {
-            "CLIPTextEncode": {
-                "input": {"required": {"text": ["STRING", {}]}},
-                "output": [],
-                "output_name": [],
-            },
-            "SaveImage": {
-                "input": {"required": {
-                    "images": ["STRING", {}],
-                    "filename_prefix": ["STRING", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-            "EmptyLatentImage": {
-                "input": {"required": {
-                    "width": ["INT", {}],
-                    "height": ["INT", {}],
-                    "batch_size": ["INT", {}],
-                }},
-                "output": [],
-                "output_name": [],
-            },
-        }
+        version_id = imported.data["id"]
         driver = Mock()
-        driver.invoke.return_value = object_info
-        driver.capabilities.return_value = {"operations": ["health", "object_info"]}
+        driver.invoke.return_value = self._canvas_object_info()
         with patch("studio.services.workflow_versions.driver_for", return_value=driver):
             validated = self.client.post(
-                f"/api/v1/workflow-template-versions/{imported.data['id']}/validate/",
+                f"/api/v1/workflow-template-versions/{version_id}/validate/",
                 {"deployment_id": str(self.deployment.id)}, format="json",
             )
-            self.assertEqual(validated.status_code, 200, validated.data)
-            smoked = self.client.post(
-                f"/api/v1/workflow-template-versions/{imported.data['id']}/smoke-test/",
-                self._smoke_action(), format="json",
-            )
-            self.assertEqual(smoked.status_code, 202, smoked.data)
-            processed = process_workflow_smoke(
-                claim_next_workflow_smoke("unsupported-worker"),
-            )
-            self.assertEqual(processed.status, WorkflowSmokeAttempt.Status.FAILED)
+        self.assertEqual(validated.status_code, 200, validated.data)
         published = self.client.post(
-            f"/api/v1/workflow-template-versions/{imported.data['id']}/publish/", {}, format="json",
+            f"/api/v1/workflow-template-versions/{version_id}/publish/", {}, format="json",
         )
         self.assertEqual(published.status_code, 400, published.data)
+        self.assertFalse(WorkflowSmokeAttempt.objects.filter(workflow_version_id=version_id).exists())
 
     def test_binding_edit_invalidates_all_live_and_smoke_evidence(self):
         imported = self._import()
@@ -4533,7 +3151,7 @@ class ModelProfileNextVersionConcurrencyTests(TransactionTestCase):
         )
 
 
-class ConfigDefinitionRevisionConcurrencyTests(TransactionTestCase):
+class ConfigDefinitionRevisionConcurrencyTests(SeededTransactionTestCase):
     """A first revision cannot land between definition validation and save."""
 
     reset_sequences = True
@@ -4568,6 +3186,7 @@ class ConfigDefinitionRevisionConcurrencyTests(TransactionTestCase):
         revision_finished = threading.Event()
         failures: list[str] = []
         response_status: list[int] = []
+        response_details: list[dict] = []
 
         def paused_validate(serializer, attrs):
             result = original_validate(serializer, attrs)
@@ -4589,6 +3208,7 @@ class ConfigDefinitionRevisionConcurrencyTests(TransactionTestCase):
                     format="json",
                 )
                 response_status.append(response.status_code)
+                response_details.append(response.data)
             except BaseException as exc:  # pragma: no cover - thread handoff
                 failures.append(repr(exc))
             finally:
@@ -4612,15 +3232,18 @@ class ConfigDefinitionRevisionConcurrencyTests(TransactionTestCase):
 
         with patch.object(ConfigDefinitionSerializer, "validate", paused_validate):
             update_thread = threading.Thread(target=update_definition, daemon=True)
-            update_thread.start()
-            self.assertTrue(validated.wait(timeout=10))
             revision_thread = threading.Thread(target=create_first_revision, daemon=True)
-            revision_thread.start()
-            self.assertTrue(revision_started.wait(timeout=10))
-            self.assertFalse(revision_finished.wait(timeout=0.25))
-            release_update.set()
-            update_thread.join(timeout=20)
-            revision_thread.join(timeout=20)
+            try:
+                update_thread.start()
+                self.assertTrue(validated.wait(timeout=10), (failures, response_status, response_details))
+                revision_thread.start()
+                self.assertTrue(revision_started.wait(timeout=10), failures)
+                self.assertFalse(revision_finished.wait(timeout=0.25))
+            finally:
+                release_update.set()
+                update_thread.join(timeout=20)
+                if revision_thread.ident is not None:
+                    revision_thread.join(timeout=20)
 
         self.assertFalse(update_thread.is_alive())
         self.assertFalse(revision_thread.is_alive())
@@ -4655,12 +3278,15 @@ class PlatformTrustFoundationTests(TestCase):
                 archived = _archive_task_output(
                     task, 0, task.outputs[0], expected_kind="image",
                     expected_sha256=digest, max_bytes=1024,
+                    output_contract={"schema_version": 1,
+                        "primary": {"node_id": "output", "kind": "image", "required": True}},
                 )
                 source.unlink()
                 managed = Path(media_dir) / archived["object_key"]
                 self.assertEqual(managed.read_bytes(), original)
                 self.assertEqual(archived["storage_backend"], "managed_local")
 
+    @override_settings(AI_PROVIDER_ALLOWED_HOSTS=("api.example.com",))
     def test_no_gpu_with_unverified_cloud_text_deployment_requires_smoke(self):
         host = RuntimeHost.objects.create(key="cpu-only", name="CPU only")
         snapshot = HostCapabilitySnapshot(
@@ -4672,17 +3298,29 @@ class PlatformTrustFoundationTests(TestCase):
         assign_json_contract(snapshot, "details", {"schema_version": 1, "gpus": []})
         snapshot.save()
         profile = ModelProfileVersion.objects.get(profile_key="deepseek-text", version=1)
+        assign_json_contract(profile, "specification", {
+            "schema_version": 1, "capabilities": ["script.generate"],
+        })
+        profile.save()
         cloud = ModelDeployment(
             key="cloud-text-test",
             name="Cloud text test",
             profile_version=profile,
             runtime_host=None,
         )
-        assign_json_contract(cloud, "runtime_config", {})
+        assign_json_contract(cloud, "runtime_config", {
+            "runtime_source": "openai_compatible_endpoint", "base_url": "https://api.example.com",
+            "chat_path": "/v1/chat/completions", "timeout_seconds": 30, "capability_ttl_seconds": 3600,
+        })
         cloud.save()
 
         readiness = capability_readiness(snapshot)
 
+        self.assertEqual(readiness["capabilities"]["text"]["state"], "blocked")
+        enable_test_keyring(self)
+        cloud.credential = create_test_secret(key="cloud-no-gpu-resource", value="isolated-cloud-secret")
+        cloud.save(update_fields=["credential", "updated_at"])
+        readiness = capability_readiness(snapshot)
         self.assertEqual(readiness["capabilities"]["text"]["state"], "smoke_required")
         self.assertEqual(readiness["capabilities"]["text"]["cloud_deployment_count"], 0)
         self.assertNotEqual(readiness["capabilities"]["text"]["state"], "blocked")

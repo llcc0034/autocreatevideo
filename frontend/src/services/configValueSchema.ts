@@ -26,6 +26,16 @@ export const validateConfigValue = (definition: ConfigDefinition, value: unknown
   }[definition.valueType]
   if (!typeMatches) return `${definition.key} 的值类型必须为 ${definition.valueType}`
 
+  if (definition.key === 'execution.resources.review_policy') {
+    const policy = value as Record<string,unknown>
+    if(Object.keys(policy).sort().join(',') !== 'budget_by_currency,call_count,output_length'
+      || !Number.isSafeInteger(policy.call_count) || Number(policy.call_count)<1 || !Number.isSafeInteger(policy.output_length) || Number(policy.output_length)<1)
+      return '调用次数和输出额度必须是正整数，且仅允许预算、次数和输出额度三项配置。'
+    if(!policy.budget_by_currency || typeof policy.budget_by_currency !== 'object' || Array.isArray(policy.budget_by_currency)
+      || Object.entries(policy.budget_by_currency).some(([code,amount])=> !/^[A-Z][A-Z0-9]{2,11}$/.test(code) || typeof amount !== 'string' || !/^(?:0|[1-9][0-9]{0,7})(?:\.[0-9]{1,4})?$/.test(amount)))
+      return '每个币种均需填写非负金额，最多 8 位整数和 4 位小数；不自动换算。'
+  }
+
   const schema = definition.valueSchema || {}
   if (Array.isArray(schema.enum) && !schema.enum.some((candidate) => JSON.stringify(candidate) === JSON.stringify(value))) {
     return `${definition.key} 的值不在允许枚举中`
@@ -83,6 +93,15 @@ export const configValueEditorKind = (definition: ConfigDefinition): 'boolean' |
   return 'json'
 }
 
+export const configEnumLabel = (definition: ConfigDefinition, value: unknown): string => {
+  const labels = definition.valueSchema?.enum_labels
+  if (typeof value === 'string' && labels && typeof labels === 'object' && !Array.isArray(labels)) {
+    const label = (labels as JsonObject)[value]
+    if (typeof label === 'string' && label) return label
+  }
+  return typeof value === 'string' ? value : JSON.stringify(value)
+}
+
 export const configValueConstraintSummary = (definition: ConfigDefinition): string => {
   const schema = definition.valueSchema || {}
   const parts = [definition.valueType, definition.unit].filter(Boolean)
@@ -92,7 +111,7 @@ export const configValueConstraintSummary = (definition: ConfigDefinition): stri
   if (schema.format === 'comfyui-saved-workflow-directory') parts.push('ComfyUI userdata 相对目录')
   if (schema.resource_ref && typeof schema.resource_ref === 'object') {
     const reference = schema.resource_ref as JsonObject
-    parts.push(`依赖 ${String(reference.resource || 'resource')} · ${String(reference.capability || '未声明能力')}`)
+    parts.push(`${reference.resource === 'execution_instance_version' ? '推荐精确实例版本' : String(reference.resource || '未声明资源')} · ${String(reference.capability || '未声明能力')}`)
   }
   return parts.join(' · ')
 }

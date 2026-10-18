@@ -1,51 +1,51 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readDialogue } from '../src/services/dialogue.ts'
+import { readShotCharacters, removeDialogueLine, toggleVisibleCharacter, visibleCharacterIds } from '../src/services/shotCharacters.ts'
+const visibleId = '11111111-1111-4111-8111-111111111111'
+const speakerId = '22222222-2222-4222-8222-222222222222'
+const lines = [{speaker_id:'S2',text:'  原文\n不裁剪。  ',language:'Chinese',delivery:' softly ',voiceover:true,start_ms:123,end_ms:987}]
+const relations = [{role:'visible',position:0,character_id:visibleId},{role:'speaker',position:0,character_id:speakerId}]
 
-import { formatDialogueLines, parseDialogueText } from '../src/services/dialogue.ts'
-
-const characters = [{ name: '沈砚', stableSpeakerId: 'S1' }]
-
-test('parses delivery and voiceover token without changing dialogue text', () => {
-  const result = parseDialogueText(
-    '沈砚（voiceover; in a low, restrained voice）：谁在等我！？\nS1（softly）：别动。',
-    characters
-  )
-  assert.deepEqual(result, [
-    { speaker_id: 'S1', text: '谁在等我！？', delivery: 'in a low, restrained voice', voiceover: true },
-    { speaker_id: 'S1', text: '别动。', delivery: 'softly' }
-  ])
+test('structured dialogue round trips original whitespace, explicit false and integer milliseconds', () => {
+  const value = [...lines, {speaker_id:'S1',text:'另一行',voiceover:false}]
+  const result = readDialogue(value)
+  assert.deepEqual(result, value)
+  assert.notEqual(result[0],value[0])
+  assert.deepEqual(readShotCharacters(relations, lines),relations)
 })
-
-test('voiceover must be an independent token and formatting is reversible', () => {
-  const parsed = parseDialogueText('S1（voiceoverish）：原文。', characters)
-  assert.deepEqual(parsed, [{ speaker_id: 'S1', text: '原文。', delivery: 'voiceoverish' }])
-  assert.equal(formatDialogueLines(parsed), 'S1（voiceoverish）：原文。')
-
-  const voiceover = [{ speaker_id: 'S1', text: '原文。', delivery: 'softly', voiceover: true }]
-  assert.deepEqual(parseDialogueText(formatDialogueLines(voiceover), characters), voiceover)
+test('no display text parsing, name inference, coercion or incomplete timing', () => {
+  for (const input of ['同名：文字',null,[{speaker_id:'同名',text:'原文'}],
+    [{...lines[0],end_ms:undefined}],[{...lines[0],start_ms:true}],[{...lines[0],voiceover:1}],
+    [{...lines[0],unexpected:'ignored'}],[{...lines[0],text:' '}], [{...lines[0],end_ms:100}]]) {
+    assert.throws(()=>readDialogue(input))
+  }
 })
-
-test('timed dialogue round-trips in milliseconds without changing the text', () => {
-  const parsed = parseDialogueText(
-    '[1–3.5秒] 沈砚（softly）：原文。\n[00:03.500-5000ms] S1：第二句。',
-    characters,
-  )
-  assert.deepEqual(parsed, [
-    { speaker_id: 'S1', text: '原文。', delivery: 'softly', start_ms: 1000, end_ms: 3500 },
-    { speaker_id: 'S1', text: '第二句。', start_ms: 3500, end_ms: 5000 },
-  ])
-  assert.equal(
-    formatDialogueLines(parsed),
-    '[1–3.5秒] S1（softly）：原文。\n[3.5–5秒] S1：第二句。',
-  )
-  assert.deepEqual(parseDialogueText(formatDialogueLines(parsed), characters), parsed)
-  assert.equal(parseDialogueText('[4-2秒] S1：倒序。', characters), undefined)
+test('each speech line keeps its language independently, missing remains missing', () => {
+  const value = [...lines, {...lines[0], text: 'Hello.', language: 'English'}, {speaker_id:'S2', text:'Unknown language'}]
+  assert.deepEqual(readDialogue(value), value)
+  for (const language of [false, null, 1, 'English\n', '{language}', '<d>', '[Chinese]']) {
+    assert.throws(() => readDialogue([{...lines[0], language}]))
+  }
 })
-
-test('rejects unknown speakers but delegates content limits to the server', () => {
-  assert.equal(parseDialogueText('陌生人：台词', characters), undefined)
-  assert.deepEqual(parseDialogueText(`S1：${'字'.repeat(2001)}`, characters), [{
-    speaker_id: 'S1',
-    text: '字'.repeat(2001),
-  }])
+test('roles require exact typed positions and complete speaker identity', () => {
+  for (const input of [undefined,[],relations.slice(0,1),[...relations,relations[1]],
+    [{...relations[1],position:true}],[{...relations[1],role:['speaker']}],
+    [{...relations[1],position:1}],[{...relations[1],character_id:'name'}]]) {
+    assert.throws(()=>readShotCharacters(input,lines))
+  }
+})
+test('visibility changes do not create or delete a speaker; line removal shifts only speaker positions', () => {
+  const shot = {characterRelations:structuredClone(relations),audio:{dialogue:structuredClone(lines)}} as never
+  toggleVisibleCharacter(shot,visibleId)
+  assert.deepEqual(visibleCharacterIds(shot),[])
+  assert.deepEqual(shot.characterRelations,[relations[1]])
+  toggleVisibleCharacter(shot,speakerId)
+  assert.deepEqual(visibleCharacterIds(shot),[speakerId])
+  shot.audio.dialogue.push({speaker_id:'S1',text:'第二行'})
+  shot.characterRelations.push({role:'speaker',position:1,character_id:visibleId})
+  removeDialogueLine(shot,0)
+  assert.deepEqual(shot.audio.dialogue,[{speaker_id:'S1',text:'第二行'}])
+  assert.deepEqual(shot.characterRelations.filter(row=>row.role==='speaker'),[{role:'speaker',position:0,character_id:visibleId}])
+  assert.deepEqual(visibleCharacterIds(shot),[speakerId])
 })

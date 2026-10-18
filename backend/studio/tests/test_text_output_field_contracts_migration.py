@@ -3,6 +3,8 @@ from __future__ import annotations
 from copy import deepcopy
 import importlib
 
+from django.core.exceptions import ValidationError
+
 from studio.tests.test_configuration_migrations import _MigrationTestCase
 
 
@@ -118,14 +120,17 @@ class TextOutputFieldContractsMigrationTests(_MigrationTestCase):
         )
 
         runtime_target = RuntimeProfile.objects.get(pk=target.id)
-        self.assertEqual(
-            validate_script_generation_model_profile(runtime_target)["field_contract"],
-            migration.SERIES_CONCEPT_FIELD_CONTRACT,
-        )
-        self.assertEqual(
-            validate_script_structure_model_profile(runtime_target)["field_contract"],
-            migration.SCRIPT_STRUCTURE_FIELD_CONTRACT,
-        )
+        # The exact field contracts are asserted against the historical
+        # migration above. v19 still includes the old model-owned output
+        # allowance, so it must not be accepted as today's runtime contract.
+        for validator in (
+            validate_script_generation_model_profile,
+            validate_script_structure_model_profile,
+        ):
+            with self.subTest(validator=validator.__name__):
+                with self.assertRaises(ValidationError) as caught:
+                    validator(runtime_target)
+                self.assertIn("specification", caught.exception.message_dict)
 
         migration.publish_text_output_field_contract_successor(self.apps, None)
         self.assertEqual(Profile.objects.filter(

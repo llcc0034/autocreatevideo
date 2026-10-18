@@ -14,7 +14,7 @@ from studio.services.configuration import ConfigurationResolutionError
 from studio.services.security_boundaries import boundary_resolution
 
 DIALOGUE_ALLOWED_KEYS = frozenset({
-    "speaker_id", "text", "delivery", "voiceover", "start_ms", "end_ms",
+    "speaker_id", "text", "language", "delivery", "voiceover", "start_ms", "end_ms",
 })
 _SPEAKER_ID_RE = re.compile(r"^S[1-9][0-9]*$")
 _VOICEOVER_TOKEN_RE = re.compile(
@@ -27,6 +27,20 @@ _VOICEOVER_TOKEN_RE = re.compile(
 
 class DialogueContractError(ValueError):
     pass
+
+
+def dialogue_language_schema():
+    """An authored speech label, never a translation target or inferred default."""
+    return {"type": "string", "title": "本句对白语言",
+        "pattern": r"^[^\x00-\x1f\x7f<>\[\]{}]*$(?![\s\S])",
+        "description": "本句实际发声语言，例如 Chinese、English 或语言代码；同一人物可逐句切换。空值表示未声明，不继承项目或导演输出语言。台词原文不翻译。"}
+
+
+def validate_dialogue_language(value):
+    schema = dialogue_language_schema()
+    if not isinstance(value, str) or re.fullmatch(schema["pattern"], value) is None:
+        raise DialogueContractError("对白语言须为语言名称或代码，不能包含控制字符或模板标记")
+    return value
 
 
 DIALOGUE_SECURITY_KEYS = {
@@ -101,6 +115,8 @@ def normalize_dialogue_entry(
         )
 
     result = {"speaker_id": speaker_id, "text": text}
+    if "language" in value:
+        result["language"] = validate_dialogue_language(value["language"])
     if "delivery" in value:
         delivery = value["delivery"]
         if not isinstance(delivery, str):
@@ -110,7 +126,7 @@ def normalize_dialogue_entry(
             raise DialogueContractError(
                 f"{label}.delivery 必须为 1–{delivery_max} 个字符的非空文本"
             )
-        result["delivery"] = delivery.strip()
+        result["delivery"] = delivery
     if "voiceover" in value:
         voiceover = value["voiceover"]
         if type(voiceover) is not bool:  # bool is deliberate; reject 0/1.

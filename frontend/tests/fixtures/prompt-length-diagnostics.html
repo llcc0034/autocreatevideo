@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <!-- Only Vite's local HMR socket is allowed, never business HTTP. -->
+  <meta http-equiv="Content-Security-Policy" content="connect-src ws://127.0.0.1:* ws://localhost:*; style-src 'self' 'unsafe-inline'; font-src 'self' data:; img-src data:; media-src data:; object-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+  <title>M6-06 长度诊断 · 隔离模拟</title>
+  <style>
+    .fixture-shell{max-width:1120px;margin:20px auto;padding:12px;min-width:0}
+    .fixture-shell h1{font-size:22px}.fixture-shell p{line-height:1.65;overflow-wrap:anywhere}
+    .fixture-warning{border:2px solid #e9ac53;padding:14px;background:#242017;margin-bottom:14px}
+    .fixture-warning strong{color:#ffd39a}.fixture-controls{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0}
+    .fixture-controls button{min-height:40px;white-space:normal}.fixture-controls [aria-pressed=true]{outline:2px solid var(--accent);outline-offset:2px}
+    .fixture-log summary{cursor:pointer;min-height:36px}.fixture-log pre{max-height:360px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px;font-size:12px}
+    @media(max-width:480px){.fixture-shell{margin:0 auto;padding:10px}.fixture-controls{display:grid;grid-template-columns:minmax(0,1fr)}.fixture-shell h1{font-size:19px}}
+  </style>
+</head>
+<body><div id="app">正在加载隔离模拟；不访问现用业务。</div><script type="module" src="./prompt-length-diagnostics.ts"></script></body>
+</html>

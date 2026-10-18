@@ -15,19 +15,8 @@ from studio.models import (
     WorkflowSmokeAttempt,
     WorkflowTemplateVersion,
 )
-from studio.services.async_media_contract import (
-    ASYNC_MEDIA_OPERATIONS,
-    deployment_target_sha256,
-)
-from studio.services.deployment_smoke_contract import (
-    DEPLOYMENT_SMOKE_OPERATIONS,
-    TEXT_DEPLOYMENT_SMOKE_OPERATIONS,
-)
+from studio.services.async_media_contract import deployment_target_sha256
 from studio.services.json_contracts import verify_json_contract
-from studio.services.model_profile_contracts import (
-    verified_model_profile_specification,
-)
-from studio.services.model_profile_options import model_capability_values
 from studio.services.provider_registry import validate_deployment_execution_contract
 from studio.services.security_boundaries import boundary_int, security_boundary_resolution_cache
 from studio.services.workflow_versions import (
@@ -97,15 +86,20 @@ def safe_deployment_attempt_summary(
 ) -> dict[str, Any] | None:
     if attempt is None:
         return None
-    resolutions = getattr(attempt, "_prefetched_objects_cache", {}).get("resolutions")
+    from studio.services.deployment_smoke_resolution import has_operator_resolution
     resolution_required = bool(
         attempt.status == ModelDeploymentSmokeAttempt.Status.UNCERTAIN
-        and not (resolutions if resolutions is not None else attempt.resolutions.exists())
+        and not has_operator_resolution(attempt)
     )
+    from studio.services.execution_deployment_resource_evidence import resource_smoke_profile_summary
+    try:
+        profile = resource_smoke_profile_summary(attempt)
+    except (ValidationError, RuntimeError, TypeError, ValueError):
+        profile = None
     return {
         "id": str(attempt.id),
         "operation": attempt.operation,
-        "prompt_profile": (attempt.request_snapshot or {}).get("prompt_profile"),
+        "prompt_profile": profile,
         "status": attempt.status,
         "request_sha256": attempt.request_sha256,
         "target_sha256": attempt.target_sha256,
@@ -161,48 +155,41 @@ def safe_snapshot_summary(
         and unexpired
         and snapshot.status == ModelDeploymentCapabilitySnapshot.Status.PASSED
     )
+    profile, evidence_valid = None, contract is not None
     if snapshot.probe_kind == ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE:
-        fresh = bool(
-            fresh
-            and snapshot.status == ModelDeploymentCapabilitySnapshot.Status.PASSED
-            and evidence.get("execution_submitted") is True
-            and operation in operations
-        )
-        from studio.services.deployment_smoke_contract import TEXT_DEPLOYMENT_SMOKE_OPERATIONS
-        from studio.services.deployment_smoke_profiles import snapshot_profile_matches
-        if operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS:
-            fresh = fresh and snapshot_profile_matches(snapshot)
+        from studio.services.execution_deployment_resource_evidence import read_resource_deployment_snapshot, resource_smoke_profile_summary
+        try:
+            attempt = read_resource_deployment_snapshot(snapshot)
+            profile = resource_smoke_profile_summary(attempt)
+            target_matches = True
+            try:
+                read_resource_deployment_snapshot(snapshot, current=True)
+            except ValidationError:
+                target_matches = False
+            fresh = bool(target_matches and unexpired and attempt.status == "succeeded" and operation in operations)
+        except (ValidationError, RuntimeError, TypeError, ValueError):
+            fresh, target_matches, evidence_valid = False, False, False
     return {
         "id": str(snapshot.id),
         "probe_kind": snapshot.probe_kind,
         "status": snapshot.status,
         "operations": operations,
-        "prompt_profile": evidence.get("prompt_profile"),
+        "prompt_profile": profile,
         "target_sha256": snapshot.target_sha256,
         "target_matches": target_matches,
         "fresh": fresh,
         "captured_at": snapshot.captured_at,
         "expires_at": snapshot.expires_at,
+        "_evidence_valid": evidence_valid,
     }
 
 
 def deployment_smoke_operations(deployment: ModelDeployment) -> tuple[str, ...]:
-    driver_type = deployment.profile_version.provider.driver_type
-    specification = verified_model_profile_specification(
-        deployment.profile_version,
-    )
-    declared = set(model_capability_values(specification))
-    if driver_type == ProviderProfile.DriverType.ASYNC_REST:
-        supported = set(ASYNC_MEDIA_OPERATIONS)
-    elif driver_type in {
-        ProviderProfile.DriverType.LOCAL_QWEN,
-        ProviderProfile.DriverType.DEEPSEEK_API,
-        ProviderProfile.DriverType.OPENAI_COMPATIBLE,
-    }:
-        supported = set(TEXT_DEPLOYMENT_SMOKE_OPERATIONS)
-    else:
-        supported = set()
-    return tuple(sorted(declared & supported & set(DEPLOYMENT_SMOKE_OPERATIONS)))
+    from studio.services.execution_instances import execution_selection_options
+    options = execution_selection_options(deployment=deployment, resource_smoke=True)
+    if deployment.provider.driver_type == ProviderProfile.DriverType.COMFYUI:
+        return ()
+    return tuple(sorted(row["value"] for row in options["target"]["operations"]))
 
 
 def workflow_acceptance_row(
@@ -290,7 +277,7 @@ def workflow_acceptance_row(
             "state": "not_current_for_selected_deployment",
             "fresh": False,
             "reason_code": "workflow_not_validated_for_selected_deployment",
-            "message": "历史 Live Validate 不属于当前筛选的模型实例。",
+            "message": "历史 Live Validate 不属于当前筛选的模型部署。",
             "current_target_sha256": "",
         })
         if (
@@ -304,7 +291,7 @@ def workflow_acceptance_row(
                 "reason_code": (
                     "workflow_smoke_not_current_for_selected_deployment"
                 ),
-                "message": "历史 Workflow Smoke 证据不属于当前筛选的模型实例。",
+                "message": "历史 Workflow Smoke 证据不属于当前筛选的模型部署。",
             })
 
     status_allows_validation = version.status in {
@@ -462,31 +449,20 @@ def _snapshots_by_operation(
     target_sha256: str,
     operations: Iterable[str],
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
-    operation_set = set(operations)
-    pending = operation_set.copy()
-    found: dict[str, dict[str, Any]] = {}
-    latest: dict[str, dict[str, Any]] = {}
+    operation_set, latest, fresh = set(operations), {}, {}
     for snapshot in snapshots:
-        contract = _snapshot_contract(snapshot)
-        if contract is None:
-            continue
-        for operation in set(contract[0]) & operation_set:
-            summary = safe_snapshot_summary(
-                snapshot,
-                current_target_sha256=target_sha256,
-                operation=operation,
-            )
-            if summary:
-                # Internal classification fact; the public snapshot serializer
-                # only exposes its declared safe evidence fields.
-                latest.setdefault(operation, {
-                    **summary, "_execution_confirmed": contract[1].get("execution_submitted") is True,
-                    "_strategy_scoped": bool(summary.get("prompt_profile")) or operation not in TEXT_DEPLOYMENT_SMOKE_OPERATIONS,
-                })
-            if summary and summary["fresh"] and operation in pending:
-                found[operation] = summary
-                pending.remove(operation)
-    return latest, found
+        try:
+            root = snapshot.smoke_attempt
+            candidates = {root.operation} if root.scope == "resource" else set()
+        except ModelDeploymentSmokeAttempt.DoesNotExist:
+            # Unbound/corrupt history cannot silently expose an older pass.
+            candidates = operation_set
+        for operation in candidates & operation_set - latest.keys():
+            summary = safe_snapshot_summary(snapshot, current_target_sha256=target_sha256, operation=operation)
+            latest[operation] = {**summary, "_execution_confirmed": summary["_evidence_valid"]}
+            if summary["fresh"]:
+                fresh[operation] = summary
+    return latest, fresh
 
 
 def _operation_evidence_state(*, applicable, target_available, latest, fresh, attempt):
@@ -499,14 +475,12 @@ def _operation_evidence_state(*, applicable, target_available, latest, fresh, at
     if fresh:
         return "fresh"
     if latest:
+        if not latest["_execution_confirmed"]:
+            return "unverified"
         if not latest["target_matches"]:
             return "drifted"
         if latest["status"] == "failed":
             return "failed"
-        if not latest.get("_strategy_scoped", True):
-            return "unverified"
-        if not latest["_execution_confirmed"]:
-            return "unverified"
         if latest["status"] == "passed" and latest["expires_at"] <= timezone.now():
             return "expired"
         return "unverified"
@@ -530,6 +504,7 @@ def deployment_acceptance_row(
     drifted_validation_count: int,
     fresh_smoke_count: int,
     unresolved_smoke_count: int,
+    current_target=None,
 ) -> dict[str, Any]:
     try:
         executable_operations = set(deployment_smoke_operations(deployment))
@@ -541,8 +516,12 @@ def deployment_acceptance_row(
 
     if contract_available:
         try:
+            from studio.services.execution_identity import execution_target_contract
             validate_deployment_execution_contract(deployment)
-            current_target_sha256 = deployment_target_sha256(deployment)
+            if isinstance(current_target, Exception):
+                raise current_target
+            identity = current_target if current_target is not None else execution_target_contract(deployment_id=deployment.pk)
+            current_target_sha256 = identity.sha256
             target_available = True
         except (ValidationError, RuntimeError, TypeError, ValueError):
             current_target_sha256 = ""
@@ -574,46 +553,47 @@ def deployment_acceptance_row(
         fresh_snapshots = {}
     health_summary = safe_snapshot_summary(
         health_snapshot,
-        current_target_sha256=current_target_sha256,
+        current_target_sha256=deployment_target_sha256(deployment) if target_available and health_snapshot is not None else "",
     )
     if health_summary is not None and not target_available:
         health_summary["target_matches"] = False
         health_summary["fresh"] = False
     operation_rows = []
     for operation in sorted(configured_operations):
-        from studio.services.deployment_smoke_contract import TEXT_DEPLOYMENT_SMOKE_OPERATIONS
-        from studio.services.deployment_smoke_profiles import smoke_profile_choices, smoke_profile_reference
-        strategy_results = []
+        from studio.services.execution_deployment_resource_evidence import read_resource_deployment_snapshot, resource_smoke_profile_summary
+        strategy_results, seen_profiles = [], set()
         strategy_catalog_available = True
-        if operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS and target_available:
+        for snapshot in snapshots:
             try:
-                choices = smoke_profile_choices(deployment, operation)
-            except (ValidationError, RuntimeError, TypeError, ValueError):
-                choices = []
+                root = snapshot.smoke_attempt
+                if root.scope != "resource" or root.operation != operation or root.prompt_profile_version_id is None:
+                    continue
+                read_resource_deployment_snapshot(snapshot)
+                reference = resource_smoke_profile_summary(root)
+                key = (reference["id"], reference["execution_mode"])
+                if key in seen_profiles:
+                    continue
+                seen_profiles.add(key)
+                summary = safe_snapshot_summary(snapshot, current_target_sha256=current_target_sha256, operation=operation)
+                latest = {**summary, "_execution_confirmed": summary["_evidence_valid"]}
+                fresh = summary if summary["fresh"] else None
+                strategy_results.append({"prompt_profile": reference,
+                    "evidence_state": _operation_evidence_state(applicable=operation in executable_operations,
+                        target_available=target_available, latest=latest, fresh=fresh, attempt=None),
+                    "latest_snapshot": latest, "fresh_passed_snapshot": fresh})
+            except (ValidationError, ModelDeploymentSmokeAttempt.DoesNotExist, RuntimeError, TypeError, ValueError):
+                # Broken evidence cannot turn the strategy catalog into a pass
+                # or be skipped in favour of a previous result.
                 strategy_catalog_available = False
-            for selected in choices:
-                reference = smoke_profile_reference(deployment, operation, selected)
-                matching = [s for s in snapshots if s.prompt_profile_binding_id == selected.binding.id
-                            and s.prompt_profile_version_id == selected.profile_version.id
-                            and s.prompt_profile_contract_sha256 == selected.profile_version.contract_sha256]
-                strategy_latest, strategy_fresh = _snapshots_by_operation(
-                    matching, target_sha256=current_target_sha256, operations=[operation],
-                )
-                strategy_results.append({
-                    "prompt_profile": reference,
-                    "evidence_state": _operation_evidence_state(
-                        applicable=True, target_available=True, latest=strategy_latest.get(operation),
-                        fresh=strategy_fresh.get(operation), attempt=None,
-                    ),
-                    "latest_snapshot": strategy_latest.get(operation),
-                    "fresh_passed_snapshot": strategy_fresh.get(operation),
-                })
+                strategy_results = []
+                break
         latest_attempt = attempts_by_operation.get(operation)
         latest_attempt_summary = safe_deployment_attempt_summary(latest_attempt)
         attempt_blocks_new_submission = bool(
             latest_attempt
             and (
                 latest_attempt.status in {
+                    ModelDeploymentSmokeAttempt.Status.PREPARING,
                     ModelDeploymentSmokeAttempt.Status.QUEUED,
                     ModelDeploymentSmokeAttempt.Status.SUBMITTING,
                     ModelDeploymentSmokeAttempt.Status.SUBMITTED,
@@ -629,7 +609,6 @@ def deployment_acceptance_row(
         enabled = bool(
             deployment.status == ModelDeployment.Status.ACTIVE
             and operation in executable_operations
-            and strategy_catalog_available
             and not attempt_blocks_new_submission
         )
         operation_rows.append({
@@ -661,8 +640,6 @@ def deployment_acceptance_row(
                     if not contract_available
                     else "deployment_target_invalid"
                     if not target_available
-                    else "prompt_profile_catalog_invalid"
-                    if not strategy_catalog_available
                     else "attempt_in_progress_or_resolution_required"
                     if attempt_blocks_new_submission
                     else "deployment_smoke_not_applicable"

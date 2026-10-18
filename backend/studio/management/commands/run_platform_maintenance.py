@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import timedelta
+from functools import partial
 import uuid
 
 from django.core.management.base import BaseCommand, CommandError
@@ -11,6 +12,8 @@ from django.utils import timezone
 
 from studio.models import WorkerLease
 from studio.services.configuration import resolve_configuration
+from studio.services.production_run_auto_advance import advance_active_recipe_runs
+from studio.services.worker_database import retry_worker_database_step
 from studio.services.runtime_host_probe_queue import (
     ACTIVE as ACTIVE_HOST_PROBE_STATUSES,
     claim_next_runtime_host_probe,
@@ -73,7 +76,7 @@ def _release_single_flight(holder_id: str) -> None:
 
 
 class Command(BaseCommand):
-    help = "Run recoverable platform maintenance, including durable runtime-host probes."
+    help = "Recover active recipe progression and process durable runtime-host probes."
 
     def add_arguments(self, parser):
         policy = _maintenance_policy()
@@ -85,21 +88,27 @@ class Command(BaseCommand):
         if not math.isfinite(poll_seconds) or poll_seconds <= 0:
             raise CommandError("--poll 必须是正数")
         holder_id = uuid.uuid4().hex
+        database_step = partial(retry_worker_database_step, wait_seconds=poll_seconds)
         while True:
-            if _acquire_single_flight(holder_id):
+            if database_step(_acquire_single_flight, holder_id):
                 try:
-                    _renew_single_flight(holder_id)
-                    recovered = recover_stale_runtime_host_probes()
-                    queued = enqueue_due_runtime_host_probes()
+                    database_step(_renew_single_flight, holder_id)
+                    heartbeat = lambda: database_step(_renew_single_flight, holder_id)
+                    checked = advance_active_recipe_runs(heartbeat=heartbeat)
+                    self.stdout.write(f"recipe-runs checked={checked}")
+                    recovered = database_step(recover_stale_runtime_host_probes)
+                    queued = database_step(enqueue_due_runtime_host_probes)
                     processed = 0
                     while True:
-                        _renew_single_flight(holder_id)
-                        attempt = claim_next_runtime_host_probe(holder_id)
+                        heartbeat()
+                        attempt = database_step(claim_next_runtime_host_probe, holder_id)
                         if attempt is None:
                             break
+                        # Only rolled-back DB steps may retry. Never replay a
+                        # probe or recipe execution after a persistence error.
                         result = process_runtime_host_probe(
                             attempt,
-                            worker_heartbeat=lambda: _renew_single_flight(holder_id),
+                            worker_heartbeat=heartbeat,
                         )
                         processed += 1
                         self.stdout.write(
@@ -115,7 +124,7 @@ class Command(BaseCommand):
                         f"queued={queued} processed={processed}"
                     )
                 finally:
-                    _release_single_flight(holder_id)
+                    database_step(_release_single_flight, holder_id)
             else:
                 self.stdout.write("maintenance sweep skipped: lease held")
             if options["once"]:

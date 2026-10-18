@@ -21,11 +21,17 @@ class DeliveryDisclosure:
     media_kind: str
 
 
-def _configured_disclosure() -> tuple[bool, str]:
-    values = resolve_configuration(required_keys=(
-        "delivery.ai_label_enabled",
-        "delivery.ai_label_text",
-    )).values
+def _configured_disclosure(values=None) -> tuple[bool, str]:
+    if values is None:
+        values = resolve_configuration(required_keys=(
+            "delivery.ai_label_enabled",
+            "delivery.ai_label_text",
+        )).values
+    if not isinstance(values, dict) or any(key not in values for key in (
+            "delivery.ai_label_enabled", "delivery.ai_label_text")):
+        raise DeliveryDisclosureError("冻结配置缺少交付披露，不补当前配置")
+    if type(values["delivery.ai_label_enabled"]) is not bool or type(values["delivery.ai_label_text"]) is not str:
+        raise DeliveryDisclosureError("交付披露开关必须为布尔值，正文必须为文本")
     label = str(values["delivery.ai_label_text"] or "").strip()
     maximum_characters = boundary_int(
         "security.delivery.disclosure_text_max_characters"
@@ -46,18 +52,19 @@ def _configured_disclosure() -> tuple[bool, str]:
 
 def resolve_delivery_disclosure(
     *,
+    values=None,
     model: str = "",
     model_key: str = "",
     media_kind: str = "",
 ) -> DeliveryDisclosure:
-    """Resolve one model-neutral disclosure from the versioned system config.
+    """Resolve disclosure from explicit frozen values or versioned system config.
 
     Model identity is supplied by the frozen execution/profile contract.  This
     function deliberately has no registry of model names and therefore works
     unchanged for newly configured image and video models.
     """
 
-    enabled, base_label = _configured_disclosure()
+    enabled, base_label = _configured_disclosure(values)
     normalized_model = str(model or "").strip()
     normalized_key = str(model_key or normalized_model).strip()
     normalized_kind = str(media_kind or "").strip().casefold()

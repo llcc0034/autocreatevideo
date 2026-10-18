@@ -71,3 +71,24 @@ test('quantity source follows the selected model, reads lazily and rejects late 
   props.initialModelProfileId = ''; await nextTick()
   assert.equal(state.profile.value, null)
 })
+
+test('classified interval comparison exposes model and total bounds without changing either source', async context => {
+  const vite = await server(); context.after(() => vite.close())
+  const { classifiedQuantityComparison: compare } = await vite.ssrLoadModule('/src/services/workflowAssetContractSource.ts')
+  const profile = { specification: { conditioning_contract: { modes: [{ key: 'Mode', input_kind: 'classified_references', inputs: {
+    entity_images: { minimum_items: 0, maximum_items: 4 }, total_images: { minimum_items: 2, maximum_items: 4 },
+  } }] } } }
+  const group = { conditioning_mode: 'Mode', model_input: 'entity_images', minimum_items: 2, maximum_items: 3 }
+  const slot = { contract_source: 'workflow' }
+  const before = JSON.stringify({ profile, group, slot })
+  const matched = compare(profile, group, slot)
+  assert.equal(matched.state, 'matched')
+  assert.deepEqual(matched.total, { minimum: 2, maximum: 4 })
+  assert.deepEqual(matched.configured, { minimum: 2, maximum: 3 })
+  assert.match(compare(profile, group, { contract_source: 'model_profile' }).message, /total_images.*2–4/)
+  assert.match(compare(profile, { ...group, maximum_items: 5 }, slot).message, /模型输入 0–4/)
+  assert.match(compare(profile, { ...group, minimum_items: true }, slot).message, /无效/)
+  assert.equal(compare(null, group, slot).state, 'none')
+  assert.match(compare(profile, { ...group, conditioning_mode: 'missing' }, slot).message, /未唯一声明/)
+  assert.equal(JSON.stringify({ profile, group, slot }), before)
+})

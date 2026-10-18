@@ -7,12 +7,13 @@ from django.apps import apps
 from django.db import connection
 from django.test import TestCase
 
-from studio.models import PromptProfileVersion, PromptProfileBinding
+from studio.services.reference_rendering_inputs import UNIT_RENDER_SLOTS
+from studio.models import PromptProfileVersion, ModelExecutionInstanceVersion
 from studio.services.prompt_compiler_contract import PromptBuildError
-from studio.services.prompt_profile_compiler import MediaPromptCompilationContext
 from studio.services.reference_context import compile_reference_context, rendering_options, validate_rendering_policy, render_reference_template, RENDERING_FIELDS
 from studio.services.prompt_profiles import normalize_prompt_profile_source_projection_config
-from studio.tests.factories import build_story, conditioning_contract
+from studio.tests.factories import conditioning_contract
+from studio.services.reference_context_facts import ReferenceContextFacts, ReferenceSubjectFacts, ReferenceUnitFacts
 
 
 class ReferenceContextTests(TestCase):
@@ -28,7 +29,7 @@ class ReferenceContextTests(TestCase):
         # Keep mandatory tokens; marker flow checks that each consumed template is
         # attributed to the correct primitive, including conditional empty/audio branches.
         policy['templates'] = {key: f'[{key}] {value}' for key, value in policy['templates'].items()}
-        contexts = [self.context, replace(self.context, include_audio=False),
+        contexts = [self.context, replace(self.context, include_audio=False, ordered_units=(replace(self.unit, dialogue=(), voice_profiles=()),)),
                     replace(self.context, extra_direction='Keep continuity', reference_bindings=({'category': 'video', 'input_label': '<Video 1>', 'purpose': 'motion_camera_reference'},))]
         for context in contexts:
             result = compile_reference_context(context, policy)
@@ -40,15 +41,41 @@ class ReferenceContextTests(TestCase):
         self.assertNotIn('not_a_template', source_projection_primitive_options()[0]['rendering_template_keys'])
 
     def setUp(self):
-        self.actor, self.project, self.character, self.scene, self.episode, self.shot, _ = build_story(username="reference-rendering")
         from studio.tests.reference_rendering_fixtures import rendering_config
         self.policy = rendering_config()["primitive_options"]["reference_context_ir_v1"]["rendering"]
         self.mode = "VendorAnyReference"
-        self.context = MediaPromptCompilationContext(
-            project=self.project, shots=(self.shot,), prompt_type="video", mode=self.mode, include_audio=True,
+        # Explicit renderer data, not a synthetic Project/Shot adapter.
+        self.unit = ReferenceUnitFacts(
+            unit_key="first-unit", duration_ms=3500,
+            render_values={**{key: "" for key in UNIT_RENDER_SLOTS},
+                "narrative": "A courier opens a parcel.", "description": "ORIGINAL-DETAIL"},
+            subject_keys=(("character", "character-1"),),
+            dialogue=({"speaker_id": "S1", "text": "Verbatim", "language": "English", "delivery": " softly ",
+                "subject": "", "voice_profile": "low voice", "voiceover": True,
+                "start_ms": 123, "end_ms": 987},),
+            voice_profiles=("low voice",), continuity_notes="",
+            requires_first_frame_continuity=False, requires_last_frame_continuity=False, ambient_sound="",
+        )
+        self.context = ReferenceContextFacts(
+            prompt_type="video", mode=self.mode, include_audio=True, language="Chinese",
+            ordered_units=(self.unit,), subject_facts=(ReferenceSubjectFacts("character", "character-1", ()),),
+            reference_bindings=(), generation_contributions={},
+            color_script="", extra_direction="", overall_soundscape="", non_diegetic_music="",
             conditioning_mode_contract=conditioning_contract(self.mode)["modes"][0],
             frame_policy={"fps": 30, "minimum_frames": 1, "maximum_frames": 999, "alignment_modulus": 4, "alignment_remainder": 1},
         )
+
+    def test_selected_sound_does_not_consume_other_contributions_or_dialogue_templates(self):
+        from dataclasses import replace
+        contributions = {(self.unit.unit_key, selector): selector for selector in
+            ("shot.detailed_description", "shot.sound_effects", "shot.music")}
+        policy = deepcopy(self.policy)
+        policy["templates"]["shot"] = "{shot_marker} {reference_usage} {description}"
+        result = compile_reference_context(replace(self.context, generation_contributions=contributions),
+            policy, result_fields={"overall_soundscape"})
+        self.assertEqual(set(result["fields"]), {"overall_soundscape"})
+        self.assertEqual(result["consumed_contributions"], {(self.unit.unit_key, "shot.sound_effects")})
+        self.assertIn("shot.sound_effects", result["fields"]["overall_soundscape"])
 
     def test_any_model_mode_uses_explicit_templates_and_frame_policy(self):
         result = compile_reference_context(self.context, self.policy)
@@ -63,14 +90,6 @@ class ReferenceContextTests(TestCase):
         for change in ({"conditioning_mode_contract": None}, {"frame_policy": None}, {"conditioning_mode_contract": {"key": "wrong"}}):
             with self.subTest(change=change), self.assertRaises(PromptBuildError):
                 compile_reference_context(replace(self.context, **change), self.policy)
-
-    def test_previous_compiler_artifacts_are_not_current(self):
-        from studio.serializers import PromptArtifactSerializer
-        from studio.services.prompt_compiler_contract import PROMPT_COMPILER_VERSION
-        self.assertFalse(PromptArtifactSerializer.get_compiler_current(SimpleNamespace(
-            structured_payload={"prompt_compiler_version": PROMPT_COMPILER_VERSION - 1})))
-        self.assertTrue(PromptArtifactSerializer.get_compiler_current(SimpleNamespace(
-            structured_payload={"prompt_compiler_version": PROMPT_COMPILER_VERSION})))
 
     def test_templates_are_scalar_only_and_catalog_complete(self):
         self.assertEqual(set(self.policy["templates"]), {row["key"] for row in rendering_options()})
@@ -115,7 +134,7 @@ class ReferenceContextTests(TestCase):
 
     def test_reference_identity_guidance_paired_audio_and_no_paths(self):
         from dataclasses import replace
-        reference = {"category": "character", "entity_id": str(self.character.pk), "entity_label": "<Subject 1>",
+        reference = {"category": "character", "entity_id": "character-1", "entity_label": "<Subject 1>",
                      "input_label": "<Picture 1>", "prompt_hint": "KEEP GUIDANCE", "local_path": "private-path",
                      "audio_input_label": "<Audio 1>", "audio_purpose": "audio_reference"}
         result = compile_reference_context(replace(self.context, reference_bindings=(reference,)), self.policy)
@@ -130,8 +149,7 @@ class ReferenceContextTests(TestCase):
 
     def test_contribution_replaces_source_and_cannot_be_silently_discarded(self):
         from dataclasses import replace
-        self.shot.detailed_description = "ORIGINAL-DETAIL"
-        context = replace(self.context, generation_contributions={(str(self.shot.id), "shot.detailed_description"): "REVIEWED-DETAIL"})
+        context = replace(self.context, generation_contributions={(self.unit.unit_key, "shot.detailed_description"): "REVIEWED-DETAIL"})
         result = compile_reference_context(context, self.policy)
         text = str(result["fields"])
         self.assertIn("REVIEWED-DETAIL", text)
@@ -141,55 +159,62 @@ class ReferenceContextTests(TestCase):
         with self.assertRaises(PromptBuildError):
             compile_reference_context(context, self.policy)
 
-    def test_subject_identity_uses_project_terminology_without_guessing_names(self):
-        from studio.services.prompt_profiles import media_profile_sources
-        self.project.production_settings = {"translation_glossary": {self.character.name: "Reviewed Canonical Name"}}
-        self.project.save(update_fields=("production_settings", "updated_at"))
-        self.assertIn("Reviewed Canonical Name", media_profile_sources(project=self.project, shots=[self.shot])["request.subject"])
-        self.project.production_settings = {}
-        self.project.save(update_fields=("production_settings", "updated_at"))
-        self.assertTrue(media_profile_sources(project=self.project, shots=[self.shot])["request.subject"].startswith(self.character.stable_speaker_id + ":"))
+    def test_subject_labels_are_explicit_and_homonyms_do_not_merge(self):
+        from dataclasses import replace
+        subjects = (ReferenceSubjectFacts("character", "first", ("first body",)),
+                    ReferenceSubjectFacts("character", "second", ("second body",)))
+        refs = tuple({"category": "character", "entity_id": subject.identity, "entity_label": "Same display",
+            "input_label": f"<Picture {position}>"} for position, subject in enumerate(subjects, 1))
+        context = replace(self.context, subject_facts=subjects, reference_bindings=refs,
+            ordered_units=(replace(self.unit, subject_keys=(("character", "first"), ("character", "second"))),))
+        fields = compile_reference_context(context, self.policy)["fields"]
+        for value in ("first body", "second body", "<Picture 1>", "<Picture 2>"):
+            self.assertIn(value, str(fields["subject_definitions"]))
+        self.assertEqual(len(fields["subject_definitions"]), 2)
 
-    def test_translation_overlay_is_used_without_mutating_source(self):
-        original = self.shot.narrative
-        with patch("studio.services.prompt_profiles.confirmed_translation", side_effect=lambda **kw: "REVIEWED NARRATIVE" if kw["field_key"] == "shot.narrative" else kw["source_text"]):
-            result = compile_reference_context(self.context, self.policy)
-        self.assertIn("REVIEWED NARRATIVE", str(result["fields"]))
-        self.assertEqual(self.shot.narrative, original)
+    def test_explicit_source_is_not_retranslated_or_mutated(self):
+        from dataclasses import replace
+        context = replace(self.context, ordered_units=(replace(self.unit,
+            render_values={**self.unit.render_values, "narrative": "EXPLICIT NARRATIVE"}),))
+        before = deepcopy(context)
+        with patch("studio.services.reference_context.boundary_int", return_value=65536), \
+                self.assertNumQueries(0):
+            result = compile_reference_context(context, self.policy)
+        self.assertIn("EXPLICIT NARRATIVE", str(result["fields"]))
+        self.assertEqual(context, before)
 
     def test_old_policy_is_readable_but_not_implicitly_converted(self):
         old = normalize_prompt_profile_source_projection_config(self.old_config())
         self.assertNotIn("rendering", old["primitive_options"]["reference_context_ir_v1"])
 
-    def test_runtime_audio_echo_uses_exact_reviewed_translation_only(self):
+    def test_explicit_audio_values_do_not_trigger_saved_field_echo_lookup(self):
         from dataclasses import replace
-        self.shot.sound_effects = "已保存的声音"
-        self.shot.music = "已保存的音乐"
-        context = replace(self.context, overall_soundscape=self.shot.sound_effects, non_diegetic_music=self.shot.music)
-        translations = {"shot.sound_effects": "REVIEWED SOUND", "shot.music": "REVIEWED MUSIC"}
-        with patch("studio.services.prompt_profiles.confirmed_translation", side_effect=lambda **kw: translations.get(kw["field_key"], kw["source_text"])):
+        context = replace(self.context, overall_soundscape="EXPLICIT SOUND", non_diegetic_music="EXPLICIT MUSIC")
+        with patch("studio.services.reference_context.boundary_int", return_value=65536), \
+                self.assertNumQueries(0):
             result = compile_reference_context(context, self.policy)
-            self.assertNotIn(self.shot.sound_effects, str(result["fields"]))
-            self.assertNotIn(self.shot.music, str(result["fields"]))
-            self.assertIn("REVIEWED SOUND", result["fields"]["overall_soundscape"])
-            self.assertIn("REVIEWED MUSIC", result["fields"]["non_diegetic_music"])
             changed = compile_reference_context(replace(context, overall_soundscape="A new explicit instruction"), self.policy)
-            self.assertIn("A new explicit instruction", changed["fields"]["overall_soundscape"])
+        self.assertIn("EXPLICIT SOUND", result["fields"]["overall_soundscape"])
+        self.assertIn("EXPLICIT MUSIC", result["fields"]["non_diegetic_music"])
+        self.assertIn("A new explicit instruction", changed["fields"]["overall_soundscape"])
 
-    def test_runtime_duration_override_changes_generic_fingerprint(self):
+    def test_explicit_duration_changes_the_fact_fingerprint(self):
         from dataclasses import replace
-        from studio.services.prompt_profile_compiler import media_prompt_input_fingerprint
-        self.assertNotEqual(media_prompt_input_fingerprint(self.context),
-            media_prompt_input_fingerprint(replace(self.context, duration_overrides={str(self.shot.id): 2000})))
+        from studio.services.prompt_profile_compiler import PromptProfileCompilationFacts, prompt_profile_facts_fingerprint
+        facts = PromptProfileCompilationFacts(sources={}, source_language="Chinese", target_language="Chinese",
+            reference_context=self.context, reviewed_values={}, generation_contributions={})
+        changed = replace(facts, reference_context=replace(self.context,
+            ordered_units=(replace(self.unit, duration_ms=2000),)))
+        self.assertNotEqual(prompt_profile_facts_fingerprint(facts), prompt_profile_facts_fingerprint(changed))
 
     def test_audio_disabled_cannot_discard_reviewed_audio_and_dialogue_requires_slot(self):
         from dataclasses import replace
         for selector in ("shot.sound_effects", "shot.music"):
             context = replace(self.context, include_audio=False,
-                generation_contributions={(str(self.shot.id), selector): "REVIEWED AUDIO"})
+                ordered_units=(replace(self.unit, dialogue=(), voice_profiles=()),),
+                generation_contributions={(self.unit.unit_key, selector): "REVIEWED AUDIO"})
             with self.subTest(selector=selector), self.assertRaises(PromptBuildError):
                 compile_reference_context(context, self.policy)
-        self.shot.dialogue = [{"speaker_id": "S1", "text": "Verbatim", "voiceover": True}]
         self.policy["templates"]["shot"] = "{shot_marker} {reference_usage} {narrative}"
         with self.assertRaisesMessage(PromptBuildError, "{dialogue}"):
             compile_reference_context(self.context, self.policy)
@@ -213,7 +238,7 @@ class ReferenceContextTests(TestCase):
             "prompt_hint": "VIDEO REQUIREMENT", "audio_input_label": "<Audio 2>",
             "audio_purpose": "audio_reuse", "audio_prompt_hint": "AUDIO REQUIREMENT", "use_embedded_audio": True}
         context = replace(self.context, reference_bindings=(reference,),
-            generation_contributions={(str(self.shot.id), "shot.detailed_description"): "REVIEWED PROSE"})
+            generation_contributions={(self.unit.unit_key, "shot.detailed_description"): "REVIEWED PROSE"})
         fields = compile_reference_context(context, self.policy)["fields"]
         self.assertTrue(fields["summary"].startswith("[video continuation + audio reuse]"))
         for field in ("subject_definitions", "retention_analysis", "detailed_description", "summary"):
@@ -242,17 +267,13 @@ class ReferenceContextTests(TestCase):
             compile_reference_context(context, self.policy)
 
     def test_frame_and_reference_tasks_are_deduplicated_and_timecodes_use_effective_durations(self):
-        from copy import copy
         from dataclasses import replace
-        import uuid
-        second = copy(self.shot)
-        second.id = uuid.uuid4()
         refs = ({"category": "first_frame", "input_label": "<Picture 1>"},
                 {"category": "video", "input_label": "<Video 1>", "purpose": "motion_camera_reference"},
                 {"category": "audio", "input_label": "<Audio 1>", "purpose": "audio_reference"},
                 {"category": "audio", "input_label": "<Audio 2>", "purpose": "audio_reference"})
-        context = replace(self.context, shots=(self.shot, second), reference_bindings=refs,
-            duration_overrides={str(self.shot.id): 5123})
+        context = replace(self.context, reference_bindings=refs,
+            ordered_units=(replace(self.unit, duration_ms=5123), replace(self.unit, unit_key="second-unit")))
         fields = compile_reference_context(context, self.policy)["fields"]
         self.assertTrue(fields["summary"].startswith("[keyframe completion + reference generation + audio reference]"))
         self.assertIn("[Shot 2] At 00:05.123,", str(fields["detailed_description"]))
@@ -273,13 +294,13 @@ class ReferenceContextTests(TestCase):
             "detailed_description": {"style_opening_placement": "before_first_shot", "style_opening_max_sentences": 2, "subject_reference_placement": "first_clear_appearance"},
         }}}}
 
-    def test_migration_preserves_published_content_and_active_bindings(self):
+    def test_migration_preserves_published_content_without_selecting_execution_instances(self):
         migration = import_module("studio.migrations.0140_explicit_reference_rendering_drafts")
         source = PromptProfileVersion.objects.create(profile_key="test.old-rendering", version=1, name="Old rendering",
             model_family="vendor", operation="video.generate", mode=self.mode, status="published",
             source_projection_key="declarative_v1", source_projection_config=self.old_config())
         before = list(PromptProfileVersion.objects.filter(status="published").values("id", "source_projection_config", "contract_sha256"))
-        bindings = list(PromptProfileBinding.objects.values("id", "is_active", "prompt_profile_version_id"))
+        instances = list(ModelExecutionInstanceVersion.objects.values("id", "status", "prompt_profile_version_id"))
         migration.prepare_review_drafts(apps, SimpleNamespace(connection=connection))
         count = PromptProfileVersion.objects.count()
         migration.prepare_review_drafts(apps, SimpleNamespace(connection=connection))
@@ -288,4 +309,4 @@ class ReferenceContextTests(TestCase):
         self.assertEqual((draft.status, draft.review_state), ("draft", "needs_review"))
         self.assertEqual(draft.source_projection_config["schema_version"], 4)
         self.assertEqual(list(PromptProfileVersion.objects.filter(status="published").values("id", "source_projection_config", "contract_sha256")), before)
-        self.assertEqual(list(PromptProfileBinding.objects.values("id", "is_active", "prompt_profile_version_id")), bindings)
+        self.assertEqual(list(ModelExecutionInstanceVersion.objects.values("id", "status", "prompt_profile_version_id")), instances)

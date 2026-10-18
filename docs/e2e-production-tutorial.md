@@ -1,4 +1,6 @@
-# 连续剧 0→1 生产实操教程
+# 连续剧 0→1 历史实操记录（2026-08-24）
+
+> 文档类别：历史证据（2026-09-21统一标注）。正文中的版本、任务、通过/失败及“进行中/下一步”仅表示当时状态，不是当前操作指令或新的执行授权。当前未完成工作以[统一台账](optimization/README.md)为准，实际操作按[当前手册](production-operator-manual.md)。不按旧记录重放任务，不把旧验收外推到重建配置。
 
 本文面向超级管理员，记录 2026-08-24 修复后的真实页面操作。空项目、导入剧本和 AI 描述创建三种入口均已实测；其中 AI 描述创建已完成从新建项目、人工审核、逐镜头视频生成、选片、整集装配到 ReleaseBundle 封存与实时校验的 13 阶段主路径。
 
@@ -315,7 +317,7 @@ H3 T2VA v2 把每个 Shot 自己的 `shot.narrative` 纳入必填 conditioning�
 - `prompt_language_gate_blocked`：核对 PromptProfile 装配结果、canonical overlay 和实际字段来源，修复源头，不降低语言门禁。
 - `duplicate_shot_conditioning`：在已审核策略中加入 `shot.narrative`、`shot.action` 或其他逐镜语义后创建新运行，不能绕过门禁提交相同 conditioning。
 - 创作事实真实漂移：保持 fail closed，从受审的重新创建或重跑路径生成新快照。
-- 短剧本地任务失败：从所属 ProductionRun 查看失败原因和有序 fallback；“生产工作流”中的短剧 Task 详情只做诊断。素材 AssetGenerationJob 另有明确的取消、失败/已取消重试和管理员人工消歧入口，不得套用到短剧 Task。
+- 短剧本地任务失败：从所属 ProductionRun 查看失败原因和有序 fallback；“任务中心”中的项目生产详情只做诊断。素材 AssetGenerationJob 另有明确的取消、失败/已取消重试和管理员人工消歧入口，不得套用到短剧 Task。
 - 产物质量差：执行成功不等于可交付，必须经过人工选片和 ReleaseBundle gate。
 
 问题、修复状态与未覆盖边界统一记录在 [端到端生产修复与回归台账](e2e-production-findings-20260823.md)。

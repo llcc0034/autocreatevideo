@@ -1,4 +1,5 @@
 import type { ConditioningContractEditorOptions, JsonObject } from './platformTypes'
+import { referenceTopologyErrors } from './modelReferenceTopology'
 export const contractObject = (value: unknown): JsonObject => value && typeof value === 'object' && !Array.isArray(value) ? value as JsonObject : {}
 export const contractRows = (value: unknown): JsonObject[] => Array.isArray(value) ? value.map(contractObject) : []
 const clone = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T
@@ -12,7 +13,7 @@ export function newConditioningMode(options: ConditioningContractEditorOptions, 
   return { ...mode, key: `mode_${index}`, label: choice.label, input_kind: kind }
 }
 
-export function updateConditioningQuantity(mode: JsonObject, slot: string, field: string, value: number): JsonObject {
+export function updateConditioningQuantity(mode: JsonObject, slot: string, field: string, value: number | null): JsonObject {
   const next = clone(mode)
   const inputs = contractObject(next.inputs)
   next.inputs = { ...inputs, [slot]: { ...contractObject(inputs[slot]), [field]: value } }
@@ -48,7 +49,8 @@ export function conditioningContractErrors(value: unknown, options?: Conditionin
     if (maximum('total_images') > maximum('first_frame') + maximum('last_frame') + maximum('entity_images')) errors.push(`${label}图片总数上限超过各图片槽上限之和`)
     if (maximum('paired_video_audios') > maximum('reference_videos')) errors.push(`${label}配对音频上限不能超过参考视频上限`)
     if (mode.requires_entity_reference_bible && !maximum('entity_images')) errors.push(`${label}需要实体参考素材时必须启用参考图片槽`)
-    if (['reference_videos','paired_video_audios','reference_audios'].some(slot => maximum(slot) > 0) && !mode.dynamic_reference_topology) errors.push(`${label}启用了视频／音频，必须配置预处理与配对规则；可先从已有完整合同复制`)
+    if (['reference_videos','paired_video_audios','reference_audios'].some(slot => maximum(slot) > 0) && !mode.dynamic_reference_topology) errors.push(`${label}启用了视频／音频，请在下方配置用途、预处理与配对规则`)
+    errors.push(...referenceTopologyErrors(mode, options).map(error=>`${label}：${error}`))
   })
   return errors
 }

@@ -7,9 +7,15 @@ from studio.access_views import AccessAuditEventViewSet, AccessUserViewSet, Pass
 
 from studio.capability_views import (
     ProductionCapabilityView,
-    PromptNormalizationCapabilityView,
+    VideoConditioningCapabilityView,
+    ProjectCreationCapabilityView,
 )
 from studio.health_views import ReadinessView
+from studio.maintenance_views import HistoryCleanupView, HistoryCleanupPauseView
+from studio.content_source_views import ContentSourceVersionViewSet
+from studio.field_definition_views import FieldDefinitionVersionViewSet
+from studio.data_structure_views import DataStructureVersionViewSet
+from studio.business_output_views import BusinessOutputVersionViewSet
 from studio.registry_relation_views import RegistryRelationsView
 from studio.platform_views import (
     AcceptanceSmokeView,
@@ -24,8 +30,7 @@ from studio.platform_views import (
     ModelDeploymentSmokeAttemptViewSet,
     ModelProfileVersionViewSet,
     PlatformLifecycleAuditEventViewSet,
-    PromptFieldDefinitionViewSet,
-    PromptProfileBindingViewSet,
+    FieldDefinitionViewSet,
     PromptProfileFieldRuleViewSet,
     PromptProfileVersionViewSet,
     ProductionReadinessView,
@@ -48,7 +53,8 @@ from studio.platform_views import (
     WorkflowSmokeAttemptViewSet,
 )
 from studio.bible_image_candidate_views import ProjectBibleImageCandidatesView
-from studio.deferred_generation_views import DeferredGenerationRequestViewSet
+from studio.bible_variant_views import BibleVariantViewSet
+from studio.asset_reference_views import AssetReferenceSeriesViewSet, AssetReferenceVersionViewSet
 from studio.views import (
     AssetViewSet,
     AssemblyJobViewSet,
@@ -56,11 +62,9 @@ from studio.views import (
     ComfyUIHealthView,
     ConsistencyLockViewSet,
     EpisodeViewSet,
-    GeneratedWorkflowViewSet,
     GenerationTaskViewSet,
     HealthView,
     MeView,
-    PromptArtifactViewSet,
     PromptFieldTranslationViewSet,
     PropBibleViewSet,
     ReleaseBundleViewSet,
@@ -70,35 +74,40 @@ from studio.views import (
     SignedMediaView,
     ShotViewSet,
     StyleViewSet,
+    StyleCategoryViewSet,
     WorkflowTemplateViewSet,
 )
 from studio.asset_generation_views import AssetGenerationJobViewSet
+from studio.execution_instance_views import ModelExecutionInstanceViewSet, ModelExecutionInstanceVersionViewSet
+from studio.execution_preparation_views import ExecutionPreparationViewSet, ExecutionFieldValueViewSet
+from studio.task_center_views import TaskCenterListView, TaskCenterDetailView, TaskCenterOptionsView
 
 router = DefaultRouter()
+router.register("field-definition-versions", FieldDefinitionVersionViewSet, basename="field-definition-version")
+router.register("data-structure-versions", DataStructureVersionViewSet, basename="data-structure-version")
+router.register("content-source-versions", ContentSourceVersionViewSet, basename="content-source-version")
+router.register("business-output-versions", BusinessOutputVersionViewSet, basename="business-output-version")
 router.register("styles", StyleViewSet, basename="style")
+router.register("style-categories", StyleCategoryViewSet, basename="style-category")
 router.register("assets", AssetViewSet, basename="asset")
+router.register("asset-reference-series", AssetReferenceSeriesViewSet, basename="asset-reference-series")
+router.register("asset-reference-versions", AssetReferenceVersionViewSet, basename="asset-reference-version")
 router.register(
     "asset-generation-jobs",
     AssetGenerationJobViewSet,
     basename="asset-generation-job",
 )
 router.register("projects", SeriesProjectViewSet, basename="project")
+router.register("bible-variants", BibleVariantViewSet, basename="bible-variant")
 router.register("characters", CharacterBibleViewSet, basename="character")
 router.register("scenes", SceneBibleViewSet, basename="scene")
 router.register("props", PropBibleViewSet, basename="prop")
 router.register("consistency-locks", ConsistencyLockViewSet, basename="consistency-lock")
 router.register("episodes", EpisodeViewSet, basename="episode")
 router.register("shots", ShotViewSet, basename="shot")
-router.register("prompts", PromptArtifactViewSet, basename="prompt")
 router.register("translations", PromptFieldTranslationViewSet, basename="translation")
 router.register("workflow-templates", WorkflowTemplateViewSet, basename="workflow-template")
-router.register("workflows", GeneratedWorkflowViewSet, basename="workflow")
 router.register("tasks", GenerationTaskViewSet, basename="task")
-router.register(
-    "deferred-generation-requests",
-    DeferredGenerationRequestViewSet,
-    basename="deferred-generation-request",
-)
 router.register("assemblies", AssemblyJobViewSet, basename="assembly")
 router.register("release-bundles", ReleaseBundleViewSet, basename="release-bundle")
 router.register("provider-profiles", ProviderProfileViewSet, basename="provider-profile")
@@ -108,9 +117,9 @@ router.register(
     basename="model-profile-version",
 )
 router.register(
-    "prompt-field-definitions",
-    PromptFieldDefinitionViewSet,
-    basename="prompt-field-definition",
+    "field-definitions",
+    FieldDefinitionViewSet,
+    basename="field-definition",
 )
 router.register(
     "prompt-profile-versions",
@@ -122,12 +131,11 @@ router.register(
     PromptProfileFieldRuleViewSet,
     basename="prompt-profile-field-rule",
 )
-router.register(
-    "prompt-profile-bindings",
-    PromptProfileBindingViewSet,
-    basename="prompt-profile-binding",
-)
 router.register("model-deployments", ModelDeploymentViewSet, basename="model-deployment")
+router.register("model-execution-instances", ModelExecutionInstanceViewSet, basename="model-execution-instance")
+router.register("model-execution-instance-versions", ModelExecutionInstanceVersionViewSet, basename="model-execution-instance-version")
+router.register("execution-preparations", ExecutionPreparationViewSet, basename="execution-preparation")
+router.register("execution-field-values", ExecutionFieldValueViewSet, basename="execution-field-value")
 router.register(
     "model-deployment-smoke-attempts",
     ModelDeploymentSmokeAttemptViewSet,
@@ -194,6 +202,11 @@ router.register("access/users", AccessUserViewSet, basename="access-user")
 router.register("access/audit-events", AccessAuditEventViewSet, basename="access-audit-event")
 
 urlpatterns = [
+    path("maintenance/history/", HistoryCleanupView.as_view(), name="history-cleanup"),
+    path("maintenance/history/background-pause/", HistoryCleanupPauseView.as_view(), name="history-cleanup-pause"),
+    path("task-center/", TaskCenterListView.as_view(), name="task-center-list"),
+    path("task-center/options/", TaskCenterOptionsView.as_view(), name="task-center-options"),
+    path("task-center/<str:kind>/<uuid:identifier>/", TaskCenterDetailView.as_view(), name="task-center-detail"),
     path("health/", HealthView.as_view(), name="health"),
     path("health/live/", HealthView.as_view(), name="health-live"),
     path("health/ready/", ReadinessView.as_view(), name="health-ready"),
@@ -224,9 +237,14 @@ urlpatterns = [
         name="project-config",
     ),
     path(
-        "projects/<uuid:project_id>/capabilities/prompt-normalization/",
-        PromptNormalizationCapabilityView.as_view(),
-        name="project-prompt-normalization-capability",
+        "capabilities/project-creation/",
+        ProjectCreationCapabilityView.as_view(),
+        name="project-creation-capability",
+    ),
+    path(
+        "capabilities/video-conditioning/",
+        VideoConditioningCapabilityView.as_view(),
+        name="video-conditioning-capability",
     ),
     path(
         "capabilities/production/",

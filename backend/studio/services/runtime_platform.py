@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 from contextlib import contextmanager
-from copy import deepcopy
 import hashlib
 import io
 import ipaddress
@@ -32,7 +31,6 @@ from studio.models import (
     ModelDeploymentCapabilitySnapshot,
     ModelProfileVersion,
     ProviderProfile,
-    ProductionRecipeVersion,
     RecommendationCandidate,
     RecommendationDecision,
     RecommendationSnapshot,
@@ -47,7 +45,7 @@ from studio.services.configuration import (
     create_config_revision,
     resolve_configuration,
 )
-from studio.services.async_media_contract import fresh_smoke_snapshot, validate_async_model_profile
+from studio.services.async_media_contract import validate_async_model_profile
 from studio.services.comfyui_artifacts import (
     _plain_existing_path,
     artifact_inventory_spec,
@@ -64,7 +62,7 @@ from studio.services.json_contracts import (
     verify_json_contract,
 )
 from studio.services.registry_reference_lock import registry_reference_writer
-from studio.services.registry_deletion import validate_recipe_registry_references
+from studio.services.runtime_host_probe_settings import PROBE_SETTING_KEYS, host_probe_settings
 from studio.services.model_profile_contracts import (
     verified_model_profile_specification,
 )
@@ -1054,9 +1052,10 @@ def probe_runtime_host(
     if lease_renew is not None:
         lease_renew()
     configuration = resolve_configuration(required_keys=(
-        "runtime.capability_ttl_seconds",
+        *PROBE_SETTING_KEYS,
         "runtime.gpu_probe_timeout_seconds",
     ))
+    probe_mode, probe_validity = host_probe_settings(configuration.values)
     gpu_probe_timeout_seconds = float(
         configuration.values["runtime.gpu_probe_timeout_seconds"]
     )
@@ -1132,6 +1131,8 @@ def probe_runtime_host(
         "runtime_configuration": {
             "resolution_sha256": configuration.sha256,
             "gpu_probe_timeout_seconds": gpu_probe_timeout_seconds,
+            "host_probe_mode": probe_mode,
+            "host_probe_validity_seconds": int(probe_validity.total_seconds()),
         },
     }
     try:
@@ -1214,9 +1215,7 @@ def probe_runtime_host(
             details_size_bytes=details_contract.size_bytes,
             details_sha256=details_contract.sha256,
             captured_at=captured_at,
-            expires_at=captured_at + timedelta(
-                seconds=int(configuration.values["runtime.capability_ttl_seconds"]),
-            ),
+            expires_at=captured_at + probe_validity,
         )
         RuntimeModelAvailability.objects.bulk_create([
             RuntimeModelAvailability(
@@ -1306,7 +1305,40 @@ def verify_host_snapshot(snapshot: HostCapabilitySnapshot) -> None:
     )
 
 
+def _text_resource_candidate_state(deployment):
+    """A resource recommendation, not permission for any instance to execute."""
+    from studio.services.execution_deployment_resource_evidence import current_resource_smoke
+    from studio.services.execution_native_text import NATIVE_TEXT_OPERATIONS
+    from studio.services.execution_text_contracts import TEXT_EXECUTION_OPERATIONS
+    try:
+        driver_for(deployment.provider).validate_execution_credentials(deployment)
+    except (ProviderDriverError, ValidationError):
+        return RecommendationCandidate.Status.UNAVAILABLE, "text_credential_unavailable"
+    try:
+        specification = verified_model_profile_specification(deployment.profile_version)
+        capabilities = specification.get("capabilities")
+        if not isinstance(capabilities, list) or any(not isinstance(value, str) for value in capabilities):
+            raise ValidationError("模型缺少明确能力声明")
+        operations = sorted(set(capabilities) & {*NATIVE_TEXT_OPERATIONS, *TEXT_EXECUTION_OPERATIONS})
+    except ValidationError:
+        return RecommendationCandidate.Status.UNAVAILABLE, "model_profile_contract_invalid"
+    passed, damaged = False, False
+    for operation in operations:
+        try:
+            passed = current_resource_smoke(deployment, operation) is not None or passed
+        except ValidationError:
+            damaged = True
+    # Evaluate all operations before concluding; the order of declarations
+    # must not decide whether a different, valid capability can be recommended.
+    if passed:
+        return RecommendationCandidate.Status.COMPATIBLE, "text_resource_smoke_passed"
+    if damaged:
+        return RecommendationCandidate.Status.UNAVAILABLE, "resource_smoke_evidence_invalid"
+    return RecommendationCandidate.Status.SMOKE_TEST_REQUIRED, "text_resource_smoke_required"
+
+
 def capability_readiness(snapshot: HostCapabilitySnapshot) -> dict[str, Any]:
+    from studio.services.execution_deployment_resource_evidence import current_resource_smoke
     verify_host_snapshot(snapshot)
     deployments = list(ModelDeployment.objects.filter(
         Q(runtime_host=snapshot.host) | Q(runtime_host__isnull=True),
@@ -1318,6 +1350,17 @@ def capability_readiness(snapshot: HostCapabilitySnapshot) -> dict[str, Any]:
 
     def deployment_state(deployment: ModelDeployment, modality: str) -> tuple[str, str]:
         provider = deployment.profile_version.provider
+        if modality == "text" and provider.driver_type in {
+                ProviderProfile.DriverType.OPENAI_COMPATIBLE, ProviderProfile.DriverType.DEEPSEEK_API,
+                ProviderProfile.DriverType.LOCAL_QWEN}:
+            if deployment.runtime_host_id is not None and (stale or snapshot.probe_status == HostCapabilitySnapshot.ProbeStatus.FAILED):
+                return "blocked", "主机能力快照过期或失败"
+            status, _reason = _text_resource_candidate_state(deployment)
+            if status == RecommendationCandidate.Status.COMPATIBLE:
+                return "ready", "至少一项文本能力具有有效基础烟测；业务执行仍需核对精确实例组合"
+            if status == RecommendationCandidate.Status.SMOKE_TEST_REQUIRED:
+                return "smoke_required", "文本资源尚缺对应能力的有效基础烟测，连接健康不代表能力验收通过"
+            return "blocked", "文本资源的配置、凭据或基础证据不可核验，请前往能力验收查看"
         if deployment.runtime_host_id is None:
             if provider.driver_type != ProviderProfile.DriverType.ASYNC_REST:
                 return "smoke_required", "云端 deployment 尚无受控 async smoke 证据"
@@ -1332,8 +1375,11 @@ def capability_readiness(snapshot: HostCapabilitySnapshot) -> dict[str, Any]:
             relevant = [item for item in operations if item.startswith(f"{modality}.")]
             if not relevant:
                 return "blocked", "云端 deployment 未声明该能力"
-            if any(fresh_smoke_snapshot(deployment, operation) for operation in relevant):
-                return "ready", "云端 async deployment 有新鲜真实烟测证据"
+            try:
+                if any(current_resource_smoke(deployment, operation) for operation in relevant):
+                    return "ready", "云端资源的对应能力具有有效基础烟测；业务执行仍需核对精确实例组合"
+            except ValidationError:
+                return "blocked", "基础烟测证据或目标配置不可核验，请前往能力验收查看"
             return "smoke_required", "云端 async deployment 需要真实烟测"
 
         if stale or snapshot.probe_status == HostCapabilitySnapshot.ProbeStatus.FAILED:
@@ -1413,18 +1459,32 @@ def host_resolution_and_concurrency(
 ) -> tuple[int, int]:
     """Resolve the frozen host-compatible resolution/concurrency tier."""
 
-    details = snapshot.details if isinstance(snapshot.details, dict) else {}
-    gpus = details.get("gpus") if isinstance(details.get("gpus"), list) else []
-    max_vram = max(
-        (int(item.get("vram_total_bytes") or 0) for item in gpus if isinstance(item, dict)),
-        default=0,
-    )
+    details = snapshot.details
+    gpus = details.get("gpus") if isinstance(details, dict) else None
+    if (not isinstance(gpus, list) or any(not isinstance(row, dict)
+            or type(row.get("vram_total_bytes")) is not int or row["vram_total_bytes"] < 0 for row in gpus)):
+        raise ValidationError("主机缺少完整显存观测，不能默认按零显存推断容量")
+    if not isinstance(tiers, list) or not tiers:
+        raise ValidationError("recommendation.vram_tiers 缺少完整规则")
+    previous = -1
+    for index, tier in enumerate(tiers):
+        if (not isinstance(tier, dict) or not {"max_vram_bytes", "short_edge", "concurrency"}.issubset(tier)
+                or any(type(tier[key]) is not int or tier[key] < 1 for key in ("short_edge", "concurrency"))):
+            raise ValidationError("显存规则必须明确正整数短边和并发，不能使用内置默认值")
+        upper = tier["max_vram_bytes"]
+        if upper is None:
+            if index != len(tiers) - 1:
+                raise ValidationError("显存规则的无上限档位只能放在最后")
+        elif type(upper) is not int or upper <= previous:
+            raise ValidationError("显存档位上界必须是递增的非负整数")
+        else:
+            previous = upper
+    # An explicit empty inventory is a recorded no-GPU host, not an absent
+    # observation. Keep CPU/API recommendations viable under configured tiers.
+    max_vram = max((row["vram_total_bytes"] for row in gpus), default=0)
     for tier in tiers:
-        if not isinstance(tier, dict):
-            continue
-        upper = tier.get("max_vram_bytes")
-        if upper is None or max_vram <= int(upper):
-            return int(tier.get("short_edge") or 512), int(tier.get("concurrency") or 1)
+        if tier["max_vram_bytes"] is None or max_vram <= tier["max_vram_bytes"]:
+            return tier["short_edge"], tier["concurrency"]
     raise ValidationError("recommendation.vram_tiers 没有可用规则")
 
 
@@ -1489,6 +1549,7 @@ def _candidate_state(
     availability: list[RuntimeModelAvailability],
     max_vram_bytes: int,
 ) -> tuple[str, str]:
+    from studio.services.execution_deployment_resource_evidence import current_resource_smoke
     try:
         model_specification = verified_model_profile_specification(
             deployment.profile_version,
@@ -1522,29 +1583,14 @@ def _candidate_state(
         )
         if operation not in operations:
             return RecommendationCandidate.Status.UNAVAILABLE, "async_operation_missing"
-        if fresh_smoke_snapshot(deployment, operation) is None:
-            return RecommendationCandidate.Status.SMOKE_TEST_REQUIRED, "async_smoke_test_required"
+        try:
+            if current_resource_smoke(deployment, operation) is None:
+                return RecommendationCandidate.Status.SMOKE_TEST_REQUIRED, "async_smoke_test_required"
+        except ValidationError:
+            return RecommendationCandidate.Status.UNAVAILABLE, "resource_smoke_evidence_invalid"
         return RecommendationCandidate.Status.COMPATIBLE, "remote_provider_compatible"
     if modality == ModelProfileVersion.Modality.TEXT:
-        reference = deployment.credential or deployment.profile_version.provider.credential
-        try:
-            if not reference:
-                raise ProviderDriverError("credential missing", code="credential_missing")
-            resolve_credential(reference)
-        except ProviderDriverError:
-            return RecommendationCandidate.Status.UNAVAILABLE, "text_credential_unavailable"
-        binding = credential_binding_sha256(deployment)
-        evidence = deployment.capability_snapshots.filter(
-            status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
-            expires_at__gt=timezone.now(),
-            provider_config_sha256=deployment.profile_version.provider.driver_config_sha256,
-            deployment_config_sha256=deployment.runtime_config_sha256,
-            credential_binding_sha256=binding,
-        ).order_by("-revision").first()
-        if evidence is None or not set(evidence.operations or []).intersection({
-            "chat_completion", "script.generate", "series_concept",
-        }):
-            return RecommendationCandidate.Status.SMOKE_TEST_REQUIRED, "text_health_or_smoke_required"
+        return _text_resource_candidate_state(deployment)
     if is_local and modality in {"image", "video", "multimodal"}:
         if workflow is None:
             return RecommendationCandidate.Status.UNAVAILABLE, "workflow_missing"
@@ -1835,13 +1881,6 @@ def recommend_for_host(
                 "resolution": {"width": width, "height": height},
                 "concurrency": concurrency,
             },
-            "route": {
-                "capability_key": item["capability_key"],
-                "model_deployment_id": str(item["deployment"].id),
-                "workflow_version_id": (
-                    str(item["workflow_version"].id) if item["workflow_version"] else None
-                ),
-            },
         }
         contract = json_contract(
             suggested_values,
@@ -1861,63 +1900,6 @@ def recommend_for_host(
             suggested_values_sha256=contract.sha256,
         )
     return recommendation_snapshot
-
-
-@registry_reference_writer
-def _draft_recommended_recipe(
-    candidate: RecommendationCandidate,
-    *,
-    decided_by,
-) -> ProductionRecipeVersion:
-    stage_key = (
-        "script_generate"
-        if candidate.capability_key.startswith("script.")
-        else "media_generation"
-    )
-    bases = ProductionRecipeVersion.objects.filter(
-        status=ProductionRecipeVersion.Status.PUBLISHED,
-    ).order_by("-published_at", "-version")
-    base = next((
-        item for item in bases
-        if any(
-            isinstance(stage, dict) and stage.get("key") == stage_key
-            for stage in (item.definition or {}).get("stages", [])
-        )
-    ), None)
-    if base is None:
-        raise ValidationError(f"没有包含 {stage_key} 的已发布配方可供派生")
-    definition = deepcopy(base.definition)
-    route = {"model_deployment_id": str(candidate.deployment_id)}
-    if candidate.workflow_version_id:
-        route["workflow_version_id"] = str(candidate.workflow_version_id)
-    for stage in definition.get("stages", []):
-        if isinstance(stage, dict) and stage.get("key") == stage_key:
-            stage["routing"] = {
-                "mode": "fixed",
-                "routes": [route],
-                "variant_count": 1,
-            }
-            break
-    next_version = (
-        ProductionRecipeVersion.objects.filter(recipe_key=base.recipe_key)
-        .aggregate(value=Max("version"))["value"]
-        or 0
-    ) + 1
-    draft = ProductionRecipeVersion(
-        recipe_key=base.recipe_key,
-        version=next_version,
-        name=f"{base.name} · 推荐草稿",
-        status=ProductionRecipeVersion.Status.DRAFT,
-    )
-    assign_json_contract(
-        draft,
-        "definition",
-        definition,
-        max_bytes=_stage_snapshot_max_bytes(),
-    )
-    validate_recipe_registry_references(definition)
-    draft.save()
-    return draft
 
 
 def _assert_recommendation_current(
@@ -2043,12 +2025,17 @@ def decide_recommendation(
         raise ValidationError(
             f"override_values 不能包含敏感字段: {', '.join(sensitive)}"
         )
+    if set(override_values) - {"configuration"}:
+        raise ValidationError("推荐只支持 configuration 覆盖；执行实例和配方须通过正式配置入口创建")
+    if not isinstance(override_values.get("configuration", {}), dict):
+        raise ValidationError("configuration override 必须是对象")
+    if decision != RecommendationDecision.Decision.OVERRIDE and override_values:
+        raise ValidationError("仅 override 决策可提交覆盖配置")
     contract = json_contract(
         override_values,
         max_bytes=_stage_snapshot_max_bytes(),
     )
     config_revision = None
-    recipe_version = None
     if decision != RecommendationDecision.Decision.REJECT:
         suggested = (
             candidate.suggested_values
@@ -2072,7 +2059,6 @@ def decide_recommendation(
                 created_by=decided_by,
                 change_summary=f"推荐决策 {recommendation.id}: {decision}"[:500],
             )
-        recipe_version = _draft_recommended_recipe(candidate, decided_by=decided_by)
     return RecommendationDecision.objects.create(
         recommendation_snapshot=recommendation,
         candidate=candidate,
@@ -2080,7 +2066,6 @@ def decide_recommendation(
         scope_type=scope_type,
         project=project,
         config_revision=config_revision,
-        recipe_version=recipe_version,
         override_values=override_values,
         override_values_schema_version=contract.schema_version,
         override_values_size_bytes=contract.size_bytes,

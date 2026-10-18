@@ -13,6 +13,7 @@ from studio.services.comfyui_schema import (
 )
 from studio.services.workflow import WorkflowBuildError, validate_comfy_graph
 from studio.services.security_boundaries import boundary_int
+from studio.services.workflow_media_tokens import MEDIA_USE_TOKEN_PREFIX
 
 
 
@@ -173,12 +174,16 @@ def _input_specs(info: dict, api_inputs: dict, *, node_label: str) -> tuple[dict
                 dynamic_widgets.append((name, type_name, config))
 
     for parent_name, input_type, config in dynamic_widgets:
-        for child_name, child_definition, child_required in dynamic_widget_definitions(
-            parent_name,
-            input_type,
-            config,
-            selected_value=api_inputs.get(parent_name),
-        ):
+        try:
+            children = dynamic_widget_definitions(
+                parent_name, input_type, config,
+                selected_value=api_inputs.get(parent_name),
+                resolve_value=lambda name, _definition: api_inputs.get(name),
+            )
+        except ValueError as exc:
+            _append_issue(issues, f"{node_label}: {exc}")
+            continue
+        for child_name, child_definition, child_required in children:
             if child_name in specs:
                 _append_issue(issues, f"{node_label}.{child_name} 动态输入与静态 schema 冲突")
                 continue
@@ -197,6 +202,8 @@ def _input_specs(info: dict, api_inputs: dict, *, node_label: str) -> tuple[dict
                     if isinstance(configured_options, list)
                     else None
                 )
+            elif child_type == "COMFY_DYNAMICCOMBO_V3":
+                child_options = _dynamic_combo_options(child_config)
             specs[child_name] = _InputSpec(
                 name=child_name,
                 type_name=child_type,
@@ -340,6 +347,8 @@ def _validate_widget_value(
     allow_managed_asset_tokens: bool,
     allow_unverified_upload_names: bool,
 ) -> str | None:
+    if isinstance(value, str) and value.startswith(MEDIA_USE_TOKEN_PREFIX):
+        return "仍包含未上传的素材使用占位符"
     if isinstance(value, str) and value.startswith(_STAGED_ASSET_PREFIX):
         if (
             allow_managed_asset_tokens
@@ -385,21 +394,6 @@ def _validate_widget_value(
             return "既不在实时文件枚举中，也不在本任务已确认的上传结果中"
         if options:
             if value not in options:
-                from studio.services.comfyui_artifacts import safe_model_relative_filename
-
-                normalized_value = (
-                    safe_model_relative_filename(value)
-                    if isinstance(value, str) else None
-                )
-                normalized_options = {
-                    normalized
-                    for option in options
-                    if isinstance(option, str)
-                    for normalized in [safe_model_relative_filename(option)]
-                    if normalized is not None
-                }
-                if normalized_value is not None and normalized_value in normalized_options:
-                    return None
                 # Contract errors cross an API boundary during saved-workflow
                 # review.  Never echo a canvas literal: model names are
                 # reported through the separately reviewed dependency surface

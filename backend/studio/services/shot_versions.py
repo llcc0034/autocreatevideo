@@ -121,10 +121,10 @@ def resolve_episode_shot_version(
         queryset = queryset.select_for_update(of=("self",))
         # Fetch the nullable scene in a separate query as well.  This keeps the
         # locking SELECT free of an outer join on PostgreSQL.
-        queryset = queryset.prefetch_related("scene", "characters", "props")
+        queryset = queryset.prefetch_related("scene", "props")
     else:
         queryset = queryset.select_related("scene").prefetch_related(
-            "characters", "props",
+            "props",
         )
     rows = list(queryset.order_by("number", "id"))
     return resolve_shot_version_from_rows(episode, requested_key, rows)

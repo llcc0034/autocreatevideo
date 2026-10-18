@@ -3,12 +3,13 @@ from __future__ import annotations
 import secrets
 
 from django.contrib.auth import get_user_model
-from django.core.management.base import BaseCommand
+from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
 
-from studio.models import CharacterBible, Episode, SceneBible, SeriesProject, Shot, Style
+from studio.models import CharacterBible, Episode, SceneBible, SeriesProject, Shot, ShotCharacterRelation, Style, StyleCategory
 from studio.services.configuration import project_creation_policy
 from studio.services.consistency import sync_consistency_locks
+from studio.services.bible_variants import create_variant
 
 
 STYLES = [
@@ -24,6 +25,22 @@ STYLES = [
     ("healing-fantasy", "治愈奇幻", "xuanhuan", "healing gentle fantasy, warm pastoral light, tactile handcrafted environments, benevolent magical creatures, soft natural palette, emotionally comforting cinema"),
     ("glamour-wuxia", "魅影风华", "wuxia", "original cinematic elegant wuxia fantasy noir, mature adult characters, refined wardrobe, dramatic night lighting, premium live-action concept art"),
 ]
+
+# Bootstrap data only. Runtime choices and wording always come from Style rows;
+# subsequent runs do not overwrite the administrator's edits or active state.
+STYLE_DESCRIPTIONS = {
+    "wuxia": "水墨氛围与写实人物结合，青玉、朱红配色，飘逸衣料与凌厉武打构图。",
+    "xianxia": "仙山云海、灵光与华丽古装，强调宏大空间和电影级奇幻质感。",
+    "anime": "精细线稿、鲜明表情与分层背景，强调统一角色造型和动画式构图。",
+    "thriller": "压迫性光影、斑驳材质与克制线索，以心理紧张感营造悬疑氛围。",
+    "detective": "民国黑色电影质感，雨窗、明暗对照与琥珀深蓝色调，镜头沉稳。",
+    "urban-drama": "自然窗光、真实生活空间与细腻微表情，呈现贴近人物的都市写实感。",
+    "cyberpunk": "近未来城市与功能性工业设计，雨夜霓虹、精密科技细节和大画幅构图。",
+    "palace-intrigue": "考究宫廷礼制、木构殿堂与克制华服，以烛光和沉稳构图表现权谋张力。",
+    "post-apocalypse": "风沙、工业废墟与磨损装备，强调严酷自然光和写实生存氛围。",
+    "healing-fantasy": "温暖田园光线、柔和自然色与手作质感，营造亲切、舒缓的奇幻世界。",
+    "glamour-wuxia": "优雅武侠与黑色电影结合，精致服装、戏剧性夜景与成熟人物气质。",
+}
 
 
 class Command(BaseCommand):
@@ -41,17 +58,16 @@ class Command(BaseCommand):
 
     @transaction.atomic
     def handle(self, *args, **options):
-        active_slugs = {item[0] for item in STYLES}
-        Style.objects.filter(owner=None, is_system=True).exclude(
-            slug__in=active_slugs,
-        ).update(is_active=False)
+        created_count = 0
         for slug, name, category, visual_prompt in STYLES:
-            Style.objects.update_or_create(
+            if not Style.objects.filter(owner=None, slug=slug).exists() and not StyleCategory.objects.filter(key=category, is_active=True).exists():
+                raise CommandError(f"Cannot initialize style {slug}: category {category} is missing or inactive. Manage categories in the visual style manager; seed_data does not restore them.")
+            _, created = Style.objects.get_or_create(
                 owner=None,
                 slug=slug,
                 defaults={
                     "name": name,
-                    "category": category,
+                    "category_id": category,
                     "visual_prompt": visual_prompt,
                     "negative_prompt": (
                         "identity drift, face drift, costume drift, duplicate people, "
@@ -59,15 +75,16 @@ class Command(BaseCommand):
                         "extra fingers, malformed hands, text, watermark, logo, low detail, flicker"
                     ),
                     "defaults": {"aspect_ratio": "9:16", "fps": 24},
-                    "description": f"{name}商业短剧预设，可绑定本地人物、场景与道具参考图。",
+                    "description": STYLE_DESCRIPTIONS[slug],
                     "is_system": True,
                     "is_active": True,
                 },
             )
+            created_count += int(created)
         if options["with_demo_project"]:
             self._seed_demo_project()
         self.stdout.write(self.style.SUCCESS(
-            "Seeded 11 display styles. System workflows were not changed.",
+            f"Created {created_count} missing display styles. Existing styles and system workflows were not changed.",
         ))
 
     def _seed_demo_project(self):
@@ -128,32 +145,42 @@ class Command(BaseCommand):
                     "Updated seeded demo project from published creation policy: "
                     + ", ".join(changed_fields)
                 )
-        character, _ = CharacterBible.objects.get_or_create(
+        character, character_created = CharacterBible.objects.get_or_create(
             project=project,
             slug="shen-yan",
             defaults={
                 "name": "沈砚",
                 "stable_speaker_id": "S1",
                 "role": "主角",
-                "visual_identity": "清瘦青年剑客，冷峻轮廓，右眉尾浅疤，长发高束",
                 "face_identity": "狭长深色眼睛，直鼻，薄唇",
                 "wardrobe": "深靛窄袖劲装，旧黑披风",
                 "voice_profile": "低沉克制，语速偏慢",
                 "is_locked": True,
             },
         )
-        scene, _ = SceneBible.objects.get_or_create(
+        scene, scene_created = SceneBible.objects.get_or_create(
             project=project,
             slug="rain-inn",
             defaults={
                 "name": "雨夜客栈",
                 "location": "山道旁两层木客栈",
                 "time_of_day": "深夜",
-                "visual_identity": "潮湿乌木梁柱，破旧纸窗，门外连绵冷雨",
                 "lighting": "暖黄油灯对比门外青蓝雨光",
                 "ambient_sound": "屋檐雨滴，远雷，木板轻响",
             },
         )
+        # Explicit sample content only for newly created entities. Re-seeding
+        # never derives settings from old columns or overwrites authored revisions.
+        for entity, entity_kind, created, identity in (
+            (character, "character", character_created, "清瘦青年剑客，冷峻轮廓，右眉尾浅疤，长发高束"),
+            (scene, "scene", scene_created, "潮湿乌木梁柱，破旧纸窗，门外连绵冷雨"),
+        ):
+            if created:
+                create_variant(actor=user, project_id=project.pk, entity_kind=entity_kind,
+                    entity_id=entity.pk, appearance_role="primary", primary_setting_revision_id=None,
+                    primary_setting_sha256="", value={"name": "主图设定", "reference_name": f"{entity.name}主图",
+                        "identity_anchor": identity, "appearance_anchor": "",
+                        "basis_asset_id": None, "basis_asset_sha256": ""})
         episode, _ = Episode.objects.get_or_create(
             project=project,
             number=1,
@@ -164,8 +191,6 @@ class Command(BaseCommand):
             number=1,
             defaults={
                 "title": "推门",
-                "narrative": "沈砚推开客栈木门，雨水沿披风滴落，他停在门槛扫视众人。",
-                "camera": "低机位中景缓慢推近，最后停在右眉浅疤特写",
                 "duration_ms": project.default_shot_duration_ms,
                 "media_type": creation_policy["default_shot_media_type"],
                 "include_audio": (
@@ -173,13 +198,17 @@ class Command(BaseCommand):
                     if creation_policy["default_shot_media_type"] == Shot.MediaType.VIDEO
                     else False
                 ),
-                "dialogue": [{"speaker_id": "S1", "text": "有人在等我？"}],
+                "dialogue": [{"speaker_id": character.stable_speaker_id, "text": "有人在等我？", "voiceover": False}],
                 "scene": scene,
-                "sound_effects": "木门吱呀，雨声突然清晰",
-                "music": "低沉古琴单音",
             },
         )
-        if not shot_created:
+        if shot_created:
+            # Authored demo relations, not inferred from dialogue or an old pool.
+            ShotCharacterRelation.objects.bulk_create([
+                ShotCharacterRelation(shot=shot, character=character, role=role, position=0)
+                for role in (ShotCharacterRelation.Role.VISIBLE, ShotCharacterRelation.Role.SPEAKER)
+            ])
+        else:
             shot_policy_values = {
                 "duration_ms": project.default_shot_duration_ms,
                 "media_type": creation_policy["default_shot_media_type"],
@@ -193,7 +222,6 @@ class Command(BaseCommand):
             if creation_policy["default_shot_media_type"] == Shot.MediaType.IMAGE:
                 shot_policy_values.update({
                     "conditioning_mode": "",
-                    "reference_bindings": {},
                 })
             changed_fields = [
                 field
@@ -208,5 +236,4 @@ class Command(BaseCommand):
                     "Updated seeded demo shot from published creation policy: "
                     + ", ".join(changed_fields)
                 )
-        shot.characters.add(character)
         sync_consistency_locks(project)

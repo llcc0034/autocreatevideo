@@ -15,15 +15,21 @@ from drf_spectacular.extensions import OpenApiSerializerFieldExtension
 from drf_spectacular.utils import PolymorphicProxySerializer, extend_schema_field
 from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied as DRFPermissionDenied
+from studio.execution_instance_serializers import ExecutionAuthoringSerializer
+from studio.production_manual_serializers import ManualMediaCandidateSerializer, BibleContentConfirmationSerializer
 
 from studio.models import (
+    ContentSourceVersion,
+    DataStructureVersion,
     ApprovalDecision,
     ArtifactSelectionDecision,
+    AssetReferenceSeries,
     ComfyWorkflowSource,
     ComfyWorkflowContractDraft,
     ConfigDefinition,
     ConfigRevision,
     ConfigValue,
+    ExecutionPreparation,
     GeneratedArtifact,
     GenerationAttempt,
     GenerationAttemptResolution,
@@ -35,8 +41,9 @@ from studio.models import (
     ModelDeploymentSmokeAttemptResolution,
     ModelProfileVersion,
     PlatformLifecycleAuditEvent,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    FieldDefinition,
+    FieldDefinitionVersion,
+    ModelExecutionInstanceVersion,
     PromptProfileFieldRule,
     PromptProfileVersion,
     ProductionRecipeVersion,
@@ -106,9 +113,6 @@ from studio.services.provider_registry import (
     validate_deployment_execution_contract,
     validate_provider_profile,
 )
-from studio.services.prompt_profile_preview_examples import (
-    prompt_profile_preview_example,
-)
 from studio.services.prompt_profiles import (
     PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
     SUPPORTED_FIELD_SOURCE_SELECTORS,
@@ -116,16 +120,14 @@ from studio.services.prompt_profiles import (
     normalize_prompt_profile_channel_limits,
     normalize_prompt_profile_source_projection_config,
     refresh_prompt_profile_contract,
-    validate_field_definition,
     validate_prompt_operation_key,
-    validate_prompt_profile_binding,
     validate_profile_rule,
 )
 from studio.services.source_projection_primitives import (
     SOURCE_PROJECTION_PRIMITIVES,
 )
 from studio.media_signing import signed_media_token
-from studio.services.workflow_smoke_fixtures import workflow_smoke_fixture_schema
+from studio.services.workflow_smoke_fixtures import workflow_execution_input_schema
 from studio.services.workflow_projectors import (
     WORKFLOW_PROJECTOR_DEFINITION_SCHEMA_VERSION,
     validate_workflow_projector_definition,
@@ -141,7 +143,6 @@ from studio.services.prompt_normalization_contract import (
     normalization_batch_max_items,
     normalization_text_max_characters,
 )
-from studio.services.registry_deletion import validate_recipe_registry_references
 
 
 def _stage_snapshot_max_bytes() -> int:
@@ -310,6 +311,9 @@ class ModelProfileVersionSerializer(serializers.ModelSerializer):
         specification = attrs.get("specification", existing_specification)
         if not isinstance(specification, dict):
             raise serializers.ValidationError({"specification": "模型规格必须是 JSON 对象"})
+        visual_rules = specification.get("visual_rules")
+        if isinstance(visual_rules, dict) and "quality_advisories" in visual_rules:
+            raise serializers.ValidationError({"specification": "影视规则质量建议请在业务输出版本配置；从模型草稿移除此项后保存。已发布模型及历史请求不修改。"})
         requested_schema_version = specification.get("schema_version")
         if requested_schema_version not in {
             None,
@@ -378,6 +382,13 @@ class ModelProfileVersionSerializer(serializers.ModelSerializer):
                 specification,
                 modality=str(modality or ""),
             )
+            from studio.services.execution_text_contracts import text_execution_policies
+
+            text_execution_policies(specification)
+            from studio.services.script_model_policies import validate_script_model_policies
+            validate_script_model_policies(specification)
+            from studio.services.async_media_contract import validate_async_media_specification
+            validate_async_media_specification(specification, required=provider.driver_type == ProviderProfile.DriverType.ASYNC_REST)
         except DjangoValidationError as exc:
             _raise_drf(exc)
         contract = json_contract(
@@ -433,6 +444,46 @@ class ModelProfileProviderDriverOptionSerializer(serializers.Serializer):
     )
 
 
+class ReferencePreprocessingAdapterOptionSerializer(serializers.Serializer):
+    value = serializers.CharField(read_only=True)
+    label = serializers.CharField(read_only=True)
+    description = serializers.CharField(read_only=True)
+    target_fps = serializers.ChoiceField(choices=['required', 'forbidden', 'not_applicable'], read_only=True)
+
+
+class ReferencePreprocessingSlotOptionSerializer(serializers.Serializer):
+    value = serializers.CharField(read_only=True)
+    label = serializers.CharField(read_only=True)
+    input_slot = serializers.CharField(read_only=True)
+    include_target_fps = serializers.BooleanField(read_only=True)
+    adapters = ReferencePreprocessingAdapterOptionSerializer(many=True, read_only=True)
+
+
+class ReferenceMediaGroupOptionSerializer(serializers.Serializer):
+    value = serializers.CharField(read_only=True)
+    label = serializers.CharField(read_only=True)
+    media_kind = serializers.CharField(read_only=True)
+    input_slot = serializers.CharField(read_only=True)
+
+
+class ReferencePairingDirectionSerializer(serializers.Serializer):
+    source_media_kind = serializers.CharField(read_only=True)
+    target_media_kind = serializers.CharField(read_only=True)
+
+
+class ReferenceTopologyEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(read_only=True)
+    maximum_rules = serializers.IntegerField(read_only=True)
+    maximum_duration_ms = serializers.IntegerField(read_only=True)
+    maximum_fps = serializers.IntegerField(read_only=True)
+    label_max_characters = serializers.IntegerField(read_only=True)
+    text_max_characters = serializers.IntegerField(read_only=True)
+    maximum_targets_per_source = serializers.IntegerField(read_only=True)
+    media_groups = ReferenceMediaGroupOptionSerializer(many=True, read_only=True)
+    preprocessing_slots = ReferencePreprocessingSlotOptionSerializer(many=True, read_only=True)
+    pairing_direction = ReferencePairingDirectionSerializer(read_only=True)
+
+
 class ConditioningContractEditorOptionsSerializer(serializers.Serializer):
     schema_version = serializers.IntegerField(read_only=True)
     adapter_key = serializers.CharField(read_only=True)
@@ -442,9 +493,153 @@ class ConditioningContractEditorOptionsSerializer(serializers.Serializer):
     maximum_modes = serializers.IntegerField(read_only=True)
     identifier_pattern = serializers.CharField(read_only=True)
     mode_template = serializers.JSONField(read_only=True)
+    dynamic_reference_topology = ReferenceTopologyEditorOptionsSerializer(read_only=True)
+
+
+class ChatRequestOptionsEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(read_only=True)
+    temperature_minimum = serializers.FloatField(read_only=True)
+    response_format_types = serializers.ListField(child=serializers.DictField(), read_only=True)
+    assembly_description = serializers.CharField(read_only=True, help_text="模型只维护格式选项；json_schema.schema 从执行实例的确切业务输出派生，禁止内联重复定义。")
+    boundary_description = serializers.CharField(read_only=True)
+
+
+class IntegerParameterEditorOptionsSerializer(serializers.Serializer):
+    value_fields = serializers.ListField(child=serializers.DictField(), read_only=True)
+    seed_policies = serializers.ListField(child=serializers.DictField(), read_only=True)
+
+
+class TextExecutionEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(read_only=True)
+    integer_constraints = IntegerParameterEditorOptionsSerializer(read_only=True)
+    operations = serializers.ListField(child=serializers.DictField(), read_only=True)
+    parameters = serializers.ListField(child=serializers.DictField(), read_only=True)
+
+
+class MediaIntegerBoundsSerializer(serializers.Serializer):
+    minimum = serializers.IntegerField(read_only=True)
+    maximum = serializers.IntegerField(read_only=True)
+
+
+class MediaResolutionFieldSerializer(MediaIntegerBoundsSerializer):
+    key = serializers.CharField(read_only=True)
+    label = serializers.CharField(read_only=True)
+    unit = serializers.CharField(read_only=True)
+
+
+class MediaFpsBoundsSerializer(MediaIntegerBoundsSerializer):
+    maximum_items = serializers.IntegerField(read_only=True)
+
+
+class MediaConstraintsEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(read_only=True)
+    resolution_fields = MediaResolutionFieldSerializer(many=True, read_only=True)
+    resolution_pairs = serializers.ListField(child=serializers.ListField(child=serializers.CharField()), read_only=True)
+    fps = MediaFpsBoundsSerializer(read_only=True)
+    duration_ms = MediaIntegerBoundsSerializer(read_only=True)
+
+
+class ModelExecutionMonitoringEditorOptionsSerializer(serializers.Serializer):
+    max_idle_timeout_seconds = serializers.IntegerField(read_only=True)
+    max_node_type_overrides = serializers.IntegerField(read_only=True)
+
+
+class VisualRulesOutputEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField(read_only=True)
+    operation = serializers.CharField(read_only=True)
+    response_schema_version = serializers.IntegerField(read_only=True)
+    number_fields = MediaResolutionFieldSerializer(many=True, read_only=True)
+    number_pairs = serializers.ListField(child=serializers.ListField(child=serializers.CharField()), read_only=True)
+    clauses_max_bytes = serializers.IntegerField(read_only=True)
+    color_choices = serializers.DictField(child=serializers.ListField(), read_only=True)
+    outputs = serializers.ListField(child=serializers.DictField(child=serializers.CharField()), read_only=True)
+    response_example = serializers.JSONField(read_only=True)
+
+
+class VisualRulesOutputPreviewInputSerializer(serializers.Serializer):
+    response_text = serializers.CharField(trim_whitespace=False, allow_blank=True)
+    quality_advisories = serializers.JSONField(required=False)
+    allowed_values = serializers.DictField(required=False)
+    field_sources = serializers.DictField(child=serializers.CharField(), required=False)
+    response_keys = serializers.DictField(child=serializers.CharField(trim_whitespace=False), required=False)
+    output_version_id = serializers.UUIDField(required=False)
+    expected_revision = serializers.IntegerField(min_value=1, required=False)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or set(data) - set(self.fields):
+            raise serializers.ValidationError({"non_field_errors": ["仅接受响应正文与输出配置；不接受任务、项目或批准信息"]})
+        if not isinstance(data.get("response_text"), str):
+            raise serializers.ValidationError({"response_text": "请提供模型响应正文文本"})
+        if ("output_version_id" in data) != ("expected_revision" in data):
+            raise serializers.ValidationError({"expected_revision": "指定输出版本时须同时提供当前修订号"})
+        if "output_version_id" in data and ({"quality_advisories", "allowed_values", "field_sources", "response_keys"}.intersection(data) or type(data["expected_revision"]) is not int):
+            raise serializers.ValidationError({"non_field_errors": ["版本预检只使用已保存合同与建议，不能混用草稿值"]})
+        return super().to_internal_value(data)
+
+
+class VisualRulesOutputPreviewResponseSerializer(serializers.Serializer):
+    preview_only = serializers.BooleanField(read_only=True)
+    response_schema_version = serializers.IntegerField(read_only=True)
+    valid = serializers.BooleanField(read_only=True)
+    candidate = serializers.DictField(child=serializers.CharField(), allow_null=True, read_only=True)
+    warnings = serializers.ListField(child=serializers.CharField(), read_only=True)
+    errors = serializers.ListField(child=serializers.DictField(child=serializers.CharField()), read_only=True)
+    output_version_id = serializers.UUIDField(read_only=True, allow_null=True)
+    output_revision = serializers.IntegerField(read_only=True, allow_null=True)
+    output_contract_sha256 = serializers.CharField(read_only=True, allow_null=True)
+
+
+class ScriptContractNumberOptionSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    label = serializers.CharField()
+    unit = serializers.CharField()
+    integer = serializers.BooleanField()
+    minimum = serializers.FloatField()
+    maximum = serializers.FloatField(allow_null=True)
+    exclusive_minimum = serializers.BooleanField()
+
+
+class ScriptContractPolicyOptionSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    operation = serializers.CharField()
+    label = serializers.CharField()
+    number_fields = ScriptContractNumberOptionSerializer(many=True)
+
+
+class ScriptContractEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField()
+    policies = ScriptContractPolicyOptionSerializer(many=True)
+    description = serializers.CharField()
+
+
+class AsyncMediaFieldOptionSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    label = serializers.CharField()
+    types = serializers.ListField(child=serializers.CharField())
+    source_description = serializers.CharField()
+
+
+class AsyncMediaOperationOptionSerializer(serializers.Serializer):
+    key = serializers.CharField()
+    output_kind = serializers.CharField()
+
+
+class AsyncMediaEditorOptionsSerializer(serializers.Serializer):
+    schema_version = serializers.IntegerField()
+    maximum_string_length = serializers.IntegerField()
+    fields = AsyncMediaFieldOptionSerializer(many=True)
+    operations = AsyncMediaOperationOptionSerializer(many=True)
+    description = serializers.CharField()
 
 
 class ModelProfileRegistryOptionsSerializer(serializers.Serializer):
+    async_media = AsyncMediaEditorOptionsSerializer(read_only=True)
+    script_contracts = ScriptContractEditorOptionsSerializer(read_only=True)
+    visual_rules_output = VisualRulesOutputEditorOptionsSerializer(read_only=True)
+    execution_monitoring = ModelExecutionMonitoringEditorOptionsSerializer(read_only=True)
+    media_constraints = MediaConstraintsEditorOptionsSerializer(read_only=True)
+    text_execution = TextExecutionEditorOptionsSerializer(read_only=True)
+    chat_request_options = ChatRequestOptionsEditorOptionsSerializer(read_only=True)
     conditioning_contract = ConditioningContractEditorOptionsSerializer(read_only=True)
     specification_schema_version = serializers.IntegerField(read_only=True)
     provider_drivers = ModelProfileProviderDriverOptionSerializer(
@@ -469,23 +664,15 @@ class ModelProfileRegistryOptionsSerializer(serializers.Serializer):
     )
 
 
-class PromptFieldDefinitionSerializer(serializers.ModelSerializer):
-    preview_example = serializers.SerializerMethodField()
-
+class FieldDefinitionSerializer(serializers.ModelSerializer):
     class Meta:
-        model = PromptFieldDefinition
+        model = FieldDefinition
         fields = (
-            "id", "key", "label", "category", "description", "impact",
-            "value_type", "default_value", "preview_example", "value_options",
-            "is_required", "is_active", "display_order", "created_at", "updated_at",
+            "id", "key", "is_active", "display_order", "created_at", "updated_at",
         )
         read_only_fields = (
-            "preview_example", "display_order", "created_at", "updated_at",
+            "id", "display_order", "created_at", "updated_at",
         )
-
-    @extend_schema_field(serializers.JSONField())
-    def get_preview_example(self, obj):
-        return prompt_profile_preview_example(obj)
 
     def validate(self, attrs):
         if (
@@ -496,46 +683,31 @@ class PromptFieldDefinitionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({
                 "key": "通用字段 key 创建后不可修改；请新建字段并更新草稿 Profile",
             })
-        instance = self.instance or PromptFieldDefinition()
-        for field, value in attrs.items():
-            setattr(instance, field, value)
-        try:
-            validate_field_definition(instance)
-        except DjangoValidationError as exc:
-            _raise_drf(exc)
         return attrs
+
+    def to_internal_value(self, data):
+        unknown = set(data) - set(self.fields) if isinstance(data, dict) else set()
+        if unknown:
+            raise serializers.ValidationError({name: "字段身份只维护key及启停；定义内容请在具体版本维护" for name in unknown})
+        return super().to_internal_value(data)
 
     def create(self, validated_data):
         # Display order is presentation metadata, not business input.  Append
         # new definitions deterministically; reordering belongs to a dedicated
         # operation instead of an unlabelled number in the create form.
         with transaction.atomic():
-            maximum = PromptFieldDefinition.objects.aggregate(
+            maximum = FieldDefinition.objects.aggregate(
                 maximum=Max("display_order"),
             )["maximum"]
             validated_data["display_order"] = int(maximum or 0) + 1
             return super().create(validated_data)
 
-    def update(self, instance, validated_data):
-        with transaction.atomic():
-            instance = super().update(instance, validated_data)
-            profile_ids = instance.profile_rules.filter(
-                profile_version__status=PromptProfileVersion.Status.DRAFT,
-            ).values_list("profile_version_id", flat=True).distinct()
-            for profile in PromptProfileVersion.objects.filter(pk__in=profile_ids):
-                refresh_prompt_profile_contract(
-                    profile,
-                    schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
-                )
-        return instance
-
-
-class PromptFieldDefinitionCreateInputSerializer(PromptFieldDefinitionSerializer):
+class FieldDefinitionCreateInputSerializer(FieldDefinitionSerializer):
     """Create contract without server-owned presentation/lifecycle fields."""
 
-    class Meta(PromptFieldDefinitionSerializer.Meta):
+    class Meta(FieldDefinitionSerializer.Meta):
         read_only_fields = (
-            *PromptFieldDefinitionSerializer.Meta.read_only_fields,
+            *FieldDefinitionSerializer.Meta.read_only_fields,
             "is_active",
         )
 
@@ -545,17 +717,14 @@ class FormCatalogChoiceSerializer(serializers.Serializer):
     label = serializers.CharField(read_only=True)
 
 
-class PromptFieldDefinitionOptionsSerializer(serializers.Serializer):
-    value_types = FormCatalogChoiceSerializer(many=True, read_only=True)
-    categories = FormCatalogChoiceSerializer(many=True, read_only=True)
-    custom_entry_fields = serializers.ListField(
-        child=serializers.CharField(),
-        read_only=True,
-    )
+class FieldDefinitionOptionsSerializer(serializers.Serializer):
     system_defaults = serializers.DictField(read_only=True)
 
 
 class PromptProfileVersionSerializer(serializers.ModelSerializer):
+    input_structure_version = serializers.PrimaryKeyRelatedField(
+        queryset=DataStructureVersion.objects.filter(status="published"), required=False, allow_null=True,
+    )
     field_rule_count = serializers.IntegerField(read_only=True, default=0)
     source_projection_key = serializers.CharField(
         required=True,
@@ -573,7 +742,7 @@ class PromptProfileVersionSerializer(serializers.ModelSerializer):
         fields = (
             "id", "profile_key", "version", "name", "description",
             "model_family", "operation", "mode", "source_projection_key",
-            "source_projection_config", "official_reference", "channel_limits",
+            "source_projection_config", "official_reference", "channel_limits", "input_structure_version",
             "status", "review_state", "contract_schema_version",
             "contract_size_bytes", "contract_sha256", "field_rule_count",
             "published_at", "published_by", "created_at", "updated_at",
@@ -657,10 +826,10 @@ class PromptProfileVersionSerializer(serializers.ModelSerializer):
                 PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
             )
             instance = super().create(validated_data)
-            refresh_prompt_profile_contract(
-                instance,
-                schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
-            )
+            try:
+                refresh_prompt_profile_contract(instance, schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION)
+            except DjangoValidationError as exc:
+                _raise_drf(exc)
         return instance
 
     def update(self, instance, validated_data):
@@ -669,10 +838,10 @@ class PromptProfileVersionSerializer(serializers.ModelSerializer):
                 PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
             )
             instance = super().update(instance, validated_data)
-            refresh_prompt_profile_contract(
-                instance,
-                schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
-            )
+            try:
+                refresh_prompt_profile_contract(instance, schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION)
+            except DjangoValidationError as exc:
+                _raise_drf(exc)
         return instance
 
 
@@ -686,18 +855,38 @@ class PromptProfileVersionCreateInputSerializer(PromptProfileVersionSerializer):
         )
 
 
+_PROFILE_SOURCE_PATH_HELP = (
+    "装配来源或生成来源为request.structured_input时的确切路径数组；属性名不拆点，整数表示列表下标，[]选择根值，其他来源为null。"
+    "原值装配按路径取值；文本路径支持model_generated/translate_only，generation_source_selector须为request.structured_input。"
+    "direct_v1和declarative_v1的final均从本次根结构取值，采用结果直接填本字段；declarative_v1的contribution从ordered_units[].structured_input逐单元取值，插入项由projection_primitive决定。"
+    "仅所选文本及明确上下文进入辅助请求，最终编译使用明确采用的字段结果。"
+)
+
+
 class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
+    source_path = serializers.JSONField(required=False, allow_null=True, default=None, help_text=_PROFILE_SOURCE_PATH_HELP)
+    field_definition_version = serializers.PrimaryKeyRelatedField(
+        queryset=FieldDefinitionVersion.objects.select_related("field_definition"), required=True,
+    )
+    source_definition = serializers.SerializerMethodField()
+
+    def get_source_definition(self, obj) -> dict | None:
+        if not obj.source_version_id:
+            return None
+        from studio.services.content_sources import source_reference
+        return source_reference(obj.source_version)
+
     field_key = serializers.CharField(source="field_definition.key", read_only=True)
-    field_label = serializers.CharField(source="field_definition.label", read_only=True)
+    field_label = serializers.CharField(source="field_definition_version.label", read_only=True)
     field_value_type = serializers.CharField(
-        source="field_definition.value_type", read_only=True,
+        source="field_definition_version.value_type", read_only=True,
     )
     generation_mode = serializers.ChoiceField(
         choices=PromptProfileFieldRule.GenerationMode.choices,
         required=True,
     )
     generation_source_selector = serializers.CharField(
-        required=True,
+        required=False,
         allow_blank=False,
         max_length=191,
     )
@@ -715,6 +904,7 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         required=True,
         allow_blank=False,
         max_length=64,
+        help_text="创作正文的输出语言约束；冻结 Bible/素材参考原名及输入槽位按原值透传，不翻译且不受此语言约束。",
     )
     length_unit = serializers.ChoiceField(
         choices=PromptProfileFieldRule.LengthUnit.choices,
@@ -738,11 +928,10 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         allow_empty=True,
     )
     generation_context_selectors = serializers.ListField(
-        child=serializers.ChoiceField(
-            choices=PromptProfileFieldRule.GenerationContextSelector.choices,
-        ),
+        child=serializers.CharField(trim_whitespace=False),
         required=True,
         allow_empty=True,
+        help_text='受控上下文名称，或 request.structured_input: 后接规范 JSON 属性/下标路径数组；路径须属于策略绑定结构，由服务端校验。',
     )
     projection_primitive = serializers.ChoiceField(
         choices=tuple(SOURCE_PROJECTION_PRIMITIVES),
@@ -750,15 +939,16 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         allow_blank=True,
         default="",
     )
-    source_selector = serializers.CharField(required=True, max_length=80)
+    source_selector = serializers.CharField(required=False, max_length=80)
 
     class Meta:
         model = PromptProfileFieldRule
         fields = (
-            "id", "profile_version", "field_definition", "field_key",
+            "id", "profile_version", "field_definition", "field_definition_version", "field_key",
             "field_label", "field_value_type", "source_selector", "channel",
+            "source_version", "source_definition", "source_path",
             "projection_primitive",
-            "position", "label_style", "separator", "required",
+            "position", "label_style", "separator", "required", "fixed_value", "has_default", "default_value",
             "omit_if_empty", "max_chars", "generation_mode",
             "generation_source_selector", "generation_instruction",
             "generation_output_semantics",
@@ -772,6 +962,18 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         )
 
     def validate(self, attrs):
+        source = attrs.get("source_version", self.instance.source_version if self.instance else None)
+        if source:
+            from studio.services.content_sources import source_reference
+            try:
+                reference = source_reference(source, require_published=True)
+            except DjangoValidationError as exc:
+                _raise_drf(exc)
+            for key in ("source_selector", "generation_source_selector"):
+                selector = reference["reader"]["selector"]
+                if key in attrs and attrs[key] != selector:
+                    raise serializers.ValidationError({key: "不能覆盖来源版本声明的取值位置"})
+                attrs[key] = selector
         if self.instance and "profile_version" in attrs and (
             attrs["profile_version"].pk != self.instance.profile_version_id
         ):
@@ -785,7 +987,7 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         if source_selector not in SUPPORTED_FIELD_SOURCE_SELECTORS:
             raise serializers.ValidationError({
                 "source_selector": (
-                    "该来源 selector 只支持已冻结历史 Profile，不能用于新建或修改规则"
+                    "该来源不在当前目录中；请选择确切结构字段或当前来源，不转换旧镜头列"
                 ),
             })
         instance = self.instance or PromptProfileFieldRule()
@@ -796,10 +998,7 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         if not getattr(instance, "field_definition_id", None):
             raise serializers.ValidationError({"field_definition": "此字段为必填项"})
         try:
-            validate_profile_rule(
-                instance,
-                enforce_current_generation_source=True,
-            )
+            validate_profile_rule(instance)
         except DjangoValidationError as exc:
             _raise_drf(exc)
         return attrs
@@ -807,12 +1006,20 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
     def validate_source_selector(self, value):
         if value not in SUPPORTED_FIELD_SOURCE_SELECTORS:
             raise serializers.ValidationError(
-                "该来源 selector 只支持已冻结历史 Profile，不能用于新建或修改规则",
+                "该来源不在当前目录中；请选择确切结构字段或当前来源，不转换旧镜头列",
             )
         return value
 
     def create(self, validated_data):
         with transaction.atomic():
+            source = validated_data.get("source_version")
+            if source:
+                source.refresh_from_db()
+                from studio.services.content_sources import source_reference
+                try:
+                    source_reference(source, require_published=True)
+                except DjangoValidationError as exc:
+                    _raise_drf(exc)
             instance = super().create(validated_data)
             refresh_prompt_profile_contract(
                 instance.profile_version,
@@ -822,6 +1029,14 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         with transaction.atomic():
+            source = validated_data.get("source_version", instance.source_version)
+            if source:
+                source.refresh_from_db()
+                from studio.services.content_sources import source_reference
+                try:
+                    source_reference(source, require_published=True)
+                except DjangoValidationError as exc:
+                    _raise_drf(exc)
             instance = super().update(instance, validated_data)
             refresh_prompt_profile_contract(
                 instance.profile_version,
@@ -830,89 +1045,20 @@ class PromptProfileFieldRuleSerializer(serializers.ModelSerializer):
         return instance
 
 
-class PromptProfileBindingSerializer(serializers.ModelSerializer):
-    prompt_profile_name = serializers.CharField(source="prompt_profile_version.name", read_only=True)
-    prompt_profile_version_number = serializers.IntegerField(source="prompt_profile_version.version", read_only=True)
-    prompt_profile_status = serializers.CharField(source="prompt_profile_version.status", read_only=True)
-    prompt_profile_key = serializers.CharField(
-        source="prompt_profile_version.profile_key", read_only=True,
-    )
-    prompt_profile_contract_sha256 = serializers.CharField(
-        source="prompt_profile_version.contract_sha256", read_only=True,
-    )
-    model_identifier = serializers.CharField(
-        source="model_profile_version.model_identifier", read_only=True,
-        allow_null=True,
-    )
-
-    def validate_operation(self, value):
-        try:
-            return validate_prompt_operation_key(value)
-        except DjangoValidationError as exc:
-            _raise_drf(exc)
-
-    class Meta:
-        model = PromptProfileBinding
-        fields = (
-            "id", "key", "name", "operation", "model_family", "mode",
-            "model_profile_version", "model_identifier", "prompt_profile_version",
-            "prompt_profile_name", "prompt_profile_version_number", "prompt_profile_status",
-            "prompt_profile_key", "prompt_profile_contract_sha256", "priority",
-            "is_active", "created_at", "updated_at",
-        )
-        read_only_fields = (
-            "model_identifier", "prompt_profile_key",
-            "prompt_profile_contract_sha256", "created_at", "updated_at",
-        )
-        extra_kwargs = {
-            "operation": {
-                "help_text": (
-                    "受控 operation key。Binding 不授予执行能力；非内置 operation 的 active "
-                    "Binding 必须选择精确且声明同名 capability 的已发布模型版本。"
-                ),
-            },
-        }
-
-    def validate(self, attrs):
-        if (
-            self.instance is not None
-            and "key" in attrs
-            and attrs["key"] != self.instance.key
-        ):
-            raise serializers.ValidationError({
-                "key": "PromptProfile binding key 创建后不可修改；请新建绑定",
-            })
-        instance = self.instance or PromptProfileBinding()
-        for field, value in attrs.items():
-            setattr(instance, field, value)
-        if not getattr(instance, "prompt_profile_version_id", None):
-            raise serializers.ValidationError({"prompt_profile_version": "此字段为必填项"})
-        try:
-            validate_prompt_profile_binding(instance)
-        except DjangoValidationError as exc:
-            _raise_drf(exc)
-        if instance.is_active:
-            duplicate = PromptProfileBinding.objects.filter(
-                is_active=True,
-                operation=instance.operation,
-                model_family=instance.model_family,
-                mode=instance.mode,
-                model_profile_version_id=instance.model_profile_version_id,
-                priority=instance.priority,
-            )
-            if self.instance:
-                duplicate = duplicate.exclude(pk=self.instance.pk)
-            if duplicate.exists():
-                raise serializers.ValidationError(
-                    "相同 selector 与 priority 已存在 active binding；运行时将无法唯一解析",
-                )
-        return attrs
 
 
 class PromptProfilePreviewRuleCandidateSerializer(serializers.Serializer):
+    source_path = serializers.JSONField(required=False, allow_null=True, default=None, help_text=_PROFILE_SOURCE_PATH_HELP)
+    field_definition_version = serializers.PrimaryKeyRelatedField(
+        queryset=FieldDefinitionVersion.objects.select_related("field_definition"),
+    )
+    fixed_value = serializers.JSONField(required=False, allow_null=True, default=None)
+    has_default = serializers.BooleanField(required=False, default=False)
+    default_value = serializers.JSONField(required=False, allow_null=True, default=None)
+    source_version = serializers.PrimaryKeyRelatedField(queryset=ContentSourceVersion.objects.all(), required=False, allow_null=True)
     id = serializers.UUIDField(required=False, allow_null=True)
     field_definition = serializers.PrimaryKeyRelatedField(
-        queryset=PromptFieldDefinition.objects.all(),
+        queryset=FieldDefinition.objects.all(),
     )
     source_selector = serializers.ChoiceField(
         choices=tuple((value, value) for value in SUPPORTED_FIELD_SOURCE_SELECTORS),
@@ -942,10 +1088,9 @@ class PromptProfilePreviewRuleCandidateSerializer(serializers.Serializer):
         max_length=191,
     )
     generation_context_selectors = serializers.ListField(
-        child=serializers.ChoiceField(
-            choices=PromptProfileFieldRule.GenerationContextSelector.choices,
-        ),
+        child=serializers.CharField(trim_whitespace=False),
         allow_empty=True,
+        help_text='受控上下文名称，或 request.structured_input: 后接规范 JSON 属性/下标路径数组；路径须属于策略绑定结构，由服务端校验。',
     )
     generation_instruction = serializers.CharField(
         allow_blank=True,
@@ -955,7 +1100,8 @@ class PromptProfilePreviewRuleCandidateSerializer(serializers.Serializer):
         choices=PromptProfileFieldRule.GenerationOutputSemantics.choices,
     )
     generation_required = serializers.BooleanField()
-    language_policy = serializers.CharField(allow_blank=False, max_length=64)
+    language_policy = serializers.CharField(allow_blank=False, max_length=64,
+        help_text="创作正文的输出语言约束；冻结 Bible/素材参考原名及输入槽位按原值透传，不翻译且不受此语言约束。")
     length_unit = serializers.ChoiceField(
         choices=PromptProfileFieldRule.LengthUnit.choices,
     )
@@ -978,6 +1124,10 @@ class PromptProfilePreviewRuleCandidateSerializer(serializers.Serializer):
 
 
 class PromptProfilePreviewCandidateSerializer(serializers.Serializer):
+    input_structure_version = serializers.PrimaryKeyRelatedField(
+        queryset=DataStructureVersion.objects.filter(status="published"),
+        required=False, allow_null=True, default=None,
+    )
     model_family = serializers.RegexField(
         regex=r"^[a-z][a-z0-9_.-]{1,99}$",
         max_length=100,
@@ -1139,6 +1289,15 @@ class ReferenceRenderingOptionSerializer(serializers.Serializer):
     example = ReferenceRenderingExampleSerializer(read_only=True)
 
 
+class PromptSourceOptionSerializer(serializers.Serializer):
+    value = serializers.CharField()
+    label = serializers.CharField()
+    group_label = serializers.CharField()
+    description = serializers.CharField()
+    record_location = serializers.CharField()
+    execution_usage = serializers.CharField()
+
+
 class PromptProfileOptionsSerializer(serializers.Serializer):
     operations = serializers.ListField(
         child=serializers.CharField(),
@@ -1150,21 +1309,20 @@ class PromptProfileOptionsSerializer(serializers.Serializer):
     )
     model_families = serializers.ListField(child=serializers.CharField(), read_only=True)
     modes = serializers.ListField(child=serializers.CharField(), read_only=True)
-    field_value_types = FormCatalogChoiceSerializer(many=True, read_only=True)
-    field_categories = FormCatalogChoiceSerializer(many=True, read_only=True)
     custom_entry_fields = serializers.ListField(
         child=serializers.CharField(),
         read_only=True,
     )
-    field_system_defaults = serializers.DictField(read_only=True)
     rule_system_defaults = serializers.DictField(read_only=True)
-    source_selectors = serializers.ListField(child=serializers.DictField(), read_only=True)
+    source_selectors = PromptSourceOptionSerializer(many=True, read_only=True)
     channels = serializers.ListField(child=serializers.DictField(), read_only=True)
     label_styles = serializers.ListField(child=serializers.DictField(), read_only=True)
     separators = serializers.ListField(child=serializers.DictField(), read_only=True)
     generation_modes = serializers.ListField(
         child=serializers.DictField(), read_only=True,
     )
+    generation_leaf_operations = serializers.ListField(child=serializers.CharField(), read_only=True,
+        help_text="不可递归声明辅助字段的叶子操作；其他使用策略的输入字段共享辅助准备和采用链路。")
     generation_output_semantics = serializers.ListField(
         child=serializers.DictField(), read_only=True,
     )
@@ -1173,6 +1331,7 @@ class PromptProfileOptionsSerializer(serializers.Serializer):
         read_only=True,
     )
     reference_rendering_fields = ReferenceRenderingOptionSerializer(many=True, read_only=True)
+    reference_rendering_text_slots = serializers.ListField(child=serializers.DictField(), read_only=True)
     source_projection_primitives = (
         PromptProfileSourceProjectionPrimitiveOptionSerializer(
             many=True,
@@ -1197,6 +1356,7 @@ class PromptProfileOptionsSerializer(serializers.Serializer):
     generation_source_selectors = PromptProfileGenerationSourceOptionSerializer(
         many=True,
         read_only=True,
+        help_text="由已实现执行来源读者派生的文本生成目录。结构化路径另选 request.structured_input 并指定确切输入结构及 source_path；逐单元贡献只使用本单元结构路径，不读取旧 Bible/Shot 列。",
     )
     model_profile_versions = serializers.ListField(
         child=serializers.DictField(), read_only=True,
@@ -1318,12 +1478,12 @@ class ModelDeploymentSerializer(serializers.ModelSerializer):
 
     def get_latest_smoke(self, obj) -> dict | None:
         unresolved = obj.smoke_attempts.filter(
+            scope="resource",
             status__in=(
                 ModelDeploymentSmokeAttempt.Status.SUBMITTING,
                 ModelDeploymentSmokeAttempt.Status.UNCERTAIN,
             ),
-            resolutions__isnull=True,
-        ).order_by("-created_at").first()
+        ).without_operator_resolution().order_by("-created_at").first()
         snapshot = obj.capability_snapshots.filter(
             probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
         ).order_by("-revision").first()
@@ -1368,16 +1528,9 @@ class ModelDeploymentSerializer(serializers.ModelSerializer):
                 max_bytes=_stage_snapshot_max_bytes(),
             )
             operations = operations_contract.value
-            fresh = bool(
-                snapshot.status == snapshot.Status.PASSED
-                and snapshot.expires_at > timezone.now()
-                and snapshot.target_sha256 == deployment_target_sha256(obj)
-            )
-            from studio.services.deployment_smoke_contract import TEXT_DEPLOYMENT_SMOKE_OPERATIONS
-            from studio.services.deployment_smoke_profiles import snapshot_profile_matches
-            if any(operation in TEXT_DEPLOYMENT_SMOKE_OPERATIONS for operation in operations):
-                snapshot.deployment = obj
-                fresh = fresh and snapshot_profile_matches(snapshot)
+            from studio.services.execution_deployment_resource_evidence import read_resource_deployment_snapshot
+            attempt = read_resource_deployment_snapshot(snapshot, current=True)
+            fresh = attempt.status == "succeeded" and attempt.evidence_expires_at > timezone.now()
         except (DjangoValidationError, RuntimeError, TypeError, ValueError):
             # A damaged or stale snapshot remains visible as audit history, but
             # must never be advertised as executable readiness.
@@ -1491,23 +1644,20 @@ class WorkflowLinkedDeploymentSerializer(serializers.Serializer):
     model_profile_version_id = serializers.UUIDField()
 
 
-class WorkflowLinkedPromptSerializer(serializers.Serializer):
-    binding_id = serializers.UUIDField()
-    profile_id = serializers.UUIDField()
+class WorkflowLinkedExecutionSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
     name = serializers.CharField()
     version = serializers.IntegerField()
     status = serializers.CharField()
-    scope = serializers.ChoiceField(choices=("exact_model", "model_family"))
     operation = serializers.CharField()
     mode = serializers.CharField(allow_blank=True)
-    is_active = serializers.BooleanField()
+    prompt_mode = serializers.ChoiceField(choices=ModelExecutionInstanceVersion.PromptMode.choices)
 
 
-class WorkflowLinkedPromptsSerializer(serializers.Serializer):
-    state = serializers.ChoiceField(choices=("available", "model_unbound", "family_missing"))
+class WorkflowLinkedExecutionsSerializer(serializers.Serializer):
     total = serializers.IntegerField(min_value=0)
     active_total = serializers.IntegerField(min_value=0)
-    preview = WorkflowLinkedPromptSerializer(many=True, max_length=3)
+    preview = WorkflowLinkedExecutionSerializer(many=True, max_length=3)
 
 
 class WorkflowLinkedProjectorSerializer(serializers.Serializer):
@@ -1525,7 +1675,7 @@ class WorkflowLinkedProjectorSerializer(serializers.Serializer):
 class WorkflowConfigurationLinksSerializer(serializers.Serializer):
     model = WorkflowLinkedModelSerializer(allow_null=True)
     validated_deployment = WorkflowLinkedDeploymentSerializer(allow_null=True)
-    prompt_bindings = WorkflowLinkedPromptsSerializer()
+    execution_instances = WorkflowLinkedExecutionsSerializer()
     projector = WorkflowLinkedProjectorSerializer()
 
 
@@ -1622,17 +1772,17 @@ class WorkflowExecutionInputSchemaSerializer(serializers.Serializer):
 class WorkflowTemplateVersionDetailSerializer(WorkflowTemplateVersionListSerializer):
     semantic_bindings = WorkflowSemanticBindingSerializer(many=True, read_only=True)
     model_requirements = WorkflowModelRequirementSerializer(many=True, read_only=True)
-    smoke_fixture_schema = serializers.SerializerMethodField()
+    workflow_input_schema = serializers.SerializerMethodField()
 
     @extend_schema_field(WorkflowExecutionInputSchemaSerializer)
-    def get_smoke_fixture_schema(self, obj) -> dict:
+    def get_workflow_input_schema(self, obj) -> dict:
         try:
-            return workflow_smoke_fixture_schema(obj)
+            return workflow_execution_input_schema(obj)
         except DjangoValidationError:
             return {
                 "schema_version": 2,
                 "available": False,
-                "reason_code": "workflow_fixture_contract_invalid",
+                "reason_code": "workflow_input_contract_invalid",
                 "parameters": [],
                 "asset_slots": [],
                 "asset_groups": [],
@@ -1643,7 +1793,7 @@ class WorkflowTemplateVersionDetailSerializer(WorkflowTemplateVersionListSeriali
     class Meta(WorkflowTemplateVersionListSerializer.Meta):
         fields = WorkflowTemplateVersionListSerializer.Meta.fields + (
             "graph", "input_contract", "semantic_bindings", "model_requirements",
-            "validation_evidence", "smoke_test_evidence", "smoke_fixture_schema",
+            "validation_evidence", "smoke_test_evidence", "workflow_input_schema",
         )
 
 
@@ -2075,8 +2225,14 @@ class WorkflowProjectorAdapterOptionsSerializer(serializers.Serializer):
     dynamic = WorkflowProjectorChoiceOptionSerializer(many=True)
 
 
+class WorkflowModelQuantityInputOptionSerializer(WorkflowProjectorChoiceOptionSerializer):
+    media_kind = serializers.ChoiceField(choices=["image", "video", "audio"])
+
+
 class WorkflowProjectorEditorChoiceCatalogSerializer(serializers.Serializer):
+    execution_capabilities = WorkflowProjectorChoiceOptionSerializer(many=True)
     asset_group_wirings = WorkflowProjectorChoiceOptionSerializer(many=True)
+    model_quantity_inputs = WorkflowModelQuantityInputOptionSerializer(many=True)
     cardinalities = WorkflowProjectorChoiceOptionSerializer(many=True)
     parameter_policies = WorkflowProjectorChoiceOptionSerializer(many=True)
     artifact_roles = WorkflowProjectorChoiceOptionSerializer(many=True)
@@ -2225,6 +2381,8 @@ class WorkflowProjectorRecommendationSerializer(serializers.Serializer):
 
 
 class ComfySavedWorkflowPreviewInputSerializer(serializers.Serializer):
+    request_key = serializers.RegexField(r"^[A-Za-z0-9:._-]{1,191}$", required=False,
+        help_text="浏览器派发前保存的稳定请求标识；同账号同键只对应同一请求，响应丢失后用该键只读回查。未提供时由服务端分配。")
     source_path = serializers.CharField(
         max_length=500,
         help_text="必须先以 import_kind=candidate 纳管的精确来源路径。",
@@ -2322,6 +2480,12 @@ class ComfySavedWorkflowBatchItemSerializer(serializers.Serializer):
         allow_null=True,
     )
     new_template = ComfyNewWorkflowTemplateSerializer(required=False, allow_null=True)
+    successor_of = serializers.PrimaryKeyRelatedField(
+        queryset=WorkflowTemplateVersion.objects.all(),
+        required=False,
+        allow_null=True,
+        help_text="显式重建后继时填写原工作流版本；只追加原模板，不复用旧版本或其验收证据。同一完整请求重放返回原后继。",
+    )
     model_profile_version = serializers.PrimaryKeyRelatedField(
         queryset=ModelProfileVersion.objects.filter(
             status__in=(
@@ -2333,6 +2497,12 @@ class ComfySavedWorkflowBatchItemSerializer(serializers.Serializer):
         allow_null=True,
     )
     def validate(self, attrs):
+        if attrs.get("successor_of") is not None and (
+            attrs["import_kind"] != "template_version" or attrs.get("template") is None
+        ):
+            raise serializers.ValidationError({
+                "successor_of": "后继版本必须提升到原有 template",
+            })
         if attrs["import_kind"] == "template_version":
             if bool(attrs.get("template")) == bool(attrs.get("new_template")):
                 raise serializers.ValidationError(
@@ -2584,8 +2754,25 @@ class ComfySavedWorkflowPreviewCoreSerializer(serializers.Serializer):
     contract_draft_revision = serializers.IntegerField(min_value=0)
 
 
+class ComfyWorkflowPreviewRequestIdentitySerializer(serializers.Serializer):
+    deployment_id = serializers.UUIDField()
+    source_path = serializers.CharField()
+    expected_sha256 = serializers.CharField()
+    expected_source_scope_schema_version = serializers.IntegerField()
+    expected_source_scope_sha256 = serializers.CharField()
+    primary_output_node_ids = serializers.ListField(child=serializers.CharField())
+    model_profile_version = serializers.UUIDField(allow_null=True)
+
+
+class ComfyWorkflowPreviewReceiptSerializer(serializers.Serializer):
+    request_key = serializers.CharField()
+    candidate_source_id = serializers.UUIDField()
+    request = ComfyWorkflowPreviewRequestIdentitySerializer()
+
+
 class ComfySavedWorkflowPreviewResponseSerializer(ComfySavedWorkflowPreviewCoreSerializer):
     effective_limits = ComfySavedWorkflowEffectiveLimitsSerializer()
+    request_receipt = ComfyWorkflowPreviewReceiptSerializer(required=False)
 
 
 class ComfySavedWorkflowDiscoveryItemSerializer(ComfySavedWorkflowScanItemSerializer):
@@ -2672,7 +2859,7 @@ class ComfyWorkflowSourceSerializer(serializers.ModelSerializer):
             "import_contract_sha256", "import_kind",
             "converted_graph_sha256", "conversion_report",
             "conversion_report_schema_version", "conversion_report_size_bytes",
-            "conversion_report_sha256", "workflow_version", "generated_workflow",
+            "conversion_report_sha256", "workflow_version",
             "generation_task", "imported_by", "created_at",
         )
         read_only_fields = fields
@@ -2746,23 +2933,6 @@ class DeploymentActionSerializer(serializers.Serializer):
     deployment_id = serializers.UUIDField()
 
 
-class DeploymentProbeInputSerializer(serializers.Serializer):
-    prompt_profile_binding_id = serializers.UUIDField(required=False)
-    operation = serializers.ChoiceField(
-        choices=(
-            "image.text_to_image",
-            "video.text_to_video",
-            "audio.text_to_audio",
-            "prompt.normalize",
-            "script.generate",
-            "script.structure",
-            "visual_rules.generate",
-        ),
-        required=False,
-        allow_null=True,
-    )
-
-
 class ModelArtifactVerificationInputSerializer(serializers.Serializer):
     host_snapshot_id = serializers.UUIDField()
 
@@ -2790,18 +2960,38 @@ class ModelDeploymentCapabilitySnapshotSerializer(serializers.ModelSerializer):
         return bool(obj.credential_binding_sha256)
 
 
-class ModelDeploymentSmokeAttemptSerializer(serializers.ModelSerializer):
+class PreparedSmokeAttemptSerializer(serializers.ModelSerializer):
+    preparation_id = serializers.SerializerMethodField()
+
+    def _preparation(self, obj):
+        rows = list(obj.execution_preparations.all())
+        if len(rows) > 1:
+            raise DjangoValidationError("原始烟测关联了多份执行准备，不能选择其中一份代替")
+        return rows[0] if rows else None
+
+    @extend_schema_field(serializers.UUIDField(allow_null=True))
+    def get_preparation_id(self, obj):
+        prep = self._preparation(obj)
+        return str(prep.pk) if prep else None
+
+
+class ModelDeploymentSmokeAttemptSerializer(PreparedSmokeAttemptSerializer):
     prompt_profile = serializers.SerializerMethodField()
 
     def get_prompt_profile(self, obj) -> dict | None:
-        return obj.request_snapshot.get("prompt_profile")
+        from studio.services.execution_preparations import preparation_execution_definition
+        prep = self._preparation(obj)
+        return preparation_execution_definition(prep).value["resources"].get("prompt_profile") if prep else None
 
     class Meta:
         model = ModelDeploymentSmokeAttempt
         fields = (
             "id", "deployment", "operation", "status", "request_sha256",
+            "scope", "execution_instance_version", "preparation_id", "evidence_expires_at",
+            "result", "result_schema_version", "result_size_bytes", "result_sha256",
             "prompt_profile",
             "target_sha256", "estimated_cost", "cost_currency",
+            "allow_external_calls", "budget_limit", "actual_cost",
             "provider_request_id_sha256", "worker_id", "claimed_at", "heartbeat_at",
             "submission_started_at", "submitted_at", "last_polled_at", "next_poll_at",
             "poll_count", "remote_status", "deadline_started_at", "hard_deadline_at",
@@ -2879,11 +3069,6 @@ class WorkflowExecutionInputSerializer(serializers.Serializer):
         default=dict,
     )
 
-class WorkflowSmokeActionSerializer(serializers.Serializer):
-    deployment_id = serializers.UUIDField()
-    fixture = WorkflowExecutionInputSerializer()
-
-
 class WorkflowSmokeAssetBindingSerializer(serializers.ModelSerializer):
     class Meta:
         model = WorkflowSmokeAssetBinding
@@ -2928,7 +3113,7 @@ class WorkflowSmokeResolutionSerializer(serializers.ModelSerializer):
         read_only_fields = fields
 
 
-class WorkflowSmokeAttemptSerializer(serializers.ModelSerializer):
+class WorkflowSmokeAttemptSerializer(PreparedSmokeAttemptSerializer):
     asset_bindings = WorkflowSmokeAssetBindingSerializer(many=True, read_only=True)
     resolutions = WorkflowSmokeResolutionSerializer(many=True, read_only=True)
     resolution_required = serializers.SerializerMethodField()
@@ -2943,10 +3128,13 @@ class WorkflowSmokeAttemptSerializer(serializers.ModelSerializer):
         model = WorkflowSmokeAttempt
         fields = (
             "id", "workflow_version", "deployment", "created_by", "status",
+            "scope", "execution_instance_version", "preparation_id", "evidence_expires_at",
+            "result_schema_version", "result_size_bytes", "result_sha256",
             "graph_sha256", "execution_contract_sha256", "validation_evidence_sha256",
             "target_sha256", "fixture_values_schema_version",
             "fixture_values_size_bytes", "fixture_values_sha256", "fixture_sha256",
             "asset_bindings", "resolutions", "resolution_required",
+            "allow_external_calls", "budget_limit", "estimated_cost", "actual_cost", "cost_currency",
             "worker_id", "claimed_at", "heartbeat_at",
             "submission_started_at", "submitted_at", "last_polled_at", "next_poll_at",
             "poll_count", "remote_status", "deadline_started_at", "hard_deadline_at",
@@ -2966,18 +3154,9 @@ CONFIG_DEFAULT_SOURCE_ORDER = tuple(
 )
 
 
-def prompt_field_system_defaults() -> dict:
+def field_system_defaults() -> dict:
     return {
-        "default_value": PromptFieldDefinition._meta.get_field(
-            "default_value",
-        ).get_default(),
-        "value_options": PromptFieldDefinition._meta.get_field(
-            "value_options",
-        ).get_default(),
-        "is_required": PromptFieldDefinition._meta.get_field(
-            "is_required",
-        ).get_default(),
-        "is_active": PromptFieldDefinition._meta.get_field(
+        "is_active": FieldDefinition._meta.get_field(
             "is_active",
         ).get_default(),
         "display_order": "append",
@@ -2989,6 +3168,7 @@ def prompt_rule_system_defaults() -> dict:
         "label_style",
         "separator",
         "required",
+        "has_default",
         "omit_if_empty",
         "max_chars",
         "generation_output_semantics",
@@ -3217,31 +3397,11 @@ class ConfigDefinitionSerializer(serializers.ModelSerializer):
         schema = attrs.get("value_schema", getattr(self.instance, "value_schema", {}))
         resource_ref = schema.get("resource_ref") if isinstance(schema, dict) else None
         if resource_ref is not None:
-            if not isinstance(resource_ref, dict):
-                raise serializers.ValidationError({
-                    "value_schema": "resource_ref 必须是对象",
-                })
-            allowed_resource_ref_keys = {
-                "resource", "capability", "allow_empty", "require_ready",
-            }
-            unknown_resource_ref_keys = set(resource_ref) - allowed_resource_ref_keys
-            if unknown_resource_ref_keys:
-                raise serializers.ValidationError({
-                    "value_schema": (
-                        "resource_ref 包含未注册字段: "
-                        + ", ".join(sorted(unknown_resource_ref_keys))
-                    ),
-                })
-            if (
-                resource_ref.get("resource") != "model_deployment"
-                or not isinstance(resource_ref.get("capability"), str)
-                or not resource_ref.get("capability", "").strip()
-                or type(resource_ref.get("allow_empty", False)) is not bool
-                or type(resource_ref.get("require_ready", True)) is not bool
-            ):
-                raise serializers.ValidationError({
-                    "value_schema": "resource_ref 必须声明受支持的资源、能力与布尔约束",
-                })
+            from studio.services.configuration import validate_config_resource_reference_schema
+            try:
+                validate_config_resource_reference_schema(resource_ref)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError({"value_schema": exc.messages}) from exc
         is_secret = attrs.get("is_secret", getattr(self.instance, "is_secret", False))
         initial = attrs.get("initial_value", getattr(self.instance, "initial_value", None))
         if is_secret and initial is not None:
@@ -3548,14 +3708,15 @@ class RegistryDeletionPreviewInputSerializer(serializers.Serializer):
         "provider_profile",
         "model_profile_version",
         "model_deployment",
+        "model_execution_instance",
+        "model_execution_instance_version",
         "model_artifact",
         "workflow_template_version",
         "production_recipe_version",
         "config_definition",
-        "prompt_field_definition",
+        "field_definition",
         "prompt_profile_version",
         "prompt_profile_field_rule",
-        "prompt_profile_binding",
     ))
     object_id = serializers.UUIDField()
 
@@ -3708,9 +3869,26 @@ class RuntimeReadinessResponseSerializer(serializers.Serializer):
 
 
 class ProductionReadinessCapabilitySerializer(serializers.Serializer):
+    scope = serializers.ChoiceField(choices=("configuration_only",))
+    request_checked = serializers.BooleanField()
     state = serializers.ChoiceField(choices=("not_required", "blocked", "ready"))
     required = serializers.BooleanField()
     reason_codes = serializers.ListField(child=serializers.CharField())
+    warning_codes = serializers.ListField(child=serializers.CharField())
+    instance_count = serializers.IntegerField(min_value=0, allow_null=True)
+    viable_instance_count = serializers.IntegerField(min_value=0, allow_null=True)
+
+
+class ProductionReadinessValidationErrorSerializer(serializers.Serializer):
+    phase = serializers.ChoiceField(choices=("definition", "requirements", "pipeline"))
+    field_path = serializers.CharField()
+    message = serializers.CharField()
+    code = serializers.CharField(allow_null=True)
+    stage_index = serializers.IntegerField(min_value=0, allow_null=True)
+    stage_key = serializers.CharField(allow_null=True)
+    stage_kind = serializers.CharField(allow_null=True)
+    routing_key = serializers.CharField(allow_null=True)
+    route_index = serializers.IntegerField(min_value=0, allow_null=True)
 
 
 class ProductionReadinessRecipeSerializer(serializers.Serializer):
@@ -3720,10 +3898,12 @@ class ProductionReadinessRecipeSerializer(serializers.Serializer):
     state = serializers.ChoiceField(choices=("blocked", "ready"))
     reason_codes = serializers.ListField(child=serializers.CharField())
     capabilities = serializers.DictField(child=ProductionReadinessCapabilitySerializer())
+    validation_errors = ProductionReadinessValidationErrorSerializer(many=True)
 
 
 class ProductionReadinessResponseSerializer(serializers.Serializer):
     schema_version = serializers.IntegerField()
+    request_checked = serializers.BooleanField()
     status = serializers.ChoiceField(choices=("unconfigured", "blocked", "ready"))
     reason_codes = serializers.ListField(child=serializers.CharField())
     recipes = ProductionReadinessRecipeSerializer(many=True)
@@ -3841,6 +4021,18 @@ class ScriptSourceSerializer(serializers.ModelSerializer):
         return str(revision.id) if revision else None
 
 
+class ScriptContentField(serializers.CharField):
+    """The source writer hashes original text; never coerce or trim it here."""
+
+    def __init__(self, **kwargs):
+        super().__init__(trim_whitespace=False, **kwargs)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, str):
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
 class ScriptSourceCreateInputSerializer(serializers.Serializer):
     project_id = serializers.UUIDField()
     asset_id = serializers.UUIDField(required=False)
@@ -3853,7 +4045,7 @@ class ScriptSourceCreateInputSerializer(serializers.Serializer):
         required=False,
         default=ScriptSource.SourceFormat.PLAIN,
     )
-    content = serializers.CharField(required=False, allow_blank=True)
+    content = ScriptContentField(required=False, allow_blank=True)
     file = serializers.FileField(required=False)
 
     def validate(self, attrs):
@@ -3892,9 +4084,21 @@ class ScriptSourceCreateResponseSerializer(serializers.Serializer):
     revision = ScriptRevisionDetailSerializer()
 
 
+class ScriptStructureBasisSerializer(serializers.Serializer):
+    revision_id = serializers.UUIDField()
+    document_sha256 = serializers.RegexField(r"^[a-f0-9]{64}$")
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or set(data) != {"revision_id", "document_sha256"}:
+            raise serializers.ValidationError("结构化另存仅接受原修订及其详情摘要，不接受替换输出合同。")
+        return super().to_internal_value(data)
+
+
 class ScriptRevisionCreateInputSerializer(serializers.Serializer):
     source_id = serializers.UUIDField()
-    content = serializers.CharField()
+    content = ScriptContentField()
+    structure_basis = ScriptStructureBasisSerializer(required=False,
+        help_text="按已有结构化详情的确切合同另存新预览；原文与结构化详情一起提交，失败全部回滚，不确认或采用。")
 
 
 class RuntimeRecommendationInputSerializer(serializers.Serializer):
@@ -3945,6 +4149,29 @@ class NodeMetadataQuerySerializer(serializers.Serializer):
 
 
 class ProductionRecipeVersionSerializer(serializers.ModelSerializer):
+    definition = serializers.JSONField(required=False, help_text=(
+        "schema3配方。assembly/existing_pipeline阶段可选assembly_output、assembly_timing或assembly_media："
+        "output_version_id(UUID)、expected_contract_sha256(64位摘要)、mapping，以及互斥的source_text(人工JSON原文)"
+        "或source={kind:selected_output,stage_key,output_key,scope:{kind:project},selection_policy:reviewed_selected}。"
+        "上游必须是本配方更早步骤的确切通用JSON输出；保存校验结构映射，准备时读取正式选择并冻结决定/产物身份及原值。"
+        "mapping使用M1 schema_version=1及node。所选已发布structured_json.v1输出定义原始字段布局，"
+        "assembly_output映射目标必须完整提供width/height/fps正整数；assembly_timing映射目标为"
+        "episodes[{number,shots[{number,duration_ms,episode_start_ms,episode_end_ms}]}]，"
+        "完整已知集镜范围及顺序时长须与本轮分镜一致；不改选片、不覆盖分镜。"
+        "assembly_media目标为episodes[{number,shots[{number,artifact_id}]}]，核对完整集镜与原已采用产物；"
+        "已有Asset先经原素材采用入口形成adopted_media，不伪造生成。映射不执行采用或改变原决定。"
+        "不转换类型或回退项目值，"
+        "不修改媒体采用、逐镜时序或编码配置。省略assembly_output时使用项目几何；"
+        "省略assembly_timing时直接使用本轮分镜时序，均在阶段准备时冻结。"
+        "delivery/existing_pipeline可选delivery_metadata，复用上述确切版本及原文/上游来源映射，"
+        "目标为title（1至200字符）和notes（可为空文本）；原值与完整结构来源冻结并进入ReleaseBundle签名。"))
+
+    def to_internal_value(self, data):
+        unknown = set(data) - set(self.fields)
+        if unknown:
+            raise serializers.ValidationError({key: "未声明字段" for key in sorted(unknown)})
+        return super().to_internal_value(data)
+
     class Meta:
         model = ProductionRecipeVersion
         fields = "__all__"
@@ -3969,7 +4196,8 @@ class ProductionRecipeVersionSerializer(serializers.ModelSerializer):
             })
         definition = attrs.get("definition", getattr(self.instance, "definition", {}))
         try:
-            validate_recipe_registry_references(definition)
+            from studio.services.production_recipe_contracts import validate_recipe_definition
+            validate_recipe_definition(definition)
         except DjangoValidationError as exc:
             _raise_drf(exc)
         sensitive = find_forbidden_secret_fields(definition)
@@ -3979,6 +4207,7 @@ class ProductionRecipeVersionSerializer(serializers.ModelSerializer):
             })
         contract = json_contract(
             definition,
+            schema_version=definition["schema_version"],
             max_bytes=_stage_snapshot_max_bytes(),
         )
         attrs.update({
@@ -3995,72 +4224,72 @@ class ProductionRecipeCloneSuccessorInputSerializer(serializers.Serializer):
     )
 
 
+class ProductionRecipeAuthoringLimitsSerializer(serializers.Serializer):
+    max_routing_routes = serializers.IntegerField(min_value=1)
+    max_variants = serializers.IntegerField(min_value=1)
+    max_generation_tasks = serializers.IntegerField(min_value=1)
+
+
+class ProductionRecipeParameterSourceOptionSerializer(serializers.Serializer):
+    selector_key = serializers.CharField()
+    label = serializers.CharField()
+    scope_kind = serializers.CharField()
+    type = serializers.CharField()
+    unit = serializers.CharField()
+    source_kind = serializers.CharField()
+    parameter_key = serializers.CharField(allow_null=True)
+    stage_key = serializers.CharField(allow_null=True)
+    description = serializers.CharField()
+
+
+class ProductionRecipeSourceOptionsInputSerializer(serializers.Serializer):
+    definition = serializers.JSONField(help_text="当前 schema3 草稿；只核对步骤声明和确切输出路线，不保存或校验未完成的输入映射。")
+
+
+class ProductionRecipeSourceOptionsSerializer(serializers.Serializer):
+    text_output_options = serializers.ListField(child=serializers.DictField(), read_only=True)
+
+
+class RecipeShotReferenceSourceOptionSerializer(serializers.Serializer):
+    value = serializers.CharField(read_only=True)
+    label = serializers.CharField(read_only=True)
+    upstream_stage_key = serializers.CharField(read_only=True, allow_null=True)
+    selection_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+
+
 class ProductionRecipeEditorOptionsSerializer(serializers.Serializer):
+    delivery_metadata_schema = serializers.DictField(read_only=True,
+        help_text="交付标题及说明的M1映射目标Schema；原值及确切来源进入同一ReleaseBundle签名。")
+    assembly_output_schema = serializers.DictField(read_only=True,
+        help_text="装配输出M1映射的有限目标Schema（width/height/fps）；原始字段来自确切业务输出结构。")
+    assembly_timing_schema = serializers.DictField(read_only=True,
+        help_text="已知逐集逐镜时序M1映射的有限目标Schema；完整范围须匹配本轮分镜，不包含选片身份或自动上游来源。")
+    assembly_media_schema = serializers.DictField(read_only=True,
+        help_text="完整集镜及已采用产物的M1映射目标Schema；只核对原选择，不执行采用或生成。")
+    shot_reference_source_options = RecipeShotReferenceSourceOptionSerializer(many=True, read_only=True)
+    material_source_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+    material_selection_options = FormCatalogChoiceSerializer(many=True, read_only=True)
     definition_schema_version = serializers.IntegerField(read_only=True)
+    effective_limits = ProductionRecipeAuthoringLimitsSerializer(read_only=True)
     stage_options = serializers.ListField(child=serializers.DictField(), read_only=True)
     approval_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+    interaction_mode_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+    field_review_policy_options = serializers.ListField(child=serializers.DictField(), read_only=True)
+    source_kind_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+    structure_node_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+    text_output_options = serializers.ListField(child=serializers.DictField(), read_only=True)
+    reference_source_options = serializers.ListField(child=serializers.DictField(), read_only=True)
+    parameter_source_options = ProductionRecipeParameterSourceOptionSerializer(many=True, read_only=True)
+    parameter_policy_options = FormCatalogChoiceSerializer(many=True, read_only=True)
+    scope_options = FormCatalogChoiceSerializer(many=True, read_only=True)
     routing_mode_options = FormCatalogChoiceSerializer(many=True, read_only=True)
     presets = serializers.ListField(child=serializers.DictField(), read_only=True)
-
-
-class ProductionPromptProfileChoiceSerializer(serializers.Serializer):
-    binding_id = serializers.UUIDField()
-    binding_key = serializers.CharField()
-    binding_name = serializers.CharField()
-    prompt_profile_version_id = serializers.UUIDField()
-    profile_key = serializers.CharField()
-    profile_version = serializers.IntegerField(min_value=1)
-    profile_name = serializers.CharField()
-    contract_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$")
-    priority = serializers.IntegerField()
-    binding_scope = serializers.ChoiceField(choices=("exact_model", "model_family"))
-
-
-class ProductionPromptProfileRequirementSerializer(serializers.Serializer):
-    operation = serializers.CharField()
-    mode = serializers.CharField(allow_blank=True)
-    choices = ProductionPromptProfileChoiceSerializer(many=True)
-
-
-class ProductionRecipeMediaRouteOptionSerializer(serializers.Serializer):
-    route_index = serializers.IntegerField(min_value=0)
-    workflow_version_id = serializers.UUIDField(allow_null=True)
-    workflow_label = serializers.CharField()
-    model_deployment_id = serializers.UUIDField(allow_null=True)
-    deployment_label = serializers.CharField()
-    model_identifier = serializers.CharField(allow_blank=True)
-    driver_type = serializers.CharField(allow_blank=True)
-    output_kinds = serializers.ListField(child=serializers.CharField())
-    conditioning_modes = serializers.ListField(child=serializers.DictField())
-    conditioning_contract_sha256 = serializers.CharField(allow_blank=True)
-    media_constraints = serializers.DictField(allow_null=True)
-    media_constraints_sha256 = serializers.CharField(allow_blank=True)
-    media_operations = serializers.ListField(child=serializers.CharField())
-    is_selectable = serializers.BooleanField()
-    reason_codes = serializers.ListField(child=serializers.CharField())
-    reasons = serializers.ListField(child=serializers.CharField())
-    prompt_profile_requirements = ProductionPromptProfileRequirementSerializer(many=True)
-
-
-class ProductionRecipeMediaRouteEffectiveLimitsSerializer(serializers.Serializer):
-    max_routing_routes = serializers.IntegerField(min_value=1)
-
-
-class ProductionRecipeMediaRouteOptionsSerializer(serializers.Serializer):
-    schema_version = serializers.IntegerField(min_value=2, max_value=2)
-    recipe_version_id = serializers.UUIDField()
-    recipe_definition_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$")
-    routes = ProductionRecipeMediaRouteOptionSerializer(many=True)
-    bible_image_generation = ProductionPromptProfileRequirementSerializer(allow_null=True)
-    effective_limits = ProductionRecipeMediaRouteEffectiveLimitsSerializer(
-        read_only=True,
-    )
 
 
 class ArtifactSelectionDecisionSerializer(serializers.ModelSerializer):
     class Meta:
         model = ArtifactSelectionDecision
-        fields = ("id", "variant_group", "revision", "artifact", "selected_by", "created_at")
+        fields = ("id", "variant_group", "revision", "artifact", "selection_mode", "selected_by", "created_at")
         read_only_fields = fields
 
 
@@ -4163,6 +4392,18 @@ class ApprovalDecisionFactSerializer(serializers.ModelSerializer):
 
 
 class StageRunSerializer(serializers.ModelSerializer):
+    input_amendment_policy = serializers.SerializerMethodField()
+
+    def get_input_amendment_policy(self, instance) -> str | None:
+        run = instance.production_run
+        if (run.plan_source != "recipe" or run.status != "blocked"
+                or run.current_stage_key != instance.stage_key or instance.mode != "ai"):
+            return None
+        from studio.services.production_recipe_preparations import recipe_stage_context
+        from studio.services.production_stage_input_amendments import source_amendment_policy
+        _, declaration = recipe_stage_context(instance)
+        return source_amendment_policy(declaration)
+
     approval_decisions = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
     approval_decision_facts = ApprovalDecisionFactSerializer(
         source="approval_decisions",
@@ -4176,10 +4417,11 @@ class StageRunSerializer(serializers.ModelSerializer):
         model = StageRun
         fields = (
             "id", "stage_key", "ordinal", "mode", "status", "approval_required",
+            "input_amendment_policy",
             "decision_policy", "decision_policy_sha256",
             "attempt_count", "input_reference", "output_reference", "reason_code",
             "reason", "routing", "routing_sha256", "routing_decision",
-            "routing_decision_sha256", "selected_route_index",
+            "routing_decision_sha256", "selected_route_index", "selected_variant_route_index",
             "config_snapshot", "config_snapshot_sha256",
             "input_snapshot", "input_snapshot_sha256",
             "output_snapshot", "output_snapshot_sha256",
@@ -4240,17 +4482,15 @@ class StageRunSerializer(serializers.ModelSerializer):
 class GenerationAttemptSerializer(serializers.ModelSerializer):
     provider_request_id_sha256 = serializers.SerializerMethodField()
     provider_request_id_suffix = serializers.SerializerMethodField()
-    repair_of_attempt_id = serializers.SerializerMethodField()
-    retry_feedback_sha256 = serializers.SerializerMethodField()
 
     class Meta:
         model = GenerationAttempt
         fields = (
-            "id", "stage_run", "unit_key", "attempt_number", "model_deployment",
-            "generation_task", "prompt_profile_version", "prompt_profile_binding_key",
+            "id", "stage_run", "unit_key", "attempt_number", "model_deployment", "retry_of", "retry_requested_by",
+            "execution_instance_version", "preparation", "parent_preparation", "role", "auxiliary_purpose", "field_batch_key",
+            "generation_task", "prompt_profile_version",
             "prompt_profile_contract_sha256", "status", "route_index", "operation", "is_external",
             "provider_request_id_sha256", "provider_request_id_suffix",
-            "repair_of_attempt_id", "retry_feedback_sha256",
             "request_sha256", "request_snapshot_schema_version",
             "request_snapshot_size_bytes", "request_snapshot_sha256", "result_sha256",
             "estimated_cost", "committed_cost", "actual_cost", "cost_currency",
@@ -4274,26 +4514,11 @@ class GenerationAttemptSerializer(serializers.ModelSerializer):
         value = str(obj.provider_request_id or "")
         return value[-6:] if value else ""
 
-    def get_repair_of_attempt_id(self, obj) -> str:
-        snapshot = obj.request_snapshot if isinstance(obj.request_snapshot, dict) else {}
-        value = snapshot.get("repair_of_attempt_id")
-        try:
-            return str(uuid.UUID(str(value))) if value else ""
-        except (TypeError, ValueError, AttributeError):
-            return ""
-
-    def get_retry_feedback_sha256(self, obj) -> str:
-        snapshot = obj.request_snapshot if isinstance(obj.request_snapshot, dict) else {}
-        value = str(snapshot.get("retry_feedback_sha256") or "").casefold()
-        if len(value) == 64 and all(character in "0123456789abcdef" for character in value):
-            return value
-        return ""
-
 
 class ResolvePromptNormalizationSmokeInputSerializer(serializers.Serializer):
     smoke_attempt_id = serializers.UUIDField()
     outcome = serializers.ChoiceField(
-        choices=ModelDeploymentSmokeAttemptResolution.Outcome.choices,
+        choices=ModelDeploymentSmokeAttemptResolution.OPERATOR_CHOICES,
     )
     note = serializers.CharField(trim_whitespace=True)
     provider_request_id = serializers.CharField(
@@ -4325,6 +4550,10 @@ class ResolvePromptNormalizationSmokeInputSerializer(serializers.Serializer):
 
 
 class PromptNormalizationSmokeResolutionSerializer(serializers.ModelSerializer):
+    # This endpoint returns an operator decision, never a system observation.
+    outcome = serializers.ChoiceField(read_only=True,
+        choices=ModelDeploymentSmokeAttemptResolution.OPERATOR_CHOICES)
+    decided_by = serializers.PrimaryKeyRelatedField(read_only=True)
     smoke_attempt_id = serializers.UUIDField(source="attempt_id", read_only=True)
     smoke_attempt_status = serializers.CharField(source="attempt.status", read_only=True)
     request_sha256 = serializers.CharField(source="attempt.request_sha256", read_only=True)
@@ -4367,6 +4596,7 @@ class GeneratedArtifactListSerializer(serializers.ModelSerializer):
             or obj.kind not in {
                 GeneratedArtifact.Kind.IMAGE,
                 GeneratedArtifact.Kind.VIDEO,
+                GeneratedArtifact.Kind.AUDIO,
                 GeneratedArtifact.Kind.ASSEMBLY,
             }
         ):
@@ -4391,8 +4621,27 @@ class GeneratedArtifactListSerializer(serializers.ModelSerializer):
 
 
 class GeneratedArtifactDetailSerializer(GeneratedArtifactListSerializer):
+    text_candidate = serializers.SerializerMethodField()
+    manual_media_candidate = serializers.SerializerMethodField()
+
+    @extend_schema_field(ManualMediaCandidateSerializer(allow_null=True))
+    def get_manual_media_candidate(self, obj):
+        from studio.services.production_manual_media import manual_media_candidate_detail
+        try:
+            return manual_media_candidate_detail(obj)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"manual_media_candidate": exc.messages}) from exc
+
+    @extend_schema_field(serializers.JSONField(allow_null=True, help_text="原调用文本候选；text.structured 的 candidate.value 为实际 JSON。结构化剧本的 candidate 为完整原始 JSON，text 为保真原文，revision/projection 为原修订及语义投影。json_schema 来自原冻结结构，output_contract 保留确切版本；读取不解析重跑、不采用、不补查新版本。"))
+    def get_text_candidate(self, obj):
+        from studio.services.execution_production_candidates import read_production_text_candidate
+        try:
+            return read_production_text_candidate(obj)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"text_candidate": exc.messages}) from exc
+
     class Meta(GeneratedArtifactListSerializer.Meta):
-        fields = GeneratedArtifactListSerializer.Meta.fields + ("manifest_metadata",)
+        fields = GeneratedArtifactListSerializer.Meta.fields + ("manifest_metadata", "text_candidate", "manual_media_candidate")
 
 
 class ProductionRunListSerializer(serializers.ModelSerializer):
@@ -4402,12 +4651,12 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
     class Meta:
         model = ProductionRun
         fields = (
-            "id", "project", "project_title", "script_revision", "recipe_version",
+            "id", "project", "project_title", "script_revision", "recipe_version", "plan_source",
             "idempotency_key", "request_sha256", "status", "current_stage_key",
-            "blocked_code", "blocked_reason", "allow_external_calls", "budget_limit",
+            "blocked_code", "blocked_reason", "allow_external_calls",
             "cost_currency", "estimated_cost_total", "committed_cost_total",
             "actual_cost_total", "release_bundle_id",
-            "max_generation_tasks", "generation_task_count", "config_snapshot_sha256",
+            "generation_task_count", "config_snapshot_sha256",
             "input_snapshot_sha256", "started_at", "finished_at", "created_at", "updated_at",
         )
         read_only_fields = fields
@@ -4433,13 +4682,106 @@ class ProductionRunListSerializer(serializers.ModelSerializer):
         return data
 
 
+class ProductionRunPlanEnvelopeSerializer(serializers.Serializer):
+    value = serializers.JSONField()
+    schema_version = serializers.IntegerField()
+    size_bytes = serializers.IntegerField()
+    sha256 = serializers.CharField()
+
+
+class ProductionBudgetCurrencyOptionSerializer(serializers.Serializer):
+    value = serializers.CharField()
+    label = serializers.CharField()
+
+
+class ProductionBudgetOptionsSerializer(serializers.Serializer):
+    resource_policy = serializers.JSONField(read_only=True)
+    currencies = ProductionBudgetCurrencyOptionSerializer(many=True)
+
+
+class ProductionManualOptionsSerializer(serializers.Serializer):
+    project_id = serializers.UUIDField()
+    stage_catalog = ProductionRunPlanEnvelopeSerializer()
+    scope_kinds = serializers.ListField(child=serializers.CharField())
+    delivery_kinds = serializers.ListField(child=serializers.CharField())
+    initial_content_kinds = serializers.ListField(child=serializers.CharField())
+    facts = serializers.DictField(child=serializers.IntegerField(min_value=0))
+
+
+class ProductionRunRetryInputSerializer(ExecutionAuthoringSerializer):
+    expected_stage_id = serializers.UUIDField()
+    expected_attempt_ids = serializers.ListField(child=serializers.UUIDField(), allow_empty=True)
+    expected_assembly_job_ids = serializers.ListField(child=serializers.UUIDField(), allow_empty=True, required=False)
+    expected_input_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$", allow_blank=True, required=False)
+
+    def validate_expected_assembly_job_ids(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("不能重复指定失败装配任务")
+        return value
+
+    def validate_expected_attempt_ids(self, value):
+        if len(value) != len(set(value)):
+            raise serializers.ValidationError("不能重复指定失败调用")
+        return value
+
+
+class ProductionRetryPreviewQuerySerializer(serializers.Serializer):
+    expected_stage_id = serializers.UUIDField()
+
+
+class ProductionRetryImpactSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    kind = serializers.ChoiceField(choices=("call", "preparation", "assembly"))
+    unit_key = serializers.CharField()
+    preparation_id = serializers.UUIDField(allow_null=True)
+    attempt_id = serializers.UUIDField(allow_null=True)
+    status = serializers.CharField()
+    error_code = serializers.CharField(allow_blank=True)
+    disposition = serializers.ChoiceField(choices=("retry", "skip", "attention"))
+    message = serializers.CharField()
+    episode_number = serializers.IntegerField(min_value=1, required=False)
+    consumer_input_sha256 = serializers.CharField(allow_blank=True, required=False)
+    error_message = serializers.CharField(allow_blank=True, required=False)
+
+
+class ProductionRetryPreviewSerializer(serializers.Serializer):
+    retry_context = ProductionRunRetryInputSerializer()
+    mode = serializers.ChoiceField(choices=("primary_calls", "stage_flow", "assembly_jobs"))
+    can_submit = serializers.BooleanField(help_text="当前原重试检查结果；不是提交承诺，提交仍检查状态、范围及资源。")
+    reason = serializers.CharField(allow_blank=True)
+    message = serializers.CharField()
+    call_count = serializers.IntegerField(min_value=0)
+    preparation_count = serializers.IntegerField(min_value=0)
+    assembly_count = serializers.IntegerField(min_value=0, required=False)
+    count = serializers.IntegerField(min_value=0)
+    next = serializers.URLField(allow_null=True)
+    previous = serializers.URLField(allow_null=True)
+    results = ProductionRetryImpactSerializer(many=True)
+
+
 class ProductionRunDetailSerializer(ProductionRunListSerializer):
     stages = StageRunSerializer(many=True, read_only=True)
     artifacts = GeneratedArtifactListSerializer(many=True, read_only=True)
+    execution_plan = serializers.SerializerMethodField()
+    retry_context = serializers.SerializerMethodField()
+
+    @extend_schema_field(ProductionRunRetryInputSerializer(allow_null=True))
+    def get_retry_context(self, obj):
+        from studio.services.production_execution_retry import stage_retry_context
+        stage = obj.stages.filter(stage_key=obj.current_stage_key).first()
+        if stage is None or obj.plan_source != "recipe":
+            return None
+        return stage_retry_context(stage)
+
+    @extend_schema_field(ProductionRunPlanEnvelopeSerializer)
+    def get_execution_plan(self, obj):
+        from studio.services.production_run_plans import get_run_execution_plan
+        plan = get_run_execution_plan(obj)
+        return {"value": plan.value, "schema_version": plan.schema_version, "size_bytes": plan.size_bytes, "sha256": plan.sha256}
 
     class Meta(ProductionRunListSerializer.Meta):
         fields = ProductionRunListSerializer.Meta.fields + (
-            "config_revision", "config_snapshot", "input_snapshot", "stages", "artifacts",
+            "config_revision", "config_snapshot", "input_snapshot", "stages", "artifacts", "execution_plan", "retry_context",
         )
 
     def to_representation(self, instance):
@@ -4449,113 +4791,58 @@ class ProductionRunDetailSerializer(ProductionRunListSerializer):
         return data
 
 
-class ProductionWorkflowShotRouteSerializer(serializers.Serializer):
-    shot_id = serializers.UUIDField()
-    route_index = serializers.IntegerField(min_value=0)
-    prompt_profile_binding_id = serializers.UUIDField()
 
 
-class ProductionWorkflowPromptProfileSelectionSerializer(serializers.Serializer):
-    operation = serializers.CharField(max_length=100)
-    mode = serializers.CharField(required=False, allow_blank=True, default="", max_length=100)
-    prompt_profile_binding_id = serializers.UUIDField()
-
-
-class ProductionWorkflowSelectionSerializer(serializers.Serializer):
-    schema_version = serializers.IntegerField(min_value=2, max_value=2)
-    mode = serializers.ChoiceField(choices=("uniform", "per_shot"))
-    route_index = serializers.IntegerField(
-        required=False,
-        allow_null=True,
-        default=None,
-        min_value=0,
-    )
-    shot_routes = ProductionWorkflowShotRouteSerializer(
-        many=True,
-        required=False,
-        default=list,
-        allow_empty=True,
-    )
-    prompt_profile_selections = ProductionWorkflowPromptProfileSelectionSerializer(
-        many=True,
-        required=False,
-        default=list,
-        allow_empty=True,
-    )
+class ProductionPlanScopeSerializer(ExecutionAuthoringSerializer):
+    kind = serializers.ChoiceField(choices=("project", "episodes"))
+    episode_ids = serializers.ListField(child=serializers.UUIDField(), required=False, allow_empty=False)
 
     def validate(self, attrs):
-        mode = attrs["mode"]
-        route_index = attrs.get("route_index")
-        shot_routes = attrs.get("shot_routes") or []
-        profile_selections = attrs.get("prompt_profile_selections") or []
-        if mode == "uniform":
-            if route_index is None:
-                raise serializers.ValidationError({
-                    "route_index": "整集统一工作流必须选择一个配方 route",
-                })
-            if shot_routes:
-                raise serializers.ValidationError({
-                    "shot_routes": "整集统一工作流不能同时提交逐镜头 route",
-                })
-            if not profile_selections:
-                raise serializers.ValidationError({
-                    "prompt_profile_selections": "整集 route 必须显式选择 PromptProfile binding",
-                })
-            contracts = [
-                (item["operation"], item.get("mode") or "")
-                for item in profile_selections
-            ]
-            if len(contracts) != len(set(contracts)):
-                raise serializers.ValidationError({
-                    "prompt_profile_selections": "同一 operation/mode 不能重复选择",
-                })
-            return attrs
-        if route_index is not None:
-            raise serializers.ValidationError({
-                "route_index": "逐镜头工作流不能同时提交整集 route",
-            })
-        if not shot_routes:
-            raise serializers.ValidationError({
-                "shot_routes": "逐镜头工作流必须提交完整镜头映射",
-            })
-        if profile_selections:
-            raise serializers.ValidationError({
-                "prompt_profile_selections": "逐镜头模式的 binding 必须随 shot_routes 提交",
-            })
-        shot_ids = [str(item["shot_id"]) for item in shot_routes]
-        if len(shot_ids) != len(set(shot_ids)):
-            raise serializers.ValidationError({
-                "shot_routes": "同一镜头不能重复选择 route",
-            })
+        if (attrs["kind"] == "episodes") != ("episode_ids" in attrs):
+            raise serializers.ValidationError("项目范围不携带剧集数组；剧集范围必须明确选择")
+        if "episode_ids" in attrs:
+            ids = [str(value) for value in attrs["episode_ids"]]
+            if len(ids) != len(set(ids)):
+                raise serializers.ValidationError({"episode_ids": "不能重复指定同一剧集"})
+            attrs["episode_ids"] = sorted(ids)
         return attrs
 
 
-class UnattendedReferenceInputSerializer(serializers.Serializer):
-    asset_id = serializers.UUIDField()
-    purpose = serializers.RegexField(SAFE_CONDITIONING_IDENTIFIER_PATTERN)
-    use_embedded_audio = serializers.BooleanField()
+class ProductionPlanDeliverySerializer(ExecutionAuthoringSerializer):
+    kind = serializers.ChoiceField(choices=("episode_masters",))
 
 
-class ProductionRunCreateSerializer(serializers.Serializer):
+class ProductionPlanInitialContentSerializer(ExecutionAuthoringSerializer):
+    kind = serializers.ChoiceField(choices=("script_revision",))
+    id = serializers.UUIDField()
+    expected_sha256 = serializers.RegexField(r"^[a-f0-9]{64}$")
+
+    def validate_id(self, value):
+        return str(value)
+
+
+class ProductionManualPlanInputSerializer(ExecutionAuthoringSerializer):
+    stage_catalog_key = serializers.CharField(max_length=100)
+    expected_stage_catalog_sha256 = serializers.RegexField(r"^[a-f0-9]{64}$")
+    scope = ProductionPlanScopeSerializer()
+    delivery = ProductionPlanDeliverySerializer()
+    initial_content = ProductionPlanInitialContentSerializer(allow_null=True)
+
+
+class RecipeProjectSourceConfirmationSerializer(ExecutionAuthoringSerializer):
+    execution_instance_version_id = serializers.UUIDField()
+    input_key = serializers.CharField()
+    reference = serializers.CharField(help_text="原项目输入预览凭据；提交表示确认冻结所预览内容，不代表外部调用或产物审核授权。")
+
+
+class ProductionRunCreateSerializer(ExecutionAuthoringSerializer):
     project_id = serializers.UUIDField()
+    plan_source = serializers.ChoiceField(choices=ProductionRun.PlanSource.choices)
     script_revision_id = serializers.UUIDField(required=False, allow_null=True)
-    recipe_version_id = serializers.UUIDField()
+    recipe_version_id = serializers.UUIDField(required=False, allow_null=True)
+    manual_plan = ProductionManualPlanInputSerializer(required=False)
     idempotency_key = serializers.CharField(max_length=120)
     allow_external_calls = serializers.BooleanField(required=False, allow_null=True, default=None)
-    budget_limit = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=4,
-        required=False,
-        allow_null=True,
-        default=None,
-        min_value=0,
-    )
-    max_generation_tasks = serializers.IntegerField(
-        required=False,
-        allow_null=True,
-        default=None,
-        min_value=1,
-    )
     config_overrides = serializers.DictField(required=False, default=dict)
     idea = serializers.CharField(required=False, allow_blank=True, default="")
     style_hint = serializers.CharField(required=False, allow_blank=True, default="")
@@ -4565,8 +4852,8 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         default=None,
         min_value=1,
         help_text=(
-            "AI 剧本或含 script_structure/ai 的导入结构化计划集数；省略时使用"
-            "当前项目创建策略的冻结默认值。"
+            "本轮明确的计划集数；AI 剧本必须提供，导入结构化计划需与镜数、时长同时提供。"
+            "省略表示未指定，不读取项目默认值。"
         ),
     )
     shots_per_episode = serializers.IntegerField(
@@ -4575,8 +4862,8 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         default=None,
         min_value=1,
         help_text=(
-            "AI 剧本必须提供；导入剧本仅在配方含 script_structure/ai 时可与"
-            "episode_duration_seconds 成对提供。"
+            "本轮明确的每集镜数；AI 剧本必须提供，导入剧本仅在配方含 script_structure/ai "
+            "且同时指定集数、时长时可提供。"
         ),
     )
     episode_duration_seconds = serializers.IntegerField(
@@ -4585,8 +4872,8 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         default=None,
         min_value=1,
         help_text=(
-            "单集总时长预算（秒）；会与所选结构化文本模型全部冻结 route 的"
-            "镜头时长策略求交并在外部调用前冻结或拒绝。"
+            "单集镜头时长之和（秒），不是平均镜头时长；须由配方显式映射到实例输入。"
+            "每次请求按精确实例核验，结果不符合计划或改写原稿明确时间时拒绝。"
         ),
     )
     episode_ids = serializers.ListField(
@@ -4595,25 +4882,25 @@ class ProductionRunCreateSerializer(serializers.Serializer):
         allow_empty=True,
         default=list,
     )
-    workflow_selection = ProductionWorkflowSelectionSerializer(
-        required=False,
-        allow_null=True,
-        default=None,
-    )
-    bible_image_prompt_profile_binding_id = serializers.UUIDField(
-        required=False,
-        allow_null=True,
-        default=None,
-    )
     unattended_confirmed = serializers.BooleanField(required=False, default=False)
-    reference_inputs = UnattendedReferenceInputSerializer(
-        many=True,
-        required=False,
-        default=list,
-    )
+    project_source_confirmations = RecipeProjectSourceConfirmationSerializer(many=True, required=False, default=list)
+
+    def validate_project_source_confirmations(self, value):
+        return [{**row, "execution_instance_version_id": str(row["execution_instance_version_id"])} for row in value]
 
     def validate_episode_ids(self, value):
         return sorted(set(value), key=str)
+
+    def validate(self, attrs):
+        if attrs["plan_source"] == "recipe":
+            if not attrs.get("recipe_version_id") or "manual_plan" in self.initial_data:
+                raise serializers.ValidationError("配方生产必须引用精确配方版本，不接收人工计划")
+        else:
+            allowed = {"project_id", "plan_source", "recipe_version_id", "manual_plan", "idempotency_key",
+                "allow_external_calls", "config_overrides"}
+            if attrs.get("recipe_version_id") is not None or "manual_plan" not in attrs or set(self.initial_data) - allowed:
+                raise serializers.ValidationError("人工制作仅通过 manual_plan 声明范围和初始内容，不接收配方或独立工作流选择")
+        return attrs
 
 
 class BibleLibraryAssetSelectionSerializer(serializers.Serializer):
@@ -4639,44 +4926,12 @@ class BibleImageBindingSelectionSerializer(serializers.Serializer):
     anchor_library_asset_id = serializers.UUIDField(required=False, allow_null=True)
 
     def validate(self, attrs):
-        selected_artifacts = attrs.get("selected_artifact_ids") or []
-        selected_library_assets = attrs.get("selected_library_assets") or []
-        selected_asset_ids = [item["asset_id"] for item in selected_library_assets]
-        if len(selected_artifacts) != len(set(selected_artifacts)):
-            raise serializers.ValidationError({
-                "selected_artifact_ids": "同一候选不能重复选择",
-            })
-        if len(selected_asset_ids) != len(set(selected_asset_ids)):
-            raise serializers.ValidationError({
-                "selected_library_assets": "同一素材库图片不能重复选择",
-            })
-        if not selected_artifacts and not selected_library_assets:
-            raise serializers.ValidationError(
-                "每个 Bible 实体必须至少选择一个模型候选或素材库图片",
-            )
-        maximum_assets = boundary_int(
-            "security.production.max_bible_reference_assets_per_entity"
-        )
-        if len(selected_artifacts) + len(selected_library_assets) > maximum_assets:
-            raise serializers.ValidationError(
-                f"每个 Bible 实体最多选择 {maximum_assets} 张参考图"
-            )
-        anchor_artifact = attrs.get("anchor_artifact_id")
-        anchor_asset = attrs.get("anchor_library_asset_id")
-        if bool(anchor_artifact) == bool(anchor_asset):
-            raise serializers.ValidationError(
-                "必须且只能从模型候选或素材库图片中指定一个 anchor",
-            )
-        if anchor_artifact and anchor_artifact not in selected_artifacts:
-            raise serializers.ValidationError({
-                "anchor_artifact_id": "anchor 必须属于 selected_artifact_ids",
-            })
-        if anchor_asset and anchor_asset not in selected_asset_ids:
-            raise serializers.ValidationError({
-                "anchor_library_asset_id": (
-                    "anchor 必须属于 selected_library_assets"
-                ),
-            })
+        from studio.services.bible_image_selections import normalize_bible_image_selection
+        try:
+            normalize_bible_image_selection(attrs, maximum_assets=boundary_int(
+                "security.production.max_bible_reference_assets_per_entity"))
+        except DjangoValidationError as exc:
+            _raise_drf(exc)
         return attrs
 
 
@@ -4705,55 +4960,33 @@ class BibleImageRegenerationInputSerializer(serializers.Serializer):
         return value
 
 
-class ShotReferenceEntityBindingSerializer(serializers.Serializer):
-    entity_id = serializers.UUIDField()
-    asset_id = serializers.UUIDField()
+class RecipeStoryboardReferenceSelectionSerializer(serializers.Serializer):
+    display = serializers.JSONField(help_text="只读显示：name_basis=current_bible_by_id；shots按原集号/镜号及ID排序，含episode_id/episode_number/episode_title、shot_id/number/title、scene、characters(role/position/entity)、props。实体含id/name/status(available或unavailable)。关系取原canonical，名称按同项目确切ID读取当前Bible；不进入审核摘要或模型输入。")
+    source_snapshot_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$")
+    selection_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$")
+    shot_count = serializers.IntegerField(min_value=1)
+    selection = serializers.JSONField(help_text="schema_version=1；project_id及按原分镜排序的shots；每镜有shot_id和有序uses（确切use_id/use_key/position/media_kind/purpose/setting/source_mode/source/asset），无默认主图或模型用途推断。")
 
 
-class StoryboardVideoReferenceSerializer(serializers.Serializer):
-    asset_id = serializers.UUIDField()
-    purpose = serializers.RegexField(SAFE_CONDITIONING_IDENTIFIER_PATTERN)
-    use_embedded_audio = serializers.BooleanField()
-    audio_asset_id = serializers.UUIDField(required=False, allow_null=True)
-    audio_purpose = serializers.RegexField(
-        SAFE_CONDITIONING_IDENTIFIER_PATTERN,
-        required=False,
-    )
+class TextCandidateSelectionSerializer(serializers.Serializer):
+    artifact_id = serializers.UUIDField()
+    expected_sha256 = serializers.RegexField(regex=r"^[0-9a-f]{64}$")
 
-    def validate(self, attrs):
-        embedded = bool(attrs.get("use_embedded_audio", False))
-        external_audio = attrs.get("audio_asset_id") is not None
-        if (embedded or external_audio) != (attrs.get("audio_purpose") is not None):
-            raise serializers.ValidationError(
-                "启用视频配套音频时必须提供 audio_purpose；未启用时不得提供",
-            )
-        return attrs
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or set(data) != {"artifact_id", "expected_sha256"}:
+            raise serializers.ValidationError("需要且仅接受候选产物ID和期望摘要")
+        return super().to_internal_value(data)
 
 
-class StoryboardAudioReferenceSerializer(serializers.Serializer):
-    asset_id = serializers.UUIDField()
-    purpose = serializers.RegexField(SAFE_CONDITIONING_IDENTIFIER_PATTERN)
-
-
-class StoryboardShotReferenceBindingsSerializer(serializers.Serializer):
-    first_frame_asset_id = serializers.UUIDField(required=False)
-    last_frame_asset_id = serializers.UUIDField(required=False)
-    first_frame_reference_asset_id = serializers.UUIDField(required=False)
-    characters = ShotReferenceEntityBindingSerializer(many=True, required=False)
-    scene = ShotReferenceEntityBindingSerializer(required=False)
-    props = ShotReferenceEntityBindingSerializer(many=True, required=False)
-    videos = StoryboardVideoReferenceSerializer(many=True, required=False)
-    audios = StoryboardAudioReferenceSerializer(many=True, required=False)
-
-
-class StoryboardShotReferenceSelectionSerializer(serializers.Serializer):
-    shot_id = serializers.UUIDField()
-    reference_bindings = StoryboardShotReferenceBindingsSerializer()
-
-
-class ApprovalDecisionInputSerializer(serializers.Serializer):
+class ApprovalDecisionInputSerializer(ExecutionAuthoringSerializer):
     stage_key = serializers.CharField(max_length=100)
     decision = serializers.ChoiceField(choices=ApprovalDecision.Decision.choices)
+    bible_review = BibleContentConfirmationSerializer(required=False,
+        help_text="Bible批准必须提交完整声明、设定确认集合及所见基线；不自动代审或采用图片。")
+    text_candidate = TextCandidateSelectionSerializer(required=False,
+        help_text="批准剧本或全剧影视规则时，明确选择当前生成阶段的候选产物及其摘要。")
+    script_content = ScriptContentField(required=False,
+        help_text="仅剧本批准：按原候选冻结合同编辑后的完整JSON。明确采用时另存人工修订；不改原模型返回，不写项目标题或梗概。省略则采用原候选。")
     comment = serializers.CharField(
         required=False,
         allow_blank=True,
@@ -4773,14 +5006,6 @@ class ApprovalDecisionInputSerializer(serializers.Serializer):
         allow_blank=True,
         default="",
     )
-    adopt_generated_metadata = serializers.BooleanField(
-        required=False,
-        default=False,
-        help_text=(
-            "仅在批准 script_review 时可设为 true；服务端只采用冻结候选的 title/logline，"
-            "并保留运行创建后发生的人工并发编辑。"
-        ),
-    )
     bible_image_bindings = BibleImageBindingSelectionSerializer(
         many=True,
         required=False,
@@ -4790,15 +5015,14 @@ class ApprovalDecisionInputSerializer(serializers.Serializer):
             "并从所选来源中指定唯一 anchor。"
         ),
     )
-    shot_reference_bindings = StoryboardShotReferenceSelectionSerializer(
-        many=True,
-        required=False,
-        default=list,
-        help_text=(
-            "storyboard_review 按 Shot 完整提交精确 reference_bindings；"
-            "Bible 生产闭包要求覆盖所有已选分集的 Shot。"
-        ),
-    )
+    expected_selection_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$", required=False,
+        help_text="storyboard_review批准必须提交正式只读审核返回的完整选择摘要；批准不写选择，来源或选择变化时报冲突。")
+
+    def validate_stage_key(self, value):
+        from studio.services.production_stage_catalog import PRODUCTION_STAGE_ORDER
+        if value not in PRODUCTION_STAGE_ORDER:
+            raise serializers.ValidationError("请选择当前阶段目录中的审核对象")
+        return value
 
     def validate_candidate_overrides(self, value):
         maximum_items = normalization_batch_max_items()
@@ -4808,7 +5032,7 @@ class ApprovalDecisionInputSerializer(serializers.Serializer):
                 f"candidate_overrides 最多包含 {maximum_items} 项",
             )
         if any(not isinstance(key, str) or not key or len(key) > 191 for key in value):
-            raise serializers.ValidationError("candidate_overrides 的 request_id 无效")
+            raise serializers.ValidationError("candidate_overrides 的字段名无效")
         if any(len(item) > maximum_characters for item in value.values()):
             raise serializers.ValidationError(
                 f"candidate_overrides 文本不能超过 {maximum_characters} 个字符",
@@ -4824,12 +5048,19 @@ class ApprovalDecisionInputSerializer(serializers.Serializer):
     def validate(self, attrs):
         is_snapshot_bound_approval = (
             attrs.get("stage_key") in {
-                "storyboard_review", "script_normalize_review", "visual_rules_review",
+                "script_review", "storyboard_review", "visual_rules_review",
                 "bible_image_review",
             }
             and attrs.get("decision") == ApprovalDecision.Decision.APPROVE
         )
+        if (attrs.get("stage_key") == "bible_review" and attrs.get("decision") == "approve") != ("bible_review" in attrs):
+            raise serializers.ValidationError({"bible_review": "批准Bible须提交完整核对；其他操作不接受此字段"})
         expected = str(attrs.get("expected_source_snapshot_sha256") or "")
+        text_approval = attrs.get("stage_key") in {"script_review", "visual_rules_review"} and attrs.get("decision") == "approve"
+        if "script_content" in attrs and not (attrs.get("stage_key") == "script_review" and attrs.get("decision") == "approve"):
+            raise serializers.ValidationError({"script_content": "编辑稿只允许在剧本审核批准时提交"})
+        if text_approval != ("text_candidate" in attrs):
+            raise serializers.ValidationError({"text_candidate": "文本候选批准必须明确选择产物；其他操作不接受此字段"})
         if is_snapshot_bound_approval and not expected:
             raise serializers.ValidationError({
                 "expected_source_snapshot_sha256": "批准前必须提交页面展示的来源快照 hash",
@@ -4837,16 +5068,9 @@ class ApprovalDecisionInputSerializer(serializers.Serializer):
         if expected and not is_snapshot_bound_approval:
             raise serializers.ValidationError({
                 "expected_source_snapshot_sha256": (
-                    "该字段只允许用于批准 storyboard_review、script_normalize_review、"
+                    "该字段只允许用于批准 script_review、storyboard_review、"
                     "visual_rules_review 或 bible_image_review"
                 ),
-            })
-        if attrs.get("adopt_generated_metadata") and not (
-            attrs.get("stage_key") == "script_review"
-            and attrs.get("decision") == ApprovalDecision.Decision.APPROVE
-        ):
-            raise serializers.ValidationError({
-                "adopt_generated_metadata": "只允许在批准 script_review 时启用",
             })
         bindings = attrs.get("bible_image_bindings") or []
         is_bible_approval = (
@@ -4870,43 +5094,61 @@ class ApprovalDecisionInputSerializer(serializers.Serializer):
             raise serializers.ValidationError({
                 "bible_image_bindings": "同一 Bible 实体不能重复提交",
             })
-        shot_bindings = attrs.get("shot_reference_bindings") or []
-        is_storyboard_approval = (
-            attrs.get("stage_key") == "storyboard_review"
-            and attrs.get("decision") == ApprovalDecision.Decision.APPROVE
-        )
-        if shot_bindings and not is_storyboard_approval:
-            raise serializers.ValidationError({
-                "shot_reference_bindings": "该字段只允许用于批准 storyboard_review",
-            })
-        shot_ids = [str(item["shot_id"]) for item in shot_bindings]
-        if len(shot_ids) != len(set(shot_ids)):
-            raise serializers.ValidationError({
-                "shot_reference_bindings": "同一 Shot 不能重复提交",
-            })
+        is_storyboard_approval = attrs.get("stage_key") == "storyboard_review" and attrs.get("decision") == "approve"
+        if is_storyboard_approval != ("expected_selection_sha256" in attrs):
+            raise serializers.ValidationError({"expected_selection_sha256": "批准分镜参考须提交所见选择摘要；其他操作不接受此字段"})
         return attrs
 
 
-class SelectArtifactInputSerializer(serializers.Serializer):
+class RecipeMaterialSelectionInputSerializer(ExecutionAuthoringSerializer):
+    expected_decision_id = serializers.UUIDField(allow_null=True,
+        help_text="影响预览返回的确切选择决定；尚无选择时显式传 null。")
+    expected_dependencies_sha256 = serializers.RegexField(r"^[0-9a-f]{64}$", required=False,
+        help_text="影响预览返回的依赖摘要。涉及变体准备的主图改选必须原样传回；服务端重查状态后原子处理。")
+
+
+class RecipeMaterialDependencySerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    unit_key = serializers.CharField()
+    reference_name = serializers.CharField()
+    status = serializers.ChoiceField(choices=ExecutionPreparation.Status.choices)
+    revision = serializers.IntegerField(min_value=1)
+    action = serializers.ChoiceField(choices=("reprepare", "retain", "blocked"))
+    reason = serializers.CharField()
+
+
+class RecipeMaterialSelectionContextSerializer(serializers.Serializer):
     artifact_id = serializers.UUIDField()
+    stage_run_id = serializers.UUIDField()
+    unit_key = serializers.CharField()
+    appearance_role = serializers.ChoiceField(choices=AssetReferenceSeries.Role.choices)
+    reference_name = serializers.CharField()
+    candidate_number = serializers.IntegerField()
+    expected_decision_id = serializers.UUIDField(allow_null=True)
+    selected_artifact_id = serializers.UUIDField(allow_null=True)
+    can_select = serializers.BooleanField()
+    reason = serializers.CharField(allow_blank=True)
+    dependent_preparations = RecipeMaterialDependencySerializer(many=True)
+    dependencies_sha256 = serializers.CharField()
+
+
+class SelectArtifactInputSerializer(ExecutionAuthoringSerializer):
+    artifact_id = serializers.UUIDField()
+    material_selection = RecipeMaterialSelectionInputSerializer(required=False,
+        help_text="配方素材阶段必填；复用原选择账本，不进行 Bible 审核采用或重写已冻结请求。")
 
 
 class SelectRouteInputSerializer(serializers.Serializer):
     stage_key = serializers.CharField(max_length=100)
     route_index = serializers.IntegerField(min_value=0)
+    appearance_role = serializers.ChoiceField(choices=AssetReferenceSeries.Role.choices, default="primary",
+        help_text="primary选择原阶段路线；variant只用于主图/变体生成阶段的变体路线，不继承主图选择。")
 
 
-class AuthorizeStageCostInputSerializer(serializers.Serializer):
-    stage_key = serializers.CharField(max_length=100)
+class AuthorizeStageCostInputSerializer(ExecutionAuthoringSerializer):
+    stage_key = serializers.CharField(max_length=100, required=False, allow_blank=True, default="",
+        help_text="留空只保存人工制作的整轮调用授权，不执行、批准或重试任何阶段。")
     allow_external_calls = serializers.BooleanField(required=False, allow_null=True, default=None)
-    budget_limit = serializers.DecimalField(
-        max_digits=12,
-        decimal_places=4,
-        required=False,
-        allow_null=True,
-        default=None,
-        min_value=0,
-    )
     approved_estimated_cost = serializers.DecimalField(
         max_digits=14,
         decimal_places=6,

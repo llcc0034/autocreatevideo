@@ -158,13 +158,11 @@ class PromptNormalizationRepairBatchMigrationTests(_MigrationTestCase):
             for row in Recipe.objects.all()
         }
 
-        from studio.models import ModelDeployment as RuntimeDeployment
-        from studio.services.async_media_contract import deployment_target_sha256
-
         self.smoke_facts = {}
         for deployment in deployments:
-            runtime = RuntimeDeployment.objects.get(pk=deployment.id)
-            target_sha256 = deployment_target_sha256(runtime)
+            # An opaque historical target hash must survive unchanged; current
+            # runtime readers must not be applied to this historical schema.
+            target_sha256 = "c" * 64
             operations = ["prompt.normalize"]
             evidence = {"schema_version": 1, "execution_submitted": True}
             operation_size, operation_sha = self._contract(operations)
@@ -197,6 +195,8 @@ class PromptNormalizationRepairBatchMigrationTests(_MigrationTestCase):
                 "target_sha256": target_sha256,
                 "evidence": deepcopy(smoke.evidence),
                 "evidence_sha256": smoke.evidence_sha256,
+                "profile_id": deployment.profile_version_id,
+                "specification_sha256": deployment.profile_version.specification_sha256,
             }
         self.assertFalse(Profile.objects.filter(
             profile_key=source.profile_key,
@@ -301,25 +301,21 @@ class PromptNormalizationRepairBatchMigrationTests(_MigrationTestCase):
             self.recipe_facts,
         )
 
-        from studio.models import ModelDeployment as RuntimeDeployment
-        from studio.services.async_media_contract import (
-            deployment_target_sha256,
-            fresh_smoke_snapshot,
-        )
-
         for deployment_key, smoke_before in self.smoke_facts.items():
             smoke = Snapshot.objects.get(pk=smoke_before["id"])
             self.assertEqual(smoke.target_sha256, smoke_before["target_sha256"])
             self.assertEqual(smoke.evidence, smoke_before["evidence"])
             self.assertEqual(smoke.evidence_sha256, smoke_before["evidence_sha256"])
-            current = RuntimeDeployment.objects.get(
+            current = Deployment.objects.get(
                 pk=self.deployments[deployment_key]["id"],
             )
             self.assertNotEqual(
-                deployment_target_sha256(current),
-                smoke_before["target_sha256"],
+                current.profile_version_id, smoke_before["profile_id"],
             )
-            self.assertIsNone(fresh_smoke_snapshot(current, "prompt.normalize"))
+            self.assertNotEqual(
+                current.profile_version.specification_sha256,
+                smoke_before["specification_sha256"],
+            )
 
     def test_v11_historical_snapshot_keeps_exact_binding_closure(self):
         Deployment = self.apps.get_model("studio", "ModelDeployment")

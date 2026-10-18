@@ -119,8 +119,10 @@ export const apiErrorPresentation = (
   const explicitMessage = cleanText(nestedError?.message)
     || cleanText(data?.message)
     || cleanText(data?.detail)
+    || stringMessages(data?.detail).join('；')
     || cleanText(details?.message)
     || cleanText(details?.detail)
+    || stringMessages(details?.detail).join('；')
     || [...detailMessages, ...fallbackDetailMessages].join('；')
   const localMessage = response ? '' : cleanText(root?.message)
   const message = htmlResponse

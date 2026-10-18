@@ -323,6 +323,8 @@ def api_graph_to_ui_workflow(
                 parsed_type, parsed_config, is_widget = _as_definition(
                     raw_definition, context=f"{class_type}.{name}"
                 )
+                if parsed_config.get("hidden") and name not in api_inputs:
+                    continue
                 if parsed_type == "COMFY_AUTOGROW_V3":
                     dynamic_records, dynamic_consumed = _autogrow_definition(
                         name, raw_definition, api_inputs
@@ -338,6 +340,30 @@ def api_graph_to_ui_workflow(
                 )
                 if name in api_inputs:
                     consumed.add(name)
+                try:
+                    children = dynamic_widget_definitions(
+                        name, parsed_type, parsed_config,
+                        selected_value=api_inputs.get(name),
+                        resolve_value=lambda child_name, _definition: api_inputs.get(child_name),
+                    )
+                except ValueError as exc:
+                    raise ComfyUICanvasExportError(str(exc)) from exc
+                for child_name, child_definition, child_required in children:
+                    child_type, child_config, child_widget = _as_definition(
+                        child_definition, context=f"{class_type}.{child_name}",
+                    )
+                    if not child_widget:
+                        raise ComfyUICanvasExportError(f"dynamic input {child_name!r} must be a bounded widget.")
+                    if child_name not in api_inputs:
+                        raise ComfyUICanvasExportError(
+                            f"{'required' if child_required else 'optional'} dynamic input "
+                            f"{node_id!r}.{child_name} is missing; positional canvas export requires explicit widget values."
+                        )
+                    input_records.append((child_name, child_type, child_config, True, None, child_required))
+                    consumed.add(child_name)
+        names = [record[0] for record in input_records]
+        if len(set(names)) != len(names):
+            raise ComfyUICanvasExportError(f"node {node_id!r} has colliding dynamic inputs.")
         unknown = sorted(set(api_inputs) - consumed)
         if unknown:
             raise ComfyUICanvasExportError(
@@ -876,6 +902,8 @@ class _CanvasImportBuilder:
                         )
                     except ComfyUICanvasExportError as exc:
                         raise ComfyUICanvasImportError(str(exc)) from exc
+                    if config.get("hidden") and name not in index_by_name:
+                        continue
                     if not is_widget or offset >= len(raw_widget_values):
                         continue
                     selected_widgets[name] = raw_widget_values[offset]
@@ -898,12 +926,8 @@ class _CanvasImportBuilder:
                             selected_value,
                             config,
                         )
-                    for child_name, child_definition, _child_required in dynamic_widget_definitions(
-                        name,
-                        input_type,
-                        config,
-                        selected_value=selected_value,
-                    ):
+                    def consume_child(child_name, child_definition):
+                        nonlocal offset
                         try:
                             child_type, child_config, child_widget = _as_definition(
                                 child_definition,
@@ -912,11 +936,39 @@ class _CanvasImportBuilder:
                         except ComfyUICanvasExportError as exc:
                             raise ComfyUICanvasImportError(str(exc)) from exc
                         if not child_widget or offset >= len(raw_widget_values):
-                            continue
+                            return None
                         selected_widgets[child_name] = raw_widget_values[offset]
                         offset += 1
                         if child_config.get("control_after_generate") and offset < len(raw_widget_values):
                             offset += 1
+                        child_value = selected_widgets[child_name]
+                        return (
+                            _normalized_combo_widget_value(child_value, child_config)
+                            if child_type in {"COMBO", "COMFY_DYNAMICCOMBO_V3"}
+                            else child_value
+                        )
+
+                    try:
+                        dynamic_widget_definitions(
+                            name, input_type, config, selected_value=selected_value,
+                            resolve_value=consume_child,
+                        )
+                    except ValueError as exc:
+                        raise ComfyUICanvasImportError(str(exc)) from exc
+
+        def selected_child(child_name, child_definition):
+            try:
+                child_type, child_config, _widget = _as_definition(
+                    child_definition, context=f"{instance.raw['type']}.{child_name}",
+                )
+            except ComfyUICanvasExportError as exc:
+                raise ComfyUICanvasImportError(str(exc)) from exc
+            value = selected_widgets.get(child_name)
+            return (
+                _normalized_combo_widget_value(value, child_config)
+                if child_type in {"COMBO", "COMFY_DYNAMICCOMBO_V3"} else value
+            )
+
         for category in ("required", "optional"):
             definitions = sections.get(category) or {}
             if not isinstance(definitions, dict):
@@ -924,12 +976,16 @@ class _CanvasImportBuilder:
                     f"node type {instance.raw['type']!r} has an invalid {category} schema."
                 )
             for name in _ordered_names(info, category, definitions):
+                if name in known_names:
+                    raise ComfyUICanvasImportError(f"input {name!r} collides with a dynamic input.")
                 try:
                     input_type, config, is_widget = _as_definition(
                         definitions[name], context=f"{instance.raw['type']}.{name}"
                     )
                 except ComfyUICanvasExportError as exc:
                     raise ComfyUICanvasImportError(str(exc)) from exc
+                if config.get("hidden") and name not in selected_widgets and name not in index_by_name:
+                    continue
                 if input_type == "COMFY_AUTOGROW_V3":
                     template = config.get("template") if isinstance(config, dict) else None
                     required = template.get("input", {}).get("required", {}) if isinstance(template, dict) else {}
@@ -971,12 +1027,14 @@ class _CanvasImportBuilder:
                         selected_value,
                         config,
                     )
-                for child_name, child_definition, child_required in dynamic_widget_definitions(
-                    name,
-                    input_type,
-                    config,
-                    selected_value=selected_value,
-                ):
+                try:
+                    children = dynamic_widget_definitions(
+                        name, input_type, config, selected_value=selected_value,
+                        resolve_value=selected_child,
+                    )
+                except ValueError as exc:
+                    raise ComfyUICanvasImportError(str(exc)) from exc
+                for child_name, child_definition, child_required in children:
                     try:
                         child_type, child_config, child_widget = _as_definition(
                             child_definition,

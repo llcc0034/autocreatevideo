@@ -8,16 +8,22 @@ const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
 
 test('deployment smoke creation identifies preparation and blocks changing operation while pending', async () => {
   const source = await readFile(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf8')
-  assert.match(source, /正在创建烟测任务…/)
-  assert.match(source, /正在准备并创建烟测任务；完成后将显示任务状态，由后台执行。请勿重复提交。/)
-  assert.match(source, /v-model="actionOperation" :disabled="saving"/)
+  const form = await readFile(new URL('../src/components/ExecutionSmokeCreateForm.vue', import.meta.url), 'utf8')
+  const resource = await readFile(new URL('../src/components/ResourceSmokeCreateForm.vue', import.meta.url), 'utf8')
+  assert.ok(source.includes('ResourceSmokeCreateForm'))
+  assert.ok(source.replace(/\s/g, '').includes("router.push({name:'workflows',query:{category:'smoke',kind:'preparation',id}})"))
+  assert.ok(!source.includes('ExecutionPreparationWorkbench'), 'saved Smoke uses the single task detail entry')
+  assert.ok(form.includes('正在创建…') && form.includes('重试确认同一请求'))
+  assert.ok(form.includes('pending.value.key') && form.includes(':disabled="busy || !!pending"'))
+  assert.ok(resource.includes('<fieldset v-if="options?.target" :disabled="busy || !!context">'))
 })
 
 const server = () => createServer({
   root: frontendRoot,
   logLevel: 'silent',
   appType: 'custom',
-  server: { middlewareMode: true },
+  server: { middlewareMode: true, hmr: false },
+  optimizeDeps: { noDiscovery: true },
 })
 
 test('acceptance smoke adapter preserves paginated workflow and deployment evidence', async () => {
@@ -235,7 +241,7 @@ test('acceptance smoke is a shared first-level settings destination without dupl
   try {
     const { settingsPrimaryNavigation, settingsSectionCatalog } = await vite.ssrLoadModule('/src/content/settingsSectionCatalog.ts')
     assert.deepEqual(settingsPrimaryNavigation.map((item: { id: string }) => item.id), [
-      'models', 'workflows', 'acceptance-smoke', 'prompts', 'routing', 'defaults', 'security', 'runtime', 'governance',
+      'models', 'workflows', 'acceptance-smoke', 'fields', 'prompts', 'routing', 'defaults', 'security', 'runtime', 'governance',
     ])
     assert.equal(settingsSectionCatalog.some((item: { id: string }) => item.id === 'acceptance-smoke'), false)
   } finally {
@@ -251,7 +257,7 @@ test('acceptance smoke is a shared first-level settings destination without dupl
   assert.ok(center.includes('<SettingsPrimaryNav/>'))
   assert.equal(settings.includes('验收与烟测中心'), false, '模型/工作流标题栏不应保留重复通用入口')
   assert.match(settings, /:to="workflowSmokeUrlForDeployment\(item\)"[^>]*><ShieldCheck[^>]*\/>工作流验收<\/RouterLink>/, '简短验收按钮仍指向精确实例的 Workflow Smoke 深链')
-  assert.ok(settings.includes('查看该实例验收'), '可直接 Smoke 的实例仍需保留精确验收深链')
+  assert.ok(settings.includes('查看该部署验收'), '可直接 Smoke 的实例仍需保留精确验收深链')
   assert.ok(settings.includes("['probe','smoke'].includes(String(route.query.focus||''))"), '实例 Probe/Smoke 深链都应高亮精确目标')
   assert.ok(settings.includes('() => route.query.focus'), '同一实例切换 Probe/Smoke 焦点时应重新聚焦')
   assert.equal(center.includes('返回系统设置'), false, '一级导航已提供返回路径，不应重复返回按钮')

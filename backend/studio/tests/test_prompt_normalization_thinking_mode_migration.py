@@ -121,17 +121,16 @@ class PromptNormalizationThinkingModeMigrationTests(_MigrationTestCase):
             for row in deployments
         }
 
-        from studio.models import ModelDeployment as RuntimeDeployment
-        from studio.services.async_media_contract import deployment_target_sha256
-
-        runtime = RuntimeDeployment.objects.get(pk=deployments[0].id)
-        target_sha256 = deployment_target_sha256(runtime)
+        # Opaque historical evidence is preserved by the migration, not
+        # recomputed by a runtime reader that requires the latest schema.
+        target_sha256 = "c" * 64
+        self.source_specification_sha256 = source.specification_sha256
         operations = ["prompt.normalize"]
         evidence = {"schema_version": 1, "execution_submitted": True}
         operations_size, operations_sha = self._contract(operations)
         evidence_size, evidence_sha = self._contract(evidence)
         smoke = Snapshot.objects.create(
-            deployment_id=runtime.id,
+            deployment_id=deployments[0].id,
             revision=1,
             probe_kind="smoke",
             status="succeeded",
@@ -156,7 +155,7 @@ class PromptNormalizationThinkingModeMigrationTests(_MigrationTestCase):
             Profile.objects.filter(profile_key="deepseek-text", version=13).exists(),
         )
 
-    def test_v13_enables_configured_thinking_and_invalidates_old_smoke(self):
+    def test_v13_changes_target_contract_and_preserves_historical_smoke(self):
         Profile = self.apps.get_model("studio", "ModelProfileVersion")
         Deployment = self.apps.get_model("studio", "ModelDeployment")
         Binding = self.apps.get_model("studio", "PromptProfileBinding")
@@ -216,20 +215,15 @@ class PromptNormalizationThinkingModeMigrationTests(_MigrationTestCase):
             ).exists(),
         )
 
-        from studio.models import ModelDeployment as RuntimeDeployment
-        from studio.services.async_media_contract import (
-            deployment_target_sha256,
-            fresh_smoke_snapshot,
-        )
-
         smoke = Snapshot.objects.get(pk=self.smoke_id)
         self.assertEqual(smoke.target_sha256, self.smoke_target_sha256)
-        current = RuntimeDeployment.objects.get(
+        current = Deployment.objects.get(
             pk=self.deployment_facts[self.route_keys[0]]["id"],
         )
         self.assertNotEqual(
-            deployment_target_sha256(current),
-            self.smoke_target_sha256,
+            current.profile_version_id, self.source_id,
         )
-        self.assertIsNone(fresh_smoke_snapshot(current, "prompt.normalize"))
-
+        self.assertNotEqual(
+            current.profile_version.specification_sha256,
+            self.source_specification_sha256,
+        )

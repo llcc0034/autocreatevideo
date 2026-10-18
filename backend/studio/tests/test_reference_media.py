@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from django.test import SimpleTestCase, override_settings
+from django.test import SimpleTestCase, TestCase, override_settings
 
 from studio.services.reference_media import (
     ReferenceMediaNormalizationError,
@@ -87,7 +87,7 @@ class ReferenceMediaValidationTests(SimpleTestCase):
     shutil.which("ffmpeg") and shutil.which("ffprobe"),
     "ffmpeg/ffprobe are not installed",
 )
-class ReferenceMediaFFmpegIntegrationTests(SimpleTestCase):
+class ReferenceMediaFFmpegIntegrationTests(TestCase):
     @staticmethod
     def _run(command):
         completed = subprocess.run(
@@ -136,7 +136,6 @@ class ReferenceMediaFFmpegIntegrationTests(SimpleTestCase):
             audio_metadata = normalize_paired_audio(
                 source_audio,
                 normalized_audio,
-                paired_video_asset_id="video-asset-id",
                 effective_duration_seconds=plan.effective_duration_seconds,
                 effective_fps=plan.target_fps,
                 minimum_duration_ms=2000,
@@ -177,3 +176,22 @@ class ReferenceMediaFFmpegIntegrationTests(SimpleTestCase):
             )
             self.assertEqual(output_video["avg_frame_rate"], "24/1")
             self.assertEqual(output_video["r_frame_rate"], "24/1")
+
+            # Real local FFmpeg/probe metadata feeds the same read-only summary;
+            # no upload receipt, provider call or business task is fabricated.
+            from studio.task_center_media_processing import processing_summary
+            from studio.services.media_processing_profiles import media_profile_sha256
+            for slot, adapter, source, output, metadata in (
+                ("videos", "cfr_video_v1", source_video, normalized_video, video_metadata),
+                ("paired_video_audios", "aligned_audio_v1", source_audio, normalized_audio, audio_metadata),
+            ):
+                summary = processing_summary(adapter=adapter,
+                    spec={"slot": slot, "contract": {"adapter_key": adapter, "minimum_duration_ms": 2000, "maximum_duration_ms": 15000}},
+                    profile={"sha256": media_profile_sha256(REFERENCE_MEDIA_PROFILE)},
+                    receipt={"source_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+                             "submitted_sha256": hashlib.sha256(output.read_bytes()).hexdigest()}, metadata=metadata)
+                self.assertEqual(summary["state"], "recorded")
+                self.assertEqual(summary["byte_identity"], "changed")
+                observed = {row["key"]: row for row in summary["observed"]}
+                self.assertEqual(observed["effective_duration_ms"]["value"], metadata["effective_duration_ms"])
+                self.assertEqual(observed["verified_audio_duration_ms"]["value"], metadata["verified_audio_duration_ms"])

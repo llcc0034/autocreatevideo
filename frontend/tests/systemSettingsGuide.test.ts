@@ -11,6 +11,44 @@ import {
 const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
 const guide = JSON.parse(readFileSync(new URL('../src/content/systemSettingsGuide.json', import.meta.url), 'utf8'))
 
+test('workflow guide restores exact original contracts without claiming legacy or executing promotion', () => {
+  const section = guide.sections.find((row: { id: string }) => row.id === 'workflows')
+  const content = JSON.stringify(section)
+  assert.match(content, /按提交前保存的请求键读取原完整合同/)
+  assert.match(content, /选择已改变时只展示原合同，不覆盖输入/)
+  assert.match(content, /旧请求没有回执时不补造结果/)
+  assert.match(content, /恢复成功也不会自动提升/)
+  assert.doesNotMatch(content, /合同生成查询目前只提供摘要/)
+})
+
+test('execution guide explains identity, two-phase authoring, successor and resource return without implying calls', () => {
+  const section = guide.sections.find((row: { id: string }) => row.id === 'executions')
+  const steps = JSON.stringify(section.steps)
+  assert.match(steps, /新建执行实例[^]*创建实例并配置首个版本/)
+  assert.match(steps, /创建草稿并配置输入[^]*保存组合并配置输入/)
+  assert.match(steps, /精确组合保存后才读取它的输入目录/)
+  assert.match(steps, /创建后继草稿[^]*不覆盖原发布版本/)
+  assert.match(steps, /前往维护（新窗口）[^]*明确选择新版本/)
+  assert.match(steps, /整页刷新可能丢失未提交内容/)
+  assert.match(steps, /保存草稿、发布、烟测与启动生成是独立动作/)
+  const example = section.fieldNotes.find((row: { term: string }) => row.term.startsWith('H3参考生视频'))
+  assert.match(example.meaning, /具体值不写入公共字段定义/)
+  assert.match(example.meaning, /均读所选合同[^]*不按字段名猜接线/)
+  assert.match(example.meaning, /人工完整提示词或无需提示词，不强制经过策略/)
+  assert.match(example.meaning, /不是已执行结果/)
+})
+
+test('current instructions use Preparation and resource recommendations do not author routes', () => {
+  const current = JSON.stringify({ componentFlow: guide.componentFlow, productionFlow: guide.productionFlow,
+    troubleshooting: guide.troubleshooting, glossary: guide.glossary })
+  assert.doesNotMatch(current, /PromptArtifact|GeneratedWorkflow/)
+  assert.match(current, /ExecutionPreparation/)
+  const runtime = guide.sections.find((section: { id: string }) => section.id === 'runtime')
+  assert.ok(runtime)
+  assert.match(JSON.stringify(runtime), /不自动创建执行实例或配方/)
+  assert.doesNotMatch(JSON.stringify(runtime), /草稿 Revision 或 Recipe/)
+})
+
 test('system settings guide covers every real settings section with detailed novice actions', () => {
   assert.deepEqual(guide.sections.map((section: { id: string }) => section.id), settingsSectionCatalog.map((section) => section.id))
   assert.equal(guide.sections.length, settingsSectionCatalog.length)
@@ -22,7 +60,7 @@ test('system settings guide covers every real settings section with detailed nov
     assert.ok(section.steps.every((step: Record<string, string>) => step.title && step.action && step.expected && step.ifBlocked))
     assert.ok(section.fieldNotes.length >= 4, `${section.id} needs field explanations`)
     assert.ok(section.mistakes.length >= 2, `${section.id} needs beginner recovery advice`)
-    assert.match(section.image, /^\/help\/system-settings\/.+\.jpg$/)
+    assert.match(section.image, /^\/help\/system-settings\/.+\.(jpg|png)$/)
   }
 })
 
@@ -76,7 +114,8 @@ test('component call graph is complete, ordered and links every dependency to a 
   const relations = new Set(edges.map((edge) => `${edge.from}->${edge.to}`))
   for (const relation of [
     'provider->model-profile', 'model-profile->deployment', 'deployment->workflow',
-    'workflow->recipe', 'recipe->readiness', 'readiness->production-run',
+    'workflow->execution-instance', 'deployment->execution-instance', 'execution-instance->recipe',
+    'recipe->readiness', 'readiness->production-run',
     'security-boundaries->config-revision', 'security-boundaries->readiness', 'security-boundaries->production-run',
     'production-run->execution', 'execution->layer-one-facts',
     'layer-one-facts->layer-two-fields', 'layer-two-fields->prompt-validation',
@@ -89,6 +128,18 @@ test('component call graph is complete, ordered and links every dependency to a 
   const deployment = nodes.find((node) => node.id === 'deployment')!
   assert.match(deployment.detail, /Probe 查健康能力，Smoke 提交最小真实调用/)
   assert.match(JSON.stringify(guide.componentFlow), /Readiness 是汇总检查结果，不是执行器/)
+})
+
+test('current strategy instructions lead to exact execution versions rather than the removed binding form', () => {
+  const section = guide.sections.find((item: { id: string }) => item.id === 'prompts')
+  assert.match(JSON.stringify(section.steps), /独立“执行实例”分区/)
+  assert.doesNotMatch(JSON.stringify(section.steps), /创建 Binding|新建 Binding|设置 priority/)
+  assert.doesNotMatch(settingsSectionCatalog.find((item) => item.id === 'prompts')!.hint, /Binding/)
+  const nodes = guide.componentFlow.stages.flatMap((stage: { nodes: Array<{ id: string }> }) => stage.nodes)
+  assert.ok(nodes.some((node: { id: string }) => node.id === 'execution-instance'))
+  assert.ok(!nodes.some((node: { id: string }) => node.id === 'prompt-binding'))
+  assert.ok(!guide.componentFlow.edges.some((edge: { from: string; to: string }) =>
+    edge.to === 'recipe' && ['deployment', 'workflow', 'prompt-contract'].includes(edge.from)))
 })
 
 test('security boundaries have a superuser-only novice path, fail-closed recovery and a real workflow example', () => {
@@ -134,53 +185,37 @@ test('production flow B is a complete bilingual sequence from empty project to R
   assert.match(text, /z-image-turbo Bible Candidates/)
   assert.match(text, /generation mode[^]*generation source[^]*required[^]*language[^]*length[^]*validators/)
   assert.match(text, /模型专属规则来自冻结 Profile 数据/)
-  assert.match(text, /script_breakdown[^]*detailed_description[^]*sound_effects[^]*music/)
+  assert.match(text, /规范剧本[^]*叙事、对白和声景[^]*原审核与物化链[^]*缺少事实不能由后续模型擅自补造/)
   assert.match(text, /原生 Ref2VA 会读取完整参考视频/)
   assert.match(text, /purpose[^。；]*不构成模型级内容隔离/)
   assert.match(text, /fixture_scope=workflow_smoke[^。；]*工作流版本验收页/)
   assert.match(text, /历史 0\.2MP 参数[^。；]*版本化验收案例[^。；]*不是[^。；]*默认值/)
-  assert.match(text, /structured_shot_duration_contract/)
-  assert.match(JSON.stringify(guide), /structured_shot_duration_contract[^]*1000\/1000\/1000ms/)
+  assert.match(text, /planning/)
+  assert.match(JSON.stringify(guide), /run\.episode_count[^]*run\.shots_per_episode[^]*run\.episode_duration_seconds/)
+  assert.doesNotMatch(JSON.stringify(guide), /structured_shot_duration_contract|1000\/1000\/1000ms/)
   assert.match(text, /已确认内容事实[^]*生成目标字段内容[^]*最终提示词(?:确定性)?装配/)
   assert.doesNotMatch(text, /(?:第一层|第二层|第三层|Layer-?\s*[123])/i)
   assert.match(text, /input_contract\.conditioning_contract\.modes\[\][^]*dynamic_reference_topology\.videos[^]*minimum_items=0[^]*maximum_items=0[^]*minimum_items\.\.maximum_items/)
   assert.match(text, /人工、辅助和全自动[^]*同一 0\.\.N 合同/)
   assert.doesNotMatch(text, /全自动首版每镜最多一条|minimum_items>1 当前不支持/)
   assert.doesNotMatch(text, /input_rules/)
-  assert.match(text, /production\.prompt_field_retry_limit/)
-  assert.match(text, /只重试失败批/)
-  assert.match(text, /重试耗尽进入人工确认/)
-  assert.match(text, /uncertain[^]*(?:不自动重投|不走(?:该)?自动重试)/)
-  assert.match(text, /PromptProfile schema v6/)
+  assert.doesNotMatch(text, /production\.prompt_field_retry_limit/)
+  assert.match(text, /明确.*重试.*批次/)
+  assert.match(text, /人工.*确认.*采用/)
+  assert.match(text, /远端结果不确定时先消歧/)
+  assert.match(text, /PromptProfile schema v8/)
 })
 
-test('prompt field retry policy is explained as frozen finite retry with narrow human fallback', () => {
-  assert.equal(guide.version, '1.3.0')
+test('field preparation guide has one review path, explicit batch retries and genuine manual input', () => {
   const text = JSON.stringify(guide)
-  assert.match(text, /production\.prompt_field_retry_limit/)
-  assert.match(text, /production\.prompt_language_gate/)
-  assert.doesNotMatch(text, /production\.h3_prompt_language_gate/)
-  assert.match(text, /0 表示首次[^。；]*(?:转人工|人工确认)/)
-  assert.match(text, /security\.production\.max_automatic_retries/)
-  assert.match(text, /总尝试数=1\+该值/)
-  assert.match(text, /运行创建后冻结|ProductionRun 创建时冻结/)
-  assert.match(text, /provider_response_invalid/)
-  assert.match(text, /prompt_normalize_contract_failed/)
-  assert.match(text, /唯一 KNOWN_RESPONSE_REJECTED/)
-  assert.match(text, /uncertain[^。；]*(?:不自动重投|停止自动和人工重复提交|必须先消歧)/)
-  assert.match(text, /Provider Smoke[^。；]*(?:硬阻断|失效)/)
-  assert.match(text, /配置漂移[^。；]*(?:硬阻断|不走(?:该)?自动重试)/)
-  assert.match(text, /pre-submit[^。；]*(?:不计入|门禁)/)
-  assert.match(text, /目标合同漂移[^。；]*(?:不计入|按门禁处理|非重试)/)
-  assert.match(text, /审计缺失[^。；]*(?:不计入|修复审计链|非重试)/)
-  assert.match(text, /awaiting approval/)
-  assert.match(text, /失败输出不会成为候选/)
-  assert.match(text, /全部冻结字段的空白候选|全部空白冻结候选/)
-  assert.match(text, /retry_feedback[^。；]*不是(?:管理员)?配置|retry_feedback 不是设置项/)
-  assert.match(text, /reason_code[^。；]*validation_context[^。；]*request_index/)
-  assert.match(text, /repair_of_attempt_id[^。；]*retry_feedback_sha256/)
-  assert.match(text, /页面只读显示[^。；]*(?:关系|下一 attempt)[^。；]*hash/)
-  assert.match(text, /不显示[^。；]*(?:模型原文|反馈正文)/)
+  assert.match(text, /同一媒体请求只使用一份主准备/)
+  assert.match(text, /辅助生成、翻译各有自身准备和真实调用记录/)
+  assert.match(text, /成功批次不重跑/)
+  assert.match(text, /结果不确定时先消歧/)
+  assert.match(text, /查看和确认本身不提交模型/)
+  assert.match(text, /人工可直接填写，不需要等待失败/)
+  assert.match(text, /不自动创建空白候选充当模型结果/)
+  assert.doesNotMatch(text, /script_normalize|production\.prompt_field_retry_limit|retry_feedback_sha256|repair_of_attempt_id/)
 })
 
 test('guide documents operation-scoped chat options from the currently selected model version', () => {
@@ -188,11 +223,11 @@ test('guide documents operation-scoped chat options from the currently selected 
   for (const marker of [
     'specification.prompt_normalization', 'specification.visual_rules', 'quality_advisories', 'recommended_negative_clauses', 'chat_request_options',
     '当前已选 prompt.normalize 合同', '当前已选 visual_rules.generate 合同',
-    'max_input_bytes', 'max_output_tokens', 'timeout_seconds',
+    'max_input_bytes', 'execution.resources.review_policy', 'timeout_seconds',
     'script.generate', 'script.structure', 'prompt.normalize', 'visual_rules.generate',
   ]) assert.ok(text.includes(marker), marker)
-  assert.match(text, /prompt_normalization[^]*四项[^]*(?:可选|配置)[^]*chat_request_options/)
-  assert.match(text, /visual_rules[^]*max_input_bytes[^]*max_output_tokens[^]*timeout_seconds[^]*chat_request_options/)
+  assert.match(text, /prompt_normalization[^]*输入[^]*chat_request_options/)
+  assert.match(text, /visual_rules[^]*max_input_bytes[^]*timeout_seconds[^]*chat_request_options/)
   assert.match(text, /temperature[^]*response_format/)
   for (const reserved of ['model', 'messages', 'max_tokens', 'stream', 'seed', 'timeout_seconds']) {
     assert.ok(text.includes(reserved), reserved)
@@ -201,7 +236,7 @@ test('guide documents operation-scoped chat options from the currently selected 
   assert.match(text, /本次选择的已发布 ModelProfileVersion[^。；]*按 operation 读取/)
   assert.match(text, /max_input_bytes[^。；]*覆盖[^。；]*operation[^。；]*完整冻结输入/)
   assert.match(text, /当前已选 prompt\.normalize 合同[^}]*运行快照[^}]*不要复制退役版本/)
-  assert.match(text, /当前已选 visual_rules\.generate 合同[^}]*按 operation 读取冻结规格/)
+  assert.match(text, /当前已选 visual_rules\.generate 合同[^}]*独立业务输出版本[^}]*执行实例精确引用并冻结/)
   assert.match(text, /quality_advisories[^。；]*(?:warning|warnings)[^。；]*advisory audit/)
   assert.match(text, /省略对象或字段[^。；]*不启用隐含建议/)
   assert.match(text, /recommended_negative_clauses[^。；]*(?:人工可移除|可人工移除)/)
@@ -217,9 +252,12 @@ test('guide explains the generic configurable prompt contract without making H3 
   const promptSection = guide.sections.find((section: { id: string }) => section.id === 'prompts')
   assert.ok(promptSection)
   const text = JSON.stringify(promptSection)
+  assert.match(text, /request\.structured_input/)
+  assert.match(text, /source_path[^。；]*确切输入结构/)
+  assert.doesNotMatch(JSON.stringify(guide), /shot\.(?:narrative|detailed_description|camera|action|sound_effects|music|negative_prompt)/)
   for (const field of [
     'source_projection_key', 'direct_v1', 'declarative_v1',
-    'classified_reference_context_ir_v1', 'projection.output',
+    'projection.output',
     'projection_primitive', 'reference_context',
     'field_definition.key', 'profile_field_key', 'generation_source_selector', 'generation_source_selectors',
     'generation_context_selectors', 'target_shot.dialogue_metadata', 'target_shot.dialogue_authored_text',
@@ -232,7 +270,7 @@ test('guide explains the generic configurable prompt contract without making H3 
   assert.match(text, /generation_source_selector[^。；]*主要内容来源/)
   assert.match(text, /generation_source_selectors[^。；]*(?:服务端|目录)/)
   assert.match(text, /不是文件地址[^。；]*(?:数据库位置|可手写表达式)/)
-  assert.match(text, /读取什么[^。；]*什么时候可用[^。；]*作用范围/)
+  assert.match(text, /读取内容[^。；]*适用条件[^。；]*作用范围/)
   assert.match(text, /generation_context_selectors[^。；]*(?:额外|上下文)/)
   assert.match(text, /dialogue_metadata[^。；]*不含对白(?:原文|正文)/)
   assert.match(text, /dialogue_authored_text[^。；]*(?:对白原文|台词)/)
@@ -242,6 +280,10 @@ test('guide explains the generic configurable prompt contract without making H3 
   assert.match(text, /source_selector[^。；]*(?:最终提示词取值|最终拼装)/)
   assert.match(text, /final[^。]*目标字段/)
   assert.match(text, /contribution[^。]*(?:原语|投影)/)
+  assert.match(text, /字段内容流转[^。]*未保存设置/)
+  assert.match(text, /不会自动选首项或把候选当绑定/)
+  assert.match(text, /同一辅助目标的多个用途分别显示/)
+  assert.match(text, /切换策略／分页清除旧选择/)
   assert.match(text, /H3 六段[^。；]*(?:可复制|配置实例|配置案例)/)
   assert.match(text, /(?:主编排[^。；]*(?:不识别 H3|不在主编排)|不是主编排硬编码)/)
   assert.match(text, /纯配置接入[^。；]*复用[^。；]*已登记原语/)
@@ -249,10 +291,12 @@ test('guide explains the generic configurable prompt contract without making H3 
   assert.match(text, /现有原语无法表达[^。；]*(?:新确定性转换|新增[^。；]*代码原语|需要代码)/)
   assert.match(text, /配置[^。；]*(?:不能|不)[^。；]*(?:执行脚本|执行代码|任意代码)/)
   assert.match(text, /Operation 首次登记/)
-  assert.match(text, /options[^。；]*建议/)
+  assert.match(text, /options 目录/)
+  assert.match(text, /目录项只是录入建议，不授予能力/)
   assert.match(text, /operation evidence missing/)
-  assert.match(text, /非内置 operation[^。；]*active Binding[^。；]*精确[^。；]*模型/)
-  assert.match(text, /没有 Deployment\/Workflow[^。；]*(?:fail closed|阻断)/)
+  assert.match(text, /执行实例[^。；]*实际资源操作[^。；]*兼容性/)
+  assert.match(text, /缺合同[^。；]*资源不相容[^。；]*明确报错/)
+  assert.doesNotMatch(text, /active Binding|Profile 版本、Binding|只保留给历史冻结合同运行/)
   assert.match(text, /实时查看最终提示词[^]*当前未保存的完整候选快照[^。；]*各通道实际组合文本/)
   assert.match(text, /预览不保存示例[^。；]*不调用模型[^。；]*只执行[^。；]*最终排版/)
   assert.match(text, /字段生成[^。；]*声明式 H3 原语[^。；]*没有在此执行/)
@@ -323,24 +367,29 @@ test('guide records the completed Ref2VA dual-clock case without mixing fixture 
   assert.doesNotMatch(caseText, /minimax-h3-ref2va-official-v4/)
   assert.match(caseText, /PromptProfile v3/)
   assert.match(caseText, /f2cce7ef-ca4f-4928-98dd-d8586e8fbadc[^]*PromptProfile v4[^]*没有动态参考视频/)
-  assert.match(caseText, /没有 production\.prompt_field_retry_limit/)
-  assert.match(caseText, /没有 target_prompt_contract|请求没有 target_prompt_contract/)
-  assert.match(caseText, /不能证明 v8、动态视频、容量分批和新逐字段合同的联合真实执行/)
+  assert.match(caseText, /不能作为当前执行实例、字段确认或批次重试的验收证据/)
+  assert.match(caseText, /不会自动成为新执行准备的已采用字段/)
+  assert.match(caseText, /不能证明当前精确执行实例、独立字段合同、动态视频及容量分批的联合真实执行/)
+  assert.doesNotMatch(caseText, /当前 H3 逐字段 target_prompt_contract/)
   assert.match(text, /56 (?:帧|frames)[^。；]*单元测试 fixture/)
   assert.equal([...guide.caseStudy.facts, ...guide.caseStudy.result].some((item: string) => /56 帧/.test(item)), false)
   assert.equal(text.includes('待补齐'), false)
   assert.equal(guide.caseStudy.result.some((item: string) => /ReleaseBundle[^。；]*已 sealed/.test(item)), true)
   assert.equal(guide.caseStudy.result.some((item: string) => /总耗时约 19 分 27 秒/.test(item)), true)
   assert.equal(guide.caseStudy.result.some((item: string) => /实际费用 0\.03 USD/.test(item)), true)
-  assert.match(text, /当前可视结构化编辑器没有 interaction_mode=unattended/)
-  assert.match(text, /shot\.narrative 是[^。；]*上游镜头事实[^。；]*不能互相替代/)
+  assert.match(text, /schema3 编辑器选择人工辅助或无人值守制作/)
+  assert.match(text, /无人值守的审核阶段须选择已注册审核策略/)
+  assert.match(text, /project_snapshot\/v1 的来源路径由精确实例合同提供/)
+  assert.match(text, /本轮项目来源确认/)
+  assert.doesNotMatch(text, /当前可视结构化编辑器没有 interaction_mode=unattended|已有已发布 schema v2 unattended/)
+  assert.match(text, /参考生视频[^。；]*确切素材引用名[^。；]*不自动追加外观锚点/)
   assert.match(caseText, /本案例结论以该 Run 持久化的 Stage、PromptArtifact、Artifact 和 ReleaseBundle 证据为准/)
 })
 
 test('guide keeps H3 as a configurable example and reads current frozen workflows', () => {
   const text = JSON.stringify(guide)
-  assert.match(text, /H3 六段声明式配置案例[^]*schema v6/)
-  assert.match(text, /实际运行读取本次选择并冻结的 Profile 版本/)
+  assert.match(text, /H3 六段声明式配置案例[^]*schema v8/)
+  assert.match(text, /实际运行读取精确执行实例引用并冻结的 Profile 版本/)
   assert.match(text, /实际操作必须分别读取本次选择并冻结的视频 Workflow 和 Bible 图片 Workflow/)
   assert.match(text, /0\.2MP 验收案例[^]*352×608 \/ 4 steps[^]*只证明对应的精确 Workflow/)
   assert.match(text, /detailed_description[^]*350–500[^]*(?:英文词|english_words)/)
@@ -360,6 +409,7 @@ test('bilingual presenters keep raw machine values while adding Chinese explanat
     [artifactRoleLabel('diffusion_model'), '扩散模型', 'diffusion_model'],
     [artifactRoleLabel('episode_master'), '分集成片母版', 'episode_master'],
     [artifactRoleLabel('primary_generation_output'), '主生成产物', 'primary_generation_output'],
+    [artifactRoleLabel('bible_reference_candidate'), '设定参考图候选', 'bible_reference_candidate'],
     [operationLabel('video.reference_to_video'), '参考生视频', 'video.reference_to_video'],
     [stageLabel('media_generation'), '媒体生成', 'media_generation'],
     [modeLabel('Ref2VA'), '参考生视频', 'Ref2VA'],
@@ -372,6 +422,7 @@ test('bilingual presenters keep raw machine values while adding Chinese explanat
     assert.match(actual, new RegExp(raw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   }
   assert.equal(operationLabel('custom.operation'), '自定义操作（custom.operation）')
+  assert.equal(artifactRoleLabel('unregistered.role'), '未识别文件角色（unregistered.role）')
 
   const workflowImportReasons = [
     ['required_dimension_multiple_unresolved', '画面尺寸倍数约束无法证明'],
@@ -380,6 +431,9 @@ test('bilingual presenters keep raw machine values while adding Chinese explanat
     ['workflow_profile_projection_failed', '工作流与模型合同投影失败'],
     ['workflow_projector_contract_mismatch', '工作流合同方案与图结构不兼容'],
     ['workflow_projector_engine_unavailable', '工作流合同引擎不可用'],
+    ['text_resource_smoke_passed', '文本资源基础烟测已通过，实例组合需另行验收'],
+    ['text_resource_smoke_required', '缺少文本能力的有效基础烟测，连接健康不能替代'],
+    ['resource_smoke_evidence_invalid', '基础烟测证据或目标配置不可核验'],
   ] as const
   for (const [code, title] of workflowImportReasons) {
     assert.equal(reasonCodeTitle(code), title)
@@ -396,6 +450,9 @@ test('in-app guide route, settings deep links and generated printable guide stay
   const guideView = readFileSync(new URL('../src/views/SystemSettingsGuideView.vue', import.meta.url), 'utf8')
   const markdown = readFileSync(new URL('../../docs/system-settings-beginner-guide.md', import.meta.url), 'utf8')
   const optimizationLedger = readFileSync(new URL('../../docs/optimization/README.md', import.meta.url), 'utf8')
+  const registrations = readFileSync(new URL('../../docs/optimization/registrations/README.md', import.meta.url), 'utf8')
+  const settingsRegistration = readFileSync(new URL('../../docs/optimization/registrations/opt-settings-001.md', import.meta.url), 'utf8')
+  const registrationBaseline = readFileSync(new URL('../../docs/optimization/registrations/baseline-2026-09-28.md', import.meta.url), 'utf8')
   const assetConfiguration = readFileSync(new URL('../../docs/asset-generation-model-configuration.md', import.meta.url), 'utf8')
   assert.match(router, /path: 'manual\/settings'/)
   assert.match(settingsView, /当前分区图文指南/)
@@ -406,7 +463,7 @@ test('in-app guide route, settings deep links and generated printable guide stay
   assert.match(guideView, /<figure[^>]+settings-component-flow/)
   assert.match(guideView, /<figure[^>]+settings-production-flow/)
   assert.match(markdown, /正文唯一来源：`frontend\/src\/content\/systemSettingsGuide\.json`/)
-  assert.match(markdown, /## 核心组件调用关系与推荐配置顺序/)
+  assert.match(markdown, /## 配置准备顺序与依赖关系（不是运行路径）/)
   assert.match(markdown, /```mermaid[\s\S]*flowchart TD[\s\S]*```/)
   for (const stage of guide.componentFlow.stages) {
     assert.ok(markdown.includes(stage.title), stage.title)
@@ -419,19 +476,30 @@ test('in-app guide route, settings deep links and generated printable guide stay
   }
   assert.match(markdown, /## 历史案例：动态 Ref2VA 双时钟全自动短剧（PromptProfile v3）/)
   assert.match(markdown, /OPT-SETTINGS-001/)
-  assert.match(optimizationLedger, /OPT-SETTINGS-001 Provider 与模型录入收敛为服务端选项目录/)
-  assert.match(optimizationLedger, /\| `OPT-SETTINGS-001` \|[^\n]+\| 已完成 \|/)
-  assert.match(optimizationLedger, /输入新值不会给驱动增加能力/)
+  assert.match(optimizationLedger, /\[原登记索引\]\(registrations\/README\.md\)/)
+  assert.match(registrations, /\[OPT-SETTINGS-001\]\(opt-settings-001\.md\)/)
+  assert.match(registrations, /\(baseline-2026-09-28\.md\)/)
+  assert.match(settingsRegistration, /OPT-SETTINGS-001 Provider 与模型录入收敛为服务端选项目录/)
+  assert.match(registrationBaseline, /\| `OPT-SETTINGS-001` \|[^\n]+\| 已完成 \|/)
+  assert.match(settingsRegistration, /输入新值不会给驱动增加能力/)
   assert.doesNotMatch(assetConfiguration, /受控操作[^\n]+页面和烟测候选来源/)
-  assert.match(assetConfiguration, /烟测候选来自模型版本 capability/)
+  assert.match(assetConfiguration, /素材库只选择一个明确的\*\*模型执行实例版本\*\*/)
+  assert.match(assetConfiguration, /从该版本的组合烟测入口/)
+  assert.match(assetConfiguration, /不能转移给其他策略、工作流或版本/)
+  assert.match(markdown, /模型部署验收证据、配方生产链核对独立加载/)
 })
 
-test('every guide screenshot is a real JPEG public asset with a matching extension', () => {
+test('every guide screenshot is a real image public asset with a matching extension', () => {
   const images = [guide.overviewImage.image, ...guide.sections.map((section: { image: string }) => section.image), guide.caseStudy.image]
   assert.equal(new Set(images).size, settingsSectionCatalog.length + 2)
   for (const image of images) {
     const absolutePath = `${frontendRoot}/public${image}`
     assert.ok(existsSync(absolutePath), image)
-    assert.deepEqual([...readFileSync(absolutePath).subarray(0, 3)], [0xff, 0xd8, 0xff], `${image} must be JPEG encoded`)
+    const bytes = readFileSync(absolutePath)
+    if (image.endsWith('.png')) assert.deepEqual([...bytes.subarray(0, 8)], [137, 80, 78, 71, 13, 10, 26, 10], `${image} must be PNG encoded`)
+    else {
+      assert.ok(image.endsWith('.jpg'), image)
+      assert.deepEqual([...bytes.subarray(0, 3)], [0xff, 0xd8, 0xff], `${image} must be JPEG encoded`)
+    }
   }
 })

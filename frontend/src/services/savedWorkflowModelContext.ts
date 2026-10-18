@@ -9,6 +9,14 @@ export interface SavedWorkflowModelContext {
 }
 
 const normalizedId = (value: string) => value.trim().toLocaleLowerCase('en-US')
+
+// An ordinary matched import reuses its frozen target. An explicitly requested
+// successor has its own contract and may bind a corrected model version.
+export const savedWorkflowModelSelectionLocked = (
+  item: Pick<ComfySavedWorkflowItem, 'matchStatus'>,
+  draft: { projectorSuccessorRequested: boolean },
+) => item.matchStatus === 'matched' && !draft.projectorSuccessorRequested
+
 export const classifySavedWorkflowModelContext = (
   item: ComfySavedWorkflowItem,
   context: SavedWorkflowModelContext,

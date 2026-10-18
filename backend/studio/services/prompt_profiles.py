@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import unicodedata
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Any
 
 from django.core.exceptions import ValidationError
@@ -14,26 +12,22 @@ from django.utils import timezone
 
 from studio.models import (
     ModelProfileVersion,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    FieldDefinitionVersion,
     PromptProfileFieldRule,
     PromptProfileVersion,
     ProviderProfile,
 )
-from studio.services.dialogue import (
-    DialogueContractError,
-    validate_dialogue_timing,
-)
+from studio.services.field_definitions import field_definition_snapshot, profile_rule_definition as resolve_rule_definition
 from studio.services.json_contracts import json_contract, verify_json_contract
 from studio.services.model_profile_contracts import (
     verified_model_profile_specification,
 )
 from studio.services.prompt_generation_sources import (
-    MODEL_GENERATION_OPERATIONS,
+    FIELD_AUXILIARY_OPERATIONS,
     MODEL_GENERATION_MODES,
-    PROMPT_GENERATION_SOURCE_VALUES,
+    prompt_generation_source_values,
 )
-from studio.services.prompt_translation import confirmed_translation, canonical_identity_mappings
+from studio.services.prompt_normalization_contract import PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
 from studio.services.security_boundaries import boundary_int
 from studio.services.source_projection_primitives import (
     REFERENCE_CONTEXT_ENGINE_KEY,
@@ -41,14 +35,8 @@ from studio.services.source_projection_primitives import (
 )
 
 
-PROMPT_PROFILE_FIELD_GENERATION_SCHEMA_VERSION = 2
-PROMPT_PROFILE_CHANNEL_LIMITS_SCHEMA_VERSION = 3
-PROMPT_PROFILE_SOURCE_PROJECTION_CONFIG_SCHEMA_VERSION = 4
-PROMPT_PROFILE_GENERATION_CONTEXT_SCHEMA_VERSION = 5
-PROMPT_PROFILE_PROJECTION_PRIMITIVE_SCHEMA_VERSION = 6
-PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION = 6
-PROMPT_PROFILE_LEGACY_CONTRACT_SCHEMA_VERSION = 1
 KNOWN_PROMPT_OPERATIONS = (
+    "text.structured",
     "video.generate",
     "image.generate",
     "script.generate",
@@ -61,12 +49,6 @@ CONTROLLED_PROMPT_OPERATION_REGISTRY = frozenset(KNOWN_PROMPT_OPERATIONS)
 # families already present in published ModelProfileVersion/PromptProfile rows,
 # but it must never seed or infer them from vendor/model names.
 KNOWN_MODEL_FAMILIES: tuple[str, ...] = ()
-CAPABILITY_BOUND_PROMPT_OPERATIONS = frozenset({
-    "script.generate",
-    "script.structure",
-    "visual_rules.generate",
-    "prompt.normalize",
-})
 _BIBLE_ENTITY_TYPES = ("character", "scene", "prop")
 # These values are non-empty for every formal Bible entity after the required
 # prompt.normalize review.  Other selectors (for example lighting or action)
@@ -100,13 +82,6 @@ _LANGUAGE_TAG_RE = re.compile(
     r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8}){0,5}$",
 )
 _LANGUAGE_POLICY_KEYWORDS = frozenset({"inherit", "preserve_source", "any"})
-_GENERATION_ENGLISH_WORD_RE = re.compile(r"[A-Za-z]+(?:['-][A-Za-z]+)*")
-_GENERATION_NUMBERED_REFERENCE_RE = re.compile(
-    r"<\s*[A-Za-z][A-Za-z0-9_-]*\s+[1-9][0-9]*\s*>",
-)
-_GENERATION_UNRESOLVED_PLACEHOLDER_RE = re.compile(
-    r"(?:\{\{[^{}]*\}\}|\$\{[^{}]*\}|__AUTOPROMPT_[A-Z0-9_]+__)",
-)
 _STATIC_REFERENCE_TARGET_KIND_RE = re.compile(r"^[a-z][a-z0-9_.-]{1,63}$")
 _STATIC_REFERENCE_SNAPSHOT_SELECTORS = frozenset({"literal", "initial", "final"})
 _STATIC_REFERENCE_VIOLATION_ACTIONS = frozenset({"block"})
@@ -172,18 +147,6 @@ def _transition_patterns_max_items() -> int:
     )
 
 
-def _value_options_max_items() -> int:
-    return boundary_int(
-        "security.contract_complexity.prompt_profile.value_options_max_items",
-    )
-
-
-def _value_option_max_characters() -> int:
-    return boundary_int(
-        "security.contract_complexity.prompt_profile.value_option_max_characters",
-    )
-
-
 def _field_list_item_max_characters() -> int:
     return boundary_int(
         "security.prompt_profile.field_list_item_max_characters",
@@ -205,18 +168,10 @@ CLASSIFIED_REFERENCE_CONTEXT_OUTPUT_SELECTORS = frozenset({
     PromptProfileFieldRule.SourceSelector.H3_REF2VA_OVERALL_SOUNDSCAPE,
     PromptProfileFieldRule.SourceSelector.H3_REF2VA_NON_DIEGETIC_MUSIC,
 })
-CLASSIFIED_REFERENCE_CONTEXT_CONTRIBUTION_SELECTORS = frozenset({
-    PromptProfileFieldRule.SourceSelector.SHOT_DETAIL,
-    PromptProfileFieldRule.SourceSelector.SHOT_SOUND_EFFECTS,
-    PromptProfileFieldRule.SourceSelector.SHOT_MUSIC,
-})
-# Compatibility name for callers that need the registered adapter vocabulary.
-# It deliberately contains no field keys or presentation rules.
-RUNTIME_ONLY_FIELD_SOURCE_SELECTORS = CLASSIFIED_REFERENCE_CONTEXT_OUTPUT_SELECTORS
 SUPPORTED_FIELD_SOURCE_SELECTORS = tuple(
     value
     for value, _label in PromptProfileFieldRule.SourceSelector.choices
-    if value not in RUNTIME_ONLY_FIELD_SOURCE_SELECTORS
+    if value not in CLASSIFIED_REFERENCE_CONTEXT_OUTPUT_SELECTORS
 )
 
 
@@ -230,6 +185,19 @@ class PromptProfileError(ValidationError):
 
 class PromptProfileResolutionError(PromptProfileError):
     code = "prompt_profile_resolution_failed"
+
+
+class PromptProfileChannelLengthError(PromptProfileError):
+    """Failed assembly evidence, not a compilation or permission to submit.
+
+    Only the authorized read-only preparation display consumes this bounded
+    payload. All execution callers still receive a ValidationError.
+    """
+
+    def __init__(self, messages, *, channels, lengths, profile_basis):
+        self.diagnostic = json_contract({"channels": channels, "lengths": lengths, "profile_basis": profile_basis},
+            max_bytes=_prompt_profile_preview_max_bytes()).value
+        super().__init__(messages, code="prompt_profile_channel_too_long")
 
 
 def normalize_prompt_profile_channel_limits(value: Any) -> dict[str, dict[str, int | None]]:
@@ -691,7 +659,7 @@ def normalize_prompt_profile_source_projection_config(value: Any) -> dict[str, A
             not isinstance(selector, str)
             or selector not in PromptProfileFieldRule.SourceSelector.values
             or selector
-            == PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+            == PromptProfileFieldRule.SourceSelector.FIXED_VALUE
             for selector in selectors
         )
         or len(selectors) != len(set(selectors))
@@ -778,7 +746,7 @@ def normalize_prompt_profile_source_projection_config(value: Any) -> dict[str, A
         if (
             not isinstance(selector, str)
             or selector not in PromptProfileFieldRule.SourceSelector.values
-            or selector == PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+            or selector == PromptProfileFieldRule.SourceSelector.FIXED_VALUE
         ):
             raise PromptProfileError(
                 "static_reference_policy.negative_token_exclusions 包含未知 selector",
@@ -864,11 +832,11 @@ def normalize_prompt_profile_source_projection_config(value: Any) -> dict[str, A
             continuity_source_selector
             not in PromptProfileFieldRule.SourceSelector.values
             or continuity_source_selector
-            == PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+            == PromptProfileFieldRule.SourceSelector.FIXED_VALUE
         ):
             raise PromptProfileError(
                 "initial_snapshot_clause_policy.continuity_source_selector "
-                "必须是受控且非 definition.default 的来源 selector",
+                "必须是受控且非 fixed.value 的来源 selector",
                 code="prompt_profile_source_projection_config_invalid",
             )
         trailing_clause_action = str(
@@ -917,10 +885,6 @@ def normalize_prompt_profile_source_projection_config(value: Any) -> dict[str, A
     }
 
 
-@dataclass(frozen=True)
-class ResolvedPromptProfile:
-    binding: PromptProfileBinding
-    profile_version: PromptProfileVersion
 
 
 _SEPARATORS = {
@@ -1059,55 +1023,64 @@ def validate_prompt_operation_publish_evidence(
     return evidence
 
 
-def validate_field_definition(definition: PromptFieldDefinition) -> None:
-    options = definition.value_options
-    if not isinstance(options, list) or len(options) > _value_options_max_items():
+def profile_rule_definition(rule, *, require_published=False):
+    try:
+        return resolve_rule_definition(rule, require_published=require_published)
+    except ValidationError as exc:
+        raise PromptProfileError(str(exc), code="prompt_profile_field_version_invalid") from exc
+
+
+def validate_field_source_selector(selector: str) -> None:
+    """One current vocabulary for authoring and new execution input projection."""
+    if selector not in SUPPORTED_FIELD_SOURCE_SELECTORS:
         raise PromptProfileError(
-            f"value_options 必须是不超过 {_value_options_max_items()} 项的数组",
+            "来源不在当前目录中；创作字段请使用确切结构版本的 request.structured_input 路径，"
+            "不读取或转换旧镜头列",
+            code="prompt_profile_source_selector_unsupported",
         )
-    if any(
-        not isinstance(item, str)
-        or not item.strip()
-        or len(item) > _value_option_max_characters()
-        for item in options
+
+
+def _validate_rule_values(rule: PromptProfileFieldRule) -> None:
+    validate_field_source_selector(rule.source_selector)
+    if (
+        rule.source_selector == PromptProfileFieldRule.SourceSelector.FIXED_VALUE
+        and rule.fixed_value is None
     ):
-        raise PromptProfileError(
-            "value_options 只能包含非空且不超过 "
-            f"{_value_option_max_characters()} 字符的短文本",
-        )
-    if len(options) != len(set(options)):
-        raise PromptProfileError("value_options 不能重复")
-    if definition.value_type == PromptFieldDefinition.ValueType.ENUM and not options:
-        raise PromptProfileError("enum 字段必须配置 value_options")
-    if definition.value_type != PromptFieldDefinition.ValueType.ENUM and options:
-        raise PromptProfileError("只有 enum 字段可以配置 value_options")
-    if definition.default_value is not None:
-        _typed_value(definition, definition.default_value)
+        raise PromptProfileError("fixed.value 规则必须在本规则配置固定值")
+    if rule.source_selector == PromptProfileFieldRule.SourceSelector.FIXED_VALUE:
+        _typed_value(profile_rule_definition(rule), rule.fixed_value)
+        if rule.has_default:
+            raise PromptProfileError("固定值来源不能同时配置缺失默认值")
+    elif rule.fixed_value is not None and rule.generation_source_selector != PromptProfileFieldRule.SourceSelector.FIXED_VALUE:
+        raise PromptProfileError("仅固定值来源可以配置 fixed_value")
+    if rule.has_default and rule.default_value is not None:
+        _typed_value(profile_rule_definition(rule), rule.default_value)
+    if not rule.has_default and rule.default_value is not None:
+        raise PromptProfileError("配置 default_value 时必须启用 has_default")
 
 
 def validate_profile_rule(
     rule: PromptProfileFieldRule,
-    *,
-    enforce_current_generation_source: bool = False,
+    *, require_published_source: bool = True,
 ) -> None:
+    from studio.services.content_sources import validate_rule_source
+    profile_rule_definition(rule, require_published=require_published_source)
+    validate_rule_source(rule, require_published=require_published_source)
+    from studio.services.prompt_profile_structures import validate_structured_rule
+    validate_structured_rule(rule, require_published=require_published_source)
     if rule.profile_version.status != PromptProfileVersion.Status.DRAFT:
         raise PromptProfileError("published/retired PromptProfile 的字段规则不可修改")
     if not rule.field_definition.is_active:
         raise PromptProfileError("字段规则不能引用已停用字段")
-    validate_field_definition(rule.field_definition)
+    _validate_rule_values(rule)
     if (
         rule.channel == PromptProfileFieldRule.Channel.SYSTEM_INSTRUCTION
-        and rule.source_selector != PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+        and rule.source_selector != PromptProfileFieldRule.SourceSelector.FIXED_VALUE
     ):
         raise PromptProfileError(
-            "system_instruction 只能装配管理员维护的字段默认值；项目和请求内容不得提升为系统指令",
+            "system_instruction 只能装配本规则维护的固定值；项目和请求内容不得提升为系统指令",
             code="prompt_profile_untrusted_system_source",
         )
-    if (
-        rule.source_selector == PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
-        and rule.field_definition.default_value is None
-    ):
-        raise PromptProfileError("definition.default 规则要求字段已配置默认值")
     primitive_key = str(rule.projection_primitive or "").strip()
     if (
         rule.source_selector
@@ -1155,7 +1128,7 @@ def validate_profile_rule(
         generation_source = str(rule.generation_source_selector or "").strip()
         if (
             primitive is not None
-            and generation_source not in primitive.contribution_source_selectors
+            and (not primitive.contribution_source_selectors or generation_source != "request.structured_input")
         ):
             raise PromptProfileError(
                 "所选 projection_primitive 不支持当前 contribution 主要内容来源",
@@ -1170,20 +1143,13 @@ def validate_profile_rule(
             code="prompt_profile_field_limit_invalid",
         )
     validate_generation_field_contract(rule)
-    if (
-        enforce_current_generation_source
-        or rule.profile_version.contract_schema_version
-        >= PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
-    ):
-        validate_current_generation_source(rule)
+    validate_current_generation_source(rule)
 
 
 def validate_current_generation_source(rule: PromptProfileFieldRule) -> None:
-    """Validate the source vocabulary used by a mutable current contract.
+    """Validate the same explicit source vocabulary when writing and executing.
 
-    Published and retired profiles keep their frozen historical vocabulary;
-    this check is intentionally called only from the draft write path.  The
-    model-backed modes use the same registry as runtime source collection.
+    The model-backed modes reuse the implemented execution reader catalog.
     Modes that do not run field generation always read the final source
     directly and therefore do not expose a second independent selector.
     """
@@ -1191,13 +1157,25 @@ def validate_current_generation_source(rule: PromptProfileFieldRule) -> None:
     mode = str(rule.generation_mode or "")
     generation_source = str(rule.generation_source_selector or "").strip()
     if mode in MODEL_GENERATION_MODES:
-        if rule.profile_version.operation not in MODEL_GENERATION_OPERATIONS:
+        if rule.profile_version.operation in FIELD_AUXILIARY_OPERATIONS:
             raise PromptProfileError(
-                "模型生成或仅翻译目前只在 image.generate / video.generate "
-                "生产链执行；其他 operation 不能声明不会被执行的字段生成合同",
+                "字段辅助实例必须为叶子，不能再声明辅助生成或翻译",
                 code="prompt_profile_generation_mode_operation_unsupported",
             )
-        if generation_source not in PROMPT_GENERATION_SOURCE_VALUES:
+        if rule.channel == PromptProfileFieldRule.Channel.SYSTEM_INSTRUCTION:
+            raise PromptProfileError("系统约束须为维护者明确配置的固定文本，不能由辅助结果提升为系统指令",
+                code="prompt_profile_untrusted_system_source")
+        if generation_source == "projection.output":
+            if (rule.source_selector != "projection.output" or rule.profile_version.source_projection_key != "declarative_v1"
+                    or rule.generation_output_semantics != "final"):
+                raise PromptProfileError("装配原文仅用于声明式字段的最终结果，不可注入或作为逐单元贡献",
+                    code="prompt_profile_generation_source_unknown")
+            return
+        from studio.services.prompt_profile_structures import STRUCTURED_INPUT_SELECTOR, validate_structured_rule
+        if rule.source_selector == STRUCTURED_INPUT_SELECTOR or generation_source == STRUCTURED_INPUT_SELECTOR:
+            validate_structured_rule(rule)
+            return
+        if generation_source not in prompt_generation_source_values():
             raise PromptProfileError(
                 "模型生成或仅翻译的主要内容来源不在服务端当前可解析目录中；"
                 "请从 PromptProfile options 返回的 generation_source_selectors 选择",
@@ -1215,6 +1193,15 @@ def validate_current_generation_source(rule: PromptProfileFieldRule) -> None:
         )
 
 
+def prompt_language_options():
+    """Shared language-tag choices for policy authoring and execution forms."""
+    return [
+        {"value": "en", "label": "英文 / English"},
+        {"value": "zh-Hans", "label": "简体中文 / Simplified Chinese"},
+        {"value": "zh-Hant", "label": "繁体中文 / Traditional Chinese"},
+    ]
+
+
 def _valid_language_policy(value: str) -> bool:
     if value in _LANGUAGE_POLICY_KEYWORDS or _LANGUAGE_TAG_RE.fullmatch(value):
         return True
@@ -1229,14 +1216,7 @@ def _valid_language_policy(value: str) -> bool:
 
 
 def validate_generation_field_contract(rule: PromptProfileFieldRule) -> None:
-    """Validate the declarative Layer-2 contract without executing config.
-
-    Schema v1 profiles are immutable historical facts.  Their source path may
-    be blank because the field did not exist when the hash was published.  A
-    schema v2 profile must name every source explicitly; no executable
-    template, wildcard, bracket expression, function, or custom regular
-    expression is accepted.
-    """
+    """Validate the current explicit field contract without executing config."""
 
     mode = str(rule.generation_mode or "")
     if mode not in PromptProfileFieldRule.GenerationMode.values:
@@ -1245,9 +1225,6 @@ def validate_generation_field_contract(rule: PromptProfileFieldRule) -> None:
             code="prompt_profile_generation_mode_invalid",
         )
     generation_source = str(rule.generation_source_selector or "").strip()
-    schema_version = int(
-        getattr(rule.profile_version, "contract_schema_version", 1) or 1,
-    )
     context_selectors = rule.generation_context_selectors
     if not isinstance(context_selectors, list) or (
         len(context_selectors) > _generation_context_selectors_max_items()
@@ -1270,30 +1247,23 @@ def validate_generation_field_contract(rule: PromptProfileFieldRule) -> None:
             "generation_context_selectors 不能重复",
             code="prompt_profile_generation_context_selectors_invalid",
         )
+    from studio.services.prompt_generation_contexts import structured_context_path
     unknown_context_selectors = sorted(
         set(context_selectors)
         - set(PromptProfileFieldRule.GenerationContextSelector.values),
     )
+    unknown_context_selectors = [item for item in unknown_context_selectors if structured_context_path(item) is None]
     if unknown_context_selectors:
         raise PromptProfileError(
             "generation_context_selectors 包含未知范围: "
             + ", ".join(unknown_context_selectors),
             code="prompt_profile_generation_context_selector_unknown",
         )
-    if (
-        schema_version < PROMPT_PROFILE_GENERATION_CONTEXT_SCHEMA_VERSION
-        and context_selectors
-    ):
-        raise PromptProfileError(
-            "历史 PromptProfile 合同不能声明未纳入其校验和的字段生成上下文",
-            code="prompt_profile_generation_context_schema_unsupported",
-        )
     if not generation_source:
-        if schema_version >= PROMPT_PROFILE_FIELD_GENERATION_SCHEMA_VERSION:
-            raise PromptProfileError(
-                "schema v2 字段规则必须显式配置 generation_source_selector",
-                code="prompt_profile_generation_source_required",
-            )
+        raise PromptProfileError(
+            "字段规则必须显式配置 generation_source_selector",
+            code="prompt_profile_generation_source_required",
+        )
     elif _GENERATION_SOURCE_SELECTOR_RE.fullmatch(generation_source) is None:
         raise PromptProfileError(
             "generation_source_selector 只允许最多 12 段的小写点路径；"
@@ -1320,7 +1290,7 @@ def validate_generation_field_contract(rule: PromptProfileFieldRule) -> None:
             "generation_instruction 包含禁止的控制字符",
             code="prompt_profile_generation_instruction_invalid",
         )
-    if schema_version >= PROMPT_PROFILE_FIELD_GENERATION_SCHEMA_VERSION and mode in {
+    if mode in {
         PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
         PromptProfileFieldRule.GenerationMode.TRANSLATE_ONLY,
     } and not instruction:
@@ -1502,250 +1472,48 @@ def _generation_value_text(value: Any) -> str:
     return str(value).strip()
 
 
-def _generation_value_items(value: Any, text: str) -> list[Any]:
-    if isinstance(value, list):
-        return value
-    try:
-        decoded = json.loads(text)
-    except (json.JSONDecodeError, TypeError, ValueError):
-        decoded = None
-    if isinstance(decoded, list):
-        return decoded
-    return [
-        re.sub(r"^\s*(?:[-*]|[0-9]+[.)])\s*", "", line).strip()
-        for line in text.splitlines()
-        if line.strip()
-    ]
+def _generation_check_rule(rule: PromptProfileFieldRule) -> dict[str, Any]:
+    return {
+        "generation_required": rule.generation_required,
+        "generation_validator_keys": list(rule.generation_validator_keys or []),
+        "length_unit": str(rule.length_unit or ""),
+        "generation_min": rule.generation_min, "generation_max": rule.generation_max,
+    }
 
 
 def prompt_profile_generation_length_audit(
-    rule: PromptProfileFieldRule,
-    value: Any,
+    rule: PromptProfileFieldRule, value: Any,
 ) -> dict[str, Any]:
-    """Measure one Layer-2 value only from its frozen declarative rule."""
+    from studio.services.prompt_normalization_contract import prompt_field_length_audit
 
-    text = _generation_value_text(value)
-    items = _generation_value_items(value, text)
-    length_unit = str(rule.length_unit or "")
-    if length_unit == PromptProfileFieldRule.LengthUnit.CHARACTERS:
-        measured: int | None = len(text)
-    elif length_unit == PromptProfileFieldRule.LengthUnit.ENGLISH_WORDS:
-        measured = len(_GENERATION_ENGLISH_WORD_RE.findall(text))
-    elif length_unit == PromptProfileFieldRule.LengthUnit.ITEMS:
-        measured = len(items)
-    else:
-        measured = None
-    within_contract = measured is None or not (
-        (rule.generation_min is not None and measured < rule.generation_min)
-        or (rule.generation_max is not None and measured > rule.generation_max)
-    )
-    advisory = (
-        PromptProfileFieldRule.GenerationValidator.LENGTH_ADVISORY
-        in set(rule.generation_validator_keys or [])
-    )
+    contract = _generation_check_rule(rule)
     return {
-        "field_key": rule.field_definition.key,
-        "generation_mode": rule.generation_mode,
-        "length_unit": length_unit,
-        "generation_min": rule.generation_min,
+        "field_key": rule.field_definition.key, "generation_mode": rule.generation_mode,
+        "length_unit": contract["length_unit"], "generation_min": rule.generation_min,
         "generation_max": rule.generation_max,
-        "measured": measured,
-        "status": (
-            "ready"
-            if within_contract
-            else "warning"
-            if advisory
-            else "invalid"
-        ),
-        "enforcement": "advisory" if advisory else "required",
+        **prompt_field_length_audit(contract, _generation_value_text(value)),
     }
-
-
-def _validate_generation_text_characters(text: str, *, field_key: str) -> None:
-    if any(
-        unicodedata.category(character) == "Cf"
-        or (
-            unicodedata.category(character) == "Cc"
-            and character not in "\n\r\t"
-        )
-        for character in text
-    ):
-        raise PromptProfileError(
-            f"字段 {field_key} 包含禁止的控制或 Unicode 格式字符",
-            code="prompt_profile_generation_value_validator_failed",
-        )
-
-
-def _generation_language_family(value: str) -> str:
-    normalized = str(value or "").strip().casefold()
-    if normalized in {"english", "en"} or normalized.startswith("en-"):
-        return "en"
-    if normalized in {"chinese", "zh"} or normalized.startswith("zh-"):
-        return "zh"
-    return normalized
 
 
 def validate_prompt_profile_generation_value(
-    rule: PromptProfileFieldRule,
-    value: Any,
-    *,
-    source_language: str = "",
-    inherited_language: str = "",
-) -> None:
-    """Execute one frozen schema-v2 field-value contract for every mode.
+    rule: PromptProfileFieldRule, value: Any,
+) -> list[dict[str, Any]]:
+    """Use the same generic execution checks for every strategy and field mode."""
+    from studio.services.prompt_normalization_contract import (
+        PromptNormalizationContractError, validate_prompt_field_text,
+    )
 
-    This validator is deliberately independent of Provider responses.  The
-    compiler applies it to server-locked facts, passthrough facts, reviewed
-    final values, and projection contributions so switching generation mode
-    cannot bypass the same required/language/length/validator contract.
-    """
-
-    if int(rule.profile_version.contract_schema_version or 1) < 2:
-        return
     validate_generation_field_contract(rule)
     field_key = rule.field_definition.key
-    validators = set(rule.generation_validator_keys or [])
-    text = _generation_value_text(value)
-    missing = value is None or value == [] or not text
-    if missing:
-        if (
-            rule.generation_required
-            or PromptProfileFieldRule.GenerationValidator.NON_EMPTY in validators
-        ):
-            raise PromptProfileError(
-                f"字段 {field_key} 的 schema v2 生成合同要求非空值",
-                code="prompt_profile_generation_value_required",
-            )
-        return
-
-    _validate_generation_text_characters(text, field_key=field_key)
-    if (
-        PromptProfileFieldRule.GenerationValidator.NO_UNRESOLVED_PLACEHOLDERS
-        in validators
-        and (
-            _GENERATION_UNRESOLVED_PLACEHOLDER_RE.search(text)
-            or _GENERATION_NUMBERED_REFERENCE_RE.search(text)
+    try:
+        return validate_prompt_field_text(
+            rule=_generation_check_rule(rule), field_key=field_key,
+            text="" if value is None or value == [] else _generation_value_text(value), request_id=f"字段 {field_key}",
         )
-    ):
-        raise PromptProfileError(
-            f"字段 {field_key} 含未解析占位符或引用标记",
-            code="prompt_profile_generation_value_validator_failed",
-        )
-    if (
-        PromptProfileFieldRule.GenerationValidator.SINGLE_LINE in validators
-        and ("\n" in text or "\r" in text)
-    ):
-        raise PromptProfileError(
-            f"字段 {field_key} 必须是单行文本",
-            code="prompt_profile_generation_value_validator_failed",
-        )
-
-    parsed_json: Any = value if isinstance(value, (dict, list)) else None
-    json_validators = validators & {
-        PromptProfileFieldRule.GenerationValidator.VALID_JSON,
-        PromptProfileFieldRule.GenerationValidator.JSON_OBJECT,
-        PromptProfileFieldRule.GenerationValidator.JSON_ARRAY,
-    }
-    if json_validators and parsed_json is None:
-        try:
-            parsed_json = json.loads(text)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise PromptProfileError(
-                f"字段 {field_key} 必须是合法 JSON",
-                code="prompt_profile_generation_value_validator_failed",
-            ) from exc
-    if (
-        PromptProfileFieldRule.GenerationValidator.JSON_OBJECT in validators
-        and not isinstance(parsed_json, dict)
-    ):
-        raise PromptProfileError(
-            f"字段 {field_key} 必须是 JSON 对象",
-            code="prompt_profile_generation_value_validator_failed",
-        )
-    if (
-        PromptProfileFieldRule.GenerationValidator.JSON_ARRAY in validators
-        and not isinstance(parsed_json, list)
-    ):
-        raise PromptProfileError(
-            f"字段 {field_key} 必须是 JSON 数组",
-            code="prompt_profile_generation_value_validator_failed",
-        )
-
-    items = _generation_value_items(value, text)
-    if PromptProfileFieldRule.GenerationValidator.UNIQUE_ITEMS in validators:
-        normalized_items = [
-            json.dumps(
-                item,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            for item in items
-        ]
-        if len(normalized_items) != len(set(normalized_items)):
-            raise PromptProfileError(
-                f"字段 {field_key} 包含重复列表项",
-                code="prompt_profile_generation_value_validator_failed",
-            )
-
-    policy = str(rule.language_policy or "")
-    if policy == "any":
-        language_targets: list[str] = []
-    elif policy == "inherit":
-        language_targets = [_generation_language_family(inherited_language)]
-    elif policy == "preserve_source":
-        language_targets = [_generation_language_family(source_language)]
-    elif policy.startswith("bilingual:"):
-        language_targets = [
-            _generation_language_family(item)
-            for item in policy.removeprefix("bilingual:").split("+")
-        ]
-    else:
-        language_targets = [_generation_language_family(policy)]
-    if any(not item for item in language_targets):
-        raise PromptProfileError(
-            f"字段 {field_key} 缺少 language_policy 的运行语言上下文",
-            code="prompt_profile_generation_language_context_missing",
-        )
-    alphabetic = [character for character in text if character.isalpha()]
-    latin = [
-        character
-        for character in alphabetic
-        if "LATIN" in unicodedata.name(character, "")
-    ]
-    if "en" in language_targets:
-        if not latin:
-            raise PromptProfileError(
-                f"字段 {field_key} 缺少 language_policy 要求的英文内容",
-                code="prompt_profile_generation_language_invalid",
-            )
-        if len(language_targets) == 1 and len(latin) != len(alphabetic):
-            raise PromptProfileError(
-                f"字段 {field_key} 的 English 值包含非拉丁文字",
-                code="prompt_profile_generation_language_invalid",
-            )
-    if "zh" in language_targets and not re.search(
-        r"[\u3400-\u4dbf\u4e00-\u9fff]",
-        text,
-    ):
-        raise PromptProfileError(
-            f"字段 {field_key} 缺少 language_policy 要求的中文内容",
-            code="prompt_profile_generation_language_invalid",
-        )
-
-    length_audit = prompt_profile_generation_length_audit(rule, value)
-    measured = length_audit["measured"]
-    length_unit = str(length_audit["length_unit"])
-    if length_audit["status"] == "invalid":
-        lower = str(rule.generation_min) if rule.generation_min is not None else "0"
-        upper = (
-            str(rule.generation_max)
-            if rule.generation_max is not None else "unbounded"
-        )
-        raise PromptProfileError(
-            f"字段 {field_key} 长度为 {measured}，要求 {lower}–{upper} {length_unit}",
-            code="prompt_profile_generation_value_length_invalid",
-        )
+    except PromptNormalizationContractError as exc:
+        code = ("prompt_profile_generation_value_required" if exc.reason_code == "empty"
+                else "prompt_profile_generation_value_validator_failed")
+        raise PromptProfileError(str(exc), code=code) from exc
 
 
 def _validate_direct_source_projection(
@@ -1804,6 +1572,12 @@ def _validate_declarative_source_projection(
             "此策略缺少当前参考关系合同；请在草稿中配置 schema v5 用途规则与渲染模板并复核发布",
             code="prompt_profile_source_projection_config_incompatible",
         )
+    from studio.services.reference_rendering_inputs import validate_unit_text_bindings
+    from studio.services.prompt_profile_structures import profile_input_structure
+    rendering = config.get("primitive_options", {}).get(REFERENCE_CONTEXT_ENGINE_KEY, {}).get("rendering")
+    if rendering is not None:
+        validate_unit_text_bindings(rendering.get("unit_text_bindings"),
+            structure=profile_input_structure(profile), check_structure=True)
     projection_rules = [
         rule for rule in rules
         if rule.source_selector
@@ -1849,7 +1623,7 @@ def _validate_declarative_source_projection(
             continue
         primitive = SOURCE_PROJECTION_PRIMITIVES[rule.projection_primitive]
         source = str(rule.generation_source_selector or "")
-        if source not in primitive.contribution_source_selectors:
+        if not primitive.contribution_source_selectors or source != "request.structured_input":
             unsupported_contributions.append(
                 f"{rule.field_definition.key}:{source or '(empty)'}",
             )
@@ -1900,14 +1674,11 @@ def validate_prompt_profile_source_projection(
     candidate_rules = list(
         rules
         if rules is not None
-        else profile.field_rules.select_related("field_definition").all()
+        else profile.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").all()
     )
     if projection_config:
         if "quality_advisories" in projection_config and (
-            projection_key not in {
-                CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
-                DECLARATIVE_SOURCE_PROJECTION_KEY,
-            }
+            projection_key != DECLARATIVE_SOURCE_PROJECTION_KEY
             or profile.operation != "video.generate"
         ):
             raise PromptProfileError(
@@ -1948,7 +1719,7 @@ def validate_prompt_profile_source_projection(
             rule.source_selector
             for rule in candidate_rules
             if rule.source_selector
-            != PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+            != PromptProfileFieldRule.SourceSelector.FIXED_VALUE
         }
         clause_policy = projection_config["static_reference_policy"].get(
             "initial_snapshot_clause_policy",
@@ -2012,18 +1783,17 @@ def prompt_profile_contract_payload(
         if schema_version is not None
         else profile.contract_schema_version
     )
-    if resolved_schema_version not in {
-        PROMPT_PROFILE_LEGACY_CONTRACT_SCHEMA_VERSION,
-        PROMPT_PROFILE_FIELD_GENERATION_SCHEMA_VERSION,
-        PROMPT_PROFILE_CHANNEL_LIMITS_SCHEMA_VERSION,
-        PROMPT_PROFILE_SOURCE_PROJECTION_CONFIG_SCHEMA_VERSION,
-        PROMPT_PROFILE_GENERATION_CONTEXT_SCHEMA_VERSION,
-        PROMPT_PROFILE_PROJECTION_PRIMITIVE_SCHEMA_VERSION,
-    }:
+    if (
+        resolved_schema_version != PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+        or profile.contract_schema_version != PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION
+    ):
         raise PromptProfileError(
-            f"不支持的 PromptProfile 合同 schema v{resolved_schema_version}",
+            "PromptProfile 只支持当前合同 schema "
+            f"v{PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION}；不自动转换旧版本",
             code="prompt_profile_contract_schema_unsupported",
         )
+    from studio.services.prompt_profile_structures import profile_input_structure, validate_structured_rule
+    structure = profile_input_structure(profile)
     rule_payloads = []
     if rules is not None:
         candidate_rules = sorted(
@@ -2032,20 +1802,23 @@ def prompt_profile_contract_payload(
         )
     elif profile.pk:
         candidate_rules = list(
-            profile.field_rules.select_related("field_definition").order_by(
+            profile.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").order_by(
                 "position", "id",
             )
         )
     else:
         candidate_rules = []
     for rule in candidate_rules:
-        definition = rule.field_definition
+        validate_structured_rule(rule, snapshot=structure)
+        definition = profile_rule_definition(rule)
         rule_payload = {
             "field_key": definition.key,
             "field_value_type": definition.value_type,
-            "field_default_value": definition.default_value,
+            "field_definition": field_definition_snapshot(definition),
             "field_value_options": definition.value_options,
-            "field_required": definition.is_required,
+            "fixed_value": rule.fixed_value,
+            "has_default": rule.has_default,
+            "default_value": rule.default_value,
             "source_selector": rule.source_selector,
             "channel": rule.channel,
             "position": rule.position,
@@ -2055,27 +1828,26 @@ def prompt_profile_contract_payload(
             "omit_if_empty": rule.omit_if_empty,
             "max_chars": rule.max_chars,
         }
-        if resolved_schema_version >= 2:
-            rule_payload.update({
-                "generation_mode": rule.generation_mode,
-                "generation_source_selector": rule.generation_source_selector,
-                "generation_instruction": rule.generation_instruction,
-                "generation_output_semantics": rule.generation_output_semantics,
-                "generation_required": rule.generation_required,
-                "language_policy": rule.language_policy,
-                "length_unit": rule.length_unit,
-                "generation_min": rule.generation_min,
-                "generation_max": rule.generation_max,
-                "generation_validator_keys": rule.generation_validator_keys,
-            })
-        if resolved_schema_version >= PROMPT_PROFILE_GENERATION_CONTEXT_SCHEMA_VERSION:
-            rule_payload["generation_context_selectors"] = list(
-                rule.generation_context_selectors,
-            )
-        if resolved_schema_version >= PROMPT_PROFILE_PROJECTION_PRIMITIVE_SCHEMA_VERSION:
-            rule_payload["projection_primitive"] = str(
-                rule.projection_primitive or "",
-            )
+        rule_payload.update({
+            "generation_mode": rule.generation_mode,
+            "generation_source_selector": rule.generation_source_selector,
+            "generation_instruction": rule.generation_instruction,
+            "generation_output_semantics": rule.generation_output_semantics,
+            "generation_required": rule.generation_required,
+            "language_policy": rule.language_policy,
+            "length_unit": rule.length_unit,
+            "generation_min": rule.generation_min,
+            "generation_max": rule.generation_max,
+            "generation_validator_keys": rule.generation_validator_keys,
+            "generation_context_selectors": list(rule.generation_context_selectors),
+            "projection_primitive": str(rule.projection_primitive or ""),
+        })
+        if rule.source_version_id:
+            from studio.services.content_sources import source_reference, validate_rule_source
+            validate_rule_source(rule)
+            rule_payload["source_definition"] = source_reference(rule.source_version)
+        if rule.source_path is not None:
+            rule_payload["source_path"] = deepcopy(rule.source_path)
         rule_payloads.append(rule_payload)
     payload = {
         "schema_version": resolved_schema_version,
@@ -2086,18 +1858,15 @@ def prompt_profile_contract_payload(
         "mode": profile.mode,
         "rules": rule_payloads,
     }
-    if resolved_schema_version >= PROMPT_PROFILE_FIELD_GENERATION_SCHEMA_VERSION:
-        payload["source_projection_key"] = profile.source_projection_key
-    if resolved_schema_version >= PROMPT_PROFILE_CHANNEL_LIMITS_SCHEMA_VERSION:
-        payload["channel_limits"] = normalize_prompt_profile_channel_limits(
-            profile.channel_limits,
-        )
-    if resolved_schema_version >= PROMPT_PROFILE_SOURCE_PROJECTION_CONFIG_SCHEMA_VERSION:
-        payload["source_projection_config"] = (
-            normalize_prompt_profile_source_projection_config(
-                profile.source_projection_config,
-            )
-        )
+    payload["source_projection_key"] = profile.source_projection_key
+    if structure is not None:
+        payload["input_structure"] = structure
+    payload["channel_limits"] = normalize_prompt_profile_channel_limits(
+        profile.channel_limits,
+    )
+    payload["source_projection_config"] = normalize_prompt_profile_source_projection_config(
+        profile.source_projection_config,
+    )
     return payload
 
 
@@ -2218,6 +1987,7 @@ def clone_prompt_profile_successor(
             operation=locked_source.operation,
             mode=locked_source.mode,
             source_projection_key=locked_source.source_projection_key,
+            input_structure_version_id=locked_source.input_structure_version_id,
             source_projection_config=deepcopy(
                 locked_source.source_projection_config,
             ),
@@ -2230,7 +2000,7 @@ def clone_prompt_profile_successor(
             contract_sha256="",
         )
         source_rules = list(
-            locked_source.field_rules.select_related("field_definition").order_by(
+            locked_source.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").order_by(
                 "position",
                 "id",
             )
@@ -2239,13 +2009,19 @@ def clone_prompt_profile_successor(
             PromptProfileFieldRule(
                 profile_version=target,
                 field_definition_id=rule.field_definition_id,
+                field_definition_version_id=rule.field_definition_version_id,
+                source_version_id=rule.source_version_id,
                 source_selector=rule.source_selector,
+                source_path=deepcopy(rule.source_path),
                 projection_primitive=str(rule.projection_primitive or ""),
                 channel=rule.channel,
                 position=rule.position,
                 label_style=rule.label_style,
                 separator=rule.separator,
                 required=rule.required,
+                fixed_value=deepcopy(rule.fixed_value),
+                has_default=rule.has_default,
+                default_value=deepcopy(rule.default_value),
                 omit_if_empty=rule.omit_if_empty,
                 max_chars=rule.max_chars,
                 generation_mode=rule.generation_mode,
@@ -2263,13 +2039,15 @@ def clone_prompt_profile_successor(
             for rule in source_rules
         ])
         target_rules = list(
-            target.field_rules.select_related("field_definition").order_by(
+            target.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").order_by(
                 "position",
                 "id",
             )
         )
         for rule in target_rules:
-            validate_profile_rule(rule)
+            # A draft can carry the exact retired dependency for replacement;
+            # publishing it still requires every source to be published.
+            validate_profile_rule(rule, require_published_source=False)
         normalize_prompt_profile_channel_limits(target.channel_limits)
         normalize_prompt_profile_source_projection_config(
             target.source_projection_config,
@@ -2306,13 +2084,13 @@ def validate_prompt_profile_for_publish(profile: PromptProfileVersion) -> None:
             "该来源投影器仅供历史查看，不能发布新的 PromptProfile",
             code="prompt_profile_source_projection_runtime_only",
         )
-    rules = list(profile.field_rules.select_related("field_definition").order_by("position"))
+    rules = list(profile.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").order_by("position"))
     if not rules:
         raise PromptProfileError("PromptProfile 至少需要一个字段规则")
     runtime_only_selectors = sorted({
         rule.source_selector
         for rule in rules
-        if rule.source_selector in RUNTIME_ONLY_FIELD_SOURCE_SELECTORS
+        if rule.source_selector in CLASSIFIED_REFERENCE_CONTEXT_OUTPUT_SELECTORS
     })
     if runtime_only_selectors:
         raise PromptProfileError(
@@ -2321,40 +2099,13 @@ def validate_prompt_profile_for_publish(profile: PromptProfileVersion) -> None:
             code="prompt_profile_source_selector_runtime_only",
         )
     for rule in rules:
-        validate_profile_rule(
-            rule,
-            enforce_current_generation_source=True,
-        )
+        validate_profile_rule(rule)
     normalize_prompt_profile_channel_limits(profile.channel_limits)
     normalize_prompt_profile_source_projection_config(
         profile.source_projection_config,
     )
     validate_prompt_profile_source_projection(profile, rules=rules)
     validate_prompt_operation_publish_evidence(profile)
-    if profile.operation == "image.generate":
-        # Bible reference-image runs happen before any image generation and
-        # must be recoverable through the reviewed prompt.normalize surface.
-        # These management-copy selectors have no translation overlay contract;
-        # publishing them would create a Chinese-project route that can only
-        # fail at runtime with no in-run repair path.
-        unsupported_bible_selectors = {
-            PromptProfileFieldRule.SourceSelector.PROJECT_TITLE,
-            PromptProfileFieldRule.SourceSelector.PROJECT_LOGLINE,
-            PromptProfileFieldRule.SourceSelector.PROJECT_SCRIPT,
-            PromptProfileFieldRule.SourceSelector.STYLE_NAME,
-            PromptProfileFieldRule.SourceSelector.STYLE_DESCRIPTION,
-        }
-        selected_unsupported = sorted({
-            rule.source_selector
-            for rule in rules
-            if rule.source_selector in unsupported_bible_selectors
-        })
-        if selected_unsupported:
-            raise PromptProfileError(
-                "image.generate PromptProfile 选择了 prompt.normalize 无法审核的 Bible 来源: "
-                + ", ".join(selected_unsupported),
-                code="bible_image_selector_not_normalizable",
-            )
     if profile.operation in {"video.generate", "image.generate"}:
         if any(
             rule.channel == PromptProfileFieldRule.Channel.SYSTEM_INSTRUCTION
@@ -2388,9 +2139,9 @@ def retire_prompt_profile(profile: PromptProfileVersion) -> PromptProfileVersion
     locked = PromptProfileVersion.objects.select_for_update().get(pk=profile.pk)
     if locked.status != PromptProfileVersion.Status.PUBLISHED:
         raise PromptProfileError("只有 published PromptProfile 可以退役")
-    if locked.bindings.filter(is_active=True).exists():
+    if locked.execution_versions.filter(status="published", instance__is_active=True).exists():
         raise PromptProfileError(
-            "仍有 active binding 引用该 PromptProfile，请先停用绑定",
+            "仍有启用且已发布的执行实例版本引用该策略，请先调整这些执行实例",
             code="prompt_profile_in_use",
         )
     locked.status = PromptProfileVersion.Status.RETIRED
@@ -2398,253 +2149,11 @@ def retire_prompt_profile(profile: PromptProfileVersion) -> PromptProfileVersion
     return locked
 
 
-def validate_prompt_profile_binding(binding: PromptProfileBinding) -> None:
-    profile = binding.prompt_profile_version
-    if profile.status != PromptProfileVersion.Status.PUBLISHED:
-        raise PromptProfileError("binding 只能引用 published PromptProfile")
-    verify_prompt_profile_contract(profile)
-    if binding.is_active:
-        validate_prompt_profile_source_projection(profile)
-    if binding.operation != profile.operation:
-        raise PromptProfileError("binding.operation 必须与 PromptProfile 一致")
-    operation = validate_prompt_operation_key(binding.operation)
-    if binding.model_family != profile.model_family:
-        raise PromptProfileError("binding.model_family 必须与 PromptProfile 一致")
-    if profile.mode and binding.mode != profile.mode:
-        raise PromptProfileError("binding.mode 必须与非空 PromptProfile.mode 一致")
-    model_profile = binding.model_profile_version
-    requires_exact_model_capability = (
-        operation in CAPABILITY_BOUND_PROMPT_OPERATIONS
-        or operation not in CONTROLLED_PROMPT_OPERATION_REGISTRY
-    )
-    if (
-        binding.is_active
-        and operation not in CONTROLLED_PROMPT_OPERATION_REGISTRY
-        and model_profile is None
-    ):
-        raise PromptProfileError(
-            "自定义 operation 的 active binding 必须选择精确 published model profile；禁止创建模型族泛化执行入口",
-            code="prompt_profile_custom_operation_exact_model_required",
-        )
-    if model_profile is not None:
-        if model_profile.status != ModelProfileVersion.Status.PUBLISHED:
-            raise PromptProfileError("binding 只能引用 published model profile")
-        family = model_family_for_profile(model_profile)
-        if family != binding.model_family:
-            raise PromptProfileError(
-                f"binding.model_family={binding.model_family} 与实际模型族 {family} 不一致",
-            )
-        if binding.is_active and requires_exact_model_capability:
-            specification = verified_model_profile_specification(model_profile)
-            capabilities = (
-                specification.get("capabilities")
-                if isinstance(specification, dict)
-                else None
-            )
-            if (
-                not isinstance(capabilities, list)
-                or any(
-                    not isinstance(item, str)
-                    or not item
-                    or item != item.strip()
-                    for item in capabilities
-                )
-                or len(capabilities) != len(set(capabilities))
-            ):
-                raise PromptProfileError(
-                    "active exact binding 要求模型 specification.capabilities "
-                    "为无重复的精确非空字符串数组",
-                    code="prompt_profile_model_capabilities_invalid",
-                )
-            if binding.operation not in capabilities:
-                raise PromptProfileError(
-                    "active exact binding 的模型版本未在 "
-                    f"specification.capabilities 精确声明 {binding.operation}",
-                    code="prompt_profile_model_capability_missing",
-                )
-
-
-def resolve_prompt_profile_binding(
-    *,
-    operation: str,
-    model_family: str,
-    mode: str = "",
-    model_profile_version: ModelProfileVersion | None = None,
-) -> ResolvedPromptProfile | None:
-    """Resolve one active binding; equal top candidates are a hard error."""
-
-    operation = str(operation or "").strip()
-    model_family = str(model_family or "").strip()
-    mode = str(mode or "").strip()
-    queryset = PromptProfileBinding.objects.select_related(
-        "prompt_profile_version", "model_profile_version",
-    ).filter(
-        is_active=True,
-        operation=operation,
-        model_family=model_family,
-    )
-    candidates: list[tuple[int, int, PromptProfileBinding]] = []
-    for binding in queryset:
-        if binding.mode and binding.mode != mode:
-            continue
-        if binding.model_profile_version_id:
-            if model_profile_version is None or binding.model_profile_version_id != model_profile_version.id:
-                continue
-            model_specificity = 2
-        else:
-            model_specificity = 0
-        mode_specificity = 1 if binding.mode else 0
-        candidates.append((model_specificity + mode_specificity, binding.priority, binding))
-    if not candidates:
-        return None
-    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
-    best_specificity, best_priority, binding = candidates[0]
-    ties = [
-        item for item in candidates
-        if item[0] == best_specificity and item[1] == best_priority
-    ]
-    if len(ties) != 1:
-        keys = ", ".join(sorted(item[2].key for item in ties))
-        raise PromptProfileResolutionError(
-            f"PromptProfile binding 冲突: {keys}",
-            code="prompt_profile_binding_ambiguous",
-        )
-    validate_prompt_profile_binding(binding)
-    return ResolvedPromptProfile(
-        binding=binding,
-        profile_version=binding.prompt_profile_version,
-    )
-
-
-def require_prompt_profile_binding(
-    *,
-    operation: str,
-    model_family: str,
-    mode: str = "",
-    model_profile_version: ModelProfileVersion | None = None,
-) -> ResolvedPromptProfile:
-    """Resolve the single production PromptProfile or fail closed.
-
-    Draft/preview tools may call ``resolve_prompt_profile_binding`` directly,
-    but a ProductionRun must never silently fall back to an unversioned prompt
-    assembler after an actual model route has been selected.
-    """
-
-    resolved = resolve_prompt_profile_binding(
-        operation=operation,
-        model_family=model_family,
-        mode=mode,
-        model_profile_version=model_profile_version,
-    )
-    if resolved is None:
-        target = str(
-            getattr(model_profile_version, "model_identifier", "")
-            or model_family
-            or "unknown-model"
-        )
-        suffix = f"/{mode}" if mode else ""
-        raise PromptProfileResolutionError(
-            f"模型 {target} 的 {operation}{suffix} 缺少唯一 active PromptProfile binding",
-            code="prompt_profile_binding_missing",
-        )
-    return resolved
-
-
-def compatible_prompt_profile_bindings(
-    *,
-    operation: str,
-    model_family: str,
-    mode: str = "",
-    model_profile_version: ModelProfileVersion | None = None,
-    lock: bool = False,
-) -> list[ResolvedPromptProfile]:
-    """List every valid explicit production choice without applying priority.
-
-    Priority remains catalog metadata for operators.  A ProductionRun choice is
-    an exact binding id and therefore must never be collapsed through the
-    implicit resolver used by draft/preview tools.
-    """
-
-    operation = str(operation or "").strip()
-    model_family = str(model_family or "").strip()
-    mode = str(mode or "").strip()
-    queryset = PromptProfileBinding.objects.select_related(
-        "prompt_profile_version", "model_profile_version",
-    ).filter(
-        is_active=True,
-        operation=operation,
-        model_family=model_family,
-    )
-    if lock:
-        # Lock only the binding row. ``model_profile_version`` is nullable and
-        # PostgreSQL rejects FOR UPDATE on the nullable side of this LEFT JOIN.
-        queryset = queryset.select_for_update(of=("self",))
-    resolved: list[ResolvedPromptProfile] = []
-    for binding in queryset:
-        if binding.mode and binding.mode != mode:
-            continue
-        if binding.model_profile_version_id and (
-            model_profile_version is None
-            or binding.model_profile_version_id != model_profile_version.id
-        ):
-            continue
-        try:
-            validate_prompt_profile_binding(binding)
-        except ValidationError:
-            continue
-        resolved.append(ResolvedPromptProfile(
-            binding=binding,
-            profile_version=binding.prompt_profile_version,
-        ))
-    resolved.sort(key=lambda item: (
-        0 if item.binding.model_profile_version_id else 1,
-        0 if item.binding.mode else 1,
-        -item.binding.priority,
-        item.binding.key,
-        str(item.binding.id),
-    ))
-    return resolved
-
-
-def require_explicit_prompt_profile_binding(
-    binding_id: Any,
-    *,
-    operation: str,
-    model_family: str,
-    mode: str = "",
-    model_profile_version: ModelProfileVersion | None = None,
-    bible_image: bool = False,
-    lock: bool = False,
-) -> ResolvedPromptProfile:
-    """Validate one user-selected binding id against the exact route contract."""
-
-    selected_id = str(binding_id or "").strip()
-    if not selected_id:
-        raise PromptProfileResolutionError(
-            "必须显式选择 PromptProfile binding",
-            code="prompt_profile_selection_required",
-        )
-    choices = compatible_prompt_profile_bindings(
-        operation=operation,
-        model_family=model_family,
-        mode=mode,
-        model_profile_version=model_profile_version,
-        lock=lock,
-    )
-    matches = [item for item in choices if str(item.binding.id) == selected_id]
-    if len(matches) != 1:
-        raise PromptProfileResolutionError(
-            "所选 PromptProfile binding 不存在、未启用或与 route 不兼容",
-            code="prompt_profile_selection_incompatible",
-        )
-    resolved = matches[0]
-    if bible_image:
-        validate_bible_image_prompt_profile(resolved.profile_version)
-    return resolved
 
 
 def _profile_rule_has_nonempty_default(rule: PromptProfileFieldRule) -> bool:
-    value = rule.field_definition.default_value
+    value = (rule.fixed_value if rule.source_selector == PromptProfileFieldRule.SourceSelector.FIXED_VALUE
+             else rule.default_value if rule.has_default else None)
     return value is not None and value != "" and value != []
 
 
@@ -2668,11 +2177,11 @@ def validate_bible_image_prompt_profile(profile: PromptProfileVersion) -> None:
     }:
         verify_prompt_profile_contract(profile)
     rules = list(
-        profile.field_rules.select_related("field_definition").order_by("position", "id")
+        profile.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").order_by("position", "id")
     )
     unavailable_required: list[str] = []
     for rule in rules:
-        required = bool(rule.required or rule.field_definition.is_required)
+        required = rule.required
         if not required or _profile_rule_has_nonempty_default(rule):
             continue
         if rule.source_selector not in _BIBLE_ALWAYS_AVAILABLE_SELECTORS:
@@ -2702,11 +2211,11 @@ def validate_bible_image_prompt_profile(profile: PromptProfileVersion) -> None:
         )
 
 
-def _typed_value(definition: PromptFieldDefinition, value: Any) -> Any:
+def _typed_value(definition: FieldDefinitionVersion, value: Any) -> Any:
     value_type = definition.value_type
     if value_type in {
-        PromptFieldDefinition.ValueType.TEXT,
-        PromptFieldDefinition.ValueType.LONG_TEXT,
+        FieldDefinitionVersion.ValueType.TEXT,
+        FieldDefinitionVersion.ValueType.LONG_TEXT,
     }:
         if not isinstance(value, str):
             raise PromptProfileError(f"{definition.key} 必须是文本")
@@ -2714,8 +2223,11 @@ def _typed_value(definition: PromptFieldDefinition, value: Any) -> Any:
             raise PromptProfileError(
                 f"{definition.key} 超过 {_field_text_max_characters()} 字符",
             )
-        return value.strip()
-    if value_type == PromptFieldDefinition.ValueType.STRING_LIST:
+        # Type validation must not rewrite source or adopted text. Formatting
+        # belongs to explicit projection/fragment rules; limits count the exact
+        # submitted characters, including whitespace.
+        return value
+    if value_type == FieldDefinitionVersion.ValueType.LIST:
         if not isinstance(value, list) or len(value) > _field_list_max_items() or any(
             not isinstance(item, str)
             or len(item) > _field_list_item_max_characters()
@@ -2726,18 +2238,20 @@ def _typed_value(definition: PromptFieldDefinition, value: Any) -> Any:
                 f"单项不超过 {_field_list_item_max_characters()} 字符的文本数组",
             )
         return [item.strip() for item in value if item.strip()]
-    if value_type == PromptFieldDefinition.ValueType.BOOLEAN:
+    if value_type == FieldDefinitionVersion.ValueType.BOOLEAN:
         if type(value) is not bool:
             raise PromptProfileError(f"{definition.key} 必须是布尔值")
         return value
-    if value_type == PromptFieldDefinition.ValueType.NUMBER:
+    if value_type in {FieldDefinitionVersion.ValueType.INTEGER, FieldDefinitionVersion.ValueType.DECIMAL}:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise PromptProfileError(f"{definition.key} 必须是数值")
+        if value_type == FieldDefinitionVersion.ValueType.INTEGER and type(value) is not int:
+            raise PromptProfileError(f"{definition.key} 必须是整数")
         absolute_max = _field_numeric_absolute_max()
         if not -absolute_max <= float(value) <= absolute_max:
             raise PromptProfileError(f"{definition.key} 数值超出安全范围")
         return value
-    if value_type == PromptFieldDefinition.ValueType.ENUM:
+    if value_type == FieldDefinitionVersion.ValueType.ENUM:
         if not isinstance(value, str) or value not in definition.value_options:
             raise PromptProfileError(f"{definition.key} 不在允许选项中")
         return value
@@ -3064,7 +2578,7 @@ def _project_static_reference_sources(
         for rule in candidate_rules
         if rule.channel == PromptProfileFieldRule.Channel.POSITIVE_PROMPT
         and rule.source_selector
-        != PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+        != PromptProfileFieldRule.SourceSelector.FIXED_VALUE
     }
     trimmed_selectors: list[str] = []
     removed_context_clauses: dict[str, list[str]] = {}
@@ -3212,6 +2726,7 @@ def assemble_prompt_profile(
     *,
     sources: dict[str, Any],
     reviewed_field_values: dict[str, Any] | None = None,
+    require_generated_values: bool = False,
     projection_context: dict[str, Any] | None = None,
     allow_draft: bool = False,
     rules: list[PromptProfileFieldRule] | None = None,
@@ -3235,7 +2750,7 @@ def assemble_prompt_profile(
     if rules is None:
         verify_prompt_profile_contract(profile)
         candidate_rules = list(
-            profile.field_rules.select_related("field_definition").order_by(
+            profile.field_rules.select_related("field_definition", "field_definition_version__field_definition", "source_version").order_by(
                 "position", "id",
             )
         )
@@ -3258,6 +2773,9 @@ def assemble_prompt_profile(
         effective_contract_sha256 = candidate_contract.sha256
     if not isinstance(sources, dict):
         raise PromptProfileError("sources 必须是对象")
+    from studio.services.prompt_profile_structures import profile_input_structure, resolve_profile_structure, read_profile_path, STRUCTURED_INPUT_SELECTOR
+    sources, structure_resolution = resolve_profile_structure(profile_input_structure(profile), sources,
+                                                              max_bytes=_prompt_profile_contract_max_bytes())
     if reviewed_field_values is None:
         reviewed_field_values = {}
     if not isinstance(reviewed_field_values, dict) or any(
@@ -3283,6 +2801,7 @@ def assemble_prompt_profile(
     }
     structured_fields: dict[str, Any] = {}
     trace: list[dict[str, Any]] = []
+    length_fragments: dict[str, list[dict[str, Any]]] = {key: [] for key in channel_fragments}
     configured_field_keys = {
         rule.field_definition.key for rule in candidate_rules
     }
@@ -3293,9 +2812,10 @@ def assemble_prompt_profile(
             + ", ".join(unknown_reviewed_fields),
             code="prompt_profile_reviewed_field_unknown",
         )
+    missing_source = object()
     for rule in candidate_rules:
         validate_profile_rule_runtime(rule)
-        definition = rule.field_definition
+        definition = profile_rule_definition(rule)
         defaulted = False
         reviewed = definition.key in reviewed_field_values
         if reviewed:
@@ -3312,9 +2832,15 @@ def assemble_prompt_profile(
                     code="prompt_profile_reviewed_field_not_generated",
                 )
             raw = reviewed_field_values[definition.key]
-        elif rule.source_selector == PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT:
-            raw = definition.default_value
-            defaulted = True
+        elif require_generated_values and rule.generation_mode in MODEL_GENERATION_MODES and rule.generation_output_semantics == "final":
+            # Production must not mistake a shared raw input (or a rule default)
+            # for a selected auxiliary result. Preview examples remain separate.
+            if rule.generation_required:
+                raise PromptProfileError(f"字段 {definition.key} 尚未明确采用生成结果",
+                    code="prompt_profile_required_field_missing")
+            raw = None
+        elif rule.source_selector == PromptProfileFieldRule.SourceSelector.FIXED_VALUE:
+            raw = rule.fixed_value
         elif (
             rule.source_selector
             == PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
@@ -3323,21 +2849,25 @@ def assemble_prompt_profile(
                 PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT,
             )
             if projected_values is None:
-                raw = None
+                raw = missing_source
             elif not isinstance(projected_values, dict):
                 raise PromptProfileError(
                     "projection.output 必须是以冻结字段 key 为键的对象",
                     code="prompt_profile_projection_output_invalid",
                 )
             else:
-                raw = projected_values.get(definition.key)
+                raw = projected_values.get(definition.key, missing_source)
         else:
-            raw = sources.get(rule.source_selector)
-            if (raw is None or raw == "" or raw == []) and definition.default_value is not None:
-                raw = definition.default_value
-                defaulted = True
+            raw = sources.get(rule.source_selector, missing_source)
+            if rule.source_selector == STRUCTURED_INPUT_SELECTOR and raw is not missing_source:
+                raw, _, present = read_profile_path(raw, rule.source_path, definition.key)
+                if not present:
+                    raw = missing_source
+        if raw is missing_source:
+            defaulted = rule.has_default
+            raw = rule.default_value if rule.has_default else None
         missing = raw is None or raw == "" or raw == []
-        required = rule.required or definition.is_required
+        required = rule.required
         if missing:
             if required:
                 raise PromptProfileError(
@@ -3355,6 +2885,10 @@ def assemble_prompt_profile(
                 code="prompt_profile_field_too_long",
             )
         separator = _SEPARATORS[rule.separator]
+        length_fragments[rule.channel].append({"field_key": definition.key, "label": definition.label,
+            "field_definition_version_id": str(rule.field_definition_version_id),
+            "source_selector": rule.source_selector, "max_chars": rule.max_chars,
+            "text_chars": len(fragment), "separator_chars": 0})
         channel_fragments[rule.channel].append((separator, fragment))
         structured_fields[definition.key] = value
         trace_row = {
@@ -3364,27 +2898,29 @@ def assemble_prompt_profile(
             "channel": rule.channel,
             "defaulted": defaulted,
         }
+        if rule.source_selector == STRUCTURED_INPUT_SELECTOR:
+            trace_row["source_path"] = deepcopy(rule.source_path)
+            trace_row["input_structure"] = structure_resolution
         if reviewed:
             trace_row["reviewed"] = True
         trace.append(trace_row)
     channels: dict[str, str] = {}
     for channel, fragments in channel_fragments.items():
         result = ""
-        for separator, fragment in fragments:
+        for index, (separator, fragment) in enumerate(fragments):
+            length_fragments[channel][index]["separator_chars"] = len(separator) if result else 0
             result = fragment if not result else result + separator + fragment
         channels[channel] = result
     channel_limits = normalize_prompt_profile_channel_limits(profile.channel_limits)
     channel_audit: dict[str, dict[str, int | str | None]] = {}
     channel_warnings: list[str] = []
+    length_errors: list[str] = []
     for channel, limit in channel_limits.items():
         character_count = len(channels.get(channel, ""))
         maximum = int(limit["max_chars"] or 0)
         warning = limit["warn_at_chars"]
         if character_count > maximum:
-            raise PromptProfileError(
-                f"通道 {channel} 装配后为 {character_count} 字符，超过配置上限 {maximum}",
-                code="prompt_profile_channel_too_long",
-            )
+            length_errors.append(f"通道 {channel} 装配后为 {character_count} 字符，超过配置上限 {maximum}")
         status = (
             "warning"
             if warning is not None and character_count >= warning
@@ -3400,6 +2936,17 @@ def assemble_prompt_profile(
             "warn_at_chars": warning,
             "status": status,
         }
+    profile_basis = {"version_id": str(profile.pk), "version": profile.version,
+        "contract_sha256": effective_contract_sha256}
+    length_diagnostics = [
+            {"channel": key, "character_count": len(value),
+                "max_chars": channel_limits.get(key, {}).get("max_chars"),
+                "over_by": max(0, len(value) - channel_limits[key]["max_chars"]) if key in channel_limits else 0,
+                "fragments": length_fragments[key]}
+            for key, value in channels.items()]
+    if length_errors:
+        raise PromptProfileChannelLengthError(length_errors, channels=channels,
+            lengths=length_diagnostics, profile_basis=profile_basis)
     payload = {
         "schema_version": 1,
         "prompt_profile_version_id": str(profile.id),
@@ -3427,6 +2974,7 @@ def assemble_prompt_profile(
         "channels": channels,
         "channel_limits": channel_limits,
         "channel_audit": channel_audit,
+        "length_diagnostics": length_diagnostics,
         "warnings": channel_warnings,
         "structured_fields": structured_fields,
         "trace": trace,
@@ -3445,7 +2993,10 @@ def validate_profile_rule_runtime(rule: PromptProfileFieldRule) -> None:
             f"PromptProfile 字段 {rule.field_definition.key} 已停用",
             code="prompt_profile_field_inactive",
         )
-    validate_field_definition(rule.field_definition)
+    profile_rule_definition(rule)
+    from studio.services.prompt_profile_structures import validate_structured_rule
+    validate_structured_rule(rule)
+    _validate_rule_values(rule)
     primitive_key = str(rule.projection_primitive or "").strip()
     if (
         rule.source_selector
@@ -3467,7 +3018,7 @@ def validate_profile_rule_runtime(rule: PromptProfileFieldRule) -> None:
         )
     if (
         rule.channel == PromptProfileFieldRule.Channel.SYSTEM_INSTRUCTION
-        and rule.source_selector != PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
+        and rule.source_selector != PromptProfileFieldRule.SourceSelector.FIXED_VALUE
     ):
         raise PromptProfileError(
             "published PromptProfile 包含不安全 system_instruction source",
@@ -3482,328 +3033,6 @@ def validate_profile_rule_runtime(rule: PromptProfileFieldRule) -> None:
             code="prompt_profile_field_limit_invalid",
         )
     validate_generation_field_contract(rule)
-
-
-def frozen_profile_reference(
-    resolved: ResolvedPromptProfile | None,
-    *,
-    model_profile_version: ModelProfileVersion | None = None,
-    operation: str | None = None,
-    mode: str | None = None,
-) -> dict[str, Any]:
-    if resolved is None:
-        return {}
-    binding = resolved.binding
-    model_profile = model_profile_version or binding.model_profile_version
-    return {
-        "schema_version": 2,
-        "prompt_profile_binding_id": str(binding.id),
-        "prompt_profile_binding_key": binding.key,
-        "prompt_profile_binding_name": binding.name,
-        "prompt_profile_binding_mode": binding.mode,
-        "prompt_profile_binding_priority_at_selection": binding.priority,
-        "binding_model_profile_version_id": (
-            str(binding.model_profile_version_id)
-            if binding.model_profile_version_id else None
-        ),
-        "prompt_profile_version_id": str(resolved.profile_version.id),
-        "prompt_profile_key": resolved.profile_version.profile_key,
-        "prompt_profile_version": resolved.profile_version.version,
-        "prompt_profile_name": resolved.profile_version.name,
-        "prompt_profile_contract_sha256": resolved.profile_version.contract_sha256,
-        "model_profile_version_id": str(model_profile.id) if model_profile else None,
-        "model_family": binding.model_family,
-        "operation": str(operation if operation is not None else binding.operation),
-        "mode": str(mode if mode is not None else binding.mode),
-    }
-
-
-def load_frozen_prompt_profile_selection(
-    reference: Any,
-    *,
-    model_profile_version: ModelProfileVersion,
-    operation: str,
-    mode: str = "",
-    bible_image: bool = False,
-) -> PromptProfileVersion:
-    """Load one exact frozen profile without re-running global binding selection.
-
-    Binding active/priority changes after Run creation must not alter an already
-    hashed route.  The immutable route stores the selected binding identity and
-    profile contract; runtime reads only that exact profile version.
-    """
-
-    if (
-        not isinstance(reference, dict)
-        or reference.get("schema_version") not in {1, 2}
-    ):
-        raise PromptProfileResolutionError(
-            "PromptProfile 冻结选择缺失或版本无效",
-            code="prompt_profile_frozen_selection_invalid",
-        )
-    binding_id = str(reference.get("prompt_profile_binding_id") or "")
-    binding_key = str(reference.get("prompt_profile_binding_key") or "")
-    profile_id = str(reference.get("prompt_profile_version_id") or "")
-    contract_sha256 = str(reference.get("prompt_profile_contract_sha256") or "")
-    expected_family = model_family_for_profile(model_profile_version)
-    if (
-        not binding_id
-        or not binding_key
-        or not profile_id
-        or reference.get("model_profile_version_id") != str(model_profile_version.id)
-        or reference.get("model_family") != expected_family
-        or reference.get("operation") != operation
-        or reference.get("mode") != mode
-        or (
-            reference.get("schema_version") == 2
-            and reference.get("prompt_profile_binding_mode") not in {"", mode}
-        )
-        or (
-            reference.get("schema_version") == 2
-            and reference.get("binding_model_profile_version_id")
-            not in {None, str(model_profile_version.id)}
-        )
-    ):
-        raise PromptProfileResolutionError(
-            "PromptProfile 冻结选择与模型 route 不一致",
-            code="prompt_profile_frozen_selection_invalid",
-        )
-    try:
-        profile = PromptProfileVersion.objects.get(pk=profile_id)
-    except (PromptProfileVersion.DoesNotExist, ValueError) as exc:
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile 版本不存在",
-            code="prompt_profile_frozen_selection_invalid",
-        ) from exc
-    verify_frozen_profile_reference(
-        profile,
-        binding_key=binding_key,
-        contract_sha256=contract_sha256,
-    )
-    if (
-        reference.get("prompt_profile_key") != profile.profile_key
-        or reference.get("prompt_profile_version") != profile.version
-        or (
-            reference.get("schema_version") == 2
-            and reference.get("prompt_profile_name") != profile.name
-        )
-        or profile.operation != operation
-        or profile.model_family != expected_family
-        or (profile.mode and profile.mode != mode)
-    ):
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile 身份或适用范围已漂移",
-            code="prompt_profile_frozen_selection_invalid",
-        )
-    if bible_image:
-        validate_bible_image_prompt_profile(profile)
-    return profile
-
-
-def verify_frozen_profile_reference(
-    profile: PromptProfileVersion | None,
-    *,
-    binding_key: str,
-    contract_sha256: str,
-) -> None:
-    if profile is None:
-        if binding_key or contract_sha256:
-            raise PromptProfileResolutionError(
-                "PromptProfile 冻结引用不完整",
-                code="prompt_profile_frozen_reference_invalid",
-            )
-        return
-    if profile.status not in {
-        PromptProfileVersion.Status.PUBLISHED,
-        PromptProfileVersion.Status.RETIRED,
-    }:
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile 从未发布或状态无效",
-            code="prompt_profile_frozen_reference_invalid",
-        )
-    if not binding_key or contract_sha256 != profile.contract_sha256:
-        raise PromptProfileResolutionError(
-            "PromptProfile 冻结 checksum 已漂移",
-            code="prompt_profile_frozen_reference_invalid",
-        )
-    verify_prompt_profile_contract(profile)
-
-
-def validate_frozen_prompt_profile_binding_reference(
-    *,
-    binding_key: str,
-    prompt_profile_version: PromptProfileVersion | None,
-    contract_sha256: str,
-) -> PromptProfileBinding | None:
-    """Validate one non-FK binding reference against its frozen identity.
-
-    Callers that persist ``prompt_profile_binding_key`` must invoke this while
-    holding ``registry_reference_write_guard``.  The binding row is loaded
-    afresh inside that guard so registry deletion cannot race a stale in-memory
-    binding resolved earlier in the production flow.
-    """
-
-    key = str(binding_key or "")
-    checksum = str(contract_sha256 or "")
-    if not key:
-        verify_frozen_profile_reference(
-            prompt_profile_version,
-            binding_key="",
-            contract_sha256=checksum,
-        )
-        return None
-    prompt_profile_version_id = getattr(prompt_profile_version, "pk", None)
-    if prompt_profile_version_id is None:
-        raise PromptProfileResolutionError(
-            "PromptProfile binding key 缺少冻结 PromptProfile 版本",
-            code="prompt_profile_binding_reference_invalid",
-        )
-    try:
-        binding = (
-            PromptProfileBinding.objects.select_for_update()
-            .select_related("prompt_profile_version")
-            .get(key=key)
-        )
-    except PromptProfileBinding.DoesNotExist as exc:
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile binding 不存在",
-            code="prompt_profile_binding_reference_missing",
-        ) from exc
-    frozen_profile = binding.prompt_profile_version
-    if frozen_profile.pk != prompt_profile_version_id:
-        raise PromptProfileResolutionError(
-            "PromptProfile binding 与冻结 PromptProfile 版本不一致",
-            code="prompt_profile_binding_reference_invalid",
-        )
-    verify_frozen_profile_reference(
-        frozen_profile,
-        binding_key=key,
-        contract_sha256=checksum,
-    )
-    return binding
-
-
-def verify_frozen_profile_assembly(
-    profile: PromptProfileVersion,
-    assembly: Any,
-) -> dict[str, Any]:
-    if not isinstance(assembly, dict):
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile assembly 缺失",
-            code="prompt_profile_frozen_assembly_invalid",
-        )
-    if (
-        assembly.get("prompt_profile_version_id") != str(profile.id)
-        or assembly.get("contract_sha256") != profile.contract_sha256
-    ):
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile assembly identity 已漂移",
-            code="prompt_profile_frozen_assembly_invalid",
-        )
-    channels = assembly.get("channels")
-    if not isinstance(channels, dict) or set(channels) != set(
-        PromptProfileFieldRule.Channel.values
-    ) or any(not isinstance(value, str) for value in channels.values()):
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile channels 无效",
-            code="prompt_profile_frozen_assembly_invalid",
-        )
-    if not isinstance(assembly.get("structured_fields"), dict) or not isinstance(
-        assembly.get("trace"), list
-    ):
-        raise PromptProfileResolutionError(
-            "冻结 PromptProfile structured fields 无效",
-            code="prompt_profile_frozen_assembly_invalid",
-        )
-    json_contract(assembly, max_bytes=_prompt_profile_preview_max_bytes())
-    return assembly
-
-
-def profile_fingerprint(base_fingerprint: str, resolved: ResolvedPromptProfile | None) -> str:
-    if resolved is None:
-        return base_fingerprint
-    material = (
-        f"{base_fingerprint}|{resolved.profile_version.id}|"
-        f"{resolved.profile_version.contract_sha256}|{resolved.binding.key}"
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def frozen_profile_fingerprint(
-    base_fingerprint: str,
-    *,
-    profile: PromptProfileVersion,
-    binding_key: str,
-) -> str:
-    material = (
-        f"{base_fingerprint}|{profile.id}|{profile.contract_sha256}|{binding_key}"
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
-
-
-def _translated_media_value(
-    project,
-    *,
-    scope_type: str,
-    scope_id,
-    field_key: str,
-    source: Any,
-) -> str:
-    """Read only a current, human-confirmed translation overlay.
-
-    PromptProfile owns selection and ordering, while the translation overlay
-    remains the authoritative execution-language view of one source field.  A
-    missing/stale overlay intentionally returns the original value so the
-    production language gate can report the real unresolved input.
-    """
-
-    return confirmed_translation(
-        project_id=project.id,
-        scope_type=scope_type,
-        scope_id=scope_id,
-        field_key=field_key,
-        source_text=str(source or ""),
-    ).strip()
-
-
-def _joined_shot_values(shots: list, values: list[str]) -> str:
-    rows = [
-        (shot, str(value or "").strip())
-        for shot, value in zip(shots, values, strict=True)
-        if str(value or "").strip()
-    ]
-    if len(shots) == 1:
-        return rows[0][1] if rows else ""
-    return "\n".join(f"[Shot {shot.number}] {value}" for shot, value in rows)
-
-
-def _reference_source_items(reference_bindings: list[dict[str, Any]]) -> list[str]:
-    """Expose the canonical graph bindings without local paths or checksums."""
-
-    values: list[str] = []
-    for item in reference_bindings:
-        if not isinstance(item, dict):
-            raise PromptProfileError("reference_bindings 每项必须是对象")
-        label = str(item.get("input_label") or "").strip()
-        category = str(item.get("category") or "").strip()
-        identity = str(
-            item.get("entity_label")
-            or item.get("entity_name")
-            or item.get("name")
-            or ""
-        ).strip()
-        purpose = str(item.get("purpose") or "").strip()
-        if label:
-            role = ":".join(part for part in (category, purpose) if part)
-            suffix = f" {identity}" if identity else ""
-            values.append(f"{label} {role}{suffix}".strip())
-        audio_label = str(item.get("audio_input_label") or "").strip()
-        if audio_label:
-            audio_purpose = str(item.get("audio_purpose") or "audio_reference").strip()
-            audio_name = str(item.get("audio_name") or item.get("name") or "").strip()
-            suffix = f" {audio_name}" if audio_name else ""
-            values.append(f"{audio_label} audio:{audio_purpose}{suffix}".strip())
-    return values
 
 
 def reference_context_profile_source(
@@ -3861,450 +3090,6 @@ def reference_context_profile_source(
         f"Reference Context-IR 包含未注册输出字段: {result_field}",
         code="prompt_profile_projection_output_invalid",
     )
-
-
-def resolved_media_override(project, shots, attribute: str, value: str) -> str:
-    """Re-use reviewed translation only for an exact saved-field echo.
-
-    A genuinely new run-level instruction stays unchanged and subject to the
-    normal language gate. Conflicting scoped translations are not guessed.
-    """
-    text = str(value or "").strip()
-    matches = {
-        _translated_media_value(project, scope_type="shot", scope_id=shot.id,
-            field_key=f"shot.{attribute}", source=getattr(shot, attribute, ""))
-        for shot in shots if text and text == str(getattr(shot, attribute, "") or "").strip()
-    }
-    if len(matches) > 1:
-        raise PromptProfileError("运行级声音描述对应多个不同的已审核译文，请明确选择内容")
-    return next(iter(matches)) if matches else text
-
-
-def media_profile_sources(
-    *,
-    project,
-    shot=None,
-    shots: list | None = None,
-    extra_direction: str = "",
-    overall_soundscape: str = "",
-    non_diegetic_music: str = "",
-    include_audio: bool = True,
-    effective_durations_ms: dict[str, int] | None = None,
-    reference_bindings: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Build typed media facts; never assemble a model prompt.
-
-    Every user-configurable semantic value enters the final request only when a
-    published PromptProfile selects this allow-listed source.  Dialogue,
-    delivery and voiceover are intentionally separate facts, and reference
-    facts come from the already-normalized binding contract rather than the
-    shot's untyped asset pool.
-    """
-
-    selected_shots = list(shots or ([shot] if shot is not None else []))
-    if not selected_shots:
-        raise PromptProfileError("media profile sources 至少需要一个分镜")
-    if any(item.episode.project_id != project.id for item in selected_shots):
-        raise PromptProfileError("media profile sources 的分镜不属于当前项目")
-    effective_durations_ms = dict(effective_durations_ms or {})
-    reference_bindings = list(reference_bindings or [])
-    style = getattr(project, "style", None)
-
-    def shot_value(item, field_key: str, source: Any) -> str:
-        return _translated_media_value(
-            project,
-            scope_type="shot",
-            scope_id=item.id,
-            field_key=field_key,
-            source=source,
-        )
-
-    def scene_value(item, field_key: str, source: Any) -> str:
-        scene = getattr(item, "scene", None)
-        if scene is None:
-            return ""
-        return _translated_media_value(
-            project,
-            scope_type="scene",
-            scope_id=scene.id,
-            field_key=field_key,
-            source=source,
-        )
-
-    titles = [str(item.title or "").strip() for item in selected_shots]
-    narratives = [shot_value(item, "shot.narrative", item.narrative) for item in selected_shots]
-    details = [
-        shot_value(item, "shot.detailed_description", item.detailed_description)
-        for item in selected_shots
-    ]
-    cameras = [shot_value(item, "shot.camera", item.camera) for item in selected_shots]
-    actions = [shot_value(item, "shot.action", item.action) for item in selected_shots]
-    sound_effects = [
-        shot_value(item, "shot.sound_effects", item.sound_effects)
-        for item in selected_shots
-    ]
-    music = [shot_value(item, "shot.music", item.music) for item in selected_shots]
-    lighting = [
-        scene_value(item, "scene.lighting", getattr(item.scene, "lighting", ""))
-        if item.scene else ""
-        for item in selected_shots
-    ]
-    colors = [
-        scene_value(item, "scene.color_palette", getattr(item.scene, "color_palette", ""))
-        if item.scene else ""
-        for item in selected_shots
-    ]
-    environments = []
-    for item in selected_shots:
-        scene = item.scene
-        environments.append("; ".join(filter(None, (
-            scene_value(item, "scene.visual_identity", getattr(scene, "visual_identity", ""))
-            if scene else "",
-            scene_value(item, "scene.location", getattr(scene, "location", ""))
-            if scene else "",
-            scene_value(item, "scene.time_of_day", getattr(scene, "time_of_day", ""))
-            if scene else "",
-        ))))
-
-    on_camera_dialogue: list[str] = []
-    dialogue_delivery: list[str] = []
-    voiceover: list[str] = []
-    for item in (selected_shots if include_audio else []):
-        duration_ms = int(effective_durations_ms.get(str(item.id), item.duration_ms))
-        try:
-            dialogue = validate_dialogue_timing(item.dialogue or [], duration_ms=duration_ms)
-        except DialogueContractError as exc:
-            raise PromptProfileError(f"分镜 {item.number} 的 {exc}") from exc
-        for index, entry in enumerate(dialogue):
-            start_ms = int(entry.get("start_ms", 0))
-            end_ms = int(entry.get("end_ms", duration_ms))
-            identity = f"[Shot {item.number} {start_ms / 1000:.3f}-{end_ms / 1000:.3f}s] ({entry['speaker_id']})"
-            authored = f"<d>[{project.language}] {entry['text']}</d>"
-            delivery_source = str(entry.get("delivery") or "")
-            delivery = _translated_media_value(
-                project,
-                scope_type="shot",
-                scope_id=item.id,
-                field_key=f"shot.dialogue.{index}.delivery",
-                source=delivery_source,
-            ) if delivery_source else ""
-            if delivery:
-                dialogue_delivery.append(f"{identity} {delivery}")
-            if entry.get("voiceover") is True:
-                voiceover.append(
-                    f"{identity} off-screen voiceover: {authored}; visible on-screen speaker keeps lips closed"
-                )
-            else:
-                on_camera_dialogue.append(f"{identity} on-camera dialogue: {authored}")
-
-    negative_values: list[str] = []
-    settings = project.production_settings if isinstance(project.production_settings, dict) else {}
-    project_negative = str(settings.get("negative_prompt") or "")
-    if project_negative:
-        negative_values.append(_translated_media_value(
-            project,
-            scope_type="project",
-            scope_id=project.id,
-            field_key="project.production_settings.negative_prompt",
-            source=project_negative,
-        ))
-    style_negative = str(getattr(style, "negative_prompt", "") or "") if style else ""
-    translated_style_negative = ""
-    if style_negative:
-        translated_style_negative = _translated_media_value(
-            project,
-            scope_type="project",
-            scope_id=project.id,
-            field_key="style.negative_prompt",
-            source=style_negative,
-        )
-        negative_values.append(translated_style_negative)
-    shot_negatives: list[str] = []
-    for item in selected_shots:
-        metadata = item.metadata if isinstance(item.metadata, dict) else {}
-        value = str(metadata.get("negative_prompt") or "")
-        translated = shot_value(item, "shot.negative_prompt", value) if value else ""
-        shot_negatives.append(translated)
-        if translated:
-            negative_values.append(translated)
-        for character in item.characters.all():
-            source = str(getattr(character, "negative_constraints", "") or "")
-            if source:
-                negative_values.append(_translated_media_value(
-                    project,
-                    scope_type="character",
-                    scope_id=character.id,
-                    field_key="character.negative_constraints",
-                    source=source,
-                ))
-        if item.scene:
-            source = str(getattr(item.scene, "negative_constraints", "") or "")
-            if source:
-                negative_values.append(scene_value(item, "scene.negative_constraints", source))
-        for prop in item.props.all():
-            source = str(getattr(prop, "negative_constraints", "") or "")
-            if source:
-                negative_values.append(_translated_media_value(
-                    project,
-                    scope_type="prop",
-                    scope_id=prop.id,
-                    field_key="prop.negative_constraints",
-                    source=source,
-                ))
-    negative_constraints = "; ".join(dict.fromkeys(
-        value.strip() for value in negative_values if value.strip()
-    ))
-
-    subject_values: list[str] = []
-    seen_subjects: set[tuple[str, str]] = set()
-    # Identity terminology already has one authoritative project glossary.
-    # Use its stable subject identifiers when no authored name is configured;
-    # do not invent a model-specific English proper name or translate here.
-    identity_names = canonical_identity_mappings(project)
-    from studio.services.visual_reference_policy import visual_reference_characters
-    for item in selected_shots:
-        for character in visual_reference_characters(item.characters.all()):
-            key = ("character", str(character.id))
-            if key in seen_subjects:
-                continue
-            seen_subjects.add(key)
-            canonical_name = identity_names[character.name]
-            identity = _translated_media_value(
-                project,
-                scope_type="character",
-                scope_id=character.id,
-                field_key="character.visual_identity",
-                source=getattr(character, "visual_identity", ""),
-            )
-            wardrobe = _translated_media_value(
-                project,
-                scope_type="character",
-                scope_id=character.id,
-                field_key="character.wardrobe",
-                source=getattr(character, "wardrobe", ""),
-            )
-            subject_values.append(
-                ": ".join(filter(None, (canonical_name, identity, wardrobe)))
-            )
-        for prop in item.props.all():
-            key = ("prop", str(prop.id))
-            if key in seen_subjects:
-                continue
-            seen_subjects.add(key)
-            canonical_name = identity_names[prop.name]
-            identity = _translated_media_value(
-                project,
-                scope_type="prop",
-                scope_id=prop.id,
-                field_key="prop.visual_identity",
-                source=getattr(prop, "visual_identity", ""),
-            )
-            subject_values.append(": ".join(filter(None, (canonical_name, identity))))
-
-    style_visual = str(getattr(style, "visual_prompt", "") or "") if style else ""
-    translated_style = _translated_media_value(
-        project,
-        scope_type="project",
-        scope_id=project.id,
-        field_key="style.visual_prompt",
-        source=style_visual,
-    ) if style_visual else ""
-    ambient_values = [
-        scene_value(item, "scene.ambient_sound", getattr(item.scene, "ambient_sound", ""))
-        if item.scene else ""
-        for item in selected_shots
-    ]
-    soundscape = resolved_media_override(project, selected_shots, "sound_effects", overall_soundscape) or "; ".join(dict.fromkeys(
-        value for value in [*ambient_values, *sound_effects] if value
-    ))
-    bgm = resolved_media_override(project, selected_shots, "music", non_diegetic_music) or _joined_shot_values(selected_shots, music)
-    durations = [
-        int(effective_durations_ms.get(str(item.id), item.duration_ms))
-        for item in selected_shots
-    ]
-
-    return {
-        "project.title": project.title,
-        "project.logline": project.logline,
-        "project.master_script": project.master_script,
-        "project.language": project.language,
-        "project.aspect_ratio": project.aspect_ratio,
-        "style.name": getattr(style, "name", "") if style else "",
-        "style.description": getattr(style, "description", "") if style else "",
-        "style.visual_prompt": translated_style,
-        "style.negative_prompt": translated_style_negative,
-        "shot.title": _joined_shot_values(selected_shots, titles),
-        "shot.narrative": _joined_shot_values(selected_shots, narratives),
-        "shot.detailed_description": _joined_shot_values(selected_shots, details),
-        "shot.camera": _joined_shot_values(selected_shots, cameras),
-        "shot.action": _joined_shot_values(selected_shots, actions),
-        "shot.dialogue": "\n".join(on_camera_dialogue) if include_audio else "",
-        "shot.sound_effects": _joined_shot_values(selected_shots, sound_effects) if include_audio else "",
-        "shot.music": _joined_shot_values(selected_shots, music) if include_audio else "",
-        "shot.negative_prompt": _joined_shot_values(selected_shots, shot_negatives),
-        "request.theme": project.logline or project.title,
-        "request.lighting": _joined_shot_values(selected_shots, lighting),
-        "request.environment": _joined_shot_values(selected_shots, environments),
-        "request.action": _joined_shot_values(selected_shots, actions),
-        "request.camera": _joined_shot_values(selected_shots, cameras),
-        "request.style": translated_style,
-        "request.language": project.language,
-        "request.text": str(extra_direction or "").strip(),
-        "request.bgm_style": bgm if include_audio else "",
-        "request.dialogue_delivery": "\n".join(dialogue_delivery) if include_audio else "",
-        "request.negative_constraints": negative_constraints,
-        "request.subject": "; ".join(value for value in subject_values if value),
-        "request.composition": _joined_shot_values(selected_shots, cameras),
-        "request.color_palette": _joined_shot_values(selected_shots, colors),
-        "request.motion": _joined_shot_values(selected_shots, actions),
-        "request.duration": sum(durations) / 1000,
-        "request.aspect_ratio": project.aspect_ratio,
-        "request.sound_effects": soundscape if include_audio else "",
-        "request.voiceover": "\n".join(voiceover) if include_audio else "",
-        "request.reference_assets": _reference_source_items(reference_bindings),
-    }
-
-
-def bible_image_profile_sources(
-    *,
-    project,
-    entity_type: str,
-    entity,
-    extra_direction: str = "",
-) -> dict[str, Any]:
-    """Return allow-listed Bible facts for an image PromptProfile.
-
-    This function deliberately does not concatenate a final prompt.  Field
-    inclusion, order, labels, separators and channels remain exclusively owned
-    by the selected immutable PromptProfile.
-    """
-
-    normalized_type = str(entity_type or "").strip().lower()
-    if normalized_type not in {"character", "scene", "prop"}:
-        raise PromptProfileError("Bible 参考图实体类型无效")
-    if getattr(entity, "project_id", None) != project.id:
-        raise PromptProfileError("Bible 参考图实体不属于当前项目")
-    style = getattr(project, "style", None)
-
-    def translated(field_key: str, source: Any) -> str:
-        return _translated_media_value(
-            project,
-            scope_type=normalized_type,
-            scope_id=entity.id,
-            field_key=f"{normalized_type}.{field_key}",
-            source=source,
-        )
-
-    def project_value(field_key: str, source: Any) -> str:
-        return _translated_media_value(
-            project,
-            scope_type="project",
-            scope_id=project.id,
-            field_key=field_key,
-            source=source,
-        )
-
-    name = translated("name", getattr(entity, "name", ""))
-    visual_identity = translated(
-        "visual_identity", getattr(entity, "visual_identity", ""),
-    )
-    negative = translated(
-        "negative_constraints", getattr(entity, "negative_constraints", ""),
-    )
-    # ``description`` is management copy and has no reviewed translation field;
-    # do not leak it into the executable prompt.  Every value below is either a
-    # reviewed overlay or a deterministic English production instruction.
-    subject_parts = [name, visual_identity]
-    environment = ""
-    lighting = ""
-    color_palette = ""
-    action = ""
-    if normalized_type == "character":
-        subject_parts.extend((
-            translated("age_appearance", getattr(entity, "age_appearance", "")),
-            translated("face_identity", getattr(entity, "face_identity", "")),
-            translated("wardrobe", getattr(entity, "wardrobe", "")),
-            translated("personality", getattr(entity, "personality", "")),
-        ))
-        composition = (
-            "single canonical character reference, full identity visible, "
-            "neutral readable pose, no additional characters"
-        )
-    elif normalized_type == "scene":
-        environment = "; ".join(filter(None, (
-            visual_identity,
-            translated("location", getattr(entity, "location", "")),
-            translated("time_of_day", getattr(entity, "time_of_day", "")),
-        )))
-        lighting = translated("lighting", getattr(entity, "lighting", ""))
-        color_palette = translated(
-            "color_palette", getattr(entity, "color_palette", ""),
-        )
-        composition = (
-            "canonical establishing environment reference, spatial layout and "
-            "landmarks clearly visible, no foreground character"
-        )
-    else:
-        subject_parts.extend((
-            translated("material", getattr(entity, "material", "")),
-            translated("distinctive_marks", getattr(entity, "distinctive_marks", "")),
-            translated("continuity_state", getattr(entity, "continuity_state", "")),
-        ))
-        composition = (
-            "single isolated canonical prop reference, complete silhouette and "
-            "distinctive details visible, no unrelated objects"
-        )
-
-    style_visual = str(getattr(style, "visual_prompt", "") or "") if style else ""
-    style_negative = str(getattr(style, "negative_prompt", "") or "") if style else ""
-    translated_style = project_value("style.visual_prompt", style_visual) if style_visual else ""
-    translated_style_negative = (
-        project_value("style.negative_prompt", style_negative) if style_negative else ""
-    )
-    negative_constraints = "; ".join(dict.fromkeys(filter(None, (
-        negative,
-        translated_style_negative,
-    ))))
-    subject = "; ".join(dict.fromkeys(
-        value.strip() for value in subject_parts if str(value or "").strip()
-    ))
-    return {
-        "project.language": project.language,
-        "project.aspect_ratio": project.aspect_ratio,
-        "style.visual_prompt": translated_style,
-        "style.negative_prompt": translated_style_negative,
-        "request.theme": f"canonical {normalized_type} production reference",
-        "request.lighting": lighting,
-        "request.environment": environment,
-        "request.action": action,
-        "request.camera": "",
-        "request.style": translated_style,
-        "request.language": project.language,
-        "request.text": str(extra_direction or "").strip(),
-        "request.bgm_style": "",
-        "request.dialogue_delivery": "",
-        "request.negative_constraints": negative_constraints,
-        "request.subject": subject,
-        "request.composition": composition,
-        "request.color_palette": color_palette,
-        "request.motion": "",
-        "request.duration": "",
-        "request.aspect_ratio": project.aspect_ratio,
-        "request.sound_effects": "",
-        "request.voiceover": "",
-        "request.reference_assets": [],
-        # Shot selectors are present as empty facts so a shared comprehensive
-        # image profile can remain valid without leaking unrelated shot data.
-        "shot.title": "",
-        "shot.narrative": "",
-        "shot.detailed_description": "",
-        "shot.camera": "",
-        "shot.action": "",
-        "shot.dialogue": "",
-        "shot.sound_effects": "",
-        "shot.music": "",
-        "shot.negative_prompt": "",
-    }
 
 
 def text_profile_sources(*, project, inputs: dict[str, Any], operation: str) -> dict[str, Any]:

@@ -1,10 +1,8 @@
 """Model-agnostic visual-reference eligibility for character Bible rows.
 
-``Shot.characters`` is the authoritative story/speaker relationship.  It must
-therefore keep an off-screen speaker so dialogue validation can still resolve
-its stable speaker ID.  Visual conditioning is a different concern: a
-globally voice-only/unseen character must not consume a Bible image or a
-classified image slot.
+This is a Bible-level visual policy, not a source of shot visibility, speakers
+or per-call material selections. ShotCharacterRelation and ShotReferenceUse
+own those explicitly authored facts; this policy must not rewrite them.
 
 An explicit structured policy in ``CharacterBible.metadata`` always wins::
 
@@ -16,7 +14,9 @@ An explicit structured policy in ``CharacterBible.metadata`` always wins::
     }
 
 ``auto`` (and an absent policy) uses a deliberately small, high-confidence
-semantic fallback over the Bible description/visual identity.  The fallback
+semantic rule over the Bible description/role and verified primary identity.
+It never reads the obsolete entity visual text or interprets an appearance
+change as a permanent change to speaker eligibility. The rule
 is platform vocabulary, not a model/workflow name, so every image/video
 adapter consumes the same decision.
 """
@@ -66,7 +66,7 @@ _VOICE_ONLY_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 
 class VisualReferencePolicyError(ValueError):
-    """An explicit visual-reference policy is malformed."""
+    """A visual-reference policy or its authoritative source is invalid."""
 
 
 @dataclass(frozen=True)
@@ -112,10 +112,10 @@ def validate_visual_reference_policy_metadata(metadata: object) -> None:
     _explicit_mode(metadata)
 
 
-def _semantic_text(character: Any) -> str:
+def _semantic_text(character: Any, primary_setting) -> str:
     values = (
         getattr(character, "description", ""),
-        getattr(character, "visual_identity", ""),
+        primary_setting.identity_anchor if primary_setting is not None else "",
         getattr(character, "role", ""),
     )
     return " ".join(
@@ -125,12 +125,7 @@ def _semantic_text(character: Any) -> str:
     )
 
 
-def character_visual_reference_decision(
-    character: Any,
-) -> CharacterVisualReferenceDecision:
-    """Resolve one stable character-level visual-conditioning decision."""
-
-    mode = _explicit_mode(getattr(character, "metadata", None))
+def _decision(character, mode, primary_setting) -> CharacterVisualReferenceDecision:
     if mode == "include":
         return CharacterVisualReferenceDecision(
             eligible=True,
@@ -146,7 +141,7 @@ def character_visual_reference_decision(
             source="structured_metadata",
         )
 
-    text = _semantic_text(character)
+    text = _semantic_text(character, primary_setting)
     for reason, pattern in _VOICE_ONLY_PATTERNS:
         if pattern.search(text):
             return CharacterVisualReferenceDecision(
@@ -158,18 +153,53 @@ def character_visual_reference_decision(
     return CharacterVisualReferenceDecision(
         eligible=True,
         mode="auto",
-        reason="visual_identity_default",
+        reason="visual_reference_default",
         source="semantic_fallback",
     )
 
 
-def character_requires_visual_reference(character: Any) -> bool:
-    return character_visual_reference_decision(character).eligible
+def character_visual_reference_decisions(
+    characters: Iterable[Any], *, primary_settings=None,
+) -> dict[str, CharacterVisualReferenceDecision]:
+    """Read auto-mode primary identities in batches, scoped to each project.
+
+    ``primary_settings`` is an internal reuse point for an operation that has
+    already used read_entity_primary_settings (such as consistency capture).
+    Explicit overrides need no primary. A missing primary is allowed; a broken
+    pointer/body is not absence and must not produce a guessed decision.
+    Nothing is attached to ORM instances or cached across operations.
+    """
+    from studio.services.bible_setting_evidence import read_entity_primary_settings
+    from studio.services.bible_variants import BibleVariantConflict
+
+    rows = {str(row.pk): row for row in characters}
+    modes = {key: _explicit_mode(row.metadata) for key, row in rows.items()}
+    groups = {}
+    for key, row in rows.items():
+        if modes[key] not in {"include", "exclude"}:
+            groups.setdefault(row.project_id, []).append(("character", key))
+    settings = {} if primary_settings is None else primary_settings
+    if primary_settings is None:
+        try:
+            for project_id, keys in groups.items():
+                settings.update(read_entity_primary_settings(project_id=project_id, entity_keys=keys))
+        except BibleVariantConflict as exc:
+            raise VisualReferencePolicyError(f"人物出镜判断的主图设定无效: {exc}") from exc
+    if any(key not in settings for keys in groups.values() for key in keys):
+        raise VisualReferencePolicyError("人物出镜判断缺少已核验的主图读取结果")
+    return {key: _decision(row, modes[key], settings.get(("character", key))) for key, row in rows.items()}
+
+
+def character_visual_reference_decision(character: Any) -> CharacterVisualReferenceDecision:
+    """Resolve one character through the same batched current-source reader."""
+    return character_visual_reference_decisions([character])[str(character.pk)]
 
 
 def visual_reference_characters(characters: Iterable[Any]) -> list[Any]:
+    characters = list(characters)
+    decisions = character_visual_reference_decisions(characters)
     return [
         character
         for character in characters
-        if character_requires_visual_reference(character)
+        if decisions[str(character.pk)].eligible
     ]

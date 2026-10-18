@@ -129,19 +129,21 @@ class TextChatRequestOptionsMigrationTests(_MigrationTestCase):
         )
 
         runtime_target = RuntimeProfile.objects.get(pk=target.id)
-        # v18 remains a truthful historical snapshot.  Current runtime
-        # validators intentionally reject its text-output policies because
-        # the required field contract is introduced by the v19 successor.
-        with self.assertRaises(ValidationError):
-            validate_script_generation_model_profile(runtime_target)
-        with self.assertRaises(ValidationError):
-            validate_script_structure_model_profile(runtime_target)
-        normalized_policies = (
-            validate_prompt_normalization_model_profile(runtime_target),
-            validate_visual_rules_model_profile(runtime_target),
-        )
-        for policy in normalized_policies:
-            self.assertIn("chat_request_options", policy)
+        # v18 remains a truthful historical snapshot, not a current runtime
+        # contract. It predates field contracts and still owns output allowances
+        # that are now exclusively supplied by the system resource policy.
+        # Preserve the exact historical bytes/options checked above; do not
+        # revive retired fields merely to make a migration test pass.
+        for validator in (
+            validate_script_generation_model_profile,
+            validate_script_structure_model_profile,
+            validate_prompt_normalization_model_profile,
+            validate_visual_rules_model_profile,
+        ):
+            with self.subTest(validator=validator.__name__):
+                with self.assertRaises(ValidationError) as caught:
+                    validator(runtime_target)
+                self.assertIn("specification", caught.exception.message_dict)
 
         migration.publish_text_chat_request_options_successor(self.apps, None)
         self.assertEqual(Profile.objects.filter(

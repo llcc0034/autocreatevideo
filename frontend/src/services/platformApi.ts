@@ -1,11 +1,15 @@
 import { api, fetchAllPages, unwrap } from './api'
+import { adaptRecipeMaterialSelectionContext } from './recipeMaterialSelection'
+import { adaptMaterialFulfillmentContext, adaptMaterialFulfillmentReceipt, materialFulfillmentPayload,
+  type MaterialFulfillmentContext, type MaterialFulfillmentChoice } from './recipeMaterialFulfillment'
 import {
+  adaptRecipeTextOutputOptions,
   adaptAcceptanceSmokePage,
   adaptAcceptanceSmokeRow,
   adaptConfigDefinition, adaptConfigDefinitionOptions, adaptConfigResourceOption, adaptConfigRevision, adaptGeneratedArtifact, adaptGenerationAttempt,
   adaptHostSnapshot, adaptLegacyWorkflowTemplate, adaptModelArtifact, adaptModelDeployment,
-  adaptModelDeploymentSmokeAttempt, adaptModelProfileRegistryOptions, adaptModelProfileVersion, adaptNodeMetadata, adaptProductionRecipe, adaptProductionRecipeEditorOptions, adaptProductionRecipeMediaRouteOptions, adaptProductionRun,
-  adaptPromptFieldDefinition, adaptPromptProfileBinding, adaptPromptProfileFieldRule, adaptPromptProfileOptions,
+  adaptModelDeploymentSmokeAttempt, adaptModelProfileRegistryOptions, adaptModelProfileVersion, adaptNodeMetadata, adaptProductionRecipe, adaptProductionRecipeEditorOptions, adaptProductionRun,
+  adaptFieldDefinition, adaptPromptProfileFieldRule, adaptPromptProfileOptions,
   adaptPromptProfilePreview, adaptPromptProfileVersion,
   adaptProviderProfile, adaptRecommendation, adaptResolvedConfiguration, adaptRuntimeHost, adaptRuntimeHostProbeAttempt,
   adaptRuntimeReadiness, adaptProductionReadiness, adaptScriptRevision, adaptScriptSource, adaptWorkflowSmokeAttempt, adaptWorkflowTemplateVersion, adaptWorkflowTemplateVersionForAudit,
@@ -22,16 +26,15 @@ import type {
   ArtifactPreview, ConfigDefinition, ConfigDefinitionOptions, ConfigResourceOption, ConfigRevision, GeneratedArtifact, GenerationAttempt, HostCapabilitySnapshot,
   JsonObject, LegacyWorkflowTemplate, ModelArtifact, ModelDeployment,
   ModelDeploymentSmokeAttempt, ModelProfileRegistryOptions, ModelProfileVersion,
-  NodeMetadataCatalog, NodeMetadataResponse, ProductionRecipe, ProductionRecipeEditorOptions, ProductionRecipeMediaRouteOptions, ProductionRun, ProductionRunCreateInput,
-  PromptFieldDefinition, PromptProfileBinding, PromptProfileFieldRule, PromptProfileOptions, PromptProfilePreview, PromptProfilePreviewRequest, PromptProfileVersion,
+  NodeMetadataCatalog, NodeMetadataResponse, ProductionRecipe, ProductionRecipeEditorOptions, ProductionRun, ProductionRunCreateInput,
+  FieldDefinition, PromptProfileFieldRule, PromptProfileOptions, PromptProfilePreview, PromptProfilePreviewRequest, PromptProfileVersion,
   ProductionReadiness, ProviderProfile, RecommendationSnapshot, ResolvedConfiguration, RuntimeHost, RuntimeHostProbeAttempt,
   RuntimeReadiness, ScriptRevision, ScriptSource, WorkflowTemplateCanvasExport, WorkflowTemplateVersion,
   RecommendationDecision,
   PlatformLifecycleAuditEvent, PromptNormalizationSmokeResolution, ResolveUncertainAttemptInput, SecretAuditEvent, SecretBinding,
   SmokeResolutionOutcome, WorkflowSmokeAttempt, WorkflowSmokeAttemptResolution,
   WorkflowSmokeResolutionOutcome,
-  WorkflowSmokeFixtureInput,
-  BibleImageBindingSelectionInput, RegenerateBibleImagesInput, StoryboardShotReferenceSelectionInput,
+  BibleImageBindingSelectionInput, RegenerateBibleImagesInput,
   ComfySavedWorkflowBatchItemInput, ComfySavedWorkflowBatchResult, ComfySavedWorkflowPreview, ComfySavedWorkflowScan,
   WorkflowSmokeAssetCandidate,
   RegistryDeletionExecuteInput, RegistryDeletionImpact, RegistryDeletionResourceType,
@@ -39,8 +42,11 @@ import type {
 } from './platformTypes'
 import { adaptRegistryDeletionImpact } from './registryDeletion'
 import { buildProductionRunRequestPayload } from './productionRunPayload'
+import { adaptProductionManualOptions, adaptManualActionOptions, adaptManualTargetPage, adaptManualScriptStructureCheck, type ManualScopeKind } from './productionManual'
+import { adaptManualChangeImpact } from './productionManualChangeImpact'
 import { loadCompleteNodeMetadata } from './nodeMetadata'
-import { shotReferenceBindingsPayload } from './storyboardReferenceBindings'
+import { adaptSavedWorkflowSource } from './savedWorkflowRecovery'
+import { adaptRetryPreview, type RetryPreview, type RetryContext } from './productionRetryPreview'
 
 const body = <T>(payload: unknown): T => unwrap<T>(payload)
 const auditOptions = (reasonCode = '') => reasonCode
@@ -69,6 +75,12 @@ export const regenerateBibleImagesPayload = (input: RegenerateBibleImagesInput) 
 })
 
 export const platformApi = {
+  async getTaskDistributions(runId: string, page = 1): Promise<unknown> {
+    return body((await api.get(`/production-runs/${runId}/distribution-recovery/`, { params: { page } })).data)
+  },
+  async retryTaskDistribution(runId: string, request: JsonObject): Promise<unknown> {
+    return body((await api.post(`/production-runs/${runId}/distribution-recovery/`, request)).data)
+  },
   async getAcceptanceSmokePage(input: AcceptanceSmokeQuery): Promise<AcceptanceSmokePage> {
     const response = await api.get('/acceptance-smoke/', { params: {
       subject: input.subject,
@@ -87,8 +99,8 @@ export const platformApi = {
     })).map(adaptAcceptanceSmokeRow)
     const deploymentIds = new Set<string>()
     return rows.map((row) => {
-      if (row.subject !== 'deployment') throw new Error('模型实例验收响应包含非 Deployment 记录')
-      if (deploymentIds.has(row.deployment.id)) throw new Error(`模型实例验收响应包含重复 Deployment：${row.deployment.id}`)
+      if (row.subject !== 'deployment') throw new Error('模型部署验收响应包含非 Deployment 记录')
+      if (deploymentIds.has(row.deployment.id)) throw new Error(`模型部署验收响应包含重复 Deployment：${row.deployment.id}`)
       deploymentIds.add(row.deployment.id)
       return row
     })
@@ -101,13 +113,16 @@ export const platformApi = {
     })).data))
   },
   async executeRegistryDeletion(resourceType: RegistryDeletionResourceType, objectId: string, input: RegistryDeletionExecuteInput): Promise<void> {
-    await api.post('/registry-deletion-execute/', {
+    const result = body((await api.post('/registry-deletion-execute/', {
         resource_type: resourceType,
         object_id: objectId,
         expected_impact_sha256: input.expectedImpactSha256,
         selected_dependency_keys: input.selectedDependencyKeys,
         confirmation_phrase: input.confirmationPhrase,
-      }, auditOptions(input.reasonCode))
+      }, auditOptions(input.reasonCode))).data) as Record<string, any> | null
+    if (result?.deleted !== true || result.target?.resource_type !== resourceType || result.target?.object_id !== objectId) {
+      throw new Error('删除完成回执缺失或目标不一致；结果尚未确认，请核对资源目录与生命周期审计。')
+    }
   },
   async listProviders(): Promise<ProviderProfile[]> { return (await fetchAllPages('/provider-profiles/', { page_size: 500 })).map(adaptProviderProfile) },
   async createProvider(payload: JsonObject, reasonCode = ''): Promise<ProviderProfile> { return adaptProviderProfile(body((await api.post('/provider-profiles/', payload, auditOptions(reasonCode))).data)) },
@@ -120,15 +135,11 @@ export const platformApi = {
   async publishModelProfile(id: string, reasonCode = ''): Promise<ModelProfileVersion> { return adaptModelProfileVersion(body((await api.post(`/model-profile-versions/${id}/publish/`, {}, auditOptions(reasonCode))).data)) },
   async retireModelProfile(id: string, reasonCode = ''): Promise<ModelProfileVersion> { return adaptModelProfileVersion(body((await api.post(`/model-profile-versions/${id}/retire/`, {}, auditOptions(reasonCode))).data)) },
   async listDeployments(): Promise<ModelDeployment[]> { return (await fetchAllPages('/model-deployments/', { page_size: 500 })).map(adaptModelDeployment) },
+  async getDeployment(id: string): Promise<ModelDeployment> { return adaptModelDeployment(body((await api.get(`/model-deployments/${encodeURIComponent(id)}/`)).data)) },
   async createDeployment(payload: JsonObject, reasonCode = ''): Promise<ModelDeployment> { return adaptModelDeployment(body((await api.post('/model-deployments/', payload, auditOptions(reasonCode))).data)) },
   async updateDeployment(id: string, payload: JsonObject, reasonCode = ''): Promise<ModelDeployment> { return adaptModelDeployment(body((await api.patch(`/model-deployments/${id}/`, payload, auditOptions(reasonCode))).data)) },
   async retireDeployment(id: string, reasonCode = ''): Promise<ModelDeployment> { return adaptModelDeployment(body((await api.post(`/model-deployments/${id}/retire/`, {}, auditOptions(reasonCode))).data)) },
   async probeDeployment(id: string): Promise<JsonObject> { return platformRecord(body((await api.post(`/model-deployments/${id}/probe/`, {})).data)) },
-  async smokeTestDeployment(id: string, operation: string, promptProfileBindingId?: string): Promise<ModelDeploymentSmokeAttempt> {
-    const response = await api.post(`/model-deployments/${id}/smoke-test/`, { operation, ...(promptProfileBindingId ? { prompt_profile_binding_id: promptProfileBindingId } : {}) })
-    if (response.status !== 202) throw new Error(`部署烟测必须返回持久任务，实际 HTTP ${response.status}`)
-    return adaptModelDeploymentSmokeAttempt(body(response.data))
-  },
   async getDeploymentSmokeAttempt(id: string): Promise<ModelDeploymentSmokeAttempt> { return adaptModelDeploymentSmokeAttempt(body((await api.get(`/model-deployment-smoke-attempts/${id}/`)).data)) },
   async listDeploymentSmokeAttempts(params: JsonObject = {}): Promise<ModelDeploymentSmokeAttempt[]> { return (await fetchAllPages('/model-deployment-smoke-attempts/', { ...params, page_size: 100 })).map(adaptModelDeploymentSmokeAttempt) },
   async cancelDeploymentSmokeAttempt(id: string): Promise<ModelDeploymentSmokeAttempt> { return adaptModelDeploymentSmokeAttempt(body((await api.post(`/model-deployment-smoke-attempts/${id}/cancel/`, {})).data)) },
@@ -138,10 +149,24 @@ export const platformApi = {
   async updateModelArtifact(id: string, payload: JsonObject, reasonCode = ''): Promise<ModelArtifact> { return adaptModelArtifact(body((await api.patch(`/model-artifacts/${id}/`, payload, auditOptions(reasonCode))).data)) },
   async verifyModelArtifact(id: string, hostSnapshotId: string): Promise<ModelArtifact> { return adaptModelArtifact(body((await api.post(`/model-artifacts/${id}/verify/`, { host_snapshot_id: hostSnapshotId })).data)) },
 
-  async listPromptFieldDefinitions(): Promise<PromptFieldDefinition[]> { return (await fetchAllPages('/prompt-field-definitions/', { page_size: 500 })).map(adaptPromptFieldDefinition) },
-  async createPromptFieldDefinition(payload: JsonObject, reasonCode = ''): Promise<PromptFieldDefinition> { return adaptPromptFieldDefinition(body((await api.post('/prompt-field-definitions/', payload, auditOptions(reasonCode))).data)) },
-  async updatePromptFieldDefinition(id: string, payload: JsonObject, reasonCode = ''): Promise<PromptFieldDefinition> { return adaptPromptFieldDefinition(body((await api.patch(`/prompt-field-definitions/${id}/`, payload, auditOptions(reasonCode))).data)) },
+  async listFieldDefinitions(): Promise<FieldDefinition[]> { return (await fetchAllPages('/field-definitions/', { page_size: 100 })).map(adaptFieldDefinition) },
+  async fieldDefinitionPage(page: number, search: string, includeInactive: boolean) {
+    const response = (await api.get('/field-definitions/', {
+      params: { page, page_size: 20, search, ...(includeInactive ? {} : { is_active: true }) },
+    })).data
+    // Preserve the page envelope: unwrap intentionally extracts results for
+    // unpaged consumers and would discard the total needed by this table.
+    const result = (response?.data ?? response) as { count: number; results: unknown[]; next: string | null; previous: string | null }
+    if (!Number.isInteger(result.count) || !Array.isArray(result.results)
+      || !(result.next === null || typeof result.next === 'string' && result.next.length > 0)
+      || !(result.previous === null || typeof result.previous === 'string' && result.previous.length > 0)) throw new Error('字段目录响应不完整')
+    return { count: result.count, results: result.results.map(adaptFieldDefinition), hasNext: result.next !== null, hasPrevious: result.previous !== null }
+  },
+  async getFieldDefinition(id: string): Promise<FieldDefinition> { return adaptFieldDefinition(body((await api.get(`/field-definitions/${id}/`)).data)) },
+  async createFieldDefinition(payload: JsonObject, reasonCode = ''): Promise<FieldDefinition> { return adaptFieldDefinition(body((await api.post('/field-definitions/', payload, auditOptions(reasonCode))).data)) },
+  async updateFieldDefinition(id: string, payload: JsonObject, reasonCode = ''): Promise<FieldDefinition> { return adaptFieldDefinition(body((await api.patch(`/field-definitions/${id}/`, payload, auditOptions(reasonCode))).data)) },
   async listPromptProfileVersions(): Promise<PromptProfileVersion[]> { return (await fetchAllPages('/prompt-profile-versions/', { page_size: 500 })).map(adaptPromptProfileVersion) },
+  async getPromptProfileVersion(id: string): Promise<PromptProfileVersion> { return adaptPromptProfileVersion(body((await api.get(`/prompt-profile-versions/${encodeURIComponent(id)}/`)).data)) },
   async createPromptProfileVersion(payload: JsonObject, reasonCode = ''): Promise<PromptProfileVersion> { return adaptPromptProfileVersion(body((await api.post('/prompt-profile-versions/', payload, auditOptions(reasonCode))).data)) },
   async updatePromptProfileVersion(id: string, payload: JsonObject, reasonCode = ''): Promise<PromptProfileVersion> { return adaptPromptProfileVersion(body((await api.patch(`/prompt-profile-versions/${id}/`, payload, auditOptions(reasonCode))).data)) },
   async clonePromptProfileSuccessor(id: string, expectedSourceContractSha256: string, name: string): Promise<PromptProfileVersion> { return adaptPromptProfileVersion(body((await api.post(`/prompt-profile-versions/${id}/clone-successor/`, { expected_source_contract_sha256: expectedSourceContractSha256, name })).data)) },
@@ -153,13 +178,10 @@ export const platformApi = {
     ...(request.candidate ? { candidate: request.candidate } : {}),
   })).data)) },
   async getPromptProfileOptions(): Promise<PromptProfileOptions> { return adaptPromptProfileOptions(body((await api.get('/prompt-profile-versions/options/')).data)) },
-  async listPromptProfileFieldRules(): Promise<PromptProfileFieldRule[]> { return (await fetchAllPages('/prompt-profile-field-rules/', { page_size: 1000 })).map(adaptPromptProfileFieldRule) },
+  async listPromptProfileFieldRules(profileVersion?: string): Promise<PromptProfileFieldRule[]> { return (await fetchAllPages('/prompt-profile-field-rules/', { page_size: 1000, ...(profileVersion ? { profile_version: profileVersion } : {}) })).map(adaptPromptProfileFieldRule) },
   async createPromptProfileFieldRule(payload: JsonObject, reasonCode = ''): Promise<PromptProfileFieldRule> { return adaptPromptProfileFieldRule(body((await api.post('/prompt-profile-field-rules/', payload, auditOptions(reasonCode))).data)) },
   async updatePromptProfileFieldRule(id: string, payload: JsonObject, reasonCode = ''): Promise<PromptProfileFieldRule> { return adaptPromptProfileFieldRule(body((await api.patch(`/prompt-profile-field-rules/${id}/`, payload, auditOptions(reasonCode))).data)) },
-  async listPromptProfileBindings(params: { model_family?: string; model_profile_version?: string } = {}): Promise<PromptProfileBinding[]> { return (await fetchAllPages('/prompt-profile-bindings/', { ...params, page_size: 50 })).map(adaptPromptProfileBinding) },
   async getModelProfile(id: string): Promise<ModelProfileVersion> { return adaptModelProfileVersion(body((await api.get(`/model-profile-versions/${id}/`)).data)) },
-  async createPromptProfileBinding(payload: JsonObject, reasonCode = ''): Promise<PromptProfileBinding> { return adaptPromptProfileBinding(body((await api.post('/prompt-profile-bindings/', payload, auditOptions(reasonCode))).data)) },
-  async updatePromptProfileBinding(id: string, payload: JsonObject, reasonCode = ''): Promise<PromptProfileBinding> { return adaptPromptProfileBinding(body((await api.patch(`/prompt-profile-bindings/${id}/`, payload, auditOptions(reasonCode))).data)) },
 
   async listLegacyWorkflowTemplates(): Promise<LegacyWorkflowTemplate[]> { return (await fetchAllPages('/workflow-templates/', { page_size: 500 })).map(adaptLegacyWorkflowTemplate) },
   async listWorkflowVersions(options: { modelProfileVersion?: string } = {}): Promise<WorkflowTemplateVersion[]> {
@@ -225,6 +247,18 @@ export const platformApi = {
       '/comfy-workflow-sources/discover/',
     )).data))
   },
+  async listComfyWorkflowSources(_deploymentId: string, input: ComfySavedWorkflowBatchItemInput) {
+    // Existing database reader, not discover/preview and never a ComfyUI scan.
+    return (await fetchAllPages('/comfy-workflow-sources/', {
+      source_scope_sha256: input.expectedSourceScopeSha256,
+      source_sha256: input.expectedSha256, import_kind: input.importKind, page_size: 50,
+    })).map(adaptSavedWorkflowSource)
+  },
+  async getComfyWorkflowPreviewReceipt(deploymentId: string, requestKey: string): Promise<ComfySavedWorkflowPreview> {
+    return adaptComfySavedWorkflowPreview(body((await api.get(
+      `/model-deployments/${deploymentId}/saved-workflows/preview-receipt/`, { params: { request_key: requestKey } },
+    )).data))
+  },
   async listWorkflowSmokeAssetCandidates(): Promise<WorkflowSmokeAssetCandidate[]> {
     return (await fetchAllPages(
       '/assets/workflow-smoke-candidates/',
@@ -232,6 +266,7 @@ export const platformApi = {
     )).map(adaptWorkflowSmokeAssetCandidate)
   },
   async previewComfySavedWorkflow(deploymentId: string, input: {
+    requestKey?: string
     sourcePath: string
     expectedSha256: string
     expectedSourceScopeSchemaVersion: number
@@ -242,6 +277,7 @@ export const platformApi = {
     const preview = adaptComfySavedWorkflowPreview(body((await api.post(
       `/model-deployments/${deploymentId}/saved-workflows/preview/`,
       {
+        ...(input.requestKey ? { request_key: input.requestKey } : {}),
         source_path: input.sourcePath,
         expected_sha256: input.expectedSha256,
         expected_source_scope_schema_version: input.expectedSourceScopeSchemaVersion,
@@ -294,6 +330,7 @@ export const platformApi = {
         expected_source_scope_sha256: item.expectedSourceScopeSha256,
         import_kind: item.importKind,
         contract_draft: item.contractDraft || null,
+        successor_of: item.successorOf || null,
         primary_output_node_ids: item.primaryOutputNodeIds || [],
         expected_object_info_schema_sha256: item.expectedObjectInfoSchemaSha256 || '',
         expected_converted_graph_sha256: item.expectedConvertedGraphSha256 || '',
@@ -313,33 +350,6 @@ export const platformApi = {
   async validateWorkflow(id: string, deploymentId: string): Promise<{ version: WorkflowTemplateVersion; contractReport: JsonObject }> {
     const raw = platformRecord(body((await api.post(`/workflow-template-versions/${id}/validate/`, { deployment_id: deploymentId })).data))
     return { version: adaptWorkflowTemplateVersion(raw.version), contractReport: platformRecord(raw.contract_report) }
-  },
-  async createWorkflowSmokeAttempt(id: string, deploymentId: string, fixture: WorkflowSmokeFixtureInput): Promise<WorkflowSmokeAttempt> {
-    return adaptWorkflowSmokeAttempt(body((await api.post(`/workflow-template-versions/${id}/smoke-test/`, {
-      deployment_id: deploymentId,
-      fixture: {
-        schema_version: fixture.schemaVersion,
-        values: fixture.values,
-        assets: fixture.assets.map((item) => ({ semantic_key: item.semanticKey, asset_id: item.assetId })),
-        references: {
-          pictures: fixture.references.pictures.map((item) => ({
-            asset_id: item.assetId,
-            category: item.category,
-          })),
-          videos: fixture.references.videos.map((item) => ({
-            asset_id: item.assetId,
-            purpose: item.purpose,
-            use_embedded_audio: item.useEmbeddedAudio,
-            ...(item.audioAssetId ? { audio_asset_id: item.audioAssetId } : {}),
-            ...(item.audioPurpose ? { audio_purpose: item.audioPurpose } : {}),
-          })),
-          audios: fixture.references.audios.map((item) => ({
-            asset_id: item.assetId,
-            purpose: item.purpose,
-          })),
-        },
-      },
-    })).data))
   },
   async getWorkflowSmokeAttempt(id: string): Promise<WorkflowSmokeAttempt> { return adaptWorkflowSmokeAttempt(body((await api.get(`/workflow-smoke-attempts/${id}/`)).data)) },
   async listWorkflowSmokeAttempts(params: JsonObject = {}): Promise<WorkflowSmokeAttempt[]> { return (await fetchAllPages('/workflow-smoke-attempts/', { ...params, page_size: 50 })).map(adaptWorkflowSmokeAttempt) },
@@ -366,7 +376,7 @@ export const platformApi = {
   async listConfigDefinitions(): Promise<ConfigDefinition[]> { return (await fetchAllPages('/config-definitions/', { page_size: 500 })).map(adaptConfigDefinition) },
   async getConfigDefinitionOptions(): Promise<ConfigDefinitionOptions> { return adaptConfigDefinitionOptions(body((await api.get('/config-definitions/options/')).data)) },
   async listConfigResourceOptions(id: string): Promise<ConfigResourceOption[]> {
-    return (body<unknown[]>((await api.get(`/config-definitions/${id}/resource-options/`)).data) || []).map(adaptConfigResourceOption)
+    return (await fetchAllPages(`/config-definitions/${id}/resource-options/`, { page_size: 50 })).map(adaptConfigResourceOption)
   },
   async createConfigDefinition(payload: JsonObject, reasonCode = ''): Promise<ConfigDefinition> { return adaptConfigDefinition(body((await api.post('/config-definitions/', payload, auditOptions(reasonCode))).data)) },
   async updateConfigDefinition(id: string, payload: JsonObject, reasonCode = ''): Promise<ConfigDefinition> { return adaptConfigDefinition(body((await api.patch(`/config-definitions/${id}/`, payload, auditOptions(reasonCode))).data)) },
@@ -420,7 +430,7 @@ export const platformApi = {
     return {
       id: String(raw.id || ''), createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''),
       recommendationSnapshot: String(raw.recommendation_snapshot || ''), candidate: String(raw.candidate || ''), decision: String(raw.decision || ''),
-      scopeType: String(raw.scope_type || ''), project: String(raw.project || ''), configRevision: String(raw.config_revision || ''), recipeVersion: String(raw.recipe_version || ''),
+      scopeType: String(raw.scope_type || ''), project: String(raw.project || ''), configRevision: String(raw.config_revision || ''),
       overrideValues: platformRecord(raw.override_values), reason: String(raw.reason || ''),
     }
   },
@@ -440,12 +450,19 @@ export const platformApi = {
     return { source: adaptScriptSource(raw.source), revision: adaptScriptRevision(raw.revision) }
   },
   async getScriptRevision(id: string): Promise<ScriptRevision> { return adaptScriptRevision(body((await api.get(`/script-revisions/${id}/`)).data)) },
-  async createScriptRevision(sourceId: string, content: string): Promise<ScriptRevision> { return adaptScriptRevision(body((await api.post('/script-revisions/', { source_id: sourceId, content })).data)) },
+  async listConfirmedScriptRevisions(sourceId: string): Promise<ScriptRevision[]> {
+    return (await fetchAllPages('/script-revisions/', { source: sourceId, status: 'confirmed', page_size: 200 })).map(adaptScriptRevision)
+  },
+  async createScriptRevision(sourceId: string, content: string, structureBasis?: { revision_id: string; document_sha256: string }): Promise<ScriptRevision> {
+    return adaptScriptRevision(body((await api.post('/script-revisions/', { source_id: sourceId, content,
+      ...(structureBasis ? {structure_basis: structureBasis} : {}) })).data))
+  },
   async confirmScriptRevision(id: string): Promise<ScriptRevision> { return adaptScriptRevision(body((await api.post(`/script-revisions/${id}/confirm/`, {})).data)) },
 
   async listRecipes(status?: string): Promise<ProductionRecipe[]> { return (await fetchAllPages('/production-recipes/', { status, page_size: 500 })).map(adaptProductionRecipe) },
+  async getRecipe(id: string): Promise<ProductionRecipe> { return adaptProductionRecipe(body((await api.get(`/production-recipes/${id}/`)).data)) },
   async getRecipeEditorOptions(): Promise<ProductionRecipeEditorOptions> { return adaptProductionRecipeEditorOptions(body((await api.get('/production-recipes/options/')).data)) },
-  async getRecipeMediaRouteOptions(id: string): Promise<ProductionRecipeMediaRouteOptions> { return adaptProductionRecipeMediaRouteOptions(body((await api.get(`/production-recipes/${id}/media-route-options/`)).data)) },
+  async getRecipeSourceOptions(definition: JsonObject): Promise<ProductionRecipeEditorOptions['textOutputOptions']> { return adaptRecipeTextOutputOptions(body((await api.post('/production-recipes/source-options/', {definition})).data)) },
   async createRecipe(payload: JsonObject, reasonCode = ''): Promise<ProductionRecipe> { return adaptProductionRecipe(body((await api.post('/production-recipes/', payload, auditOptions(reasonCode))).data)) },
   async cloneRecipeSuccessor(id: string, expectedDefinitionSha256: string, reasonCode = ''): Promise<ProductionRecipe> { return adaptProductionRecipe(body((await api.post(`/production-recipes/${id}/clone-successor/`, { expected_definition_sha256: expectedDefinitionSha256 }, auditOptions(reasonCode))).data)) },
   async updateRecipe(id: string, payload: JsonObject, reasonCode = ''): Promise<ProductionRecipe> { return adaptProductionRecipe(body((await api.patch(`/production-recipes/${id}/`, payload, auditOptions(reasonCode))).data)) },
@@ -456,23 +473,101 @@ export const platformApi = {
   async createProductionRun(input: ProductionRunCreateInput): Promise<ProductionRun> {
     return adaptProductionRun(body((await api.post('/production-runs/', buildProductionRunRequestPayload(input))).data))
   },
-  async approveProductionRun(id: string, input: { stageKey: string; decision: string; comment?: string; candidateOverrides?: Record<string, string>; expectedSourceSnapshotSha256?: string; adoptGeneratedMetadata?: boolean; bibleImageBindings?: BibleImageBindingSelectionInput[]; shotReferenceBindings?: StoryboardShotReferenceSelectionInput[] }): Promise<ProductionRun> {
+  async getManualProductionOptions(projectId: string) {
+    return adaptProductionManualOptions(body((await api.get('/production-runs/manual-options/', { params: { project_id: projectId } })).data))
+  },
+  async getManualProductionActions(runId: string) {
+    return adaptManualActionOptions(body((await api.get(`/production-runs/${runId}/manual-action-options/`)).data))
+  },
+  async getManualScriptStructure(runId: string) {
+    return adaptManualScriptStructureCheck(body((await api.get(`/production-runs/${runId}/manual-script-structure/`)).data))
+  },
+  async getManualChangeImpact(runId: string, stageKey: string, offset = 0) {
+    return adaptManualChangeImpact((await api.get(`/production-runs/${runId}/manual-change-impact/`, {
+      params: { stage_key: stageKey, offset },
+    })).data)
+  },
+  async getManualMediaReview(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-media-review/`)).data) as JsonObject
+  },
+  async getManualAssembly(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-assembly/`)).data) as JsonObject
+  },
+  async previewManualAssembly(runId: string, expectedRunPlanSha256: string, authors: JsonObject): Promise<JsonObject> {
+    return body((await api.post(`/production-runs/${runId}/manual-assembly/`, {
+      expected_run_plan_sha256: expectedRunPlanSha256, authors,
+    })).data) as JsonObject
+  },
+  async getManualDelivery(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-delivery/`)).data) as JsonObject
+  },
+  async getBibleReview(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/bible-review/`)).data) as JsonObject
+  },
+  async getManualBibleImageReview(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-bible-image-review/`)).data) as JsonObject
+  },
+  async getManualStoryboard(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-storyboard/`)).data) as JsonObject
+  },
+  async getManualStoryboardReview(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-storyboard-review/`)).data) as JsonObject
+  },
+  async getManualShotReferences(runId: string, shotId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/manual-shot-references/`, { params: { shot_id: shotId } })).data) as JsonObject
+  },
+  async getStoryboardReferenceSelection(runId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/storyboard-reference-selection/`)).data) as JsonObject
+  },
+  async getRecipeShotReferences(runId: string, shotId: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/recipe-shot-references/`, { params: { shot_id: shotId } })).data) as JsonObject
+  },
+  async listProductionTargets(runId: string, kind: ManualScopeKind, page = 1) {
+    return adaptManualTargetPage((await api.get(`/production-runs/${runId}/targets/`, { params: { kind, page } })).data)
+  },
+  async getReviewedVisualSources(runId: string, stageKey: string): Promise<JsonObject> {
+    return body((await api.get(`/production-runs/${runId}/reviewed-visual-sources/`, { params: { stage_key: stageKey } })).data) as JsonObject
+  },
+  async previewProductionReferenceMapping(runId: string, input: JsonObject): Promise<JsonObject> {
+    return body((await api.post(`/production-runs/${runId}/reference-mapping-preview/`, input)).data) as JsonObject
+  },
+  async amendProductionStageInputs(runId: string, input: JsonObject): Promise<JsonObject> {
+    return body((await api.post(`/production-runs/${runId}/stage-input-amendment/`, input)).data) as JsonObject
+  },
+  async performManualProductionAction(runId: string, payload: JsonObject): Promise<JsonObject> {
+    return body((await api.post(`/production-runs/${runId}/manual-actions/`, payload)).data) as JsonObject
+  },
+  async approveProductionRun(id: string, input: { stageKey: string; decision: string; comment?: string; scriptContent?: string; candidateOverrides?: Record<string, string>; expectedSourceSnapshotSha256?: string; textCandidate?: { artifactId: string; expectedSha256: string }; bibleImageBindings?: BibleImageBindingSelectionInput[]; expectedSelectionSha256?: string; bibleReview?: JsonObject }): Promise<ProductionRun> {
     return adaptProductionRun(body((await api.post(`/production-runs/${id}/approve/`, {
       stage_key: input.stageKey,
       decision: input.decision,
       comment: input.comment || '',
+      ...(input.scriptContent !== undefined ? { script_content: input.scriptContent } : {}),
       ...(input.candidateOverrides ? { candidate_overrides: input.candidateOverrides } : {}),
+      ...(input.bibleReview ? { bible_review: input.bibleReview } : {}),
       ...(input.expectedSourceSnapshotSha256 ? { expected_source_snapshot_sha256: input.expectedSourceSnapshotSha256 } : {}),
-      ...(input.adoptGeneratedMetadata !== undefined ? { adopt_generated_metadata: input.adoptGeneratedMetadata } : {}),
+      ...(input.textCandidate ? { text_candidate: { artifact_id: input.textCandidate.artifactId, expected_sha256: input.textCandidate.expectedSha256 } } : {}),
       ...(input.bibleImageBindings ? { bible_image_bindings: bibleImageBindingsPayload(input.bibleImageBindings) } : {}),
-      ...(input.shotReferenceBindings ? { shot_reference_bindings: input.shotReferenceBindings.map((item) => ({ shot_id: item.shotId, reference_bindings: shotReferenceBindingsPayload(item.referenceBindings) })) } : {}),
+      ...(input.expectedSelectionSha256 ? { expected_selection_sha256: input.expectedSelectionSha256 } : {}),
     })).data))
   },
   async continueProductionRun(id: string): Promise<ProductionRun> { return adaptProductionRun(body((await api.post(`/production-runs/${id}/continue/`, {})).data)) },
   async regenerateBibleImages(id: string, input: RegenerateBibleImagesInput): Promise<ProductionRun> {
     return adaptProductionRun(body((await api.post(`/production-runs/${id}/regenerate-bible-images/`, regenerateBibleImagesPayload(input))).data))
   },
-  async retryProductionRun(id: string): Promise<ProductionRun> { return adaptProductionRun(body((await api.post(`/production-runs/${id}/retry/`, {})).data)) },
+  async retryProductionRun(id: string, context: RetryContext): Promise<ProductionRun> {
+    return adaptProductionRun(body((await api.post(`/production-runs/${id}/retry/`, {
+      expected_stage_id: context.expectedStageId, expected_attempt_ids: context.expectedAttemptIds,
+      ...(context.expectedAssemblyJobIds === undefined ? {} : {
+        expected_assembly_job_ids: context.expectedAssemblyJobIds, expected_input_sha256: context.expectedInputSha256,
+      }),
+    })).data))
+  },
+  async getProductionRetryPreview(id: string, stageId: string, page = 1): Promise<RetryPreview> {
+    return adaptRetryPreview((await api.get(`/production-runs/${id}/retry-preview/`, {
+      params: { expected_stage_id: stageId, page, page_size: 20 },
+    })).data)
+  },
   async cancelProductionRun(id: string): Promise<ProductionRun> { return adaptProductionRun(body((await api.post(`/production-runs/${id}/cancel/`, {})).data)) },
   async listGenerationAttempts(params: JsonObject = {}): Promise<GenerationAttempt[]> { return (await fetchAllPages('/generation-attempts/', { ...params, page_size: 200 })).map(adaptGenerationAttempt) },
   async resolveProductionRunUncertain(id: string, input: ResolveUncertainAttemptInput): Promise<ProductionRun> {
@@ -495,21 +590,44 @@ export const platformApi = {
       cost_currency: input.costCurrency || '',
     })).data))
   },
-  async selectProductionRoute(id: string, input: { stageKey: string; routeIndex: number }): Promise<ProductionRun> {
-    return adaptProductionRun(body((await api.post(`/production-runs/${id}/select-route/`, { stage_key: input.stageKey, route_index: input.routeIndex })).data))
+  async selectProductionRoute(id: string, input: { stageKey: string; routeIndex: number; appearanceRole?: 'primary'|'variant' }): Promise<ProductionRun> {
+    return adaptProductionRun(body((await api.post(`/production-runs/${id}/select-route/`, { stage_key: input.stageKey, route_index: input.routeIndex, appearance_role: input.appearanceRole ?? 'primary' })).data))
   },
-  async authorizeProductionCost(id: string, input: { stageKey: string; allowExternalCalls?: boolean | null; budgetLimit?: string | null; approvedEstimatedCost?: string | null; currency?: string; comment?: string }): Promise<ProductionRun> {
+  async authorizeProductionCost(id: string, input: { stageKey: string; allowExternalCalls?: boolean | null; approvedEstimatedCost?: string | null; currency?: string; comment?: string }): Promise<ProductionRun> {
     return adaptProductionRun(body((await api.post(`/production-runs/${id}/authorize-cost/`, {
       stage_key: input.stageKey, allow_external_calls: input.allowExternalCalls ?? null,
-      budget_limit: input.budgetLimit ?? null, approved_estimated_cost: input.approvedEstimatedCost ?? null,
+      approved_estimated_cost: input.approvedEstimatedCost ?? null,
       currency: input.currency || '', comment: input.comment || '',
     })).data))
   },
-  async selectArtifact(runId: string, artifactId: string): Promise<GeneratedArtifact> { return adaptGeneratedArtifact(body((await api.post(`/production-runs/${runId}/select-artifact/`, { artifact_id: artifactId })).data)) },
+  async getMaterialSelectionContext(runId: string, artifactId: string) {
+    return adaptRecipeMaterialSelectionContext(body((await api.get(`/production-runs/${runId}/material-selection-context/`, { params: { artifact_id: artifactId } })).data), artifactId)
+  },
+  async getMaterialFulfillmentContext(runId: string, stageRunId: string, unitKey: string) {
+    return adaptMaterialFulfillmentContext(body((await api.get(`/production-runs/${runId}/material-fulfillment-context/`,
+      { params: { stage_run_id: stageRunId, unit_key: unitKey } })).data), stageRunId, unitKey)
+  },
+  async fulfillMaterial(runId: string, context: MaterialFulfillmentContext,
+      choice: MaterialFulfillmentChoice) {
+    return adaptMaterialFulfillmentReceipt(body((await api.post(`/production-runs/${runId}/fulfill-material/`,
+      materialFulfillmentPayload(context, choice))).data))
+  },
+  async selectArtifact(runId: string, request: import('./artifactSelectionCommand').ArtifactSelectionBody, key: string) {
+    return body<import('./artifactSelectionCommand').ArtifactSelectionReceipt>((await api.post(`/production-runs/${runId}/select-artifact/`, request, { headers: { 'Idempotency-Key': key } })).data)
+  },
   async listArtifacts(params: JsonObject = {}): Promise<GeneratedArtifact[]> { return (await fetchAllPages('/generated-artifacts/', { ...params, page_size: 500 })).map(adaptGeneratedArtifact) },
+  async listArtifactPage(params: JsonObject): Promise<{ results: GeneratedArtifact[]; count: number; hasNext: boolean; hasPrevious: boolean }> {
+    const page = (await api.get('/generated-artifacts/', { params })).data as JsonObject
+    if (!Array.isArray(page.results) || typeof page.count !== 'number' || !Number.isInteger(page.count) || page.count < 0
+        || !('next' in page) || !('previous' in page)) throw new Error('候选清单的分页信息不完整，请重新读取')
+    return { results: page.results.map(adaptGeneratedArtifact), count: page.count, hasNext: Boolean(page.next), hasPrevious: Boolean(page.previous) }
+  },
+  async getVerifiedReleaseDocument(id: string): Promise<unknown> { return body((await api.get(`/release-bundles/${id}/verify/`)).data) },
   async getArtifact(id: string): Promise<GeneratedArtifact> { return adaptGeneratedArtifact(body((await api.get(`/generated-artifacts/${id}/`)).data)) },
   async getArtifactPreview(artifact: GeneratedArtifact): Promise<ArtifactPreview | null> {
-    const detail = artifact.manifestMetadata ? artifact : await this.getArtifact(artifact.id)
+    // Signed URLs expire independently of the immutable manifest. Refresh from
+    // the original detail endpoint, never reuse the list/detail object's URL.
+    const detail = await this.getArtifact(artifact.id)
     const taskId = String(detail.manifestMetadata?.task_id || detail.generationTask || '')
     const rawOutputIndex = Number(detail.manifestMetadata?.output_index)
     const outputIndex = Number.isInteger(rawOutputIndex) && rawOutputIndex >= 0 ? rawOutputIndex : 0

@@ -11,7 +11,6 @@ from studio.services.execution_monitoring import (
 from studio.services.media_capabilities import (
     validate_model_profile_media_capabilities,
 )
-from studio.services.production_runs import _safe_media_route_projection
 
 
 class ExecutionMonitoringContractTests(SimpleTestCase):
@@ -33,14 +32,17 @@ class ExecutionMonitoringContractTests(SimpleTestCase):
             "studio.services.execution_monitoring.boundary_int",
             side_effect=lambda key: configured[key],
         )
-        snapshot_limit_patch = patch(
-            "studio.services.production_runs._stage_snapshot_max_bytes",
-            return_value=8 * 1024 * 1024,
-        )
         execution_limit_patch.start()
-        snapshot_limit_patch.start()
         self.addCleanup(execution_limit_patch.stop)
-        self.addCleanup(snapshot_limit_patch.stop)
+
+    def test_boolean_or_float_schema_version_is_not_an_integer_contract(self):
+        from studio.services.execution_monitoring import normalize_frozen_execution_monitoring_contract
+        for schema in (True, 1.0, "1"):
+            with self.subTest(schema=schema), self.assertRaises(ValidationError):
+                resolve_execution_monitoring_contract(model_specification={"execution_monitoring": {"schema_version": schema}})
+            with self.subTest(frozen=schema), self.assertRaises(ValidationError):
+                normalize_frozen_execution_monitoring_contract({"schema_version": schema,
+                    "default_idle_timeout_seconds": None, "node_type_overrides": {}, "node_overrides": {}})
 
     def test_model_and_workflow_sources_merge_without_model_names(self):
         contract = resolve_execution_monitoring_contract(
@@ -234,75 +236,4 @@ class ExecutionMonitoringContractTests(SimpleTestCase):
                 "node_type_overrides",
                 "node_overrides",
             },
-        )
-
-    def test_production_run_route_projection_freezes_contract_and_hash(self):
-        monitoring = resolve_execution_monitoring_contract(
-            model_specification={
-                "execution_monitoring": {
-                    "schema_version": 1,
-                    "node_type_overrides": {"SamplerCustomAdvanced": 3_600},
-                },
-            },
-            workflow_input_contract={
-                "execution_monitoring": {
-                    "schema_version": 1,
-                    "node_type_overrides": {},
-                    "node_overrides": {"10": 5_400},
-                },
-            },
-            workflow_graph=self.graph,
-        )
-        route = {
-            "index": 0,
-            "workflow_version_id": "00000000-0000-0000-0000-000000000010",
-            "workflow_sha256": "a" * 64,
-            "workflow_output_kind": "video",
-            "conditioning_contract": {},
-            "conditioning_contract_sha256": "",
-            "media_constraints": {},
-            "media_constraints_sha256": "",
-            "model_deployment_id": "00000000-0000-0000-0000-000000000011",
-            "model_profile_version_id": "00000000-0000-0000-0000-000000000012",
-            "model_identifier": "configured-video-model",
-            "provider_id": "00000000-0000-0000-0000-000000000013",
-            "driver_type": "comfyui",
-            "runtime_host_id": None,
-            "is_external": False,
-            "media_operations": [],
-            "smoke_evidence": {},
-            "prompt_profile": None,
-            "execution_monitoring": monitoring,
-            "execution_monitoring_sha256": execution_monitoring_contract_sha256(
-                monitoring,
-            ),
-            "model_specification": {
-                "execution_monitoring": {
-                    "schema_version": 1,
-                    "node_type_overrides": {"SamplerCustomAdvanced": 3_600},
-                },
-            },
-            "workflow_snapshot": {
-                "graph": self.graph,
-                "input_contract": {
-                    "execution_monitoring": {
-                        "schema_version": 1,
-                        "node_type_overrides": {},
-                        "node_overrides": {"10": 5_400},
-                    },
-                },
-            },
-        }
-
-        projected = _safe_media_route_projection(route)
-
-        self.assertEqual(
-            projected["execution_monitoring"]["node_overrides"],
-            {"10": 5_400},
-        )
-        self.assertEqual(
-            projected["execution_monitoring_sha256"],
-            execution_monitoring_contract_sha256(
-                projected["execution_monitoring"],
-            ),
         )

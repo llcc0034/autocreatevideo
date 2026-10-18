@@ -18,6 +18,7 @@ from studio.services.text_generation_queue import (
 from studio.services.worker_heartbeat import WorkerHeartbeat
 from studio.services.worker_database import retry_worker_database_step
 from studio.services.configuration import resolve_configuration
+from studio.services.execution_preparation_queue import advance_next_execution_preparation
 from studio.services.asset_generation import (
     claim_next_text_asset_job,
     fail_unhandled_asset_generation_job,
@@ -105,6 +106,7 @@ class Command(BaseCommand):
                     self.stdout.write(f"Recovered asset generation jobs: {asset_recovery}")
                 last_recovery = current
 
+            retry_worker_database_step(advance_next_execution_preparation, wait_seconds=poll_seconds)
             attempt = retry_worker_database_step(
                 claim_next_text_attempt, worker_id, wait_seconds=poll_seconds,
             )

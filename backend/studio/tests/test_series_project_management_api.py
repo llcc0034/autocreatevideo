@@ -1,16 +1,17 @@
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
 from studio.models import (
     AssemblyJob,
-    GeneratedWorkflow,
+    ExecutionPreparation,
+    GenerationAttempt,
     GenerationTask,
-    PromptArtifact,
+    ProductionRun,
     ReleaseBundle,
     SeriesProject,
-    WorkflowTemplate,
 )
+from studio.tests import test_execution_production_workflow_requests as execution_fixtures
 from studio.tests.factories import build_story
 from studio.services.configuration import project_creation_policy
 from studio.services.security_boundaries import boundary_int
@@ -49,6 +50,24 @@ class SeriesProjectManagementAPITests(TestCase):
         self.assertEqual(project.fps, policy["fps"])
         self.assertEqual(project.continuity_seed, seed)
 
+    def test_owned_source_catalog_does_not_confuse_staff_visibility_with_execution_scope(self):
+        staff, own, *_ = build_story("source-catalog-staff")
+        other, foreign, *_ = build_story("source-catalog-other")
+        staff.is_staff = True
+        staff.save(update_fields=("is_staff",))
+        self.client.force_authenticate(staff)
+        for query, expected in (({}, {str(own.id), str(foreign.id)}),
+                                ({"owned_only": "false"}, {str(own.id), str(foreign.id)}),
+                                ({"owned_only": "true"}, {str(own.id)})):
+            response = self.client.get("/api/v1/projects/", query)
+            self.assertEqual(response.status_code, 200, response.data)
+            self.assertEqual({row["id"] for row in response.data["results"]}, expected)
+        self.assertEqual(self.client.get("/api/v1/projects/", {"owned_only": "other"}).status_code, 400)
+        self.client.force_authenticate(other)
+        for value in ("true", "false"):
+            response = self.client.get("/api/v1/projects/", {"owned_only": value})
+            self.assertEqual({row["id"] for row in response.data["results"]}, {str(foreign.id)})
+
     def test_create_rejects_explicit_invalid_runtime_values(self):
         owner = get_user_model().objects.create_user(username="creation-invalid-owner")
         self.client.force_authenticate(owner)
@@ -78,51 +97,6 @@ class SeriesProjectManagementAPITests(TestCase):
             self.assertEqual(response.status_code, 201, response.data)
             self.assertEqual(response.data["width"], option["width"])
             self.assertEqual(response.data["height"], option["height"])
-
-    def _create_generation_task(
-        self,
-        *,
-        user,
-        project,
-        suffix,
-        task_status,
-        submission_state=GenerationTask.SubmissionState.UNPREPARED,
-        submission_token="",
-        remote_state=GenerationTask.RemoteState.UNKNOWN,
-    ):
-        artifact = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
-            project=project,
-            created_by=user,
-            total_duration_ms=project.default_shot_duration_ms,
-            prompt_text=f"project delete {suffix}",
-            content_hash=suffix.encode("utf-8").hex().ljust(64, "0")[:64],
-        )
-        template = WorkflowTemplate.objects.create(
-            owner=user,
-            name=f"Project delete {suffix}",
-            slug=f"project-delete-{suffix}",
-            output_kind=WorkflowTemplate.OutputKind.VIDEO,
-        )
-        workflow = GeneratedWorkflow.objects.create(
-            project=project,
-            prompt_artifact=artifact,
-            template=template,
-            created_by=user,
-            content_hash=suffix.encode("utf-8").hex().rjust(64, "0")[-64:],
-        )
-        task = GenerationTask.objects.create(
-            owner=user,
-            project=project,
-            generated_workflow=workflow,
-            kind=GenerationTask.Kind.VIDEO,
-            status=task_status,
-            max_attempts=3,
-            submission_state=submission_state,
-            submission_token=submission_token,
-            comfy_prompt_id=submission_token,
-            remote_state=remote_state,
-        )
-        return artifact, workflow, task
 
     def test_owner_can_favorite_project_but_other_tenant_cannot_patch_it(self):
         owner = get_user_model().objects.create_user(
@@ -218,185 +192,6 @@ class SeriesProjectManagementAPITests(TestCase):
         self.assertEqual(response.status_code, 404, response.data)
         self.assertTrue(SeriesProject.objects.filter(pk=project.pk).exists())
 
-    def test_active_generation_tasks_block_project_delete(self):
-        user, project, *_ = build_story("project-delete-generation")
-        artifact = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
-            project=project,
-            created_by=user,
-            total_duration_ms=project.default_shot_duration_ms,
-            prompt_text="delete guard",
-            content_hash="a" * 64,
-        )
-        template = WorkflowTemplate.objects.create(
-            owner=user,
-            name="Delete guard template",
-            slug="delete-guard-template",
-            output_kind=WorkflowTemplate.OutputKind.VIDEO,
-        )
-        workflow = GeneratedWorkflow.objects.create(
-            project=project,
-            prompt_artifact=artifact,
-            template=template,
-            created_by=user,
-            content_hash="b" * 64,
-        )
-        task = GenerationTask.objects.create(
-            owner=user,
-            project=project,
-            generated_workflow=workflow,
-            kind=GenerationTask.Kind.VIDEO,
-            max_attempts=3,
-        )
-        self.client.force_authenticate(user)
-
-        for task_status in (
-            GenerationTask.Status.QUEUED,
-            GenerationTask.Status.RUNNING,
-            GenerationTask.Status.CANCEL_REQUESTED,
-        ):
-            with self.subTest(status=task_status):
-                task.status = task_status
-                task.save(update_fields=("status", "updated_at"))
-                response = self.client.delete(f"/api/v1/projects/{project.id}/")
-                self.assertEqual(response.status_code, 409, response.data)
-                self.assertEqual(response.data["error"]["code"], "project_has_active_work")
-                active_count = response.data["error"]["details"]["active_generation_tasks"]
-                self.assertIsInstance(active_count, int)
-                self.assertEqual(active_count, 1)
-                self.assertTrue(SeriesProject.objects.filter(pk=project.pk).exists())
-
-    def test_terminal_generation_history_is_deleted_with_project(self):
-        cases = (
-            (
-                "locally-succeeded",
-                GenerationTask.Status.SUCCEEDED,
-                GenerationTask.SubmissionState.SUBMITTED,
-                "project-delete-locally-succeeded-token",
-                GenerationTask.RemoteState.UNKNOWN,
-            ),
-            (
-                "remotely-succeeded",
-                GenerationTask.Status.FAILED,
-                GenerationTask.SubmissionState.SUBMITTED,
-                "project-delete-remotely-succeeded-token",
-                GenerationTask.RemoteState.SUCCEEDED,
-            ),
-            (
-                "failed",
-                GenerationTask.Status.FAILED,
-                GenerationTask.SubmissionState.TERMINAL_FAILED,
-                "project-delete-failed-token",
-                GenerationTask.RemoteState.FAILED,
-            ),
-            (
-                "cancelled",
-                GenerationTask.Status.CANCELLED,
-                GenerationTask.SubmissionState.TERMINAL_CANCELLED,
-                "project-delete-cancelled-token",
-                GenerationTask.RemoteState.CANCELLED,
-            ),
-        )
-        for suffix, task_status, submission_state, token, remote_state in cases:
-            with self.subTest(status=task_status):
-                user, project, *_ = build_story(f"project-delete-terminal-{suffix}")
-                artifact, workflow, task = self._create_generation_task(
-                    user=user,
-                    project=project,
-                    suffix=suffix,
-                    task_status=task_status,
-                    submission_state=submission_state,
-                    submission_token=token,
-                    remote_state=remote_state,
-                )
-                self.client.force_authenticate(user)
-
-                response = self.client.delete(f"/api/v1/projects/{project.id}/")
-
-                self.assertEqual(response.status_code, 204, response.data)
-                self.assertFalse(SeriesProject.objects.filter(pk=project.pk).exists())
-                self.assertFalse(GenerationTask.objects.filter(pk=task.pk).exists())
-                self.assertFalse(GeneratedWorkflow.objects.filter(pk=workflow.pk).exists())
-                self.assertFalse(PromptArtifact.objects.filter(pk=artifact.pk).exists())
-
-    def test_protected_release_rolls_back_terminal_task_cleanup(self):
-        user, project, *_ = build_story("project-delete-protected-release")
-        artifact, workflow, task = self._create_generation_task(
-            user=user,
-            project=project,
-            suffix="protected-release",
-            task_status=GenerationTask.Status.SUCCEEDED,
-            submission_state=GenerationTask.SubmissionState.SUBMITTED,
-            submission_token="project-delete-protected-token",
-            remote_state=GenerationTask.RemoteState.SUCCEEDED,
-        )
-        ReleaseBundle.objects.create(
-            owner=user,
-            project=project,
-            created_by=user,
-            version=1,
-            title="受保护发行证据",
-            selection={"shots": [], "episodes": [], "series_assembly_id": None},
-        )
-        self.client.force_authenticate(user)
-
-        response = self.client.delete(f"/api/v1/projects/{project.id}/")
-
-        self.assertEqual(response.status_code, 409, response.data)
-        self.assertEqual(response.data["error"]["code"], "protected_resource")
-        self.assertTrue(SeriesProject.objects.filter(pk=project.pk).exists())
-        self.assertTrue(GenerationTask.objects.filter(pk=task.pk).exists())
-        self.assertTrue(GeneratedWorkflow.objects.filter(pk=workflow.pk).exists())
-        self.assertTrue(PromptArtifact.objects.filter(pk=artifact.pk).exists())
-
-    def test_nonterminal_remote_token_blocks_project_delete_after_local_failure_or_cancel(self):
-        user, project, *_ = build_story("project-delete-unresolved-remote")
-        artifact = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
-            project=project,
-            created_by=user,
-            total_duration_ms=project.default_shot_duration_ms,
-            prompt_text="unresolved remote delete guard",
-            content_hash="c" * 64,
-        )
-        template = WorkflowTemplate.objects.create(
-            owner=user,
-            name="Unresolved remote delete guard",
-            slug="unresolved-remote-delete-guard",
-            output_kind=WorkflowTemplate.OutputKind.VIDEO,
-        )
-        workflow = GeneratedWorkflow.objects.create(
-            project=project,
-            prompt_artifact=artifact,
-            template=template,
-            created_by=user,
-            content_hash="d" * 64,
-        )
-        task = GenerationTask.objects.create(
-            owner=user,
-            project=project,
-            generated_workflow=workflow,
-            kind=GenerationTask.Kind.VIDEO,
-            max_attempts=3,
-            submission_token="2f270fa3-9715-448e-a499-57ad82ae152a",
-            comfy_prompt_id="2f270fa3-9715-448e-a499-57ad82ae152a",
-            submission_state=GenerationTask.SubmissionState.SUBMITTED,
-        )
-        self.client.force_authenticate(user)
-
-        for task_status in (
-            GenerationTask.Status.FAILED,
-            GenerationTask.Status.CANCELLED,
-        ):
-            with self.subTest(status=task_status):
-                task.status = task_status
-                task.save(update_fields=("status", "updated_at"))
-                response = self.client.delete(f"/api/v1/projects/{project.id}/")
-                self.assertEqual(response.status_code, 409, response.data)
-                self.assertEqual(response.data["error"]["code"], "project_has_active_work")
-                unresolved_count = response.data["error"]["details"]["unresolved_remote_tasks"]
-                self.assertIsInstance(unresolved_count, int)
-                self.assertEqual(unresolved_count, 1)
-                self.assertTrue(SeriesProject.objects.filter(pk=project.pk).exists())
-
     def test_active_assembly_jobs_block_project_delete(self):
         user, project, *_ = build_story("project-delete-assembly")
         job = AssemblyJob.objects.create(
@@ -418,3 +213,70 @@ class SeriesProjectManagementAPITests(TestCase):
                 self.assertIsInstance(active_count, int)
                 self.assertEqual(active_count, 1)
                 self.assertTrue(SeriesProject.objects.filter(pk=project.pk).exists())
+
+
+
+@override_settings(AI_PROVIDER_ALLOWED_HOSTS=("127.0.0.1",))
+class SeriesProjectExecutionDeleteTests(TestCase):
+    _create_version = execution_fixtures.ProductionWorkflowRequestTests._create_version
+    resolve = execution_fixtures.ProductionWorkflowRequestTests.resolve
+
+    def setUp(self):
+        execution_fixtures.ProductionWorkflowRequestTests.setUp(self)
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+        self.task = self.attempt.generation_task
+
+    def assert_execution_retained(self):
+        for model, row in ((SeriesProject, self.project), (ProductionRun, self.run),
+                (ExecutionPreparation, self.preparation), (GenerationAttempt, self.attempt),
+                (GenerationTask, self.task)):
+            self.assertTrue(model.objects.filter(pk=row.pk).exists(), model.__name__)
+
+    def test_active_generation_tasks_block_project_delete(self):
+        for state in ("queued", "running", "cancel_requested"):
+            GenerationTask.objects.filter(pk=self.task.pk).update(status=state)
+            response = self.client.delete(f"/api/v1/projects/{self.project.pk}/")
+            self.assertEqual(response.status_code, 409, response.data)
+            self.assertEqual(response.data["error"]["code"], "project_has_active_work")
+            self.assertEqual(response.data["error"]["details"]["active_generation_tasks"], 1)
+            self.assert_execution_retained()
+
+    def test_terminal_execution_still_has_a_formal_run_not_an_orphan_workflow(self):
+        # The real queue is allocated from a Run/Preparation/Attempt. The
+        # ordinary project delete endpoint does not purge that closure; P5's
+        # explicitly reviewed incompatible-data cleanup is a different action.
+        for state, submission, remote in (
+            ("succeeded", "submitted", "unknown"), ("failed", "submitted", "succeeded"),
+            ("failed", "terminal_failed", "failed"), ("cancelled", "terminal_cancelled", "cancelled"),
+        ):
+            GenerationTask.objects.filter(pk=self.task.pk).update(status=state,
+                submission_state=submission, submission_token="recorded-submit", remote_state=remote)
+            GenerationAttempt.objects.filter(pk=self.attempt.pk).update(status=state)
+            ProductionRun.objects.filter(pk=self.run.pk).update(status="cancelled")
+            response = self.client.delete(f"/api/v1/projects/{self.project.pk}/")
+            self.assertEqual(response.status_code, 409, response.data)
+            self.assertEqual(response.data["error"]["code"], "protected_resource")
+            self.assert_execution_retained()
+
+    def test_protected_run_release_preserves_all_current_execution_members(self):
+        GenerationTask.objects.filter(pk=self.task.pk).update(status="succeeded",
+            submission_state="terminal_succeeded", remote_state="succeeded")
+        bundle = ReleaseBundle.objects.create(owner=self.user, project=self.project, production_run=self.run,
+            created_by=self.user, version=1, title="Run delivery",
+            selection={"shots": [], "episodes": [], "series_artifact_id": None})
+        response = self.client.delete(f"/api/v1/projects/{self.project.pk}/")
+        self.assertEqual(response.status_code, 409, response.data)
+        self.assertEqual(response.data["error"]["code"], "protected_resource")
+        self.assert_execution_retained()
+        self.assertTrue(ReleaseBundle.objects.filter(pk=bundle.pk).exists())
+
+    def test_remote_token_blocks_delete_even_after_local_failure_or_cancel(self):
+        for state in ("failed", "cancelled"):
+            GenerationTask.objects.filter(pk=self.task.pk).update(status=state,
+                submission_token="recorded-submit", submission_state="submitted", remote_state="missing")
+            response = self.client.delete(f"/api/v1/projects/{self.project.pk}/")
+            self.assertEqual(response.status_code, 409, response.data)
+            self.assertEqual(response.data["error"]["code"], "project_has_active_work")
+            self.assertEqual(response.data["error"]["details"]["unresolved_remote_tasks"], 1)
+            self.assert_execution_retained()

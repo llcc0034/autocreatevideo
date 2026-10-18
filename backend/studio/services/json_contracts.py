@@ -13,6 +13,9 @@ from django.core.exceptions import ValidationError
 # must pass the matching configured security boundary explicitly so changing a
 # boundary never leaves a hidden 64 KiB write/read gate behind.
 DEFAULT_JSON_LIMIT_BYTES = 64 * 1024
+# Existing configuration-column ceiling, not a database engine limit or a
+# blanket policy for runtime input/request facts.
+DATABASE_JSON_FIELD_MAX_BYTES = 64 * 1024
 SENSITIVE_KEY_PARTS = (
     "api_key",
     "apikey",
@@ -72,6 +75,58 @@ class JsonContract:
     sha256: str
 
 
+class JsonExpansionBudget:
+    """Caller-owned byte work budget for synchronous copies and expansion."""
+    def __init__(self, maximum, *, path):
+        self.maximum = maximum
+        self.path = path
+        self.used = 0
+
+    def consume(self, value):
+        self.used += len(canonical_json_bytes(value))
+        if self.used > self.maximum:
+            raise ValidationError({self.path: f"累计取值/构造及路径记录超过当前{self.maximum}字节预算；请检查默认值、缩小样例或避免重复遍历完整列表"})
+
+
+def parse_json_value_text(text: str, *, max_bytes: int) -> Any:
+    """One strict JSON decoder for configured structures and native protocols."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"重复JSON属性：{key}")
+            result[key] = value
+        return result
+
+    def invalid_constant(_value):
+        raise ValueError("JSON不允许非有限数字")
+
+    try:
+        if not isinstance(text, str):
+            raise ValueError("请输入JSON文本")
+        if len(text.encode("utf-8")) > max_bytes:
+            raise ValidationError("正文超过当前字节上限", code="json_text_too_large")
+        payload = json.loads(text, object_pairs_hook=unique, parse_constant=invalid_constant)
+        canonical_json_bytes(payload)
+    except json.JSONDecodeError as exc:
+        raise ValidationError(f"JSON第{exc.lineno}行第{exc.colno}列（字符位置{exc.pos}）：{exc.msg}", code="json_text_invalid") from exc
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise ValidationError("JSON格式无效、重复属性或嵌套无法解析", code="json_text_invalid") from exc
+    return payload
+
+
+def parse_json_object_text(text: str, *, max_bytes: int) -> dict:
+    """Native object protocol, using the same decoder without format guessing."""
+    try:
+        payload = parse_json_value_text(text, max_bytes=max_bytes)
+    except ValidationError as exc:
+        code = "native_text_response_too_large" if exc.code == "json_text_too_large" else "native_text_response_invalid"
+        raise ValidationError("；".join(exc.messages), code=code) from exc
+    if not isinstance(payload, dict):
+        raise ValidationError("原生业务结果必须是对象", code="native_text_response_invalid")
+    return payload
+
+
 def canonical_json_bytes(value: Any) -> bytes:
     try:
         encoded = json.dumps(
@@ -81,9 +136,11 @@ def canonical_json_bytes(value: Any) -> bytes:
             separators=(",", ":"),
             allow_nan=False,
         )
+        return encoded.encode("utf-8")
+    except UnicodeError as exc:
+        raise ValidationError("JSON 载荷包含无效 Unicode 文本") from exc
     except (TypeError, ValueError) as exc:
         raise ValidationError("JSON 载荷必须可确定序列化，且不能包含 NaN/Infinity") from exc
-    return encoded.encode("utf-8")
 
 
 def json_contract(

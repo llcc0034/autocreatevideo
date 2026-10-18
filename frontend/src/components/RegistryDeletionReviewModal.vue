@@ -1,5 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { useAuthStore } from '@/stores/auth'
 import { AlertTriangle, CheckSquare, FileClock, Link2, LoaderCircle, RefreshCw, ShieldAlert, Trash2 } from 'lucide-vue-next'
 import BaseModal from '@/components/BaseModal.vue'
 import { apiErrorPresentation } from '@/services/apiErrorPresentation'
@@ -16,12 +18,23 @@ const props = defineProps<{
   objectId: string
   title?: string
 }>()
-const emit = defineEmits<{ close: []; completed: [] }>()
+const emit = defineEmits<{ close: []; completed: [target: { resourceType: RegistryDeletionResourceType; objectId: string }] }>()
+const route = useRoute()
+const auth = useAuthStore()
+const scope = () => JSON.stringify([props.open, props.resourceType, props.objectId, route.fullPath,
+  auth.user?.id, auth.user?.isStaff, auth.user?.isSuperuser])
+let generation = 0, disposed = false
+const isCurrent = (serial: number, context: string) => !disposed && serial === generation && context === scope() && props.open
+onBeforeUnmount(() => { disposed = true; generation++ })
 
 const loading = ref(false)
 const saving = ref(false)
 const error = ref('')
 const impact = ref<RegistryDeletionImpact | null>(null)
+const reviewedScope = ref('')
+const stale = ref(false)
+const submissionUnknown = ref(false)
+const completed = ref(false)
 const selectedKeys = ref(new Set<string>())
 const confirmation = ref('')
 const reasonCode = ref('')
@@ -38,7 +51,9 @@ const allSelectableConfirmed = computed(() => (
   selectableRows.value.every((item) => selectedKeys.value.has(item.dependencyKey))
 ))
 const canSubmit = computed(() => Boolean(
-  impact.value?.complete
+  !loading.value && !saving.value && !stale.value && !submissionUnknown.value && !completed.value
+  && props.open && !disposed && reviewedScope.value === scope()
+  && impact.value?.complete
   && impact.value.canExecute
   && allSelectableConfirmed.value
   && confirmation.value === impact.value.confirmationPhrase
@@ -56,27 +71,40 @@ const clearReview = () => {
 }
 
 const loadImpact = async () => {
-  if (!props.open || !props.objectId) return
+  if (!props.open || !props.objectId || loading.value || saving.value || disposed || completed.value) return
+  const serial = ++generation, context = scope()
+  const resourceType = props.resourceType, objectId = props.objectId
   loading.value = true
   error.value = ''
-  impact.value = null
-  clearReview()
+  stale.value = true
   try {
-    impact.value = await platformApi.previewRegistryDeletion(props.resourceType, props.objectId)
+    const result = await platformApi.previewRegistryDeletion(resourceType, objectId)
+    if (!isCurrent(serial, context)) return
+    if (result.target.resourceType !== resourceType || result.target.objectId !== objectId) throw Error('删除影响响应与当前目标不一致，已禁止提交。')
+    impact.value = result
+    reviewedScope.value = context
+    stale.value = false
+    clearReview()
   } catch (cause) {
-    error.value = apiErrorPresentation(cause, '删除影响读取失败；未执行任何删除。').message
+    if (isCurrent(serial, context)) error.value = `依赖读取失败；旧清单和输入仅供查看，禁止提交。本次读取不执行删除。${apiErrorPresentation(cause).message}`
   } finally {
-    loading.value = false
+    if (isCurrent(serial, context)) loading.value = false
   }
 }
 
 watch(
-  () => [props.open, props.resourceType, props.objectId] as const,
-  ([open]) => { if (open) void loadImpact(); else { impact.value = null; clearReview(); error.value = '' } },
-  { immediate: true },
+  scope,
+  () => {
+    generation++; loading.value = false; saving.value = false
+    impact.value = null; reviewedScope.value = ''; stale.value = false
+    submissionUnknown.value = false; completed.value = false; clearReview(); error.value = ''
+    if (props.open) void loadImpact()
+  },
+  { immediate: true, flush: 'sync' },
 )
 
 const toggleDependency = (key: string, checked: boolean) => {
+  if (loading.value || saving.value || stale.value || submissionUnknown.value || completed.value) return
   const next = new Set(selectedKeys.value)
   if (checked) next.add(key)
   else next.delete(key)
@@ -88,25 +116,31 @@ const close = () => { if (!saving.value) emit('close') }
 const submit = async () => {
   const current = impact.value
   if (!current || !canSubmit.value) return
+  const serial = generation, context = scope()
+  const target = { resourceType: props.resourceType, objectId: props.objectId }
   saving.value = true
   error.value = ''
   try {
-    await platformApi.executeRegistryDeletion(props.resourceType, props.objectId, {
+    await platformApi.executeRegistryDeletion(target.resourceType, target.objectId, {
       expectedImpactSha256: current.impactSha256,
       selectedDependencyKeys: [...selectedKeys.value],
       confirmationPhrase: confirmation.value,
       reasonCode: reasonCode.value,
     })
-    emit('completed')
+    if (!isCurrent(serial, context)) return
+    completed.value = true
+    emit('completed', target)
   } catch (cause) {
-    const failure = apiErrorPresentation(cause, '删除未完成；事务已回滚。')
+    if (!isCurrent(serial, context)) return
+    const failure = apiErrorPresentation(cause, '未收到可验证的删除完成回执。')
     const message = `${failure.code ? `[${failure.code}] ` : ''}${failure.message}`
-    if (failure.code === 'deletion_impact_changed') {
-      await loadImpact()
-      error.value = message
-    } else error.value = message
+    const status = Number((cause as { response?: { status?: number } })?.response?.status || 0)
+    stale.value = true
+    // Transport errors, invalid acknowledgements and 5xx do not prove rollback.
+    submissionUnknown.value = !(status >= 400 && status < 500)
+    error.value = submissionUnknown.value ? `删除结果尚未确认。${message}` : `${message} 请重新读取依赖并重新复核后操作。`
   } finally {
-    saving.value = false
+    if (isCurrent(serial, context)) saving.value = false
   }
 }
 </script>
@@ -122,7 +156,8 @@ const submit = async () => {
   >
     <div class="deletion-review">
       <div v-if="loading" class="deletion-loading"><LoaderCircle :size="18" class="spin"/><span>正在读取完整关联依赖，尚未执行删除…</span></div>
-      <div v-else-if="impact" class="deletion-content">
+      <div v-if="impact" class="deletion-content">
+        <p v-if="stale" role="status">依赖清单已失效或尚未重新读取；当前内容仅供查看，不能用于删除。</p>
         <section class="deletion-target">
           <div><span>删除目标</span><strong>{{ impact.target.label }}</strong><small>{{ impact.target.resourceType }} · {{ impact.target.status }} · {{ impact.target.objectId }}</small></div>
           <div class="deletion-counts">
@@ -162,7 +197,7 @@ const submit = async () => {
           <header><CheckSquare :size="16"/><div><strong>可由人工确认删除的安全草稿依赖</strong><small>默认全部不选；要删除目标，必须逐项确认所有直接依赖。</small></div><b>{{ selectableRows.length }}</b></header>
           <div class="dependency-list">
             <label v-for="item in selectableRows" :key="item.dependencyKey">
-              <input type="checkbox" :checked="selectedKeys.has(item.dependencyKey)" :disabled="!impact.canExecute" @change="toggleDependency(item.dependencyKey, ($event.target as HTMLInputElement).checked)"/>
+              <input type="checkbox" :checked="selectedKeys.has(item.dependencyKey)" :disabled="!impact.canExecute || loading || saving || stale || submissionUnknown || completed" @change="toggleDependency(item.dependencyKey, ($event.target as HTMLInputElement).checked)"/>
               <span><strong>{{ item.label }}</strong><small>{{ item.relationshipLabel }} · {{ item.resourceType }} · {{ item.status }}</small><code>{{ item.objectId }}</code><em>{{ item.reason }}</em></span>
             </label>
           </div>
@@ -177,17 +212,19 @@ const submit = async () => {
 
         <div v-if="impact.canExecute" class="deletion-confirmation">
           <p><Trash2 :size="15"/>此操作只删除平台注册记录，不会移动或删除磁盘上的模型或媒体文件；操作不可撤销。</p>
-          <label>审计原因代码<select v-model="reasonCode"><option value="">请选择稳定原因代码</option><option value="lifecycle_cleanup">生命周期清理</option><option value="configuration_correction">配置纠正</option><option value="planned_change">计划变更</option><option value="incident_response">故障处置</option></select></label>
-          <label>输入完整确认短语 <code>{{ impact.confirmationPhrase }}</code><input v-model="confirmation" autocomplete="off" :placeholder="impact.confirmationPhrase"/></label>
+          <label>审计原因代码<select v-model="reasonCode" :disabled="loading || saving || stale || submissionUnknown || completed"><option value="">请选择稳定原因代码</option><option value="lifecycle_cleanup">生命周期清理</option><option value="configuration_correction">配置纠正</option><option value="planned_change">计划变更</option><option value="incident_response">故障处置</option></select></label>
+          <label>输入完整确认短语 <code>{{ impact.confirmationPhrase }}</code><input v-model="confirmation" :disabled="loading || saving || stale || submissionUnknown || completed" autocomplete="off" :placeholder="impact.confirmationPhrase"/></label>
         </div>
       </div>
 
       <div v-if="error" class="platform-alert danger"><AlertTriangle :size="15"/><p>{{ error }}</p></div>
+      <p v-if="submissionUnknown" role="alert">未确认的目标：{{ resourceType }} · {{ objectId }}。请关闭后到资源目录和生命周期审计核对实际结果；重新读取依赖只更新清单，不证明原请求失败，也不会解锁本窗口或自动重发删除。</p>
+      <p v-if="completed" role="status">服务端已确认删除完成，请在资源目录查看刷新结果；不要重复提交。</p>
     </div>
 
     <template #footer>
       <button class="button ghost" :disabled="saving" @click="close">取消</button>
-      <button class="button ghost" :disabled="loading||saving" @click="loadImpact"><RefreshCw :size="13"/>重新读取依赖</button>
+      <button class="button ghost" :disabled="loading||saving||completed" @click="loadImpact"><RefreshCw :size="13"/>重新读取依赖</button>
       <button class="button danger" :disabled="saving||!canSubmit" @click="submit"><Trash2 :size="13"/>{{ saving?'事务校验与删除中…':confirmLabel }}</button>
     </template>
   </BaseModal>

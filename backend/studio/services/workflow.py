@@ -83,14 +83,8 @@ class WorkflowBuildError(ValueError):
     pass
 
 
-def aligned_frames(duration_ms: int, frame_policy: dict) -> int:
-    """Return the nearest legal frame count declared by a frozen contract.
-
-    Always rounding upward can create a large duration drift at short lengths
-    so preserve the requested duration by choosing the closest legal count.
-    No model identifier or model-specific constants are interpreted here.
-    """
-
+def validate_frame_policy(frame_policy: dict) -> None:
+    """Check the frozen clock without inventing a requested duration."""
     if not isinstance(frame_policy, dict):
         raise WorkflowBuildError("frame_policy 必须是冻结对象")
     fps = frame_policy.get("fps")
@@ -113,6 +107,19 @@ def aligned_frames(duration_ms: int, frame_policy: dict) -> int:
         or minimum % modulus != remainder
     ):
         raise WorkflowBuildError("frame_policy 的 fps/范围/模数合同无效")
+
+
+def aligned_frames(duration_ms: int, frame_policy: dict) -> int:
+    """Return the nearest legal frame count declared by a frozen contract.
+
+    Always rounding upward can create a large duration drift at short lengths
+    so preserve the requested duration by choosing the closest legal count.
+    No model identifier or model-specific constants are interpreted here.
+    """
+    validate_frame_policy(frame_policy)
+    fps, minimum, maximum, modulus, remainder = (
+        frame_policy[key] for key in ("fps", "minimum_frames", "maximum_frames", "alignment_modulus", "alignment_remainder")
+    )
     requested = min(maximum, max(minimum, round(duration_ms * float(fps) / 1000)))
     lower = remainder + ((requested - remainder) // modulus) * modulus
     upper = lower + modulus

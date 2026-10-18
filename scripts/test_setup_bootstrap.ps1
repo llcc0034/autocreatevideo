@@ -22,6 +22,16 @@ function Test-HasIfAncestor([System.Management.Automation.Language.Ast]$Node) {
     return $false
 }
 
+function Test-HasSwitchGuard([System.Management.Automation.Language.Ast]$Node, [string]$SwitchName) {
+    for ($Parent = $Node.Parent; $null -ne $Parent; $Parent = $Parent.Parent) {
+        if ($Parent -is [System.Management.Automation.Language.IfStatementAst] -and
+            $Parent.Clauses[0].Item1.Extent.Text.Trim() -eq ('$' + $SwitchName)) {
+            return $true
+        }
+    }
+    return $false
+}
+
 $Assignments = $Ast.FindAll({
     param($Node)
     $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and
@@ -62,6 +72,25 @@ $AssetImport = $Commands | Where-Object {
 } | Select-Object -First 1
 if ($null -eq $AssetImport -or $SeedInvocation.Extent.StartOffset -ge $AssetImport.Extent.StartOffset) {
     throw 'setup.ps1 must seed system styles before importing the asset library.'
+}
+if (-not (Test-HasSwitchGuard $AssetImport 'ImportAssetLibrary')) {
+    throw 'Asset import must require explicit -ImportAssetLibrary; reinstall must not restore deleted assets.'
+}
+$FreshCheck = $Commands | Where-Object {
+    $_.Extent.Text -match '\bmanage\.py\s+assert_clean_install\b'
+} | Select-Object -First 1
+$Bootstrap = $Commands | Where-Object {
+    $_.Extent.Text -match '\bmanage\.py\s+bootstrap_superadmin\b'
+} | Select-Object -First 1
+if ($null -eq $FreshCheck -or $null -eq $Bootstrap -or
+    -not (Test-HasSwitchGuard $FreshCheck 'Fresh') -or
+    $FreshCheck.Extent.StartOffset -ge $Bootstrap.Extent.StartOffset -or
+    $FreshCheck.Extent.StartOffset -ge $SeedInvocation.Extent.StartOffset) {
+    throw 'Fresh must check existing history before creating accounts or seeding; it must not silently clean existing data.'
+}
+$DockerEntry = Get-Content (Join-Path $PSScriptRoot '../docker/backend-entrypoint.sh') -Raw
+if ($DockerEntry -match 'manage.py import_asset_library' -or $DockerEntry -notmatch 'manage.py seed_data') {
+    throw 'Container bootstrap must initialize styles but never automatically restore library assets.'
 }
 
 Write-Host 'Setup bootstrap ordering tests passed.' -ForegroundColor Green

@@ -24,10 +24,6 @@ def translation_request_max_entries() -> int:
     return boundary_int("security.translation.max_entries_per_request")
 
 
-def translation_promotion_max_entries() -> int:
-    return boundary_int("security.translation.max_promotions_per_request")
-
-
 def canonical_glossary_max_entities() -> int:
     return boundary_int("security.canonical_glossary.max_entities_per_request")
 

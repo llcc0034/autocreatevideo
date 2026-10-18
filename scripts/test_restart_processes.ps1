@@ -41,6 +41,36 @@ $restartPath = Join-Path $PSScriptRoot 'restart.ps1'
 Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Stop-ProcessTree')
 Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Stop-RecordedServices')
 Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Assert-JwtSigningKeyConfiguration')
+Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Read-ExecutionCutoverReview')
+
+# Probe tests use a local fake clock and HTTP response, never start a service.
+& {
+    Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Test-Http')
+    Invoke-Expression (Get-RestartFunctionText -Path $restartPath -Name 'Wait-Http')
+    $script:probeClock = [datetime]'2026-01-01T00:00:00'
+    $script:probeStatus = 200
+    $script:probeTimeouts = [System.Collections.Generic.List[int]]::new()
+    function Get-Date { return $script:probeClock }
+    function Start-Sleep { param([int]$Seconds) $script:probeClock = $script:probeClock.AddSeconds($Seconds) }
+    function Invoke-WebRequest {
+        param([string]$Uri, [switch]$UseBasicParsing, [int]$TimeoutSec)
+        $script:probeTimeouts.Add($TimeoutSec)
+        $script:probeClock = $script:probeClock.AddSeconds([Math]::Min(7, $TimeoutSec))
+        if ($TimeoutSec -lt 7) { throw 'fixture HTTP timeout' }
+        return [pscustomobject]@{ StatusCode = $script:probeStatus }
+    }
+    Wait-Http 'slow valid readiness' 'http://fixture.invalid/ready' 20
+    Assert-Equal $script:probeTimeouts.Count 1 'A slow healthy probe must not be abandoned and duplicated.'
+    Assert-Equal $script:probeTimeouts[0] 20 'The request receives the remaining startup budget.'
+    $script:probeTimeouts.Clear()
+    $script:probeStatus = 503
+    $notReadyError = $null
+    try { Wait-Http 'unhealthy readiness' 'http://fixture.invalid/ready' 10 } catch { $notReadyError = $_ }
+    Assert-True ($null -ne $notReadyError) 'A real unhealthy response must still fail startup.'
+    Assert-Equal $script:probeTimeouts[0] 10 'The first probe receives the deadline budget.'
+    Assert-Equal $script:probeTimeouts[1] 2 'A retry only receives the remaining budget, not a fresh timeout.'
+    Assert-Equal $script:probeTimeouts.Count 2 'The deadline still bounds failed retries.'
+}
 
 # The JWT preflight must provide Django's module selector to raw python, restore
 # the caller environment afterwards, and remain before every destructive stop.
@@ -89,6 +119,40 @@ try {
     Assert-True ($null -ne $preflightCall) 'restart.ps1 must invoke the JWT preflight.'
     Assert-True ($null -ne $stopCall) 'restart.ps1 must invoke recorded-service cleanup.'
     Assert-True ($preflightCall.Extent.StartOffset -lt $stopCall.Extent.StartOffset) 'JWT preflight must run before recorded services are stopped.'
+    $cutoverCalls = @($topLevelCommands | Where-Object { $_.GetCommandName() -eq 'Invoke-ExecutionCutover' })
+    Assert-Equal $cutoverCalls.Count 2 'Cutover has exactly one readonly preflight and one stopped-writer execution.'
+    Assert-True ($cutoverCalls[0].Extent.StartOffset -lt $stopCall.Extent.StartOffset) 'Review must be checked before stopping services.'
+    $lastStop = $topLevelCommands | Where-Object { $_.GetCommandName() -eq 'Stop-PortListener' } |
+        Sort-Object { $_.Extent.StartOffset } | Select-Object -Last 1
+    Assert-True ($cutoverCalls[1].Extent.StartOffset -gt $lastStop.Extent.StartOffset) 'Execute cleanup only after all platform stop operations.'
+    $migrationCall = $topLevelCommands | Where-Object { $_.Extent.Text -match 'manage.py migrate --noinput' } | Select-Object -First 1
+    Assert-True ($cutoverCalls[1].Extent.StartOffset -lt $migrationCall.Extent.StartOffset) 'Reviewed cleanup precedes schema migration.'
+    Assert-True ($cutoverCalls[0].Extent.Text -notmatch '-Execute') 'Preflight is read only.'
+    Assert-True ($cutoverCalls[1].Extent.Text -match '-Execute') 'Stopped-writer phase explicitly executes reviewed cleanup.'
+
+    $reviewPath = Join-Path $preflightRoot 'cutover-review.json'
+    $reviewFixture = @{
+        plan_sha256 = ('a' * 64)
+        obsolete_prompt_version_ids = @('a4107821-f3ef-4f2f-9841-36a20c5db239')
+        operator = 'isolated-cutover'
+        confirmation = 'DELETE_REVIEWED_0144_EXECUTION_DATA_WITHOUT_BACKUP'
+    }
+    $reviewFixture | ConvertTo-Json | Set-Content -LiteralPath $reviewPath -Encoding UTF8
+    $parsedReview = Read-ExecutionCutoverReview -Path $reviewPath
+    Assert-Equal $parsedReview.plan_sha256 ('a' * 64) 'Review preserves the exact approved hash.'
+    foreach ($invalidField in @('plan_sha256', 'confirmation', 'obsolete_prompt_version_ids')) {
+        $invalidReview = $reviewFixture.Clone()
+        $invalidReview[$invalidField] = 'invalid'
+        $invalidReview | ConvertTo-Json | Set-Content -LiteralPath $reviewPath -Encoding UTF8
+        $rejected = $false
+        try { Read-ExecutionCutoverReview -Path $reviewPath | Out-Null } catch { $rejected = $true }
+        Assert-True $rejected "Invalid $invalidField must be rejected without stopping services."
+    }
+    $reviewFixture.extra_command = 'must never become executable input'
+    $reviewFixture | ConvertTo-Json | Set-Content -LiteralPath $reviewPath -Encoding UTF8
+    $rejected = $false
+    try { Read-ExecutionCutoverReview -Path $reviewPath | Out-Null } catch { $rejected = $true }
+    Assert-True $rejected 'Arbitrary command hooks are not supported by the cutover review.'
 } finally {
     if ($hadOriginalSettingsModule) {
         $env:DJANGO_SETTINGS_MODULE = $originalSettingsModule

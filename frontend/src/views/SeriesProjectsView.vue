@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   AlertTriangle,
@@ -30,6 +30,7 @@ const studio = useStudioStore()
 
 const retrying = ref(false)
 const retryError = ref('')
+const listLoaded = ref(false)
 const favoritePendingIds = ref(new Set<string>())
 const redoTarget = ref<SeriesProject | null>(null)
 const deleteTarget = ref<SeriesProject | null>(null)
@@ -46,11 +47,9 @@ const episodeCount = computed(() => studio.projects.reduce((sum, project) => sum
   project.detailLoaded ? (projectEpisodeSummary(project).episodeCount ?? 0) : (project.episodeCount ?? 0)
 ), 0))
 const loadingWithoutData = computed(() => (
-  studio.loading
-  || retrying.value
-  || (!studio.ready && !studio.error)
+  retrying.value || (!listLoaded.value && !retryError.value)
 ) && !studio.projects.length)
-const visibleLoadError = computed(() => retryError.value || studio.error)
+const visibleLoadError = computed(() => retryError.value)
 const canConfirmDelete = computed(() => Boolean(
   deleteTarget.value
   && isProjectDeleteConfirmed(deleteTarget.value.title, deleteConfirmation.value)
@@ -71,19 +70,22 @@ const refreshProjectCover = async (projectId: string) => {
   return studio.projects.find((project) => project.id === projectId)?.coverUrl
 }
 
-const retry = async () => {
+const loadProjects = async (initial = false) => {
+  if (retrying.value) return
   retrying.value = true
   retryError.value = ''
   try {
-    if (studio.ready) await studio.refreshProjects()
-    else await studio.initialize()
-    if (studio.error) retryError.value = studio.error
+    if (initial) await studio.initializeNavigation()
+    else await studio.refreshProjects()
+    listLoaded.value = true
   } catch (error) {
     retryError.value = error instanceof Error ? error.message : '项目列表加载失败，请稍后重试。'
   } finally {
     retrying.value = false
   }
 }
+const retry = () => loadProjects()
+onMounted(() => { void loadProjects(true) })
 
 const toggleFavorite = async (project: SeriesProject) => {
   if (favoritePendingIds.value.has(project.id)) return

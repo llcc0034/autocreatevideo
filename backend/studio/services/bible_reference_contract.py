@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-from copy import deepcopy
-import hashlib
-import json
 import re
+import unicodedata
 import uuid
 from typing import Any
 
@@ -17,13 +15,18 @@ BIBLE_IMAGE_REVIEW_STAGE_KEY = "bible_image_review"
 BIBLE_IMAGE_GENERATION_PURPOSE = "bible_reference_image"
 BIBLE_IMAGE_SOURCE_SCHEMA_VERSION = 1
 
-# Historical rows created before the ProductionRun Bible pipeline remain
-# readable for audit/provenance only.  No service may materialize this retired
-# purpose into a workflow, task, Asset, or current Bible binding.
+# This rejected purpose is removed with the remaining legacy materializers;
+# it has no read-side adapter or current provenance projection.
 RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE = "bible_image_candidate"
-RETIRED_BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION = 1
 
 ENTITY_TYPES = ("character", "scene", "prop")
+
+
+def bible_reference_name_key(value: str) -> str:
+    """Shared conflict identity only; never change the authored display name."""
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
 _UNIT_RE = re.compile(
     r"^bible:(character|scene|prop):"
     r"([0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})"
@@ -106,61 +109,3 @@ def validate_bible_prompt_target(value: Any) -> dict[str, Any]:
 def is_retired_bible_image_candidate_prompt(prompt: Any) -> bool:
     options = prompt.request_options if isinstance(prompt.request_options, dict) else {}
     return options.get("generation_purpose") == RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE
-
-
-def retired_bible_image_candidate_snapshot(prompt: Any) -> dict[str, Any] | None:
-    """Validate a retired PromptArtifact for read-only provenance projection."""
-
-    options = prompt.request_options if isinstance(prompt.request_options, dict) else {}
-    if options.get("generation_purpose") != RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE:
-        return None
-    target = options.get("bible_target")
-    source_snapshot = options.get("source_snapshot")
-    request_fingerprint = options.get("request_fingerprint")
-    idempotency_key = options.get("idempotency_key")
-    quality = options.get("quality")
-    if (
-        prompt.prompt_type != "image"
-        or not isinstance(target, dict)
-        or set(target) != {
-            "schema_version", "reference_category", "entity_id", "entity_name",
-            "source_fingerprint",
-        }
-        or type(target.get("schema_version")) is not int
-        or target["schema_version"] != RETIRED_BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION
-        or target.get("reference_category") not in ENTITY_TYPES
-        or type(target.get("entity_id")) is not str
-        or type(target.get("entity_name")) is not str
-        or type(target.get("source_fingerprint")) is not str
-        or not re.fullmatch(r"[0-9a-f]{64}", target["source_fingerprint"])
-        or type(request_fingerprint) is not str
-        or not re.fullmatch(r"[0-9a-f]{64}", request_fingerprint)
-        or type(idempotency_key) is not str
-        or not 1 <= len(idempotency_key) <= 120
-        or not isinstance(source_snapshot, dict)
-        or not isinstance(quality, dict)
-        or type(options.get("extended_generation_confirmed")) is not bool
-    ):
-        raise ValidationError("历史 Bible 参考图 Prompt 合同无效")
-    try:
-        uuid.UUID(target["entity_id"])
-    except (TypeError, ValueError, AttributeError) as exc:
-        raise ValidationError("历史 Bible 参考图 Prompt 实体 ID 无效") from exc
-    source_snapshot_hash = hashlib.sha256(json.dumps(
-        source_snapshot,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    ).encode("utf-8")).hexdigest()
-    if source_snapshot_hash != target["source_fingerprint"]:
-        raise ValidationError("历史 Bible 参考图 Prompt 来源摘要无效")
-    return {
-        "generation_purpose": RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,
-        "idempotency_key": idempotency_key,
-        "request_fingerprint": request_fingerprint,
-        "bible_target": deepcopy(target),
-        "source_snapshot_sha256": source_snapshot_hash,
-        "quality": deepcopy(quality),
-        "extended_generation_confirmed": options["extended_generation_confirmed"],
-    }

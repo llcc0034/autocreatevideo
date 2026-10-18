@@ -9,6 +9,10 @@ backend/.venv/
 backend/staticfiles/
 backend/media/
 backend/db.sqlite3
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
 backend/*.sqlite3-journal
 /db.sqlite3
 

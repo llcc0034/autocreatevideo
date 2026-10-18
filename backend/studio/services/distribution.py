@@ -52,6 +52,7 @@ from studio.services.provenance import (
     verified_task_manifest,
 )
 from studio.services.security_boundaries import boundary_bool
+from studio.services.worker_heartbeat import WorkerHeartbeat
 
 
 DISTRIBUTION_SCHEMA = "https://autoprompt.local/schemas/task-distribution-provenance/v1"
@@ -62,6 +63,10 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 class DistributionError(ValueError):
     """A public distribution copy cannot be created or safely verified."""
+
+
+class DistributionClaimLost(DistributionError):
+    """Late work must not replace the current source or another publisher."""
 
 
 def _canonical_bytes(value: dict) -> bytes:
@@ -105,24 +110,16 @@ def _assert_distribution_enabled() -> None:
         raise DistributionError("Managed public distribution copies are disabled")
 
 
-def _task_disclosure(task: GenerationTask, media_kind: str) -> dict:
+def _task_disclosure(task: GenerationTask, media_kind: str, *, generation: dict) -> dict:
     _assert_distribution_enabled()
     if task.kind != media_kind:
         raise DistributionError("Task output kind does not match its model distribution profile")
-    workflow = task.generated_workflow
-    if not workflow.workflow_template_version_id:
-        raise DistributionError(
-            "Unversioned workflow distribution is retired",
-        )
-    versioned_profile = workflow.workflow_template_version.model_profile_version
-    if versioned_profile is None:
-        raise DistributionError(
-            "Versioned workflow has no frozen model profile",
-        )
-    model = str(versioned_profile.model_identifier or "").strip()
-    if not model:
+    # The signed source was checked against the actual Preparation, including
+    # the exact model version. Do not consult a mutable deployment or old trace.
+    model = generation.get("model")
+    model_key = generation.get("model_profile_version_id")
+    if not isinstance(model, str) or not model.strip() or not isinstance(model_key, str) or not model_key:
         raise DistributionError("Task execution contract has no model identity")
-    model_key = f"{versioned_profile.profile_key}:v{versioned_profile.version}"
     try:
         disclosure = resolve_delivery_disclosure(
             model=model,
@@ -645,22 +642,61 @@ def _record_from_document(document: dict) -> dict:
     }
 
 
-def _persist_record(task_id, output_index: int, record: dict) -> GenerationTask:
+def _publication_guard(task: GenerationTask, output_index: int) -> dict:
+    if (task.status != GenerationTask.Status.SUCCEEDED or type(output_index) is not int
+            or not isinstance(task.outputs, list) or not 0 <= output_index < len(task.outputs)
+            or not isinstance(task.outputs[output_index], dict)):
+        raise DistributionError("Successful task output index is unavailable")
+    item = deepcopy(task.outputs[output_index])
+    distribution = item.pop("distribution", None)
+    return {"owner_id": task.owner_id, "project_id": task.project_id, "kind": task.kind,
+        "source_sha256": _canonical_sha256(item), "distribution": distribution,
+        "claim": task.distribution_claim, "revision": task.distribution_revision}
+
+
+def _require_publication_lock(path: Path, owner_token: str) -> None:
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(document, dict) or document.get("owner_token") != owner_token:
+            raise ValueError
+    except (OSError, ValueError) as exc:
+        raise DistributionClaimLost("Distribution publisher no longer owns its processing lock") from exc
+
+
+class _PublicationLockHeartbeat(WorkerHeartbeat):
+    def __init__(self, path, owner_token):
+        super().__init__(f"publication-{owner_token}")
+        if self.interval >= _lock_stale_seconds():
+            raise DistributionError("Distribution stale-lock interval must exceed the task heartbeat interval")
+        self.path, self.owner_token = path, owner_token
+
+    def _touch(self):
+        _require_publication_lock(self.path, self.owner_token)
+        os.utime(self.path, None)
+
+
+def _persist_record(task_id, output_index: int, record: dict, *, expected: dict,
+        lock: Path | None = None, lock_owner: str = "") -> GenerationTask:
     with transaction.atomic():
         current = GenerationTask.objects.select_for_update().get(pk=task_id)
-        if not isinstance(current.outputs, list) or not 0 <= output_index < len(current.outputs):
-            raise DistributionError("Task output changed before distribution publication")
+        if lock is not None:
+            _require_publication_lock(lock, lock_owner)
+        try:
+            actual = _publication_guard(current, output_index)
+        except DistributionError as exc:
+            raise DistributionClaimLost("Task output no longer permits distribution publication") from exc
+        if actual != expected:
+            raise DistributionClaimLost("Task source or distribution changed before publication")
         outputs = deepcopy(current.outputs)
         item = outputs[output_index]
-        if not isinstance(item, dict):
-            raise DistributionError("Task output changed before distribution publication")
         item["distribution"] = record
         current.outputs = outputs
         current.save(update_fields=("outputs", "updated_at"))
         return current
 
 
-def record_distribution_failure(task: GenerationTask, output_index: int, exc: BaseException) -> None:
+def record_distribution_failure(task: GenerationTask, output_index: int, exc: BaseException, *, expected: dict,
+        lock: Path | None = None, lock_owner: str = "") -> None:
     message = str(exc).strip() or exc.__class__.__name__
     # The persisted/API-visible message is deliberately bounded and contains no
     # source/output paths or FFmpeg stderr.
@@ -671,9 +707,10 @@ def record_distribution_failure(task: GenerationTask, output_index: int, exc: Ba
             "schema": DISTRIBUTION_SCHEMA,
             "error": safe_message,
             "failed_at": timezone.now().isoformat(),
-        })
-    except (GenerationTask.DoesNotExist, DistributionError):
-        pass
+        }, expected=expected, lock=lock, lock_owner=lock_owner)
+    except (GenerationTask.DoesNotExist, DistributionClaimLost):
+        # The caller still receives failure; no late write to a newer fact.
+        return
 
 
 def _verify_document(task: GenerationTask, output_index: int, document: dict, artifact: Path, *, expected: dict | None = None) -> dict:
@@ -705,8 +742,9 @@ def _verify_document(task: GenerationTask, output_index: int, document: dict, ar
         raise DistributionError("Distribution provenance subject does not match")
     disclosure = body.get("disclosure") or {}
     artifact_body = body.get("artifact") or {}
+    source = verified_task_manifest(task, output_index)
     expected_profile = _task_disclosure(
-        task, str(artifact_body.get("media_kind") or ""),
+        task, str(artifact_body.get("media_kind") or ""), generation=source["generation"],
     )
     if (
         disclosure.get("ai_generated") is not True
@@ -719,7 +757,6 @@ def _verify_document(task: GenerationTask, output_index: int, document: dict, ar
         or (body.get("release") or {}).get("model") != expected_profile["model"]
     ):
         raise DistributionError("Distribution disclosure does not match the approved configuration")
-    source = verified_task_manifest(task, output_index)
     source_artifact = body.get("source_artifact") or {}
     if (
         source_artifact.get("sha256") != source["artifact"]["sha256"]
@@ -770,16 +807,15 @@ def verified_distribution_manifest(task: GenerationTask, output_index: int) -> d
     return _verify_document(task, output_index, document, artifact, expected=record)
 
 
-def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
+def prepare_task_distribution(task: GenerationTask, output_index: int, *, claim=None) -> dict:
     """Create or idempotently reuse one managed task-output distribution copy."""
 
-    task = GenerationTask.objects.select_related(
-        "generated_workflow__prompt_artifact", "generated_workflow__template",
-    ).get(pk=task.pk)
+    task = GenerationTask.objects.get(pk=task.pk)
+    if claim is not None and (task.distribution_claim != claim or task.distribution_state != "running"):
+        raise DistributionClaimLost("Distribution task claim has expired")
     if task.status != GenerationTask.Status.SUCCEEDED:
         raise DistributionError("Only a successful generation task can be published")
-    if not isinstance(task.outputs, list) or not 0 <= output_index < len(task.outputs):
-        raise DistributionError("Task output index is unavailable")
+    expected = _publication_guard(task, output_index)
     item = task.outputs[output_index]
     media_kind = classify_task_output(item)
     if media_kind not in {"video", "image"}:
@@ -796,7 +832,7 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
             media_profile = resolve_distribution_media_profile(project=task.project)
         except MediaProcessingProfileError as exc:
             raise DistributionError(str(exc)) from exc
-        disclosure = _task_disclosure(task, media_kind)
+        disclosure = _task_disclosure(task, media_kind, generation=source_manifest["generation"])
         config = _release_config(
             source_sha256=source_sha256,
             media_kind=media_kind,
@@ -805,7 +841,7 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
             media_profile=media_profile,
         )
     except DistributionError as exc:
-        record_distribution_failure(task, output_index, exc)
+        record_distribution_failure(task, output_index, exc, expected=expected)
         raise
     release_id = _canonical_sha256(config)
     parent = _distribution_parent(task, output_index)
@@ -823,8 +859,20 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
             if not _reclaim_stale_lock(lock) or not _try_create_lock(lock, lock_owner):
                 raise DistributionError("A managed distribution copy is already being prepared")
     temporary_dir = parent / f".{release_id}.{uuid.uuid4().hex}.tmp"
+    heartbeat = None
     try:
+        heartbeat = _PublicationLockHeartbeat(lock, lock_owner)
+        heartbeat.__enter__()
         task.refresh_from_db(fields=("outputs",))
+        # A previous producer may have committed between our initial read and
+        # acquiring the per-release lock. Reuse its exact record, never adopt
+        # a changed master as if it were this render's source.
+        current_guard = _publication_guard(task, output_index)
+        if {k: v for k, v in current_guard.items() if k != "distribution"} != {
+                k: v for k, v in expected.items() if k != "distribution"}:
+            raise DistributionClaimLost("Task source changed before distribution rendering")
+        expected = current_guard
+        _require_publication_lock(lock, lock_owner)
         try:
             existing = verified_distribution_manifest(task, output_index)
             if existing["release"]["release_id"] == release_id:
@@ -842,7 +890,7 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
                 if verified["release"]["release_id"] != release_id:
                     raise DistributionError("Existing managed distribution release does not match configuration")
                 record = _record_from_document(verified)
-                task = _persist_record(task.pk, output_index, record)
+                task = _persist_record(task.pk, output_index, record, expected=expected, lock=lock, lock_owner=lock_owner)
                 return verified_distribution_manifest(task, output_index)
             except (OSError, json.JSONDecodeError, KeyError, DistributionError) as exc:
                 raise DistributionError(
@@ -876,31 +924,40 @@ def prepare_task_distribution(task: GenerationTask, output_index: int) -> dict:
         # Verify the complete temporary release before one atomic directory
         # rename makes media and provenance visible together.
         _verify_document(task, output_index, document, temporary_artifact)
+        _require_publication_lock(lock, lock_owner)
         os.replace(temporary_dir, release_dir)
         record = _record_from_document(document)
-        task = _persist_record(task.pk, output_index, record)
+        task = _persist_record(task.pk, output_index, record, expected=expected, lock=lock, lock_owner=lock_owner)
         return verified_distribution_manifest(task, output_index)
+    except DistributionClaimLost:
+        raise
     except Exception as exc:
         if isinstance(exc, DistributionError):
-            record_distribution_failure(task, output_index, exc)
+            record_distribution_failure(task, output_index, exc, expected=expected, lock=lock, lock_owner=lock_owner)
             raise
         wrapped = DistributionError("Managed distribution copy could not be published")
-        record_distribution_failure(task, output_index, wrapped)
+        record_distribution_failure(task, output_index, wrapped, expected=expected, lock=lock, lock_owner=lock_owner)
         raise wrapped from exc
     finally:
+        if heartbeat is not None:
+            heartbeat.__exit__(None, None, None)
         shutil.rmtree(temporary_dir, ignore_errors=True)
         _unlink_owned_lock(lock, lock_owner)
 
 
-def prepare_all_task_distributions(task: GenerationTask) -> list[str]:
+def prepare_all_task_distributions(task: GenerationTask, *, claim=None) -> list[str]:
     """Best-effort post-generation publication; masters remain successful on failure."""
 
     errors: list[str] = []
+    if not isinstance(task.outputs, list) or not any(classify_task_output(item) in {"video", "image"} for item in task.outputs):
+        raise DistributionError("Successful task has no distributable output")
     for index, item in enumerate(task.outputs or []):
         if classify_task_output(item) not in {"video", "image"}:
             continue
         try:
-            prepare_task_distribution(task, index)
+            prepare_task_distribution(task, index, claim=claim)
+        except DistributionClaimLost:
+            raise
         except DistributionError as exc:
             errors.append(f"output {index}: {exc}")
         task.refresh_from_db(fields=("outputs",))

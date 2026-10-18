@@ -1,45 +1,31 @@
 import json
+from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
 from studio.models import (
     CharacterBible,
-    GenerationAttempt,
-    GenerationAttemptResolution,
-    ProductionRecipeVersion,
-    ProductionRun,
     SeriesProject,
-    StageRun,
 )
-from studio.services.json_contracts import assign_json_contract, json_contract
-from studio.services.production_runs import (
-    StageBlocked,
-    _prepare_visual_rules,
-    _queue_visual_rules_attempt_for_route,
-)
-from studio.services.production_visual_rules import (
-    COLOR_DESIGN_CHOICES,
-    COLOR_VALUES,
-    VisualRulesConflict,
-    VisualRulesError,
-    apply_visual_rules_candidate,
-    build_visual_rules_smoke_plan,
-    build_visual_rules_plan,
-    finalize_visual_rules,
-    validate_visual_rules_model_profile,
-    validate_reviewed_rules,
-    visual_rules_provider_payload,
-    visual_rules_resource_estimate,
-    VISUAL_RULES_OPERATION,
-    VISUAL_RULES_UNIT_KEY,
-)
-from studio.services.deployment_smoke import execute_visual_rules_smoke_request
+from studio.services.production_visual_rules import COLOR_DESIGN_CHOICES, COLOR_VALUES, VisualRulesConflict, VisualRulesError, apply_visual_rules_candidate, build_visual_rules_plan, finalize_visual_rules, validate_visual_rules_model_profile, validate_reviewed_rules, visual_rules_provider_payload, visual_rules_resource_estimate
 from studio.services.provider_registry import ProviderDriverError, _invoke_chat_completion
 from studio.services.script_sources import confirm_script_revision, create_pasted_script_source
 from studio.tests.factories import build_story
+from studio.services.visual_rules_inputs import capture_visual_rules_baseline
+
+
+def configured_plan(*, project, model_identifier, policy):
+    inputs = {"logical_values": {"theme": "A traveler follows a mysterious letter.", "style": "Restrained cool realism."},
+        "input_provenance": []}
+    plan = build_visual_rules_plan(baseline=capture_visual_rules_baseline(project_id=project.pk, owner=project.owner,
+        inputs=inputs), model_identifier=model_identifier, policy=policy, seed=42)
+    plan["prompt_profile_assembly"] = {"channels": {"positive_prompt": inputs["logical_values"]["theme"] + " " +
+        inputs["logical_values"]["style"]}, "structured_fields": {}}
+    visual_rules_provider_payload(plan)
+    return plan
 
 
 RECOMMENDED_NEGATIVE_CLAUSES = (
@@ -57,6 +43,129 @@ def _visual_chat_request_options(**extra) -> dict:
 
 
 class ProductionVisualRulesContractTests(TestCase):
+    def test_json_schema_wire_format_uses_exact_business_output_without_rewriting_plan(self):
+        from studio.services.business_outputs import write_output, output_reference
+        from studio.services.data_structures import validate_data_structure_snapshot
+        from studio.tests.output_structure_fixtures import response_structure
+        output = write_output(actor=self.user, data={'name': 'Exact visual output', 'parser_key': 'visual_rules.v2',
+            'data_structure_version': response_structure().pk})
+        output = write_output(actor=self.user, output_id=output.pk, expected_revision=1, action='publish')
+        plan = deepcopy(self.plan)
+        plan['business_output'] = output_reference(output)
+        plan['request']['chat_request_options'] = {'temperature': 0, 'response_format': {
+            'type': 'json_schema', 'json_schema': {'strict': False}}}
+        original = deepcopy(plan)
+        payload = visual_rules_provider_payload(plan)
+        metadata = payload['chat_request_options']['response_format']['json_schema']
+        self.assertEqual(metadata['schema'], validate_data_structure_snapshot(plan['business_output']['data_structure']))
+        self.assertFalse(metadata['strict'])
+        self.assertEqual(plan, original)
+        plan.pop('business_output')
+        with self.assertRaisesMessage(ValidationError, '确切业务输出'):
+            visual_rules_provider_payload(plan)
+
+    def test_named_output_contract_drives_request_preview_and_finalizer_for_all_formats(self):
+        self.assert_named_output_contract({'continuity_summary': 'rules', 'color_script': 'palette',
+            'negative_prompt': 'avoid', 'camera_guidance': 'camera'})
+
+    def test_nested_output_contract_drives_request_preview_and_finalizer_for_all_formats(self):
+        self.assert_named_output_contract({'continuity_summary': 'visual.rules', 'color_script': 'visual.palette',
+            'negative_prompt': 'constraints.avoid', 'camera_guidance': 'visual.camera'})
+
+    def test_array_output_contract_drives_request_preview_and_finalizer_for_all_formats(self):
+        self.assert_named_output_contract({'continuity_summary': 'rules.0.summary', 'color_script': 'rules.1.palette',
+            'negative_prompt': 'rules.2.avoid', 'camera_guidance': 'rules.3.camera'})
+
+    def assert_named_output_contract(self, configured_keys):
+        from itertools import product
+        from studio.services.business_outputs import write_output, output_reference
+        from studio.tests.output_structure_fixtures import response_structure
+        from studio.services.visual_rules_output_contract import visual_rule_field_source_options
+        from studio.services.visual_rules_output_preview import preview_visual_rules_output
+        options = visual_rule_field_source_options()
+        self.assertEqual(set(configured_keys), {row['field'] for row in options})
+        # Optional outputs need both selected and absent cases. Every selected
+        # field must have an explicit response position in the same contract.
+        for choices in product(*(([None, *row['choices']] if row.get('optional') else row['choices']) for row in options)):
+            sources = {row['field']: choice['response_field'] for row, choice in zip(options, choices) if choice is not None}
+            keys = {field: configured_keys[field] for field in sources}
+            with self.subTest(sources=sources):
+                quality = {'schema_version': 1, 'negative_constraints_max_items': 0,
+                    **({'base_colors_max_items': 1} if sources['color_script'] == 'color_design' else {})}
+                output = write_output(actor=self.user, data={'name': 'Named output', 'parser_key': 'visual_rules.v2',
+                    'data_structure_version': response_structure(field_sources=sources, response_keys=keys).pk,
+                    'quality_advisories': quality, 'field_sources': sources, 'response_keys': keys})
+                output = write_output(actor=self.user, output_id=output.pk, expected_revision=1, action='publish')
+                plan = deepcopy(self.plan)
+                plan['business_output'] = output_reference(output)
+                plan['resource_estimate']['quality_advisories'] = quality
+                system = visual_rules_provider_payload(plan)['messages'][0]['content']
+                sample = output.parser_contract['response_example']
+                self.assertEqual(json.loads(system.split('CONTRACT=', 1)[1].split('\n', 1)[0]), sample)
+                self.assertIn(keys['continuity_summary'] + ' MUST', system)
+                self.assertIn(keys['negative_prompt'] + ' MUST', system)
+                if sources['color_script'] == 'color_design':
+                    enums = json.loads(system.split('OUTPUT_ENUMS=', 1)[1].split('\n', 1)[0])
+                    self.assertTrue(all(key.startswith(keys['color_script'] + '.') for key in enums))
+                else:
+                    self.assertIn(keys['color_script'] + ' MUST', system)
+                preview = preview_visual_rules_output(response_text=json.dumps(sample), field_sources=sources, response_keys=keys, quality_advisories=quality)
+                result = finalize_visual_rules(plan=plan, payload=sample)
+                self.assertEqual(preview['candidate'], result['candidate'])
+                self.assertEqual(result['business_output'], plan['business_output'])
+                self.assertEqual('camera_guidance' in result['candidate'], 'camera_guidance' in sources)
+                if 'camera_guidance' in sources:
+                    from studio.services.visual_rules_output_contract import visual_rule_response_value
+                    self.assertEqual(result['candidate']['camera_guidance'],
+                        visual_rule_response_value(sample, keys['camera_guidance']))
+                self.assertIn(keys['negative_prompt'], [row['field'] for row in result['advisory_audit']])
+                if sources['color_script'] == 'color_design':
+                    self.assertIn(keys['color_script'] + '.base_colors', [row['field'] for row in result['advisory_audit']])
+                with self.assertRaises(VisualRulesError):
+                    finalize_visual_rules(plan=plan, payload={**sample, 'continuity_summary': 'Not an alias.'})
+
+    def test_sample_preview_and_real_finalizer_parse_identically_without_bypassing_baseline(self):
+        from studio.services.visual_rules_output_preview import preview_visual_rules_output
+        from studio.services.visual_rules_output_contract import visual_rule_response_example
+        quality = {"schema_version": 1, "continuity_summary_max_chars": 1,
+            "recommended_negative_clauses": ["identity drift"]}
+        self.plan["resource_estimate"]["quality_advisories"] = quality
+        sample = visual_rule_response_example()
+        report = preview_visual_rules_output(response_text=json.dumps(sample), quality_advisories=quality)
+        result = finalize_visual_rules(plan=self.plan, payload=sample)
+        self.assertEqual(report["candidate"], result["candidate"])
+        self.assertEqual(report["warnings"], result["warnings"])
+        prompt = visual_rules_provider_payload(self.plan)["messages"][0]["content"]
+        self.assertEqual(json.loads(prompt.split("CONTRACT=", 1)[1].split("\nOUTPUT_ENUMS=", 1)[0]), sample)
+        self.plan["business_input_sha256"] = "0" * 64
+        with self.assertRaises(VisualRulesError):
+            finalize_visual_rules(plan=self.plan, payload=sample)
+
+    def test_output_editor_catalog_shares_validator_bounds_and_reviewed_readers(self):
+        from studio.services.production_visual_rules import visual_rules_output_editor_options, _normalize_visual_rules_quality_advisories
+        from studio.services.execution_source_readers import VISUAL_RULE_SOURCE_FIELDS
+        from studio.services.visual_rules_output_contract import visual_rule_field_source_options
+        from studio.platform_serializers import ModelProfileRegistryOptionsSerializer
+        from studio.services.model_profile_options import model_profile_registry_options
+        options = visual_rules_output_editor_options()
+        self.assertEqual(ModelProfileRegistryOptionsSerializer(model_profile_registry_options()).data['visual_rules_output'], options)
+        field_options = visual_rule_field_source_options()
+        self.assertEqual({row['source_selector'] for row in options['outputs']},
+            {'reviewed_visual_rules.' + row['field'] for row in field_options if not row.get('optional')})
+        self.assertEqual({'reviewed_visual_rules.' + row['field'] for row in field_options}, set(VISUAL_RULE_SOURCE_FIELDS))
+        self.assertEqual(options['color_choices']['base_colors'], list(COLOR_VALUES))
+        for key, choices in COLOR_DESIGN_CHOICES.items():
+            self.assertEqual(options['color_choices'][key], list(choices))
+        with patch('studio.services.production_visual_rules._provider_response_max_bytes', return_value=80):
+            bounded = visual_rules_output_editor_options()
+            self.assertEqual(bounded['clauses_max_bytes'], 80)
+            for row in bounded['number_fields']:
+                for valid in (row['minimum'], row['maximum']):
+                    self.assertEqual(_normalize_visual_rules_quality_advisories({'schema_version': 1, row['key']: valid})[row['key']], valid)
+                for invalid in (row['minimum'] - 1, row['maximum'] + 1, True):
+                    with self.assertRaises(ValidationError):
+                        _normalize_visual_rules_quality_advisories({'schema_version': 1, row['key']: invalid})
+
     def setUp(self):
         self.user, self.project, *_ = build_story("visual-rules-owner")
         self.project.production_settings = {
@@ -76,8 +185,7 @@ class ProductionVisualRulesContractTests(TestCase):
             ),
         )
         self.revision = confirm_script_revision(revision, user=self.user)
-        self.plan = build_visual_rules_plan(
-            revision=self.revision,
+        self.plan = configured_plan(
             project=SeriesProject.objects.select_related("style").get(pk=self.project.pk),
             model_identifier="fixture-model",
             policy={
@@ -89,12 +197,8 @@ class ProductionVisualRulesContractTests(TestCase):
         )
 
     def _payload(self):
-        source = self.plan["source_revision"]
         return {
-            "schema_version": 1,
-            "source_revision_id": source["id"],
-            "source_sha256": source["content_sha256"],
-            "source_size_bytes": source["content_size_bytes"],
+            "schema_version": 2,
             "color_design": {
                 "base_colors": ["charcoal", "green"],
                 "accent_color": "amber",
@@ -116,14 +220,39 @@ class ProductionVisualRulesContractTests(TestCase):
             ),
         }
 
-    def test_full_script_and_confirmed_bible_enter_frozen_request(self):
+    def test_only_configured_inputs_enter_request_not_script_bible_or_old_rules(self):
         provider_payload = visual_rules_provider_payload(self.plan)
         user_payload = json.loads(provider_payload["messages"][1]["content"])
-        self.assertEqual(self.revision.content, user_payload["source_text"])
-        context = self.plan["project_context"]
-        self.assertTrue(context["confirmed_bible"]["characters"])
-        self.assertTrue(context["confirmed_bible"]["scenes"])
-        self.assertEqual(len(context["confirmed_bible_sha256"]), 64)
+        self.assertEqual(set(user_payload), {"prompt_profile"})
+        rendered = json.dumps(provider_payload, ensure_ascii=False)
+        self.assertNotIn(self.revision.content, rendered)
+        self.assertNotIn(str(self.project.pk), rendered)
+        self.assertNotIn("costume drift", rendered)
+        self.assertNotIn("source_revision", rendered)
+        self.assertNotIn("confirmed_bible", rendered)
+        self.assertIn("Restrained cool realism.", rendered)
+
+    def test_profile_snapshot_remains_in_plan_not_duplicated_in_provider_messages(self):
+        assembly = self.plan["prompt_profile_assembly"]
+        assembly["channels"].update(system_instruction="REVIEWED_STYLE_GUARD", negative_prompt="NO_UNIQUE_DEFECT")
+        assembly["structured_fields"] = {
+            "theme": assembly["channels"]["positive_prompt"],
+            "system_guidance": "REVIEWED_STYLE_GUARD", "negative": "NO_UNIQUE_DEFECT",
+        }
+        original = deepcopy(assembly)
+        payload = visual_rules_provider_payload(self.plan)
+        user = json.loads(payload["messages"][1]["content"])
+        self.assertEqual(set(user["prompt_profile"]), {"positive_prompt", "negative_prompt"})
+        for text in original["structured_fields"].values():
+            self.assertEqual(sum(message["content"].count(text) for message in payload["messages"]), 1)
+        self.assertNotIn("REVIEWED_STYLE_GUARD", payload["messages"][1]["content"])
+        self.assertEqual(self.plan["prompt_profile_assembly"], original)
+
+    def test_field_snapshot_cannot_replace_missing_positive_channel(self):
+        self.plan["prompt_profile_assembly"] = {"channels": {"system_instruction": "rules"},
+            "structured_fields": {"theme": "must be rendered"}}
+        with self.assertRaisesRegex(VisualRulesError, "缺少已配置的实际输入"):
+            visual_rules_provider_payload(self.plan)
 
     def test_provider_prompt_keeps_structure_hard_without_hidden_length_advisories(self):
         provider_payload = visual_rules_provider_payload(self.plan)
@@ -152,15 +281,13 @@ class ProductionVisualRulesContractTests(TestCase):
         self.assertNotIn("QUALITY_ADVISORIES=", system)
 
     def test_model_chat_options_and_advisory_thresholds_are_frozen_not_hardcoded(self):
-        plan = build_visual_rules_plan(
-            revision=self.revision,
+        plan = configured_plan(
             project=SeriesProject.objects.select_related("style").get(pk=self.project.pk),
             model_identifier="fixture-model",
             policy={
                 "max_input_bytes": 64_000,
                 "input_byte_warning_threshold": 1,
                 "max_output_tokens": 131_072,
-                "output_token_warning_threshold": 32_768,
                 "timeout_seconds": 600,
                 "chat_request_options": _visual_chat_request_options(
                     thinking={"type": "disabled"},
@@ -174,13 +301,10 @@ class ProductionVisualRulesContractTests(TestCase):
             provider_payload["chat_request_options"],
             _visual_chat_request_options(thinking={"type": "disabled"}),
         )
-        self.assertEqual(
-            plan["resource_estimate"]["output_token_warning_threshold"],
-            32_768,
-        )
+        self.assertNotIn("output_token_warning_threshold", plan["resource_estimate"])
         frozen = finalize_visual_rules(plan=plan, payload=self._payload())
         self.assertIn(
-            "仍使用完整正文生成",
+            "本次未截断",
             " ".join(frozen["warnings"]),
         )
 
@@ -197,8 +321,7 @@ class ProductionVisualRulesContractTests(TestCase):
             "negative_prompt_max_chars": 10,
             "color_script_max_chars": 10,
         }
-        plan = build_visual_rules_plan(
-            revision=self.revision,
+        plan = configured_plan(
             project=SeriesProject.objects.select_related("style").get(pk=self.project.pk),
             model_identifier="fixture-model",
             policy={
@@ -290,127 +413,6 @@ class ProductionVisualRulesContractTests(TestCase):
             ),
         )
 
-    def test_fallback_rebuild_freezes_selected_profile_quality_policy(self):
-        quality_advisories = {
-            "schema_version": 1,
-            "negative_constraints_max_items": 32,
-            "recommended_negative_clauses": list(
-                RECOMMENDED_NEGATIVE_CLAUSES,
-            ),
-        }
-        policy = {
-            "max_input_bytes": 64_000,
-            "max_output_tokens": 2_048,
-            "timeout_seconds": 45,
-            "chat_request_options": _visual_chat_request_options(),
-            "quality_advisories": quality_advisories,
-        }
-        profile_version = SimpleNamespace(model_identifier="fallback-model")
-        deployment = SimpleNamespace(profile_version=profile_version)
-        live_deployment = SimpleNamespace(profile_version=profile_version)
-        run = SimpleNamespace(
-            script_revision=self.revision,
-            stages=MagicMock(),
-            project_id=self.project.id,
-            input_snapshot={},
-            generation_task_count=0,
-            max_generation_tasks=10,
-            save=MagicMock(),
-        )
-        run.stages.filter.return_value.first.return_value = object()
-        resolved_profile = SimpleNamespace(
-            profile_version=SimpleNamespace(contract_sha256="a" * 64),
-            binding=SimpleNamespace(key="fixture-visual-rules-binding"),
-        )
-        route = {
-            "index": 1,
-            "model_deployment_id": "11111111-1111-1111-1111-111111111111",
-            "is_external": True,
-        }
-        select_related = MagicMock()
-        select_related.get.return_value = live_deployment
-        current_context = {
-            "rules_sha256": self.plan["project_context"]["current_rules_sha256"],
-            "bible_sha256": self.plan["project_context"]["confirmed_bible_sha256"],
-        }
-
-        with (
-            patch(
-                "studio.services.production_runs.ModelDeployment.objects.select_related",
-                return_value=select_related,
-            ),
-            patch(
-                "studio.services.production_runs.frozen_text_deployment",
-                return_value=deployment,
-            ),
-            patch(
-                "studio.services.production_runs.deployment_supports_script_generation",
-                return_value=True,
-            ),
-            patch(
-                "studio.services.production_runs._route_with_revalidated_text_smoke",
-                return_value=route,
-            ),
-            patch("studio.services.production_runs.verify_visual_rules_smoke"),
-            patch(
-                "studio.services.production_runs.validate_visual_rules_model_profile",
-                return_value=policy,
-            ),
-            patch(
-                "studio.services.production_runs.SeriesProject.objects.select_related",
-            ) as project_query,
-            patch(
-                "studio.services.production_runs.current_visual_context_snapshot",
-                return_value=current_context,
-            ),
-            patch(
-                "studio.services.production_runs.require_prompt_profile_binding",
-                return_value=resolved_profile,
-            ),
-            patch(
-                "studio.services.production_runs."
-                "validate_frozen_prompt_profile_binding_reference",
-            ),
-            patch(
-                "studio.services.production_runs.model_family_for_profile",
-                return_value="fixture-family",
-            ),
-            patch(
-                "studio.services.production_runs.text_profile_sources",
-                return_value={},
-            ),
-            patch(
-                "studio.services.production_runs.assemble_prompt_profile",
-                return_value={"channels": {}, "structured_fields": {}},
-            ),
-            patch(
-                "studio.services.production_runs.visual_rules_provider_payload",
-                return_value={"messages": []},
-            ),
-            patch(
-                "studio.services.production_runs.GenerationAttempt.objects.create",
-                side_effect=lambda **kwargs: SimpleNamespace(**kwargs),
-            ),
-            patch("studio.services.production_runs._estimate_and_reserve"),
-            patch("studio.services.production_runs._mark_route_selected"),
-        ):
-            project_query.return_value.get.return_value = self.project
-            attempt = _queue_visual_rules_attempt_for_route(
-                run,
-                MagicMock(),
-                route=route,
-                attempt_number=2,
-                reason="ordered_fallback",
-                frozen_plan=self.plan,
-            )
-
-        frozen_estimate = attempt.request_snapshot["plan"]["resource_estimate"]
-        self.assertEqual(
-            frozen_estimate["quality_advisories"],
-            quality_advisories,
-        )
-        self.assertEqual(frozen_estimate["configured_output_token_hint"], 2_048)
-
     def test_duplicate_negative_constraints_remain_a_hard_uniqueness_error(self):
         payload = self._payload()
         payload["negative_constraints"] = ["compression banding", "Compression Banding"]
@@ -426,7 +428,6 @@ class ProductionVisualRulesContractTests(TestCase):
             "capabilities": ["visual_rules.generate"],
             "visual_rules": {
                 "max_input_bytes": 64_000,
-                "max_output_tokens": 1_024,
                 "timeout_seconds": 30,
                 "chat_request_options": _visual_chat_request_options(),
                 "quality_advisories": {
@@ -514,7 +515,7 @@ class ProductionVisualRulesContractTests(TestCase):
             validate_visual_rules_model_profile(profile)
 
     def test_response_schema_version_and_source_size_require_exact_integer_types(self):
-        for field in ("schema_version", "source_size_bytes"):
+        for field in ("schema_version",):
             payload = self._payload()
             payload[field] = True
             with self.subTest(field=field), self.assertRaises(VisualRulesError) as captured:
@@ -528,7 +529,7 @@ class ProductionVisualRulesContractTests(TestCase):
             "negative_prompt", "color_script", "continuity_summary",
         })
         negative = frozen["candidate"]["negative_prompt"].casefold()
-        self.assertIn("costume drift", negative)
+        self.assertNotIn("costume drift", negative)
         self.assertIn("anachronistic props", negative)
         self.assertNotIn("identity drift", negative)
         self.assertIn("charcoal", frozen["candidate"]["color_script"])
@@ -542,7 +543,7 @@ class ProductionVisualRulesContractTests(TestCase):
 
         self.assertEqual(frozen["kind"], "visual_rules_candidates")
         negative = frozen["candidate"]["negative_prompt"].casefold()
-        self.assertEqual(negative, "costume drift")
+        self.assertEqual(negative, "")
 
     def test_review_atomically_applies_rules_and_preserves_other_settings(self):
         frozen = finalize_visual_rules(plan=self.plan, payload=self._payload())
@@ -550,7 +551,6 @@ class ProductionVisualRulesContractTests(TestCase):
         reviewed["continuity_summary"] += " Preserve eyeline continuity."
         evidence = apply_visual_rules_candidate(
             project=self.project,
-            revision=self.revision,
             frozen=frozen,
             reviewed_rules=reviewed,
         )
@@ -568,20 +568,14 @@ class ProductionVisualRulesContractTests(TestCase):
         self.assertEqual(evidence["modified_fields"], ["continuity_summary"])
         self.assertEqual(evidence["advisories"], [])
 
-    def test_bible_drift_rejects_old_candidate_without_writing(self):
+    def test_unselected_bible_change_does_not_invalidate_candidate(self):
         frozen = finalize_visual_rules(plan=self.plan, payload=self._payload())
         character = CharacterBible.objects.get(project=self.project)
         character.wardrobe = "白色风衣"
         character.save(update_fields=("wardrobe", "updated_at"))
-        with self.assertRaises(VisualRulesConflict):
-            apply_visual_rules_candidate(
-                project=self.project,
-                revision=self.revision,
-                frozen=frozen,
-                reviewed_rules=frozen["candidate"],
-            )
+        apply_visual_rules_candidate(project=self.project, frozen=frozen, reviewed_rules=frozen["candidate"])
         self.project.refresh_from_db()
-        self.assertEqual(self.project.continuity_summary, "")
+        self.assertEqual(self.project.continuity_summary, frozen["candidate"]["continuity_summary"])
 
     def test_review_can_remove_recommended_negative_clauses(self):
         reviewed = validate_reviewed_rules({
@@ -628,7 +622,6 @@ class ProductionVisualRulesContractTests(TestCase):
 
         evidence = apply_visual_rules_candidate(
             project=self.project,
-            revision=self.revision,
             frozen=frozen,
             reviewed_rules=reviewed,
         )
@@ -656,7 +649,6 @@ class ProductionVisualRulesContractTests(TestCase):
 
         evidence = apply_visual_rules_candidate(
             project=self.project,
-            revision=self.revision,
             frozen=frozen,
             reviewed_rules=reviewed,
         )
@@ -683,279 +675,7 @@ class ProductionVisualRulesContractTests(TestCase):
         self.assertEqual(captured.exception.code, "negative_constraint_delimiter_invalid")
 
 
-class VisualRulesTextContractRetryTests(TestCase):
-    """Regression coverage for finite, audit-bound visual-rules retries."""
-
-    def setUp(self):
-        self.user, self.project, *_ = build_story("visual-rules-contract-retry")
-        self.recipe = ProductionRecipeVersion(
-            recipe_key="visual-rules-contract-retry",
-            version=1,
-            name="Visual rules contract retry",
-            status=ProductionRecipeVersion.Status.PUBLISHED,
-        )
-        assign_json_contract(self.recipe, "definition", {"schema_version": 1})
-        self.recipe.save()
-
-        empty = json_contract({"schema_version": 1})
-        self.run = ProductionRun.objects.create(
-            owner=self.user,
-            project=self.project,
-            recipe_version=self.recipe,
-            idempotency_key="visual-rules-contract-retry-run",
-            request_sha256="a" * 64,
-            status=ProductionRun.Status.RUNNING,
-            allow_external_calls=True,
-            max_generation_tasks=10,
-            config_snapshot=empty.value,
-            config_snapshot_schema_version=empty.schema_version,
-            config_snapshot_size_bytes=empty.size_bytes,
-            config_snapshot_sha256=empty.sha256,
-            input_snapshot=empty.value,
-            input_snapshot_schema_version=empty.schema_version,
-            input_snapshot_size_bytes=empty.size_bytes,
-            input_snapshot_sha256=empty.sha256,
-        )
-        self.route = {
-            "index": 0,
-            "model_deployment_id": "11111111-1111-1111-1111-111111111111",
-            "is_external": True,
-        }
-        routing = json_contract({
-            "schema_version": 1,
-            "mode": "fixed",
-            "routes": [self.route],
-            "variant_count": 1,
-            "evaluator": None,
-        })
-        frozen_config = json_contract({
-            "schema_version": 1,
-            "base": {
-                "values": {"production.text_contract_retry_limit": 2},
-            },
-            "routes": {
-                "0": {
-                    "values": {"production.text_contract_retry_limit": 2},
-                },
-            },
-        })
-        self.stage = StageRun.objects.create(
-            production_run=self.run,
-            stage_key="visual_rules_generate",
-            ordinal=1,
-            mode="ai",
-            status=StageRun.Status.RUNNING,
-            idempotency_key=f"{self.run.id}:1:visual_rules_generate",
-            routing=routing.value,
-            routing_schema_version=routing.schema_version,
-            routing_size_bytes=routing.size_bytes,
-            routing_sha256=routing.sha256,
-            routing_decision=empty.value,
-            routing_decision_schema_version=empty.schema_version,
-            routing_decision_size_bytes=empty.size_bytes,
-            routing_decision_sha256=empty.sha256,
-            config_snapshot=frozen_config.value,
-            config_snapshot_schema_version=frozen_config.schema_version,
-            config_snapshot_size_bytes=frozen_config.size_bytes,
-            config_snapshot_sha256=frozen_config.sha256,
-            input_snapshot=empty.value,
-            input_snapshot_schema_version=empty.schema_version,
-            input_snapshot_size_bytes=empty.size_bytes,
-            input_snapshot_sha256=empty.sha256,
-            output_snapshot=empty.value,
-            output_snapshot_schema_version=empty.schema_version,
-            output_snapshot_size_bytes=empty.size_bytes,
-            output_snapshot_sha256=empty.sha256,
-            selected_route_index=0,
-        )
-        self.frozen_plan = {
-            "schema_version": 1,
-            "source_revision": {"id": "frozen-script"},
-            "project_context": {"confirmed_bible_sha256": "b" * 64},
-            "request": {"source_text": "frozen full script"},
-        }
-
-    def _failed_attempt(
-        self,
-        attempt_number: int,
-        *,
-        classifier: str = "response_output_budget_exhausted",
-        finish_reason: str = "length",
-    ) -> tuple[GenerationAttempt, GenerationAttemptResolution]:
-        snapshot = json_contract({
-            "schema_version": 1,
-            "plan": self.frozen_plan,
-            "route": self.route,
-        })
-        attempt = GenerationAttempt.objects.create(
-            stage_run=self.stage,
-            unit_key=VISUAL_RULES_UNIT_KEY,
-            attempt_number=attempt_number,
-            status=GenerationAttempt.Status.FAILED,
-            route_index=0,
-            operation=VISUAL_RULES_OPERATION,
-            is_external=True,
-            request_sha256=snapshot.sha256,
-            request_snapshot=snapshot.value,
-            request_snapshot_schema_version=snapshot.schema_version,
-            request_snapshot_size_bytes=snapshot.size_bytes,
-            request_snapshot_sha256=snapshot.sha256,
-            error_code="provider_response_invalid",
-            error_message="safe provider response rejection",
-        )
-        evidence = json_contract({
-            "schema_version": 1,
-            "attempt_id": str(attempt.id),
-            "request_sha256": attempt.request_sha256,
-            "failure_code": attempt.error_code,
-            "contract_error_code": classifier,
-            "finish_reason": finish_reason,
-        })
-        resolution = GenerationAttemptResolution.objects.create(
-            attempt=attempt,
-            revision=1,
-            outcome=(
-                GenerationAttemptResolution.Outcome.KNOWN_RESPONSE_REJECTED
-            ),
-            evidence=evidence.value,
-            evidence_schema_version=evidence.schema_version,
-            evidence_size_bytes=evidence.size_bytes,
-            evidence_sha256=evidence.sha256,
-        )
-        return attempt, resolution
-
-    def test_budget_exhaustion_queues_same_fixed_route_with_audit_bound_retry(self):
-        first, resolution = self._failed_attempt(1)
-
-        with patch(
-            "studio.services.production_runs._queue_visual_rules_attempt_for_route",
-        ) as queue_retry:
-            result = _prepare_visual_rules(self.run, self.stage)
-
-        self.assertIsNone(result)
-        queue_retry.assert_called_once()
-        args, kwargs = queue_retry.call_args
-        self.assertEqual(args, (self.run, self.stage))
-        self.assertEqual(kwargs["route"], self.route)
-        self.assertEqual(kwargs["attempt_number"], 2)
-        self.assertEqual(kwargs["reason"], "known_text_contract_retry")
-        self.assertEqual(kwargs["frozen_plan"], self.frozen_plan)
-        self.assertEqual(kwargs["retry_contract"], {
-            "schema_version": 1,
-            "config_key": "production.text_contract_retry_limit",
-            "retry_limit": 2,
-            "max_attempts": 3,
-            "attempts_used": 1,
-            "repair_of_attempt_id": str(first.id),
-            "contract_error_code": "response_output_budget_exhausted",
-            "resolution_id": str(resolution.id),
-            "resolution_evidence_sha256": resolution.evidence_sha256,
-        })
-        route_event = self.stage.route_events.get()
-        self.assertEqual(route_event.event_type, "known_text_contract_retry_queued")
-        self.assertEqual(route_event.route_index, 0)
-        self.assertEqual(route_event.code, "response_output_budget_exhausted")
-
-    def test_second_known_rejection_queues_final_allowed_attempt(self):
-        self._failed_attempt(1)
-        second, resolution = self._failed_attempt(2)
-
-        with patch(
-            "studio.services.production_runs._queue_visual_rules_attempt_for_route",
-        ) as queue_retry:
-            result = _prepare_visual_rules(self.run, self.stage)
-
-        self.assertIsNone(result)
-        queue_retry.assert_called_once()
-        retry_call = queue_retry.call_args.kwargs
-        self.assertEqual(retry_call["attempt_number"], 3)
-        self.assertEqual(retry_call["route"], self.route)
-        self.assertEqual(retry_call["frozen_plan"], self.frozen_plan)
-        self.assertEqual(retry_call["retry_contract"]["attempts_used"], 2)
-        self.assertEqual(
-            retry_call["retry_contract"]["repair_of_attempt_id"],
-            str(second.id),
-        )
-        self.assertEqual(
-            retry_call["retry_contract"]["resolution_id"],
-            str(resolution.id),
-        )
-        self.assertEqual(
-            retry_call["retry_contract"]["resolution_evidence_sha256"],
-            resolution.evidence_sha256,
-        )
-
-    def test_third_known_rejection_stops_without_queue_and_requires_human(self):
-        self._failed_attempt(1)
-        self._failed_attempt(2)
-        self._failed_attempt(3)
-
-        with (
-            patch(
-                "studio.services.production_runs._queue_visual_rules_attempt_for_route",
-            ) as queue_retry,
-            self.assertRaises(StageBlocked) as captured,
-        ):
-            _prepare_visual_rules(self.run, self.stage)
-
-        self.assertEqual(
-            captured.exception.code,
-            "text_contract_human_confirmation_required",
-        )
-        self.assertIn("首次调用 + 2 次自动重试", str(captured.exception))
-        queue_retry.assert_not_called()
-        self.assertFalse(self.stage.route_events.exists())
-
-    def test_content_filter_never_auto_retries_and_requires_human(self):
-        self._failed_attempt(
-            1,
-            classifier="response_content_filtered",
-            finish_reason="content_filter",
-        )
-
-        with (
-            patch(
-                "studio.services.production_runs._queue_visual_rules_attempt_for_route",
-            ) as queue_retry,
-            self.assertRaises(StageBlocked) as captured,
-        ):
-            _prepare_visual_rules(self.run, self.stage)
-
-        self.assertEqual(
-            captured.exception.code,
-            "text_contract_human_confirmation_required",
-        )
-        self.assertIn("内容过滤", str(captured.exception))
-        queue_retry.assert_not_called()
-        self.assertFalse(self.stage.route_events.exists())
-
-
-class VisualRulesSmokeFailureEvidenceTests(TestCase):
-    def setUp(self):
-        self.plan = build_visual_rules_smoke_plan(
-            model_identifier="fixture-model",
-            policy={
-                "max_input_bytes": 64_000,
-                "max_output_tokens": 2_048,
-                "timeout_seconds": 30,
-                "chat_request_options": _visual_chat_request_options(),
-            },
-        )
-        self.request_snapshot = {
-            "payload": visual_rules_provider_payload(self.plan),
-            "plan": self.plan,
-            "plan_sha256": json_contract(self.plan).sha256,
-        }
-        self.deployment = SimpleNamespace(provider=object())
-
-    def test_smoke_uses_full_published_output_budget(self):
-        self.assertEqual(self.plan["request"]["max_output_tokens"], 2_048)
-        self.assertEqual(
-            self.plan["resource_estimate"]["configured_output_token_hint"],
-            2_048,
-        )
-        self.assertEqual(self.request_snapshot["payload"]["max_tokens"], 2_048)
-
+class ChatCompletionResponseDiagnosticsTests(TestCase):
     def test_empty_length_response_has_safe_budget_classifier(self):
         deployment = SimpleNamespace(
             profile_version=SimpleNamespace(model_identifier="fixture-model"),
@@ -1060,124 +780,3 @@ class VisualRulesSmokeFailureEvidenceTests(TestCase):
             "provider-authored secret reasoning",
             json.dumps(captured.exception.metadata),
         )
-
-    def test_driver_reason_is_persisted_as_safe_code_without_message(self):
-        failure = ProviderDriverError(
-            "provider raw response TOP-SECRET",
-            code="provider_response_invalid",
-            submission_uncertain=False,
-        )
-        failure.metadata = {"contract_error_code": "response_missing_text"}
-        driver = SimpleNamespace(invoke=lambda *_args: (_ for _ in ()).throw(failure))
-
-        with patch("studio.services.deployment_smoke.driver_for", return_value=driver):
-            result = execute_visual_rules_smoke_request(
-                self.deployment,
-                self.request_snapshot,
-            )
-
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["evidence"]["contract_error_code"], "response_missing_text")
-        persisted = json.dumps(result, ensure_ascii=False)
-        self.assertNotIn("TOP-SECRET", persisted)
-        self.assertNotIn("provider raw response", persisted)
-
-    def test_invalid_enum_records_exact_safe_contract_reason_without_response(self):
-        response_payload = {
-            "schema_version": 1,
-            "source_revision_id": self.plan["source_revision"]["id"],
-            "source_sha256": self.plan["source_revision"]["content_sha256"],
-            "source_size_bytes": self.plan["source_revision"]["content_size_bytes"],
-            "color_design": {
-                "base_colors": ["teal", "slate"],
-                "accent_color": "provider-secret-purple",
-                "palette_relation": "cinematic",
-                "lighting": "soft_diffuse",
-                "contrast": "restrained",
-                "saturation": "muted",
-                "exposure": "balanced",
-                "progression": "stable",
-                "preserve_natural_skin_exposure": True,
-            },
-            "negative_constraints": ["identity drift"],
-            "continuity_summary": "Keep the frozen visual identities consistent.",
-        }
-        driver = SimpleNamespace(invoke=lambda *_args: {
-            "schema_version": 1,
-            "request_id": "provider-secret-request-id",
-            "text": json.dumps(response_payload),
-            "usage": {},
-        })
-
-        with patch("studio.services.deployment_smoke.driver_for", return_value=driver):
-            result = execute_visual_rules_smoke_request(
-                self.deployment,
-                self.request_snapshot,
-            )
-
-        self.assertEqual(result["status"], "failed")
-        self.assertEqual(result["error_code"], "visual_rules_response_invalid")
-        self.assertEqual(result["evidence"]["contract_error_code"], "color_design_enum_invalid")
-        persisted = json.dumps(result, ensure_ascii=False)
-        self.assertNotIn("provider-secret-purple", persisted)
-        self.assertNotIn("provider-secret-request-id", persisted)
-
-    def test_invalid_continuity_text_records_field_specific_safe_reason(self):
-        response_payload = {
-            "schema_version": 1,
-            "source_revision_id": self.plan["source_revision"]["id"],
-            "source_sha256": self.plan["source_revision"]["content_sha256"],
-            "source_size_bytes": self.plan["source_revision"]["content_size_bytes"],
-            "color_design": {
-                "base_colors": ["teal", "slate"],
-                "accent_color": "amber",
-                "palette_relation": "cinematic",
-                "lighting": "soft_diffuse",
-                "contrast": "restrained",
-                "saturation": "muted",
-                "exposure": "balanced",
-                "progression": "stable",
-                "preserve_natural_skin_exposure": True,
-            },
-            "negative_constraints": ["identity drift"],
-            "continuity_summary": "<script>provider-secret</script>",
-        }
-        driver = SimpleNamespace(invoke=lambda *_args: {
-            "schema_version": 1,
-            "request_id": "",
-            "text": json.dumps(response_payload),
-            "usage": {},
-        })
-
-        with patch("studio.services.deployment_smoke.driver_for", return_value=driver):
-            result = execute_visual_rules_smoke_request(
-                self.deployment,
-                self.request_snapshot,
-            )
-
-        self.assertEqual(
-            result["evidence"]["contract_error_code"],
-            "continuity_summary_text_invalid",
-        )
-        self.assertNotIn("provider-secret", json.dumps(result))
-
-    def test_untrusted_driver_metadata_cannot_enter_failure_evidence(self):
-        failure = ProviderDriverError(
-            "rejected",
-            code="provider_response_invalid",
-            submission_uncertain=False,
-        )
-        failure.metadata = {"contract_error_code": "secret=value from raw response"}
-        driver = SimpleNamespace(invoke=lambda *_args: (_ for _ in ()).throw(failure))
-
-        with patch("studio.services.deployment_smoke.driver_for", return_value=driver):
-            result = execute_visual_rules_smoke_request(
-                self.deployment,
-                self.request_snapshot,
-            )
-
-        self.assertEqual(
-            result["evidence"]["contract_error_code"],
-            "provider_contract_validation_failed",
-        )
-        self.assertNotIn("secret=value", json.dumps(result))

@@ -1,5 +1,7 @@
 # MVP Requirements
 
+本文是产品范围与验收目标，不代表全部能力已完成真实验证。当前未完事项、合并归属与范围决策只在[最新待办复核清单](optimization/backlog-review-2026-09-28.md)维护；详细设计及日期化证据见[执行计划](optimization/execution-instance-unification-plan.md)，不能据旧记录推导当前部署通过。
+
 ## 产品目标
 
 MVP 为单人或早期团队提供一条可追踪、可审核、失败可恢复的逐集媒体生产链路。验收对象是 ProductionRun、受管产物、逐集母版和 ReleaseBundle，不是某个固定模型、固定节点 ID 或单台 GPU。
@@ -23,9 +25,11 @@ MVP 为单人或早期团队提供一条可追踪、可审核、失败可恢复�
 6. 每个 episode 生成独立 master。
 7. ReleaseBundle 聚合并验证逐集母版。
 
-Task、DeferredGenerationRequest、Assembly、ReleaseBundle 只用于完全只读诊断。创建、重试、取消与有序 fallback 只允许通过所属 ProductionRun，不存在任务级例外。
+短剧创建、重试、取消和有序fallback归属ProductionRun；Task、Assembly与ReleaseBundle提供其结果/证据入口。独立素材生成及分发副本恢复沿各自正式入口处理，不据此建立第二个短剧生产入口；旧DeferredGenerationRequest业务入口已撤下。
 
 可发布 ProductionRecipe 必须包含唯一正式 content 入口，以及完整有序的 content → storyboard → prompt → media → selection → assembly → delivery 闭包。
+
+无配方人工制作同样使用ProductionRun与冻结RunPlan，不要求隐藏Recipe。预算、调用次数及平台输出额度统一由系统配置管理，超额进入人工确认而非直接终态失败；外发授权、未知费用、安全、真实模型能力和结构合同不能由额度确认绕过。
 
 ## 工作流与执行器
 

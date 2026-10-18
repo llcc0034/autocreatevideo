@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>隔离分镜内容保存与选材导航</title></head>
+<body><div id="app"></div><script type="module">
+import {createApp, h, ref} from 'vue'
+import {createPinia} from 'pinia'
+import {createRouter, createMemoryHistory, RouterView} from 'vue-router'
+import Storyboard from '/src/views/StoryboardView.vue'
+import {useStudioStore} from '/src/stores/studio.ts'
+import {adaptShot, shotPersistencePayload} from '/src/services/backendAdapters.ts'
+import {repository} from '/src/services/repository.ts'
+import {api} from '/src/services/api.ts'
+import {shotSourceFieldsApi} from '/src/services/shotSourceFieldsApi.ts'
+import {shotFieldRevisionsApi} from '/src/services/shotFieldRevisionsApi.ts'
+import '/src/styles.css'
+import '/src/series.css'
+import '/src/storyboard.css'
+import '/src/responsive.css'
+import '/src/platform.css'
+const id=n=>`20000000-0000-4000-8000-${String(n).padStart(12,'0')}`
+const fail=ref(false), result=ref('未保存'), notice=ref(''), blockedRequests=ref(0)
+const sourceFailure=ref(false), sourceReads=ref(0)
+shotSourceFieldsApi.read=async shotId=>{
+  sourceReads.value++
+  if(sourceFailure.value)throw new Error('隔离来源冲突：原文档已变化，不能改读当前版本。')
+  return {source:{shot_id:shotId,structure_id:id(20),stage_id:id(21),episode_number:4,shot_number:8,
+    document_sha256:'a'.repeat(64),materialization_sha256:'b'.repeat(64)},fields:[
+    ['mood_note','情绪描述','  门后传来轻声，保持原文与空格。\n第二行。  '],['empty_note','空文本',''],
+    ['optional_note','空值',null],['intensity','强度',0],['visible','是否可见',false],
+    ['custom_detail','自定义集合',{lens:'主观视角',cues:[null,false,0]}],['missing_note','缺失字段'],
+    ['default_note','配置默认值','环境安静']].map(([key,label,...values],i)=>({
+      structure_version_id:id(22),node_key:key,field_definition:{field_definition_id:id(30+i),field_definition_version_id:id(40+i),key,label,version:2},
+      source_path:`source.scenes[0].shots[0].${key}`,value_path:['scenes',0,'shots',0,key],present:values.length>0,
+      source_present:values.length>0 && key!=='default_note',default_paths:key==='default_note'?[`source.scenes[0].shots[0].${key}`]:[],
+      ...(values.length?{value:values[0]}:{})}))}
+}
+api.interceptors.request.use(()=>{blockedRequests.value++;throw new Error('隔离夹具禁止真实业务API')})
+const fieldWrites=ref(0), loseReceipt=ref(false), fieldHistory=[], fieldReceipts=new Map()
+const valueSchema=value=>value===null?{anyOf:[{type:'string'},{type:'null'}]}:Array.isArray(value)?{type:'array',items:{}}:typeof value==='object'?{type:'object'}:{type:typeof value}
+const initialFields=async()=>{const original=await shotSourceFieldsApi.read(id(3));return{source:original.source,source_sha256:'c'.repeat(64),revision:null,
+  fields:original.fields.map(row=>({original:row,schema:valueSchema(row.value===undefined?'':row.value),overridden:false,present:row.present,...(row.present?{value:row.value}:{})}))}}
+shotFieldRevisionsApi.read=async(_shotId,revisionId)=>{
+  if(sourceFailure.value)throw new Error('隔离修订读取失败，不能显示旧成功。')
+  return structuredClone(revisionId?fieldHistory.find(row=>row.revision.id===revisionId):fieldHistory.at(-1)||await initialFields())
+}
+shotFieldRevisionsApi.write=async(_shotId,request)=>{
+  const raw=JSON.parse(JSON.stringify(request))
+  if(fieldReceipts.has(raw.request_id))return{detail:structuredClone(fieldReceipts.get(raw.request_id)),replayed:true}
+  const detail=await shotFieldRevisionsApi.read(id(3))
+  if(raw.expected_revision_id!==(detail.revision?.id||null))throw{response:{status:409,data:{error:{message:'隔离并发修订冲突'}}}}
+  const field=detail.fields.find(row=>row.original.node_key===raw.node_key)
+  if(raw.operation==='set'){field.value=raw.value;field.present=true;field.overridden=true}
+  else{field.overridden=false;field.present=field.original.present;if(field.present)field.value=field.original.value;else delete field.value}
+  detail.revision={id:id(100+fieldHistory.length),revision:fieldHistory.length+1,previous_id:detail.revision?.id||null,
+    source_sha256:'c'.repeat(64),content_sha256:'d'.repeat(64),created_by:1,created_at:new Date().toISOString()}
+  fieldHistory.push(structuredClone(detail));fieldReceipts.set(raw.request_id,structuredClone(detail));fieldWrites.value++
+  if(loseReceipt.value){loseReceipt.value=false;throw new Error('隔离模拟：服务端已保存，但回执未到达')}
+  return{detail,replayed:false}
+}
+const shot=adaptShot({id:id(3),number:1,title:'隔离镜头',media_type:'video',duration_ms:6000,
+  include_audio:true,episode_start_ms:1200,episode_end_ms:7200,dialogue:[{speaker_id:'S2',text:'  门后传来声音。  ',delivery:' softly ',voiceover:true,start_ms:123,end_ms:987}],
+  character_relations:[{role:'visible',position:0,character_id:id(4)},{role:'speaker',position:0,character_id:id(5)}],props:[]})
+const episode={id:id(2),number:1,title:'隔离试用集',status:'draft',audioEnabled:true,shots:[shot],shotVersions:[]}
+const project={id:id(1),title:'隔离项目（不访问数据库）',aspectRatio:'9:16',episodes:[episode],translationGlossary:[],
+  bible:{characters:[{id:id(4),name:'门内人物',stableSpeakerId:'S1'},{id:id(5),name:'门外声音',stableSpeakerId:'S2'}],scenes:[],props:[],colorScript:'',negativePrompt:''}}
+const pinia=createPinia(), studio=useStudioStore(pinia)
+studio.initialize=async()=>{}
+studio.loadProject=async()=>structuredClone(project)
+studio.refreshAssets=async()=>{}
+studio.notify=(message)=>{notice.value=message}
+studio.saveEpisode=async(p,e)=>{
+  const payloads=e.shots.map(s=>shotPersistencePayload(p,s))
+  if(fail.value)throw new Error('隔离保存失败（未写入）')
+  notice.value='隔离保存已恢复（仅内存回执）'
+  result.value=JSON.stringify(payloads,null,2)
+  return JSON.parse(JSON.stringify(e))
+}
+repository.getProjectTranslations=async()=>[]
+repository.getProductionCapability=async()=>({videoShotMinDurationMs:1000,videoShotMaxDurationMs:15000,
+  scriptBreakdownDefaultShotDurationMs:6000,scriptBreakdownDefaultFirstFrameContinuity:false,scriptBreakdownDefaultLastFrameContinuity:false,
+  creationDefaults:{defaultShotMediaType:'video',defaultIncludeAudio:true}})
+const router=createRouter({history:createMemoryHistory(),routes:[
+  {path:'/projects/:projectId/episodes/:episodeId/storyboard',component:Storyboard},
+  {path:'/projects/:projectId/production',component:{render:()=>h('p',{id:'destination'},'隔离生产工作台入口：仅验证导航，不创建运行、不调用模型。')}}
+]})
+await router.push(`/projects/${id(1)}/episodes/${id(2)}/storyboard`)
+await router.isReady()
+createApp({setup:()=>()=>h('div',[
+  h('section',{style:'padding:12px;overflow-wrap:anywhere'},[
+    h('strong','隔离夹具：正式分镜页面 + 正式保存适配器；仅内存回执，不操作业务数据。'),
+    h('button',{onClick:()=>fail.value=!fail.value},fail.value?'恢复隔离保存':'模拟保存失败'),
+    h('button',{onClick:()=>sourceFailure.value=!sourceFailure.value},sourceFailure.value?'恢复原字段读取':'模拟原字段冲突'),
+    h('button',{onClick:()=>loseReceipt.value=true},'模拟下次字段保存回执丢失'),
+    h('p',{id:'field-writes'},`独立字段隔离写入：${fieldWrites.value}`),
+    h('p',{id:'source-reads'},`原字段按需读取次数：${sourceReads.value}`),
+    h('p',{id:'notice'},notice.value),h('p',{id:'blocked'},`意外API请求拦截数：${blockedRequests.value}`)
+  ]),h('div',{class:'page-content'},[h(RouterView)]),h('pre',{id:'payload',style:'white-space:pre-wrap;overflow-wrap:anywhere;padding:12px'},result.value)
+])}).use(pinia).use(router).mount('#app')
+</script></body></html>

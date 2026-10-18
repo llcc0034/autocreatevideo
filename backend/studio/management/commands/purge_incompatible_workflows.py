@@ -24,11 +24,12 @@ from studio.models import (
     AssemblySourceItem,
     CharacterBible,
     Episode,
-    GeneratedWorkflow,
     GenerationAttempt,
     GenerationTask,
     ModelArtifact,
     ModelDeployment,
+    ModelExecutionInstance,
+    ModelExecutionInstanceVersion,
     ModelProfileVersion,
     PromptProfileVersion,
     ProductionRecipeVersion,
@@ -47,7 +48,6 @@ from studio.models import (
     WorkflowProjector,
     WorkflowProjectorVersion,
 )
-from studio.services.registry_deletion import recipe_references_any
 from studio.services.registry_reference_lock import registry_reference_write_guard
 from studio.services.workflow_versions import (
     declared_workflow_operation,
@@ -104,6 +104,8 @@ PRESERVED_SHARED_MODELS: tuple[type[Model], ...] = (
     ProviderProfile,
     ModelProfileVersion,
     ModelDeployment,
+    ModelExecutionInstance,
+    ModelExecutionInstanceVersion,
     ModelArtifact,
     PromptProfileVersion,
     SeriesProject,
@@ -257,7 +259,9 @@ def _incoming_fields(
     parent_model: type[Model],
 ) -> tuple[tuple[type[Model], Any], ...]:
     rows: list[tuple[type[Model], Any]] = []
-    for child_model in apps.get_models(include_auto_created=True):
+    # Inspect the registry that actually owns this model. A maintenance
+    # preview of the applied migration state must not mix in the leaf schema.
+    for child_model in parent_model._meta.apps.get_models(include_auto_created=True):
         for field in child_model._meta.fields:
             remote_field = getattr(field, "remote_field", None)
             if (
@@ -329,11 +333,12 @@ def _payload_references(value: Any, targets: set[str]) -> bool:
     return bool({match.group(0).lower() for match in UUID_PATTERN.finditer(value)} & targets)
 
 
-def _semantic_reference_hits(targets: set[str]) -> list[dict[str, Any]]:
+def _semantic_reference_hits(targets: set[str], *, model_registry=None, all_fields=False) -> list[dict[str, Any]]:
     if not targets:
         return []
+    model_registry = model_registry or apps
     hits: list[dict[str, Any]] = []
-    for model in apps.get_models(include_auto_created=False):
+    for model in model_registry.get_models(include_auto_created=False):
         json_fields = [
             field for field in model._meta.fields
             if field.get_internal_type() == "JSONField"
@@ -351,12 +356,14 @@ def _semantic_reference_hits(targets: set[str]) -> list[dict[str, Any]]:
                         "id": identifier,
                         "field": field.name,
                     })
-                    break
-    for identifier in PlatformLifecycleAuditEvent._base_manager.filter(
+                    if not all_fields:
+                        break
+    audit_model = model_registry.get_model("studio", "PlatformLifecycleAuditEvent")
+    for identifier in audit_model._base_manager.filter(
         object_id__in=targets,
     ).values_list("pk", flat=True):
         hits.append({
-            "model": PlatformLifecycleAuditEvent,
+            "model": audit_model,
             "id": identifier,
             "field": "object_id",
         })
@@ -494,6 +501,7 @@ def _active_rows(selected: dict[type[Model], set[Any]]) -> list[dict[str, Any]]:
             pk__in=generation_task_ids,
         ).exclude(submission_token="").exclude(
             Q(submission_state__in=(
+                GenerationTask.SubmissionState.TERMINAL_SUCCEEDED,
                 GenerationTask.SubmissionState.TERMINAL_FAILED,
                 GenerationTask.SubmissionState.TERMINAL_CANCELLED,
             ))
@@ -536,18 +544,6 @@ def build_purge_plan(
             if not WorkflowProjectorVersion.objects.filter(projector_id=projector.projector_id).exclude(pk__in=obsolete_projector_ids).exists():
                 selected[WorkflowProjector].add(projector.projector_id)
 
-    recipe_rows = recipe_references_any(*version_ids)
-    selected[ProductionRecipeVersion].update(
-        recipe.id for recipe, _paths in recipe_rows
-    )
-    recipe_details = sorted(({
-        "id": str(recipe.id),
-        "recipe_key": recipe.recipe_key,
-        "version": int(recipe.version),
-        "status": recipe.status,
-        "reference_paths": sorted(paths),
-    } for recipe, paths in recipe_rows), key=lambda item: item["id"])
-
     snapshot_ids = set(
         RecommendationSnapshot.objects.filter(
             candidates__workflow_version_id__in=version_ids,
@@ -576,14 +572,20 @@ def build_purge_plan(
         remaining_versions = WorkflowTemplateVersion.objects.filter(
             template_id=template_id,
         ).exclude(id__in=selected[WorkflowTemplateVersion]).exists()
-        remaining_generated = GeneratedWorkflow.objects.filter(
-            template_id=template_id,
-        ).exclude(id__in=selected[GeneratedWorkflow]).exists()
-        if not remaining_versions and not remaining_generated:
+        if not remaining_versions:
             orphan_template_ids.add(template_id)
     selected[WorkflowTemplate].update(orphan_template_ids)
     _expand_owned_and_semantic_dependencies(selected)
     _assert_no_preserved_shared_rows(selected)
+    # Current recipes reference exact execution instances, never a bare
+    # workflow UUID. These shared instances are protected above; this scoped
+    # workflow cleanup must not invent or cascade a replacement route.
+    recipe_details = [{
+        "id": str(recipe.pk), "recipe_key": recipe.recipe_key,
+        "version": int(recipe.version), "status": recipe.status,
+        "reference_paths": ["dependency_closure"],
+    } for recipe in ProductionRecipeVersion.objects.filter(
+        pk__in=selected[ProductionRecipeVersion]).order_by("pk")]
     if workflow_version_ids is not None:
         outside_scope = selected[WorkflowTemplateVersion] - workflow_version_ids
         if outside_scope:
@@ -797,6 +799,19 @@ class Command(BaseCommand):
     )
 
     def add_arguments(self, parser):
+        parser.add_argument('--registry-configuration-plan', default='',
+            help='Explicit reviewed obsolete configuration UUID/reason JSON; one-off SQLite repair, preview by default; never deletes media or business history.')
+        parser.add_argument("--production-run", type=UUID, help="One explicitly reviewed cancelled ProductionRun; preview by default.")
+        parser.add_argument("--recipe-version", type=UUID, help="The exact retired recipe owned exclusively by the selected run.")
+        parser.add_argument("--detach-script-provenance", action="store_true", help="Explicit audited source detachment; retains script text and review facts.")
+        parser.add_argument("--writers-stopped", action="store_true", help="Execution-only assertion from the formal service maintenance entry.")
+        parser.add_argument("--resource-policy-cutover", action="store_true", help="Reviewed resource policy replacement; preserves projects, scripts and all media.")
+        parser.add_argument("--execution-cutover-preview", action="store_true",
+            help="Read-only inventory of the reviewed 0144 execution cutover; never deletes or migrates.")
+        parser.add_argument("--execution-cutover", action="store_true",
+            help="One-off reviewed 0144 execution cleanup; preview by default, execute only during platform downtime.")
+        parser.add_argument("--obsolete-prompt-version", action="append", type=UUID, default=[])
+        parser.add_argument("--operator", default="")
         parser.add_argument(
             "--workflow-version", action="append", type=UUID, default=None,
             help="Limit repair to these exact workflow version UUIDs; repeat for multiple targets.",
@@ -809,6 +824,88 @@ class Command(BaseCommand):
         parser.add_argument("--irreversible-without-backup", action="store_true", help="Only for explicitly scoped, confirmed deletion where no backup is requested.")
 
     def handle(self, *args, **options):
+        if options['registry_configuration_plan']:
+            from studio.management.registry_configuration_cleanup import build_plan, execute
+            if any(options[key] for key in ('production_run','recipe_version','detach_script_provenance','writers_stopped',
+                    'resource_policy_cutover','execution_cutover_preview','execution_cutover','obsolete_prompt_version',
+                    'workflow_version','obsolete_projector_version','irreversible_without_backup')):
+                raise CommandError('精确配置清理不能混用其他清理范围或无备份执行')
+            try:
+                spec=json.loads(Path(options['registry_configuration_plan']).read_text(encoding='utf-8-sig'))
+            except (OSError, ValueError) as exc:
+                raise CommandError('无法读取精确配置清单；必须提供有效JSON文件') from exc
+            if options['execute']:
+                result=execute(spec,expected_sha256=options['expected_plan_sha256'],confirmation=options['confirmation'],
+                    backup_manifest=options['backup_manifest'],operator=options['operator'])
+            else:
+                if options['expected_plan_sha256'] or options['confirmation']:
+                    raise CommandError('预览不接受执行确认参数')
+                result=build_plan(spec).report
+            self.stdout.write(json.dumps(result,ensure_ascii=True,indent=2))
+            return
+        if options["production_run"] is not None:
+            from studio.management.production_run_cleanup import build_plan, execute, _backup_matches_plan
+            if options["recipe_version"] is None or any(options[key] for key in (
+                    "resource_policy_cutover", "execution_cutover_preview", "execution_cutover",
+                    "obsolete_prompt_version", "workflow_version", "obsolete_projector_version", "irreversible_without_backup")):
+                raise CommandError("指定运行清理必须明确配方版本，不能混用其他范围或无备份删除")
+            scope = dict(run_id=options["production_run"], recipe_id=options["recipe_version"],
+                detach_script_provenance=options["detach_script_provenance"])
+            if options["execute"]:
+                report = execute(**scope, expected_sha256=options["expected_plan_sha256"],
+                    confirmation=options["confirmation"], backup_manifest=options["backup_manifest"],
+                    operator=options["operator"], writers_stopped=options["writers_stopped"])
+            else:
+                if any(options[key] for key in ("writers_stopped", "expected_plan_sha256", "confirmation", "operator")):
+                    raise CommandError("指定运行预览不得混入执行确认参数")
+                plan = build_plan(**scope)
+                report = dict(plan.report)
+                if options["backup_manifest"]:
+                    report["backup"] = _backup_matches_plan(plan, options["backup_manifest"])
+            self.stdout.write(json.dumps(report, ensure_ascii=False, indent=2))
+            return
+        if options["recipe_version"] or options["detach_script_provenance"] or options["writers_stopped"]:
+            raise CommandError("配方版本、来源解关联及停写确认只能用于明确的production-run范围")
+        if options["resource_policy_cutover"]:
+            from django.core.serializers.json import DjangoJSONEncoder
+            from studio.management.resource_policy_cutover import build_plan, execute
+            if options["backup_manifest"]:
+                _validate_backup_manifest(Path(options["backup_manifest"]))
+            if any(options[key] for key in ("execution_cutover_preview", "execution_cutover", "obsolete_prompt_version", "workflow_version", "obsolete_projector_version", "irreversible_without_backup")):
+                raise CommandError("资源清理不能混用其他清理范围")
+            report = execute(expected_sha256=options["expected_plan_sha256"], confirmation=options["confirmation"],
+                backup_manifest=options["backup_manifest"], operator=options["operator"]) if options["execute"] else build_plan().report
+            self.stdout.write(json.dumps(report, ensure_ascii=False, indent=2, cls=DjangoJSONEncoder))
+            return
+        if options["execution_cutover_preview"]:
+            if (options["execution_cutover"] or options["obsolete_prompt_version"] or options["operator"]
+                    or options["execute"] or options["workflow_version"] or options["obsolete_projector_version"]
+                    or options["expected_plan_sha256"] or options["confirmation"]
+                    or options["backup_manifest"] or options["irreversible_without_backup"]):
+                raise CommandError("执行入口切换盘点只读，不能与工作流清理/执行参数混用")
+            from studio.management.execution_cutover_inventory import execution_cutover_inventory
+            self.stdout.write(json.dumps(execution_cutover_inventory(), ensure_ascii=False, indent=2))
+            return
+        if options["execution_cutover"]:
+            if options["workflow_version"] or options["obsolete_projector_version"] or options["backup_manifest"]:
+                raise CommandError("执行入口切换不能与其他工作流清理范围或备份参数混用")
+            from studio.management.execution_cutover import build_execution_cutover_plan, cutover_operator, execute_execution_cutover
+            if options["execute"]:
+                if not options["irreversible_without_backup"]:
+                    raise CommandError("本次已核对清理不保留备份，必须明确不可恢复删除")
+                report = execute_execution_cutover(prompt_ids=options["obsolete_prompt_version"],
+                    expected_sha256=options["expected_plan_sha256"], confirmation=options["confirmation"],
+                    operator=options["operator"])
+            else:
+                if options["irreversible_without_backup"] or options["expected_plan_sha256"] or options["confirmation"]:
+                    raise CommandError("切换预览不得携带执行确认参数")
+                if options["operator"]:
+                    cutover_operator(options["operator"])
+                report = build_execution_cutover_plan(options["obsolete_prompt_version"]).report
+            self.stdout.write(json.dumps(report, ensure_ascii=False, indent=2))
+            return
+        if options["obsolete_prompt_version"] or options["operator"]:
+            raise CommandError("策略清理和操作人参数仅用于已复核的执行入口切换")
         if connection.vendor != "sqlite":
             raise CommandError(
                 "该未上线环境修复命令仅支持 SQLite；PostgreSQL 必须另行制定停机清理方案",

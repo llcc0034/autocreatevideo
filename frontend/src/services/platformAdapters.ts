@@ -1,5 +1,13 @@
 import { adaptResolutionOptions } from './workflowResolution'
+import { adaptRetryContext } from './productionRetryPreview'
+import { adaptMediaConstraintsOptions } from './modelMediaConstraints'
+import { adaptVisualRulesOutputOptions } from './visualRulesOutput'
 import { adaptWorkflowConfigurationLinks } from './workflowConfigurationLinks'
+import { adaptProductionPlanEnvelope } from './productionManual'
+import { adaptChatRequestOptions } from './modelChatRequestOptions'
+import { adaptScriptContracts } from './modelScriptContracts'
+import { adaptAsyncMediaOptions } from './modelAsyncMedia'
+import { adaptReferenceTopologyOptions } from './modelReferenceTopology'
 import type {
   AcceptanceSmokeAction, AcceptanceSmokeDeploymentAttempt, AcceptanceSmokeDeploymentRef,
   AcceptanceSmokeDeploymentSummary,
@@ -11,10 +19,10 @@ import type {
   GenerationAttempt,
   HostCapabilitySnapshot, LegacyWorkflowTemplate, ModelArtifact, ModelDeployment,
   ComfySavedWorkflowBatchResult, ComfySavedWorkflowPreview, ComfySavedWorkflowScan,
-  WorkflowSmokeAssetCandidate, WorkflowSmokeFixtureSchema,
+  WorkflowSmokeAssetCandidate, WorkflowInputSchema,
   ModelDeploymentSmokeAttempt,
-  ModelProfileRegistryOptions, ModelProfileVersion, NodeMetadataItem, NodeMetadataResponse, ProductionRecipe, ProductionRecipeEditorOptions, ProductionRecipeMediaRouteOptions,
-  PromptFieldDefinition, PromptFieldValueType, PromptProfileBinding, PromptProfileFieldRule,
+  ModelProfileRegistryOptions, ModelProfileVersion, NodeMetadataItem, NodeMetadataResponse, ProductionRecipe, ProductionRecipeEditorOptions,
+  FieldDefinition, PromptProfileFieldRule,
   PromptProfileOptions, PromptProfilePreview, PromptProfileVersion,
   ProductionRun, ProviderProfile, RecommendationCandidate, RecommendationDecision,
   RecommendationSnapshot, ResolvedConfiguration,
@@ -25,7 +33,6 @@ import type {
   WorkflowProjector, WorkflowProjectorOptions, WorkflowProjectorRecommendation, WorkflowProjectorVersion,
   ProductionRecipeInteractionMode,
   ProductionRecipeScriptClassification,
-  ProductionPromptProfileRequirement,
   PlatformLifecycleAuditEvent, SecretAuditEvent, SecretBinding, WorkflowSmokeAttempt,
   WorkflowSmokeAttemptResolution,
 } from './platformTypes'
@@ -155,22 +162,12 @@ export const productionRecipeScriptMode = (definition: JsonObject): ProductionRe
     const row = platformRecord(value)
     return row.key === 'script_structure' && row.mode === 'ai'
   })
-  const normalizeStages = stages.filter((value) => {
-    const row = platformRecord(value)
-    return row.key === 'script_normalize' && ['ai', 'manual'].includes(string(row.mode))
-  })
-  const normalizeReviewStages = stages.filter((value) => {
-    const row = platformRecord(value)
-    return row.key === 'script_normalize_review' && row.mode === 'review'
-  })
   const scriptStageInvalid = stages.some((value) => {
     const row = platformRecord(value)
     if (row.key === 'script_generate') return row.mode !== 'ai'
     if (row.key === 'script_input') return !['confirmed_revision', 'manual'].includes(string(row.mode))
     if (row.key === 'script_structure') return row.mode !== 'ai'
     if (row.key === 'script_review') return row.mode !== 'review'
-    if (row.key === 'script_normalize') return !['ai', 'manual'].includes(string(row.mode))
-    if (row.key === 'script_normalize_review') return row.mode !== 'review'
     return typeof row.key === 'string' && row.key.startsWith('script_')
   })
   if (
@@ -181,8 +178,6 @@ export const productionRecipeScriptMode = (definition: JsonObject): ProductionRe
     || (scriptStructureStages.length === 1 && (
       confirmedStages.length !== 1 || scriptReviewStages.length !== 1
     ))
-    || normalizeStages.length !== normalizeReviewStages.length
-    || normalizeStages.length > 1
   ) return 'invalid'
   if (aiStages.length === 1) return 'ai'
   if (confirmedStages.length === 1) return 'confirmed_revision'
@@ -190,10 +185,9 @@ export const productionRecipeScriptMode = (definition: JsonObject): ProductionRe
 }
 
 export const productionRecipeInteractionMode = (definition: JsonObject): ProductionRecipeInteractionMode => {
-  const schemaVersion = number(definition.schema_version, -1)
-  const interactionMode = string(definition.interaction_mode)
-  if (schemaVersion === 2 && interactionMode === 'unattended') return 'unattended'
-  if (schemaVersion === 1 && !interactionMode) return 'assisted'
+  if (definition.schema_version !== 3) return 'invalid'
+  const interactionMode = definition.interaction_mode
+  if (interactionMode === 'unattended' || interactionMode === 'assisted') return interactionMode
   return 'invalid'
 }
 
@@ -265,8 +259,37 @@ export const adaptModelProfileRegistryOptions = (value: unknown): ModelProfileRe
   const inputKinds = choices(conditioning.input_kinds, 'conditioning_contract.input_kinds')
   const inputSlots = choices(conditioning.input_slots, 'conditioning_contract.input_slots')
   if (!inputKinds.length || !inputSlots.length) throw new Error('模型素材合同缺少模式或素材槽选项')
+  const textExecution = platformRecord(raw.text_execution)
+  if (textExecution.schema_version !== 1) throw new Error('文本执行协议目录未读取，请重新读取系统设置')
+  const textOperations = choices(textExecution.operations, 'text_execution.operations')
+  const integerConstraints = platformRecord(textExecution.integer_constraints)
+  const valueFields = choices(integerConstraints.value_fields, 'text_execution.integer_constraints.value_fields')
+  const seedPolicies = choices(integerConstraints.seed_policies, 'text_execution.integer_constraints.seed_policies')
+  if (valueFields.length !== 4 || new Set(valueFields.map(row=>row.value)).size !== 4 || valueFields.some(row=>!['minimum','maximum','default','const'].includes(row.value))
+    || seedPolicies.length !== 2 || new Set(seedPolicies.map(row=>row.value)).size !== 2 || seedPolicies.some(row=>!['fixed','generate_once'].includes(row.value))) throw new Error('整数约束目录不完整，请重新读取服务端目录')
+  const textParameters = requiredArray(textExecution.parameters, 'text_execution.parameters').map(item => {
+    const row = platformRecord(item)
+    const template = platformRecord(row.template)
+    if (typeof row.required !== 'boolean' || typeof row.require_maximum !== 'boolean' || template.type !== 'integer' || typeof template.required !== 'boolean') throw new Error('文本参数目录格式不完整')
+    return { value: requiredString(row.value, 'text_execution.parameters.value'), label: requiredString(row.label, 'text_execution.parameters.label'),
+      description: requiredString(row.description, 'text_execution.parameters.description'), required: row.required, requireMaximum: row.require_maximum, template }
+  })
+  if (!textOperations.length || !textParameters.length) throw new Error('文本执行协议目录缺少操作或参数')
+  const monitoring = platformRecord(raw.execution_monitoring)
+  if (!Number.isSafeInteger(monitoring.max_idle_timeout_seconds) || Number(monitoring.max_idle_timeout_seconds) < 1
+    || !Number.isSafeInteger(monitoring.max_node_type_overrides) || Number(monitoring.max_node_type_overrides) < 1) {
+    throw new Error('模型等待时限目录不完整，请重新读取系统设置')
+  }
   return {
+    executionMonitoring: {maxSeconds: Number(monitoring.max_idle_timeout_seconds), maxOverrides: Number(monitoring.max_node_type_overrides)},
+    textExecution: {schemaVersion: Number(textExecution.schema_version), operations: textOperations, parameters: textParameters, integerConstraints: {valueFields, seedPolicies}},
+    chatRequestOptions: adaptChatRequestOptions(raw.chat_request_options),
+    mediaConstraints: adaptMediaConstraintsOptions(raw.media_constraints),
+    visualRulesOutput: adaptVisualRulesOutputOptions(raw.visual_rules_output),
+    scriptContracts: adaptScriptContracts(raw.script_contracts),
+    asyncMedia: adaptAsyncMediaOptions(raw.async_media),
     conditioningContract: {
+      dynamicReferenceTopology: adaptReferenceTopologyOptions(conditioning.dynamic_reference_topology),
       schemaVersion: Number(conditioning.schema_version), adapterKey: requiredString(conditioning.adapter_key, 'conditioning_contract.adapter_key'),
       inputKinds, inputSlots,
       maximumItems: Number(conditioning.maximum_items), maximumModes: Number(conditioning.maximum_modes),
@@ -615,11 +638,11 @@ export const adaptModelArtifact = (value: unknown): ModelArtifact => { const raw
   verifiedAt: string(raw.verified_at), verifiedBy: string(raw.verified_by),
 } }
 
-export const adaptPromptFieldDefinition = (value: unknown): PromptFieldDefinition => { const raw = platformRecord(value); return {
-  ...entity(raw), key: string(raw.key), label: string(raw.label), category: string(raw.category),
-  description: string(raw.description), impact: string(raw.impact), valueType: string(raw.value_type) as PromptFieldValueType,
-  defaultValue: raw.default_value, previewExample: raw.preview_example, valueOptions: strings(raw.value_options), isRequired: boolean(raw.is_required),
-  isActive: boolean(raw.is_active), displayOrder: number(raw.display_order),
+export const adaptFieldDefinition = (value: unknown): FieldDefinition => { const raw = platformRecord(value)
+  if (typeof raw.is_active !== 'boolean') throw new Error('字段身份响应缺少有效启停状态')
+  return {
+  ...entity(raw), key: string(raw.key),
+  isActive: raw.is_active, displayOrder: number(raw.display_order),
 } }
 
 const adaptPromptProfileChannelLimits = (value: unknown) => Object.fromEntries(
@@ -633,6 +656,7 @@ const adaptPromptProfileChannelLimits = (value: unknown) => Object.fromEntries(
 )
 
 export const adaptPromptProfileVersion = (value: unknown): PromptProfileVersion => { const raw = platformRecord(value); return {
+  inputStructureVersion: raw.input_structure_version ? string(raw.input_structure_version) : null,
   ...entity(raw), profileKey: string(raw.profile_key), version: number(raw.version), name: string(raw.name),
   description: string(raw.description), modelFamily: string(raw.model_family), operation: string(raw.operation),
   mode: string(raw.mode), sourceProjectionKey: string(raw.source_projection_key),
@@ -643,7 +667,17 @@ export const adaptPromptProfileVersion = (value: unknown): PromptProfileVersion 
   fieldRuleCount: number(raw.field_rule_count), publishedAt: string(raw.published_at), publishedBy: string(raw.published_by),
 } }
 
+const promptSourcePath = (value: unknown): (string | number)[] | null => {
+  if (value === null || value === undefined) return null
+  if (!Array.isArray(value) || value.some(token => typeof token !== 'string' && !(typeof token === 'number' && Number.isSafeInteger(token) && token >= 0))) throw new Error('提示词字段路径响应无效')
+  return [...value]
+}
 export const adaptPromptProfileFieldRule = (value: unknown): PromptProfileFieldRule => { const raw = platformRecord(value); return {
+  sourcePath: promptSourcePath(raw.source_path),
+  fieldDefinitionVersion: raw.field_definition_version ? string(raw.field_definition_version) : null,
+  fixedValue: raw.fixed_value, hasDefault: boolean(raw.has_default), defaultValue: raw.default_value,
+  sourceVersion: raw.source_version ? string(raw.source_version) : null,
+  sourceDefinition: raw.source_definition ? platformRecord(raw.source_definition) as JsonObject : null,
   ...entity(raw), profileVersion: string(raw.profile_version), fieldDefinition: string(raw.field_definition),
   fieldKey: string(raw.field_key), fieldLabel: string(raw.field_label), fieldValueType: string(raw.field_value_type),
   sourceSelector: string(raw.source_selector), projectionPrimitive: string(raw.projection_primitive), channel: string(raw.channel), position: number(raw.position),
@@ -657,15 +691,6 @@ export const adaptPromptProfileFieldRule = (value: unknown): PromptProfileFieldR
   generationMax: nullableNumber(raw.generation_max), generationValidatorKeys: strings(raw.generation_validator_keys),
 } }
 
-export const adaptPromptProfileBinding = (value: unknown): PromptProfileBinding => { const raw = platformRecord(value); return {
-  ...entity(raw), key: string(raw.key), name: string(raw.name), operation: string(raw.operation),
-  modelFamily: string(raw.model_family), mode: string(raw.mode), modelProfileVersion: string(raw.model_profile_version),
-  modelIdentifier: string(raw.model_identifier), promptProfileVersion: string(raw.prompt_profile_version),
-  promptProfileName: string(raw.prompt_profile_name), promptProfileVersionNumber: number(raw.prompt_profile_version_number),
-  promptProfileStatus: string(raw.prompt_profile_status),
-  promptProfileKey: string(raw.prompt_profile_key), promptProfileContractSha256: string(raw.prompt_profile_contract_sha256),
-  priority: number(raw.priority), isActive: boolean(raw.is_active),
-} }
 
 export const adaptPromptProfileOptions = (value: unknown): PromptProfileOptions => { const raw = platformRecord(value); const choice = (item: unknown) => { const row = platformRecord(item); return { value: string(row.value), label: string(row.label) } }; const contextChoice = (item: unknown) => { const row = platformRecord(item); return { ...choice(row), description: string(row.description) } }; const generationSourceChoice = (item: unknown) => { const row = platformRecord(item); return {
   ...choice(row), scopeType: string(row.scope_type), group: string(row.group), groupLabel: string(row.group_label),
@@ -676,16 +701,21 @@ export const adaptPromptProfileOptions = (value: unknown): PromptProfileOptions 
   operations: requiredStringArray(raw, 'operations', 'PromptProfile options'),
   modelFamilies: requiredStringArray(raw, 'model_families', 'PromptProfile options'),
   modes: requiredStringArray(raw, 'modes', 'PromptProfile options'),
-  fieldValueTypes: requiredArray(raw, 'field_value_types', 'PromptProfile options').map(choice),
-  fieldCategories: requiredArray(raw, 'field_categories', 'PromptProfile options').map(choice),
   customEntryFields: requiredStringArray(raw, 'custom_entry_fields', 'PromptProfile options'),
-  fieldSystemDefaults: requiredObject(raw, 'field_system_defaults', 'PromptProfile options'),
   ruleSystemDefaults: requiredObject(raw, 'rule_system_defaults', 'PromptProfile options'),
-  sourceSelectors: requiredArray(raw, 'source_selectors', 'PromptProfile options').map(choice),
+  sourceSelectors: requiredArray(raw, 'source_selectors', 'PromptProfile options').map(item => {
+    const row = platformRecord(item)
+    const requiredHelp = (key: string) => {
+      if (typeof row[key] !== 'string' || !row[key].trim()) throw new Error(`来源目录缺少 ${key}，请更新平台服务并重新读取`)
+      return row[key] as string
+    }
+    return { ...choice(row), groupLabel: requiredHelp('group_label'), description: requiredHelp('description'), recordLocation: requiredHelp('record_location'), executionUsage: requiredHelp('execution_usage') }
+  }),
   channels: requiredArray(raw, 'channels', 'PromptProfile options').map(choice),
   labelStyles: requiredArray(raw, 'label_styles', 'PromptProfile options').map(choice),
   separators: requiredArray(raw, 'separators', 'PromptProfile options').map(choice),
   generationModes: requiredArray(raw, 'generation_modes', 'PromptProfile options').map(choice),
+  generationLeafOperations: requiredStringArray(raw, 'generation_leaf_operations', '字段辅助能力目录'),
   generationSourceSelectors: requiredArray(raw, 'generation_source_selectors', 'PromptProfile options').map(generationSourceChoice),
   generationContextSelectors: requiredArray(raw, 'generation_context_selectors', 'PromptProfile options').map(contextChoice),
   generationOutputSemantics: requiredArray(raw, 'generation_output_semantics', 'PromptProfile options').map(choice),
@@ -717,6 +747,7 @@ export const adaptPromptProfileOptions = (value: unknown): PromptProfileOptions 
       example: {template: acceptanceString(example, 'template', '参考渲染示例'), result: example.result},
     }
   }),
+  referenceRenderingTextSlots: requiredArray(raw, 'reference_rendering_text_slots', 'PromptProfile options').map(choice),
   languagePolicies: requiredArray(raw, 'language_policies', 'PromptProfile options').map(choice),
   lengthUnits: requiredArray(raw, 'length_units', 'PromptProfile options').map(choice),
   generationValidators: requiredArray(raw, 'generation_validators', 'PromptProfile options').map(choice),
@@ -754,7 +785,7 @@ const adaptModelRequirement = (value: unknown): WorkflowModelRequirement => { co
   id: string(raw.id), role: string(raw.role), alias: string(raw.alias), artifactId: string(raw.artifact),
   expectedFilename: string(raw.expected_filename), expectedSha256: string(raw.expected_sha256), isRequired: boolean(raw.is_required),
 } }
-export const adaptWorkflowSmokeFixtureSchema = (value: unknown): WorkflowSmokeFixtureSchema => {
+export const adaptWorkflowInputSchema = (value: unknown): WorkflowInputSchema => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('工作流输入 Schema 必须是对象')
   const raw = value as Raw
   if (raw.schema_version !== 2) throw new Error('工作流输入 Schema 版本不受支持')
@@ -898,7 +929,7 @@ export const adaptWorkflowSmokeFixtureSchema = (value: unknown): WorkflowSmokeFi
     assetGroups,
   }
 }
-export const adaptWorkflowTemplateVersion = (value: unknown, options: { reportInvalidSmokeFixtureForAudit?: boolean } = {}): WorkflowTemplateVersion => { const raw = platformRecord(value); const result: WorkflowTemplateVersion = {
+export const adaptWorkflowTemplateVersion = (value: unknown, options: { reportInvalidWorkflowInputForAudit?: boolean } = {}): WorkflowTemplateVersion => { const raw = platformRecord(value); const result: WorkflowTemplateVersion = {
   ...entity(raw), template: string(raw.template), templateName: string(raw.template_name), templateSlug: string(raw.template_slug),
   outputKind: string(raw.output_kind), version: number(raw.version), provider: string(raw.provider),
   modelProfileVersion: string(raw.model_profile_version), status: string(raw.status) as WorkflowTemplateVersion['status'],
@@ -919,18 +950,18 @@ export const adaptWorkflowTemplateVersion = (value: unknown, options: { reportIn
   if (Array.isArray(raw.model_requirements)) result.modelRequirements = raw.model_requirements.map(adaptModelRequirement)
   if ('validation_evidence' in raw) result.validationEvidence = object(raw.validation_evidence)
   if ('smoke_test_evidence' in raw) result.smokeTestEvidence = object(raw.smoke_test_evidence)
-  if ('smoke_fixture_schema' in raw) {
-    try { result.smokeFixtureSchema = adaptWorkflowSmokeFixtureSchema(raw.smoke_fixture_schema) }
+  if ('workflow_input_schema' in raw) {
+    try { result.workflowInputSchema = adaptWorkflowInputSchema(raw.workflow_input_schema) }
     catch (cause) {
-      if (!options.reportInvalidSmokeFixtureForAudit) throw cause
-      result.smokeFixtureSchemaError = cause instanceof Error ? cause.message : '工作流输入 Schema 无法解析'
+      if (!options.reportInvalidWorkflowInputForAudit) throw cause
+      result.workflowInputSchemaError = cause instanceof Error ? cause.message : '工作流输入 Schema 无法解析'
     }
   }
   return result
 }
 
 export const adaptWorkflowTemplateVersionForAudit = (value: unknown): WorkflowTemplateVersion => (
-  adaptWorkflowTemplateVersion(value, { reportInvalidSmokeFixtureForAudit: true })
+  adaptWorkflowTemplateVersion(value, { reportInvalidWorkflowInputForAudit: true })
 )
 
 export const adaptWorkflowTemplateCanvasExport = (value: unknown): WorkflowTemplateCanvasExport => {
@@ -1123,9 +1154,11 @@ const WORKFLOW_PROJECTOR_EDITOR_V1_FIELDS = new Map<string, { control: string; r
 ])
 const WORKFLOW_PROJECTOR_PROJECTION_V1_FIELDS = new Map<string, Map<string, { control: string; readOnly: boolean }>>([
   ['generic_fixed', new Map([
+    ['projection.config.capability', { control: 'execution_capability', readOnly: false }],
     ['projection.config.image_resolution', { control: 'image_resolution', readOnly: false }],
   ])],
   ['generic_references', new Map([
+    ['projection.config.capability', { control: 'execution_capability', readOnly: false }],
     ['projection.config.groups', { control: 'asset_group_list', readOnly: false }],
   ])],
   ['generic_classified', new Map([
@@ -1312,6 +1345,12 @@ export const adaptWorkflowProjectorOptions = (value: unknown): WorkflowProjector
         outputKinds: editorChoice('output_kinds'),
         contractSources: editorChoice('contract_sources'),
         assetGroupWirings: engines.some((engine) => engine.key === 'generic.references') ? editorChoice('asset_group_wirings') : [],
+        modelQuantityInputs: editorChoice('model_quantity_inputs').map((choice, index) => {
+          const mediaKind = platformRecord((choicesRaw.model_quantity_inputs as unknown[])[index]).media_kind
+          if (mediaKind !== 'image' && mediaKind !== 'video' && mediaKind !== 'audio') throw new Error('workflow projector model quantity media kind is invalid')
+          return { ...choice, mediaKind }
+        }),
+        executionCapabilities: editorChoice('execution_capabilities'),
         roleSelectors: editorChoice('role_selectors'),
         scalarTypes: editorChoice('scalar_types'),
       },
@@ -1720,7 +1759,15 @@ export const adaptComfySavedWorkflowPreview = (value: unknown): ComfySavedWorkfl
   ) {
     throw new Error('saved workflow preview returned invalid admission or contract draft identity')
   }
+  const receipt = object(raw.request_receipt), request = object(receipt.request)
   return {
+    ...(raw.request_receipt ? { requestReceipt: {
+      requestKey: string(receipt.request_key), candidateSourceId: string(receipt.candidate_source_id),
+      request: { deploymentId: string(request.deployment_id), sourcePath: string(request.source_path),
+        expectedSha256: string(request.expected_sha256), expectedSourceScopeSchemaVersion: number(request.expected_source_scope_schema_version),
+        expectedSourceScopeSha256: string(request.expected_source_scope_sha256), primaryOutputNodeIds: strings(request.primary_output_node_ids),
+        modelProfileVersion: request.model_profile_version === null ? null : string(request.model_profile_version) },
+    } } : {}),
     schemaVersion: number(raw.schema_version), sourcePath: string(raw.source_path), sourceSha256: string(raw.source_sha256),
     sizeBytes: number(raw.size_bytes), sourceWorkflowId: string(raw.source_workflow_id),
     primaryOutputNodeIds: strings(raw.primary_output_node_ids),
@@ -1869,7 +1916,24 @@ export const adaptWorkflowSmokeResolution = (value: unknown): WorkflowSmokeAttem
   evidenceSha256: string(raw.evidence_sha256), note: string(raw.note), decidedBy: string(raw.decided_by),
 } }
 
+const smokeIdentity = (raw: Record<string, unknown>) => {
+  if ((raw.scope !== 'resource' && raw.scope !== 'instance')
+      || (raw.preparation_id !== null && (typeof raw.preparation_id !== 'string' || !raw.preparation_id.trim()))
+      || (raw.scope === 'resource' && raw.execution_instance_version !== null)
+      || (raw.scope === 'instance' && (typeof raw.execution_instance_version !== 'string' || !raw.execution_instance_version.trim()))) {
+    throw new Error('烟测响应缺少明确的验收范围，或执行实例关联不一致')
+  }
+  return { scope: raw.scope as 'resource' | 'instance', executionInstanceVersion: raw.execution_instance_version as string | null,
+    preparationId: raw.preparation_id as string | null,
+    allowExternalCalls: boolean(raw.allow_external_calls), budgetLimit: raw.budget_limit == null ? null : string(raw.budget_limit),
+    actualCost: raw.actual_cost == null ? null : string(raw.actual_cost),
+    evidenceExpiresAt: string(raw.evidence_expires_at), resultSchemaVersion: number(raw.result_schema_version),
+    resultSizeBytes: number(raw.result_size_bytes), resultSha256: string(raw.result_sha256) }
+}
+
 export const adaptWorkflowSmokeAttempt = (value: unknown): WorkflowSmokeAttempt => { const raw = platformRecord(value); return {
+  estimatedCost: string(raw.estimated_cost), costCurrency: string(raw.cost_currency),
+  ...smokeIdentity(raw),
   ...entity(raw), workflowVersion: string(raw.workflow_version), deployment: string(raw.deployment), createdBy: string(raw.created_by),
   status: string(raw.status), graphSha256: string(raw.graph_sha256), executionContractSha256: string(raw.execution_contract_sha256),
   validationEvidenceSha256: string(raw.validation_evidence_sha256), targetSha256: string(raw.target_sha256),
@@ -1892,6 +1956,7 @@ export const adaptWorkflowSmokeAttempt = (value: unknown): WorkflowSmokeAttempt 
 } }
 
 export const adaptModelDeploymentSmokeAttempt = (value: unknown): ModelDeploymentSmokeAttempt => { const raw = platformRecord(value); return {
+  ...smokeIdentity(raw), result: object(raw.result),
   promptProfile: raw.prompt_profile == null ? null : acceptanceRecord(raw.prompt_profile, '烟测策略'),
   ...entity(raw), deployment: string(raw.deployment), operation: string(raw.operation), status: string(raw.status),
   requestSha256: string(raw.request_sha256), targetSha256: string(raw.target_sha256), estimatedCost: string(raw.estimated_cost),
@@ -1998,18 +2063,47 @@ export const adaptRuntimeReadiness = (value: unknown): RuntimeReadiness => { con
   for (const [key, itemValue] of Object.entries(object(raw.capabilities))) { const item = platformRecord(itemValue); capabilities[key] = { state: string(item.state), reason: string(item.reason), deploymentCount: number(item.deployment_count) } }
   return { schemaVersion: number(raw.schema_version), snapshotId: string(raw.snapshot_id), capturedAt: string(raw.captured_at), capabilities }
 }
-export const adaptProductionReadiness = (value: unknown): ProductionReadiness => { const raw = platformRecord(value); return {
-  schemaVersion: number(raw.schema_version), status: string(raw.status), reasonCodes: strings(raw.reason_codes),
-  recipes: (Array.isArray(raw.recipes) ? raw.recipes : []).map((recipeValue) => {
-    const recipe = platformRecord(recipeValue)
-    const capabilities: ProductionReadiness['recipes'][number]['capabilities'] = {}
-    for (const [key, capabilityValue] of Object.entries(object(recipe.capabilities))) {
-      const capability = platformRecord(capabilityValue)
-      capabilities[key] = { state: string(capability.state), required: boolean(capability.required), reasonCodes: strings(capability.reason_codes) }
-    }
-    return { id: string(recipe.id), recipeKey: string(recipe.recipe_key), version: number(recipe.version), state: string(recipe.state), reasonCodes: strings(recipe.reason_codes), capabilities }
-  }),
-} }
+export const adaptProductionReadiness = (value: unknown): ProductionReadiness => {
+  const label = '配方配置与生产链核对', raw = acceptanceRecord(value, label)
+  if (raw.schema_version !== 2 || raw.request_checked !== false) throw new Error(label + '合同版本或检查范围无效')
+  const codes = (row: Raw, key: string): string[] => acceptanceArray(row, key, label).map(item => {
+    if (typeof item !== 'string' || !item.trim()) throw new Error(label + '原因代码无效')
+    return item
+  })
+  const state = (row: Raw, key: string, choices: string[]): string => {
+    const item = acceptanceString(row, key, label)
+    if (!choices.includes(item)) throw new Error(label + '状态无效')
+    return item
+  }
+  const count = (row: Raw, key: string) => row[key] === null ? null : acceptanceInteger(row, key, label)
+  return { schemaVersion: 2, requestChecked: false,
+    status: state(raw, 'status', ['unconfigured', 'blocked', 'ready']), reasonCodes: codes(raw, 'reason_codes'),
+    recipes: acceptanceArray(raw, 'recipes', label).map(value => {
+      const row = acceptanceRecord(value, label)
+      const capabilities: ProductionReadiness['recipes'][number]['capabilities'] = {}
+      for (const [key, value] of Object.entries(requiredObject(row, 'capabilities', label))) {
+        const capability = acceptanceRecord(value, label)
+        if (capability.scope !== 'configuration_only' || capability.request_checked !== false) throw new Error(label + '能力检查范围无效')
+        capabilities[key] = { scope: 'configuration_only', requestChecked: false,
+          state: state(capability, 'state', ['not_required', 'blocked', 'ready']),
+          required: acceptanceBoolean(capability, 'required', label), reasonCodes: codes(capability, 'reason_codes'),
+          warningCodes: codes(capability, 'warning_codes'), instanceCount: count(capability, 'instance_count'),
+          viableInstanceCount: count(capability, 'viable_instance_count') }
+      }
+      return { id: acceptanceString(row, 'id', label), recipeKey: acceptanceString(row, 'recipe_key', label),
+        version: acceptanceInteger(row, 'version', label, 1), state: state(row, 'state', ['blocked', 'ready']),
+        reasonCodes: codes(row, 'reason_codes'), capabilities,
+        validationErrors: acceptanceArray(row, 'validation_errors', label).map(value => {
+          const error = acceptanceRecord(value, label)
+          const nullableText = (key: string) => error[key] === null ? null : acceptanceString(error, key, label)
+          return { phase: state(error, 'phase', ['definition', 'requirements', 'pipeline']) as 'definition' | 'requirements' | 'pipeline',
+            fieldPath: acceptanceString(error, 'field_path', label), message: acceptanceString(error, 'message', label),
+            code: nullableText('code'), stageIndex: count(error, 'stage_index'), stageKey: nullableText('stage_key'),
+            stageKind: nullableText('stage_kind'), routingKey: nullableText('routing_key'), routeIndex: count(error, 'route_index') }
+        }) }
+    })
+  }
+}
 const adaptRecommendationCandidate = (value: unknown): RecommendationCandidate => { const raw = platformRecord(value); return {
   ...entity(raw), capabilityKey: string(raw.capability_key), deployment: string(raw.deployment), deploymentKey: string(raw.deployment_key),
   workflowVersion: string(raw.workflow_version), status: string(raw.status), rank: nullableNumber(raw.rank), reasonCode: string(raw.reason_code),
@@ -2017,7 +2111,7 @@ const adaptRecommendationCandidate = (value: unknown): RecommendationCandidate =
 } }
 const adaptRecommendationDecision = (value: unknown): RecommendationDecision => { const raw = platformRecord(value); return {
   ...entity(raw), recommendationSnapshot: string(raw.recommendation_snapshot), candidate: string(raw.candidate), decision: string(raw.decision),
-  scopeType: string(raw.scope_type), project: string(raw.project), configRevision: string(raw.config_revision), recipeVersion: string(raw.recipe_version),
+  scopeType: string(raw.scope_type), project: string(raw.project), configRevision: string(raw.config_revision),
   overrideValues: object(raw.override_values), reason: string(raw.reason),
 } }
 export const adaptRecommendation = (value: unknown): RecommendationSnapshot => { const raw = platformRecord(value); return {
@@ -2044,84 +2138,91 @@ export const adaptProductionRecipe = (value: unknown): ProductionRecipe => { con
   definitionSha256: string(raw.definition_sha256),
 } }
 
+export const adaptRecipeTextOutputOptions = (value: unknown): ProductionRecipeEditorOptions['textOutputOptions'] => {
+  const rows = requiredArray(platformRecord(value), 'text_output_options', 'ProductionRecipe sources').map(item => {
+    const row = platformRecord(item)
+    if (['output_key','stage_key','kind','scope_kind','label'].some(key=>typeof row[key] !== 'string' || !row[key])
+      || !['text','json'].includes(String(row.kind))) throw new Error('配方来源目录缺少完整的步骤、输出或类型')
+    const exact = ['output_version_id','output_contract_sha256','structure_version_id']
+    const hasExact = exact.some(key=>row[key] !== undefined)
+    if ((hasExact || row.reader === 'structured_text') && (exact.some(key=>typeof row[key] !== 'string' || !row[key])
+      || !/^[0-9a-f]{64}$/.test(String(row.output_contract_sha256)))) throw new Error('结构化上游缺少确切输出、结构版本或摘要')
+    return {outputKey: string(row.output_key), stageKey: string(row.stage_key), kind: string(row.kind),
+      scopeKind: string(row.scope_kind), label: string(row.label),
+      ...(hasExact ? {outputVersionId:string(row.output_version_id),outputContractSha256:string(row.output_contract_sha256),structureVersionId:string(row.structure_version_id)} : {}),
+      ...(row.value_schema === undefined ? {} : {value_schema: requiredObject(row,'value_schema','ProductionRecipe output')})}
+  })
+  if (new Set(rows.map(row=>JSON.stringify([row.stageKey,row.outputKey]))).size !== rows.length) throw new Error('配方来源目录存在重复步骤输出')
+  return rows
+}
+
 export const adaptProductionRecipeEditorOptions = (value: unknown): ProductionRecipeEditorOptions => { const raw = platformRecord(value); const result = {
+  assemblyOutputSchema: requiredObject(raw, 'assembly_output_schema', 'ProductionRecipe options'),
+  assemblyTimingSchema: requiredObject(raw, 'assembly_timing_schema', 'ProductionRecipe options'),
+  assemblyMediaSchema: requiredObject(raw, 'assembly_media_schema', 'ProductionRecipe options'),
+  deliveryMetadataSchema: requiredObject(raw, 'delivery_metadata_schema', 'ProductionRecipe options'),
+  shotReferenceSourceOptions: requiredArray(raw, 'shot_reference_source_options', 'ProductionRecipe options').map(value => {
+    const row = platformRecord(value)
+    if (typeof row.value !== 'string' || !row.value || typeof row.label !== 'string' || !row.label
+        || (row.upstream_stage_key !== null && (typeof row.upstream_stage_key !== 'string' || !row.upstream_stage_key))) throw new Error('分镜素材来源目录不完整')
+    return {value: row.value, label: row.label, upstreamStageKey: row.upstream_stage_key as string | null,
+      selectionOptions: requiredCatalog(row, 'selection_options', 'Shot reference source')}
+  }),
+  materialSourceOptions: requiredCatalog(raw, 'material_source_options', 'ProductionRecipe options'),
+  materialSelectionOptions: requiredCatalog(raw, 'material_selection_options', 'ProductionRecipe options'),
   definitionSchemaVersion: number(raw.definition_schema_version),
+  effectiveLimits: { maxRoutingRoutes: platformRecord(raw.effective_limits).max_routing_routes as number,
+    maxVariants: platformRecord(raw.effective_limits).max_variants as number,
+    maxGenerationTasks: platformRecord(raw.effective_limits).max_generation_tasks as number },
   stageOptions: requiredArray(raw, 'stage_options', 'ProductionRecipe options').map((item) => { const row = platformRecord(item); return {
     value: string(row.value), modes: strings(row.modes), requiresRouting: boolean(row.requires_routing),
+    label: string(row.label), repeatable: row.repeatable as boolean,
+    candidateEvaluatorOptions: requiredArray(row, 'candidate_evaluator_options', 'Recipe stage').map(value => {
+      const option = platformRecord(value)
+      if ((option.value !== null && typeof option.value !== 'string') || typeof option.label !== 'string' || !option.label) throw new Error('配方候选选择目录不完整')
+      return { value: option.value as string | null, label: option.label }
+    }),
+    routingModes: requiredArray(row, 'routing_modes', 'Recipe stage').map(string),
+    decisionPolicy: row.decision_policy === null ? null : string(row.decision_policy),
   } }),
   approvalOptions: requiredCatalog(raw, 'approval_options', 'ProductionRecipe options'),
+  interactionModeOptions: requiredCatalog(raw, 'interaction_mode_options', 'ProductionRecipe options'),
+  fieldReviewPolicyOptions: requiredArray(raw, 'field_review_policy_options', 'ProductionRecipe options').map(object),
+  sourceKindOptions: requiredCatalog(raw, 'source_kind_options', 'ProductionRecipe options'),
+  structureNodeOptions: requiredCatalog(raw, 'structure_node_options', 'ProductionRecipe options'),
+  textOutputOptions: adaptRecipeTextOutputOptions(raw),
+  parameterPolicyOptions: requiredCatalog(raw, 'parameter_policy_options', 'ProductionRecipe options'),
+  referenceSourceOptions: requiredArray(raw, 'reference_source_options', 'ProductionRecipe options').map(value => {
+    const row = platformRecord(value)
+    if (['value','label','kind','scope_kind','stage_key'].some(key=>typeof row[key] !== 'string' || !row[key]) || typeof row.paired !== 'boolean') throw new Error('配方参考来源目录不完整')
+    return { value: String(row.value), label: String(row.label), kind: String(row.kind), scopeKind: String(row.scope_kind), stageKey: String(row.stage_key), paired: row.paired }
+  }),
+  parameterSourceOptions: requiredArray(raw, 'parameter_source_options', 'ProductionRecipe options').map(value => {
+    const row = platformRecord(value)
+    if (['selector_key','label','scope_kind','type','unit','source_kind','description'].some(key => typeof row[key] !== 'string' || !row[key])
+      || ['parameter_key','stage_key'].some(key=>row[key] !== null && (typeof row[key] !== 'string' || !row[key]))) throw new Error('配方参数来源目录不完整')
+    return { selectorKey: String(row.selector_key), label: String(row.label), scopeKind: String(row.scope_kind), type: String(row.type), unit: String(row.unit),
+      sourceKind: String(row.source_kind), parameterKey: row.parameter_key as string | null, stageKey: row.stage_key as string | null, description: String(row.description) }
+  }),
+  scopeOptions: requiredCatalog(raw, 'scope_options', 'ProductionRecipe options'),
   routingModeOptions: requiredCatalog(raw, 'routing_mode_options', 'ProductionRecipe options'),
   presets: requiredArray(raw, 'presets', 'ProductionRecipe options').map((item) => { const row = platformRecord(item); return {
     ...adaptFormCatalogOption(row),
     stages: Array.isArray(row.stages) ? row.stages.map(object) : [],
   } }),
-}; const stageValues = new Set(result.stageOptions.map((item) => item.value)); if (
+}; if (Object.values(result.effectiveLimits).some(value=>!Number.isSafeInteger(value)||value<1)) {
+  throw new Error('ProductionRecipe options 缺少有效的 effective_limits.max_variants / max_routing_routes / max_generation_tasks')
+}
+const stageValues = new Set(result.stageOptions.map((item) => item.value)); if (
   !Number.isSafeInteger(result.definitionSchemaVersion) || result.definitionSchemaVersion < 1
   || !result.stageOptions.length || stageValues.size !== result.stageOptions.length
-  || result.stageOptions.some((item) => !item.value || !item.modes.length || item.modes.some((mode) => !mode))
+  || result.stageOptions.some((item) => !item.value || !item.label || typeof item.repeatable !== 'boolean' || !item.modes.length || item.modes.some((mode) => !mode)
+    || item.repeatable && !item.candidateEvaluatorOptions.length)
   || !result.presets.length || result.presets.some((item) => !item.value || !item.label || !item.stages.length)
 ) throw new Error('ProductionRecipe options 的结构版本、阶段或预设目录不完整'); return result }
-const adaptProductionPromptProfileRequirement = (value: unknown): ProductionPromptProfileRequirement => {
-  const raw = platformRecord(value)
-  return {
-    operation: string(raw.operation),
-    mode: string(raw.mode),
-    choices: (Array.isArray(raw.choices) ? raw.choices : []).map((choiceValue) => {
-      const choice = platformRecord(choiceValue)
-      return {
-        bindingId: string(choice.binding_id),
-        bindingKey: string(choice.binding_key),
-        bindingName: string(choice.binding_name),
-        promptProfileVersionId: string(choice.prompt_profile_version_id),
-        profileKey: string(choice.profile_key),
-        profileVersion: number(choice.profile_version),
-        profileName: string(choice.profile_name),
-        contractSha256: string(choice.contract_sha256),
-        priority: number(choice.priority),
-        bindingScope: string(choice.binding_scope),
-      }
-    }),
-  }
-}
-
-export const adaptProductionRecipeMediaRouteOptions = (value: unknown): ProductionRecipeMediaRouteOptions => {
-  const raw = platformRecord(value)
-  if (number(raw.schema_version) !== 2) throw new Error('不支持的媒体 route options 版本')
-  return {
-    schemaVersion: 2,
-    recipeVersionId: string(raw.recipe_version_id),
-    recipeDefinitionSha256: string(raw.recipe_definition_sha256),
-    routes: (Array.isArray(raw.routes) ? raw.routes : []).map((routeValue) => {
-      const route = platformRecord(routeValue)
-      return {
-        routeIndex: number(route.route_index),
-        workflowVersionId: string(route.workflow_version_id),
-        workflowLabel: string(route.workflow_label),
-        modelDeploymentId: string(route.model_deployment_id),
-        deploymentLabel: string(route.deployment_label),
-        modelIdentifier: string(route.model_identifier),
-        driverType: string(route.driver_type),
-        outputKinds: strings(route.output_kinds),
-        conditioningModes: adaptConditioningModes(route.conditioning_modes),
-        conditioningContractSha256: string(route.conditioning_contract_sha256),
-        mediaOperations: strings(route.media_operations),
-        isSelectable: boolean(route.is_selectable),
-        reasonCodes: strings(route.reason_codes),
-        reasons: strings(route.reasons),
-        promptProfileRequirements: (
-          Array.isArray(route.prompt_profile_requirements)
-            ? route.prompt_profile_requirements
-            : []
-        ).map(adaptProductionPromptProfileRequirement),
-      }
-    }),
-    bibleImageGeneration: raw.bible_image_generation === null || raw.bible_image_generation === undefined
-      ? null
-      : adaptProductionPromptProfileRequirement(raw.bible_image_generation),
-  }
-}
 const adaptStageRun = (value: unknown): StageRun => { const raw = platformRecord(value); return {
   ...entity(raw), stageKey: string(raw.stage_key), ordinal: number(raw.ordinal), mode: string(raw.mode), status: string(raw.status),
+  inputAmendmentPolicy: typeof raw.input_amendment_policy === 'string' ? raw.input_amendment_policy : null,
   approvalRequired: boolean(raw.approval_required), decisionPolicy: string(raw.decision_policy),
   decisionPolicySha256: string(raw.decision_policy_sha256),
   attemptCount: number(raw.attempt_count), inputReference: string(raw.input_reference),
@@ -2130,9 +2231,16 @@ const adaptStageRun = (value: unknown): StageRun => { const raw = platformRecord
   reasonCode: string(raw.reason_code), reason: string(raw.reason),
   routing: object(raw.routing), routingSha256: string(raw.routing_sha256), routingDecision: object(raw.routing_decision),
   routingDecisionSha256: string(raw.routing_decision_sha256), selectedRouteIndex: nullableNumber(raw.selected_route_index),
+  selectedVariantRouteIndex: nullableNumber(raw.selected_variant_route_index),
   approvedEstimatedCost: string(raw.approved_estimated_cost), approvedCostCurrency: string(raw.approved_cost_currency),
   selectionConfirmedAt: string(raw.selection_confirmed_at),
   startedAt: string(raw.started_at), finishedAt: string(raw.finished_at), approvalDecisions: strings(raw.approval_decisions),
+  artifactSelectionDecisions: (Array.isArray(raw.artifact_selection_decisions) ? raw.artifact_selection_decisions : []).map(value => {
+    const fact = platformRecord(value)
+    return { id: string(fact.id), variantGroup: string(fact.variant_group), revision: number(fact.revision),
+      artifact: string(fact.artifact), selectionMode: string(fact.selection_mode),
+      selectedBy: fact.selected_by === null ? null : string(fact.selected_by), createdAt: string(fact.created_at) }
+  }),
   approvalDecisionFacts: (Array.isArray(raw.approval_decision_facts) ? raw.approval_decision_facts : []).map((value) => {
     const fact = platformRecord(value)
     return {
@@ -2150,19 +2258,35 @@ export const adaptGeneratedArtifact = (value: unknown): GeneratedArtifact => { c
   storageBackend: string(raw.storage_backend), objectKey: string(raw.object_key), mimeType: string(raw.mime_type), sizeBytes: nullableNumber(raw.size_bytes),
   sha256: string(raw.sha256), manifestMetadataSha256: string(raw.manifest_metadata_sha256),
   previewUrl: string(raw.preview_url), downloadUrl: string(raw.download_url), comparisonParameters: object(raw.comparison_parameters),
-}; if ('manifest_metadata' in raw) result.manifestMetadata = object(raw.manifest_metadata); return result }
-export const adaptProductionRun = (value: unknown): ProductionRun => { const raw = platformRecord(value); const result: ProductionRun = {
+}; if ('manifest_metadata' in raw) result.manifestMetadata = object(raw.manifest_metadata)
+  if ('text_candidate' in raw) result.textCandidate = raw.text_candidate === null ? null : object(raw.text_candidate)
+  if ('manual_media_candidate' in raw) result.manualMediaCandidate = raw.manual_media_candidate === null ? null : object(raw.manual_media_candidate)
+  return result }
+export const adaptProductionRun = (value: unknown): ProductionRun => { const raw = platformRecord(value)
+  if (raw.plan_source !== 'manual' && raw.plan_source !== 'recipe') throw new Error('生产运行缺少明确的计划来源，不能按配方推断')
+  if ((raw.plan_source === 'manual' && raw.recipe_version != null) || (raw.plan_source === 'recipe' && !raw.recipe_version)) throw new Error('生产运行的来源与配方引用不一致')
+  const result: ProductionRun = {
+  planSource: raw.plan_source,
   ...entity(raw), project: string(raw.project), projectTitle: string(raw.project_title), scriptRevision: string(raw.script_revision),
   recipeVersion: string(raw.recipe_version), idempotencyKey: string(raw.idempotency_key), requestSha256: string(raw.request_sha256),
   status: string(raw.status), currentStageKey: string(raw.current_stage_key), blockedCode: string(raw.blocked_code), blockedReason: string(raw.blocked_reason),
-  allowExternalCalls: boolean(raw.allow_external_calls), budgetLimit: string(raw.budget_limit), costCurrency: string(raw.cost_currency),
+  allowExternalCalls: boolean(raw.allow_external_calls), costCurrency: string(raw.cost_currency),
   estimatedCostTotal: string(raw.estimated_cost_total), committedCostTotal: string(raw.committed_cost_total),
-  actualCostTotal: string(raw.actual_cost_total), releaseBundleId: string(raw.release_bundle_id), maxGenerationTasks: number(raw.max_generation_tasks),
+  actualCostTotal: string(raw.actual_cost_total), releaseBundleId: string(raw.release_bundle_id),
   generationTaskCount: number(raw.generation_task_count), configSnapshotSha256: string(raw.config_snapshot_sha256), inputSnapshotSha256: string(raw.input_snapshot_sha256),
   startedAt: string(raw.started_at), finishedAt: string(raw.finished_at),
 }; if ('config_revision' in raw) result.configRevision = string(raw.config_revision); if ('config_snapshot' in raw) result.configSnapshot = object(raw.config_snapshot)
+  if ('retry_context' in raw) {
+    if (raw.retry_context === null) result.retryContext = null
+    else {
+      try { result.retryContext = adaptRetryContext(raw.retry_context) }
+      catch { throw new Error('重试目标数据不完整，请重新读取') }
+    }
+  }
   if ('input_snapshot' in raw) result.inputSnapshot = object(raw.input_snapshot); if (Array.isArray(raw.stages)) result.stages = raw.stages.map(adaptStageRun)
-  if (Array.isArray(raw.artifacts)) result.artifacts = raw.artifacts.map(adaptGeneratedArtifact); return result }
+  if (Array.isArray(raw.artifacts)) result.artifacts = raw.artifacts.map(adaptGeneratedArtifact)
+  if ('execution_plan' in raw) result.executionPlan = adaptProductionPlanEnvelope(raw.execution_plan)
+  return result }
 
 export const adaptGenerationAttempt = (value: unknown): GenerationAttempt => { const raw = platformRecord(value); return {
   ...entity(raw), stageRun: string(raw.stage_run), unitKey: string(raw.unit_key), attemptNumber: number(raw.attempt_number),
@@ -2171,7 +2295,6 @@ export const adaptGenerationAttempt = (value: unknown): GenerationAttempt => { c
   providerRequestIdSha256: string(raw.provider_request_id_sha256), providerRequestIdSuffix: string(raw.provider_request_id_suffix),
   requestSha256: string(raw.request_sha256), requestSnapshotSchemaVersion: number(raw.request_snapshot_schema_version),
   requestSnapshotSizeBytes: number(raw.request_snapshot_size_bytes), requestSnapshotSha256: string(raw.request_snapshot_sha256),
-  repairOfAttemptId: string(raw.repair_of_attempt_id), retryFeedbackSha256: string(raw.retry_feedback_sha256),
   resultSha256: string(raw.result_sha256), estimatedCost: string(raw.estimated_cost), committedCost: string(raw.committed_cost),
   actualCost: string(raw.actual_cost), costCurrency: string(raw.cost_currency), errorCode: string(raw.error_code),
   remoteStatus: string(raw.remote_status), submissionStartedAt: string(raw.submission_started_at), submittedAt: string(raw.submitted_at),
@@ -2195,8 +2318,11 @@ export const adaptArtifactPreview = (value: unknown, taskId: string, outputIndex
 }
 
 export const presentPlatformStatus = (status: string): { label: string; tone: string } => {
+  if (status === 'awaiting_input') return { label: '等待人工操作', tone: 'warning' }
   const normalized = status.trim().toLowerCase()
   const known: Record<string, { label: string; tone: string }> = {
+    expired: { label: '已过期', tone: 'warning' },
+    preparing: { label: '准备请求', tone: 'info' }, dispatched: { label: '已派发', tone: 'info' }, awaiting_input: { label: '待补充输入', tone: 'warning' }, awaiting_review: { label: '待人工确认', tone: 'warning' },
     active: { label: '启用', tone: 'info' }, ready: { label: '就绪', tone: 'success' }, configured: { label: '已配置', tone: 'info' }, published: { label: '已发布', tone: 'info' }, validated: { label: '已校验', tone: 'success' }, confirmed: { label: '已确认', tone: 'success' }, preview: { label: '预览', tone: 'info' }, imported: { label: '已导入', tone: 'info' }, unconfigured: { label: '未配置', tone: 'warning' },
     succeeded: { label: '成功', tone: 'success' }, passed: { label: '通过', tone: 'success' }, fresh: { label: '证据有效', tone: 'success' }, selected: { label: '已选', tone: 'success' }, available: { label: '可用', tone: 'info' }, current: { label: '当前版本', tone: 'success' }, sealed: { label: '已封存', tone: 'success' }, released: { label: '已发行', tone: 'success' },
     running: { label: '运行中', tone: 'info' }, queued: { label: '排队中', tone: 'info' }, submitting: { label: '提交中', tone: 'info' }, submitted: { label: '已提交', tone: 'info' }, cancel_requested: { label: '取消中', tone: 'warning' }, uncertain: { label: '待消歧', tone: 'danger' }, draft: { label: '草稿', tone: 'muted' }, declared: { label: '已声明', tone: 'muted' }, inactive: { label: '停用', tone: 'muted' }, disabled: { label: '禁用', tone: 'muted' }, retired: { label: '已退役', tone: 'muted' }, not_run: { label: '未执行', tone: 'muted' }, not_applicable: { label: '不适用', tone: 'muted' }, unavailable: { label: '不可用', tone: 'warning' },

@@ -9,10 +9,13 @@ from copy import deepcopy
 from string import Formatter
 import json
 import re
+from django.core.exceptions import ValidationError
 
 from studio.services.prompt_compiler_contract import PromptBuildError
 from studio.services.workflow import aligned_frames, WorkflowBuildError
 from studio.services.security_boundaries import boundary_int
+from studio.services.reference_context_facts import ReferenceContextFacts, validate_reference_context_facts
+from studio.services.reference_rendering_inputs import validate_unit_text_bindings
 
 
 RENDERING_FIELDS = {
@@ -32,9 +35,10 @@ RENDERING_FIELDS = {
 }
 RENDERING_FIELDS["shot"] = (RENDERING_FIELDS["shot"][0], (*RENDERING_FIELDS["shot"][1], "requires_first_frame_continuity", "requires_last_frame_continuity"))
 RENDERING_FIELDS["reviewed_shot"] = ("已审核逐镜贡献", RENDERING_FIELDS["shot"][1])
-RENDERING_FIELDS["dialogue"] = ("对白", (*RENDERING_FIELDS["dialogue"][1], "subject", "voice_profile"))
+RENDERING_FIELDS["dialogue"] = ("对白", (*RENDERING_FIELDS["dialogue"][1], "subject", "voice_profile",
+    "speaker_reference_label", "speaker_index", "start_timecode", "end_timecode"))
 RENDERING_FIELDS["voiceover_dialogue"] = ("画外音对白", RENDERING_FIELDS["dialogue"][1])
-REFERENCE_FACTS = (*RENDERING_FIELDS["reference"][1], "relationship", "usage", "shots")
+REFERENCE_FACTS = (*RENDERING_FIELDS["reference"][1], "relationship", "usage", "shots", "source_labels")
 RENDERING_FIELDS["reference"] = ("参考素材声明", REFERENCE_FACTS)
 RENDERING_FIELDS["entity_reference"] = ("参考主体声明", REFERENCE_FACTS)
 RENDERING_FIELDS["retention"] = ("参考保留关系", REFERENCE_FACTS)
@@ -63,12 +67,37 @@ def rendering_options() -> list[dict]:
 
 
 def validate_rendering_policy(value: object) -> dict:
-    if not isinstance(value, dict) or set(value) != {"templates", "separator", "list_prefix", "prompt_template_key", "reference_rules", "task_separator", "unreferenced_task"}:
-        raise PromptBuildError("参考上下文缺少完整渲染配置；请创建后继草稿并配置模板、分隔符和模板标识")
+    required = {"templates", "separator", "list_prefix", "prompt_template_key", "reference_rules", "task_separator", "unreferenced_task", "unit_text_bindings"}
+    if not isinstance(value, dict) or not required <= set(value) or set(value) - required - {"reference_layout"}:
+        raise PromptBuildError("参考上下文缺少完整渲染配置；请创建后继草稿并配置模板、分隔符、模板标识及明确的原文映射（可为空）")
+    try:
+        validate_unit_text_bindings(value["unit_text_bindings"])
+    except ValidationError as exc:
+        raise PromptBuildError(str(exc)) from exc
     templates = value["templates"]
     if not isinstance(templates, dict) or set(templates) != set(RENDERING_FIELDS):
         raise PromptBuildError("参考上下文模板字段必须与服务端目录一致")
     limit = boundary_int("security.prompt_profile.field_text_max_characters")
+    layout = value.get("reference_layout")
+    if "reference_layout" in value:
+        if not isinstance(layout, dict) or set(layout) != {"subject_label_template", "source_separator", "summary_reference_template", "shot_reference_template"}:
+            raise PromptBuildError("分段参考布局必须完整声明主体编号、来源分隔符及摘要/逐镜参考模板")
+        if any(not isinstance(text, str) or len(text) > limit for text in layout.values()):
+            raise PromptBuildError("分段参考布局必须为有界文本")
+        if not re.fullmatch(r"<[A-Za-z][A-Za-z_ -]* \{index\}>", layout["subject_label_template"]):
+            raise PromptBuildError("主体编号模板须为 <名称 {index}>；编号由本次实际主体分配")
+        if not layout["source_separator"]:
+            raise PromptBuildError("主体来源分隔符不能为空")
+        for key in ("summary_reference_template", "shot_reference_template"):
+            try:
+                parsed = list(Formatter().parse(layout[key]))
+            except ValueError as exc:
+                raise PromptBuildError(f"{key} 花括号格式无效") from exc
+            if any(name is not None and (name not in REFERENCE_FACTS or spec or conversion)
+                   for _, name, spec, conversion in parsed):
+                raise PromptBuildError(f"{key} 仅允许参考事实目录中的简单占位符")
+            if layout[key].strip() and "label" not in {name for _, name, _, _ in parsed}:
+                raise PromptBuildError(f"{key} 非空时必须保留 {{label}}")
     rules = value["reference_rules"]
     if not isinstance(rules, list) or len(rules) > boundary_int("security.contract_complexity.prompt_profile.value_options_max_items"):
         raise PromptBuildError("参考用途规则必须是有界列表")
@@ -97,6 +126,8 @@ def validate_rendering_policy(value: object) -> dict:
         for _, name, spec, conversion in fields:
             if name is not None and (name not in allowed or spec or conversion):
                 raise PromptBuildError(f"渲染模板 {key} 仅允许目录中的简单占位符；不支持表达式或格式指令")
+        if key == "entity_reference" and layout is not None and "source_labels" not in {name for _, name, _, _ in fields}:
+            raise PromptBuildError("启用主体编号时，主体声明必须包含 {source_labels} 以说明真实素材来源")
         if key in {"reference", "entity_reference", "retention", "reference_usage", "shot", "reviewed_shot", "summary", "shot_opening", "shot_transition"} and not template.strip():
             raise PromptBuildError(f"必需的渲染模板 {key} 不能为空")
         if key in {"reference", "entity_reference", "retention", "reference_usage"} and not any(name == "label" for _, name, _, _ in fields):
@@ -118,6 +149,17 @@ def validate_rendering_policy(value: object) -> dict:
         raise PromptBuildError("必须明确填写本策略的提示词模板标识")
     if len(value["prompt_template_key"]) > limit:
         raise PromptBuildError("提示词模板标识超过字段上限")
+    from studio.services.prompt_normalization_contract import PromptNormalizationContractError, validate_director_text_characters
+    authored_texts = [*templates.values(), *(value[key] for key in (
+        "separator", "list_prefix", "prompt_template_key", "task_separator", "unreferenced_task"))]
+    authored_texts.extend(text for rule in rules for text in rule.values())
+    if layout is not None:
+        authored_texts.extend(layout.values())
+    try:
+        for text in authored_texts:
+            validate_director_text_characters(text)
+    except PromptNormalizationContractError as exc:
+        raise PromptBuildError("参考渲染配置包含禁止的控制或 Unicode 格式字符") from exc
     return deepcopy(value)
 
 
@@ -129,8 +171,12 @@ def _text(value: object) -> str:
     return str(value)
 
 
+def _join_reference_text(separator, values):
+    return separator.join(values)
+
+
 def render_reference_template(template: str, names, facts: dict) -> str:
-    """Shared scalar replacement after policy validation; no recursive expansion."""
+    """Render declared values verbatim; no language-specific shadow copy."""
     return template.format_map({name: _text(facts.get(name)) for name in names}).strip()
 
 
@@ -140,36 +186,46 @@ def _timecode(milliseconds: int) -> str:
     return f"{minutes:02d}:{seconds:02d}.{millis:03d}"
 
 
-def compile_reference_context(context, rendering: dict) -> dict:
+def compile_reference_context(context: ReferenceContextFacts, rendering: dict, *, result_fields=None) -> dict:
     """Use canonical, reviewed facts. Templates never execute code or invent assets."""
-    from studio.services.prompt_profiles import media_profile_sources, _translated_media_value, resolved_media_override
-    from studio.services.dialogue import validate_dialogue_timing
-    from studio.services.visual_reference_policy import character_requires_visual_reference
-
+    validate_reference_context_facts(context)
     policy = validate_rendering_policy(rendering)
+    from studio.services.source_projection_primitives import SOURCE_PROJECTION_PRIMITIVES, reference_requires_units
+    available = {primitive.result_field for primitive in SOURCE_PROJECTION_PRIMITIVES.values()}
+    selected = available if result_fields is None else set(result_fields)
+    if not selected or selected - available:
+        raise PromptBuildError("参考组装必须选择已声明的原语输出")
+    needs_units = reference_requires_units(prompt_type=context.prompt_type, result_fields=selected, rendering=policy)
+    if needs_units and not context.ordered_units:
+        raise PromptBuildError("所选参考输出需要明确的有序单元")
     separator = policy["separator"]
+    from studio.services.reference_subject_labels import reference_subject_labels
+    subject_labels = reference_subject_labels(context, policy)
+    layout = policy.get("reference_layout")
+    # Clip-local voice order is independent of project IDs and reference slots.
+    # Same-time speech follows the explicit dialogue-list order.
+    speaker_indices = {}
+    for unit in context.ordered_units:
+        for entry in sorted(unit.dialogue, key=lambda row: row["start_ms"]):
+            if entry["speaker_id"]:
+                speaker_indices.setdefault(entry["speaker_id"], len(speaker_indices) + 1)
 
     def render(key: str, **facts) -> str:
         return render_reference_template(policy["templates"][key], RENDERING_FIELDS[key][1], facts)
 
-    def translated(scope, entity, attribute):
-        return _translated_media_value(context.project, scope_type=scope, scope_id=entity.id,
-            field_key=f"{scope}.{attribute}", source=getattr(entity, attribute, ""))
-
     references = deepcopy(list(context.reference_bindings))
     mode_contract = context.conditioning_mode_contract
-    if not isinstance(mode_contract, dict) or mode_contract.get("key") != context.mode:
+    # An image Workflow explicitly has no conditioning mode; its frozen input
+    # ports own reference quantities. Do not fabricate a video mode to render it.
+    image_without_mode = context.prompt_type == "image" and context.mode == "" and mode_contract is None
+    if not image_without_mode and (not isinstance(mode_contract, dict) or mode_contract.get("key") != context.mode):
         raise PromptBuildError("参考上下文必须使用与请求模式一致的冻结数量合同")
-    if any(shot.episode.project_id != context.project.id for shot in context.shots):
-        raise PromptBuildError("参考上下文的分镜必须属于当前项目")
     durations = []
-    for shot in context.shots:
-        duration = context.duration_overrides.get(str(shot.id), shot.duration_ms)
+    for unit in context.ordered_units:
+        duration = unit.duration_ms
         if type(duration) is not int or duration <= 0:
             raise PromptBuildError("参考上下文的每个镜头必须有明确的正整数时长")
         durations.append(duration)
-    if not durations:
-        raise PromptBuildError("参考上下文至少需要一个镜头")
     duration_seconds = sum(durations) / 1000
     if context.prompt_type == "video":
         if not isinstance(context.frame_policy, dict):
@@ -181,20 +237,21 @@ def compile_reference_context(context, rendering: dict) -> dict:
 
     fields = {"subject_definitions": [], "retention_analysis": [], "detailed_description": [],
               "overall_soundscape": "", "non_diegetic_music": ""}
-    usage, entities = {}, {}
-    for index, shot in enumerate(context.shots, 1):
-        for category, rows in (("character", shot.characters.all()), ("prop", shot.props.all()),
-                               ("scene", [shot.scene] if shot.scene_id else [])):
-            for entity in rows:
-                key = (category, str(entity.id))
-                entities[key] = entity
-                usage.setdefault(key, []).append(index)
+    usage = {}
+    entities = {(subject.category, subject.identity): subject for subject in context.subject_facts}
+    for index, unit in enumerate(context.ordered_units, 1):
+        for key in unit.subject_keys:
+            usage.setdefault(key, []).append(index)
 
     labels = set()
     reference_facts = []
+    declared_subjects = {}
     rule_index = {(rule["category"], rule["purpose"]): rule for rule in policy["reference_rules"]}
     def used_in(item, index):
-        return not item.get("entity_id") or index in usage.get((item.get("category"), str(item.get("entity_id"))), [])
+        if "unit_keys" in item and context.ordered_units[index - 1].unit_key not in item["unit_keys"]:
+            return False
+        subject_category = item.get("entity_category", item.get("category"))
+        return not item.get("entity_id") or index in usage.get((subject_category, str(item.get("entity_id"))), [])
 
     def record_reference(facts, item):
         identity = (facts["category"], facts["purpose"])
@@ -203,8 +260,20 @@ def compile_reference_context(context, rendering: dict) -> dict:
         rule = rule_index[identity]
         facts.update({key: rule[key] for key in ("task", "relationship", "usage")})
         reference_facts.append((item, facts))
-        fields["subject_definitions"].append(render("entity_reference" if facts["subject"] else "reference", **facts))
-        fields["retention_analysis"].append(render("retention", **facts))
+        # Several physical sources may define one exact subject. Do not merge
+        # contradictory roles or guess that two equal names are one identity.
+        previous = declared_subjects.get(facts["label"])
+        if previous is not None:
+            if any(previous[key] != facts[key] for key in ("category", "purpose", "relationship", "usage", "guidance")):
+                raise PromptBuildError("同一主体的参考用途不一致；请明确各来源职责后再组装")
+            if previous["subject"] != facts["subject"]:
+                raise PromptBuildError("同一主体的参考名称不一致；请核对来源投影的主体名称")
+        else:
+            declared_subjects[facts["label"]] = facts
+            if "subject_definitions" in selected:
+                fields["subject_definitions"].append(render("entity_reference" if facts["subject"] else "reference", **facts))
+            if "retention_analysis" in selected:
+                fields["retention_analysis"].append(render("retention", **facts))
 
     for item in references:
         label = item.get("input_label")
@@ -212,16 +281,17 @@ def compile_reference_context(context, rendering: dict) -> dict:
             raise PromptBuildError("参考上下文素材标签缺失或重复")
         labels.add(label)
         category = item.get("category", "")
-        key = (category, str(item.get("entity_id", "")))
+        key = (item.get("entity_category", category), str(item.get("entity_id", "")))
         entity = entities.get(key)
-        attributes = {"character": ("visual_identity", "wardrobe", "body_language"),
-                      "scene": ("visual_identity", "location", "time_of_day", "lighting", "color_palette"),
-                      "prop": ("visual_identity", "material", "distinctive_marks", "continuity_state")}.get(category, ())
-        description = separator.join(filter(None, (translated(category, entity, attr) for attr in attributes))) if entity else item.get("description", "")
-        facts = {"label": label, "subject": item.get("entity_label", ""), "category": category,
+        logical = subject_labels.get(key)
+        description = separator.join(filter(None, entity.description_parts)) if entity else item.get("description", "")
+        facts = {"label": logical["label"] if logical else label, "subject": item.get("entity_label", ""), "category": category,
+                 "source_labels": layout["source_separator"].join(logical["source_labels"]) if logical else label,
                  "purpose": item.get("purpose", ""), "description": description,
-                 "guidance": item.get("prompt_hint", ""), "source_kind": "asset", "parent_label": "",
-                 "shots": separator.join(str(index) for index in range(1, len(durations) + 1) if used_in(item, index))}
+                 "guidance": item.get("prompt_hint", ""),
+                 "source_kind": "generated_artifact" if item.get("artifact_id") else "asset", "parent_label": "",
+                 "shots": separator.join(str(index) for index in range(1, len(durations) + 1)
+                    if (context.ordered_units[index - 1].unit_key in logical["unit_keys"] if logical else used_in(item, index)))}
         record_reference(facts, item)
         paired_label = item.get("audio_input_label")
         if paired_label:
@@ -229,33 +299,41 @@ def compile_reference_context(context, rendering: dict) -> dict:
                 raise PromptBuildError("配套音频标签无效或重复")
             labels.add(paired_label)
             record_reference({
-                **facts, "label": paired_label, "subject": "", "category": "audio", "purpose": item.get("audio_purpose", ""),
+                **facts, "label": paired_label, "subject": item.get("audio_use", {}).get("entity_label", ""),
+                "source_labels": paired_label,
+                "category": "audio", "purpose": item.get("audio_purpose", ""),
                 "parent_label": label, "source_kind": "embedded_audio" if item.get("use_embedded_audio") else "paired_audio",
                 "description": item.get("audio_description", ""), "guidance": item.get("audio_prompt_hint", ""),
             }, item)
     for group, template in (("subject_definitions", "empty_references"), ("retention_analysis", "empty_retention")):
-        if not fields[group]:
+        if group in selected and not fields[group]:
             empty = render(template)
             fields[group] = [empty] if empty else []
 
     consumed = set()
+    def render_usage(facts, section):
+        if layout is None:
+            return render("reference_usage", **facts)
+        return render_reference_template(layout[f"{section}_reference_template"], REFERENCE_FACTS, facts)
+
+    def unique_reference_facts(rows):
+        return list({row["label"]: row for row in rows}.values())
+
     sounds, music = [], []
     elapsed = 0
-    for index, (shot, duration) in enumerate(zip(context.shots, durations, strict=True), 1):
-        canonical = media_profile_sources(project=context.project, shots=[shot], include_audio=context.include_audio,
-            effective_durations_ms={str(shot.id): duration}, reference_bindings=references)
-        if index == 1:
-            color_script = _translated_media_value(context.project, scope_type="project", scope_id=context.project.id,
-                field_key="project.production_settings.color_script",
-                source=(context.project.production_settings or {}).get("color_script", ""))
-            style = render("style", visual_prompt=canonical["style.visual_prompt"], color_script=color_script)
+    for index, (unit, duration) in enumerate(zip(context.ordered_units, durations, strict=True), 1):
+        if not selected.intersection({"detailed_description", "overall_soundscape", "non_diegetic_music"}):
+            break
+        canonical = unit.render_values
+        if index == 1 and "detailed_description" in selected:
+            style = render("style", visual_prompt=canonical["visual_prompt"], color_script=context.color_script)
             if style:
                 fields["detailed_description"].append(style)
 
-        def contribution(selector, template, placeholder):
-            key = (str(shot.id), selector)
+        def contribution(selector, template, placeholder, raw_value):
+            key = (unit.unit_key, selector)
             if key not in context.generation_contributions:
-                return canonical[selector]
+                return raw_value
             if selector in {"shot.sound_effects", "shot.music"} and not context.include_audio:
                 raise PromptBuildError(f"当前合同不输出音频，不能丢弃已审核的 {selector} 贡献")
             placeholders = {name for _, name, _, _ in Formatter().parse(policy["templates"][template])}
@@ -264,85 +342,109 @@ def compile_reference_context(context, rendering: dict) -> dict:
             consumed.add(key)
             return context.generation_contributions[key]
 
-        shot_template = "reviewed_shot" if (str(shot.id), "shot.detailed_description") in context.generation_contributions else "shot"
-        description = contribution("shot.detailed_description", shot_template, "description")
-        sound = contribution("shot.sound_effects", "sound", "description")
-        score = contribution("shot.music", "music", "description")
-        dialogue_text = []
-        if context.include_audio:
-            if shot.dialogue and "dialogue" not in {name for _, name, _, _ in Formatter().parse(policy["templates"][shot_template])}:
-                raise PromptBuildError("当前逐镜模板未引用 {dialogue}，不能丢弃镜头对白")
-            for dialogue_index, entry in enumerate(validate_dialogue_timing(shot.dialogue or [], duration_ms=duration)):
-                speaker = next((row for row in shot.characters.all() if row.stable_speaker_id == entry["speaker_id"]), None)
-                is_voiceover = entry.get("voiceover", False) or (speaker is not None and not character_requires_visual_reference(speaker))
-                template = "voiceover_dialogue" if is_voiceover else "dialogue"
-                if not policy["templates"][template].strip():
-                    raise PromptBuildError("当前镜头包含对白，不能使用空的对白模板")
-                delivery = _translated_media_value(context.project, scope_type="shot", scope_id=shot.id,
-                    field_key=f"shot.dialogue.{dialogue_index}.delivery", source=entry.get("delivery", ""))
-                subject = next((item.get("entity_label", "") for item in references if speaker and item.get("category") == "character" and item.get("entity_id") == str(speaker.id)), "")
-                dialogue_text.append(render(template, **{**entry, "delivery": delivery, "language": context.project.language,
-                    "subject": subject, "voice_profile": translated("character", speaker, "voice_profile") if speaker else "",
-                    "start_ms": entry.get("start_ms", 0), "end_ms": entry.get("end_ms", duration), "voiceover": is_voiceover}))
-        used_facts = [facts for item, facts in reference_facts if used_in(item, index)]
-        used_labels = [facts["label"] for facts in used_facts]
-        voices = separator.join(filter(None, (translated("character", row, "voice_profile")
-                      for row in shot.characters.all()))) if context.include_audio else ""
-        marker = render("shot_opening" if index == 1 else "shot_transition", index=index,
-                        timecode=_timecode(elapsed), start_seconds=elapsed / 1000)
-        fields["detailed_description"].append(render(shot_template, index=index, start_seconds=elapsed / 1000,
-            timecode=_timecode(elapsed), shot_marker=marker,
-            reference_usage=separator.join(render("reference_usage", **facts) for facts in used_facts),
-            duration_seconds=duration / 1000, narrative=canonical["shot.narrative"], description=description,
-            action=canonical["shot.action"], camera=canonical["shot.camera"],
-            dialogue=separator.join(dialogue_text), references=separator.join(used_labels),
-            subjects=canonical["request.subject"], environment=canonical["request.environment"],
-            lighting=canonical["request.lighting"], color_palette=canonical["request.color_palette"],
-            voice_profiles=voices, continuity=translated("shot", shot, "continuity_notes"),
-            requires_first_frame_continuity=shot.requires_first_frame_continuity,
-            requires_last_frame_continuity=shot.requires_last_frame_continuity,
-            subject_labels=separator.join(dict.fromkeys(facts["subject"] for facts in used_facts if facts["subject"]))))
-        if sound:
-            sounds.append(render("sound", index=index, description=sound))
-        ambient = translated("scene", shot.scene, "ambient_sound") if shot.scene_id else ""
-        if ambient and ambient != sound:
-            sounds.append(render("sound", index=index, description=ambient))
-        if score:
-            music.append(render("music", index=index, description=score))
+        if "detailed_description" in selected:
+            shot_template = "reviewed_shot" if (unit.unit_key, "shot.detailed_description") in context.generation_contributions else "shot"
+            description = contribution("shot.detailed_description", shot_template, "description", canonical["description"])
+            dialogue_text = []
+            if context.include_audio:
+                if unit.dialogue and "dialogue" not in {name for _, name, _, _ in Formatter().parse(policy["templates"][shot_template])}:
+                    raise PromptBuildError("当前逐镜模板未引用 {dialogue}，不能丢弃镜头对白")
+                for dialogue_index, entry in enumerate(unit.dialogue):
+                    template = "voiceover_dialogue" if entry["voiceover"] else "dialogue"
+                    if not policy["templates"][template].strip():
+                        raise PromptBuildError("当前镜头包含对白，不能使用空的对白模板")
+                    required = {name for _, name, _, _ in Formatter().parse(policy["templates"][template])}
+                    language = entry.get("language", "")
+                    if "language" in required and not language.strip():
+                        raise PromptBuildError(f"单元 {unit.unit_key} 的 dialogue[{dialogue_index}].language 未声明；"
+                            "当前对白模板需要本句语言，不能用项目语言或导演输出语言代替")
+                    speaker_label = ""
+                    if "speaker_reference_label" in required:
+                        key = tuple(entry.get("speaker_subject_key", ()))
+                        binding = subject_labels.get(key)
+                        if binding is None or unit.unit_key not in binding["unit_keys"]:
+                            raise PromptBuildError("对白模板需要发言人参考标签，但缺少本单元确切主体与参考素材的绑定")
+                        speaker_label = binding["label"]
+                    if "speaker_index" in required and not entry["speaker_id"].strip():
+                        raise PromptBuildError("对白模板需要本次发言序号，但未提供稳定说话人标识")
+                    dialogue_text.append(render(template, **{**entry, "language": language,
+                        "speaker_reference_label": speaker_label, "speaker_index": speaker_indices.get(entry["speaker_id"]),
+                        "start_timecode": _timecode(elapsed + entry["start_ms"]),
+                        "end_timecode": _timecode(elapsed + entry["end_ms"])}))
+            used_facts = unique_reference_facts(facts for item, facts in reference_facts if used_in(item, index))
+            used_labels = [facts["label"] for facts in used_facts]
+            voices = separator.join(filter(None, unit.voice_profiles)) if context.include_audio else ""
+            marker = render("shot_opening" if index == 1 else "shot_transition", index=index,
+                            timecode=_timecode(elapsed), start_seconds=elapsed / 1000)
+            fields["detailed_description"].append(render(shot_template, index=index, start_seconds=elapsed / 1000,
+                timecode=_timecode(elapsed), shot_marker=marker,
+                reference_usage=_join_reference_text(separator, filter(None, (render_usage(facts, "shot") for facts in used_facts))),
+                duration_seconds=duration / 1000, narrative=canonical["narrative"], description=description,
+                action=canonical["action"], camera=canonical["camera"],
+                dialogue=_join_reference_text(separator, dialogue_text), references=separator.join(used_labels),
+                subjects=canonical["subjects"], environment=canonical["environment"],
+                lighting=canonical["lighting"], color_palette=canonical["color_palette"],
+                voice_profiles=voices, continuity=unit.continuity_notes,
+                requires_first_frame_continuity=unit.requires_first_frame_continuity,
+                requires_last_frame_continuity=unit.requires_last_frame_continuity,
+                subject_labels=separator.join(dict.fromkeys((facts["label"] if layout else facts["subject"]) for facts in used_facts if facts["subject"]))))
+        if "overall_soundscape" in selected:
+            sound = contribution("shot.sound_effects", "sound", "description", canonical["sound_effects"])
+            if sound:
+                sounds.append(render("sound", index=index, description=sound))
+            ambient = unit.ambient_sound
+            if ambient and ambient != sound:
+                sounds.append(render("sound", index=index, description=ambient))
+        if "non_diegetic_music" in selected:
+            score = contribution("shot.music", "music", "description", canonical["music"])
+            if score:
+                music.append(render("music", index=index, description=score))
         elapsed += duration
-    if context.extra_direction:
+    if "detailed_description" in selected and context.extra_direction:
         direction = render("direction", description=context.extra_direction)
         if not direction:
             raise PromptBuildError("存在全局导演要求，但未配置对应渲染模板")
         fields["detailed_description"].append(direction)
-    overall = resolved_media_override(context.project, context.shots, "sound_effects", context.overall_soundscape)
-    background = resolved_media_override(context.project, context.shots, "music", context.non_diegetic_music)
-    fields["overall_soundscape"] = (separator.join(dict.fromkeys(filter(None, [overall, *sounds])))
-                                   if context.include_audio else render("silent_sound"))
-    fields["non_diegetic_music"] = (separator.join(dict.fromkeys(filter(None, [background, *music])))
-                                  if context.include_audio else render("silent_music"))
-    fields["summary"] = render("summary", mode=context.mode, shot_count=len(durations),
-        duration_seconds=f"{duration_seconds:.3f}".rstrip("0").rstrip("."), reference_count=len(labels), include_audio=context.include_audio,
-        task_types=policy["task_separator"].join(dict.fromkeys(facts["task"] for _, facts in reference_facts)) if reference_facts else policy["unreferenced_task"],
-        reference_relationships=separator.join(render("reference_usage", **facts) for _, facts in reference_facts))
+    overall = context.overall_soundscape
+    background = context.non_diegetic_music
+    if "overall_soundscape" in selected:
+        fields["overall_soundscape"] = (_join_reference_text(separator, dict.fromkeys(filter(None, [overall, *sounds])))
+                                       if context.include_audio else render("silent_sound"))
+    if "non_diegetic_music" in selected:
+        fields["non_diegetic_music"] = (_join_reference_text(separator, dict.fromkeys(filter(None, [background, *music])))
+                                      if context.include_audio else render("silent_music"))
+    if "summary" in selected:
+        fields["summary"] = render("summary", mode=context.mode, shot_count=len(durations),
+            duration_seconds=f"{duration_seconds:.3f}".rstrip("0").rstrip("."), reference_count=len(labels), include_audio=context.include_audio,
+            task_types=policy["task_separator"].join(dict.fromkeys(facts["task"] for _, facts in reference_facts)) if reference_facts else policy["unreferenced_task"],
+            reference_relationships=_join_reference_text(separator, filter(None, (render_usage(facts, "summary")
+                for facts in unique_reference_facts(facts for _, facts in reference_facts)))))
+    fields = {key: value for key, value in fields.items() if key in selected}
+    fields = {key: [str(item) for item in value] if isinstance(value, list) else str(value)
+        for key, value in fields.items()}
     return {"fields": fields, "consumed_contributions": frozenset(consumed),
             "execution_facts": {"effective_conditioning_mode": context.mode,
-                                "prompt_template_key": policy["prompt_template_key"]}}
+                                "prompt_template_key": policy["prompt_template_key"],
+                                **({"reference_subject_bindings": list(subject_labels.values())} if subject_labels else {})}}
 
 
 def reference_context_advisories(context, assembly: dict, config: dict) -> list[str]:
     """Diagnostics only; absence disables a hint, never an integrity check."""
+    if config.get("short_shot_action_density") or config.get("motion_camera_reference_guidance"):
+        if context is None:
+            raise PromptBuildError("配置的质量建议需要明确的参考单元事实")
+        validate_reference_context_facts(context)
     warnings = []
     density = config.get("short_shot_action_density")
     if density:
-        for shot in context.shots:
-            duration = context.duration_overrides.get(str(shot.id), shot.duration_ms)
-            action = " ".join(dict.fromkeys(value for value in (shot.narrative, shot.action) if value))
+        for unit in context.ordered_units:
+            duration = unit.duration_ms
+            action = " ".join(dict.fromkeys(value for value in (unit.render_values["narrative"], unit.render_values["action"]) if value))
             if duration <= density["maximum_duration_ms"] and (
                 len(action) > density["maximum_action_characters"]
                 or len(re.findall(r"[,，;；]", action)) >= density["minimum_clause_separators"]
             ):
-                warnings.append(f"镜头 {shot.number} 的动作密度超过本策略建议值，可拆分镜头或减少同时动作。")
+                warnings.append(f"单元 {unit.unit_key} 的动作密度超过本策略建议值，可拆分单元或减少同时动作。")
     overlap = config.get("positive_negative_token_overlap")
     if overlap:
         channels = assembly.get("channels") or {}

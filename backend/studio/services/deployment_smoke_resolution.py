@@ -14,7 +14,6 @@ from studio.models import (
     ModelDeploymentSmokeAttemptResolution,
 )
 from studio.services.deployment_smoke_contract import (
-    DEPLOYMENT_SMOKE_OPERATIONS,
     DEPLOYMENT_SMOKE_SUBMISSION_SEMANTICS,
 )
 from studio.services.json_contracts import json_contract
@@ -24,6 +23,14 @@ from studio.services.content_contracts import normalize_audit_note
 
 def _deployment_smoke_snapshot_max_bytes() -> int:
     return boundary_int("security.snapshot.stage_max_bytes")
+
+
+def has_operator_resolution(attempt) -> bool:
+    outcomes = ModelDeploymentSmokeAttemptResolution.OPERATOR_OUTCOMES
+    cached = getattr(attempt, "_prefetched_objects_cache", {}).get("resolutions")
+    if cached is not None:
+        return any(row.outcome in outcomes for row in cached)
+    return attempt.resolutions.filter(outcome__in=outcomes).exists()
 
 
 def unresolved_deployment_smoke_attempt(
@@ -39,8 +46,7 @@ def unresolved_deployment_smoke_attempt(
             ModelDeploymentSmokeAttempt.Status.SUBMITTING,
             ModelDeploymentSmokeAttempt.Status.UNCERTAIN,
         ),
-        resolutions__isnull=True,
-    )
+    ).without_operator_resolution()
     if operation:
         queryset = queryset.filter(operation=operation)
     return queryset.order_by("-created_at").first()
@@ -64,7 +70,7 @@ def resolve_deployment_smoke_attempt(
     if not getattr(user, "is_staff", False):
         raise ValidationError("只有 staff 可以消歧 deployment smoke")
     normalized_note = normalize_audit_note(note)
-    if outcome not in set(ModelDeploymentSmokeAttemptResolution.Outcome.values):
+    if outcome not in ModelDeploymentSmokeAttemptResolution.OPERATOR_OUTCOMES:
         raise ValidationError({"outcome": "smoke 消歧结果无效"})
     request_id = str(provider_request_id or "").strip()
     if len(request_id) > 191:
@@ -90,6 +96,8 @@ def resolve_deployment_smoke_attempt(
     if len(normalized_currency) > 12:
         raise ValidationError({"cost_currency": "币种过长"})
 
+    # Match the original worker's owner -> attempt -> preparation lock order.
+    ModelDeployment.objects.select_for_update().get(pk=deployment.pk)
     try:
         attempt = ModelDeploymentSmokeAttempt.objects.select_for_update().get(
             pk=smoke_attempt_id,
@@ -97,8 +105,16 @@ def resolve_deployment_smoke_attempt(
         )
     except (ModelDeploymentSmokeAttempt.DoesNotExist, ValueError, TypeError) as exc:
         raise ValidationError({"smoke_attempt_id": "smoke attempt 不存在"}) from exc
-    if attempt.operation not in DEPLOYMENT_SMOKE_OPERATIONS:
-        raise ValidationError({"smoke_attempt_id": "smoke attempt operation 不受支持"})
+    from studio.models import ExecutionPreparation
+    from studio.services.execution_smoke_evidence import read_prepared_smoke_context
+    try:
+        prep = ExecutionPreparation.objects.select_for_update().get(deployment_smoke=attempt)
+    except ExecutionPreparation.DoesNotExist as exc:
+        raise ValidationError({"smoke_attempt_id": "烟测缺少原始执行准备，不能人工消歧"}) from exc
+    _detail, identity = read_prepared_smoke_context(attempt, prep)
+    prepared_identity = {"scope": attempt.scope, "preparation_id": str(prep.pk),
+        "execution_instance_version_id": identity.version_id, "prepared_request_sha256": prep.request_sha256,
+        "definition_sha256": identity.definition_sha256}
     if expected_operation and attempt.operation != expected_operation:
         raise ValidationError({"smoke_attempt_id": "smoke attempt operation 不匹配"})
     if attempt.status not in {
@@ -106,7 +122,7 @@ def resolve_deployment_smoke_attempt(
         ModelDeploymentSmokeAttempt.Status.UNCERTAIN,
     }:
         raise ValidationError("只有 submitting/uncertain smoke attempt 可以人工消歧")
-    if attempt.resolutions.exists():
+    if has_operator_resolution(attempt):
         raise ValidationError("该 smoke attempt 已完成消歧，审计事实不可覆盖")
 
     provider_request_hash = (
@@ -126,6 +142,7 @@ def resolve_deployment_smoke_attempt(
         "cost_currency": normalized_currency,
         "submission_semantics": DEPLOYMENT_SMOKE_SUBMISSION_SEMANTICS,
         "resolved_at": timezone.now().isoformat(),
+        **prepared_identity,
     }
     evidence_contract = json_contract(
         evidence,

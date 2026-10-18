@@ -1,57 +1,35 @@
-# Local Prompt Translation and Authoring Adapters
+# 项目字段翻译与创作辅助
 
-本文描述内容创作阶段的翻译/提示辅助，不把它们当作 ProductionRun 媒体执行器或生产就绪证明。
+本文说明当前项目字段的独立翻译入口，不把翻译候选当作短剧生成、媒体执行或生产就绪证据。实施记录与未完成验收见[统一工作包](optimization/records/execution-unification/2026-09-25.md#current-work-packages)。
 
-## 职责边界
+## 唯一调用路径
 
-authoring adapter 可以帮助操作员生成或翻译导演字段、提示文本和内容草案。输出始终是待审核内容，不能：
+在原项目/分镜/Bible内容审核入口选择已经保存的字段，读取服务端目录并明确选择已发布的 `prompt.normalize` 执行实例版本。请求提交精确实例与字段来源，不再直接挑选裸Deployment UUID，也不使用模型名固定枚举或隐藏默认部署。
 
-- 直接创建媒体 Task；
-- 绕过脚本或 Bible 审核；
-- 选择 ProductionRun route；
-- 证明某个媒体模型/deployment 已启用；
-- 代替 semantic workflow validation 或 real smoke。
+`ProjectTranslationRequest/Source`关联原`AssetGenerationJob/ExecutionPreparation`，沿原文本worker异步执行；保存、字段确认、继续执行和结果采用分别是明确动作。没有第二套翻译队列，保存Bible不自动调用模型。
 
-所有新生产仍从 ProductionRun 创建。
+本地/外部连接、能力、语言、输入和输出格式由所选精确合同决定；外部调用必须明确授权，资源提醒沿系统配置和原准备确认，不沿用旧“仅loopback、页面无外发授权”的独立路径说明。目录或准入失败如实提示，不回退其他模型或旧缓存。
 
-## prompt.normalize 部署
+## 操作与结果
 
-提示词翻译不再由页面选择 `local_qwen` 或 `deepseek_api` 固定枚举。页面读取项目级 `prompt.normalize` capability，展示所有由已发布 `ModelProfileVersion.specification.capabilities` 精确声明该能力的部署，并以 `ModelDeployment` UUID 提交。
+1. 选择已保存的字段，核对原文、范围和当前候选修订；超过批次数量由用户调整，不自动拆批外呼。
+2. 选择执行实例并按其合同填写必要参数/语言与外发授权；切换实例须重新核对输入和授权。
+3. 保存后从“查看翻译任务”恢复原准备，确认字段及资源提醒，再明确继续。
+4. 成功后阅读实际候选与原文差异，明确采用；采用进入原审核流程，不自动把内容标为已确认。
+5. 名称候选经人工“确认并写入术语表”后才更新正式术语。来源修订改变时需重新审核，不静默覆盖新原文。
+6. 剧本/Bible及短剧生产仍走项目ProductionRun，独立翻译不能选生产路线或直接创建媒体任务。
 
-当前 standalone `prompt.normalize` 只允许 loopback OpenAI-compatible endpoint。外部或非 loopback 部署会显式返回 `external_idempotency_unimplemented`，不能烟测或提交；翻译 API 和页面没有外发授权或预算入口。云端脚本生成和媒体 ProductionRun 的外发/预算机制不受此边界影响。
+## 安全与失败
 
-部署只有在 provider、credential binding、配置签名和未过期真实 smoke 都有效时才是 `ready`。smoke 与正式调用共用 request id、受保护 token 和 English 非拉丁文字校验；返回原样中文不会通过 smoke。
+凭据只通过受管SecretBinding使用，不进入正文、普通日志或文档。保留来源、修订、请求身份、诊断和真实费用；失败、超额待确认、取消和不确定结果不伪装成功。未知提交先核对原远端结果，不能用新请求绕过。
 
-管理员必须显式审核并发布 text profile，绑定受控 endpoint，通过 SecretBinding 选择受管凭据（若驱动要求）并执行真实 smoke。catalog 中出现 provider 名称不代表目标环境已经安装、授权或验证。
+本地模型安装与进程生命周期仍由运维承担；平台不下载或守护推理进程，相关延期项为OPT-LOCAL-RUNTIME-001。语言规则由具体合同解释，不恢复全局“所有输入必须英文”的门禁。
 
-本地模型的安装与进程生命周期由部署运维负责；平台只连接已登记的受管 endpoint。普通 setup、restart 和 demo seed 不会下载模型或发布模型配置。
+## 实现与验证边界
 
-## 数据规则
+- 页面：[ProjectTranslationRequests.vue](../frontend/src/components/ProjectTranslationRequests.vue)。
+- 请求与目录适配：[projectTranslationRequests.ts](../frontend/src/services/projectTranslationRequests.ts)。
+- 服务与来源：[project_translation_requests.py](../backend/studio/services/project_translation_requests.py)。
+- 定向用例：[前端测试](../frontend/tests/projectTranslationRequests.test.ts)、[后端测试](../backend/studio/tests/test_project_translation_requests.py)。
 
-- 原文是权威内容事实；翻译结果保留来源 revision。
-- AI 输出进入 draft/review，不自动确认。
-- 脚本确认后，ProductionRun 的 AI 路径以确定性逻辑 materialize Bible。
-- 对失败、超时、未配置、配额不足和返回格式错误显示真实状态。
-- 不使用旧缓存、模板文本或空结果伪装成功。
-- ProductionRun 创建后使用内容与配置快照，不因后续翻译变化静默漂移。
-
-## 配置与安全
-
-provider credential 只通过 SecretBinding 使用；明文只在超级管理员的 write-only 请求中出现，数据库保存 AES-256-GCM 密文。页面、普通 API、日志、fixture 和文档不返回明文、密文、nonce、key id、Authorization header 或内部 endpoint。
-
-对本地 runtime 记录模型来源、hash、许可与版本。对外部 provider 记录 request/attempt、耗时、错误码和审计关联，但在日志中遮蔽敏感内容。
-
-## 操作流程
-
-1. 在项目内容页面选择待翻译/生成的字段。
-2. 从服务端动态列表选择 `ready` 的本地 deployment；没有项目默认值时必须人工选择。
-3. 以该 deployment UUID 提交 authoring 请求。
-4. 审阅输出与原文差异。
-5. 明确接受或修改，不自动写成确认态。
-6. 完成脚本/Bible 审核后，从 ProductionRun 页面开始生产。
-
-如 ProductionRun 选择 AI script 模式，其正式阶段是“脚本生成 → 人工审核 → 确定性 Bible → 人工审核”；不要把普通字段翻译按钮写成该流程的替代入口。
-
-## 验证
-
-自动化测试应覆盖未配置、超时、格式错误、revision 漂移、credential 不回显和审核 gate。真实 provider 仍需在目标环境验证授权、配额和响应；mock 测试不是外部 provider E2E 证据。
+上述是当前代码入口和已有测试文件，不表示本轮执行过测试或真实翻译。目标环境仍需验证授权、精确组合、来源漂移、错误恢复、候选采用与人工审核。

@@ -3,7 +3,7 @@ import { X } from 'lucide-vue-next'
 import { nextTick, onBeforeUnmount, ref, useId, watch } from 'vue'
 
 const props = withDefaults(
-  defineProps<{ open: boolean; title?: string; eyebrow?: string; width?: string; dismissible?: boolean }>(),
+  defineProps<{ open: boolean; title?: string; eyebrow?: string; width?: string; dismissible?: boolean; configuration?: boolean; preserveContent?: boolean }>(),
   { dismissible: true },
 )
 const emit = defineEmits<{ close: [] }>()
@@ -29,7 +29,8 @@ const focusableElements = () => {
     return element.getAttribute('aria-hidden') !== 'true'
       && style.display !== 'none'
       && style.visibility !== 'hidden'
-      && !element.closest('[inert]')
+      && element.getClientRects().length > 0
+      && !element.closest('[inert],[aria-hidden="true"]')
   })
 }
 
@@ -98,10 +99,11 @@ onBeforeUnmount(restoreFocus)
 <template>
   <Teleport to="body">
     <Transition name="modal">
-      <div v-if="open" class="modal-backdrop" @mousedown.self="close" @keydown="onKeydown">
+      <div v-if="open || preserveContent" v-show="open" :inert="!open" :aria-hidden="!open || undefined" class="modal-backdrop" @mousedown.self="close" @keydown="onKeydown">
         <section
           ref="dialogRef"
           class="modal-card"
+          :class="{ 'configuration-modal': configuration }"
           role="dialog"
           aria-modal="true"
           :aria-labelledby="titleId"
@@ -116,3 +118,14 @@ onBeforeUnmount(restoreFocus)
     </Transition>
   </Teleport>
 </template>
+
+<style scoped>
+.configuration-modal>.modal-header h2{font-family:var(--font);font-size:var(--config-title-size);font-weight:600;letter-spacing:0;overflow-wrap:anywhere}
+.configuration-modal>.modal-header .eyebrow{font-size:var(--config-help-size)!important;letter-spacing:0}
+.configuration-modal>.modal-header .icon-btn{min-width:var(--config-control-height);min-height:var(--config-control-height)}
+.configuration-modal>.modal-body{padding:var(--config-space-xl);font-family:var(--font);font-size:var(--config-body-size);--config-sticky-offset:calc(-1 * var(--config-space-xl))}
+.configuration-modal>.modal-body :deep(.button){min-height:var(--config-control-height);font-size:var(--config-body-size);white-space:normal;max-width:100%}
+.configuration-modal>.modal-body :deep(summary){min-height:var(--config-control-height);font-size:var(--config-body-size);align-content:center;overflow-wrap:anywhere}
+.configuration-modal>.modal-footer :deep(.button){min-height:var(--config-control-height);font-size:var(--config-body-size)}
+@media(max-width:640px){.configuration-modal{--config-control-height:44px}}
+</style>

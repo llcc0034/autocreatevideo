@@ -27,6 +27,15 @@ from studio.services.workflow_projectors import (
 
 
 class WorkflowProjectorContractTests(TestCase):
+    def test_quantity_input_catalog_reuses_model_registry_and_serializes_media(self):
+        from studio.services.media_capabilities import conditioning_contract_editor_options, CONDITIONING_INPUT_MEDIA_KINDS
+        from studio.platform_serializers import WorkflowProjectorEditorChoiceCatalogSerializer
+        choices = workflow_projector_configuration_options()['definition_editor']['choices']
+        rows = choices['model_quantity_inputs']
+        self.assertEqual(rows, conditioning_contract_editor_options()['input_slots'])
+        self.assertEqual({row['value']: row['media_kind'] for row in rows}, CONDITIONING_INPUT_MEDIA_KINDS)
+        self.assertEqual(WorkflowProjectorEditorChoiceCatalogSerializer(choices).data['model_quantity_inputs'], rows)
+
     def test_missing_projector_cannot_use_a_compiler_as_an_execution_bypass(self):
         for compiler in ({"id": "generic.comfy", "version": 1}, {"id": "generic.comfy", "version": 2}, {"id": "minimax_h3", "version": 3}):
             with self.subTest(compiler=compiler), self.assertRaisesRegex(WorkflowProjectorError, "缺少冻结的 Projector"):

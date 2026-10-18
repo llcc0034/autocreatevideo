@@ -26,6 +26,12 @@ MODEL_PROFILE_SPECIFICATION_SCHEMA_VERSION = 1
 # evidence; selecting an entry here grants no executable capability by itself.
 MODEL_CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
     {
+        "value": "text.structured",
+        "label": "通用结构化文本",
+        "modalities": ("text", "multimodal"),
+        "driver_types": ("local_qwen", "deepseek_api", "openai_compatible"),
+    },
+    {
         "value": "script.generate",
         "label": "剧本生成",
         "modalities": ("text", "multimodal"),
@@ -46,6 +52,24 @@ MODEL_CAPABILITY_CATALOG: tuple[dict[str, Any], ...] = (
     {
         "value": "visual_rules.generate",
         "label": "全剧影视规则生成",
+        "modalities": ("text", "multimodal"),
+        "driver_types": ("local_qwen", "deepseek_api", "openai_compatible"),
+    },
+    {
+        "value": "prompt.fields.generate",
+        "label": "提示词字段生成",
+        "modalities": ("text", "multimodal"),
+        "driver_types": ("local_qwen", "deepseek_api", "openai_compatible"),
+    },
+    {
+        "value": "prompt.fields.translate",
+        "label": "提示词字段翻译",
+        "modalities": ("text", "multimodal"),
+        "driver_types": ("local_qwen", "deepseek_api", "openai_compatible"),
+    },
+    {
+        "value": "prompt.draft",
+        "label": "提示词起草",
         "modalities": ("text", "multimodal"),
         "driver_types": ("local_qwen", "deepseek_api", "openai_compatible"),
     },
@@ -314,7 +338,12 @@ def _verified_model_facts() -> tuple[set[str], set[str]]:
 
 
 def model_profile_registry_options() -> dict[str, Any]:
-    from studio.services.media_capabilities import conditioning_contract_editor_options
+    from studio.services.execution_monitoring import model_execution_monitoring_editor_options
+    from studio.services.media_capabilities import conditioning_contract_editor_options, media_constraints_editor_options
+    from studio.services.execution_text_contracts import text_execution_editor_options
+    from studio.services.model_profile_contracts import chat_request_options_editor_options
+    from studio.services.script_model_policies import script_contract_editor_options
+    from studio.services.production_visual_rules import visual_rules_output_editor_options
     observed_capabilities, model_families = _verified_model_facts()
     known_capabilities = {str(item["value"]) for item in MODEL_CAPABILITY_CATALOG}
     capability_options = [
@@ -345,7 +374,10 @@ def model_profile_registry_options() -> dict[str, Any]:
             "operations": list(declared["operations"]),
         })
 
+    from studio.services.async_media_schema import async_media_editor_options
+
     return {
+        "async_media": async_media_editor_options(),
         "specification_schema_version": MODEL_PROFILE_SPECIFICATION_SCHEMA_VERSION,
         "provider_drivers": provider_drivers,
         "modalities": _choice_options(ModelProfileVersion.Modality.choices),
@@ -353,4 +385,10 @@ def model_profile_registry_options() -> dict[str, Any]:
         "capabilities": capability_options,
         "model_families": sorted({str(value) for value in model_families if value}),
         "conditioning_contract": conditioning_contract_editor_options(),
+        "media_constraints": media_constraints_editor_options(),
+        "execution_monitoring": model_execution_monitoring_editor_options(),
+        "text_execution": text_execution_editor_options(MODEL_CAPABILITY_CATALOG),
+        "chat_request_options": chat_request_options_editor_options(),
+        "script_contracts": script_contract_editor_options(),
+        "visual_rules_output": visual_rules_output_editor_options(),
     }

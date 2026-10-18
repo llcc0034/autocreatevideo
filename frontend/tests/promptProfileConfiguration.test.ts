@@ -55,12 +55,14 @@ test('prompt strategy configuration preserves saved historical and current value
   await context.test('current schema exposes exact saved purpose rules and shot markers', async () => {
     const config = {schema_version:5,primitive_options:{reference_context_ir_v1:{rendering:{
       task_separator:' + ',unreferenced_task:'explicit empty task',
+      reference_layout:{subject_label_template:'<Subject {index}>',source_separator:', ',summary_reference_template:'{label}: {usage}',shot_reference_template:''},
       reference_rules:[{category:'video',purpose:'custom_purpose',task:'custom task',relationship:'custom retention',usage:'custom usage'}],
       templates:{shot_opening:'[Shot {index}]',shot_transition:'[Shot {index}] At {timecode},'}
     }}}}
     const before = JSON.stringify(config)
     const html = await render({...profile,sourceProjectionConfig:config} as any,[rule])
     for (const value of ['custom_purpose','custom task','custom retention','custom usage','{timecode}','explicit empty task']) assert.ok(html.includes(value),value)
+    for (const value of ['主体编号与分段参考布局','主体编号模板','摘要参考模板','逐镜参考模板','Subject {index}']) assert.ok(html.includes(value),value)
     assert.equal(JSON.stringify(config),before)
   })
   await context.test('missing rules and empty/invalid configs are not presented as a complete version', async () => {
@@ -85,7 +87,10 @@ test('prompt strategy configuration preserves saved historical and current value
     assert.match(source,/@click="openConfiguration\(selectedProfile\)"/)
     assert.match(source,/<PromptProfileConfiguration v-if="configurationSnapshot"/)
     assert.match(source,/@close="configurationSnapshot=null"/)
-    const opener = source.slice(source.indexOf('const openConfiguration ='),source.indexOf('const fieldForm ='))
+    const openerStart = source.indexOf('const openConfiguration =')
+    const openerEnd = source.indexOf('const profileForm =', openerStart)
+    assert.ok(openerStart >= 0 && openerEnd > openerStart,'inspect the actual configuration opener boundary')
+    const opener = source.slice(openerStart,openerEnd)
     assert.match(opener,/JSON\.parse\(JSON\.stringify/)
     assert.doesNotMatch(opener,/platformApi|openProfile|preview|save/i)
     const viewer = await readFile(new URL('../src/components/PromptProfileConfiguration.vue',import.meta.url),'utf8')

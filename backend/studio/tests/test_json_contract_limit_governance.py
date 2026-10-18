@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
+from uuid import uuid4
 
 from django.core.exceptions import ValidationError
-from django.test import SimpleTestCase
+from django.test import SimpleTestCase, TestCase
 
-from studio.services.json_contracts import canonical_json_bytes
+from studio.services.json_contracts import canonical_json_bytes, json_contract
 from studio.services.production_runs import _save_stage_snapshot, _verify_stage_snapshot
 from studio.services.workflow_compiler import workflow_execution_contract
 from studio.services.workflow_semantics import canonical_binding_rows
@@ -127,16 +129,74 @@ class ConfiguredJsonContractLimitTests(SimpleTestCase):
                         )
 
 
+class ExplicitRegistryContractLimitTests(TestCase):
+    def test_registry_metadata_write_read_and_frozen_reference_share_size_boundaries(self):
+        from studio.services import business_outputs, content_sources
+
+        source = SimpleNamespace(pk=uuid4(), source_key=uuid4(), version=1, name="梗概",
+            description="来源定义", reader_selector="project.logline", status="published",
+            reader_contract=content_sources.reader_contract("project.logline"))
+        output = SimpleNamespace(pk=uuid4(), output_key=uuid4(), version=1, name="规则",
+            description="输出定义", status="published", parser_key=business_outputs.PARSER_KEY,
+            parser_contract=business_outputs.parser_contract(business_outputs.PARSER_KEY), quality_advisories={})
+        cases = (
+            (content_sources, "CONTENT_SOURCE_CONTRACT_MAX_BYTES", source,
+             content_sources.source_contract, content_sources.source_reference),
+            (business_outputs, "DATABASE_JSON_FIELD_MAX_BYTES", output,
+             business_outputs.output_contract, business_outputs.output_reference),
+        )
+        for module, boundary, obj, write, read in cases:
+            with self.subTest(registry=module.__name__):
+                original = write(obj)
+                obj.contract_size_bytes, obj.contract_sha256 = original.size_bytes, original.sha256
+                with patch.object(module, boundary, original.size_bytes):
+                    self.assertEqual(write(obj), original)
+                    reference = read(obj)
+                    self.assertEqual(reference["sha256"], original.sha256)
+                    if obj is output:
+                        self.assertEqual(business_outputs.verify_output_reference(reference), reference)
+                with patch.object(module, boundary, original.size_bytes - 1):
+                    with self.assertRaises(ValidationError):
+                        write(obj)
+                    with self.assertRaises(ValidationError):
+                        read(obj)
+                    if obj is output:
+                        with self.assertRaises(ValidationError):
+                            business_outputs.verify_output_reference(reference)
+
+    def test_parser_cannot_bypass_physical_ceiling_with_large_field_label(self):
+        from studio.services import business_outputs
+        parser = business_outputs.parser_contract(business_outputs.PARSER_KEY)
+        parser["fields"][0]["label"] = "界" * business_outputs.DATABASE_JSON_FIELD_MAX_BYTES
+        with self.assertRaisesMessage(ValidationError, "65536"):
+            business_outputs.validate_parser_contract(parser)
+
+    def test_reconciliation_uses_one_resolved_limit_for_parent_and_both_row_digests(self):
+        from studio.services import execution_profile_inputs as inputs
+        # This helper checks reconciliation only; the full instance schema is
+        # checked separately by the original authoring service.
+        row = {"key": "request.theme", "position": 0,
+            "targets": [{"target_kind": "profile_input", "target_key": "request.theme"}]}
+        version = SimpleNamespace(prompt_mode="profile", prompt_profile_version=object())
+        size = len(canonical_json_bytes([row]))
+        with patch.object(inputs, "execution_configuration_max_bytes", return_value=size) as limit, \
+                patch.object(inputs, "derived_profile_inputs", return_value=[row]), \
+                patch.object(inputs, "json_contract", wraps=json_contract) as contract:
+            self.assertEqual(inputs.reconcile_profile_inputs(version, [row]), [row])
+        limit.assert_called_once_with()
+        self.assertEqual(len(contract.call_args_list), 3)
+        self.assertEqual([item.kwargs for item in contract.call_args_list], [{"max_bytes": size}] * 3)
+        with patch.object(inputs, "execution_configuration_max_bytes", return_value=size - 1), \
+                patch.object(inputs, "derived_profile_inputs") as derive:
+            with self.assertRaises(ValidationError):
+                inputs.reconcile_profile_inputs(version, [row])
+        derive.assert_not_called()
+
+
 class JsonContractCallsiteGovernanceTests(SimpleTestCase):
     """Prevent reintroducing an implicit 64 KiB gate on runtime contracts."""
 
     _CALLS = {"json_contract", "verify_json_contract", "assign_json_contract"}
-    _CONCURRENTLY_OWNED_EXCLUSIONS = {
-        "assembly.py",
-        "dialogue.py",
-        "reference_media.py",
-        "series_concept_drafts.py",
-    }
 
     @staticmethod
     def _backend_root() -> Path:
@@ -147,8 +207,6 @@ class JsonContractCallsiteGovernanceTests(SimpleTestCase):
         root = self._backend_root()
         for path in sorted(root.rglob("*.py")):
             if "migrations" in path.parts or "tests" in path.parts:
-                continue
-            if path.name in self._CONCURRENTLY_OWNED_EXCLUSIONS:
                 continue
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             for node in ast.walk(tree):

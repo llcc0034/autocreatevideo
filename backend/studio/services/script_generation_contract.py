@@ -6,16 +6,10 @@ from django.core.exceptions import ValidationError
 
 from studio.models import ModelProfileVersion
 from studio.services.model_profile_contracts import (
-    CHAT_REQUEST_OPTIONS_KEY,
-    chat_request_options_from_policy,
     verified_model_profile_specification,
 )
 from studio.services.provider_registry import driver_for
-from studio.services.security_boundaries import boundary_number
-from studio.services.text_field_contracts import (
-    SERIES_CONCEPT_FIELD_KEYS,
-    validate_text_field_contract,
-)
+from studio.services.script_model_policies import validate_script_model_policy
 
 
 SCRIPT_GENERATE_OPERATION = "script.generate"
@@ -73,72 +67,4 @@ def validate_script_generation_model_profile(
         raise ValidationError({
             "specification": "provider driver 未实现受控 chat_completion transport",
         })
-    series = specification.get("series_concept")
-    required_series_fields = {
-        "minimum_shot_duration_ms",
-        "maximum_shot_duration_ms",
-        "max_output_tokens",
-        "timeout_seconds",
-        "field_contract",
-        CHAT_REQUEST_OPTIONS_KEY,
-    }
-    if not isinstance(series, dict) or set(series) != required_series_fields:
-        raise ValidationError({
-            "specification": (
-                "script.generate model profile 缺少精确 series_concept policy，"
-                "或包含未注册字段"
-            ),
-        })
-    integer_fields = (
-        "minimum_shot_duration_ms",
-        "maximum_shot_duration_ms",
-        "max_output_tokens",
-    )
-    invalid = [
-        field
-        for field in integer_fields
-        if type(series.get(field)) is not int or series[field] < 1
-    ]
-    if invalid:
-        raise ValidationError({
-            "specification": f"series_concept policy 无效: {', '.join(invalid)}",
-        })
-    minimum = int(series["minimum_shot_duration_ms"])
-    maximum = int(series["maximum_shot_duration_ms"])
-    if minimum > maximum:
-        raise ValidationError({
-            "specification": "series_concept minimum_shot_duration_ms 不能大于 maximum",
-        })
-    timeout_value: Any = series.get("timeout_seconds")
-    if isinstance(timeout_value, bool) or not isinstance(timeout_value, (int, float)):
-        raise ValidationError({
-            "specification": "series_concept.timeout_seconds 必须显式配置为数值",
-        })
-    timeout = float(timeout_value)
-    timeout_max = boundary_number(
-        "security.provider.async_rest_timeout_max_seconds",
-        minimum=0.001,
-    )
-    if not 0 < timeout <= timeout_max:
-        raise ValidationError({
-            "specification": (
-                "series_concept.timeout_seconds 必须大于 0 且不超过"
-                f"当前安全边界 {timeout_max:g} 秒"
-            ),
-        })
-    field_contract = validate_text_field_contract(
-        series["field_contract"],
-        fields=SERIES_CONCEPT_FIELD_KEYS,
-        label="series_concept",
-    )
-    return {
-        "minimum_shot_duration_ms": minimum,
-        "maximum_shot_duration_ms": maximum,
-        "max_output_tokens": int(series["max_output_tokens"]),
-        "timeout_seconds": timeout,
-        "field_contract": field_contract,
-        CHAT_REQUEST_OPTIONS_KEY: chat_request_options_from_policy(
-            series,
-            label="series_concept",
-        ),
-    }
+    return validate_script_model_policy(specification.get("series_concept"), key="series_concept")

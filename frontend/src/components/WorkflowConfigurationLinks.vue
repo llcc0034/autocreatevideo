@@ -1,22 +1,20 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed } from 'vue'
 import { RouterLink } from 'vue-router'
-import { Server, SlidersHorizontal, GitBranch, Ellipsis } from 'lucide-vue-next'
+import { Server, Boxes, GitBranch, Ellipsis } from 'lucide-vue-next'
 import ConfigurationRelationButton from './ConfigurationRelationButton.vue'
-import BaseModal from './BaseModal.vue'
 import PlatformStatusPill from './PlatformStatusPill.vue'
 import { relationOverviewUrl } from '@/services/registryRelations'
-import { workflowModelSettingsRoute, workflowPromptSettingsRoute, workflowProjectorSettingsRoute, workflowRelationItems } from '@/services/workflowConfigurationLinks'
+import { workflowModelSettingsRoute, workflowExecutionSettingsRoute, workflowExecutionsRoute, workflowProjectorSettingsRoute, workflowRelationItems } from '@/services/workflowConfigurationLinks'
 import { operationLabel, modeLabel } from '@/services/presentationLabels'
 import type { WorkflowTemplateVersion } from '@/services/platformTypes'
 
 const props = defineProps<{ workflow: WorkflowTemplateVersion; compact?: boolean }>()
 const emit = defineEmits<{ navigate: [] }>()
-const moreOpen = ref(false)
 const links = computed(() => props.workflow.configurationLinks)
 const relationItems = computed(() => links.value ? workflowRelationItems(props.workflow.id, links.value) : [])
-const relationIcons = { model: Server, prompt: SlidersHorizontal, projector: GitBranch }
-const navigate = () => { moreOpen.value = false; emit('navigate') }
+const relationIcons = { model: Server, execution: Boxes, projector: GitBranch }
+const navigate = () => emit('navigate')
 </script>
 
 <template>
@@ -24,46 +22,39 @@ const navigate = () => { moreOpen.value = false; emit('navigate') }
     <ConfigurationRelationButton
       v-for="item in relationItems" :key="item.key"
       :label="item.label" :name="item.name" :status="item.status" :tone="item.tone"
-      :description="item.description" :to="item.to" :icon="relationIcons[item.key]" :expanded="moreOpen"
-      @activate="item.to ? navigate() : moreOpen=true"
+      :description="item.description" :to="item.to || relationOverviewUrl('workflow',workflow.id)" :icon="relationIcons[item.key]"
+      @activate="navigate"
     />
-    <button type="button" class="button ghost tiny relation-more" aria-haspopup="dialog" :aria-expanded="moreOpen" :aria-label="`${workflow.templateName || workflow.templateSlug || '工作流'} · 更多关联`" @click="moreOpen=true">
+    <RouterLink class="button ghost tiny relation-more" :to="relationOverviewUrl('workflow',workflow.id)" :aria-label="`${workflow.templateName || workflow.templateSlug || '工作流'} · 更多关联`" @click="navigate">
       <Ellipsis :size="15" aria-hidden="true"/>更多关联
-      <span v-if="links.promptBindings.total > links.promptBindings.activeTotal" class="relation-extra-count">停用绑定 {{ links.promptBindings.total-links.promptBindings.activeTotal }}</span>
-    </button>
-    <BaseModal :open="moreOpen" :title="`${workflow.templateName || workflow.templateSlug || '工作流'} · 关联配置`" eyebrow="启用配置与历史引用" width="1060px" @close="moreOpen=false">
-      <p class="relation-legend">状态点仅表示关联配置；工作流是否通过验收，请查看在线校验和真实烟测。</p>
-      <WorkflowConfigurationLinks v-if="moreOpen" :workflow="workflow" @navigate="navigate"/>
-      <template #footer><RouterLink class="button ghost" :to="relationOverviewUrl('workflow',workflow.id)" @click="navigate">全部关联与引用配方</RouterLink><button class="button ghost" type="button" @click="moreOpen=false">关闭</button></template>
-    </BaseModal>
+      <span v-if="links.executionInstances.total > links.executionInstances.activeTotal" class="relation-extra-count">其他版本 {{ links.executionInstances.total-links.executionInstances.activeTotal }}</span>
+    </RouterLink>
   </div>
   <div v-else-if="workflow.configurationLinks" class="workflow-links" aria-label="工作流关联配置">
     <section>
-      <strong>模型实例</strong>
+      <strong>模型部署</strong>
       <template v-if="workflow.configurationLinks.validatedDeployment">
         <RouterLink :to="workflowModelSettingsRoute(workflow.id, workflow.configurationLinks.validatedDeployment.modelProfileVersionId, workflow.configurationLinks.validatedDeployment.id)" @click="emit('navigate')">{{ workflow.configurationLinks.validatedDeployment.name }}</RouterLink>
         <small>已校验目标 <PlatformStatusPill :status="workflow.configurationLinks.validatedDeployment.status"/></small>
         <small v-if="workflow.configurationLinks.validatedDeployment.modelProfileVersionId!==workflow.configurationLinks.model?.id" class="warning">校验目标与绑定模型版本不一致，请查看证据。</small>
       </template>
-      <small v-else>尚未绑定校验实例</small>
-      <RouterLink v-if="workflow.configurationLinks.model" :to="workflowModelSettingsRoute(workflow.id, workflow.configurationLinks.model.id)" @click="emit('navigate')">{{ workflow.configurationLinks.model.key }} v{{ workflow.configurationLinks.model.version }} · 查看实例（{{ workflow.configurationLinks.model.instanceCount }}）</RouterLink>
+      <small v-else>尚未绑定校验部署</small>
+      <RouterLink v-if="workflow.configurationLinks.model" :to="workflowModelSettingsRoute(workflow.id, workflow.configurationLinks.model.id)" @click="emit('navigate')">{{ workflow.configurationLinks.model.key }} v{{ workflow.configurationLinks.model.version }} · 查看部署（{{ workflow.configurationLinks.model.instanceCount }}）</RouterLink>
       <small v-else class="warning">尚未绑定精确模型版本</small>
-      <small v-if="!compact">同模型的其他实例仅供管理，不代表已经通过此工作流验收。</small>
+      <small v-if="!compact">同模型的其他部署仅供管理，不代表已经通过此工作流验收。</small>
     </section>
     <section>
-      <strong>提示词策略 · 启用 {{ workflow.configurationLinks.promptBindings.activeTotal }} / 全部 {{ workflow.configurationLinks.promptBindings.total }}</strong>
-      <div v-for="binding in workflow.configurationLinks.promptBindings.preview" :key="binding.bindingId" class="prompt-link">
-        <RouterLink :to="workflowPromptSettingsRoute(workflow.id, workflow.configurationLinks.model!.id, binding.profileId)" @click="emit('navigate')">{{ binding.name }} v{{ binding.version }}</RouterLink>
-        <small>{{ binding.scope==='exact_model'?'精确模型':'模型族' }} · {{ operationLabel(binding.operation) }}<template v-if="binding.mode"> · {{ modeLabel(binding.mode) }}</template> · {{ binding.isActive?'绑定启用':'绑定停用' }}<template v-if="binding.status!=='published'"> · 策略 {{ binding.status }}</template></small>
+      <strong>执行实例 · 启用 {{ workflow.configurationLinks.executionInstances.activeTotal }} / 全部 {{ workflow.configurationLinks.executionInstances.total }}</strong>
+      <div v-for="execution in workflow.configurationLinks.executionInstances.preview" :key="execution.id" class="prompt-link">
+        <RouterLink :to="workflowExecutionSettingsRoute(workflow.id, execution.id)" @click="emit('navigate')">{{ execution.name }} v{{ execution.version }}</RouterLink>
+        <small>{{ operationLabel(execution.operation) }}<template v-if="execution.mode"> · {{ modeLabel(execution.mode) }}</template> · {{ execution.promptMode==='profile'?'固定策略组装':execution.promptMode==='manual'?'人工完整提示词':'无需提示词' }}</small>
       </div>
-      <small v-if="workflow.configurationLinks.promptBindings.state==='model_unbound'">绑定模型后才能查看策略关联</small>
-      <small v-else-if="workflow.configurationLinks.promptBindings.state==='family_missing'" class="warning">模型族缺失，关联目录不完整</small>
-      <small v-else-if="!workflow.configurationLinks.promptBindings.total">尚未配置模型提示词绑定</small>
-      <small v-else-if="!workflow.configurationLinks.promptBindings.activeTotal">暂无启用绑定；已有绑定均已停用。</small>
-      <small v-if="workflow.configurationLinks.promptBindings.activeTotal > workflow.configurationLinks.promptBindings.preview.length">预览 {{ workflow.configurationLinks.promptBindings.preview.length }} 条启用绑定，更多请进入管理页。</small>
-      <small v-if="workflow.configurationLinks.promptBindings.total > workflow.configurationLinks.promptBindings.activeTotal">另有 {{ workflow.configurationLinks.promptBindings.total-workflow.configurationLinks.promptBindings.activeTotal }} 条停用绑定，可在“查看全部”中查看与配置。</small>
-      <RouterLink v-if="workflow.configurationLinks.model" :to="workflowPromptSettingsRoute(workflow.id, workflow.configurationLinks.model.id, '', true)" @click="emit('navigate')">查看全部 {{ workflow.configurationLinks.promptBindings.total }} 条并配置</RouterLink>
-      <small>绑定说明哪些提示词策略适用于此模型；某次任务实际使用哪条，请查看该任务的执行记录。</small>
+      <small v-if="!workflow.configurationLinks.executionInstances.total">尚无执行实例引用此工作流，请在独立执行实例分区创建执行版本。</small>
+      <small v-else-if="!workflow.configurationLinks.executionInstances.activeTotal">没有同时已发布且实例启用的版本。</small>
+      <small v-if="workflow.configurationLinks.executionInstances.activeTotal > workflow.configurationLinks.executionInstances.preview.length">仅预览 {{ workflow.configurationLinks.executionInstances.preview.length }} 个启用版本，更多请查看全部。</small>
+      <small v-if="workflow.configurationLinks.executionInstances.total > workflow.configurationLinks.executionInstances.activeTotal">其他 {{ workflow.configurationLinks.executionInstances.total-workflow.configurationLinks.executionInstances.activeTotal }} 个草稿、退役或停用版本收在全部关联中。</small>
+      <RouterLink :to="workflowExecutionsRoute(workflow.id)" @click="emit('navigate')">查看全部 {{ workflow.configurationLinks.executionInstances.total }} 个执行版本</RouterLink>
+      <small>具体提示词策略、参数和组合烟测均在执行实例中查看，不按模型族推测。</small>
     </section>
     <section>
       <strong>Workflow Projector</strong>

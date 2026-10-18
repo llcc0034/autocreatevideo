@@ -87,15 +87,18 @@ class RegistryRelationsView(APIView):
             if selected is None or selected.kind != kind:
                 raise ValidationError("此对象不支持指定关联分组。")
             queryset = queryset.filter(pk__in=selected.queryset.values("pk"))
-            name = source.get("profile_key") or source.get("name") or source.get("template__name") or source.get("projector__name")
+            name = source.get("instance__name") or source.get("profile_key") or source.get("name") or source.get("template__name") or source.get("projector__name") or source.get("label") or source.get("field_definition__key") or source.get("key")
             context_label = f"{name}" + (f" v{source['version']}" if "version" in source else "") + " → " + selected.label
         if "id_list" in data:
             queryset = queryset.filter(pk__in=data["id_list"])
         if data.get("search"):
             searchable = {"model": ["profile_key", "model_identifier"], "deployment": ["name", "key"],
                           "workflow": ["template__name", "template__slug"], "prompt": ["name", "profile_key"],
-                          "binding": ["name", "key", "model_family", "operation"],
-                          "projector": ["projector__name", "projector__key"], "recipe": ["name", "recipe_key"]}
+                          "execution": ["instance__name", "instance__key", "operation", "mode"],
+                          "projector": ["projector__name", "projector__key"], "recipe": ["name", "recipe_key"],
+                          "output": ["name", "parser_key"], "field": ["key"],
+                          "field_version": ["label", "field_definition__key"],
+                          "structure": ["name"], "source": ["name", "reader_selector"]}
             predicate = Q()
             for field in searchable[kind]: predicate |= Q(**{field + "__icontains": data["search"]})
             queryset = queryset.filter(predicate)

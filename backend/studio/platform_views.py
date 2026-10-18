@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from studio.services.prompt_source_catalog import prompt_source_options
+from studio.execution_resource_smoke_views import ResourceSmokeMixin
+from studio.task_distribution_views import TaskDistributionRecoveryMixin
+from studio.script_revision_structure_views import ScriptRevisionStructureActions
+from studio.production_material_fulfillment_views import ProductionMaterialFulfillmentActions
+from studio.platform_serializers import ProductionRetryPreviewQuerySerializer, ProductionRetryPreviewSerializer
 import json
 import uuid
 from urllib.parse import urlencode
@@ -28,9 +34,24 @@ from drf_spectacular.types import OpenApiTypes
 from drf_spectacular.utils import (
     OpenApiParameter,
     OpenApiResponse,
+    PolymorphicProxySerializer,
     extend_schema,
 )
 from rest_framework import mixins, status, viewsets
+from studio.production_manual_serializers import (
+    RecipeBibleReviewSerializer,
+    ProductionManualActionInputSerializer, ProductionManualActionResultSerializer,
+    ProductionManualActionOptionsSerializer, ManualTargetPageSerializer, ManualMediaReviewSerializer, ManualBibleReviewSerializer, ManualBibleImageReviewSerializer,
+    ManualStoryboardDetailSerializer, ManualStoryboardReviewSerializer, ManualAssemblyDetailSerializer, ManualAssemblyPreviewSerializer, ManualDeliveryDetailSerializer,
+    ManualChangeImpactQuerySerializer, ManualChangeImpactSerializer, ManualScriptStructureCheckSerializer,
+    ReviewedVisualSourceQuerySerializer, ReviewedVisualSourcesSerializer,
+    ManualShotReferenceQuerySerializer, ManualShotReferenceDetailSerializer, RecipeShotReferenceDetailSerializer,
+)
+from studio.services.production_execution_units import PRODUCTION_SCOPE_KINDS
+from studio.production_recipe_mapping_serializers import (
+    RecipeMappingPreviewInputSerializer, RecipeMappingPreviewSerializer,
+    StageInputAmendmentInputSerializer, StageInputAmendmentSerializer,
+)
 from rest_framework.views import APIView
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
@@ -53,8 +74,8 @@ from studio.models import (
     ModelDeploymentSmokeAttempt,
     ModelProfileVersion,
     PlatformLifecycleAuditEvent,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    FieldDefinition,
+    FieldDefinitionVersion,
     PromptProfileFieldRule,
     PromptProfileVersion,
     ProductionRecipeVersion,
@@ -104,7 +125,6 @@ from studio.platform_serializers import (
     ComfyWorkflowContractDraftSerializer,
     DeploymentActionSerializer,
     DeploymentAcceptanceRowSerializer,
-    DeploymentProbeInputSerializer,
     GeneratedArtifactDetailSerializer,
     GeneratedArtifactListSerializer,
     GenerationAttemptSerializer,
@@ -122,22 +142,25 @@ from studio.platform_serializers import (
     ProductionRunConflictResponseSerializer,
     PromptNormalizationSmokeResolutionSerializer,
     ProductionReadinessResponseSerializer,
-    ProductionRecipeMediaRouteOptionsSerializer,
     ProductionRecipeCloneSuccessorInputSerializer,
     ProductionRecipeEditorOptionsSerializer,
+    ProductionRecipeSourceOptionsInputSerializer,
+    ProductionRecipeSourceOptionsSerializer,
     ProductionRecipeVersionSerializer,
     ProductionRunCreateSerializer,
+    ProductionManualOptionsSerializer,
+    ProductionBudgetOptionsSerializer,
     ProductionRunDetailSerializer,
+    ProductionRunRetryInputSerializer,
     ProductionRunListSerializer,
     ProjectConfigResponseSerializer,
     ProjectConfigWriteSerializer,
     ProjectEffectiveConfigurationResponseSerializer,
     ProviderProfileSerializer,
     PlatformLifecycleAuditEventSerializer,
-    PromptFieldDefinitionSerializer,
-    PromptFieldDefinitionCreateInputSerializer,
-    PromptFieldDefinitionOptionsSerializer,
-    PromptProfileBindingSerializer,
+    FieldDefinitionSerializer,
+    FieldDefinitionCreateInputSerializer,
+    FieldDefinitionOptionsSerializer,
     PromptProfileFieldRuleSerializer,
     PromptProfileOptionsSerializer,
     PromptProfileCloneSuccessorInputSerializer,
@@ -172,13 +195,13 @@ from studio.platform_serializers import (
     SecretRotateSerializer,
     SecretStatusSerializer,
     SelectArtifactInputSerializer,
+    RecipeMaterialSelectionContextSerializer,
     SelectRouteInputSerializer,
     WorkflowTemplateVersionDetailSerializer,
     WorkflowTemplateCanvasExportSerializer,
     WorkflowTemplateCanvasExportQuerySerializer,
     WorkflowTemplateVersionListSerializer,
     WorkflowSmokeTestResponseSerializer,
-    WorkflowSmokeActionSerializer,
     WorkflowSmokeAttemptSerializer,
     WorkflowSmokeResolutionInputSerializer,
     WorkflowSmokeResolutionSerializer,
@@ -191,7 +214,7 @@ from studio.platform_serializers import (
     WorkflowValidationResponseSerializer,
     WorkflowAcceptanceRowSerializer,
     config_definition_system_defaults,
-    prompt_field_system_defaults,
+    field_system_defaults,
     prompt_rule_system_defaults,
 )
 from studio.services.acceptance_smoke import (
@@ -202,6 +225,7 @@ from studio.services.configuration import (
     ConfigurationResolutionError,
     activate_config_revision,
     config_resource_reference_options,
+    config_resource_reference_candidates,
     create_config_revision,
     publish_config_revision,
     redact_configuration_snapshot,
@@ -209,6 +233,7 @@ from studio.services.configuration import (
     validate_version_configuration_defaults,
 )
 from studio.services.json_contracts import json_contract, verify_json_contract
+from studio.services.comfy_workflow_preview_receipts import commit_preview_receipt, find_preview_receipt
 from studio.services.security_boundaries import (
     boundary_int,
     boundary_values,
@@ -236,10 +261,10 @@ from studio.services.registry_deletion import (
     RegistryDeletionTargetNotFound,
     build_registry_deletion_impact,
     execute_registry_deletion,
-    recipe_reference_exists,
     validate_recipe_registry_references,
 )
 from studio.services.registry_reference_lock import registry_reference_write_guard
+from studio.platform_serializers import RecipeStoryboardReferenceSelectionSerializer
 from studio.services.production_runs import (
     ProductionRunConflict,
     ProductionRunCreateRejected,
@@ -250,12 +275,10 @@ from studio.services.production_runs import (
     cancel_production_run,
     create_production_run,
     decide_stage,
-    production_recipe_media_route_options,
     production_recipe_editor_options,
     regenerate_bible_image_candidates,
     retry_production_run,
     resolve_uncertain_attempt,
-    select_run_artifact,
     select_stage_route,
     validate_production_recipe_executability,
 )
@@ -265,7 +288,7 @@ from studio.services.provider_registry import (
     validate_deployment_execution_contract,
 )
 from studio.services.prompt_profiles import (
-    CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
+    prompt_language_options,
     DECLARATIVE_SOURCE_PROJECTION_KEY,
     DIRECT_SOURCE_PROJECTION_KEY,
     KNOWN_MODEL_FAMILIES,
@@ -283,6 +306,7 @@ from studio.services.prompt_generation_sources import (
 )
 from studio.services.prompt_profile_preview import preview_prompt_profile
 from studio.services.reference_context import rendering_options
+from studio.services.reference_rendering_inputs import UNIT_RENDER_SLOTS
 from studio.services.source_projection_primitives import (
     source_projection_primitive_options,
 )
@@ -291,16 +315,13 @@ from studio.services.async_media_contract import (
     validate_async_model_profile,
 )
 from studio.services.deployment_smoke import (
-    SCRIPT_GENERATE_OPERATION,
     probe_async_deployment,
 )
 from studio.services.script_structure import (
-    SCRIPT_STRUCTURE_OPERATION,
     validate_script_structure_model_profile,
 )
 from studio.services.production_visual_rules import validate_visual_rules_model_profile
 from studio.services.deployment_smoke_queue import (
-    enqueue_deployment_smoke,
     request_deployment_smoke_cancel,
 )
 from studio.services.deployment_smoke_resolution import (
@@ -372,10 +393,8 @@ from studio.services.workflow_projectors import (
     workflow_projector_engine_options,
 )
 from studio.services.workflow_smoke_queue import (
-    enqueue_workflow_smoke,
     request_workflow_smoke_cancel,
 )
-from studio.services.workflow_smoke_fixtures import WorkflowSmokeFixtureConflict
 from studio.services.workflow_smoke_resolution import (
     WorkflowSmokeResolutionConflict,
     resolve_workflow_smoke_attempt,
@@ -611,6 +630,8 @@ class AcceptanceSmokeView(APIView):
             attempt.id: attempt
             for attempt in WorkflowSmokeAttempt.objects.filter(
                 id__in=attempt_ids,
+                scope="resource",
+                execution_instance_version__isnull=True,
             ).select_related(
                 "deployment__profile_version__provider",
             ).prefetch_related("resolutions")
@@ -620,6 +641,8 @@ class AcceptanceSmokeView(APIView):
     def _workflow_queryset(*, selected_deployment=None):
         latest_attempt = WorkflowSmokeAttempt.objects.filter(
             workflow_version_id=OuterRef("pk"),
+            scope="resource",
+            execution_instance_version__isnull=True,
         )
         if selected_deployment is not None:
             latest_attempt = latest_attempt.filter(
@@ -654,6 +677,8 @@ class AcceptanceSmokeView(APIView):
                 WorkflowSmokeAttempt.objects.filter(
                     workflow_version_id=OuterRef("pk"),
                     deployment_id=OuterRef("validated_deployment_id"),
+                    scope="resource",
+                    execution_instance_version__isnull=True,
                 ).order_by("-created_at", "-id").values("id")[:1],
             ),
         )
@@ -663,12 +688,14 @@ class AcceptanceSmokeView(APIView):
                     WorkflowSmokeAttempt.objects.filter(
                         workflow_version_id=OuterRef("pk"),
                         deployment_id=selected_deployment.id,
+                        scope="resource",
+                        execution_instance_version__isnull=True,
                     ),
                 ),
             ).filter(
                 Q(model_profile_version_id=selected_deployment.profile_version_id)
                 | Q(validated_deployment_id=selected_deployment.id)
-                | Q(smoke_attempts__deployment_id=selected_deployment.id)
+                | Q(has_selected_smoke_attempt=True)
             ).distinct()
         return queryset
 
@@ -838,6 +865,8 @@ class AcceptanceSmokeView(APIView):
         paginator = AcceptanceSmokePagination()
         deployments = list(paginator.paginate_queryset(queryset, request, view=self))
         deployment_ids = [row.id for row in deployments]
+        from studio.services.execution_identity import execution_target_contracts
+        current_targets = execution_target_contracts(deployment_ids=deployment_ids)
 
         health_ids = {
             row.latest_health_snapshot_id
@@ -856,34 +885,23 @@ class AcceptanceSmokeView(APIView):
         ).annotate(
             operation_row_number=Window(
                 expression=RowNumber(),
-                partition_by=(F("deployment_id"), F("operations_sha256"), F("prompt_profile_binding_id"), F("prompt_profile_version_id")),
+                partition_by=(F("deployment_id"), F("operations_sha256"), F("prompt_profile_version_id")),
                 order_by=(F("revision").desc(), F("id").desc()),
             ),
         ).filter(operation_row_number=1).values("id")
-        fresh_snapshot_filter = Q(id__in=latest_operation_snapshots)
-        for deployment in deployments:
-            try:
-                target_sha256 = deployment_target_sha256(deployment)
-            except (DjangoValidationError, RuntimeError, TypeError, ValueError):
-                continue
-            fresh_snapshot_filter |= Q(
-                deployment_id=deployment.id,
-                target_sha256=target_sha256,
-                status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
-                expires_at__gt=timezone.now(),
-            )
         smoke_snapshots_by_deployment = {}
         for snapshot in ModelDeploymentCapabilitySnapshot.objects.filter(
-            fresh_snapshot_filter,
+            id__in=latest_operation_snapshots,
             deployment_id__in=deployment_ids,
             probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
-        ).order_by("deployment_id", "-revision", "-id"):
+        ).select_related("smoke_attempt__prompt_profile_version").order_by("deployment_id", "-revision", "-id"):
             smoke_snapshots_by_deployment.setdefault(
                 snapshot.deployment_id, [],
             ).append(snapshot)
 
         latest_attempts = ModelDeploymentSmokeAttempt.objects.filter(
             deployment_id__in=deployment_ids,
+            scope="resource",
         ).annotate(
             acceptance_row_number=Window(
                 expression=RowNumber(),
@@ -962,6 +980,7 @@ class AcceptanceSmokeView(APIView):
         rows = [
             deployment_acceptance_row(
                 deployment,
+                current_target=current_targets[str(deployment.pk)],
                 health_snapshot=health_by_id.get(
                     deployment.latest_health_snapshot_id,
                 ),
@@ -1554,6 +1573,9 @@ class ModelProfileVersionViewSet(StaffPlatformModelViewSet):
                 validate_script_generation_model_profile(profile)
                 validate_script_structure_model_profile(profile)
                 validate_visual_rules_model_profile(profile)
+                from studio.services.execution_text_contracts import validate_text_execution_model_profile
+
+                validate_text_execution_model_profile(profile)
                 # Freeze the exact artifact closure while the profile row is
                 # locked.  Artifact CRUD follows the same profile -> artifact
                 # lock order, so no file declaration can cross the immutable
@@ -1620,15 +1642,15 @@ class ModelProfileVersionViewSet(StaffPlatformModelViewSet):
         return Response(self.get_serializer(profile).data)
 
 
-class PromptFieldDefinitionViewSet(StaffPlatformModelViewSet):
-    queryset = PromptFieldDefinition.objects.all()
-    serializer_class = PromptFieldDefinitionSerializer
-    filterset_fields = ("category", "value_type", "is_required", "is_active")
-    search_fields = ("key", "label", "description", "impact")
+class FieldDefinitionViewSet(StaffPlatformModelViewSet):
+    queryset = FieldDefinition.objects.all()
+    serializer_class = FieldDefinitionSerializer
+    filterset_fields = ("is_active",)
+    search_fields = ("key",)
 
     @extend_schema(
-        request=PromptFieldDefinitionCreateInputSerializer,
-        responses={201: PromptFieldDefinitionSerializer},
+        request=FieldDefinitionCreateInputSerializer,
+        responses={201: FieldDefinitionSerializer},
     )
     def create(self, request, *args, **kwargs):
         return super().create(request, *args, **kwargs)
@@ -1638,50 +1660,25 @@ class PromptFieldDefinitionViewSet(StaffPlatformModelViewSet):
         # receiving the same presentation order without making that order a
         # user-entered business field.
         with registry_reference_write_guard():
-            serializer.validated_data["is_active"] = prompt_field_system_defaults()[
+            serializer.validated_data["is_active"] = field_system_defaults()[
                 "is_active"
             ]
             super().perform_create(serializer)
 
-    def _frozen_reference_exists(self, definition) -> bool:
-        return definition.profile_rules.filter(
-            profile_version__status__in=(
-                PromptProfileVersion.Status.PUBLISHED,
-                PromptProfileVersion.Status.RETIRED,
-            ),
-        ).exists()
-
     def update(self, request, *args, **kwargs):
         with registry_reference_write_guard():
-            definition = PromptFieldDefinition.objects.select_for_update().get(
+            FieldDefinition.objects.select_for_update().get(
                 pk=self.get_object().pk,
             )
-            if self._frozen_reference_exists(definition):
-                raise ValidationError(
-                    "字段已被 published/retired PromptProfile 冻结引用；请新建字段与 PromptProfile 版本",
-                )
             return super().update(request, *args, **kwargs)
 
-    @extend_schema(request=None, responses=PromptFieldDefinitionOptionsSerializer)
+    @extend_schema(request=None, responses=FieldDefinitionOptionsSerializer)
     @action(detail=False, methods=("get",), url_path="options")
     def registry_options(self, request):
-        categories = sorted(set(
-            PromptFieldDefinition.objects.exclude(category="")
-            .values_list("category", flat=True)
-        ))
         data = {
-            "value_types": [
-                {"value": value, "label": label}
-                for value, label in PromptFieldDefinition.ValueType.choices
-            ],
-            "categories": [
-                {"value": value, "label": value}
-                for value in categories
-            ],
-            "custom_entry_fields": ["category"],
-            "system_defaults": prompt_field_system_defaults(),
+            "system_defaults": field_system_defaults(),
         }
-        return Response(PromptFieldDefinitionOptionsSerializer(data).data)
+        return Response(FieldDefinitionOptionsSerializer(data).data)
 
 class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
     serializer_class = PromptProfileVersionSerializer
@@ -1927,34 +1924,19 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
             }
             for item in model_rows
         ]
+        from studio.services.prompt_generation_sources import FIELD_AUXILIARY_OPERATIONS
         data = {
+            "generation_leaf_operations": sorted(FIELD_AUXILIARY_OPERATIONS),
             "operations": operations,
             "model_families": families,
             "modes": modes,
-            "field_value_types": [
-                {"value": value, "label": label}
-                for value, label in PromptFieldDefinition.ValueType.choices
-            ],
-            "field_categories": [
-                {"value": value, "label": value}
-                for value in sorted(set(
-                    PromptFieldDefinition.objects.exclude(category="")
-                    .values_list("category", flat=True)
-                ))
-            ],
             "custom_entry_fields": [
-                "field_category",
                 "operation",
                 "mode",
                 "language_policy",
             ],
-            "field_system_defaults": prompt_field_system_defaults(),
             "rule_system_defaults": prompt_rule_system_defaults(),
-            "source_selectors": [
-                {"value": value, "label": label}
-                for value, label in PromptProfileFieldRule.SourceSelector.choices
-                if value in SUPPORTED_FIELD_SOURCE_SELECTORS
-            ],
+            "source_selectors": prompt_source_options(SUPPORTED_FIELD_SOURCE_SELECTORS),
             "channels": choices(PromptProfileFieldRule.Channel),
             "label_styles": choices(PromptProfileFieldRule.LabelStyle),
             "separators": choices(PromptProfileFieldRule.Separator),
@@ -1974,6 +1956,7 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
             ],
             "source_projection_primitives": source_projection_primitive_options(),
             "reference_rendering_fields": rendering_options(),
+                "reference_rendering_text_slots": [{"value": key, "label": label} for key, label in UNIT_RENDER_SLOTS.items()],
             "language_policies": [
                 {"value": "inherit", "label": "继承运行上下文 / Inherit context"},
                 {
@@ -1981,18 +1964,21 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
                     "label": "保留来源语言 / Preserve source",
                 },
                 {"value": "any", "label": "不限语言 / Any language"},
-                {"value": "en", "label": "英文 / English"},
-                {"value": "zh-Hans", "label": "简体中文 / Simplified Chinese"},
-                {"value": "zh-Hant", "label": "繁体中文 / Traditional Chinese"},
+                *prompt_language_options(),
                 {
                     "value": "bilingual:zh-Hans+en",
                     "label": "中英双语 / Chinese and English",
                 },
             ],
             "length_units": choices(PromptProfileFieldRule.LengthUnit),
-            "generation_validators": choices(
-                PromptProfileFieldRule.GenerationValidator,
-            ),
+            "generation_validators": [
+                {**item, "label": (
+                    "结构检查 · " if item["value"] in {
+                        "non_empty", "no_control_characters", "valid_json", "json_object", "json_array",
+                    } else "生成指导 · "
+                ) + item["label"]}
+                for item in choices(PromptProfileFieldRule.GenerationValidator)
+            ],
             "generation_context_selectors": [
                 {
                     "value": value,
@@ -2022,7 +2008,7 @@ class PromptProfileVersionViewSet(StaffPlatformModelViewSet):
 
 class PromptProfileFieldRuleViewSet(StaffPlatformModelViewSet):
     queryset = PromptProfileFieldRule.objects.select_related(
-        "profile_version", "field_definition",
+        "profile_version", "field_definition", "field_definition_version", "source_version",
     )
     serializer_class = PromptProfileFieldRuleSerializer
     filterset_fields = (
@@ -2059,19 +2045,9 @@ class PromptProfileFieldRuleViewSet(StaffPlatformModelViewSet):
             serializer.instance = locked_rule
             serializer.save(profile_version=profile)
 
-class PromptProfileBindingViewSet(StaffPlatformModelViewSet):
-    queryset = PromptProfileBinding.objects.select_related(
-        "prompt_profile_version", "model_profile_version",
-    )
-    serializer_class = PromptProfileBindingSerializer
-    filterset_fields = (
-        "operation", "model_family", "mode", "model_profile_version",
-        "prompt_profile_version", "is_active",
-    )
-    search_fields = ("key", "name")
 
 
-class ModelDeploymentViewSet(StaffPlatformModelViewSet):
+class ModelDeploymentViewSet(ResourceSmokeMixin, StaffPlatformModelViewSet):
     queryset = ModelDeployment.objects.select_related(
         "profile_version__provider", "runtime_host",
     )
@@ -2162,12 +2138,9 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
             )
             if deployment.status != ModelDeployment.Status.DISABLED:
                 raise ValidationError("只有 disabled deployment 可以退役")
-            if recipe_reference_exists(
-                deployment.id,
-                statuses=(ProductionRecipeVersion.Status.DRAFT, ProductionRecipeVersion.Status.PUBLISHED),
-            ):
+            if deployment.execution_versions.filter(status="published", instance__is_active=True).exists():
                 return _conflict(
-                    "草稿或已发布配方仍引用该 deployment，请先发布替代配方或退役配方",
+                    "仍有启用且已发布的执行实例版本引用该模型部署，请先调整这些执行实例",
                 )
             if deployment.validated_workflow_versions.filter(
                 status=WorkflowTemplateVersion.Status.PUBLISHED,
@@ -2199,84 +2172,6 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(ModelDeploymentCapabilitySnapshotSerializer(snapshot).data)
-
-    @extend_schema(
-        request=DeploymentProbeInputSerializer,
-        responses={
-            202: ModelDeploymentSmokeAttemptSerializer,
-            400: ConfigurationErrorResponseSerializer,
-        },
-        description=(
-            "Create or reuse one durable deployment smoke attempt. All supported "
-            "text and media operations return HTTP 202; workers submit only after "
-            "the frozen request is persisted."
-        ),
-    )
-    @action(detail=True, methods=("post",), url_path="smoke-test")
-    def smoke_test(self, request, pk=None):
-        serializer = DeploymentProbeInputSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        operation = serializer.validated_data.get("operation")
-        if not operation:
-            raise ValidationError({"operation": "真实烟测必须指定能力"})
-        if self.get_object().status != ModelDeployment.Status.ACTIVE:
-            return _conflict("只有 active deployment 可以执行烟测", code="deployment_inactive")
-        unresolved = unresolved_deployment_smoke_attempt(
-            self.get_object(),
-            operation=operation,
-        )
-        if unresolved is not None:
-            return _conflict(
-                f"已有 {operation} smoke 提交状态不确定，必须先人工消歧",
-                code="unresolved_smoke_submission",
-            )
-        try:
-            attempt, _created = enqueue_deployment_smoke(
-                self.get_object(), operation=operation,
-                prompt_profile_binding_id=serializer.validated_data.get("prompt_profile_binding_id"),
-            )
-        except DjangoValidationError as exc:
-            details = getattr(exc, "message_dict", None) or {}
-            if isinstance(details, dict) and details.get("code") == [
-                "unresolved_smoke_submission"
-            ]:
-                return _conflict(
-                    f"已有 {operation} smoke 提交状态不确定，必须先人工消歧",
-                    code="unresolved_smoke_submission",
-                )
-            preflight_codes = {
-                "prompt_normalization_smoke_capacity_exceeded",
-                "prompt_normalization_smoke_contract_invalid",
-            }
-            raw_codes = details.get("code") if isinstance(details, dict) else None
-            preflight_code = (
-                raw_codes[0]
-                if isinstance(raw_codes, list) and len(raw_codes) == 1
-                else None
-            )
-            if preflight_code in preflight_codes:
-                raw_detail = details.get("detail")
-                safe_detail = (
-                    raw_detail[0]
-                    if isinstance(raw_detail, list) and len(raw_detail) == 1
-                    else "prompt.normalize smoke 提交前合同校验失败"
-                )
-                return api_error_response(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    code=preflight_code,
-                    details={"detail": safe_detail},
-                )
-            raise _drf_validation(exc) from exc
-        location = reverse(
-            "model-deployment-smoke-attempt-detail",
-            kwargs={"pk": attempt.pk},
-            request=request,
-        )
-        return Response(
-            ModelDeploymentSmokeAttemptSerializer(attempt).data,
-            status=status.HTTP_202_ACCEPTED,
-            headers={"Location": location},
-        )
 
     @extend_schema(
         request=ResolvePromptNormalizationSmokeInputSerializer,
@@ -2323,6 +2218,7 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
             400: ConfigurationErrorResponseSerializer,
             403: ConfigurationErrorResponseSerializer,
             404: ConfigurationErrorResponseSerializer,
+            409: ConfigurationErrorResponseSerializer,
         },
         description=(
             "Analyze one already-managed immutable candidate against live object_info. "
@@ -2330,7 +2226,9 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
             "one primary output selected the server creates or reuses an immutable "
             "ComfyWorkflowContractDraft. Unresolved interpretation is persisted as "
             "candidate_only instead of deleting or rejecting the safe candidate. Raw "
-            "canvas values and converted graphs are never returned to the browser."
+            "canvas values and converted graphs are never returned to the browser. "
+            "Send a stable request_key before submission to recover the exact response. "
+            "Same actor/key and identity replays the persisted response; changed identity returns 409."
         ),
     )
     @action(detail=True, methods=("post",), url_path="saved-workflows/preview")
@@ -2339,21 +2237,44 @@ class ModelDeploymentViewSet(StaffPlatformModelViewSet):
     def saved_workflow_preview(self, request, pk=None):
         serializer = ComfySavedWorkflowPreviewInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        deployment = self.get_object()
+        def build(data, persist):
+            def public_response(payload):
+                return ComfySavedWorkflowPreviewResponseSerializer({
+                    **payload, "effective_limits": _saved_workflow_effective_limits(),
+                }).data
+            payload = preview_saved_workflow(deployment, actor=request.user,
+                persist=lambda save: persist(lambda: public_response(save())), **data)
+            return public_response(payload)
         try:
-            payload = preview_saved_workflow(
-                self.get_object(),
-                actor=request.user,
-                **serializer.validated_data,
+            payload = commit_preview_receipt(
+                owner=request.user, deployment=deployment,
+                data=serializer.validated_data, build=build,
             )
         except (DjangoValidationError, ProviderDriverError) as exc:
             raise _drf_validation(exc) from exc
-        payload = {
-            **payload,
-            "effective_limits": _saved_workflow_effective_limits(),
-        }
         response = Response(ComfySavedWorkflowPreviewResponseSerializer(payload).data)
         response["Cache-Control"] = "private, no-store"
         return response
+
+    @extend_schema(
+        parameters=[OpenApiParameter("request_key", OpenApiTypes.STR, OpenApiParameter.QUERY, required=True)],
+        responses={200: ComfySavedWorkflowPreviewResponseSerializer,
+            400: ConfigurationErrorResponseSerializer, 403: ConfigurationErrorResponseSerializer,
+            404: ConfigurationErrorResponseSerializer},
+        description="Read the authenticated actor's original committed contract preview. No host access, projection, import or execution. A missing receipt is unknown, not proof of non-commit.",
+    )
+    @action(detail=True, methods=("get",), url_path="saved-workflows/preview-receipt")
+    def saved_workflow_preview_receipt(self, request, pk=None):
+        key = request.query_params.get("request_key", "")
+        field = ComfySavedWorkflowPreviewInputSerializer().fields["request_key"]
+        key = field.run_validation(key)
+        try:
+            payload = find_preview_receipt(owner=request.user, deployment=self.get_object(), request_key=key)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(ComfySavedWorkflowPreviewResponseSerializer(payload).data,
+            headers={"Cache-Control": "private, no-store"})
 
     @extend_schema(
         request=ComfyDraftArtifactAttestationInputSerializer,
@@ -2501,12 +2422,12 @@ class ComfyWorkflowSourceViewSet(viewsets.ReadOnlyModelViewSet):
     pagination_class = StandardPageNumberPagination
     serializer_class = ComfyWorkflowSourceSerializer
     queryset = ComfyWorkflowSource.objects.select_related(
-        "source_deployment", "workflow_version", "generated_workflow",
+        "source_deployment", "workflow_version",
         "generation_task", "imported_by",
     ).order_by("-created_at")
     filterset_fields = (
         "source_deployment", "source_scope_sha256", "import_kind", "workflow_version",
-        "generated_workflow", "generation_task", "source_sha256",
+        "generation_task", "source_sha256",
     )
     search_fields = ("source_path", "source_workflow_id")
 
@@ -3084,6 +3005,7 @@ class WorkflowProjectorVersionViewSet(
 
 
 class WorkflowTemplateVersionViewSet(
+    ResourceSmokeMixin,
     PlatformLifecycleAuditMixin,
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -3263,48 +3185,9 @@ class WorkflowTemplateVersionViewSet(
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response({
-            "version": WorkflowTemplateVersionDetailSerializer(version).data,
+            "version": WorkflowTemplateVersionDetailSerializer(self.get_object()).data,
             "contract_report": report,
         })
-
-    @extend_schema(
-        request=WorkflowSmokeActionSerializer,
-        responses={
-            202: WorkflowSmokeAttemptSerializer,
-            400: ConfigurationErrorResponseSerializer,
-            409: ConfigurationErrorResponseSerializer,
-        },
-    )
-    @action(detail=True, methods=("post",), url_path="smoke-test")
-    def smoke_test(self, request, pk=None):
-        payload = WorkflowSmokeActionSerializer(data=request.data)
-        payload.is_valid(raise_exception=True)
-        deployment = get_object_or_404(
-            ModelDeployment.objects.select_related("profile_version__provider"),
-            pk=payload.validated_data["deployment_id"],
-            status=ModelDeployment.Status.ACTIVE,
-        )
-        try:
-            attempt, _created = enqueue_workflow_smoke(
-                self.get_object(),
-                deployment=deployment,
-                created_by=request.user,
-                fixture=payload.validated_data["fixture"],
-            )
-        except WorkflowSmokeFixtureConflict as exc:
-            return _conflict(str(exc), code=exc.code)
-        except DjangoValidationError as exc:
-            raise _drf_validation(exc) from exc
-        location = reverse(
-            "workflow-smoke-attempt-detail",
-            kwargs={"pk": attempt.pk},
-            request=request,
-        )
-        return Response(
-            WorkflowSmokeAttemptSerializer(attempt).data,
-            status=status.HTTP_202_ACCEPTED,
-            headers={"Location": location},
-        )
 
     @extend_schema(request=None, responses={
         200: WorkflowTemplateVersionDetailSerializer,
@@ -3329,7 +3212,7 @@ class WorkflowTemplateVersionViewSet(
                 )
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
-        return Response(WorkflowTemplateVersionDetailSerializer(version).data)
+        return Response(WorkflowTemplateVersionDetailSerializer(self.get_object()).data)
 
     @extend_schema(request=None, responses={
         200: WorkflowTemplateVersionDetailSerializer,
@@ -3347,11 +3230,8 @@ class WorkflowTemplateVersionViewSet(
             before = lifecycle_summary(version)
             if version.status != WorkflowTemplateVersion.Status.PUBLISHED:
                 raise ValidationError("只有 published workflow version 可以退役")
-            if recipe_reference_exists(
-                version.id,
-                statuses=(ProductionRecipeVersion.Status.DRAFT, ProductionRecipeVersion.Status.PUBLISHED),
-            ):
-                return _conflict("草稿或已发布配方仍引用该 workflow version")
+            if version.execution_versions.filter(status="published", instance__is_active=True).exists():
+                return _conflict("仍有启用且已发布的执行实例版本引用该工作流，请先调整这些执行实例")
             version.status = WorkflowTemplateVersion.Status.RETIRED
             version.is_current = False
             version.save(update_fields=("status", "is_current", "updated_at"))
@@ -3362,7 +3242,7 @@ class WorkflowTemplateVersionViewSet(
                 before=before,
                 after=lifecycle_summary(version),
             )
-        return Response(WorkflowTemplateVersionDetailSerializer(version).data)
+        return Response(WorkflowTemplateVersionDetailSerializer(self.get_object()).data)
 
 
 class ConfigDefinitionViewSet(StaffPlatformModelViewSet):
@@ -3459,10 +3339,12 @@ class ConfigDefinitionViewSet(StaffPlatformModelViewSet):
     def resource_options(self, request, pk=None):
         definition = self.get_object()
         try:
-            rows = config_resource_reference_options(definition)
+            candidates = config_resource_reference_candidates(definition)
+            page = self.paginate_queryset(candidates)
+            rows = config_resource_reference_options(definition, page)
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
-        return Response(ConfigResourceOptionSerializer(rows, many=True).data)
+        return self.get_paginated_response(ConfigResourceOptionSerializer(rows, many=True).data)
 
 class ConfigRevisionViewSet(
     PlatformLifecycleAuditMixin,
@@ -4052,7 +3934,7 @@ class ScriptSourceViewSet(
                 source, revision = create_pasted_script_source(
                     project=project,
                     user=request.user,
-                    content=str(input_data.get("content") or ""),
+                    content=input_data["content"],
                     source_format=str(input_data.get("source_format") or ScriptSource.SourceFormat.PLAIN),
                     source_type=ScriptSource.SourceType.PASTE,
                 )
@@ -4078,6 +3960,7 @@ class ScriptSourceViewSet(
 
 
 class ScriptRevisionViewSet(
+    ScriptRevisionStructureActions,
     mixins.CreateModelMixin,
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -4102,24 +3985,29 @@ class ScriptRevisionViewSet(
         responses={201: ScriptRevisionDetailSerializer},
     )
     def create(self, request, *args, **kwargs):
+        input_serializer = ScriptRevisionCreateInputSerializer(data=request.data)
+        input_serializer.is_valid(raise_exception=True)
+        input_data = input_serializer.validated_data
         sources = ScriptSource.objects.all()
         if not request.user.is_staff:
             sources = sources.filter(owner=request.user)
-        source_obj = get_object_or_404(sources, pk=request.data.get("source_id"))
+        source_obj = get_object_or_404(sources, pk=input_data["source_id"])
         try:
-            revision = create_script_revision(
-                source=source_obj,
-                user=request.user,
-                content=str(request.data.get("content") or ""),
-            )
-        except (ScriptSourceValidationError, ConfigurationResolutionError) as exc:
+            if "structure_basis" in input_data:
+                from studio.services.script_revision_structures import revise_structured_script
+                from studio.services.execution_instances import execution_configuration_max_bytes
+                revision = revise_structured_script(source=source_obj, user=request.user, content=input_data["content"],
+                    basis=input_data["structure_basis"], max_bytes=execution_configuration_max_bytes())
+            else:
+                revision = create_script_revision(source=source_obj, user=request.user, content=input_data["content"])
+        except (DjangoValidationError, ConfigurationResolutionError) as exc:
             if isinstance(exc, ConfigurationResolutionError):
                 return api_error_response(
                     status_code=status.HTTP_409_CONFLICT,
                     code=exc.code,
                     details={"detail": str(exc)},
                 )
-            raise ValidationError(str(exc)) from exc
+            raise _drf_validation(exc) from exc
         return Response(ScriptRevisionDetailSerializer(revision).data, status=status.HTTP_201_CREATED)
 
     @extend_schema(request=None, responses=ScriptRevisionDetailSerializer)
@@ -4148,7 +4036,8 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
                     ),
                 })
             try:
-                validate_recipe_registry_references(
+                from studio.services.production_recipe_contracts import validate_recipe_definition
+                validate_recipe_definition(
                     serializer.validated_data.get("definition", {}),
                 )
             except DjangoValidationError as exc:
@@ -4162,7 +4051,8 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
                 "definition", serializer.instance.definition,
             )
             try:
-                validate_recipe_registry_references(definition)
+                from studio.services.production_recipe_contracts import validate_recipe_definition
+                validate_recipe_definition(definition)
             except DjangoValidationError as exc:
                 raise _drf_validation(exc) from exc
             super().perform_update(serializer)
@@ -4197,6 +4087,22 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
         return Response(ProductionRecipeEditorOptionsSerializer(
             production_recipe_editor_options(),
         ).data)
+
+    @extend_schema(request=ProductionRecipeSourceOptionsInputSerializer, responses={
+        200: ProductionRecipeSourceOptionsSerializer,
+        400: ConfigurationErrorResponseSerializer,
+        403: ConfigurationErrorResponseSerializer,
+    })
+    @action(detail=False, methods=("post",), url_path="source-options")
+    def source_options(self, request):
+        from studio.services.execution_text_output_catalog import recipe_text_source_options
+        data = ProductionRecipeSourceOptionsInputSerializer(data=request.data)
+        data.is_valid(raise_exception=True)
+        try:
+            options = recipe_text_source_options(data.validated_data["definition"])
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(ProductionRecipeSourceOptionsSerializer({"text_output_options": options}).data)
 
     @extend_schema(
         request=ProductionRecipeCloneSuccessorInputSerializer,
@@ -4266,13 +4172,22 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
                     f"来源不是最新版本；请从 v{latest.version} 创建后继草稿",
                     code="recipe_successor_source_not_latest",
                 )
-            serializer = self.get_serializer(data={
-                "recipe_key": locked_source.recipe_key,
-                "name": locked_source.name,
-                "definition": deepcopy(locked_source.definition),
-            })
-            serializer.is_valid(raise_exception=True)
-            target = serializer.save(version=latest.version + 1)
+            from studio.services.production_recipe_contracts import verify_recipe_successor_references
+            try:
+                verify_recipe_successor_references(locked_source.definition)
+            except DjangoValidationError as exc:
+                raise _drf_validation(exc) from exc
+            # This exact, immutable copy is not an ordinary authoring save.
+            # Current contracts are checked when the draft is edited/published.
+            target = ProductionRecipeVersion.objects.create(
+                recipe_key=locked_source.recipe_key,
+                name=locked_source.name,
+                version=latest.version + 1,
+                definition=deepcopy(locked_source.definition),
+                definition_schema_version=locked_source.definition_schema_version,
+                definition_size_bytes=locked_source.definition_size_bytes,
+                definition_sha256=locked_source.definition_sha256,
+            )
             self._record_lifecycle(
                 target,
                 action="clone_successor",
@@ -4283,27 +4198,6 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
             self.get_serializer(target).data,
             status=status.HTTP_201_CREATED,
         )
-
-    @extend_schema(
-        request=None,
-        responses={200: ProductionRecipeMediaRouteOptionsSerializer},
-    )
-    @action(detail=True, methods=("get",), url_path="media-route-options")
-    def media_route_options(self, request, pk=None):
-        recipe = self.get_object()
-        try:
-            payload = production_recipe_media_route_options(recipe)
-        except DjangoValidationError as exc:
-            raise _drf_validation(exc) from exc
-        payload = {
-            **payload,
-            "effective_limits": {
-                "max_routing_routes": boundary_int(
-                    "security.production.max_routing_routes"
-                ),
-            },
-        }
-        return Response(ProductionRecipeMediaRouteOptionsSerializer(payload).data)
 
     @extend_schema(request=None, responses={
         200: ProductionRecipeVersionSerializer,
@@ -4320,10 +4214,7 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
             if recipe.status != ProductionRecipeVersion.Status.DRAFT:
                 raise ValidationError("只有 draft recipe 可以发布")
             try:
-                validate_production_recipe_executability(
-                    recipe,
-                    require_delivery_closure=True,
-                )
+                validate_production_recipe_executability(recipe)
             except DjangoValidationError as exc:
                 raise _drf_validation(exc) from exc
             recipe.status = ProductionRecipeVersion.Status.PUBLISHED
@@ -4368,6 +4259,8 @@ class ProductionRecipeVersionViewSet(StaffPlatformModelViewSet):
 
 
 class ProductionRunViewSet(
+    TaskDistributionRecoveryMixin,
+    ProductionMaterialFulfillmentActions,
     mixins.CreateModelMixin,
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -4377,11 +4270,38 @@ class ProductionRunViewSet(
     pagination_class = StandardPageNumberPagination
     filterset_fields = ("project", "status", "recipe_version")
     queryset = ProductionRun.objects.select_related(
-        "project", "owner", "script_revision", "recipe_version", "config_revision",
-    ).prefetch_related("stages__approval_decisions", "artifacts")
+        "project", "owner", "script_revision", "recipe_version", "config_revision", "release_bundle",
+    ).prefetch_related(
+        "stages__approval_decisions", "stages__artifact_selection_decisions",
+        "stages__route_events", "artifacts",
+    )
+
+    @extend_schema(responses={
+        200: ProductionRunDetailSerializer,
+        400: ConfigurationErrorResponseSerializer,
+        403: ConfigurationErrorResponseSerializer,
+        404: ConfigurationErrorResponseSerializer,
+    })
+    @security_boundary_resolution_cache()
+    def retrieve(self, request, *args, **kwargs):
+        # One response shares current boundary resolutions across all stages;
+        # the next read resolves the active configuration again.
+        try:
+            return super().retrieve(request, *args, **kwargs)
+        except DjangoValidationError as exc:
+            # Stored contract failures remain explicit. Never reconstruct a
+            # historical plan or turn its rejection into a generic HTTP 500.
+            raise _drf_validation(exc) from exc
 
     def get_queryset(self):
         queryset = self.queryset
+        if self.action == "list":
+            queryset = queryset.select_related(None).prefetch_related(None).select_related("project", "release_bundle")
+        if self.action in ("distribution_recovery", "retry_distribution", "targets", "reference_mapping_preview", "manual_action_options", "manual_script_structure", "material_selection_context", "select_artifact", "material_fulfillment_context", "fulfill_material", "manual_shot_references", "recipe_shot_references", "storyboard_reference_selection"):
+            queryset = queryset.select_related(None).prefetch_related(None).only("id", "owner_id", "status")
+        if self.action == "retry_preview":
+            queryset = queryset.select_related(None).prefetch_related(None).only(
+                "id", "plan_source", "current_stage_key", "status", "blocked_code")
         if getattr(self, "swagger_fake_view", False):
             return queryset.none()
         return (
@@ -4396,6 +4316,324 @@ class ProductionRunViewSet(
         if self.action == "retrieve":
             return ProductionRunDetailSerializer
         return ProductionRunListSerializer
+
+    @extend_schema(responses=ProductionBudgetOptionsSerializer)
+    @action(detail=False, methods=("get",), url_path="budget-options")
+    def budget_options(self, request):
+        from studio.services.production_budget_configuration import budget_currency_options
+        try:
+            return Response(budget_currency_options())
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+
+    @extend_schema(
+        parameters=[OpenApiParameter("project_id", OpenApiTypes.UUID, OpenApiParameter.QUERY, required=True)],
+        responses={200: ProductionManualOptionsSerializer},
+    )
+    @action(detail=False, methods=("get",), url_path="manual-options")
+    def manual_options(self, request):
+        from studio.services.production_manual_creation import manual_production_options
+        raw = request.query_params.get("project_id")
+        try:
+            project_id = uuid.UUID(raw) if raw else None
+        except ValueError:
+            project_id = None
+        if project_id is None or set(request.query_params) != {"project_id"}:
+            raise ValidationError({"project_id": "必须且只能提供明确的项目 UUID"})
+        projects = SeriesProject.objects.all() if request.user.is_staff else SeriesProject.objects.filter(owner=request.user)
+        project = get_object_or_404(projects, pk=project_id)
+        return Response(manual_production_options(project))
+
+    @extend_schema(responses=ProductionManualActionOptionsSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-action-options")
+    def manual_action_options(self, request, pk=None):
+        from studio.services.production_manual_actions import manual_action_options
+        try:
+            return Response(manual_action_options(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+
+    @extend_schema(responses=ManualScriptStructureCheckSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-script-structure")
+    def manual_script_structure(self, request, pk=None):
+        from studio.services.production_manual_scripts import manual_script_structure_check
+        if request.query_params:
+            raise ValidationError("检查只读取本轮明确采用的修订，不接受替代来源或执行参数")
+        try:
+            response = Response(manual_script_structure_check(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(parameters=[ManualChangeImpactQuerySerializer], responses=ManualChangeImpactSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-change-impact")
+    def manual_change_impact(self, request, pk=None):
+        from studio.services.production_manual_change_impact import manual_content_change_impact
+        run = self.get_object()
+        if any(len(request.query_params.getlist(key)) != 1 for key in request.query_params):
+            raise ValidationError("改选影响查询不接受重复参数")
+        query = ManualChangeImpactQuerySerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        try:
+            result = manual_content_change_impact(run, **query.validated_data)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(result, headers={"Cache-Control": "private, no-store"})
+
+    @extend_schema(parameters=[ReviewedVisualSourceQuerySerializer], responses=ReviewedVisualSourcesSerializer)
+    @action(detail=True, methods=("get",), url_path="reviewed-visual-sources")
+    def reviewed_visual_sources(self, request, pk=None):
+        from studio.services.production_reviewed_visual_rules import reviewed_visual_source_options
+        if any(len(request.query_params.getlist(key)) != 1 for key in request.query_params):
+            raise ValidationError("审核来源查询不接受重复参数")
+        query = ReviewedVisualSourceQuerySerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        try:
+            result = reviewed_visual_source_options(run=self.get_object(), owner=request.user, **query.validated_data)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(result, headers={"Cache-Control": "private, no-store"})
+
+    @extend_schema(responses=ManualMediaReviewSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-media-review")
+    def manual_media_review(self, request, pk=None):
+        from studio.services.production_manual_media_review import manual_media_review_detail
+        if request.query_params:
+            raise ValidationError("选片审核读取本轮完整集合，不接受分页或隐藏成员筛选")
+        try:
+            response = Response(manual_media_review_detail(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(methods=["GET"], responses=ManualAssemblyDetailSerializer)
+    @extend_schema(methods=["POST"], request=ManualAssemblyPreviewSerializer, responses=ManualAssemblyDetailSerializer)
+    @action(detail=True, methods=("get", "post"), url_path="manual-assembly")
+    def manual_assembly(self, request, pk=None):
+        from studio.services.production_manual_assembly import manual_assembly_detail
+        if request.query_params:
+            raise ValidationError("装配读取本轮完整选片和输出配置，不接受隐藏成员筛选")
+        data = {}
+        if request.method == "POST":
+            serializer = ManualAssemblyPreviewSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            data = serializer.validated_data
+        try:
+            response = Response(manual_assembly_detail(self.get_object(), **data))
+        except DjangoValidationError as exc:
+            if getattr(exc, "code", "") == "manual_selection_conflict":
+                return Response({"detail": exc.messages, "code": exc.code}, status=status.HTTP_409_CONFLICT)
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(responses=ManualDeliveryDetailSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-delivery")
+    def manual_delivery(self, request, pk=None):
+        from studio.services.production_manual_delivery import manual_delivery_detail
+        if request.query_params:
+            raise ValidationError("成片确认读取本轮完整范围，不接受隐藏成员筛选")
+        try:
+            response = Response(manual_delivery_detail(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(responses=PolymorphicProxySerializer(component_name="BibleContentReview",
+        serializers={"manual": ManualBibleReviewSerializer, "recipe": RecipeBibleReviewSerializer},
+        resource_type_field_name="plan_source"))
+    @action(detail=True, methods=("get",), url_path="bible-review")
+    def bible_review(self, request, pk=None):
+        from studio.services.production_manual_bible import manual_bible_review_detail
+        from studio.services.bible_content_review import recipe_bible_review_detail
+        if request.query_params:
+            raise ValidationError("Bible 审核读取明确来源的完整集合，不接受隐藏成员筛选")
+        try:
+            run = self.get_object()
+            reader = manual_bible_review_detail if run.plan_source == "manual" else recipe_bible_review_detail
+            response = Response(reader(run))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(responses=ManualBibleImageReviewSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-bible-image-review")
+    def manual_bible_image_review(self, request, pk=None):
+        from studio.services.production_manual_bible_images import manual_bible_image_review_detail
+        if request.query_params:
+            raise ValidationError("参考图审核读取本轮完整集合，不接受隐藏成员筛选")
+        try:
+            response = Response(manual_bible_image_review_detail(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(responses=ManualStoryboardReviewSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-storyboard-review")
+    def manual_storyboard_review(self, request, pk=None):
+        from studio.services.production_manual_storyboard_review import manual_storyboard_review_detail
+        if request.query_params:
+            raise ValidationError("逐镜参考审核必须读取本轮完整范围，不接受隐藏成员筛选")
+        try:
+            response = Response(manual_storyboard_review_detail(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(responses=ManualStoryboardDetailSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-storyboard")
+    def manual_storyboard(self, request, pk=None):
+        from studio.services.production_manual_storyboard import manual_storyboard_detail
+        if request.query_params:
+            raise ValidationError("分镜采用读取本轮冻结范围的完整集合，不接受隐藏成员筛选")
+        try:
+            response = Response(manual_storyboard_detail(self.get_object()))
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(parameters=[ManualShotReferenceQuerySerializer], responses=ManualShotReferenceDetailSerializer)
+    @action(detail=True, methods=("get",), url_path="manual-shot-references")
+    def manual_shot_references(self, request, pk=None):
+        from studio.services.production_manual_shot_references import manual_shot_reference_detail
+        if set(request.query_params) != {"shot_id"} or len(request.query_params.getlist("shot_id")) != 1:
+            raise ValidationError("请提供唯一shot_id，不接受隐藏范围或额外筛选")
+        query = ManualShotReferenceQuerySerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        try:
+            response = Response(ManualShotReferenceDetailSerializer(manual_shot_reference_detail(
+                run_id=self.get_object().pk, actor=request.user, shot_id=query.validated_data["shot_id"])).data)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(parameters=[ManualShotReferenceQuerySerializer], responses=RecipeShotReferenceDetailSerializer)
+    @action(detail=True, methods=("get",), url_path="recipe-shot-references")
+    def recipe_shot_references(self, request, pk=None):
+        from studio.services.production_recipe_shot_reference_commands import recipe_shot_reference_detail
+        run = self.get_object()
+        if set(request.query_params) != {"shot_id"} or len(request.query_params.getlist("shot_id")) != 1:
+            raise ValidationError("配方单镜选材只接受唯一明确的shot_id")
+        query = ManualShotReferenceQuerySerializer(data=request.query_params.dict())
+        query.is_valid(raise_exception=True)
+        try:
+            response = Response(RecipeShotReferenceDetailSerializer(recipe_shot_reference_detail(
+                run_id=run.pk, actor=request.user, shot_id=query.validated_data["shot_id"])).data)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(responses={200: RecipeStoryboardReferenceSelectionSerializer,
+        409: ProductionRunConflictResponseSerializer}, filters=False)
+    @action(detail=True, methods=("get",), url_path="storyboard-reference-selection")
+    def storyboard_reference_selection(self, request, pk=None):
+        from studio.services.production_storyboard_policy import recipe_storyboard_reference_review
+        if request.query_params:
+            raise ValidationError("当前分镜参考审核读取不接受隐藏范围或额外筛选")
+        try:
+            response = Response(RecipeStoryboardReferenceSelectionSerializer(
+                recipe_storyboard_reference_review(self.get_object(), actor=request.user)).data)
+        except ProductionRunConflict as exc:
+            details = getattr(exc, "message_dict", None) or {"detail": "; ".join(exc.messages)}
+            return api_error_response(status_code=status.HTTP_409_CONFLICT, code=exc.code, details=details)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(parameters=[OpenApiParameter("kind", str, required=True, enum=list(PRODUCTION_SCOPE_KINDS)),
+        OpenApiParameter("page", OpenApiTypes.INT, description="页码，从1开始；超出范围返回404。"),
+        OpenApiParameter("page_size", OpenApiTypes.INT, description="复用全局分页大小与上限配置。")],
+        responses=ManualTargetPageSerializer)
+    @action(detail=True, methods=("get",), url_path="targets")
+    def targets(self, request, pk=None):
+        from studio.services.production_execution_targets import production_target_queryset, production_target_row
+        if (set(request.query_params) - {"kind", "page", "page_size"}
+                or any(len(request.query_params.getlist(key)) != 1 for key in request.query_params)
+                or "kind" not in request.query_params):
+            raise ValidationError("请提供唯一的目标类型及分页参数，不接受额外筛选")
+        run = self.get_object()
+        try:
+            plan, rows = production_target_queryset(run, request.query_params["kind"])
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        page = self.paginate_queryset(rows)
+        response = self.get_paginated_response([production_target_row(row, request.query_params["kind"]) for row in page])
+        response.data.update(run_id=str(run.pk), run_plan_sha256=plan.sha256)
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(request=StageInputAmendmentInputSerializer, responses=StageInputAmendmentSerializer)
+    @action(detail=True, methods=("post",), url_path="stage-input-amendment")
+    def stage_input_amendment(self, request, pk=None):
+        from studio.services.production_stage_input_amendments import amend_stage_inputs
+        run = self.get_object()
+        serializer = StageInputAmendmentInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not run.stages.filter(pk=data["stage_run_id"]).exists():
+            raise ValidationError("所选阶段不属于当前运行")
+        try:
+            result = amend_stage_inputs(stage_run_id=data["stage_run_id"], policy=data["policy"], source_changes=data.get("source_changes"),
+                expected_run_plan_sha256=data["expected_run_plan_sha256"], action=data["action"],
+                expected_amendment_sha256=data.get("expected_amendment_sha256"), actor=request.user)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response = Response(StageInputAmendmentSerializer(result).data)
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(request=RecipeMappingPreviewInputSerializer, responses=RecipeMappingPreviewSerializer)
+    @action(detail=True, methods=("post",), url_path="reference-mapping-preview")
+    def reference_mapping_preview(self, request, pk=None):
+        from studio.services.production_recipe_media_preparations import preview_recipe_media_mapping
+        run = self.get_object()
+        serializer = RecipeMappingPreviewInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if not run.stages.filter(pk=data["stage_run_id"]).exists():
+            raise ValidationError("所选阶段不属于当前运行")
+        try:
+            result = preview_recipe_media_mapping(stage_run_id=data["stage_run_id"],
+                expected_run_plan_sha256=data["expected_run_plan_sha256"], shot_id=str(data["shot_id"]),
+                candidate_number=data["candidate_number"], actor=request.user)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        response = Response(RecipeMappingPreviewSerializer(result).data)
+        response["Cache-Control"] = "private, no-store"
+        return response
+
+    @extend_schema(request=ProductionManualActionInputSerializer,
+        parameters=[OpenApiParameter("Location", OpenApiTypes.URI, OpenApiParameter.HEADER, response=[200, 202],
+            description="generate/retry 动作返回原执行准备详情地址；其他动作不返回此头。")],
+        responses={200: ProductionManualActionResultSerializer, 201: ProductionManualActionResultSerializer,
+            202: ProductionManualActionResultSerializer,
+            409: ProductionRunConflictResponseSerializer})
+    @action(detail=True, methods=("post",), url_path="manual-actions")
+    def manual_actions(self, request, pk=None):
+        from studio.services.production_manual_actions import perform_manual_action
+        run = self.get_object()
+        serializer = ProductionManualActionInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            receipt, created = perform_manual_action(run_id=run.pk, request=serializer.validated_data, actor=request.user)
+        except DjangoValidationError as exc:
+            if isinstance(exc, ProductionRunConflict) or getattr(exc, "code", "") in {"manual_selection_conflict", "run_plan_source_conflict"}:
+                return api_error_response(status_code=status.HTTP_409_CONFLICT, code=exc.code,
+                    details=getattr(exc, "message_dict", None) or {"detail": "; ".join(exc.messages)})
+            raise _drf_validation(exc) from exc
+        response_status = (status.HTTP_202_ACCEPTED if receipt.action in {"generate", "retry", "assemble"} else status.HTTP_201_CREATED) if created else status.HTTP_200_OK
+        headers = {"Location": reverse("execution-preparation-detail", kwargs={"pk": receipt.target_id}, request=request)} if receipt.action in {"generate", "retry"} else {}
+        return Response(ProductionManualActionResultSerializer(receipt).data, status=response_status, headers=headers)
 
     @extend_schema(
         request=ProductionRunCreateSerializer,
@@ -4412,10 +4650,8 @@ class ProductionRunViewSet(
         data = serializer.validated_data
         projects = SeriesProject.objects.all() if request.user.is_staff else SeriesProject.objects.filter(owner=request.user)
         project = get_object_or_404(projects, pk=data.pop("project_id"))
-        recipe = get_object_or_404(
-            ProductionRecipeVersion,
-            pk=data.pop("recipe_version_id"),
-        )
+        recipe_id = data.pop("recipe_version_id", None)
+        recipe = get_object_or_404(ProductionRecipeVersion, pk=recipe_id) if recipe_id else None
         revision_id = data.pop("script_revision_id", None)
         script_revision = None
         if revision_id:
@@ -4495,6 +4731,7 @@ class ProductionRunViewSet(
             "在 bible_image_review 待人工审核时，使用本 ProductionRun 已冻结的 "
             "Bible 模型、PromptProfile 与 route 为指定实体追加一个新候选。"
             "旧候选与正式 Bible 绑定均不会被覆盖。"
+            "支持种子时首次准备抽取并冻结未被同实体使用的合法种子，固定值不绕过；重放和失败重试不重抽。"
         ),
     )
     @action(detail=True, methods=("post",), url_path="regenerate-bible-images")
@@ -4520,14 +4757,47 @@ class ProductionRunViewSet(
             raise _drf_validation(exc) from exc
         return Response(ProductionRunDetailSerializer(run).data)
 
-    @extend_schema(request=None, responses=ProductionRunDetailSerializer)
+    @extend_schema(request=None, responses=ProductionRunDetailSerializer,
+        description="显式继续原运行。文本/媒体生成阶段的stage_validation_failed可重检已修正输入或合同，复用原准备及已有调用，不重发成功任务；未修正则返回真实阻断。待人工分镜审核时仅补齐自动选材，保留审核停点；不代替批准。来源不符或选择被执行锁定返回400。")
     @action(detail=True, methods=("post",), url_path="continue")
     def continue_run(self, request, pk=None):
-        run = advance_production_run(self.get_object())
+        try:
+            run = advance_production_run(self.get_object(), human_initiated=True)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
         return Response(ProductionRunDetailSerializer(run).data)
 
+    @extend_schema(parameters=[ProductionRetryPreviewQuerySerializer], responses=ProductionRetryPreviewSerializer,
+        filters=False)
+    @action(detail=True, methods=("get",), url_path="retry-preview")
+    def retry_preview(self, request, pk=None):
+        from studio.services.production_retry_preview import (
+            retry_preview_sources, retry_preview_rows, retry_preview_summary, serialize_retry_preview_page,
+        )
+        query = ProductionRetryPreviewQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        run = self.get_object()
+        if run.plan_source != "recipe":
+            raise ValidationError("无配方制作请使用对应步骤的人工动作。")
+        stage = run.stages.only("id", "status", "reason_code", "stage_key", "mode", "production_run_id").filter(
+            stage_key=run.current_stage_key).first()
+        if stage is None or stage.pk != query.validated_data["expected_stage_id"]:
+            raise ValidationError("当前阶段已变化，请重新读取后确认。")
+        if stage.stage_key == "assembly":
+            from studio.services.production_assembly_retry import assembly_retry_links, assembly_retry_preview, assembly_retry_impact
+            links = list(assembly_retry_links(stage))
+            rows = self.paginate_queryset(links)
+            response = self.get_paginated_response([assembly_retry_impact(row, stage) for row in rows])
+            response.data.update(assembly_retry_preview(run, stage, links))
+            return Response(ProductionRetryPreviewSerializer(response.data).data)
+        calls, preparations = retry_preview_sources(stage)
+        rows = self.paginate_queryset(retry_preview_rows(calls, preparations))
+        response = self.get_paginated_response(serialize_retry_preview_page(rows, calls, preparations, stage=stage))
+        response.data.update(retry_preview_summary(run, stage, calls, preparations))
+        return Response(ProductionRetryPreviewSerializer(response.data).data)
+
     @extend_schema(
-        request=None,
+        request=ProductionRunRetryInputSerializer,
         responses={
             200: ProductionRunDetailSerializer,
             409: ProductionRunConflictResponseSerializer,
@@ -4535,8 +4805,10 @@ class ProductionRunViewSet(
     )
     @action(detail=True, methods=("post",))
     def retry(self, request, pk=None):
+        serializer = ProductionRunRetryInputSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
         try:
-            run = retry_production_run(self.get_object(), user=request.user)
+            run = retry_production_run(self.get_object(), user=request.user, **serializer.validated_data)
         except ProductionRunRetryConflict as exc:
             return api_error_response(
                 status_code=status.HTTP_409_CONFLICT,
@@ -4588,24 +4860,48 @@ class ProductionRunViewSet(
             raise _drf_validation(exc) from exc
         return Response(ProductionRunDetailSerializer(run).data)
 
-    @extend_schema(
-        request=SelectArtifactInputSerializer,
-        responses=GeneratedArtifactDetailSerializer,
-    )
+    @extend_schema(parameters=[OpenApiParameter("artifact_id", OpenApiTypes.UUID, OpenApiParameter.QUERY, required=True)],
+        responses=RecipeMaterialSelectionContextSerializer)
+    @action(detail=True, methods=("get",), url_path="material-selection-context")
+    def material_selection_context(self, request, pk=None):
+        from studio.services.production_recipe_material_selection import recipe_material_selection_context
+        serializer = SelectArtifactInputSerializer(data={"artifact_id": request.query_params.get("artifact_id")})
+        serializer.is_valid(raise_exception=True)
+        artifact = get_object_or_404(GeneratedArtifact.objects.select_related("generation_attempt__preparation"),
+            pk=serializer.validated_data["artifact_id"], production_run=self.get_object())
+        try:
+            result = recipe_material_selection_context(artifact=artifact, actor=request.user)
+        except DjangoValidationError as exc:
+            raise _drf_validation(exc) from exc
+        return Response(RecipeMaterialSelectionContextSerializer(result).data, headers={"Cache-Control": "private, no-store"})
+
+    @extend_schema(request=SelectArtifactInputSerializer,
+        description="新媒体选片先核验真实归档文件和冻结来源；失败返回400且不写选择或回执。原键原正文重放仅返回历史决定，不代表重新验证文件。",
+        parameters=[OpenApiParameter("Idempotency-Key", OpenApiTypes.STR, OpenApiParameter.HEADER,
+            required=True, description="1至191字符的稳定请求键；失联后使用原键及原正文重放，新意图使用新键。")],
+        responses={200: ProductionManualActionResultSerializer, 409: ProductionRunConflictResponseSerializer})
     @action(detail=True, methods=("post",), url_path="select-artifact")
     def select_artifact(self, request, pk=None):
+        from studio.services.production_artifact_selection_receipts import select_run_artifact_command
+        run = self.get_object()
         serializer = SelectArtifactInputSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         artifact = get_object_or_404(
             GeneratedArtifact,
             pk=serializer.validated_data["artifact_id"],
-            production_run=self.get_object(),
+            production_run=run,
         )
         try:
-            artifact = select_run_artifact(self.get_object(), artifact, user=request.user)
+            receipt = select_run_artifact_command(run, artifact, actor=request.user,
+                request_key=request.headers.get("Idempotency-Key"),
+                material_selection=serializer.validated_data.get("material_selection"))
+        except ProductionRunConflict as exc:
+            return api_error_response(status_code=status.HTTP_409_CONFLICT, code=exc.code,
+                details=getattr(exc, "message_dict", None) or {"detail": "; ".join(exc.messages)})
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
-        return Response(GeneratedArtifactDetailSerializer(artifact).data)
+        return Response(ProductionManualActionResultSerializer(receipt).data,
+            headers={"Cache-Control": "private, no-store"})
 
     @extend_schema(
         request=SelectRouteInputSerializer,
@@ -4653,6 +4949,11 @@ class ProductionRunViewSet(
         return Response(ProductionRunDetailSerializer(run).data)
 
 
+    @security_boundary_resolution_cache()
+    def list(self, request, *args, **kwargs):
+        return super().list(request, *args, **kwargs)
+
+
 class GenerationAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     permission_classes = (IsAuthenticated,)
     serializer_class = GenerationAttemptSerializer
@@ -4678,14 +4979,14 @@ class WorkflowSmokeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = WorkflowSmokeAttemptSerializer
     queryset = WorkflowSmokeAttempt.objects.select_related(
         "workflow_version", "deployment", "created_by",
-    ).prefetch_related("asset_bindings", "resolutions__decided_by").order_by("-created_at")
-    filterset_fields = ("workflow_version", "deployment", "status")
+    ).prefetch_related("asset_bindings", "resolutions__decided_by", "execution_preparations").order_by("-created_at")
+    filterset_fields = ("workflow_version", "deployment", "status", "scope")
 
     @extend_schema(request=None, responses={202: WorkflowSmokeAttemptSerializer})
     @action(detail=True, methods=("post",), url_path="cancel")
     def cancel(self, request, pk=None):
         try:
-            attempt = request_workflow_smoke_cancel(self.get_object())
+            attempt = request_workflow_smoke_cancel(self.get_object(), actor=request.user)
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(
@@ -4736,8 +5037,8 @@ class ModelDeploymentSmokeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = ModelDeploymentSmokeAttemptSerializer
     queryset = ModelDeploymentSmokeAttempt.objects.select_related(
         "deployment", "final_snapshot",
-    ).order_by("-created_at")
-    filterset_fields = ("deployment", "operation", "status")
+    ).prefetch_related("execution_preparations").order_by("-created_at")
+    filterset_fields = ("deployment", "operation", "status", "scope")
 
     @extend_schema(
         request=None,
@@ -4750,7 +5051,7 @@ class ModelDeploymentSmokeAttemptViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=True, methods=("post",), url_path="cancel")
     def cancel(self, request, pk=None):
         try:
-            attempt = request_deployment_smoke_cancel(self.get_object())
+            attempt = request_deployment_smoke_cancel(self.get_object(), actor=request.user)
         except DjangoValidationError as exc:
             raise _drf_validation(exc) from exc
         return Response(self.get_serializer(attempt).data, status=status.HTTP_202_ACCEPTED)
@@ -4763,18 +5064,37 @@ class GeneratedArtifactViewSet(viewsets.ReadOnlyModelViewSet):
         "production_run", "stage_run", "generation_task", "kind", "status",
         "variant_group",
     )
-    queryset = GeneratedArtifact.objects.select_related(
-        "production_run__owner", "production_run__project__owner", "stage_run",
-        "generation_attempt", "generation_task", "asset",
-    )
+    queryset = GeneratedArtifact.objects.select_related("production_run__project", "generation_task")
 
     def get_queryset(self):
-        queryset = self.queryset
+        fields = [key for key in GeneratedArtifactListSerializer.Meta.fields if key not in {"preview_url", "download_url"}]
+        fields += ["production_run__id", "production_run__owner_id", "production_run__project_id",
+            "production_run__project__id", "production_run__project__owner_id",
+            "generation_task__id", "generation_task__owner_id", "generation_task__project_id"]
+        if self.action == "retrieve":
+            fields.append("manifest_metadata")
+        queryset = self.queryset.only(*fields)
         if getattr(self, "swagger_fake_view", False):
             return queryset.none()
         if self.request.user.is_staff:
             return queryset
         return queryset.filter(production_run__project__owner=self.request.user)
+
+    def list(self, request, *args, **kwargs):
+        page = self.paginate_queryset(self.filter_queryset(self.get_queryset()))
+        # Media URL provenance needs its manifest; text candidates do not.
+        # Read only the bounded page's media metadata in one batch, never the
+        # native candidate bodies or related Run/Attempt request snapshots.
+        media_ids = [row.pk for row in page if row.storage_backend in {"managed_local", "local_media"}
+            and row.kind in {"image", "video", "audio", "assembly"} and row.status in {"available", "selected"}
+            and row.production_run_id is not None and row.generation_task_id is None]
+        metadata = dict(GeneratedArtifact.objects.filter(pk__in=media_ids).values_list("id", "manifest_metadata"))
+        if len(metadata) != len(media_ids):
+            raise ValidationError("产物已变化，请重新读取")
+        for row in page:
+            if row.pk in metadata:
+                row.manifest_metadata = metadata[row.pk]
+        return self.get_paginated_response(self.get_serializer(page, many=True).data)
 
     def get_serializer_class(self):
         return (

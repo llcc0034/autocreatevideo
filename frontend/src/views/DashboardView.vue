@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { ArrowRight, Clapperboard, Clock3, Film, FolderOpen, Images, MoreHorizontal, Play, Plus, Sparkles, WandSparkles, Workflow } from 'lucide-vue-next'
 import { useStudioStore } from '@/stores/studio'
 import StatusBadge from '@/components/StatusBadge.vue'
@@ -8,6 +8,7 @@ import { workflowProgressPresentation } from '@/services/taskProgress'
 import { projectEpisodeSummary } from '@/services/projectManagement'
 
 const studio = useStudioStore()
+onMounted(() => { void studio.initialize() })
 const episodeSummary = (project: (typeof studio.projects)[number]) => project.detailLoaded ? projectEpisodeSummary(project) : project
 const completedEpisodeCountFor = (project: (typeof studio.projects)[number]) => episodeSummary(project).completedEpisodeCount ?? 0
 const episodeCountFor = (project: (typeof studio.projects)[number]) => episodeSummary(project).episodeCount ?? 0

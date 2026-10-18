@@ -19,7 +19,23 @@ from studio.services.workflow_versions import _validate_model_inventory
 
 
 class ComfyUIArtifactInventoryTests(SimpleTestCase):
-    def test_live_inventory_accepts_separator_variant_and_freezes_exact_submission(self):
+    def test_import_freezes_live_model_spelling_not_normalized_inventory_name(self):
+        from studio.services.comfyui_workflow_imports import _neutral_binding_value, SavedWorkflowUnsafeLiteral
+
+        filename = "nested/model.safetensors"
+        widget = "nested\\model.safetensors"
+        item = {"input_contract": {"parameters": {
+            "model.lora.filename": {"type": "model_artifact", "requirement_alias": "lora"},
+        }}, "model_requirements": [{"alias": "lora", "expected_filename": filename}]}
+        binding = {"value_type": "model_artifact", "semantic_key": "model.lora.filename"}
+        for definition in ([[widget], {}], ["COMBO", {"options": [widget]}]):
+            with self.subTest(definition=definition):
+                self.assertEqual(_neutral_binding_value(item=item, binding=binding, definition=definition), widget)
+        for choices in (["other.safetensors"], [filename, widget]):
+            with self.subTest(choices=choices), self.assertRaises(SavedWorkflowUnsafeLiteral):
+                _neutral_binding_value(item=item, binding=binding, definition=[choices, {}])
+
+    def test_live_inventory_requires_exact_graph_option_for_portable_file_identity(self):
         profile_id = uuid4()
         artifact = ModelArtifact(
             profile_version_id=profile_id,
@@ -89,12 +105,8 @@ class ComfyUIArtifactInventoryTests(SimpleTestCase):
         )
 
         version.graph["7"]["inputs"]["lora_name"] = requirement.expected_filename
-        normalized_graph_report = _validate_model_inventory(
-            version,
-            deployment,
-            Driver(),
-            object_info,
-        )
+        with self.assertRaisesRegex(ValidationError, "精确枚举不一致"):
+            _validate_model_inventory(version, deployment, Driver(), object_info)
 
         version.graph["7"]["inputs"]["lora_name"] = (
             "HunyuanVideo/lightning/another_lora.safetensors"
@@ -113,12 +125,6 @@ class ComfyUIArtifactInventoryTests(SimpleTestCase):
         )
         self.assertEqual(
             report["checked_requirements"][0]["submission_filename"],
-            artifact.filename,
-        )
-        self.assertEqual(
-            normalized_graph_report["checked_requirements"][0][
-                "submission_filename"
-            ],
             artifact.filename,
         )
         self.assertEqual(report["schema_version"], 2)

@@ -421,17 +421,6 @@ export const conditioningModeByKey = (
   return modes.find((item) => item.key === normalized)
 }
 
-export const resolveConfiguredConditioningMode = (
-  value: unknown,
-  modes: ConditioningModeCapability[],
-  defaultMode: unknown,
-): string => (
-  conditioningModeByKey(modes, value)?.key
-  || conditioningModeByKey(modes, defaultMode)?.key
-  || modes[0]?.key
-  || ''
-)
-
 export const conditioningInputAvailable = (
   mode: ConditioningModeCapability | undefined,
   input: keyof ConditioningModeInputs,

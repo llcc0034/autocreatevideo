@@ -1,4 +1,5 @@
 import type { ConditioningModeCapability } from './conditioningCapabilities'
+import type { RetryContext } from './productionRetryPreview'
 
 export type JsonObject = Record<string, unknown>
 
@@ -6,14 +7,15 @@ export type RegistryDeletionResourceType =
   | 'provider_profile'
   | 'model_profile_version'
   | 'model_deployment'
+  | 'model_execution_instance'
+  | 'model_execution_instance_version'
   | 'model_artifact'
   | 'workflow_template_version'
   | 'production_recipe_version'
   | 'config_definition'
-  | 'prompt_field_definition'
+  | 'field_definition'
   | 'prompt_profile_version'
   | 'prompt_profile_field_rule'
-  | 'prompt_profile_binding'
 
 export type RegistryDeletionDisposition =
   | 'selectable_delete'
@@ -131,7 +133,22 @@ export interface ModelProfileCapabilityOption extends ModelProfileRegistryChoice
   legacy: boolean
 }
 
+export interface AsyncMediaEditorOptions {
+  schemaVersion: 1
+  maximumStringLength: number
+  description: string
+  fields: { key: string; label: string; types: string[]; sourceDescription: string }[]
+  operations: { key: string; outputKind: string }[]
+}
+
 export interface ModelProfileRegistryOptions {
+  asyncMedia: AsyncMediaEditorOptions
+  scriptContracts: ScriptContractEditorOptions
+  visualRulesOutput: VisualRulesOutputOptions
+  executionMonitoring: { maxSeconds: number; maxOverrides: number }
+  mediaConstraints: MediaConstraintsEditorOptions
+  textExecution: TextExecutionEditorOptions
+  chatRequestOptions: ChatRequestOptionsEditorOptions
   conditioningContract: ConditioningContractEditorOptions
   specificationSchemaVersion: number
   providerDrivers: ModelProfileProviderDriverOption[]
@@ -139,6 +156,55 @@ export interface ModelProfileRegistryOptions {
   artifactRoles: ModelProfileRegistryChoice[]
   capabilities: ModelProfileCapabilityOption[]
   modelFamilies: string[]
+}
+
+export interface ScriptContractPolicyOption {
+  key: string
+  operation: string
+  label: string
+  numberFields: {key:string;label:string;unit:string;integer:boolean;minimum:number;maximum:number|null;exclusiveMinimum:boolean}[]
+}
+export interface ScriptContractEditorOptions {
+  schemaVersion: number
+  description: string
+  policies: ScriptContractPolicyOption[]
+}
+
+export interface VisualRulesOutputOptions {
+  schemaVersion: number
+  operation: string
+  responseSchemaVersion: number
+  responseExample: JsonObject
+  numberFields: {key:string;label:string;unit:string;minimum:number;maximum:number}[]
+  numberPairs: [string,string][]
+  clausesMaxBytes: number
+  colorChoices: Record<string,(string|boolean)[]>
+  outputs: {sourceSelector:string;field:string;label:string;responseField:string;sourceFormat?:string;transformation:string}[]
+}
+
+export interface MediaConstraintsEditorOptions {
+  schemaVersion: number
+  resolutionFields: {key: string; label: string; minimum: number; maximum: number; unit: string}[]
+  resolutionPairs: [string, string][]
+  fps: {minimum: number; maximum: number; maximumItems: number}
+  durationMs: {minimum: number; maximum: number}
+}
+
+export interface ChatRequestOptionsEditorOptions {
+  schemaVersion: number
+  temperatureMinimum: number
+  responseFormatTypes: ModelProfileRegistryChoice[]
+  assemblyDescription: string
+  boundaryDescription: string
+}
+
+export interface TextExecutionEditorOptions {
+  schemaVersion: number
+  integerConstraints: { valueFields: ModelProfileRegistryChoice[]; seedPolicies: ModelProfileRegistryChoice[] }
+  operations: ModelProfileRegistryChoice[]
+  parameters: (ModelProfileRegistryChoice & {
+    description: string; required: boolean; requireMaximum: boolean; template: JsonObject
+  })[]
 }
 
 export interface ConditioningContractEditorOptions {
@@ -150,6 +216,21 @@ export interface ConditioningContractEditorOptions {
   maximumModes: number
   identifierPattern: string
   modeTemplate: JsonObject
+  dynamicReferenceTopology: ReferenceTopologyEditorOptions
+}
+
+export interface ReferenceTopologyEditorOptions {
+  schema_version: number
+  maximum_rules: number
+  maximum_duration_ms: number
+  maximum_fps: number
+  label_max_characters: number
+  text_max_characters: number
+  maximum_targets_per_source: number
+  media_groups: {value: string; label: string; media_kind: string; input_slot: string}[]
+  preprocessing_slots: {value: string; label: string; input_slot: string; include_target_fps: boolean;
+    adapters: {value: string; label: string; description: string; target_fps: 'required' | 'forbidden' | 'not_applicable'}[]}[]
+  pairing_direction: {source_media_kind: string; target_media_kind: string}
 }
 
 export interface ModelDeploymentSmokeSummary {
@@ -393,28 +474,20 @@ export interface ModelArtifact extends PlatformEntity {
   verifiedBy: string
 }
 
-export type PromptFieldValueType = 'text' | 'long_text' | 'string_list' | 'boolean' | 'number' | 'enum'
+export type PromptFieldValueType = import('./fieldDefinitionVersions').FieldDefinitionVersionSummary['value_type']
 export interface PromptProfileChannelLimit {
   maxChars: number
   warnAtChars: number | null
 }
 
-export interface PromptFieldDefinition extends PlatformEntity {
+export interface FieldDefinition extends PlatformEntity {
   key: string
-  label: string
-  category: string
-  description: string
-  impact: string
-  valueType: PromptFieldValueType
-  defaultValue: unknown
-  previewExample: unknown
-  valueOptions: string[]
-  isRequired: boolean
   isActive: boolean
   displayOrder: number
 }
 
 export interface PromptProfileVersion extends PlatformEntity {
+  inputStructureVersion: string | null
   profileKey: string
   version: number
   name: string
@@ -437,11 +510,18 @@ export interface PromptProfileVersion extends PlatformEntity {
 }
 
 export interface PromptProfileFieldRule extends PlatformEntity {
+  sourcePath: (string | number)[] | null
+  fieldDefinitionVersion: string | null
+  sourceVersion?: string | null
+  sourceDefinition?: JsonObject | null
   profileVersion: string
   fieldDefinition: string
   fieldKey: string
   fieldLabel: string
   fieldValueType: PromptFieldValueType | string
+  fixedValue: unknown
+  hasDefault: boolean
+  defaultValue: unknown
   sourceSelector: string
   projectionPrimitive: string
   channel: string
@@ -464,25 +544,14 @@ export interface PromptProfileFieldRule extends PlatformEntity {
   generationValidatorKeys: string[]
 }
 
-export interface PromptProfileBinding extends PlatformEntity {
-  key: string
-  name: string
-  operation: string
-  modelFamily: string
-  mode: string
-  modelProfileVersion: string
-  modelIdentifier: string
-  promptProfileVersion: string
-  promptProfileName: string
-  promptProfileVersionNumber: number
-  promptProfileStatus: string
-  promptProfileKey: string
-  promptProfileContractSha256: string
-  priority: number
-  isActive: boolean
-}
 
 export interface PromptProfileChoiceOption { value: string; label: string }
+export interface PromptSourceOption extends PromptProfileChoiceOption {
+  groupLabel: string
+  description: string
+  recordLocation: string
+  executionUsage: string
+}
 export interface PromptProfileContextSelectorOption extends PromptProfileChoiceOption { description: string }
 export interface PromptProfileGenerationSourceOption extends PromptProfileChoiceOption {
   scopeType: string
@@ -523,22 +592,21 @@ export interface PromptProfileOptions {
   operations: string[]
   modelFamilies: string[]
   modes: string[]
-  fieldValueTypes: FormCatalogOption[]
-  fieldCategories: FormCatalogOption[]
   customEntryFields: string[]
-  fieldSystemDefaults: JsonObject
   ruleSystemDefaults: JsonObject
-  sourceSelectors: PromptProfileChoiceOption[]
+  sourceSelectors: PromptSourceOption[]
   channels: PromptProfileChoiceOption[]
   labelStyles: PromptProfileChoiceOption[]
   separators: PromptProfileChoiceOption[]
   generationModes: PromptProfileChoiceOption[]
+  generationLeafOperations: string[]
   generationSourceSelectors: PromptProfileGenerationSourceOption[]
   generationContextSelectors: PromptProfileContextSelectorOption[]
   generationOutputSemantics: PromptProfileChoiceOption[]
   sourceProjectionKeys: PromptProfileChoiceOption[]
   sourceProjectionPrimitives: PromptProfileProjectionPrimitiveOption[]
   referenceRenderingFields: ReferenceRenderingOption[]
+  referenceRenderingTextSlots: PromptProfileChoiceOption[]
   languagePolicies: PromptProfileChoiceOption[]
   lengthUnits: PromptProfileChoiceOption[]
   generationValidators: PromptProfileChoiceOption[]
@@ -599,7 +667,7 @@ export interface WorkflowModelRequirement {
   isRequired: boolean
 }
 
-export interface WorkflowSmokeFixtureParameter {
+export interface WorkflowInputParameter {
   semanticKey: string
   type: string
   required: boolean
@@ -615,7 +683,7 @@ export interface WorkflowSmokeFixtureParameter {
   recommendedValue: ComfyWorkflowParameterScalar | null
 }
 
-export interface WorkflowSmokeFixtureAssetSlot {
+export interface WorkflowInputAssetSlot {
   semanticKey: string
   inputSlot: number
   mediaKind: 'image' | 'video' | 'audio'
@@ -625,7 +693,7 @@ export interface WorkflowSmokeFixtureAssetSlot {
   required: boolean
 }
 
-export interface WorkflowSmokeDynamicReferencesSchema {
+export interface WorkflowDynamicReferencesSchema {
   mode: string
   conditioningMode: ConditioningModeCapability
   pictures: {
@@ -659,15 +727,15 @@ export interface WorkflowAssetGroup {
   wiring: 'ordered_ports' | 'reduce'
 }
 
-export interface WorkflowSmokeFixtureSchema {
+export interface WorkflowInputSchema {
   schemaVersion: 2
   available: boolean
   reasonCode: string
-  parameters: WorkflowSmokeFixtureParameter[]
-  assetSlots: WorkflowSmokeFixtureAssetSlot[]
+  parameters: WorkflowInputParameter[]
+  assetSlots: WorkflowInputAssetSlot[]
   assetGroups?: WorkflowAssetGroup[]
-  dynamicReferences: WorkflowSmokeDynamicReferencesSchema | null
-  dynamicReferenceModes: Record<string, WorkflowSmokeDynamicReferencesSchema>
+  dynamicReferences: WorkflowDynamicReferencesSchema | null
+  dynamicReferenceModes: Record<string, WorkflowDynamicReferencesSchema>
 }
 
 export type WorkflowTemplateVersionStatus = 'draft' | 'validated' | 'published' | 'retired'
@@ -710,20 +778,19 @@ export interface WorkflowTemplateVersion extends PlatformEntity {
   modelRequirements?: WorkflowModelRequirement[]
   validationEvidence?: JsonObject
   smokeTestEvidence?: JsonObject
-  smokeFixtureSchema?: WorkflowSmokeFixtureSchema
-  smokeFixtureSchemaError?: string
+  workflowInputSchema?: WorkflowInputSchema
+  workflowInputSchemaError?: string
 }
 
 export interface WorkflowConfigurationLinks {
   model: { id: string; key: string; version: number; status: string; instanceCount: number } | null
   validatedDeployment: { id: string; name: string; status: string; modelProfileVersionId: string } | null
-  promptBindings: {
-    state: 'available' | 'model_unbound' | 'family_missing'
+  executionInstances: {
     total: number
     activeTotal: number
     preview: {
-      bindingId: string; profileId: string; name: string; version: number; status: string
-      scope: 'exact_model' | 'model_family'; operation: string; mode: string; isActive: boolean
+      id: string; name: string; version: number; status: string
+      operation: string; mode: string; promptMode: 'profile' | 'manual' | 'none'
     }[]
   }
   projector: {
@@ -850,6 +917,7 @@ export interface WorkflowProjectorOptions {
       fields: WorkflowProjectorEditorField[]
     }>
     choices: {
+      executionCapabilities: WorkflowProjectorChoiceOption[]
       cardinalities: WorkflowProjectorChoiceOption[]
       parameterPolicies: WorkflowProjectorChoiceOption[]
       artifactRoles: WorkflowProjectorChoiceOption[]
@@ -857,6 +925,7 @@ export interface WorkflowProjectorOptions {
       outputKinds: WorkflowProjectorChoiceOption[]
       contractSources: WorkflowProjectorChoiceOption[]
       assetGroupWirings?: WorkflowProjectorChoiceOption[]
+      modelQuantityInputs: Array<WorkflowProjectorChoiceOption & { mediaKind: 'image' | 'video' | 'audio' }>
       roleSelectors: WorkflowProjectorChoiceOption[]
       scalarTypes: WorkflowProjectorChoiceOption[]
     }
@@ -1065,6 +1134,12 @@ export interface ComfyWorkflowConfigurableParameter {
 }
 
 export interface ComfySavedWorkflowPreview {
+  requestReceipt?: {
+    requestKey: string
+    candidateSourceId: string
+    request: { deploymentId: string; sourcePath: string; expectedSha256: string; expectedSourceScopeSchemaVersion: number;
+      expectedSourceScopeSha256: string; primaryOutputNodeIds: string[]; modelProfileVersion: string | null }
+  }
   schemaVersion: number
   sourcePath: string
   sourceSha256: string
@@ -1118,6 +1193,7 @@ export interface ComfySavedWorkflowBatchItemInput {
   expectedParameterSchemaSha256?: string
   expectedStructuralContractSha256?: string
   contractDraft?: string | null
+  successorOf?: string | null
   template?: string | null
   newTemplate?: { name: string; slug: string; outputKind: 'image' | 'video' | 'audio' | 'text'; description?: string } | null
   modelProfileVersion?: string | null
@@ -1170,7 +1246,22 @@ export interface NodeMetadataCatalog {
   items: NodeMetadataItem[]
 }
 
-export interface WorkflowSmokeAttempt extends PlatformEntity {
+export interface ExecutionSmokeIdentity {
+  preparationId: string | null
+  allowExternalCalls: boolean
+  budgetLimit: string | null
+  actualCost: string | null
+  scope: 'resource' | 'instance'
+  executionInstanceVersion: string | null
+  evidenceExpiresAt: string
+  resultSchemaVersion: number
+  resultSizeBytes: number
+  resultSha256: string
+}
+
+export interface WorkflowSmokeAttempt extends PlatformEntity, ExecutionSmokeIdentity {
+  estimatedCost: string
+  costCurrency: string
   workflowVersion: string
   deployment: string
   createdBy: string
@@ -1235,33 +1326,8 @@ export interface WorkflowSmokeAssetBinding {
   createdAt: string
 }
 
-export interface WorkflowSmokeFixtureInput {
-  schemaVersion: 2
-  values: Record<string, ComfyWorkflowParameterScalar>
-  assets: Array<{ semanticKey: string; assetId: string }>
-  references: {
-    pictures: Array<{
-      assetId: string
-      category: 'character' | 'scene' | 'prop' | 'continuity_frame'
-    }>
-    videos: Array<{
-      assetId: string
-      purpose: string
-      useEmbeddedAudio: boolean
-      audioAssetId?: string
-      audioPurpose?: string
-    }>
-    audios: Array<{
-      assetId: string
-      purpose: string
-    }>
-  }
-}
-
-export type WorkflowExecutionInputSchema = WorkflowSmokeFixtureSchema
-export type WorkflowExecutionInput = WorkflowSmokeFixtureInput
-
-export interface ModelDeploymentSmokeAttempt extends PlatformEntity {
+export interface ModelDeploymentSmokeAttempt extends PlatformEntity, ExecutionSmokeIdentity {
+  result: JsonObject
   promptProfile: JsonObject | null
   deployment: string
   operation: string
@@ -1483,9 +1549,26 @@ export interface RuntimeReadiness {
 }
 
 export interface ProductionReadinessCapability {
+  scope: 'configuration_only'
+  requestChecked: false
   state: 'not_required' | 'blocked' | 'ready' | string
   required: boolean
   reasonCodes: string[]
+  warningCodes: string[]
+  instanceCount: number | null
+  viableInstanceCount: number | null
+}
+
+export interface ProductionReadinessValidationError {
+  phase: 'definition' | 'requirements' | 'pipeline'
+  fieldPath: string
+  message: string
+  code: string | null
+  stageIndex: number | null
+  stageKey: string | null
+  stageKind: string | null
+  routingKey: string | null
+  routeIndex: number | null
 }
 
 export interface ProductionReadinessRecipe {
@@ -1495,10 +1578,12 @@ export interface ProductionReadinessRecipe {
   state: 'blocked' | 'ready' | string
   reasonCodes: string[]
   capabilities: Record<string, ProductionReadinessCapability>
+  validationErrors: ProductionReadinessValidationError[]
 }
 
 export interface ProductionReadiness {
   schemaVersion: number
+  requestChecked: false
   status: 'unconfigured' | 'blocked' | 'ready' | string
   reasonCodes: string[]
   recipes: ProductionReadinessRecipe[]
@@ -1535,7 +1620,6 @@ export interface RecommendationDecision extends PlatformEntity {
   scopeType: string
   project: string
   configRevision: string
-  recipeVersion: string
   overrideValues: JsonObject
   reason: string
 }
@@ -1580,8 +1664,13 @@ export interface ProductionRecipe extends PlatformEntity {
 
 export interface ProductionRecipeStageOption {
   value: string
+  label: string
+  repeatable: boolean
+  candidateEvaluatorOptions: { value: string | null; label: string }[]
   modes: string[]
   requiresRouting: boolean
+  routingModes: string[]
+  decisionPolicy: string | null
 }
 
 export interface ProductionRecipePresetOption extends FormCatalogOption {
@@ -1589,56 +1678,28 @@ export interface ProductionRecipePresetOption extends FormCatalogOption {
 }
 
 export interface ProductionRecipeEditorOptions {
+  assemblyOutputSchema?: JsonObject
+  assemblyTimingSchema?: JsonObject
+  assemblyMediaSchema?: JsonObject
+  deliveryMetadataSchema?: JsonObject
+  shotReferenceSourceOptions: {value: string; label: string; upstreamStageKey: string | null; selectionOptions: FormCatalogOption[]}[]
+  materialSourceOptions: FormCatalogOption[]
+  materialSelectionOptions: FormCatalogOption[]
   definitionSchemaVersion: number
+  effectiveLimits: { maxRoutingRoutes: number; maxVariants: number; maxGenerationTasks: number }
   stageOptions: ProductionRecipeStageOption[]
   approvalOptions: FormCatalogOption[]
+  interactionModeOptions: FormCatalogOption[]
+  fieldReviewPolicyOptions: JsonObject[]
+  sourceKindOptions: FormCatalogOption[]
+  structureNodeOptions: FormCatalogOption[]
+  textOutputOptions: { outputKey: string; stageKey: string; kind: string; scopeKind: string; label: string; value_schema?:JsonObject; outputVersionId?:string; outputContractSha256?:string; structureVersionId?:string }[]
+  referenceSourceOptions: { value: string; label: string; kind: string; scopeKind: string; stageKey: string; paired: boolean }[]
+  parameterPolicyOptions: FormCatalogOption[]
+  parameterSourceOptions: { selectorKey: string; label: string; scopeKind: string; type: string; unit: string; sourceKind: string; parameterKey: string | null; stageKey: string | null; description: string }[]
+  scopeOptions: FormCatalogOption[]
   routingModeOptions: FormCatalogOption[]
   presets: ProductionRecipePresetOption[]
-}
-
-export interface ProductionRecipeMediaRouteOption {
-  routeIndex: number
-  workflowVersionId: string
-  workflowLabel: string
-  modelDeploymentId: string
-  deploymentLabel: string
-  modelIdentifier: string
-  driverType: string
-  outputKinds: string[]
-  conditioningModes: ConditioningModeCapability[]
-  conditioningContractSha256: string
-  mediaOperations: string[]
-  isSelectable: boolean
-  reasonCodes: string[]
-  reasons: string[]
-  promptProfileRequirements: ProductionPromptProfileRequirement[]
-}
-
-export interface ProductionPromptProfileChoice {
-  bindingId: string
-  bindingKey: string
-  bindingName: string
-  promptProfileVersionId: string
-  profileKey: string
-  profileVersion: number
-  profileName: string
-  contractSha256: string
-  priority: number
-  bindingScope: string
-}
-
-export interface ProductionPromptProfileRequirement {
-  operation: string
-  mode: string
-  choices: ProductionPromptProfileChoice[]
-}
-
-export interface ProductionRecipeMediaRouteOptions {
-  schemaVersion: 2
-  recipeVersionId: string
-  recipeDefinitionSha256: string
-  routes: ProductionRecipeMediaRouteOption[]
-  bibleImageGeneration: ProductionPromptProfileRequirement | null
 }
 
 export interface ApprovalDecisionFact {
@@ -1655,6 +1716,7 @@ export interface ApprovalDecisionFact {
 }
 
 export interface StageRun extends PlatformEntity {
+  inputAmendmentPolicy?: string | null
   stageKey: string
   ordinal: number
   mode: string
@@ -1676,6 +1738,7 @@ export interface StageRun extends PlatformEntity {
   routingDecision: JsonObject
   routingDecisionSha256: string
   selectedRouteIndex: number | null
+  selectedVariantRouteIndex?: number | null
   approvedEstimatedCost: string
   approvedCostCurrency: string
   selectionConfirmedAt: string
@@ -1683,6 +1746,10 @@ export interface StageRun extends PlatformEntity {
   finishedAt: string
   approvalDecisions: string[]
   approvalDecisionFacts: ApprovalDecisionFact[]
+  artifactSelectionDecisions: Array<{
+    id: string; variantGroup: string; revision: number; artifact: string
+    selectionMode: string; selectedBy: string | null; createdAt: string
+  }>
 }
 
 export type ProductionRecipeScriptMode = 'ai' | 'confirmed_revision' | 'downstream'
@@ -1711,6 +1778,8 @@ export interface GeneratedArtifact extends PlatformEntity {
   downloadUrl: string
   comparisonParameters: JsonObject
   manifestMetadata?: JsonObject
+  textCandidate?: JsonObject | null
+  manualMediaCandidate?: JsonObject | null
 }
 
 export interface ProductionRun extends PlatformEntity {
@@ -1718,6 +1787,9 @@ export interface ProductionRun extends PlatformEntity {
   projectTitle: string
   scriptRevision: string
   recipeVersion: string
+  planSource: 'recipe' | 'manual'
+  executionPlan?: ProductionRunPlanEnvelope
+  retryContext?: RetryContext | null
   idempotencyKey: string
   requestSha256: string
   status: string
@@ -1725,13 +1797,11 @@ export interface ProductionRun extends PlatformEntity {
   blockedCode: string
   blockedReason: string
   allowExternalCalls: boolean
-  budgetLimit: string
   costCurrency: string
   estimatedCostTotal: string
   committedCostTotal: string
   actualCostTotal: string
   releaseBundleId: string
-  maxGenerationTasks: number
   generationTaskCount: number
   configSnapshotSha256: string
   inputSnapshotSha256: string
@@ -1744,16 +1814,53 @@ export interface ProductionRun extends PlatformEntity {
   artifacts?: GeneratedArtifact[]
 }
 
-export interface ProductionRunCreateInput {
+export interface ProductionRunPlanEnvelope {
+  value: JsonObject
+  schemaVersion: number
+  sizeBytes: number
+  sha256: string
+}
+
+export interface ProductionManualPlanInput {
+  stageCatalogKey: string
+  expectedStageCatalogSha256: string
+  scope: { kind: 'project' } | { kind: 'episodes'; episodeIds: string[] }
+  delivery: { kind: 'episode_masters' }
+  initialContent: { kind: 'script_revision'; id: string; expectedSha256: string } | null
+}
+
+export interface ProductionManualOptions {
   projectId: string
+  stageCatalog: ProductionRunPlanEnvelope
+  scopeKinds: string[]
+  deliveryKinds: string[]
+  initialContentKinds: string[]
+  facts: Record<string, number>
+}
+
+export interface ProductionRunCreateCommon {
+  projectId: string
+  idempotencyKey: string
+  allowExternalCalls?: boolean | null
+  configOverrides?: JsonObject
+}
+
+export interface ProductionManualRunCreateInput extends ProductionRunCreateCommon {
+  planSource: 'manual'
+  manualPlan: ProductionManualPlanInput
+}
+
+export interface RecipeProjectSourceConfirmation {
+  executionInstanceVersionId: string
+  inputKey: string
+  reference: string
+}
+
+export interface ProductionRecipeRunCreateInput extends ProductionRunCreateCommon {
+  planSource: 'recipe'
   scriptMode: ProductionRecipeScriptMode
   scriptRevisionId?: string | null
   recipeVersionId: string
-  idempotencyKey: string
-  allowExternalCalls?: boolean | null
-  budgetLimit?: string | null
-  maxGenerationTasks?: number | null
-  configOverrides?: JsonObject
   idea?: string
   styleHint?: string
   episodeCount?: number
@@ -1761,21 +1868,11 @@ export interface ProductionRunCreateInput {
   episodeDurationSeconds?: number | null
   structuredImportPlan?: boolean
   episodeIds?: string[]
-  workflowSelection?: ProductionWorkflowSelectionInput | null
-  bibleImagePromptProfileBindingId?: string | null
   unattendedConfirmed?: boolean
-  referenceInputs?: UnattendedReferenceInput[]
-  effectiveLimits?: {
-    maxRoutingRoutes: number
-    maxReferenceBindings: number
-  }
+  projectSourceConfirmations?: RecipeProjectSourceConfirmation[]
 }
 
-export interface UnattendedReferenceInput {
-  assetId: string
-  purpose: string
-  useEmbeddedAudio: boolean
-}
+export type ProductionRunCreateInput = ProductionRecipeRunCreateInput | ProductionManualRunCreateInput
 
 export interface BibleImageBindingSelectionInput {
   entityType: 'character' | 'scene' | 'prop'
@@ -1798,62 +1895,6 @@ export interface RegenerateBibleImagesInput {
   }>
 }
 
-export interface ShotReferenceEntityBindingInput {
-  entityId: string
-  assetId: string
-}
-
-export interface ShotReferenceBindingsInput {
-  firstFrameAssetId?: string
-  lastFrameAssetId?: string
-  firstFrameReferenceAssetId?: string
-  characters?: ShotReferenceEntityBindingInput[]
-  scene?: ShotReferenceEntityBindingInput
-  props?: ShotReferenceEntityBindingInput[]
-  videos?: Array<{
-    assetId: string
-    purpose: string
-    useEmbeddedAudio: boolean
-    audioAssetId?: string
-    audioPurpose?: string
-  }>
-  audios?: Array<{
-    assetId: string
-    purpose: string
-  }>
-}
-
-export interface StoryboardShotReferenceSelectionInput {
-  shotId: string
-  referenceBindings: ShotReferenceBindingsInput
-}
-
-export interface ProductionWorkflowShotRouteInput {
-  shotId: string
-  routeIndex: number
-  promptProfileBindingId: string
-}
-
-export interface ProductionWorkflowPromptProfileSelectionInput {
-  operation: string
-  mode: string
-  promptProfileBindingId: string
-}
-
-export type ProductionWorkflowSelectionInput =
-  | {
-      schemaVersion: 2
-      mode: 'uniform'
-      routeIndex: number
-      promptProfileSelections: ProductionWorkflowPromptProfileSelectionInput[]
-      shotRoutes?: never
-    }
-  | {
-      schemaVersion: 2
-      mode: 'per_shot'
-      routeIndex?: never
-      shotRoutes: ProductionWorkflowShotRouteInput[]
-    }
 
 export interface GenerationAttempt extends PlatformEntity {
   stageRun: string
@@ -1871,8 +1912,6 @@ export interface GenerationAttempt extends PlatformEntity {
   requestSnapshotSchemaVersion: number
   requestSnapshotSizeBytes: number
   requestSnapshotSha256: string
-  repairOfAttemptId: string
-  retryFeedbackSha256: string
   resultSha256: string
   estimatedCost: string
   committedCost: string

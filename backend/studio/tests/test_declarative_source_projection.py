@@ -1,6 +1,8 @@
 from __future__ import annotations
+from studio.models import FieldDefinitionVersion
+from studio.tests.field_definition_fixtures import create_field_definition
 
-from studio.tests.reference_rendering_fixtures import LEGACY_H3_SELECTOR_TO_PRIMITIVE
+from studio.tests.reference_rendering_fixtures import LEGACY_H3_SELECTOR_TO_PRIMITIVE, generation_structure_fixture
 
 from copy import deepcopy
 
@@ -8,14 +10,12 @@ from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
 
+from studio.tests.field_definition_fixtures import create_profile_field_rule
+from studio.tests.field_definition_fixtures import publish_test_field_version
 from studio.models import (
-    PromptFieldDefinition,
+    FieldDefinition,
     PromptProfileFieldRule,
     PromptProfileVersion,
-)
-from studio.services.prompt_normalization_contract import (
-    PromptNormalizationContractError,
-    _validated_profile_contract,
 )
 from studio.services.prompt_profiles import (
     CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
@@ -28,6 +28,7 @@ from studio.services.prompt_profiles import (
     refresh_prompt_profile_contract,
     validate_prompt_profile_source_projection,
     validate_profile_rule,
+    verify_prompt_profile_contract,
 )
 from studio.services.source_projection_primitives import (
     REFERENCE_CONTEXT_ENGINE_KEY,
@@ -67,23 +68,24 @@ class DeclarativeSourceProjectionContractTests(TestCase):
         rules = []
         contributions = {
             "detailed_description": (
-                PromptProfileFieldRule.SourceSelector.SHOT_DETAIL
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT
             ),
             "overall_soundscape": (
-                PromptProfileFieldRule.SourceSelector.SHOT_SOUND_EFFECTS
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT
             ),
             "non_diegetic_music": (
-                PromptProfileFieldRule.SourceSelector.SHOT_MUSIC
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT
             ),
         }
+        generation_structure_fixture(profile, properties=tuple(contributions))
         for position, (legacy_selector, field_key, label_style) in enumerate(
             H3_REF2VA_OFFICIAL_RULE_SPECS,
             start=1,
         ):
             contribution_source = contributions.get(field_key)
-            rule = PromptProfileFieldRule.objects.create(
+            rule = create_profile_field_rule(
                 profile_version=profile,
-                field_definition=PromptFieldDefinition.objects.get(key=field_key),
+                field_definition=FieldDefinition.objects.get(key=field_key),
                 source_selector=(
                     PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
                 ),
@@ -106,6 +108,7 @@ class DeclarativeSourceProjectionContractTests(TestCase):
                     contribution_source
                     or PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
                 ),
+                source_path=[field_key] if contribution_source else None,
                 generation_instruction=(
                     "Return only this reviewed contribution."
                     if contribution_source else ""
@@ -162,7 +165,7 @@ class DeclarativeSourceProjectionContractTests(TestCase):
             if rule.field_definition.key == "detailed_description"
         )
         detail.generation_source_selector = (
-            PromptProfileFieldRule.SourceSelector.SHOT_MUSIC
+            PromptProfileFieldRule.SourceSelector.REQUEST_BGM_STYLE
         )
         with self.assertRaises(PromptProfileError) as incompatible:
             validate_prompt_profile_source_projection(profile, rules=rules)
@@ -171,7 +174,7 @@ class DeclarativeSourceProjectionContractTests(TestCase):
             "prompt_profile_projection_contribution_unsupported",
         )
         detail.generation_source_selector = (
-            PromptProfileFieldRule.SourceSelector.SHOT_DETAIL
+            PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT
         )
         detail.projection_primitive = "reference_context.unknown"
         with self.assertRaises(PromptProfileError) as unknown_primitive:
@@ -197,22 +200,20 @@ class DeclarativeSourceProjectionContractTests(TestCase):
             rule.projection_primitive,
         )
         self.assertEqual(
-            _validated_profile_contract(first_payload, label="profile"),
+            verify_prompt_profile_contract(profile),
             first_payload,
         )
 
         for invalid_value in ({"nested": {"unexpected": "value"}}, "\x00"):
-            malformed_config = deepcopy(first_payload)
-            malformed_config["source_projection_config"]["primitive_options"]["reference_context_ir_v1"]["rendering"]["reference_rules"][0]["usage"] = invalid_value
-            with self.subTest(invalid_value=invalid_value), self.assertRaises(PromptNormalizationContractError):
-                _validated_profile_contract(malformed_config, label="profile")
+            malformed_config = deepcopy(first_payload["source_projection_config"])
+            malformed_config["primitive_options"]["reference_context_ir_v1"]["rendering"]["reference_rules"][0]["usage"] = invalid_value
+            with self.subTest(invalid_value=invalid_value), self.assertRaises(PromptProfileError):
+                normalize_prompt_profile_source_projection_config(malformed_config)
 
-        invalid_payload = deepcopy(first_payload)
-        invalid_payload["rules"][0]["projection_primitive"] = (
-            "reference_context.unknown"
-        )
-        with self.assertRaises(PromptNormalizationContractError):
-            _validated_profile_contract(invalid_payload, label="profile")
+        invalid_rule = deepcopy(rule)
+        invalid_rule.projection_primitive = "reference_context.unknown"
+        with self.assertRaises(PromptProfileError):
+            validate_profile_rule(invalid_rule)
 
         rule.projection_primitive = "reference_context.summary"
         rule.save(update_fields=("projection_primitive", "updated_at"))
@@ -327,7 +328,7 @@ class DeclarativeSourceProjectionApiTests(TestCase):
         self.client.force_authenticate(actor)
 
     def _create_current_profile_via_api(self):
-        """Synthetic schema-5 configuration; no live registry objects or media."""
+        """Synthetic current configuration; no live registry objects or media."""
         config = _declarative_projection_config()
         created = self.client.post("/api/v1/prompt-profile-versions/", {
             "profile_key": "qa.generic.api-acceptance",
@@ -348,17 +349,19 @@ class DeclarativeSourceProjectionApiTests(TestCase):
         profile_id = created.data["id"]
         self.assertEqual(created.data["source_projection_config"], config)
         contributions = {
-            "detailed_description": PromptProfileFieldRule.SourceSelector.SHOT_DETAIL,
-            "overall_soundscape": PromptProfileFieldRule.SourceSelector.SHOT_SOUND_EFFECTS,
-            "non_diegetic_music": PromptProfileFieldRule.SourceSelector.SHOT_MUSIC,
+            "detailed_description": PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
+            "overall_soundscape": PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
+            "non_diegetic_music": PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
         }
+        generation_structure_fixture(PromptProfileVersion.objects.get(pk=profile_id), properties=tuple(contributions))
         for position, (selector, field_key, label_style) in enumerate(
             H3_REF2VA_OFFICIAL_RULE_SPECS, start=1,
         ):
             contribution = contributions.get(field_key)
             created_rule = self.client.post("/api/v1/prompt-profile-field-rules/", {
                 "profile_version": profile_id,
-                "field_definition": str(PromptFieldDefinition.objects.get(key=field_key).id),
+                "field_definition": str(FieldDefinition.objects.get(key=field_key).id),
+                "field_definition_version": str(publish_test_field_version(FieldDefinition.objects.get(key=field_key).pk).pk),
                 "source_selector": "projection.output",
                 "projection_primitive": LEGACY_H3_SELECTOR_TO_PRIMITIVE[selector],
                 "channel": "positive_prompt", "position": position,
@@ -366,6 +369,7 @@ class DeclarativeSourceProjectionApiTests(TestCase):
                 "required": True, "omit_if_empty": False, "max_chars": 7000,
                 "generation_mode": "model_generated" if contribution else "server_locked",
                 "generation_source_selector": contribution or "projection.output",
+                "source_path": [field_key] if contribution else None,
                 "generation_instruction": "Return only this reviewed contribution." if contribution else "",
                 "generation_output_semantics": "contribution" if contribution else "final",
                 "generation_required": True,
@@ -426,6 +430,23 @@ class DeclarativeSourceProjectionApiTests(TestCase):
         self.assertEqual(saved.data["source_projection_config"], changed)
         self.assertNotEqual(saved.data["contract_sha256"], frozen_sha)
         self.assertEqual(self.client.get(url).data["source_projection_config"], config)
+
+    def test_current_config_api_rejects_control_characters_without_mutation(self):
+        profile_id, config = self._create_current_profile_via_api()
+        url = f"/api/v1/prompt-profile-versions/{profile_id}/"
+        before = self.client.get(url).data["contract_sha256"]
+        for target in ("usage", "template", "separator"):
+            changed = deepcopy(config)
+            rendering = changed["primitive_options"][REFERENCE_CONTEXT_ENGINE_KEY]["rendering"]
+            if target == "usage": rendering["reference_rules"][0]["usage"] += "\x00"
+            elif target == "template": rendering["templates"]["summary"] += "\x00"
+            else: rendering["separator"] += "\u202e"
+            with self.subTest(target=target):
+                response = self.client.patch(url, {"source_projection_config": changed}, format="json")
+                self.assertEqual(response.status_code, 400, response.data)
+                current = self.client.get(url).data
+                self.assertEqual(current["contract_sha256"], before)
+                self.assertEqual(current["source_projection_config"], config)
 
     def test_current_config_api_rejects_unknown_template_tokens_without_mutation(self):
         profile_id, config = self._create_current_profile_via_api()
@@ -559,13 +580,13 @@ class DeclarativeSourceProjectionApiTests(TestCase):
         self.assertEqual(legacy_draft.status, PromptProfileVersion.Status.DRAFT)
 
     def test_clone_successor_endpoint_reports_copied_rule_count_and_rejects_stale_hash(self):
-        definition = PromptFieldDefinition.objects.create(
+        definition = create_field_definition(
             key="qa_clone_endpoint_text",
             label="Clone endpoint text",
             category="qa",
             description="Clone endpoint fixture",
             impact="Verifies exact successor creation",
-            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
+            value_type=FieldDefinitionVersion.ValueType.LONG_TEXT,
         )
         source = PromptProfileVersion.objects.create(
             profile_key="qa.generic.clone-endpoint",
@@ -578,7 +599,7 @@ class DeclarativeSourceProjectionApiTests(TestCase):
             review_state=PromptProfileVersion.ReviewState.READY,
             contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
         )
-        PromptProfileFieldRule.objects.create(
+        create_profile_field_rule(
             profile_version=source,
             field_definition=definition,
             source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,

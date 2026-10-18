@@ -14,6 +14,14 @@ from django.utils.dateparse import parse_datetime
 from studio.models import Asset
 
 
+# AssetSerializer owns this persisted, client-read-only acquisition fact.
+ASSET_UPLOAD_SOURCE_INFO = "用户本地上传"
+
+
+def is_uploaded_asset(asset: Asset) -> bool:
+    return bool(asset.owner_id and asset.file and asset.source_info == ASSET_UPLOAD_SOURCE_INFO)
+
+
 def provenance_snapshots_equal(left: Any, right: Any) -> bool:
     """Compare immutable provenance while normalizing timezone offsets."""
 

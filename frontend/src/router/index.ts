@@ -22,11 +22,11 @@ const router = createRouter({
       { path: 'assets', name: 'assets', component: () => import('@/views/AssetLibraryView.vue'), meta: { title: '素材库' } },
       { path: 'projects', name: 'projects', component: () => import('@/views/SeriesProjectsView.vue'), meta: { title: '连续剧项目' } },
       { path: 'projects/new', name: 'project-new', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '新建连续剧' } },
-      { path: 'projects/:projectId', name: 'project-detail', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '连续剧工作室' } },
-      { path: 'projects/:projectId/production', name: 'production-run', component: () => import('@/views/ProductionRunView.vue'), meta: { title: '项目一键生产' } },
-      { path: 'projects/:projectId/production/:runId', name: 'production-run-detail', component: () => import('@/views/ProductionRunView.vue'), meta: { title: '生产运行详情（ProductionRun）' } },
+      { path: 'projects/:projectId', name: 'project-detail', component: () => import('@/views/SeriesStudioView.vue'), meta: { title: '项目工作台' } },
+      { path: 'projects/:projectId/production', name: 'production-run', component: () => import('@/views/ProductionRunView.vue'), meta: { title: '项目生产工作台' } },
+      { path: 'projects/:projectId/production/:runId', name: 'production-run-detail', component: () => import('@/views/ProductionRunView.vue'), meta: { title: '生产工作台' } },
       { path: 'projects/:projectId/episodes/:episodeId/storyboard', name: 'storyboard', component: () => import('@/views/StoryboardView.vue'), meta: { title: '可视化分镜' } },
-      { path: 'workflows', name: 'workflows', component: () => import('@/views/WorkflowView.vue'), meta: { title: '生产工作流' } },
+      { path: 'workflows', name: 'workflows', component: () => import('@/views/WorkflowView.vue'), meta: { title: '任务中心' } },
       { path: 'manual', name: 'production-manual', component: () => import('@/views/ProductionManualView.vue'), meta: { title: '视频制作操作手册' } },
       { path: 'manual/settings', name: 'system-settings-guide', component: () => import('@/views/SystemSettingsGuideView.vue'), meta: { title: '系统设置新手图文指南' } },
       { path: 'settings', name: 'settings', component: () => import('@/views/SettingsView.vue'), meta: { title: '系统设置', requiresStaff: true } },
@@ -46,7 +46,9 @@ router.beforeEach(async (to) => {
     try {
       await auth.ensureCurrentUser()
     } catch (error) {
-      if (isAxiosError(error) && error.response?.status === 401) {
+      // Only the refresh coordinator may invalidate current credentials. A delayed
+      // 401 from a previous token/account must not clear a newer login.
+      if (isAxiosError(error) && error.response?.status === 401 && !localStorage.getItem('cineforge_token')) {
         auth.logout()
         return { name: 'login', query: { redirect: to.fullPath } }
       }

@@ -28,7 +28,7 @@ const rawOptions = {
     key: 'generic.fixed', version: 1, label: 'Generic', description: 'Reviewed generic engine',
     projection_kind: 'generic_fixed',
     adapter_contract: { compiler: 'generic.comfy/v1', output: 'comfy.primary/v1', dynamic: 'none/v1' },
-    locked_fields: ['schema_version', 'adapters', 'projection.kind'], projection_fields: [editorField('projection.config.image_resolution','image_resolution')],
+    locked_fields: ['schema_version', 'adapters', 'projection.kind'], projection_fields: [editorField('projection.config.capability','execution_capability'),editorField('projection.config.image_resolution','image_resolution')],
     creation_template: {
       provider_driver_type: 'comfyui', operation: 'workflow.import', output_kind: '',
       definition: {
@@ -71,12 +71,14 @@ const rawOptions = {
       ],
     }],
     choices: {
+      execution_capabilities: [{value:'image.text_to_image',label:'文生图'},{value:'image.image_to_image',label:'图片生图'}],
       cardinalities: [{ value: 'one', label: 'One' }],
       parameter_policies: [{ value: 'runtime', label: 'Runtime' }],
       artifact_roles: [{ value: 'other', label: 'Other' }],
       media_kinds: [{ value: 'image', label: 'Image' }],
       output_kinds: [{ value: 'image', label: 'Image' }],
       contract_sources: [{ value: 'workflow', label: 'Workflow' }],
+      model_quantity_inputs: [{ value: 'total_images', label: '图片总数', media_kind: 'image' }],
       role_selectors: [{ value: 'single', label: 'Single' }],
       scalar_types: [{ value: 'string', label: 'Text' }],
     },
@@ -88,6 +90,21 @@ const rawOptions = {
     },
   },
 }
+
+test('execution capability is explicitly configured from server choices and never inferred', async () => {
+  const vite = await server()
+  try {
+    const {adaptWorkflowProjectorOptions} = await vite.ssrLoadModule('/src/services/platformAdapters.ts')
+    const {workflowProjectorDefinitionErrors, setWorkflowProjectorPath} = await vite.ssrLoadModule('/src/services/workflowProjectorDefinition.ts')
+    const options = adaptWorkflowProjectorOptions(rawOptions)
+    assert.equal(options.definitionEditor.choices.executionCapabilities[0].value, 'image.text_to_image')
+    const configured = setWorkflowProjectorPath(definition, 'projection.config.capability', 'image.text_to_image')
+    assert.deepEqual(workflowProjectorDefinitionErrors(configured, options, 'generic.fixed', 1), [])
+    assert.equal(definition.projection.config.capability, undefined)
+    assert.ok(workflowProjectorDefinitionErrors(setWorkflowProjectorPath(definition, 'projection.config.capability', 'unknown'), options, 'generic.fixed', 1).includes('请选择已登记的执行能力'))
+    assert.throws(()=>adaptWorkflowProjectorOptions({...rawOptions,definition_editor:{...rawOptions.definition_editor,choices:{...rawOptions.definition_editor.choices,execution_capabilities:[]}}}))
+  } finally { await vite.close() }
+})
 
 test('resolution policy choices validate bounds and share the Projector definition', async context => {
   const vite=await server(); context.after(()=>vite.close())
@@ -214,6 +231,11 @@ test('Projector options keep editor choices and engine adapter contracts server-
     assert.deepEqual(options.engines[0].adapterContract, rawOptions.engines[0].adapter_contract)
     assert.equal(options.definitionEditor.limits.parameterPoliciesMaxItems, 128)
     assert.equal(options.definitionEditor.sections[0].fields[0].readOnly, true)
+    assert.equal(options.definitionEditor.choices.modelQuantityInputs[0].mediaKind, 'image')
+    for (const rows of [[], [{value:'x',label:'x',media_kind:'unknown'}], [{value:'x',label:'x',media_kind:'image'},{value:'x',label:'x',media_kind:'image'}]]) {
+      const invalid=structuredClone(rawOptions);invalid.definition_editor.choices.model_quantity_inputs=rows
+      assert.throws(()=>adapters.adaptWorkflowProjectorOptions(invalid))
+    }
 
     const unsupported = structuredClone(rawOptions)
     unsupported.definition_editor.sections[0].fields[1].control = 'future_widget'
@@ -351,8 +373,6 @@ test('Settings creation handlers work with no existing versions and preserve can
   const {renderToString} = await import('vue/server-renderer')
   const {createPinia} = await import('pinia')
   const {routeLocationKey,routerKey} = await import('vue-router')
-  let approve = false
-  let confirmations = 0
   const oldStorage=Object.getOwnPropertyDescriptor(globalThis,'localStorage')
   const oldWindow=Object.getOwnPropertyDescriptor(globalThis,'window')
   const oldDocument=Object.getOwnPropertyDescriptor(globalThis,'document')
@@ -363,7 +383,7 @@ test('Settings creation handlers work with no existing versions and preserve can
     }
   })
   Object.defineProperty(globalThis,'localStorage',{configurable:true,value:{getItem:()=>null,setItem:()=>{},removeItem:()=>{}}})
-  Object.defineProperty(globalThis,'window',{configurable:true,value:{confirm:()=>{confirmations++;return approve},localStorage:globalThis.localStorage}})
+  Object.defineProperty(globalThis,'window',{configurable:true,value:{confirm:()=>{throw Error('must use the in-page confirmation')},localStorage:globalThis.localStorage}})
   const {default: Settings} = await vite.ssrLoadModule('/src/views/SettingsView.vue')
   const {adaptWorkflowProjectorOptions} = await vite.ssrLoadModule('/src/services/platformAdapters.ts')
   const {platformApi} = await vite.ssrLoadModule('/src/services/platformApi.ts')
@@ -374,46 +394,55 @@ test('Settings creation handlers work with no existing versions and preserve can
   })
   app.use(createPinia())
   app.provide(routeLocationKey,{query:{section:'workflows'},fullPath:'/settings?section=workflows'} as any)
-  app.provide(routerKey,{replace:async()=>{}} as any)
+  app.provide(routerKey,{replace:async()=>{},beforeEach:()=>()=>{}} as any)
   await renderToString(app)
   state.auth.user={isSuperuser:true}
-  state.workflowProjectorOptions.value=adaptWorkflowProjectorOptions(rawOptions)
+  context.mock.method(platformApi,'listWorkflowProjectors',async()=>[])
+  context.mock.method(platformApi,'listWorkflowProjectorVersions',async()=>[])
+  context.mock.method(platformApi,'getWorkflowProjectorOptions',async()=>adaptWorkflowProjectorOptions(rawOptions))
+  await state.readWorkflowProjectorCatalog()
   state.openWorkflowProjectorCreate()
   assert.equal(state.workflowProjectorCreateOpen.value,true,'no seed versions are required')
   assert.equal(state.workflowProjectorCreateMode.value,'recommendation')
   assert.equal(state.workflowProjectorCreateInitialized.value,false)
   await state.submitWorkflowProjectorCreate()
   assert.match(state.workflowProjectorError.value,/初始化/)
-  state.changeWorkflowProjectorCreateMode('blank')
-  state.initializeBlankWorkflowProjector({target:{value:'generic.fixed\u00001'}})
+  await state.changeWorkflowProjectorCreateMode('blank')
+  await state.initializeBlankWorkflowProjector({target:{value:'generic.fixed\u00001'}})
   assert.equal(state.workflowProjectorCreateInitialized.value,true)
   assert.deepEqual(state.workflowProjectorCreateDefinition.value.output_nodes,{})
   state.workflowProjectorCreateFamily.name='Independent family'
   state.workflowProjectorCreateDefinition.value.output_nodes={SaveImage:'image'}
-  state.changeWorkflowProjectorCreateMode('copy')
-  assert.equal(confirmations,1)
+  const cancelled = state.changeWorkflowProjectorCreateMode('copy')
+  assert.equal(state.workflowProjectorConfirmation.value.kind,'reinitialize')
+  assert.equal(state.workflowProjectorConfirmation.value.targetLabel,'复制已有方案')
+  state.settleWorkflowProjectorConfirmation()
+  await cancelled
   assert.equal(state.workflowProjectorCreateMode.value,'blank')
   assert.deepEqual(state.workflowProjectorCreateDefinition.value.output_nodes,{SaveImage:'image'})
-  approve=true
-  state.changeWorkflowProjectorCreateMode('copy')
+  const confirmed = state.changeWorkflowProjectorCreateMode('copy')
+  state.settleWorkflowProjectorConfirmation(true)
+  await confirmed
   assert.equal(state.workflowProjectorCreateMode.value,'copy')
   assert.equal(state.workflowProjectorCreateInitialized.value,false)
   assert.equal(state.workflowProjectorCreateFamily.name,'Independent family')
-  state.changeWorkflowProjectorCreateMode('blank')
-  state.initializeBlankWorkflowProjector({target:{value:'generic.fixed\u00001'}})
+  await state.changeWorkflowProjectorCreateMode('blank')
+  await state.initializeBlankWorkflowProjector({target:{value:'generic.fixed\u00001'}})
   assert.deepEqual(state.workflowProjectorCreateDefinition.value.output_nodes,{})
   assert.deepEqual(state.workflowProjectorOptions.value.engines[0].creationTemplate.definition.output_nodes,{})
   const seed={id:'seed-one',projectorKey:'existing',version:1,status:'published',isCurrent:true,engineKey:'generic.fixed',engineVersion:1,providerDriverType:'comfyui',operation:'workflow.import',outputKind:'image',definition:structuredClone(definition)}
   state.workflowProjectorVersions.value=[seed]
-  state.changeWorkflowProjectorCreateMode('copy')
-  state.changeWorkflowProjectorCreateSeed({target:{value:seed.id}})
+  await state.changeWorkflowProjectorCreateMode('copy')
+  await state.changeWorkflowProjectorCreateSeed({target:{value:seed.id}})
   assert.equal(state.workflowProjectorCreateInitialized.value,true)
   assert.deepEqual(state.workflowProjectorCreateDefinition.value,definition)
   state.workflowProjectorCreateDefinition.value.priority=7
   assert.equal(seed.definition.priority,0,'copied configuration is detached from the published source')
 
   state.workflowProjectorVersions.value=[]
-  state.changeWorkflowProjectorCreateMode('recommendation')
+  const recommencing = state.changeWorkflowProjectorCreateMode('recommendation')
+  state.settleWorkflowProjectorConfirmation(true)
+  await recommencing
   state.workflowModelContextCatalogLoaded.value=true
   state.savedWorkflowScanState.value='fresh'
   const evidence=recommendation.source_evidence
@@ -423,7 +452,23 @@ test('Settings creation handlers work with no existing versions and preserve can
   state.workflowProjectorCreateCandidateKey.value='candidate-key'
   const {adaptWorkflowProjectorRecommendation}=await vite.ssrLoadModule('/src/services/platformAdapters.ts')
   const recommendMock=context.mock.method(platformApi,'recommendWorkflowProjector',async()=>adaptWorkflowProjectorRecommendation(recommendation))
-  await state.requestProjectorRecommendationFromCreate()
+  state.workflowProjectorCreateSeedFingerprint.value=state.currentWorkflowProjectorCreateSeedFingerprint()
+  state.workflowProjectorCreateDefinition.value.priority=5
+  const cancelledRecommendation=state.requestProjectorRecommendationFromCreate()
+  assert.equal(state.workflowProjectorConfirmation.value.kind,'reinitialize')
+  assert.equal(recommendMock.mock.callCount(),0,'no recommendation request before confirmation')
+  state.settleWorkflowProjectorConfirmation()
+  await cancelledRecommendation
+  assert.equal(state.workflowProjectorCreateDefinition.value.priority,5)
+  const staleRecommendation=state.requestProjectorRecommendationFromCreate()
+  state.savedWorkflowDrafts['candidate-key'].primaryOutputNodeId='changed-during-confirmation'
+  state.settleWorkflowProjectorConfirmation(true)
+  await staleRecommendation
+  assert.equal(recommendMock.mock.callCount(),0,'changed recommendation inputs need a new decision')
+  state.savedWorkflowDrafts['candidate-key'].primaryOutputNodeId='123'
+  const confirmedRecommendation=state.requestProjectorRecommendationFromCreate()
+  state.settleWorkflowProjectorConfirmation(true)
+  await confirmedRecommendation
   assert.equal(recommendMock.mock.callCount(),1,'recommendation no longer needs a generic seed version')
   assert.equal(state.workflowProjectorCreateInitialized.value,true)
   assert.equal(state.workflowProjectorCreateFamily.name,'Independent family')
@@ -495,4 +540,15 @@ test('generic dynamic groups have one editor; asset slots are a linked read-only
   assert.doesNotMatch(html,/添加素材槽|aria-label="删除素材槽"/)
   assert.equal((html.match(/数量合同来源/g)||[]).length,2,'one source selector plus its detail button')
   assert.match(html,/查看数量合同来源/)
+  const {workflowProjectorDefinitionErrors}=await vite.ssrLoadModule('/src/services/workflowProjectorDefinition.ts')
+  const group=draft.projection.config.groups[0]
+  for(const key of ['output_index','reducer_output_index']){
+    group.wiring='reduce'
+    for(const value of [null,-1,0.5,'0']){
+      group[key]=value
+      assert.ok(workflowProjectorDefinitionErrors(draft,options,'generic.references',1).some((error:string)=>error.includes('输出索引须为非负整数')))
+    }
+    group[key]=0
+    assert.ok(!workflowProjectorDefinitionErrors(draft,options,'generic.references',1).some((error:string)=>error.includes('输出索引须为非负整数')))
+  }
 })

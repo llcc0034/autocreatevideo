@@ -24,6 +24,7 @@ from studio.services.configuration import (
 )
 from studio.services.json_contracts import assign_json_contract, verify_json_contract
 from studio.services.runtime_platform import probe_runtime_host
+from studio.services.runtime_host_probe_settings import host_probe_settings
 from studio.services.draft_model_artifact_attestation import (
     load_draft_attestation_context,
 )
@@ -88,10 +89,17 @@ def _capability_snapshot_refresh_is_due(
     *,
     now,
 ) -> bool:
+    mode, validity = host_probe_settings()
+    if mode == "manual":
+        return False
     if snapshot is None:
         return True
     if snapshot.expires_at is None:
-        return False
+        return True
+
+    # Switching back from a long-lived manual snapshot must resume the automatic
+    # cadence, without rewriting the expiry consumed by admission modules.
+    refresh_at = min(snapshot.expires_at, snapshot.captured_at + validity)
 
     policy = _runtime_host_probe_policy()
     lead_seconds = policy["runtime.host_probe_lease_seconds"]
@@ -108,10 +116,10 @@ def _capability_snapshot_refresh_is_due(
 
     snapshot_ttl_seconds = max(
         0.0,
-        (snapshot.expires_at - snapshot.captured_at).total_seconds(),
+        (refresh_at - snapshot.captured_at).total_seconds(),
     )
     lead_seconds = min(lead_seconds, snapshot_ttl_seconds)
-    return snapshot.expires_at <= now + timedelta(seconds=lead_seconds)
+    return refresh_at <= now + timedelta(seconds=lead_seconds)
 
 
 def _latest_snapshot_for_refresh(host: RuntimeHost) -> HostCapabilitySnapshot | None:
@@ -197,7 +205,6 @@ def _mark_succeeded_from_snapshot(
     return attempt
 
 
-@transaction.atomic
 def enqueue_runtime_host_probe(
     host: RuntimeHost,
     *,
@@ -205,6 +212,17 @@ def enqueue_runtime_host_probe(
     trigger: str = RuntimeHostProbeAttempt.Trigger.MANUAL,
     due_only: bool = False,
 ) -> tuple[RuntimeHostProbeAttempt | None, bool]:
+    from studio.services.history_cleanup_pause import background_check_gate
+    with background_check_gate(maintenance=True) as paused:
+        if paused and trigger == RuntimeHostProbeAttempt.Trigger.SCHEDULED:
+            return None, False
+        if (due_only or trigger == RuntimeHostProbeAttempt.Trigger.SCHEDULED) and host_probe_settings()[0] == "manual":
+            return None, False
+        return _enqueue_runtime_host_probe(host, created_by=created_by, trigger=trigger, due_only=due_only)
+
+
+@transaction.atomic
+def _enqueue_runtime_host_probe(host, *, created_by, trigger, due_only):
     host = RuntimeHost.objects.select_for_update().get(pk=host.pk)
     if host.status == RuntimeHost.Status.DISABLED:
         raise ValidationError("已禁用主机不能执行探测；请先通过受控状态入口启用")
@@ -251,6 +269,8 @@ def enqueue_runtime_host_probe(
 
 
 def enqueue_due_runtime_host_probes() -> int:
+    if host_probe_settings()[0] == "manual":
+        return 0
     created = 0
     host_ids = list(RuntimeHost.objects.exclude(
         status=RuntimeHost.Status.DISABLED,

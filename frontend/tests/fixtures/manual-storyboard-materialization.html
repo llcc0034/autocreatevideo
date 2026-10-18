@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>隔离人工分镜合同验证</title></head>
+<body><div id="app"></div><script type="module">
+import {createApp, h, ref} from 'vue'
+import {createRouter, createMemoryHistory} from 'vue-router'
+import Component from '/src/components/ManualStoryboardAdoption.vue'
+import {platformApi} from '/src/services/platformApi.ts'
+import {api} from '/src/services/api.ts'
+import {proposed, data, run, options, id, sha} from './manualStoryboardMaterialization.ts'
+import '/src/styles.css'
+api.interceptors.request.use(()=>{throw new Error('隔离夹具禁止真实业务API')})
+const mode=ref('ready'), reads=ref(0), requests=ref([]), fail=ref(true), serial=ref(0)
+const clone=value=>JSON.parse(JSON.stringify(value))
+platformApi.getManualStoryboard=async()=>{
+  reads.value++
+  if(mode.value==='error') throw new Error('隔离夹具：读取失败，没有旧缓存兜底')
+  if(mode.value==='manual') return clone(data)
+  if(mode.value==='blocked') return {...clone(proposed),materialization:{ready:false,reason:'隔离夹具：本轮 Bible 尚未有效采用。',contract:null,sha256:null}}
+  if(mode.value==='adopted'){
+    const result=clone(data)
+    result.content.script=clone(proposed.content.script)
+    result.content.script_decision_id=proposed.content.script_decision_id
+    result.content.episodes[0].shots[0].script_source={structure_id:id(8),stage_id:id(14),episode_number:4,shot_number:8,document_sha256:sha,materialization_sha256:sha}
+    result.content.episodes[0].shots[0].character_relations=[{role:'visible',position:0,character_id:id(16)},{role:'speaker',position:0,character_id:id(15)}]
+    result.content.episodes[0].shots[0].dialogue=[{speaker_id:'narrator',text:'  门后传来声音。  ',start_ms:120,end_ms:680,voiceover:true}]
+    result.content.episodes[0].shots[0].episode_start_ms=1200
+    result.content.episodes[0].shots[0].episode_end_ms=7200
+    result.content.episodes[0].shots[0].reference_uses=[]
+    result.adoption={revision:1,decision_id:id(13),snapshot_sha256:sha,content_sha256:sha,status:'current',source:{kind:'confirmed_script',contract:clone(proposed.materialization.contract),sha256:sha}}
+    return result
+  }
+  return clone(proposed)
+}
+platformApi.performManualProductionAction=async(runId,body)=>{
+  requests.value.push(clone({runId,body}))
+  if(fail.value){fail.value=false;throw new Error('隔离夹具：响应未知，请重试同一请求')}
+  mode.value='adopted'
+  return {action:'adopt',result_kind:'approval_decision',target_id:id(13)}
+}
+const router=createRouter({history:createMemoryHistory(),routes:[{path:'/',component:{render:()=>null}},{path:'/projects/:projectId/episodes/:episodeId/storyboard',name:'storyboard',component:{render:()=>null}}]})
+await router.push('/');await router.isReady()
+createApp({setup:()=>()=>h('main',{style:'max-width:960px;margin:20px auto;padding:12px'},[
+  h('h1','隔离夹具：人工分镜结构合同'),h('p','正式组件；所有读取和提交仅在内存中模拟，不连接现用 API、模型或数据库。'),
+  h('nav',{style:'display:flex;flex-wrap:wrap;gap:8px;margin-bottom:16px'},['ready','blocked','error','adopted','manual'].map(value=>h('button',{onClick:()=>{mode.value=value;serial.value++;requests.value=[];fail.value=true}},value))),
+  h('p',{id:'evidence'},'读取 '+reads.value+' / 提交 '+requests.value.length+' / 同请求重试 '+(requests.value.length>1?JSON.stringify(requests.value[0])===JSON.stringify(requests.value[1]):'未发生')),
+  h(Component,{key:serial.value,run,options})
+])}).use(router).mount('#app')
+</script></body></html>

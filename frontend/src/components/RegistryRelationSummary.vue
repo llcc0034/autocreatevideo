@@ -1,9 +1,9 @@
 <script setup lang="ts">
 import type { RelationRow } from '@/services/registryRelations'
-import { Boxes, Server, Workflow, BookOpen, SlidersHorizontal, GitBranch, Route, Info, ArrowRight } from 'lucide-vue-next'
+import { Boxes, Server, Workflow, BookOpen, GitBranch, Route, Info, ArrowRight, FileOutput } from 'lucide-vue-next'
 import ConfigurationRelationButton from './ConfigurationRelationButton.vue'
 
-const icons = { model: Boxes, deployment: Server, workflow: Workflow, prompt: BookOpen, binding: SlidersHorizontal, projector: GitBranch, recipe: Route }
+const icons = { field: BookOpen, field_version: BookOpen, structure: GitBranch, source: FileOutput, model: Boxes, deployment: Server, workflow: Workflow, prompt: BookOpen, execution: Boxes, projector: GitBranch, recipe: Route, output: FileOutput }
 defineProps<{ row?: RelationRow; loading?: boolean; error?: string; expanded?: boolean; condensed?: boolean }>()
 defineEmits<{ retry: [] }>()
 </script>

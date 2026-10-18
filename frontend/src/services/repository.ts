@@ -1,10 +1,12 @@
 import { api, fetchAllPages, unwrap } from './api'
-import type { AssemblyResult, Asset, AssetGenerationExecutionKind, AssetGenerationJob, AssetGenerationJobType, AssetGenerationMediaType, AssetGenerationResolutionOutcome, AssetGenerationRouteOption, BibleDraftEntityType, BibleImageCandidatesResult, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, DeferredGenerationRequest, DeferredGenerationStatus, Episode, GeneratedWorkflowExport, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, ReleaseSelection, SeriesProject, Shot, ShotTranslationPromotionResult, StylePreset, TaskInputPrompt, TranslationCapability, Workflow } from '@/types'
+import { adaptReleaseBundle } from './releaseBundles'
+import { adaptTaskWorkflowExport } from './taskWorkflowExport'
+import { adaptTaskInputPrompt } from './taskInputPrompt'
+import { adaptTaskObservations, type TaskObservationPage } from './taskObservations'
+import type { AssemblyResult, Asset, AssetGenerationJob, AssetGenerationJobType, AssetGenerationMediaType, AssetGenerationResolutionOutcome, BibleDraftEntityType, BibleImageCandidatesResult, Episode, TaskWorkflowExport, PromptTranslationEntry, PromptTranslationField, ReleaseBundle, SeriesProject, Shot, StylePreset, TaskInputPrompt, Workflow } from '@/types'
 import { adaptAssets, adaptCreatedEpisode, adaptProject, adaptProjectSummary, adaptStyles, adaptTasks, backendStyleId, isBackendId, persistBibleEntities, projectPayload, styleSlug, syncShot } from './backendAdapters'
-import { adaptCanonicalGlossaryEnsureResult, adaptShotTranslationPromotionResult, adaptTranslationEntry } from './translationReview'
-import { adaptPromptNormalizationCapability } from './promptNormalization'
+import { adaptTranslationEntry } from './translationReview'
 import { adaptBibleImageCandidates } from './bibleImageCandidates'
-import { adaptDeferredGenerationRequest } from './deferredGeneration'
 import { adaptAuthenticatedUser, type AuthenticatedUser } from './authTypes'
 import {
   buildAssetGenerationJobRequestPayload,
@@ -12,71 +14,16 @@ import {
 } from './assetGenerationPayload'
 import {
   adaptConditioningModes,
-  conditioningModeByKey,
   type ConditioningModeCapability,
 } from './conditioningCapabilities'
-import { adaptWorkflowSmokeFixtureSchema } from './platformAdapters'
+import { adaptAssetGenerationJob as adaptExecutionAssetJob, adaptAssetGenerationOptions } from './assetGenerationAdapters'
 
 const record = (value: unknown): Record<string, any> => value && typeof value === 'object' ? value as Record<string, any> : {}
-const adaptAssetGenerationJob = (value: unknown): AssetGenerationJob => {
-  const raw = record(value)
-  const outputAsset = raw.output_asset ? adaptAssets([raw.output_asset])[0] || null : null
-  return {
-    id: String(raw.id || ''), jobType: String(raw.job_type || 'asset') as AssetGenerationJobType,
-    mediaType: String(raw.media_type || 'image') as AssetGenerationMediaType,
-    imageCategory: String(raw.image_category || '') as AssetGenerationJob['imageCategory'], name: String(raw.name || ''),
-    description: String(raw.description || ''), prompt: String(raw.prompt || ''), negativePrompt: String(raw.negative_prompt || ''),
-    parameters: record(raw.parameters), styleId: outputAsset?.styleId || styleSlug(String(raw.style || '')),
-    executionKind: String(raw.execution_kind || 'deployment') as AssetGenerationExecutionKind,
-    modelDeploymentId: String(raw.model_deployment || ''), modelDeploymentName: String(raw.model_deployment_name || ''),
-    workflowVersionId: String(raw.workflow_template_version || ''), workflowName: String(raw.workflow_name || ''),
-    workflowVersion: raw.workflow_version === null || raw.workflow_version === undefined ? null : Number(raw.workflow_version),
-    outputAsset, status: String(raw.status || 'queued') as AssetGenerationJob['status'], operation: String(raw.operation || ''),
-    isExternal: raw.is_external === true, allowExternalCalls: raw.allow_external_calls === true,
-    budgetLimit: raw.budget_limit === null || raw.budget_limit === undefined ? null : String(raw.budget_limit),
-    estimatedCost: raw.estimated_cost === null || raw.estimated_cost === undefined ? null : String(raw.estimated_cost),
-    actualCost: raw.actual_cost === null || raw.actual_cost === undefined ? null : String(raw.actual_cost),
-    costCurrency: String(raw.cost_currency || ''), resultText: String(raw.result_text || ''), remoteStatus: String(raw.remote_status || ''),
-    providerRequestIdSha256: String(raw.provider_request_id_sha256 || ''),
-    pollCount: Number(raw.poll_count || 0), errorCode: String(raw.error_code || ''), errorMessage: String(raw.error_message || ''),
-    ignoreLateResult: raw.ignore_late_result === true,
-    submissionStartedAt: String(raw.submission_started_at || ''), cancelRequestedAt: String(raw.cancel_requested_at || ''), cancelSubmittedAt: String(raw.cancel_submitted_at || ''),
-    createdAt: String(raw.created_at || ''), updatedAt: String(raw.updated_at || ''), submittedAt: String(raw.submitted_at || ''), finishedAt: String(raw.finished_at || ''),
-  }
-}
-
-const adaptAssetGenerationOption = (value: unknown): AssetGenerationRouteOption => {
-  const raw = record(value)
-  const targetKind = String(raw.target_kind || '')
-  if (targetKind !== 'deployment' && targetKind !== 'comfy_workflow') {
-    throw new Error(`服务端返回了不支持的素材生成方案类型：${targetKind || '空值'}`)
-  }
-  const common = {
-    targetId: String(raw.target_id || ''), key: String(raw.key || ''), name: String(raw.name || ''),
-    modelDeploymentId: String(raw.model_deployment_id || ''), modelDeploymentName: String(raw.model_deployment_name || ''),
-    modelIdentifier: String(raw.model_identifier || ''), operation: String(raw.operation || ''),
-    isExternal: raw.is_external === true, smokeEvidenceId: String(raw.smoke_evidence_id || ''),
-    requestSchema: raw.request_schema && typeof raw.request_schema === 'object' ? raw.request_schema : null,
-    parameterDefaults: record(raw.parameter_defaults),
-    workflowInputSchema: raw.workflow_input_schema
-      ? adaptWorkflowSmokeFixtureSchema(raw.workflow_input_schema) : null,
-    acceptsNegativePrompt: raw.accepts_negative_prompt === true,
-  }
-  if (targetKind === 'comfy_workflow') {
-    const workflowVersion = Number(raw.workflow_version)
-    if (!raw.workflow_version_id || !raw.workflow_name || !Number.isInteger(workflowVersion) || workflowVersion < 1) {
-      throw new Error('服务端返回的 ComfyUI 工作流方案缺少版本信息')
-    }
-    return {
-      ...common, targetKind, smokeExpiresAt: null,
-      workflowVersionId: String(raw.workflow_version_id), workflowName: String(raw.workflow_name), workflowVersion,
-    }
-  }
-  return {
-    ...common, targetKind, smokeExpiresAt: String(raw.smoke_expires_at || ''),
-    workflowVersionId: '', workflowName: '', workflowVersion: null,
-  }
-}
+const adaptAssetGenerationJob = (value: unknown): AssetGenerationJob => adaptExecutionAssetJob(value, row => {
+  const result = adaptAssets([row])[0]
+  if (!result) throw new Error('生成任务产物信息不完整')
+  return result
+}, styleSlug)
 
 const translationRows = (payload: unknown): PromptTranslationEntry[] => {
   const body = unwrap<unknown>(payload)
@@ -104,10 +51,12 @@ const fileDataUrl = (file: File): Promise<string> => new Promise((resolve, rejec
 // below Gunicorn's 120s ceiling, then reconcile by GET because a proxy/client
 // timeout does not prove that the content-addressed publication failed.
 
-export interface ProductionCapability {
+export interface VideoConditioningCapability {
   conditioningModes: ConditioningModeCapability[]
   conditioningContractSha256: string
-  defaultConditioningMode: string
+}
+
+export interface ProductionCapability {
   recommendedMaxPending: number
   recommendedMaxActivePerUser: number
   maxConcurrent: number
@@ -120,8 +69,6 @@ export interface ProductionCapability {
   scriptBreakdownDefaultShotDurationMs: number
   scriptBreakdownDefaultFirstFrameContinuity: boolean
   scriptBreakdownDefaultLastFrameContinuity: boolean
-  scriptBreakdownAutoSplitTriggerChars: number
-  scriptBreakdownAutoSplitTargetChars: number
   activeTaskCount: number
   userActiveTaskCount: number
   queueGuidanceEnforcement: 'advisory'
@@ -151,11 +98,6 @@ export interface ProductionEffectiveLimits {
   executionMonitoringMaxNodeTypeOverrides: number
   executionMonitoringMaxNodeOverrides: number
   executionMonitoringMaxIdleTimeoutSeconds: number
-  promptReviewMaxCandidates: number
-  promptReviewMaxAdvisories: number
-  promptReviewMaxInputBytes: number
-  promptReviewMaxFieldCharacters: number
-  promptReviewMaxUsageCount: number
   auditNoteMinCharacters: number
   auditNoteMaxCharacters: number
 }
@@ -169,7 +111,6 @@ export interface ProductionCreationDefaults {
   episodeCount: number
   shotsPerEpisode: number
   episodeDurationSeconds: number
-  maxGenerationTasks: number
   fps: number
   width: number
   height: number
@@ -191,18 +132,76 @@ export interface QueueCapacityAdvisory {
   recommendedMaximum: number
 }
 
-export interface DeferredGenerationRequestFilters {
-  project?: string
-  sourceTask?: string
-  targetShot?: string
-  status?: DeferredGenerationStatus
-  frameSlot?: 'first_frame' | 'last_frame'
-}
-
 export const productionErrorCode = (error: unknown): string => {
   const candidate = error as { response?: { data?: { code?: unknown; error?: { code?: unknown } } } }
   const code = String(candidate?.response?.data?.error?.code ?? candidate?.response?.data?.code ?? '').trim().toLowerCase()
   return /^[a-z][a-z0-9_]{0,79}$/.test(code) ? code : ''
+}
+
+export const adaptProductionCreationDefaults = (rawCreationDefaults: unknown): ProductionCreationDefaults => {
+  if (!rawCreationDefaults || typeof rawCreationDefaults !== 'object' || Array.isArray(rawCreationDefaults)) {
+    throw new Error('生产策略缺少项目创建默认值投影')
+  }
+  const creationDefault = (key: string): number => {
+    const value = Number((rawCreationDefaults as Record<string, unknown>)[key])
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`生产策略缺少有效创建默认值 ${key}`)
+    return value
+  }
+  const creationText = (key: string): string => {
+    const value = rawCreationDefaults as Record<string, unknown>
+    if (typeof value[key] !== 'string' || !value[key].trim()) {
+      throw new Error(`生产策略缺少有效创建默认值 ${key}`)
+    }
+    return value[key].trim()
+  }
+  const rawAspectRatioOptions = (rawCreationDefaults as Record<string, unknown>).aspect_ratio_options
+  if (!Array.isArray(rawAspectRatioOptions) || !rawAspectRatioOptions.length) {
+    throw new Error('生产策略缺少有效画幅选项')
+  }
+  const aspectRatioOptions = rawAspectRatioOptions.map((item): ProductionAspectRatioOption => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('生产策略画幅选项无效')
+    const option = item as Record<string, unknown>
+    const value = typeof option.value === 'string' ? option.value.trim() : ''
+    const label = typeof option.label === 'string' ? option.label.trim() : ''
+    const width = Number(option.width)
+    const height = Number(option.height)
+    if (!value || !label || !Number.isSafeInteger(width) || width < 1 || !Number.isSafeInteger(height) || height < 1) {
+      throw new Error('生产策略画幅选项无效')
+    }
+    return { value, label, width, height }
+  })
+  if (new Set(aspectRatioOptions.map((option) => option.value)).size !== aspectRatioOptions.length) {
+    throw new Error('生产策略画幅选项存在重复值')
+  }
+  const defaultAspectRatio = creationText('default_aspect_ratio')
+  const defaultAspectRatioOption = aspectRatioOptions.find((option) => option.value === defaultAspectRatio)
+  if (!defaultAspectRatioOption) throw new Error('生产策略默认画幅不在已声明选项中')
+  const rawDefaultShotMediaType = creationText('default_shot_media_type')
+  if (rawDefaultShotMediaType !== 'video' && rawDefaultShotMediaType !== 'image') {
+    throw new Error('生产策略默认分镜媒体类型无效')
+  }
+  const rawDefaultIncludeAudio = (rawCreationDefaults as Record<string, unknown>).default_include_audio
+  if (typeof rawDefaultIncludeAudio !== 'boolean') throw new Error('生产策略默认分镜音频开关无效')
+  if (rawDefaultShotMediaType === 'image' && rawDefaultIncludeAudio) {
+    throw new Error('图片分镜不能声明默认音频')
+  }
+  const creationDefaults: ProductionCreationDefaults = {
+    defaultLanguage: creationText('default_language'),
+    defaultAspectRatio,
+    aspectRatioOptions,
+    defaultShotMediaType: rawDefaultShotMediaType,
+    defaultIncludeAudio: rawDefaultIncludeAudio,
+    episodeCount: creationDefault('episode_count'),
+    shotsPerEpisode: creationDefault('shots_per_episode'),
+    episodeDurationSeconds: creationDefault('episode_duration_seconds'),
+    fps: creationDefault('fps'),
+    width: creationDefault('width'),
+    height: creationDefault('height'),
+  }
+  if (creationDefaults.width !== defaultAspectRatioOption.width || creationDefaults.height !== defaultAspectRatioOption.height) {
+    throw new Error('生产策略默认画幅尺寸与创建默认尺寸不一致')
+  }
+  return creationDefaults
 }
 
 const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapability => {
@@ -266,11 +265,6 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     scriptBreakdownDefaultShotDurationMs < videoShotMinDurationMs
     || scriptBreakdownDefaultShotDurationMs > videoShotMaxDurationMs
   ) throw new Error('生产策略返回的母稿默认镜头时长无效')
-  const scriptBreakdownAutoSplitTriggerChars = positiveInteger('script_breakdown_auto_split_trigger_chars')
-  const scriptBreakdownAutoSplitTargetChars = positiveInteger('script_breakdown_auto_split_target_chars')
-  if (scriptBreakdownAutoSplitTargetChars > scriptBreakdownAutoSplitTriggerChars) {
-    throw new Error('生产策略返回的母稿自动分段阈值无效')
-  }
   const configuredConcurrency = positiveInteger('configured_concurrency')
   const deploymentMaxConcurrent = positiveInteger('deployment_max_concurrent')
   const maxConcurrent = positiveInteger('max_concurrent')
@@ -318,93 +312,14 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     executionMonitoringMaxNodeTypeOverrides: effectiveLimit('execution_monitoring_max_node_type_overrides'),
     executionMonitoringMaxNodeOverrides: effectiveLimit('execution_monitoring_max_node_overrides'),
     executionMonitoringMaxIdleTimeoutSeconds: effectiveLimit('execution_monitoring_max_idle_timeout_seconds'),
-    promptReviewMaxCandidates: effectiveLimit('prompt_review_max_candidates'),
-    promptReviewMaxAdvisories: effectiveLimit('prompt_review_max_advisories'),
-    promptReviewMaxInputBytes: effectiveLimit('prompt_review_max_input_bytes'),
-    promptReviewMaxFieldCharacters: effectiveLimit('prompt_review_max_field_characters'),
-    promptReviewMaxUsageCount: effectiveLimit('prompt_review_max_usage_count'),
     auditNoteMinCharacters: effectiveLimit('audit_note_min_characters'),
     auditNoteMaxCharacters: effectiveLimit('audit_note_max_characters'),
   }
   if (effectiveLimits.auditNoteMinCharacters > effectiveLimits.auditNoteMaxCharacters) {
     throw new Error('生产策略返回的审计说明范围无效')
   }
-  const rawCreationDefaults = raw.creation_defaults
-  if (!rawCreationDefaults || typeof rawCreationDefaults !== 'object' || Array.isArray(rawCreationDefaults)) {
-    throw new Error('生产策略缺少项目创建默认值投影')
-  }
-  const creationDefault = (key: string): number => {
-    const value = Number((rawCreationDefaults as Record<string, unknown>)[key])
-    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`生产策略缺少有效创建默认值 ${key}`)
-    return value
-  }
-  const creationText = (key: string): string => {
-    const value = rawCreationDefaults as Record<string, unknown>
-    if (typeof value[key] !== 'string' || !value[key].trim()) {
-      throw new Error(`生产策略缺少有效创建默认值 ${key}`)
-    }
-    return value[key].trim()
-  }
-  const rawAspectRatioOptions = (rawCreationDefaults as Record<string, unknown>).aspect_ratio_options
-  if (!Array.isArray(rawAspectRatioOptions) || !rawAspectRatioOptions.length) {
-    throw new Error('生产策略缺少有效画幅选项')
-  }
-  const aspectRatioOptions = rawAspectRatioOptions.map((item): ProductionAspectRatioOption => {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) throw new Error('生产策略画幅选项无效')
-    const option = item as Record<string, unknown>
-    const value = typeof option.value === 'string' ? option.value.trim() : ''
-    const label = typeof option.label === 'string' ? option.label.trim() : ''
-    const width = Number(option.width)
-    const height = Number(option.height)
-    if (!value || !label || !Number.isSafeInteger(width) || width < 1 || !Number.isSafeInteger(height) || height < 1) {
-      throw new Error('生产策略画幅选项无效')
-    }
-    return { value, label, width, height }
-  })
-  if (new Set(aspectRatioOptions.map((option) => option.value)).size !== aspectRatioOptions.length) {
-    throw new Error('生产策略画幅选项存在重复值')
-  }
-  const defaultAspectRatio = creationText('default_aspect_ratio')
-  const defaultAspectRatioOption = aspectRatioOptions.find((option) => option.value === defaultAspectRatio)
-  if (!defaultAspectRatioOption) throw new Error('生产策略默认画幅不在已声明选项中')
-  const rawDefaultShotMediaType = creationText('default_shot_media_type')
-  if (rawDefaultShotMediaType !== 'video' && rawDefaultShotMediaType !== 'image') {
-    throw new Error('生产策略默认分镜媒体类型无效')
-  }
-  const rawDefaultIncludeAudio = (rawCreationDefaults as Record<string, unknown>).default_include_audio
-  if (typeof rawDefaultIncludeAudio !== 'boolean') throw new Error('生产策略默认分镜音频开关无效')
-  if (rawDefaultShotMediaType === 'image' && rawDefaultIncludeAudio) {
-    throw new Error('图片分镜不能声明默认音频')
-  }
-  const creationDefaults: ProductionCreationDefaults = {
-    defaultLanguage: creationText('default_language'),
-    defaultAspectRatio,
-    aspectRatioOptions,
-    defaultShotMediaType: rawDefaultShotMediaType,
-    defaultIncludeAudio: rawDefaultIncludeAudio,
-    episodeCount: creationDefault('episode_count'),
-    shotsPerEpisode: creationDefault('shots_per_episode'),
-    episodeDurationSeconds: creationDefault('episode_duration_seconds'),
-    maxGenerationTasks: creationDefault('max_generation_tasks'),
-    fps: creationDefault('fps'),
-    width: creationDefault('width'),
-    height: creationDefault('height'),
-  }
-  if (creationDefaults.width !== defaultAspectRatioOption.width || creationDefaults.height !== defaultAspectRatioOption.height) {
-    throw new Error('生产策略默认画幅尺寸与创建默认尺寸不一致')
-  }
-  const conditioningModes = adaptConditioningModes(raw.conditioning_modes)
-  if (!conditioningModes.length) throw new Error('生产策略未声明任何条件输入模式')
-  const conditioningContractSha256 = String(raw.conditioning_contract_sha256 || '')
-  if (!/^[0-9a-f]{64}$/.test(conditioningContractSha256)) throw new Error('生产策略缺少条件输入合同指纹')
-  const defaultConditioningMode = String(raw.default_conditioning_mode || '').trim()
-  if (defaultConditioningMode && !conditioningModeByKey(conditioningModes, defaultConditioningMode)) {
-    throw new Error('生产策略的默认条件输入模式不在已声明合同中')
-  }
+  const creationDefaults = adaptProductionCreationDefaults(raw.creation_defaults)
   return {
-    conditioningModes,
-    conditioningContractSha256,
-    defaultConditioningMode,
     recommendedMaxPending: positiveInteger('recommended_max_pending'),
     recommendedMaxActivePerUser: positiveInteger('recommended_max_active_per_user'),
     maxConcurrent,
@@ -417,8 +332,6 @@ const adaptProductionCapability = (raw: Record<string, unknown>): ProductionCapa
     scriptBreakdownDefaultShotDurationMs,
     scriptBreakdownDefaultFirstFrameContinuity: boolean('script_breakdown_default_first_frame_continuity'),
     scriptBreakdownDefaultLastFrameContinuity: boolean('script_breakdown_default_last_frame_continuity'),
-    scriptBreakdownAutoSplitTriggerChars,
-    scriptBreakdownAutoSplitTargetChars,
     activeTaskCount: nonNegativeInteger('active_task_count'),
     userActiveTaskCount: nonNegativeInteger('user_active_task_count'),
     queueGuidanceEnforcement: 'advisory',
@@ -450,9 +363,10 @@ const adaptAssembly = (raw: Record<string, any>): AssemblyResult => {
     episodeId,
     outputUrl: String(raw.output_url || '') || undefined,
     downloadUrl: String(raw.download_url || '') || undefined,
-    aiGenerated: raw.ai_generated !== false,
+    aiGenerated: typeof raw.ai_generated === 'boolean' ? raw.ai_generated : undefined,
     provenanceUrl: String(raw.provenance_url || '') || undefined,
-    sourceTaskIds: Array.isArray(raw.source_tasks) ? raw.source_tasks.map(relationId).filter(Boolean) : [],
+    sourceMediaCount: typeof raw.source_media_count === 'number' && Number.isInteger(raw.source_media_count) && raw.source_media_count >= 0
+      ? raw.source_media_count : undefined,
     createdAt: String(raw.created_at || '') || undefined,
     queuedAt: String(raw.queued_at || '') || undefined,
     startedAt: String(raw.started_at || '') || undefined,
@@ -471,37 +385,6 @@ const adaptAssembly = (raw: Record<string, any>): AssemblyResult => {
             : '成片组装任务已创建'
   }
 }
-
-const adaptReleaseSelection = (raw: any): ReleaseSelection => ({
-  shots: Array.isArray(raw?.shots) ? raw.shots.map((row: any) => ({
-    shotId: String(row.shot_id || ''),
-    taskId: String(row.task_id || ''),
-    outputIndex: Number(row.output_index || 0),
-  })).filter((row: { shotId: string; taskId: string }) => row.shotId && row.taskId) : [],
-  episodes: Array.isArray(raw?.episodes) ? raw.episodes.map((row: any) => ({
-    episodeId: String(row.episode_id || ''),
-    assemblyId: String(row.assembly_id || ''),
-  })).filter((row: { episodeId: string; assemblyId: string }) => row.episodeId && row.assemblyId) : [],
-  seriesAssemblyId: String(raw?.series_assembly_id || '') || undefined,
-})
-
-const adaptReleaseBundle = (raw: Record<string, any>): ReleaseBundle => ({
-  id: String(raw.id),
-  projectId: relationId(raw.project),
-  version: Number(raw.version || 0),
-  title: String(raw.title || ''),
-  notes: String(raw.notes || ''),
-  status: ['draft', 'sealed', 'released', 'superseded'].includes(raw.status)
-    ? raw.status : 'draft',
-  selection: adaptReleaseSelection(raw.selection),
-  manifestSha256: String(raw.manifest_sha256 || '') || undefined,
-  verificationStatus: ['draft', 'verified', 'invalid'].includes(raw.verification_status)
-    ? raw.verification_status : 'invalid',
-  sealedAt: String(raw.sealed_at || '') || undefined,
-  releasedAt: String(raw.released_at || '') || undefined,
-  createdAt: String(raw.created_at || '') || undefined,
-  updatedAt: String(raw.updated_at || '') || undefined,
-})
 
 const currentUserForNewSession = async (
   tokens: { access: string; refresh: string },
@@ -523,11 +406,22 @@ const currentUserForNewSession = async (
 }
 
 export const repository = {
+  async getVideoConditioningCapability(): Promise<VideoConditioningCapability> {
+    const raw = unwrap<Record<string, unknown>>((await api.get('/capabilities/video-conditioning/')).data)
+    const conditioningModes = adaptConditioningModes(raw.conditioning_modes)
+    const conditioningContractSha256 = String(raw.conditioning_contract_sha256 || '')
+    if (!/^[0-9a-f]{64}$/.test(conditioningContractSha256)) throw new Error('视频目录缺少条件输入合同指纹')
+    return { conditioningModes, conditioningContractSha256 }
+  },
   async getCurrentUser(): Promise<AuthenticatedUser> {
     return (async () => {
       const raw = unwrap<Record<string, any>>((await api.get('/auth/me/')).data)
       return adaptAuthenticatedUser(raw)
     })()
+  },
+  async getProjectCreationCapability(): Promise<ProductionCreationDefaults> {
+    const raw = unwrap<Record<string, unknown>>((await api.get('/capabilities/project-creation/')).data)
+    return adaptProductionCreationDefaults(raw.creation_defaults)
   },
   async getProductionCapability(projectId?: string): Promise<ProductionCapability> {
     return (async () => {
@@ -537,30 +431,6 @@ export const repository = {
         })).data,
       )
       return adaptProductionCapability(raw)
-    })()
-  },
-  async getTranslationCapability(projectId: string): Promise<TranslationCapability> {
-    return (async () => {
-      return adaptPromptNormalizationCapability(unwrap<unknown>((await api.get(
-        `/projects/${projectId}/capabilities/prompt-normalization/`,
-      )).data))
-    })()
-  },
-  async ensureCanonicalGlossary(
-    projectId: string,
-    options: {
-      entries?: Array<{ scopeType: CanonicalGlossaryScope; scopeId: string }>
-      includeAllMissing?: boolean
-      ensureVisualIdentityTranslation?: boolean
-    } = {},
-  ): Promise<CanonicalGlossaryEnsureResult> {
-    return (async () => {
-      const response = await api.post(`/projects/${projectId}/ensure-canonical-glossary/`, {
-        entries: options.entries?.map((entry) => ({ scope_type: entry.scopeType, scope_id: entry.scopeId })),
-        include_all_missing: options.includeAllMissing === true,
-        ensure_visual_identity_translation: options.ensureVisualIdentityTranslation === true,
-      })
-      return adaptCanonicalGlossaryEnsureResult(response.data)
     })()
   },
   async getProjectTranslations(
@@ -573,28 +443,6 @@ export const repository = {
         shot: filters.shotId || undefined,
         status: filters.status || undefined,
       } })
-      return translationRows(response.data)
-    })()
-  },
-  async translateProjectFields(
-    projectId: string,
-    fields: PromptTranslationField[],
-    options: {
-      modelDeploymentId: string
-    },
-  ): Promise<PromptTranslationEntry[]> {
-    if (!fields.length) return []
-    return (async () => {
-      const response = await api.post(`/projects/${projectId}/translations/translate/`, {
-        source_lang: 'Chinese', target_lang: 'English',
-        model_deployment_id: options.modelDeploymentId,
-        entries: fields.map((field) => ({
-          field_key: field.fieldKey,
-          source_text: field.sourceText,
-          scope_type: field.scopeType,
-          scope_id: field.scopeId,
-        })),
-      })
       return translationRows(response.data)
     })()
   },
@@ -614,34 +462,9 @@ export const repository = {
     if (rows.length !== 1) throw new Error('手工英文候选创建结果无效')
     return rows[0]
   },
-  async retranslateProjectField(
-    entryId: string,
-    sourceText: string | undefined,
-    options: {
-      modelDeploymentId: string
-    },
-  ): Promise<PromptTranslationEntry> {
-    return (async () => adaptTranslationEntry(unwrap<Record<string, unknown>>((await api.post(
-      `/translations/${entryId}/retranslate/`, {
-        ...(sourceText === undefined ? {} : { source_text: sourceText }),
-        model_deployment_id: options.modelDeploymentId,
-      },
-    )).data)))()
-  },
   async confirmProjectTranslation(entryId: string, translatedText: string, expectedRevision: number): Promise<PromptTranslationEntry> {
     return (async () => adaptTranslationEntry(unwrap<Record<string, unknown>>((await api.post(
       `/translations/${entryId}/confirm/`, { expected_revision: expectedRevision, translation: translatedText },
-    )).data)))()
-  },
-  async promoteShotTranslations(
-    shotId: string,
-    entries: Array<{ entryId: string; expectedRevision: number }>,
-  ): Promise<ShotTranslationPromotionResult> {
-    return (async () => adaptShotTranslationPromotionResult(unwrap<Record<string, unknown>>((await api.post(
-      '/translations/promote-shot/', {
-        shot_id: shotId,
-        entries: entries.map((entry) => ({ entry_id: entry.entryId, expected_revision: entry.expectedRevision })),
-      },
     )).data)))()
   },
   async revokeProjectTranslation(entryId: string): Promise<PromptTranslationEntry> {
@@ -671,7 +494,7 @@ export const repository = {
     })()
   },
   async getStyles(): Promise<StylePreset[]> {
-    return (async () => adaptStyles(await fetchAllPages('/styles/', { is_active: true, page_size: 500 })))()
+    return (async () => adaptStyles(await fetchAllPages('/styles/')))()
   },
   async getAssets(params?: { style?: string; type?: string; search?: string }): Promise<Asset[]> {
     return (async () => {
@@ -683,6 +506,14 @@ export const repository = {
         .filter((asset)=>asset.metadata?.usage !== 'project_cover')
       return params?.type?rows.filter((asset)=>asset.type===params.type):rows
     })()
+  },
+  async getAssetPage(page: number, search = '') {
+    const raw = (await api.get('/assets/', { params: { page, search, is_active: true } })).data
+    if (!raw || !Number.isSafeInteger(raw.count) || raw.count < 0 || !Array.isArray(raw.results)
+      || !(raw.next === null || typeof raw.next === 'string') || !(raw.previous === null || typeof raw.previous === 'string')) {
+      throw new Error('素材目录分页响应不完整')
+    }
+    return { count: raw.count as number, next: raw.next as string | null, previous: raw.previous as string | null, results: adaptAssets(raw.results) }
   },
   async getAsset(id: string): Promise<Asset> {
     const asset = adaptAssets([unwrap<unknown>((await api.get(`/assets/${id}/`)).data)])[0]
@@ -717,12 +548,16 @@ export const repository = {
       return asset
     })()
   },
-  async getAssetGenerationOptions(jobType: AssetGenerationJobType, mediaType: AssetGenerationMediaType): Promise<AssetGenerationRouteOption[]> {
-    const raw = record(unwrap<unknown>((await api.get('/asset-generation-jobs/options/', { params: { job_type: jobType, media_type: mediaType } })).data))
-    return Array.isArray(raw.routes) ? raw.routes.map(adaptAssetGenerationOption) : []
+  async getAssetGenerationOptions(jobType: AssetGenerationJobType, mediaType: AssetGenerationMediaType, page = 1) {
+    return adaptAssetGenerationOptions((await api.get('/asset-generation-jobs/options/', {
+      params: { job_type: jobType, media_type: mediaType, page },
+    })).data)
   },
   async getAssetGenerationJobs(): Promise<AssetGenerationJob[]> {
     return (await fetchAllPages('/asset-generation-jobs/', { page_size: 100 })).map(adaptAssetGenerationJob)
+  },
+  async getAssetGenerationJob(id: string): Promise<AssetGenerationJob> {
+    return adaptAssetGenerationJob(unwrap((await api.get(`/asset-generation-jobs/${encodeURIComponent(id)}/`)).data))
   },
   async createAssetGenerationJob(payload: AssetGenerationJobCreateInput): Promise<AssetGenerationJob> {
     const raw = unwrap<unknown>((await api.post(
@@ -818,15 +653,22 @@ export const repository = {
       await api.delete(`/assets/${assetId}/`)
     })()
   },
+  async deleteAssets(assetIds: string[]): Promise<{ deleted_ids: string[]; deleted_count: number }> {
+    return unwrap((await api.post('/assets/batch-delete/', {
+      asset_ids: assetIds, confirmation: 'DELETE_SELECTED_ASSETS',
+    })).data)
+  },
   async uploadReferenceAsset(file: File, kind: 'reference_video'|'reference_audio', styleId?: string):Promise<Asset> {
     return this.createAsset({
       file, mediaType: kind === 'reference_video' ? 'video' : 'audio',
       name: file.name.replace(/\.[^.]+$/, ''), description: '', promptHint: '', styleId,
     })
   },
-  async getProjects(): Promise<SeriesProject[]> {
+  async getProjects(options: { ownedOnly?: boolean } = {}): Promise<SeriesProject[]> {
     return (async () => {
-      const raw = await fetchAllPages<Record<string, unknown>>('/projects/', { page_size: 200 })
+      const raw = await fetchAllPages<Record<string, unknown>>('/projects/', {
+        page_size: 200, ...(options.ownedOnly ? { owned_only: true } : {}),
+      })
       return raw.map((project) => adaptProjectSummary(project))
     })()
   },
@@ -878,7 +720,7 @@ export const repository = {
         synopsis: episode.synopsis,
         script: episode.script || '',
         status: episode.status === 'rendering' ? 'generating' : episode.status,
-        prompt_settings: { include_audio: episode.audioEnabled },
+        prompt_settings: { ...episode.promptSettings, include_audio: episode.audioEnabled },
       })).data)
       const shots = []
       for (const shot of episode.shots) shots.push(await syncShot(project, episode, shot))
@@ -897,16 +739,8 @@ export const repository = {
   async getWorkflows(): Promise<Workflow[]> {
     return (async () => adaptTasks(await fetchAllPages('/tasks/', { page_size: 500 })))()
   },
-  async getShotWorkflows(shotId: string, kind: 'video' | 'image' = 'video'): Promise<Workflow[]> {
-    return (async () => {
-      if (!isBackendId(shotId)) return []
-      return adaptTasks(await fetchAllPages('/tasks/', {
-        shot_id: shotId,
-        kind,
-        ordering: '-queued_at',
-        page_size: 100
-      }))
-    })()
+  async getShotGenerationTasks(projectId: string, shotId: string): Promise<Workflow[]> {
+    return adaptTasks(await fetchAllPages('/tasks/', { project: projectId, unit_key: `shot:${shotId}`, page_size: 50 }))
   },
   async getWorkflow(taskId: string): Promise<Workflow> {
     return (async () => {
@@ -916,89 +750,19 @@ export const repository = {
       return workflow
     })()
   },
-  async getDeferredGenerationRequests(filters: DeferredGenerationRequestFilters = {}): Promise<DeferredGenerationRequest[]> {
-    return (async () => {
-      const params: Record<string, unknown> = { page_size: 100 }
-      if (filters.project) params.project = filters.project
-      if (filters.sourceTask) params.source_task = filters.sourceTask
-      if (filters.targetShot) params.target_shot = filters.targetShot
-      if (filters.status) params.status = filters.status
-      if (filters.frameSlot) params.frame_slot = filters.frameSlot
-      return (await fetchAllPages<unknown>('/deferred-generation-requests/', params))
-        .map(adaptDeferredGenerationRequest)
-    })()
-  },
   async getTaskInputPrompt(taskId: string): Promise<TaskInputPrompt> {
-    return (async () => {
-      const raw = unwrap<Record<string, any>>((await api.get(`/tasks/${taskId}/input-prompt/`)).data)
-      const prompt = String(raw.prompt || '')
-      const negativePrompt = String(raw.negative_prompt || '')
-      return {
-        taskId: String(raw.task_id || taskId),
-        promptArtifactId: String(raw.prompt_artifact_id || '') || undefined,
-        promptType: String(raw.prompt_type || '') || undefined,
-        model: String(raw.model || '') || undefined,
-        conditioningMode: String(raw.conditioning_mode || '') || undefined,
-        effectiveConditioningMode: String(raw.effective_conditioning_mode || '') || undefined,
-        promptTemplateKey: String(raw.prompt_template_key || '') || undefined,
-        contentHash: String(raw.content_hash || '') || undefined,
-        prompt,
-        negativePrompt,
-        promptCharacterCount: Number(raw.prompt_character_count ?? prompt.length),
-        negativePromptCharacterCount: Number(raw.negative_prompt_character_count ?? negativePrompt.length),
-        negativePromptSubmitted: raw.negative_prompt_submitted === true,
-        promptSource: String(raw.prompt_source || '') || undefined,
-        negativePromptSource: String(raw.negative_prompt_source || '') || undefined
-      }
-    })()
+    const raw = unwrap<unknown>((await api.get(`/tasks/${taskId}/input-prompt/`)).data)
+    return adaptTaskInputPrompt(raw)
   },
-  async getGeneratedWorkflowExport(task: Workflow, workflowFormat: 'api' | 'ui' = 'ui'): Promise<GeneratedWorkflowExport> {
-    return (async () => {
-      if (!task.generatedWorkflowId) throw new Error('该任务未关联可查看的 generated_workflow')
-      let raw: Record<string, any>
-      try {
-        raw = unwrap<Record<string, any>>((await api.get(
-          `/tasks/${task.taskId || task.id}/comfyui-workflow/`,
-          { params: { workflow_format: workflowFormat } }
-        )).data)
-      } catch (error: any) {
-        if (error?.response?.status !== 404) throw error
-        const workflow = unwrap<Record<string, any>>((await api.get(`/workflows/${task.generatedWorkflowId}/`)).data)
-        raw = { task_id: task.taskId || task.id, generated_workflow_id: workflow.id, workflow: workflow.workflow_json, injected_values: workflow.injected_values, content_hash: workflow.content_hash, filename: `comfyui-workflow-${workflow.id}.json`, format: 'comfyui_api', safe_to_open: false, direct_open_supported: false, open_mode: 'download_import' }
-      }
-      const workflowJson = raw.workflow || raw.workflow_json
-      if (!workflowJson || typeof workflowJson !== 'object' || Array.isArray(workflowJson)) throw new Error('服务端未返回有效的 ComfyUI 工作流 JSON')
-      const safeToOpen = raw.safe_to_open === true
-      return {
-        taskId: String(raw.task_id || task.taskId || task.id),
-        generatedWorkflowId: String(raw.generated_workflow_id || raw.id || task.generatedWorkflowId),
-        workflowJson,
-        injectedValues: raw.injected_values && typeof raw.injected_values === 'object' ? raw.injected_values : {},
-        contentHash: String(raw.content_hash || ''),
-        filename: String(raw.filename || `comfyui-workflow-${task.generatedWorkflowId}.json`),
-        format: String(raw.format || 'comfyui_api'),
-        templateSlug: String(raw.template_slug || '') || undefined,
-        templateVersion: Number(raw.template_version || 0) || undefined,
-        importReady: raw.import_ready !== false,
-        comfyPromptId: task.comfyPromptId,
-        comfyuiUrl: String(raw.comfyui_url || '') || undefined,
-        directOpenUrl: String(raw.direct_open_url || '') || undefined,
-        safeToOpen,
-        directOpenSupported: raw.direct_open_supported === true,
-        openMode: String(raw.open_mode || 'download_import'),
-        downloadUrl: String(raw.download_url || '') || undefined,
-        availableFormats: Array.isArray(raw.available_formats)
-          ? raw.available_formats.filter((value: unknown) => value === 'comfyui_api' || value === 'comfyui_ui')
-          : undefined,
-        apiDownloadUrl: String(raw.api_download_url || '') || undefined,
-        uiDownloadUrl: String(raw.ui_download_url || '') || undefined,
-        containsStagedPlaceholders: raw.contains_staged_placeholders === true,
-        stagedPlaceholderCount: Number(raw.staged_placeholder_count || 0),
-        openReason: String(raw.open_reason || '') || (safeToOpen
-          ? (raw.direct_open_supported === true ? '后端已确认可通过安全地址打开该工作流。' : '请先下载 UI 画布 JSON，再打开 ComfyUI 并拖入或打开该文件；网页不会自动载入画布。')
-          : '当前没有可安全打开的 ComfyUI 地址，请先下载工作流 JSON。')
-      }
-    })()
+  async getTaskObservations(taskId: string, page = 1): Promise<TaskObservationPage> {
+    const raw = (await api.get(`/tasks/${taskId}/observations/`, { params: { page } })).data
+    return adaptTaskObservations(raw, taskId)
+  },
+  async getTaskWorkflowExport(task: Workflow, workflowFormat: 'api' | 'ui' = 'api'): Promise<TaskWorkflowExport> {
+    const raw = unwrap<unknown>((await api.get(
+      `/tasks/${task.taskId || task.id}/comfyui-workflow/`, { params: { workflow_format: workflowFormat } }
+    )).data)
+    return adaptTaskWorkflowExport(raw)
   },
   async getEpisodeAssemblies(projectId: string): Promise<AssemblyResult[]> {
     return (async () => {

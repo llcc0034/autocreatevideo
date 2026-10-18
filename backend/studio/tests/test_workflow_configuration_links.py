@@ -5,10 +5,11 @@ from django.contrib.auth import get_user_model
 from django.db import connection
 from django.test import TestCase
 from django.test.utils import CaptureQueriesContext
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from studio.models import (
-    ModelDeployment, ModelProfileVersion, PromptProfileBinding, PromptProfileVersion,
+    ModelDeployment, ModelProfileVersion, ModelExecutionInstance, ModelExecutionInstanceVersion, PromptProfileVersion,
     ProviderProfile, WorkflowProjector, WorkflowProjectorVersion,
     WorkflowTemplate, WorkflowTemplateVersion,
 )
@@ -17,7 +18,7 @@ from studio.services.workflow_configuration_links import workflow_configuration_
 
 class WorkflowConfigurationLinksTests(TestCase):
     @classmethod
-    def setUpTestData(cls):
+    def _resource_data(cls):
         cls.user = get_user_model().objects.create_user(username="links-staff", is_staff=True)
         cls.provider = ProviderProfile.objects.create(key="links-provider", name="ComfyUI", driver_type="comfyui")
         cls.model = ModelProfileVersion.objects.create(
@@ -52,31 +53,33 @@ class WorkflowConfigurationLinksTests(TestCase):
         cls.prompt = PromptProfileVersion.objects.create(
             profile_key="links-prompt", version=1, name="多图编辑策略", model_family="links-family", operation="image.generate",
         )
-        for index in range(6):
-            PromptProfileBinding.objects.create(
-                key=f"links-binding-{index}", name=f"规则{index}", model_family="links-family",
-                operation="image.generate", priority=index, prompt_profile_version=cls.prompt,
-                model_profile_version=cls.model if index == 0 else None, is_active=index != 0,
-            )
-        PromptProfileBinding.objects.create(
-            key="links-other-version", name="其他模型版本", model_family="links-family", priority=999,
-            operation="image.generate", prompt_profile_version=cls.prompt, model_profile_version=cls.other_model,
-        )
+    @classmethod
+    def setUpTestData(cls):
+        cls._resource_data()
+        cls.execution_family = ModelExecutionInstance.objects.create(key='links-execution', name='图像执行实例')
+        cls.executions = [ModelExecutionInstanceVersion.objects.create(instance=cls.execution_family, version=index+1,
+            deployment=cls.deployment, workflow_version=cls.workflow, prompt_mode='profile', prompt_profile_version=cls.prompt,
+            operation='image.generate', status='published' if index < 5 else 'draft',
+            published_at=timezone.now() if index < 5 else None, published_by=cls.user if index < 5 else None)
+            for index in range(6)]
+        # Same model/deployment without this workflow must never enter the list.
+        ModelExecutionInstanceVersion.objects.create(instance=cls.execution_family, version=7,
+            deployment=cls.deployment, prompt_mode='none', operation='image.generate')
 
-    def test_exact_links_and_bounded_prompt_catalog_do_not_resolve_runtime_selection(self):
+    def test_exact_execution_links_are_bounded_and_do_not_select_a_runtime_route(self):
         links = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]
         self.assertEqual(links["model"]["instance_count"], 2)
         self.assertEqual(links["validated_deployment"]["name"], "本机图片实例")
         self.assertEqual(links["projector"]["version_id"], str(self.projector_version.id))
         self.assertEqual(links["projector"]["status"], "retired")
         self.assertFalse(links["projector"]["is_current"])
-        self.assertEqual(links["prompt_bindings"]["total"], 6)
-        self.assertEqual(links["prompt_bindings"]["active_total"], 5)
-        preview = links["prompt_bindings"]["preview"]
+        self.assertEqual(links["execution_instances"]["total"], 6)
+        self.assertEqual(links["execution_instances"]["active_total"], 5)
+        preview = links["execution_instances"]["preview"]
         self.assertEqual(len(preview), 3)
-        self.assertEqual(preview[0]["scope"], "model_family")
-        self.assertTrue(all(item["is_active"] for item in preview))
-        self.assertEqual(preview[1]["scope"], "model_family")
+        self.assertEqual([item['version'] for item in preview], [5, 4, 3])
+        self.assertTrue(all(item["status"] == 'published' for item in preview))
+        self.assertNotIn('prompt_bindings', links)
 
     def test_missing_and_invalid_projector_never_fall_back_to_current_version(self):
         for identity in ("invalid", {**self.identity, "version_id": str(uuid4())}, {**self.identity, "definition_sha256": "b" * 64}):
@@ -95,26 +98,22 @@ class WorkflowConfigurationLinksTests(TestCase):
         WorkflowTemplateVersion.objects.filter(pk=self.workflow.id).update(model_profile_version=None)
         link = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]
         self.assertIsNone(link["model"])
-        self.assertEqual(link["prompt_bindings"], {"state": "model_unbound", "total": 0, "active_total": 0, "preview": []})
+        self.assertEqual(link["execution_instances"]['total'], 6)  # FK relation remains explicit, not a validity verdict.
 
-    def test_missing_family_keeps_only_explicit_model_bindings(self):
+    def test_missing_family_does_not_change_exact_execution_relations(self):
         ModelProfileVersion.objects.filter(pk=self.model.id).update(specification={})
         links = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]
-        self.assertEqual(links["prompt_bindings"]["state"], "family_missing")
-        self.assertEqual(links["prompt_bindings"]["total"], 1)
-        self.assertEqual(links["prompt_bindings"]["active_total"], 0)
-        self.assertEqual(links["prompt_bindings"]["preview"], [])
+        self.assertEqual(links["execution_instances"]["total"], 6)
+        self.assertEqual(links["execution_instances"]["active_total"], 5)
 
-    def test_inactive_high_priority_bindings_do_not_hide_active_candidates(self):
-        PromptProfileBinding.objects.filter(model_family="links-family").update(is_active=False)
-        for index in (0, 1):
-            PromptProfileBinding.objects.filter(key=f"links-binding-{index}").update(is_active=True)
-        link = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]["prompt_bindings"]
+    def test_drafts_retired_and_disabled_versions_do_not_hide_published_choices(self):
+        ModelExecutionInstanceVersion.objects.filter(pk__in=[row.pk for row in self.executions[2:5]]).update(status='retired')
+        link = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]["execution_instances"]
         self.assertEqual(link["total"], 6)
         self.assertEqual(link["active_total"], 2)
-        self.assertEqual([item["scope"] for item in link["preview"]], ["exact_model", "model_family"])
-        PromptProfileBinding.objects.filter(model_family="links-family").update(is_active=False)
-        link = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]["prompt_bindings"]
+        self.assertEqual([item['version'] for item in link['preview']], [2, 1])
+        ModelExecutionInstance.objects.filter(pk=self.execution_family.pk).update(is_active=False)
+        link = workflow_configuration_links([self.workflow.id])[str(self.workflow.id)]["execution_instances"]
         self.assertEqual(link["total"], 6)
         self.assertEqual(link["active_total"], 0)
         self.assertEqual(link["preview"], [])

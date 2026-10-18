@@ -202,9 +202,11 @@ WORKFLOW_PROJECTOR_EDITOR_SECTIONS = [
 
 WORKFLOW_PROJECTOR_PROJECTION_FIELDS = {
     "generic.fixed": [
+        _projector_editor_field("projection.config.capability", "执行能力", "明确这类图执行文生图、图片生图或其他已登记能力；不按模型名称、文件名或输出模态推测。未选择时不能提升工作流。", "execution_capability"),
         _projector_editor_field("projection.config.image_resolution", "图片输出尺寸", "仅适用于 LoadImage 经 FluxKontextImageScale 驱动的图片输出；单组固定尺寸，多组按原图比例选择。配置随版本冻结。", "image_resolution"),
     ],
     "generic.references": [
+        _projector_editor_field("projection.config.capability", "执行能力", "明确动态素材图的业务执行能力；须同时与主输出模态和所选模型能力合同一致。", "execution_capability"),
         _projector_editor_field("projection.config.groups", "动态素材组接线", "选择来源模板、目标角色和端口；数量由工作流或模型合同约束。在线节点不支持的接线会阻断。", "asset_group_list"),
     ],
     "generic.classified": [
@@ -218,6 +220,14 @@ class WorkflowProjectorError(ValidationError):
 
     def __init__(self, message: str):
         super().__init__(message, code=type(self).code)
+
+
+def workflow_execution_capability_options() -> list[dict[str, str]]:
+    from studio.services.model_profile_options import MODEL_CAPABILITY_CATALOG
+    return [
+        _projector_choice(row["value"], row["label"])
+        for row in MODEL_CAPABILITY_CATALOG if "comfyui" in row["driver_types"]
+    ]
 
 
 class WorkflowProjectorCatalogUnavailable(WorkflowProjectorError):
@@ -494,6 +504,9 @@ def validate_workflow_projector_definition(
     if projection.get("kind") != expected_kind:
         raise WorkflowProjectorError("projection.kind 与注册 engine 不一致")
     config = _mapping(projection.get("config"), "projection.config")
+    if engine_key in {"generic.fixed", "generic.references"} and "capability" in config:
+        if not isinstance(config["capability"], str) or config["capability"] not in {row["value"] for row in workflow_execution_capability_options()}:
+            raise WorkflowProjectorError("projection.config.capability 必须选择已登记的 ComfyUI 执行能力")
     if engine_key == "generic.references":
         from studio.services.workflow_asset_groups import AssetGroupError, validate_group_config
         try:
@@ -501,8 +514,8 @@ def validate_workflow_projector_definition(
         except AssetGroupError as exc:
             raise WorkflowProjectorError(str(exc)) from exc
     if engine_key == "generic.fixed":
-        if set(config) - {"image_resolution"}:
-            raise WorkflowProjectorError("generic.fixed projection.config 只支持 image_resolution")
+        if set(config) - {"image_resolution", "capability"}:
+            raise WorkflowProjectorError("generic.fixed projection.config 只支持 capability 与 image_resolution")
         if "image_resolution" in config:
             from studio.services.workflow_resolution import validate_image_resolution_policy, WorkflowResolutionError
             try:
@@ -624,6 +637,9 @@ def validate_frozen_workflow_projector_contract(
     )
     if identity != contract.identity:
         raise WorkflowProjectorError("workflow 冻结的 projector identity 或 SHA 已漂移")
+    declared_capability = definition["projection"]["config"].get("capability")
+    if contract.engine_key in {"generic.fixed", "generic.references"} and declared_capability is not None and input_contract.get("capability") != declared_capability:
+        raise WorkflowProjectorError("workflow 冻结的执行能力与 Projector 版本不一致")
     frozen_adapters = input_contract.get("workflow_adapters")
     if frozen_adapters != definition["adapters"]:
         raise WorkflowProjectorError("workflow 冻结的 adapter keys 与 projector 版本不一致")
@@ -914,6 +930,7 @@ def workflow_projector_engine_options() -> list[dict[str, Any]]:
 
 
 def workflow_projector_configuration_options() -> dict[str, Any]:
+    from studio.services.media_capabilities import conditioning_input_options
     from studio.services.workflow_asset_groups import WIRING_CHOICES
     from studio.services.workflow_resolution import image_resolution_options
     return {
@@ -939,7 +956,9 @@ def workflow_projector_configuration_options() -> dict[str, Any]:
         "definition_editor": {
             "sections": deepcopy(WORKFLOW_PROJECTOR_EDITOR_SECTIONS),
             "choices": {
+                "execution_capabilities": workflow_execution_capability_options(),
                 "asset_group_wirings": deepcopy(WIRING_CHOICES),
+                "model_quantity_inputs": conditioning_input_options(),
                 "cardinalities": [
                     _projector_choice("one", "唯一节点"),
                     _projector_choice("many", "允许多个节点"),

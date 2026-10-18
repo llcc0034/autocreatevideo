@@ -1,75 +1,39 @@
-import type {
-  AssetGenerationExecutionKind,
-  AssetGenerationJobType,
-  AssetGenerationMediaType,
-  BibleDraftEntityType,
-} from '@/types'
-import type { WorkflowExecutionInput } from './platformTypes'
+import type { AssetGenerationJob, AssetGenerationJobType, AssetGenerationMediaType, BibleDraftEntityType } from '@/types'
+import type { ExecutionSmokeRequest } from './executionPreparation'
+import type { AssetAppearanceTarget } from './assetAppearanceTarget'
+
+export function assetPromptContinuationTarget(job: Pick<AssetGenerationJob, 'id' | 'jobType' | 'mediaType' | 'status' | 'resultText'>) {
+  // Standalone text candidates are reviewed by their source page, not a text Asset category.
+  if (job.jobType !== 'prompt' || job.mediaType === 'text' || job.status !== 'succeeded' || !job.resultText) return null
+  return {name:'assets',query:{type:job.mediaType,promptJob:job.id}}
+}
 
 export interface AssetGenerationJobCreateInput {
   jobType: AssetGenerationJobType
   mediaType: AssetGenerationMediaType
-  executionKind: AssetGenerationExecutionKind
-  generationTargetId: string
+  executionInstanceVersionId: string
+  expectedDefinitionSha256: string
+  fixture: ExecutionSmokeRequest['fixture']
   styleId?: string
   imageCategory?: BibleDraftEntityType | 'reference'
-  name?: string
-  description?: string
-  prompt: string
-  negativePrompt?: string
-  parameters?: Record<string, unknown>
-  workflowInputs?: WorkflowExecutionInput
-  allowExternalCalls?: boolean
-  budgetLimit?: string | null
+  name: string
+  description: string
+  allowExternalCalls: boolean
   idempotencyKey: string
+  appearanceTarget?: AssetAppearanceTarget
 }
 
-export const buildAssetGenerationJobRequestPayload = (
-  payload: AssetGenerationJobCreateInput,
-  resolvedStyleId: string | null,
-) => ({
-  job_type: payload.jobType,
-  media_type: payload.mediaType,
-  execution_kind: payload.executionKind,
-  ...(payload.executionKind === 'deployment'
-    ? { model_deployment_id: payload.generationTargetId }
-    : { workflow_template_version_id: payload.generationTargetId }),
-  style_id: resolvedStyleId,
-  ...(payload.mediaType === 'image' && payload.imageCategory
-    ? { image_category: payload.imageCategory }
-    : {}),
-  name: payload.name || '',
-  description: payload.description || '',
-  prompt: payload.prompt,
-  negative_prompt: payload.negativePrompt || '',
-  parameters: payload.executionKind === 'deployment' ? payload.parameters || {} : {},
-  ...(payload.executionKind === 'comfy_workflow' && payload.workflowInputs ? {
-    workflow_inputs: {
-      schema_version: payload.workflowInputs.schemaVersion,
-      values: payload.workflowInputs.values,
-      assets: payload.workflowInputs.assets.map((item) => ({
-        semantic_key: item.semanticKey,
-        asset_id: item.assetId,
-      })),
-      references: {
-        pictures: payload.workflowInputs.references.pictures.map((item) => ({
-          asset_id: item.assetId,
-          category: item.category,
-        })),
-        videos: payload.workflowInputs.references.videos.map((item) => ({
-          asset_id: item.assetId,
-          purpose: item.purpose,
-          use_embedded_audio: item.useEmbeddedAudio,
-          ...(item.audioAssetId ? { audio_asset_id: item.audioAssetId } : {}),
-          ...(item.audioPurpose ? { audio_purpose: item.audioPurpose } : {}),
-        })),
-        audios: payload.workflowInputs.references.audios.map((item) => ({
-          asset_id: item.assetId,
-          purpose: item.purpose,
-        })),
-      },
-    },
-  } : {}),
-  allow_external_calls: payload.allowExternalCalls === true,
-  budget_limit: payload.budgetLimit || null,
+// One explicit instance version; callers cannot select a second runtime or graph.
+export const buildAssetGenerationJobRequestPayload = (payload: AssetGenerationJobCreateInput, styleId: string | null) => ({
+  execution_instance_version_id: payload.executionInstanceVersionId,
+  expected_definition_sha256: payload.expectedDefinitionSha256,
+  job_type: payload.jobType, media_type: payload.mediaType,
+  inputs: payload.fixture.inputs, parameters: payload.fixture.parameters,
+  manual_channels: payload.fixture.manual_channels, subject_facts: payload.fixture.subject_facts,
+  source_language: payload.fixture.source_language, target_language: payload.fixture.target_language,
+  field_values: [], style_id: styleId,
+  ...(payload.jobType === 'asset' && payload.mediaType === 'image' ? { image_category: payload.imageCategory } : {}),
+  name: payload.name, description: payload.description,
+  allow_external_calls: payload.allowExternalCalls,
+  ...(payload.appearanceTarget ? { appearance_target: JSON.parse(JSON.stringify(payload.appearanceTarget)) as AssetAppearanceTarget } : {}),
 })

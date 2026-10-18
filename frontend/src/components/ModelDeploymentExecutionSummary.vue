@@ -1,24 +1,20 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { BookOpenCheck, Workflow, ShieldCheck, RefreshCw } from 'lucide-vue-next'
+import { Boxes, Workflow, ShieldCheck, RefreshCw } from 'lucide-vue-next'
 import ConfigurationRelationButton from './ConfigurationRelationButton.vue'
 import DeploymentCapabilitySmoke from './DeploymentCapabilitySmoke.vue'
 import { platformApi } from '@/services/platformApi'
 import { apiErrorSummary } from '@/services/apiErrorPresentation'
 import { deploymentWorkflowSignal, workflowExecutionSignal, workflowExecutionUrl } from '@/services/modelDeploymentExecution'
-import { modelPromptSettingsRoute, promptBindingModelFamily } from '@/services/modelPromptBindings'
-import { modeLabel, operationLabel } from '@/services/presentationLabels'
-import type { AcceptanceSmokeDeploymentRow, AcceptanceSmokeWorkflowRow, ModelDeployment, ModelProfileVersion, PromptProfileBinding } from '@/services/platformTypes'
+import type { AcceptanceSmokeDeploymentRow, AcceptanceSmokeWorkflowRow, ModelDeployment } from '@/services/platformTypes'
 
 const props = defineProps<{
-  deployment: ModelDeployment; profile: ModelProfileVersion; acceptance: AcceptanceSmokeDeploymentRow | null
-  acceptanceError?: string; acceptanceLoading?: boolean; bindings: PromptProfileBinding[]; bindingsLoading: boolean; bindingsError: string
+  deployment: ModelDeployment; acceptance: AcceptanceSmokeDeploymentRow | null
+  acceptanceError?: string; acceptanceLoading?: boolean
 }>()
-defineEmits<{ showBindings: []; retryBindings: [] }>()
 const latestAcceptance = ref<AcceptanceSmokeDeploymentRow | null>(null)
 const localReadSucceeded = ref(false)
 const signal = computed(() => deploymentWorkflowSignal(loading.value ? null : latestAcceptance.value, props.acceptanceError || error.value))
-const activeBindings = computed(() => props.bindings.filter(row => row.isActive && row.promptProfileStatus === 'published'))
 const workflows = ref<AcceptanceSmokeWorkflowRow[]>([])
 const loading = ref(false); const error = ref(''); const page = ref(1); const count = ref(0); const hasNext = ref(false)
 const currentWorkflows = computed(() => workflows.value.filter(row => row.association.validatedDeploymentMatches && row.workflow.status !== 'retired'))
@@ -39,15 +35,15 @@ const refresh = async (requestedPage = 1) => {
     ])
     if (current !== serial) return
     const instanceRow = aggregate.results[0]
-    if (aggregate.count !== 1 || aggregate.results.length !== 1 || instanceRow?.subject !== 'deployment' || instanceRow.deployment.id !== deploymentId) throw new Error('实例验收摘要缺失或不匹配，请重新读取')
+    if (aggregate.count !== 1 || aggregate.results.length !== 1 || instanceRow?.subject !== 'deployment' || instanceRow.deployment.id !== deploymentId) throw new Error('部署验收摘要缺失或不匹配，请重新读取')
     const rows: AcceptanceSmokeWorkflowRow[] = []
     for (const row of response.results) {
-      if (row.subject !== 'workflow' || row.association.deploymentId !== deploymentId) throw new Error('工作流验收返回了不匹配的实例，请重新读取')
+      if (row.subject !== 'workflow' || row.association.deploymentId !== deploymentId) throw new Error('工作流验收返回了不匹配的部署，请重新读取')
       rows.push(row)
     }
     workflows.value = rows; latestAcceptance.value = instanceRow; count.value = response.count; page.value = requestedPage; hasNext.value = Boolean(response.next); localReadSucceeded.value = true
   } catch (cause) {
-    if (current === serial) error.value = apiErrorSummary(cause, '实例验收读取失败')
+    if (current === serial) error.value = apiErrorSummary(cause, '部署验收读取失败')
   } finally { if (current === serial) loading.value = false }
 }
 watch(() => [props.deployment.id, props.deployment.updatedAt, props.acceptance, props.acceptanceError] as const, () => {
@@ -58,7 +54,7 @@ onBeforeUnmount(() => { serial += 1 })
 </script>
 
 <template>
-  <section class="deployment-execution-summary" aria-label="实例烟测与关联配置">
+  <section class="deployment-execution-summary" aria-label="模型部署资源核验">
     <div v-if="deployment.providerDriver==='comfyui'" class="execution-workflows">
       <header>
         <span><ShieldCheck :size="14" aria-hidden="true"/>工作流烟测</span>
@@ -89,28 +85,17 @@ onBeforeUnmount(() => { serial += 1 })
       </template>
     </div>
     <DeploymentCapabilitySmoke v-else :row="latestAcceptance" :loading="loading || acceptanceLoading" :error="error || (!localReadSucceeded ? acceptanceError : '')" @refresh="refresh()"/>
-    <div class="execution-prompts">
-      <header><span><BookOpenCheck :size="14" aria-hidden="true"/>适用提示词策略</span><button class="button ghost tiny" @click="$emit('showBindings')">{{ bindingsLoading || bindingsError ? '查看绑定' : `全部 ${bindings.length} 条绑定` }}</button></header>
-      <p v-if="bindingsError" role="alert">{{ bindingsError }} <button class="button ghost tiny" @click="$emit('retryBindings')">重试</button></p>
-      <p v-else-if="bindingsLoading" role="status">正在读取提示词绑定…</p>
-      <template v-else>
-        <p v-if="!promptBindingModelFamily(profile)">模型族未配置：仅显示精确版本绑定，目录可能不完整。</p>
-        <p v-if="!activeBindings.length">暂无启用且已发布的适用策略。<RouterLink :to="modelPromptSettingsRoute(profile.id,'',deployment.id)">配置提示词绑定</RouterLink></p>
-        <ConfigurationRelationButton v-for="binding in activeBindings.slice(0,2)" :key="binding.id" :icon="BookOpenCheck"
-          :label="operationLabel(binding.operation)" :name="`${binding.promptProfileName || binding.promptProfileKey} v${binding.promptProfileVersionNumber}`"
-          :status="binding.mode ? modeLabel(binding.mode) : '通用模式'" tone="info"
-          description="模型版本的适用策略，不代表某次任务实际选用；执行时按操作、模式及绑定选择冻结。"
-          :to="modelPromptSettingsRoute(profile.id,binding.promptProfileVersion,deployment.id)"/>
-        <button v-if="activeBindings.length>2" class="button ghost tiny" @click="$emit('showBindings')">查看全部 {{ activeBindings.length }} 条启用策略</button>
-        <p>按操作与模式选择；任务实际使用的策略见执行记录。</p>
-      </template>
+    <div class="execution-instances">
+      <header><span><Boxes :size="14" aria-hidden="true"/>业务执行实例</span></header>
+      <p>此处只核对部署资源。提示词、工作流和运行参数在执行实例版本中明确配置，业务可用性以该组合的烟测为准。</p>
+      <RouterLink class="button ghost tiny" :to="{path:'/settings/acceptance-smoke',query:{view:'relations',kind:'execution',source_kind:'deployment',source_id:deployment.id,relation:'executions'}}">查看引用此部署的执行实例</RouterLink>
     </div>
   </section>
 </template>
 
 <style scoped>
 .deployment-execution-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:16px;grid-column:1/-1;min-width:0;padding-top:10px;border-top:1px solid var(--border)}
-.execution-workflows,.execution-prompts{display:grid;align-content:start;gap:6px;min-width:0}
+.execution-workflows,.execution-instances{display:grid;align-content:start;gap:6px;min-width:0}
 summary{cursor:pointer;font-size:11px;min-height:30px;line-height:30px;color:var(--text-secondary)}details>.configuration-relation{margin-top:5px}summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 header,header>span,.workflow-pages{display:flex;gap:6px;align-items:center;flex-wrap:wrap}header{min-height:30px}header>span:first-child{font-weight:600;color:var(--text)}header>button{margin-left:auto}
 .execution-signal{font-size:11px;color:var(--text-secondary)}.execution-signal.linked{color:var(--green)}.execution-signal.warning{color:var(--accent)}.execution-signal.danger{color:var(--red)}

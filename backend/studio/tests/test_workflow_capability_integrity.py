@@ -237,23 +237,13 @@ class PublishedWorkflowCapabilityIntegrityTests(TestCase):
         ))
         return version
 
-    def test_exact_current_integrity_target_and_real_smoke_are_accepted(self):
+    def test_legacy_success_flags_without_original_preparation_are_rejected(self):
         version = self._published_workflow()
-
-        attempt, target_sha256 = verify_published_workflow_capability(
-            version,
-            self.deployment,
-            operation="image.text_to_image",
-        )
-
-        self.assertEqual(attempt.status, WorkflowSmokeAttempt.Status.SUCCEEDED)
-        self.assertEqual(
-            target_sha256,
-            workflow_execution_target_sha256(version, self.deployment),
-        )
+        with self.assertRaises(ValidationError):
+            verify_published_workflow_capability(version, self.deployment, operation="image.text_to_image")
 
     def test_passed_legacy_contract_cannot_bypass_projector_admission(self):
-        from studio.services.workflow_compiler import compile_frozen_workflow, WorkflowCompilerError
+        from studio.services.workflow_compiler import compile_frozen_workflow_values, WorkflowCompilerError
         from studio.services.workflow_versions import workflow_version_execution_snapshot, resolve_workflow_canvas_export_deployment
 
         version = self._published_workflow(historical_unprojected=True)
@@ -262,7 +252,9 @@ class PublishedWorkflowCapabilityIntegrityTests(TestCase):
         self.assertEqual(rejected.exception.code, "workflow_integrity_invalid")
         self.assertIn("Projector", str(rejected.exception.__cause__))
         with self.assertRaisesRegex(WorkflowCompilerError, "缺少冻结的 Projector"):
-            compile_frozen_workflow(workflow_snapshot=workflow_version_execution_snapshot(version), prompt=None, project=None)
+            compile_frozen_workflow_values(workflow_snapshot=workflow_version_execution_snapshot(version),
+                scalar_values={}, resolve_asset=lambda *_: self.fail("Validate the frozen Projector first"),
+                classified_groups=None, classified_bindings=[], output_kind="image", total_duration_ms=None)
 
         with self.assertRaisesRegex(ValidationError, "缺少冻结的 Projector"):
             resolve_workflow_canvas_export_deployment(version)

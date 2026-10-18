@@ -14,6 +14,7 @@ from studio.services.async_media_queue import (
     recover_stale_async_media_attempts,
 )
 from studio.services.configuration import resolve_configuration
+from studio.services.execution_preparation_queue import advance_next_execution_preparation
 from studio.services.worker_heartbeat import WorkerHeartbeat
 from studio.services.worker_database import retry_worker_database_step
 from studio.services.deployment_smoke_queue import (
@@ -76,6 +77,7 @@ class Command(BaseCommand):
             )
             self.stdout.write(f"asset generation recovery: {asset_recovery}")
             while True:
+                retry_worker_database_step(advance_next_execution_preparation, wait_seconds=poll_seconds)
                 attempt = retry_worker_database_step(
                     claim_next_async_media_attempt, worker_id, wait_seconds=poll_seconds,
                 )

@@ -42,9 +42,8 @@ const makeProject = (patch: Partial<SeriesProject> = {}): SeriesProject => ({
   resolution: '720p',
   width: 768,
   height: 1344,
-  defaultMode: 'Ref2VA',
   bible: {
-    characters: [{ id: 'character-1', name: '沈砚', description: '剑客', visualPrompt: 'gray robe', referenceAssetIds: [], locked: true }],
+    characters: [{ id: 'character-1', name: '沈砚', description: '剑客', referenceAssetIds: [], locked: true }],
     scenes: [],
     props: [],
     negativePrompt: 'watermark',
@@ -105,19 +104,19 @@ test('redo payload is an independent draft with an explicit field allowlist', ()
   assert.equal(Array.from(payload.title).length, 225)
   assert.ok(payload.title.endsWith(' · 重做'))
   assert.equal(payload.logline, source.logline)
-  assert.equal(payload.masterScript, source.masterScript)
+  assert.equal('masterScript' in payload, false, 'redo must explicitly adopt a script revision in its own run')
   assert.equal(payload.styleId, source.styleId)
   assert.equal(payload.language, source.language)
   assert.equal(payload.aspectRatio, source.aspectRatio)
   assert.equal(payload.resolution, source.resolution)
-  assert.equal(payload.defaultMode, source.defaultMode)
+  assert.equal('defaultMode' in payload, false)
   assert.equal(payload.status, 'draft')
   assert.equal(payload.isFavorite, false)
   assert.equal(payload.continuitySummary, '')
   assert.deepEqual(payload.translationGlossary, {})
   assert.deepEqual(payload.bible, { characters: [], scenes: [], props: [], negativePrompt: '', colorScript: '' })
   assert.deepEqual(Object.keys(payload).sort(), [
-    'aspectRatio', 'bible', 'continuitySummary', 'defaultMode', 'height', 'isFavorite', 'language', 'logline', 'masterScript',
+    'aspectRatio', 'bible', 'continuitySummary', 'height', 'isFavorite', 'language', 'logline',
     'resolution', 'status', 'styleId', 'title', 'translationGlossary', 'width',
   ])
   assert.ok(!('id' in payload))
@@ -250,6 +249,20 @@ test('studio store rejects stale session results without disturbing new requests
     assert.equal(store.styles[0]?.id, 'fresh-style')
     assert.equal(store.projects[0]?.title, 'fresh initialize')
     assert.equal(projectRequests, 1)
+  })
+
+  await context.test('navigation and page share catalog reads without fetching task history', async () => {
+    setActivePinia(createPinia())
+    const store = useStudioStore(), pending = deferred<Array<{ id: string }>>()
+    let styles = 0, projects = 0, tasks = 0
+    repository.getStyles = async () => { styles++; return pending.promise }
+    repository.getProjects = async () => { projects++; return [] }
+    repository.getWorkflows = async () => { tasks++; return [] }
+    const navigation = store.initializeNavigation(), page = store.loadStyles()
+    assert.equal(styles, 1); assert.equal(tasks, 0)
+    pending.resolve([{id:'style'}]); await Promise.all([navigation, page])
+    assert.equal(projects, 1); assert.equal(tasks, 0); assert.equal(store.ready, false)
+    await store.initialize(); assert.equal(styles, 1); assert.equal(projects, 1); assert.equal(tasks, 1); assert.equal(store.ready, true)
   })
 
   await context.test('workflow diagnostics failure does not erase successfully loaded projects', async () => {
@@ -400,7 +413,7 @@ test('management view keeps card navigation separate from destructive controls',
   assert.ok(adapterSource.includes('detailLoaded, createdAt:'))
   assert.ok(!adapterSource.match(/projectPayload[\s\S]*is_favorite:/u))
   assert.ok(repositorySource.includes('return raw.map((project) => adaptProjectSummary(project))'))
-  assert.ok(repositorySource.includes("fetchAllPages<Record<string, unknown>>('/projects/', { page_size: 200 })"))
+  assert.match(repositorySource, /fetchAllPages<Record<string, unknown>>\('\/projects\/',\s*\{\s*page_size: 200, \.\.\.\(options\.ownedOnly \? \{ owned_only: true \} : \{\}\)/)
   assert.ok(!repositorySource.includes('Promise.all(raw.map(adaptProject))'))
   assert.ok(repositorySource.includes('adaptProjectSummary(unwrap<Record<string, unknown>>((await api.post'))
   assert.ok(repositorySource.includes('await api.delete(`/projects/${projectId}/`)'))

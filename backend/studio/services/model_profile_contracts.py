@@ -20,6 +20,22 @@ from studio.services.security_boundaries import boundary_int, boundary_values
 CHAT_REQUEST_OPTIONS_KEY = "chat_request_options"
 RETIRED_CHAT_COMPLETION_OPTIONS_KEY = "chat_completion_options"
 _CHAT_REQUEST_OPTION_KEY_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,79}$")
+_CHAT_TEMPERATURE_MINIMUM = 0
+
+
+def chat_request_options_editor_options() -> dict[str, Any]:
+    """Authoring metadata, not a claim about any provider's capabilities."""
+    return {
+        "schema_version": 1,
+        "temperature_minimum": _CHAT_TEMPERATURE_MINIMUM,
+        "response_format_types": [
+            {"value": "text", "label": "文本（text）"},
+            {"value": "json_object", "label": "JSON 对象（json_object）"},
+            {"value": "json_schema", "label": "JSON Schema（结构来自执行实例的业务输出）"},
+        ],
+        "assembly_description": "模型只配置响应格式与接口选项；json_schema 的 schema 由执行实例所选确切业务输出结构派生，不能另填。准备时冻结为最终 Chat 请求，不自动选择业务输出。",
+        "boundary_description": "这里只提供平台通用编辑项，不代表目标模型支持；temperature 的供应商范围和格式支持仍须核实。凭据、地址、消息、超时、输出预算和 seed 由专门配置管理。",
+    }
 
 
 def _stage_snapshot_max_bytes() -> int:
@@ -185,7 +201,7 @@ def _validated_chat_request_option_value(
     })
 
 
-def validate_chat_request_options(value: Any) -> dict[str, Any]:
+def validate_chat_request_options(value: Any, *, resolved=False) -> dict[str, Any]:
     """Validate one model-owned, provider-neutral Chat request contract.
 
     The operation policy must explicitly freeze this options object; an empty
@@ -200,6 +216,33 @@ def validate_chat_request_options(value: Any) -> dict[str, Any]:
         raise ValidationError({
             CHAT_REQUEST_OPTIONS_KEY: "chat_request_options 必须是 JSON 对象",
         })
+    value = deepcopy(value)
+    response_format = value.get("response_format")
+    schema = None
+    if isinstance(response_format, dict):
+        if "schema" in response_format:
+            raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "输出结构只在业务输出维护，不能内联 response_format.schema"})
+        metadata = response_format.get("json_schema")
+        if response_format.get("type") == "json_schema":
+            if "json_schema" in response_format and (not isinstance(metadata, dict) or set(metadata) - {"name", "strict", "description", "schema"}):
+                raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "json_schema 只配置 name、strict、description；schema 由业务输出派生"})
+            if isinstance(metadata, dict):
+                if "schema" in metadata:
+                    if not resolved:
+                        raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "不能重复维护 json_schema.schema；请在业务输出选择确切结构版本"})
+                    schema = metadata.pop("schema")
+                    if not isinstance(schema, dict) or not schema:
+                        raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "最终 JSON Schema 请求缺少派生结构"})
+                if "name" in metadata and (not isinstance(metadata["name"], str) or re.fullmatch(r"[A-Za-z0-9_-]{1,64}", metadata["name"]) is None):
+                    raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "json_schema.name 必须为1至64位字母、数字、下划线或短横线"})
+                if "strict" in metadata and type(metadata["strict"]) is not bool:
+                    raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "json_schema.strict 必须是布尔值"})
+                if "description" in metadata and not isinstance(metadata["description"], str):
+                    raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "json_schema.description 必须是字符串"})
+            if resolved and schema is None:
+                raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "JSON Schema 请求须先按确切业务输出派生结构"})
+        elif "json_schema" in response_format:
+            raise ValidationError({CHAT_REQUEST_OPTIONS_KEY: "json_schema 附加选项只用于 json_schema 格式，请明确移除不适用配置"})
     collisions = sorted(_forbidden_chat_request_field_paths(value))
     if collisions:
         raise ValidationError({
@@ -216,7 +259,7 @@ def validate_chat_request_options(value: Any) -> dict[str, Any]:
     if temperature is not None and (
         type(temperature) not in {int, float}
         or not math.isfinite(float(temperature))
-        or float(temperature) < 0
+        or float(temperature) < _CHAT_TEMPERATURE_MINIMUM
     ):
         raise ValidationError({
             CHAT_REQUEST_OPTIONS_KEY: "temperature 必须是非负有限数值",
@@ -253,6 +296,12 @@ def validate_chat_request_options(value: Any) -> dict[str, Any]:
                 f"{limits['max_bytes']} 字节"
             ),
         })
+    if schema is not None:
+        # Business field names are data, not transport overrides or secrets.
+        # The output compiler validates the exact frozen structure separately.
+        from studio.services.execution_request_storage import execution_request_max_bytes
+        normalized["response_format"]["json_schema"]["schema"] = schema
+        return json_contract(normalized, max_bytes=execution_request_max_bytes()).value
     return deepcopy(normalized)
 
 

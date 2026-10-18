@@ -22,17 +22,19 @@ test('production and prompt editors do not mirror business maxima in the browser
   for (const retired of ['max="30000"', '> 30000', '{0,11}', 'max="1000"']) {
     assert.equal(profiles.includes(retired), false, retired)
   }
-  assert.match(production, /qualityAdvisories/)
-  assert.match(production, /仅提醒，不阻断提交，绝对边界由服务端校验/)
+  const review = await readFile(new URL('../src/components/ProductionTextCandidateReview.vue', import.meta.url), 'utf8')
+  assert.match(production, /ProductionTextCandidateReview/)
+  assert.match(review, /qualityAdvisories/)
+  assert.match(review, /仅提醒，最终范围由服务端校验/)
 })
 
 test('recipe variants, uncertainty notes, and creation plans fail closed on server policy gaps', async () => {
   const [repository, schema, editor, settings, workflow, production, studio, storyboard, adapters] = await Promise.all([
     readFile(new URL('../src/services/repository.ts', import.meta.url), 'utf8'),
     readFile(new URL('../src/services/registryResourceSchema.ts', import.meta.url), 'utf8'),
-    readFile(new URL('../src/components/RegistryResourceEditor.vue', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/ProductionRecipeEditor.vue', import.meta.url), 'utf8'),
     readFile(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf8'),
-    readFile(new URL('../src/views/WorkflowView.vue', import.meta.url), 'utf8'),
+    readFile(new URL('../src/components/TaskMediaInspector.vue', import.meta.url), 'utf8'),
     readFile(new URL('../src/views/ProductionRunView.vue', import.meta.url), 'utf8'),
     readFile(new URL('../src/views/SeriesStudioView.vue', import.meta.url), 'utf8'),
     readFile(new URL('../src/views/StoryboardView.vue', import.meta.url), 'utf8'),
@@ -43,8 +45,9 @@ test('recipe variants, uncertainty notes, and creation plans fail closed on serv
   assert.equal(schema.includes('variant_count:'), false)
   assert.equal(editor.includes('stageVariantMax'), false)
   assert.match(editor, /effective_limits\.max_variants/)
-  assert.match(editor, /:max="recipeVariantLimit \|\| undefined"/)
-  assert.match(settings, /:recipe-variant-limit="productionCapability\?\.effectiveLimits\.maxVariants"/)
+  assert.match(editor, /:max="variantLimit\|\|undefined"/)
+  assert.match(editor, /props\.options\?\.effectiveLimits\.maxVariants/)
+  assert.equal(settings.includes(':recipe-variant-limit='), false)
   for (const source of [workflow, production]) {
     assert.match(source, /auditNoteMinCharacters/)
     assert.match(source, /auditNoteMaxCharacters/)
@@ -69,48 +72,21 @@ test('recipe variants, uncertainty notes, and creation plans fail closed on serv
   }
 })
 
-test('visual-rules review exposes only frozen quality advice and does not invent defaults', async () => {
+test('visual-rules candidate detail exposes only frozen advice without invented defaults', async () => {
   const vite = await server()
   try {
-    const review = await vite.ssrLoadModule('/src/services/productionRunReview.ts')
-    const stage = (qualityAdvisories?: Record<string, unknown>) => ({
-      ordinal: 1,
-      stageKey: 'visual_rules_generate',
-      status: 'succeeded',
-      outputSnapshotSha256: 'a'.repeat(64),
-      outputSnapshot: {
-        stage_key: 'visual_rules_generate',
-        review_payload: {
-          kind: 'visual_rules_candidates',
-          attempt_id: '11111111-1111-4111-8111-111111111111',
-          result_sha256: 'b'.repeat(64),
-          provider: 'provider', model: 'model',
-          source_revision: {
-            id: '22222222-2222-4222-8222-222222222222',
-            content_sha256: 'c'.repeat(64), content_size_bytes: 10,
-          },
-          base_rules_sha256: 'd'.repeat(64), confirmed_bible_sha256: 'e'.repeat(64),
-          candidate_sha256: 'f'.repeat(64),
-          candidate: { negative_prompt: 'no blur', color_script: 'teal', continuity_summary: 'same coat' },
-          warnings: [],
-          ...(qualityAdvisories ? { quality_advisories: qualityAdvisories } : {}),
-        },
-      },
+    const review = await vite.ssrLoadModule('/src/services/productionTextCandidates.ts')
+    const { visualRuleReviewFixture } = await import('./visualRulesOutputFixture.ts')
+    const artifact = (quality_advisories?: Record<string, unknown>) => ({
+      productionRun: 'run', stageRun: 'stage', status: 'available', sha256: 'a'.repeat(64), manifestMetadataSha256: 'b'.repeat(64),
+      textCandidate: { operation: 'visual_rules.generate',
+        candidate: { negative_prompt: 'no blur', color_script: 'teal', continuity_summary: 'same coat' },
+        warnings: [], text: null, quality_advisories, review_contract: visualRuleReviewFixture() },
     })
-    const omitted = review.parseVisualRulesReviewPayload([stage()])
-    assert.equal(omitted.error, '')
-    assert.equal(omitted.value.qualityAdvisories, null)
-    const configured = review.parseVisualRulesReviewPayload([stage({
-      schema_version: 1,
-      negative_prompt_max_chars: 91_000,
-      color_script_max_chars: 92_000,
-      continuity_summary_max_chars: 93_000,
-    })])
-    assert.deepEqual(configured.value.qualityAdvisories, {
-      negativePromptMaxChars: 91_000,
-      colorScriptMaxChars: 92_000,
-      continuitySummaryMaxChars: 93_000,
-    })
+    assert.equal(review.readTextCandidateDetail(artifact(), 'run', 'stage').qualityAdvisories, null)
+    const advice = { schema_version: 1, negative_prompt_max_chars: 91_000, color_script_max_chars: 92_000, continuity_summary_max_chars: 93_000 }
+    assert.deepEqual(review.readTextCandidateDetail(artifact(advice), 'run', 'stage').qualityAdvisories, advice)
+    assert.throws(() => review.readTextCandidateDetail(artifact({ schema_version: 1, color_script_max_chars: -1 }), 'run', 'stage'), /建议长度/)
   } finally { await vite.close() }
 })
 

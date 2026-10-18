@@ -24,15 +24,16 @@ CONDITIONING_INPUT_KINDS = frozenset({
     "frame_slots",
     "classified_references",
 })
-CONDITIONING_INPUT_SLOTS = (
-    "total_images",
-    "first_frame",
-    "last_frame",
-    "entity_images",
-    "reference_videos",
-    "paired_video_audios",
-    "reference_audios",
-)
+CONDITIONING_INPUT_MEDIA_KINDS = {
+    "total_images": "image",
+    "first_frame": "image",
+    "last_frame": "image",
+    "entity_images": "image",
+    "reference_videos": "video",
+    "paired_video_audios": "audio",
+    "reference_audios": "audio",
+}
+CONDITIONING_INPUT_SLOTS = tuple(CONDITIONING_INPUT_MEDIA_KINDS)
 _SAFE_MODE_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
 _SAFE_TEXT_RE = re.compile(r"^[^\x00-\x08\x0b\x0c\x0e-\x1f\x7f]*$")
 SAFE_CONDITIONING_IDENTIFIER_PATTERN = r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$"
@@ -403,6 +404,7 @@ def _normalize_dynamic_reference_topology(
         if (
             not isinstance(source_keys, list)
             or not source_keys
+            or any(not isinstance(key, str) for key in source_keys)
             or len(source_keys) != len(set(source_keys))
             or any(key not in purpose_keys["video"] for key in source_keys)
         ):
@@ -410,6 +412,7 @@ def _normalize_dynamic_reference_topology(
         if (
             not isinstance(target_keys, list)
             or not target_keys
+            or any(not isinstance(key, str) for key in target_keys)
             or len(target_keys) != len(set(target_keys))
             or any(key not in purpose_keys["audio"] for key in target_keys)
         ):
@@ -500,6 +503,7 @@ def _normalize_dynamic_reference_topology(
         if (
             not isinstance(keys, list)
             or len(keys) < 2
+            or any(not isinstance(key, str) for key in keys)
             or len(keys) != len(set(keys))
             or any(key not in purpose_keys[media_kind] for key in keys)
         ):
@@ -543,19 +547,25 @@ def empty_conditioning_contract() -> dict[str, Any]:
     }
 
 
-def conditioning_contract_editor_options() -> dict[str, Any]:
-    """Authoring metadata, not a claim about any model's actual capacity."""
-    kind_labels = {"text_only": "纯文本（不接收素材）", "frame_slots": "首尾帧素材", "classified_references": "多参考素材"}
+def conditioning_input_options() -> list[dict[str, str]]:
+    """One registered vocabulary for model authoring and Projector lookup."""
     slot_labels = {
         "total_images": "图片总数", "first_frame": "首帧图片", "last_frame": "尾帧图片",
         "entity_images": "参考图片", "reference_videos": "参考视频",
         "paired_video_audios": "视频配对音频", "reference_audios": "独立参考音频",
     }
+    return [{"value": key, "label": slot_labels[key], "media_kind": kind}
+            for key, kind in CONDITIONING_INPUT_MEDIA_KINDS.items()]
+
+
+def conditioning_contract_editor_options() -> dict[str, Any]:
+    """Authoring metadata, not a claim about any model's actual capacity."""
+    kind_labels = {"text_only": "纯文本（不接收素材）", "frame_slots": "首尾帧素材", "classified_references": "多参考素材"}
     return {
         "schema_version": CONDITIONING_CONTRACT_SCHEMA_VERSION,
         "adapter_key": CONFIGURED_CONDITIONING_ADAPTER_KEY,
         "input_kinds": [{"value": key, "label": kind_labels[key]} for key in sorted(CONDITIONING_INPUT_KINDS)],
-        "input_slots": [{"value": key, "label": slot_labels[key]} for key in CONDITIONING_INPUT_SLOTS],
+        "input_slots": conditioning_input_options(),
         "maximum_items": _reference_max_bindings(),
         "maximum_modes": _media_contract_max_modes(),
         "identifier_pattern": SAFE_CONDITIONING_IDENTIFIER_PATTERN,
@@ -564,6 +574,36 @@ def conditioning_contract_editor_options() -> dict[str, Any]:
             "requires_entity_reference_bible": False, "supports_native_audio": False,
             "inputs": {key: {"minimum_items": 0, "maximum_items": 0} for key in CONDITIONING_INPUT_SLOTS},
         },
+        "dynamic_reference_topology": reference_topology_editor_options(),
+    }
+
+
+def reference_topology_editor_options() -> dict[str, Any]:
+    from studio.services.reference_media import REFERENCE_PREPROCESSING_ADAPTERS, REFERENCE_PREPROCESSING_DESCRIPTIONS
+
+    adapters = REFERENCE_PREPROCESSING_DESCRIPTIONS
+    slots = (("videos", "参考视频", "reference_videos"),
+             ("paired_video_audios", "视频配对音频", "paired_video_audios"),
+             ("reference_audios", "独立参考音频", "reference_audios"))
+    return {
+        "schema_version": REFERENCE_TOPOLOGY_SCHEMA_VERSION,
+        "maximum_rules": _media_contract_max_rules(),
+        "maximum_duration_ms": _media_max_duration_ms(),
+        "maximum_fps": _media_max_fps(),
+        "label_max_characters": 80,
+        "text_max_characters": _media_contract_text_max_characters(),
+        "maximum_targets_per_source": 1,
+        "media_groups": [
+            {"value": "videos", "label": "视频用途", "media_kind": "video", "input_slot": "reference_videos"},
+            {"value": "audios", "label": "音频用途（独立／配对共用）", "media_kind": "audio", "input_slot": "reference_audios"},
+        ],
+        "preprocessing_slots": [{
+            "value": key, "label": label, "input_slot": slot, "include_target_fps": key == "videos",
+            "adapters": [{"value": adapter, "label": adapters[adapter][0],
+                          "description": adapters[adapter][1], "target_fps": adapters[adapter][2]}
+                         for adapter in sorted(REFERENCE_PREPROCESSING_ADAPTERS[key])],
+        } for key, label, slot in slots],
+        "pairing_direction": {"source_media_kind": "video", "target_media_kind": "audio"},
     }
 
 
@@ -813,6 +853,56 @@ def conditioning_contract_from_frozen_route(route: object) -> dict[str, Any]:
     })
 
 
+MEDIA_RESOLUTION_FIELDS = {
+    "width_multiple": "宽度倍数", "height_multiple": "高度倍数",
+    "minimum_width": "最小宽度", "maximum_width": "最大宽度",
+    "minimum_height": "最小高度", "maximum_height": "最大高度",
+    "maximum_short_side": "短边上限", "maximum_long_side": "长边上限",
+}
+MEDIA_RESOLUTION_PAIRS = (("minimum_width", "maximum_width"), ("minimum_height", "maximum_height"))
+
+
+def _validate_resolution_feasibility(resolution: dict[str, int]) -> None:
+    """Check a validated declaration without choosing actual generation sizes.
+
+    The smallest positive aligned value on each independent axis is a witness:
+    every other candidate is larger, and all remaining coupled rules are upper
+    bounds. Range endpoints themselves need not be aligned. Never persist or
+    return this witness as a default, nor round the user's declaration.
+    """
+    smallest = {}
+    for axis in ("width", "height"):
+        lower = resolution.get(f"minimum_{axis}", 1)
+        multiple = resolution.get(f"{axis}_multiple", 1)
+        candidate = ((lower + multiple - 1) // multiple) * multiple
+        upper = resolution.get(f"maximum_{axis}")
+        if upper is not None and candidate > upper:
+            raise ValidationError({"specification.media_constraints.resolution": (
+                f"{axis} 范围与 {axis}_multiple 无共同可用尺寸；"
+                f"满足下限与倍数的最小值为 {candidate}，超过 maximum_{axis}={upper}"
+            )})
+        smallest[axis] = candidate
+    for key, candidate in (("maximum_short_side", min(smallest.values())),
+                           ("maximum_long_side", max(smallest.values()))):
+        if key in resolution and candidate > resolution[key]:
+            raise ValidationError({"specification.media_constraints.resolution": (
+                f"{key} 与宽高范围／倍数无共同可用尺寸；"
+                f"最小可满足边长为 {candidate}，超过上限 {resolution[key]}"
+            )})
+
+
+def media_constraints_editor_options() -> dict[str, Any]:
+    """Form catalog from the same keys/boundaries used by runtime validation."""
+    return {
+        "schema_version": MEDIA_CONSTRAINTS_SCHEMA_VERSION,
+        "resolution_fields": [{"key": key, "label": label, "minimum": 1,
+            "maximum": _media_max_dimension(), "unit": "像素"} for key, label in MEDIA_RESOLUTION_FIELDS.items()],
+        "resolution_pairs": [list(pair) for pair in MEDIA_RESOLUTION_PAIRS],
+        "fps": {"minimum": 1, "maximum": _media_max_fps(), "maximum_items": _reference_max_bindings()},
+        "duration_ms": {"minimum": 1, "maximum": _media_max_duration_ms()},
+    }
+
+
 def normalize_model_media_constraints(specification: object) -> dict[str, Any]:
     """Return one generic executable projection from a ModelProfile specification."""
 
@@ -834,18 +924,14 @@ def normalize_model_media_constraints(specification: object) -> dict[str, Any]:
         {"schema_version", "resolution", "fps", "duration_ms"},
         label="specification.media_constraints",
     )
-    if raw.get("schema_version") != MEDIA_CONSTRAINTS_SCHEMA_VERSION:
+    if type(raw.get("schema_version")) is not int or raw["schema_version"] != MEDIA_CONSTRAINTS_SCHEMA_VERSION:
         raise ValidationError({"specification.media_constraints": "schema_version 必须为 1"})
     resolution = raw.get("resolution", {})
     if not isinstance(resolution, dict):
         raise ValidationError({"specification.media_constraints.resolution": "必须是对象"})
-    resolution_keys = {
-        "width_multiple", "height_multiple", "minimum_width", "maximum_width",
-        "minimum_height", "maximum_height", "maximum_short_side", "maximum_long_side",
-    }
     _exact_keys(
         resolution,
-        resolution_keys,
+        set(MEDIA_RESOLUTION_FIELDS),
         label="specification.media_constraints.resolution",
     )
     normalized_resolution: dict[str, int] = {}
@@ -861,16 +947,15 @@ def normalize_model_media_constraints(specification: object) -> dict[str, Any]:
                 ),
             })
         normalized_resolution[key] = value
-    for minimum_key, maximum_key in (
-        ("minimum_width", "maximum_width"),
-        ("minimum_height", "maximum_height"),
-    ):
+    for minimum_key, maximum_key in MEDIA_RESOLUTION_PAIRS:
         if (
             minimum_key in normalized_resolution
             and maximum_key in normalized_resolution
             and normalized_resolution[minimum_key] > normalized_resolution[maximum_key]
         ):
             raise ValidationError({"specification.media_constraints.resolution": f"{minimum_key} 不能大于 {maximum_key}"})
+
+    _validate_resolution_feasibility(normalized_resolution)
 
     fps_contract = raw.get("fps", {"allowed": []})
     if not isinstance(fps_contract, dict):
@@ -972,14 +1057,37 @@ def validate_media_execution_settings(
 ) -> None:
     if not isinstance(constraints, dict):
         raise ValidationError({"media_constraints": "冻结模型约束缺失"})
-    resolution = constraints.get("resolution") or {}
+    validate_media_resolution(constraints=constraints.get("resolution") or {}, width=width, height=height)
+    if media_type == "video":
+        validate_media_timing(
+            fps_constraints=constraints.get("fps") or {}, duration_constraints=constraints.get("duration_ms") or {},
+            fps=fps, duration_ms=duration_ms,
+        )
+
+
+def validate_media_resolution(*, constraints: dict, width: int | None, height: int | None) -> None:
+    """Check declared dimensions, including coupled short/long-side limits.
+
+    No implicit width/height is supplied for an API that omitted those inputs.
+    A declared constraint whose operand is unavailable is an explicit error.
+    """
+    if not isinstance(constraints, dict):
+        raise ValidationError({"resolution": "冻结尺寸约束必须是对象"})
+    resolution = constraints
+    for key, value in (("width", width), ("height", height)):
+        required = any(name in resolution for name in (
+            f"minimum_{key}", f"maximum_{key}", f"{key}_multiple", "maximum_short_side", "maximum_long_side",
+        ))
+        if (required or value is not None) and (type(value) is not int or value < 1):
+            raise ValidationError({"resolution": f"{key} 必须提供已解析的正整数，不能推断目标默认值"})
+    coupled = width is not None and height is not None
     checks = (
         ("minimum_width", width, lambda actual, limit: actual >= limit, "width 低于模型下限"),
         ("maximum_width", width, lambda actual, limit: actual <= limit, "width 超过模型上限"),
         ("minimum_height", height, lambda actual, limit: actual >= limit, "height 低于模型下限"),
         ("maximum_height", height, lambda actual, limit: actual <= limit, "height 超过模型上限"),
-        ("maximum_short_side", min(width, height), lambda actual, limit: actual <= limit, "短边超过模型上限"),
-        ("maximum_long_side", max(width, height), lambda actual, limit: actual <= limit, "长边超过模型上限"),
+        ("maximum_short_side", min(width, height) if coupled else None, lambda actual, limit: actual <= limit, "短边超过模型上限"),
+        ("maximum_long_side", max(width, height) if coupled else None, lambda actual, limit: actual <= limit, "长边超过模型上限"),
     )
     for key, actual, predicate, message in checks:
         if key in resolution and not predicate(actual, int(resolution[key])):
@@ -988,13 +1096,17 @@ def validate_media_execution_settings(
         multiple = int(resolution.get(key) or 0)
         if multiple and dimension % multiple:
             raise ValidationError({"resolution": f"width/height 必须满足冻结倍数；{key}={multiple}"})
-    if media_type != "video":
-        return
-    allowed_fps = list((constraints.get("fps") or {}).get("allowed") or [])
+
+
+def validate_media_timing(*, fps_constraints: dict, duration_constraints: dict, fps, duration_ms) -> None:
+    """Shared exact-value check; callers select applicable media semantics."""
+    if not isinstance(fps_constraints, dict) or not isinstance(duration_constraints, dict):
+        raise ValidationError({"media_constraints": "冻结时间约束必须是对象"})
+    allowed_fps = list(fps_constraints.get("allowed") or [])
     if allowed_fps and fps not in allowed_fps:
         raise ValidationError({"fps": f"必须属于冻结允许值 {allowed_fps}"})
-    duration = constraints.get("duration_ms") or {}
-    if duration and not int(duration["minimum"]) <= duration_ms <= int(duration["maximum"]):
+    duration = duration_constraints
+    if duration and (duration_ms is None or not int(duration["minimum"]) <= duration_ms <= int(duration["maximum"])):
         raise ValidationError({
             "duration_ms": (
                 f"必须在冻结模型范围 {duration['minimum']}–{duration['maximum']}ms"

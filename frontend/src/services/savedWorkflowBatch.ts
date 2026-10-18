@@ -57,11 +57,18 @@ const savedWorkflowBatchIdentity = (sourcePath: string, sourceSha256: string, im
   `${sourcePath}\u0000${sourceSha256}\u0000${importKind}`
 )
 
+const assertSavedWorkflowBatchSource = (result: ComfySavedWorkflowBatchResult): void => {
+  if (!result.deploymentId || result.items.some((item) => item.sourceDeploymentId !== result.deploymentId)) {
+    throw new Error('工作流批量结果与权威来源 deployment 不一致')
+  }
+}
+
 export const assertSavedWorkflowBatchResultMatchesRequest = (
   deploymentId: string,
   requestItems: ComfySavedWorkflowBatchItemInput[],
   result: ComfySavedWorkflowBatchResult,
 ): void => {
+  assertSavedWorkflowBatchSource(result)
   if (result.deploymentId !== deploymentId) {
     throw new Error('工作流批量结果与请求来源 deployment 不一致')
   }
@@ -87,9 +94,7 @@ export const mergeSavedWorkflowBatchResults = (
   previous: SavedWorkflowBatchAggregate | null,
   next: ComfySavedWorkflowBatchResult,
 ): SavedWorkflowBatchAggregate => {
-  if (!next.deploymentId || next.items.some((item) => item.sourceDeploymentId !== next.deploymentId)) {
-    throw new Error('工作流批量结果与权威来源 deployment 不一致')
-  }
+  assertSavedWorkflowBatchSource(next)
   const items = [...(previous?.items || []), ...next.items]
   const createdCount = items.filter((item) => item.result === 'created').length
   const reusedCount = items.filter((item) => item.result === 'reused').length

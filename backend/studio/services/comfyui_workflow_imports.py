@@ -19,7 +19,6 @@ from studio.models import (
     ComfyWorkflowSource,
     ComfyWorkflowContractDraft,
     Asset,
-    GeneratedWorkflow,
     GenerationTask,
     ModelArtifact,
     ModelDeployment,
@@ -38,6 +37,7 @@ from studio.services.comfyui_workflow_library import (
 from studio.services.comfyui_artifacts import (
     DEFAULT_MODEL_FOLDER_BY_ROLE,
     artifact_inventory_spec,
+    exact_model_input_option,
     object_info_input_options,
     safe_model_inventory_options,
     safe_model_relative_filename,
@@ -148,6 +148,10 @@ class SavedWorkflowSourceChanged(SavedWorkflowImportError):
 
 class SavedWorkflowSourceConflict(SavedWorkflowImportError):
     code = "source_already_classified"
+
+
+class SavedWorkflowSuccessorConflict(SavedWorkflowImportError):
+    code = "workflow_successor_conflict"
 
 
 class SavedWorkflowSecretField(SavedWorkflowImportError):
@@ -692,12 +696,15 @@ def _node_input_definition(object_info: dict, node: dict, input_name: str):
             selected = inputs.get(parent_name)
             if isinstance(selected, list):
                 continue
-            for child_name, child_definition, _required in dynamic_widget_definitions(
-                str(parent_name),
-                input_type,
-                _definition_config(definition),
-                selected_value=selected,
-            ):
+            try:
+                children = dynamic_widget_definitions(
+                    str(parent_name), input_type, _definition_config(definition),
+                    selected_value=selected,
+                    resolve_value=lambda name, _definition: inputs.get(name),
+                )
+            except ValueError as exc:
+                raise SavedWorkflowContractBlocked(str(exc)) from exc
+            for child_name, child_definition, _required in children:
                 if child_name == input_name:
                     return child_definition
     return None
@@ -1949,6 +1956,19 @@ def _suggested_import_contract(
         projector=projector, graph=source_graph, contract=contract, bindings=bindings,
         requirements=requirements, blockers=blockers, configurable_parameters=parameters,
     )
+    if projector.engine_key in {"generic.fixed", "generic.references"}:
+        from studio.services.model_profile_options import MODEL_CAPABILITY_CATALOG
+        capability = projector.definition["projection"]["config"].get("capability")
+        output_kind = contract.get("outputs", {}).get("primary", {}).get("kind")
+        capability_spec = next((row for row in MODEL_CAPABILITY_CATALOG if row["value"] == capability and "comfyui" in row["driver_types"]), None)
+        if not capability:
+            blockers.append({"code": "workflow_projector_capability_required", "detail": "请在 Projector 执行引擎配置中明确选择执行能力，再重新生成合同；不按输出模态推测。"})
+        elif capability_spec is None or output_kind not in capability_spec["modalities"]:
+            blockers.append({"code": "workflow_projector_capability_mismatch", "detail": "Projector 执行能力与所选主输出模态不一致。"})
+        else:
+            contract["capability"] = capability
+            if model_profile_version is not None and capability not in verified_model_profile_specification(model_profile_version).get("capabilities", []):
+                blockers.append({"code": "workflow_projector_capability_mismatch", "detail": "所选模型版本没有声明 Projector 的执行能力，请选择匹配模型或修正 Projector。"})
     if group_plans:
         from studio.services.workflow_asset_groups import attach_group_bindings, AssetGroupError
         try:
@@ -2069,12 +2089,11 @@ def _neutral_binding_value(
     if value_type in {"asset_image", "asset_video", "asset_audio"}:
         return "__AUTOPROMPT_ASSET__:managed"
     if value_type == "model_artifact":
-        normalized = safe_model_relative_filename(
-            str(_model_requirement_for_binding(item, binding)["expected_filename"]).strip(),
-        )
-        if normalized is None:  # pragma: no cover - guarded above
-            raise SavedWorkflowUnsafeLiteral(f"{semantic_key} 的模型文件名不安全")
-        return normalized
+        try:
+            return exact_model_input_option(definition, expected_filename=str(
+                _model_requirement_for_binding(item, binding)["expected_filename"]))
+        except ValueError as exc:
+            raise SavedWorkflowUnsafeLiteral(f"{semantic_key} 无法冻结精确模型选项：{exc}") from exc
     raise SavedWorkflowUnsafeLiteral(f"{semantic_key} 使用不支持的 value_type {value_type!r}")
 
 
@@ -2232,6 +2251,7 @@ def _safe_projected_error(exc: Exception, *, fallback: str) -> str:
         return {
             "source_changed": "ComfyUI 来源内容已变化，请重新扫描和预览",
             "source_already_classified": "该来源已按不同导入合同分类，请刷新后重试",
+            "workflow_successor_conflict": "后继前驱不是原模板最新版本，或同路径/来源范围登记不一致；请回读已创建版本，不要另开分支",
             "secret_field_forbidden": "工作流含禁止持久化的明文密钥字段",
             "unsafe_source_literal": "工作流含未受管的本地输入或输出路径",
             "conversion_contract_changed": "ComfyUI schema 或转换合同已变化，请重新预览",
@@ -3144,6 +3164,7 @@ def preview_saved_workflow(
     primary_output_node_ids: list[int | str],
     model_profile_version: ModelProfileVersion | None = None,
     actor=None,
+    persist=None,
 ) -> dict[str, Any]:
     _assert_preview_target_profile(deployment, model_profile_version)
     candidate = ComfyWorkflowSource.objects.select_related(
@@ -3204,16 +3225,21 @@ def preview_saved_workflow(
     if primary_output_node_ids:
         if actor is None or not getattr(actor, "is_authenticated", False):
             raise SavedWorkflowImportError("生成平台执行合同草稿必须记录操作人")
-        draft = _create_or_reuse_contract_draft(
-            candidate_source=candidate,
-            document=context.document,
-            object_info=context.object_info,
-            preview=preview,
-            model_profile_version=model_profile_version,
-            actor=actor,
-        )
-        preview["contract_draft_id"] = str(draft.id)
-        preview["contract_draft_revision"] = draft.revision
+        def save_draft():
+            draft = _create_or_reuse_contract_draft(
+                candidate_source=candidate,
+                document=context.document,
+                object_info=context.object_info,
+                preview=preview,
+                model_profile_version=model_profile_version,
+                actor=actor,
+            )
+            preview["contract_draft_id"] = str(draft.id)
+            preview["contract_draft_revision"] = draft.revision
+            return preview
+        # All host reads and projection preparation above precede the short
+        # transaction coordinating the immutable draft and its API receipt.
+        return persist(save_draft) if persist else save_draft()
     return preview
 
 
@@ -3748,6 +3774,24 @@ def _discover_saved_workflow_item(
                 "rejection_codes": [],
                 "live_validate_rejection_codes": live_validate_rejection_codes,
             })
+        # A matched import keeps its frozen identity, but an explicitly chosen
+        # successor may need a corrected model version. Evaluate other current
+        # profiles with the same admission rules as a new source; their pending
+        # evidence must never be inherited from the imported version.
+        successor_candidates, _ = _evaluate_profile_candidates(
+            context,
+            outputs=[
+                row for row in output_candidates
+                if str(row.get("canvas_node_id") or "")
+                == matched_primary_output_node_id
+            ],
+            profiles=[
+                profile for profile in profiles
+                if frozen_profile is None or profile.id != frozen_profile.id
+            ],
+            source_deployments=source_deployments,
+        )
+        model_profile_candidates.extend(successor_candidates)
         return {
             **base,
             "match_status": "matched",
@@ -3783,7 +3827,7 @@ def _discover_saved_workflow_item(
             "model_profile_candidates": model_profile_candidates,
         }
     if import_kind == ComfyWorkflowSource.ImportKind.EXECUTION_SNAPSHOT:
-        linked_workflow, linked_task = _linked_execution_snapshot(document)
+        linked_task = _linked_execution_snapshot(document)
         return {
             **base,
             "match_status": "matched" if linked_task else "unmatched",
@@ -4213,6 +4257,7 @@ def discover_saved_workflows() -> dict[str, Any]:
 
 def _import_contract_sha256(item: dict[str, Any]) -> str:
     return json_contract({
+        **({"successor_of": str(item["successor_of"].id)} if item.get("successor_of") else {}),
         "import_kind": ComfyWorkflowSource.ImportKind.TEMPLATE_VERSION,
         "template_id": str(item["template"].id),
         "model_profile_version_id": str(item["model_profile_version"].id),
@@ -4372,11 +4417,9 @@ def _resolve_target_template(item: dict[str, Any]) -> WorkflowTemplate:
 
 def _linked_execution_snapshot(document: _SourceDocument):
     match = _TASK_FILENAME.search(document.source_path)
-    task = GenerationTask.objects.filter(pk=match.group(1)).first() if match else None
-    workflow = None
-    if task is not None:
-        workflow = GeneratedWorkflow.objects.filter(tasks=task).first()
-    return workflow, task
+    # This is a source-file classification/link, not execution acceptance.
+    # Actual graph and prompt evidence belong to the task's Preparation.
+    return GenerationTask.objects.filter(pk=match.group(1)).first() if match else None
 
 
 def _create_source(
@@ -4388,7 +4431,6 @@ def _create_source(
     conversion_report: dict,
     converted_graph_sha256: str = "",
     workflow_version=None,
-    generated_workflow=None,
     generation_task=None,
 ) -> ComfyWorkflowSource:
     source_scope = comfyui_workflow_source_scope(deployment)
@@ -4406,7 +4448,6 @@ def _create_source(
         import_kind=import_kind,
         converted_graph_sha256=converted_graph_sha256,
         workflow_version=workflow_version,
-        generated_workflow=generated_workflow,
         generation_task=generation_task,
         imported_by=actor,
     )
@@ -4715,7 +4756,10 @@ def recommend_workflow_projector_from_candidate(
             graph,
             context.object_info,
             primary_api_node_ids=primary_api_ids,
-            model_dependencies=[],
+            model_dependencies=_model_dependency_candidates(
+                graph, context.object_info,
+                model_profile_version=None, projector=temporary_projector,
+            ),
             asset_dependencies=asset_dependencies,
             model_profile_version=None,
             projector=temporary_projector,
@@ -5071,6 +5115,26 @@ def _promote_contract_draft(
                 source_scope_sha256=locked_candidate.source_scope_sha256,
             )
             return _result(existing, result="reused"), None
+        predecessor = item.get("successor_of")
+        if predecessor is not None:
+            predecessor = WorkflowTemplateVersion.objects.select_for_update().get(
+                pk=predecessor.pk,
+            )
+            latest_id = WorkflowTemplateVersion.objects.filter(
+                template=template,
+            ).order_by("-version").values_list("id", flat=True).first()
+            if predecessor.template_id != template.id or predecessor.pk != latest_id:
+                raise SavedWorkflowSuccessorConflict("后继来源不是原模板的最新版本；请回读已创建的后继，不得从旧版本另开分支")
+            if not ComfyWorkflowSource.objects.filter(
+                source_scope_schema_version=locked_candidate.source_scope_schema_version,
+                source_scope_sha256=locked_candidate.source_scope_sha256,
+                source_path_sha256=locked_candidate.source_path_sha256,
+                source_path_key=locked_candidate.source_path_key,
+                import_kind=ComfyWorkflowSource.ImportKind.TEMPLATE_VERSION,
+                workflow_version=predecessor,
+            ).exists():
+                raise SavedWorkflowSuccessorConflict("后继来源缺少该候选路径和来源范围的工作流登记事实")
+            verify_workflow_version_integrity(predecessor)
         prior_template_ids = set(ComfyWorkflowSource.objects.filter(
             source_scope_schema_version=locked_candidate.source_scope_schema_version,
             source_scope_sha256=locked_candidate.source_scope_sha256,
@@ -5114,7 +5178,7 @@ def _promote_contract_draft(
             ),
             workflow_version__template__is_active=True,
         ).first()
-        if canonical_source is not None:
+        if canonical_source is not None and predecessor is None:
             _assert_reusable_workflow_version(canonical_source.workflow_version)
             version = canonical_source.workflow_version
         else:
@@ -5129,6 +5193,7 @@ def _promote_contract_draft(
             )
         report = {
             "schema_version": 1,
+            **({"successor_of": str(predecessor.pk)} if predecessor is not None else {}),
             "promotion_source": "comfy_workflow_contract_draft",
             "import_contract_sha256": import_contract_sha256,
             "object_info_schema_sha256": projection["object_info_schema_sha256"],
@@ -5236,9 +5301,9 @@ def _import_one(
     }:
         raise SavedWorkflowImportError("不支持的 ComfyUI 工作流来源分类")
 
-    generated_workflow = generation_task = None
+    generation_task = None
     if import_kind == ComfyWorkflowSource.ImportKind.EXECUTION_SNAPSHOT:
-        generated_workflow, generation_task = _linked_execution_snapshot(document)
+        generation_task = _linked_execution_snapshot(document)
     classification_contract_sha256 = _classification_contract_sha256(import_kind)
     with transaction.atomic():
         locked_source = _locked_source_deployment(
@@ -5274,9 +5339,7 @@ def _import_one(
                 "import_contract_sha256": classification_contract_sha256,
                 "source_deployment_fingerprint_sha256": source_fingerprint,
                 "linked_task": bool(generation_task),
-                "linked_generated_workflow": bool(generated_workflow),
             },
-            generated_workflow=generated_workflow,
             generation_task=generation_task,
         )
     return _result(source, result="created"), object_info

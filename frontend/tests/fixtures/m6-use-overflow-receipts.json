@@ -1,0 +1,877 @@
+{
+  "mixed": [
+    {
+      "preparation": {
+        "id": "0d74913d-9457-4a46-8355-0bbfeee348b6",
+        "revision": 6
+      },
+      "prompt": {
+        "preparation_id": "0d74913d-9457-4a46-8355-0bbfeee348b6",
+        "preparation_revision": 6,
+        "mode": "preview",
+        "request_sha256": null,
+        "frozen_at": null,
+        "channels": [
+          {
+            "key": "positive_prompt",
+            "text": "configured_action: Visual style: \nColor design:\n[Shot 1] Subjects: A parcel\nwalk.mp4\ncamera.mp4\nsound.wav [reviewed:38d5039ca095108d3269905e4c1b4157452697a742a8f131ea098238e6287804]\nsound.wav [reviewed:f027a0827ae0266f9af598ae058473db7e347872a4cb838a92ef777ad2fc3461].\nThe parcel turns with <Video 1>; keep <Video 2> timing, <Audio 1> synchronized, and <Audio 2> independent.\n<Picture 1>: Use the selected picture.\n<Video 1>: Use the declared camera motion and timing as guidance, not a replacement story.\n<Video 2>: Use the declared camera motion and timing as guidance, not a replacement story.\n<Audio 1>: Use the declared audio characteristics as guidance without copying the signal.\n<Audio 2>: Use the declared audio characteristics as guidance without copying the signal.\nFirst-frame continuity required: False; last-frame continuity required: False.",
+            "character_count": 855
+          }
+        ],
+        "field_basis": [
+          {
+            "unit_key": "composition",
+            "field_key": "configured_action",
+            "field_value_id": "27671d2c-e795-4708-8ce1-a47b2d81cf7c",
+            "revision": 1,
+            "origin": "adopted",
+            "status": "confirmed"
+          }
+        ],
+        "sources": {
+          "references": [
+            {
+              "label": "<Picture 1>",
+              "name": "A parcel",
+              "category": "image",
+              "guidance": ""
+            },
+            {
+              "label": "<Video 1>",
+              "name": "walk.mp4",
+              "category": "video",
+              "guidance": ""
+            },
+            {
+              "label": "<Video 2>",
+              "name": "camera.mp4",
+              "category": "video",
+              "guidance": ""
+            },
+            {
+              "label": "<Audio 1>",
+              "name": "sound.wav [reviewed:38d5039ca095108d3269905e4c1b4157452697a742a8f131ea098238e6287804]",
+              "category": "audio",
+              "guidance": ""
+            },
+            {
+              "label": "<Audio 2>",
+              "name": "sound.wav [reviewed:f027a0827ae0266f9af598ae058473db7e347872a4cb838a92ef777ad2fc3461]",
+              "category": "audio",
+              "guidance": ""
+            }
+          ],
+          "dialogue": []
+        },
+        "issues": [],
+        "length_diagnostics": [
+          {
+            "channel": "positive_prompt",
+            "character_count": 855,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [
+              {
+                "field_key": "configured_action",
+                "label": "Action",
+                "field_definition_version_id": "fa8cb247-0f30-4cc3-b12a-d1716b390620",
+                "source_selector": "projection.output",
+                "max_chars": 7000,
+                "text_chars": 855,
+                "separator_chars": 0
+              }
+            ],
+            "limit_sources": [
+              {
+                "source": "workflow.4ecbc85f-2e71-41d0-b16b-133a908dff70.prompt.positive",
+                "max_chars": null
+              }
+            ]
+          }
+        ],
+        "prompt_mode": "profile",
+        "content_kind": "channels",
+        "messages": [],
+        "profile_basis": {
+          "version_id": "8baa2f9a-b94d-4936-92e3-eb75b1eb7269",
+          "version": 1,
+          "contract_sha256": "8baf030173d300441b3b9714516861c4fd1879a3ab44238d46f14c5817b38f13"
+        }
+      },
+      "metrics": {
+        "preparation_id": "0d74913d-9457-4a46-8355-0bbfeee348b6",
+        "preparation_revision": 6,
+        "observed_at": "2026-10-05T15:32:11.658777+08:00",
+        "items": [
+          {
+            "key": "intent",
+            "label": "原始输入意图",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 2865,
+            "sha256": "b5a8edc22ec8245929037c57457778795f8753310fc12518af1676e049dd1f3b",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "resolved_inputs",
+            "label": "已解析输入与来源",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 31645,
+            "sha256": "227e81cfc80c8051b66cbab60dd17a12a03b605531419e708ac3b1b0b573a882",
+            "current_limit_bytes": 262144,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "review_contract",
+            "label": "字段审核合同",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 36,
+            "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "evaluation",
+            "label": "准备评估",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 328,
+            "sha256": "9135ddac19293b303fc33d766fb969e97e83864a8b0331391fa561b7c698948d",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "prepared_request",
+            "label": "最终冻结请求文件",
+            "state": "not_generated",
+            "basis": "canonical_request_file_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 8388608,
+            "over_current_limit_bytes": null
+          }
+        ]
+      }
+    },
+    {
+      "preparation": {
+        "id": "a8746968-54f4-4861-85e4-4abf10b14718",
+        "revision": 6
+      },
+      "prompt": {
+        "preparation_id": "a8746968-54f4-4861-85e4-4abf10b14718",
+        "preparation_revision": 6,
+        "mode": "preview",
+        "request_sha256": null,
+        "frozen_at": null,
+        "channels": [
+          {
+            "key": "positive_prompt",
+            "text": "configured_action: Visual style: \nColor design:\n[Shot 1] Subjects: A parcel\ncamera.mp4\nsound.wav [reviewed:38d5039ca095108d3269905e4c1b4157452697a742a8f131ea098238e6287804]\nwalk.mp4\nsound.wav [reviewed:f027a0827ae0266f9af598ae058473db7e347872a4cb838a92ef777ad2fc3461].\nThe parcel turns with <Video 1>; keep <Video 2> timing, <Audio 1> synchronized, and <Audio 2> independent.\n<Picture 1>: Use the selected picture.\n<Video 1>: Use the declared camera motion and timing as guidance, not a replacement story.\n<Audio 1>: Use the declared audio characteristics as guidance without copying the signal.\n<Video 2>: Use the declared camera motion and timing as guidance, not a replacement story.\n<Audio 2>: Use the declared audio characteristics as guidance without copying the signal.\nFirst-frame continuity required: False; last-frame continuity required: False.",
+            "character_count": 855
+          }
+        ],
+        "field_basis": [
+          {
+            "unit_key": "composition",
+            "field_key": "configured_action",
+            "field_value_id": "f9b8caef-3c87-4a14-91bd-0d266b48d90c",
+            "revision": 1,
+            "origin": "adopted",
+            "status": "confirmed"
+          }
+        ],
+        "sources": {
+          "references": [
+            {
+              "label": "<Picture 1>",
+              "name": "A parcel",
+              "category": "image",
+              "guidance": ""
+            },
+            {
+              "label": "<Video 1>",
+              "name": "camera.mp4",
+              "category": "video",
+              "guidance": ""
+            },
+            {
+              "label": "<Audio 1>",
+              "name": "sound.wav [reviewed:38d5039ca095108d3269905e4c1b4157452697a742a8f131ea098238e6287804]",
+              "category": "audio",
+              "guidance": ""
+            },
+            {
+              "label": "<Video 2>",
+              "name": "walk.mp4",
+              "category": "video",
+              "guidance": ""
+            },
+            {
+              "label": "<Audio 2>",
+              "name": "sound.wav [reviewed:f027a0827ae0266f9af598ae058473db7e347872a4cb838a92ef777ad2fc3461]",
+              "category": "audio",
+              "guidance": ""
+            }
+          ],
+          "dialogue": []
+        },
+        "issues": [],
+        "length_diagnostics": [
+          {
+            "channel": "positive_prompt",
+            "character_count": 855,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [
+              {
+                "field_key": "configured_action",
+                "label": "Action",
+                "field_definition_version_id": "fa8cb247-0f30-4cc3-b12a-d1716b390620",
+                "source_selector": "projection.output",
+                "max_chars": 7000,
+                "text_chars": 855,
+                "separator_chars": 0
+              }
+            ],
+            "limit_sources": [
+              {
+                "source": "workflow.4ecbc85f-2e71-41d0-b16b-133a908dff70.prompt.positive",
+                "max_chars": null
+              }
+            ]
+          }
+        ],
+        "prompt_mode": "profile",
+        "content_kind": "channels",
+        "messages": [],
+        "profile_basis": {
+          "version_id": "8baa2f9a-b94d-4936-92e3-eb75b1eb7269",
+          "version": 1,
+          "contract_sha256": "8baf030173d300441b3b9714516861c4fd1879a3ab44238d46f14c5817b38f13"
+        }
+      },
+      "metrics": {
+        "preparation_id": "a8746968-54f4-4861-85e4-4abf10b14718",
+        "preparation_revision": 6,
+        "observed_at": "2026-10-05T15:32:22.669991+08:00",
+        "items": [
+          {
+            "key": "intent",
+            "label": "原始输入意图",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 2866,
+            "sha256": "a42b47dfd41cf758205795e4e2b9d34b62ed8df31d4ce6f4a216acdc41946448",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "resolved_inputs",
+            "label": "已解析输入与来源",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 31645,
+            "sha256": "c6571221b5f718d923b387aff8f5af658650a6c3ff60409658470bf8fc14d1a4",
+            "current_limit_bytes": 262144,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "review_contract",
+            "label": "字段审核合同",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 36,
+            "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "evaluation",
+            "label": "准备评估",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 328,
+            "sha256": "7ea6b3f7b0c01a6b4c0775adb2716cc8e5019e70f3958bdc57f81e1913c88e25",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "prepared_request",
+            "label": "最终冻结请求文件",
+            "state": "not_generated",
+            "basis": "canonical_request_file_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 8388608,
+            "over_current_limit_bytes": null
+          }
+        ]
+      }
+    }
+  ],
+  "overflow": [
+    {
+      "preparation": {
+        "id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "revision": 3
+      },
+      "prompt": {
+        "preparation_id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "preparation_revision": 3,
+        "mode": "diagnostic",
+        "request_sha256": null,
+        "frozen_at": null,
+        "channels": [
+          {
+            "key": "system_instruction",
+            "text": "",
+            "character_count": 0
+          },
+          {
+            "key": "positive_prompt",
+            "text": "unit_description: Visual style: \nColor design:\n[Shot 1] Subjects: .\nCafé 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café \n\nFirst-frame continuity required: False; last-frame continuity required: False.\n[Shot 2] At 00:01.000, Subjects: .\nRésumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum\n\nFirst-frame continuity required: False; last-frame continuity required: False.",
+            "character_count": 4264
+          },
+          {
+            "key": "negative_prompt",
+            "text": "",
+            "character_count": 0
+          },
+          {
+            "key": "structured_input",
+            "text": "",
+            "character_count": 0
+          }
+        ],
+        "field_basis": [
+          {
+            "unit_key": "first",
+            "field_key": "unit_description",
+            "field_value_id": "7603e7b1-004d-4102-912e-7ef103820954",
+            "revision": 1,
+            "origin": "candidate",
+            "status": "pending"
+          },
+          {
+            "unit_key": "second",
+            "field_key": "unit_description",
+            "field_value_id": "1cbae80e-92fe-43b0-b73e-4cd19c4952dc",
+            "revision": 1,
+            "origin": "candidate",
+            "status": "pending"
+          }
+        ],
+        "sources": {
+          "references": [],
+          "dialogue": []
+        },
+        "issues": [
+          "通道 positive_prompt 装配后为 4264 字符，超过配置上限 4000"
+        ],
+        "length_diagnostics": [
+          {
+            "channel": "system_instruction",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          },
+          {
+            "channel": "positive_prompt",
+            "character_count": 4264,
+            "max_chars": 4000,
+            "over_by": 264,
+            "fragments": [
+              {
+                "field_key": "unit_description",
+                "label": "Unit description",
+                "field_definition_version_id": "409bf2fe-dd63-4056-8bd7-85d30e67a03d",
+                "source_selector": "projection.output",
+                "max_chars": 7000,
+                "text_chars": 4264,
+                "separator_chars": 0
+              }
+            ],
+            "limit_sources": [
+              {
+                "source": "workflow.6aa87978-f258-4ef0-b554-e90f74e2053e.prompt.positive",
+                "max_chars": null
+              },
+              {
+                "source": "profile.bd8f00da-9246-4191-bc0a-0e4cfb4e723b.positive_prompt",
+                "max_chars": 4000
+              }
+            ]
+          },
+          {
+            "channel": "negative_prompt",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          },
+          {
+            "channel": "structured_input",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          }
+        ],
+        "prompt_mode": "profile",
+        "content_kind": "channels",
+        "messages": [],
+        "profile_basis": {
+          "version_id": "bd8f00da-9246-4191-bc0a-0e4cfb4e723b",
+          "version": 1,
+          "contract_sha256": "e6824228df48b8233e02ed858249b5c2872506d4b4353ebe29a5ed0d236fce4d"
+        }
+      },
+      "metrics": {
+        "preparation_id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "preparation_revision": 3,
+        "observed_at": "2026-10-05T15:32:39.337255+08:00",
+        "items": [
+          {
+            "key": "intent",
+            "label": "原始输入意图",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 1338,
+            "sha256": "003bfd2cec47e0ed1b441876a6c14a7e584e62642d391ab1be88c614d13da334",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "resolved_inputs",
+            "label": "已解析输入与来源",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 9979,
+            "sha256": "a154fc571980be0cdffa99615769554d3e26a4a75f072ea7cfb0560acd7ba48f",
+            "current_limit_bytes": 262144,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "review_contract",
+            "label": "字段审核合同",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 36,
+            "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "evaluation",
+            "label": "准备评估",
+            "state": "not_generated",
+            "basis": "canonical_json_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": null
+          },
+          {
+            "key": "prepared_request",
+            "label": "最终冻结请求文件",
+            "state": "not_generated",
+            "basis": "canonical_request_file_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 8388608,
+            "over_current_limit_bytes": null
+          }
+        ]
+      }
+    },
+    {
+      "preparation": {
+        "id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "revision": 7
+      },
+      "prompt": {
+        "preparation_id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "preparation_revision": 7,
+        "mode": "diagnostic",
+        "request_sha256": null,
+        "frozen_at": null,
+        "channels": [
+          {
+            "key": "system_instruction",
+            "text": "",
+            "character_count": 0
+          },
+          {
+            "key": "positive_prompt",
+            "text": "unit_description: Visual style: \nColor design:\n[Shot 1] Subjects: .\nCafé 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café \n\nFirst-frame continuity required: False; last-frame continuity required: False.\n[Shot 2] At 00:01.000, Subjects: .\nRésumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum\n\nFirst-frame continuity required: False; last-frame continuity required: False.",
+            "character_count": 4264
+          },
+          {
+            "key": "negative_prompt",
+            "text": "",
+            "character_count": 0
+          },
+          {
+            "key": "structured_input",
+            "text": "",
+            "character_count": 0
+          }
+        ],
+        "field_basis": [
+          {
+            "unit_key": "first",
+            "field_key": "unit_description",
+            "field_value_id": "7603e7b1-004d-4102-912e-7ef103820954",
+            "revision": 1,
+            "origin": "adopted",
+            "status": "confirmed"
+          },
+          {
+            "unit_key": "second",
+            "field_key": "unit_description",
+            "field_value_id": "1cbae80e-92fe-43b0-b73e-4cd19c4952dc",
+            "revision": 1,
+            "origin": "adopted",
+            "status": "confirmed"
+          }
+        ],
+        "sources": {
+          "references": [],
+          "dialogue": []
+        },
+        "issues": [
+          "通道 positive_prompt 装配后为 4264 字符，超过配置上限 4000"
+        ],
+        "length_diagnostics": [
+          {
+            "channel": "system_instruction",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          },
+          {
+            "channel": "positive_prompt",
+            "character_count": 4264,
+            "max_chars": 4000,
+            "over_by": 264,
+            "fragments": [
+              {
+                "field_key": "unit_description",
+                "label": "Unit description",
+                "field_definition_version_id": "409bf2fe-dd63-4056-8bd7-85d30e67a03d",
+                "source_selector": "projection.output",
+                "max_chars": 7000,
+                "text_chars": 4264,
+                "separator_chars": 0
+              }
+            ],
+            "limit_sources": [
+              {
+                "source": "workflow.6aa87978-f258-4ef0-b554-e90f74e2053e.prompt.positive",
+                "max_chars": null
+              },
+              {
+                "source": "profile.bd8f00da-9246-4191-bc0a-0e4cfb4e723b.positive_prompt",
+                "max_chars": 4000
+              }
+            ]
+          },
+          {
+            "channel": "negative_prompt",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          },
+          {
+            "channel": "structured_input",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          }
+        ],
+        "prompt_mode": "profile",
+        "content_kind": "channels",
+        "messages": [],
+        "profile_basis": {
+          "version_id": "bd8f00da-9246-4191-bc0a-0e4cfb4e723b",
+          "version": 1,
+          "contract_sha256": "e6824228df48b8233e02ed858249b5c2872506d4b4353ebe29a5ed0d236fce4d"
+        }
+      },
+      "metrics": {
+        "preparation_id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "preparation_revision": 7,
+        "observed_at": "2026-10-05T15:32:44.383381+08:00",
+        "items": [
+          {
+            "key": "intent",
+            "label": "原始输入意图",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 1338,
+            "sha256": "003bfd2cec47e0ed1b441876a6c14a7e584e62642d391ab1be88c614d13da334",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "resolved_inputs",
+            "label": "已解析输入与来源",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 9979,
+            "sha256": "a154fc571980be0cdffa99615769554d3e26a4a75f072ea7cfb0560acd7ba48f",
+            "current_limit_bytes": 262144,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "review_contract",
+            "label": "字段审核合同",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 36,
+            "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "evaluation",
+            "label": "准备评估",
+            "state": "not_generated",
+            "basis": "canonical_json_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": null
+          },
+          {
+            "key": "prepared_request",
+            "label": "最终冻结请求文件",
+            "state": "not_generated",
+            "basis": "canonical_request_file_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 8388608,
+            "over_current_limit_bytes": null
+          }
+        ]
+      }
+    },
+    {
+      "preparation": {
+        "id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "revision": 8
+      },
+      "prompt": {
+        "preparation_id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "preparation_revision": 8,
+        "mode": "diagnostic",
+        "request_sha256": null,
+        "frozen_at": null,
+        "channels": [
+          {
+            "key": "system_instruction",
+            "text": "",
+            "character_count": 0
+          },
+          {
+            "key": "positive_prompt",
+            "text": "unit_description: Visual style: \nColor design:\n[Shot 1] Subjects: .\nCafé 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café \n\nFirst-frame continuity required: False; last-frame continuity required: False.\n[Shot 2] At 00:01.000, Subjects: .\nRésumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum\n\nFirst-frame continuity required: False; last-frame continuity required: False.",
+            "character_count": 4264
+          },
+          {
+            "key": "negative_prompt",
+            "text": "",
+            "character_count": 0
+          },
+          {
+            "key": "structured_input",
+            "text": "",
+            "character_count": 0
+          }
+        ],
+        "field_basis": [
+          {
+            "unit_key": "first",
+            "field_key": "unit_description",
+            "field_value_id": "7603e7b1-004d-4102-912e-7ef103820954",
+            "revision": 1,
+            "origin": "adopted",
+            "status": "confirmed"
+          },
+          {
+            "unit_key": "second",
+            "field_key": "unit_description",
+            "field_value_id": "1cbae80e-92fe-43b0-b73e-4cd19c4952dc",
+            "revision": 1,
+            "origin": "adopted",
+            "status": "confirmed"
+          }
+        ],
+        "sources": {
+          "references": [],
+          "dialogue": []
+        },
+        "issues": [
+          "通道 positive_prompt 装配后为 4264 字符，超过配置上限 4000"
+        ],
+        "length_diagnostics": [
+          {
+            "channel": "system_instruction",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          },
+          {
+            "channel": "positive_prompt",
+            "character_count": 4264,
+            "max_chars": 4000,
+            "over_by": 264,
+            "fragments": [
+              {
+                "field_key": "unit_description",
+                "label": "Unit description",
+                "field_definition_version_id": "409bf2fe-dd63-4056-8bd7-85d30e67a03d",
+                "source_selector": "projection.output",
+                "max_chars": 7000,
+                "text_chars": 4264,
+                "separator_chars": 0
+              }
+            ],
+            "limit_sources": [
+              {
+                "source": "workflow.6aa87978-f258-4ef0-b554-e90f74e2053e.prompt.positive",
+                "max_chars": null
+              },
+              {
+                "source": "profile.bd8f00da-9246-4191-bc0a-0e4cfb4e723b.positive_prompt",
+                "max_chars": 4000
+              }
+            ]
+          },
+          {
+            "channel": "negative_prompt",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          },
+          {
+            "channel": "structured_input",
+            "character_count": 0,
+            "max_chars": null,
+            "over_by": 0,
+            "fragments": [],
+            "limit_sources": []
+          }
+        ],
+        "prompt_mode": "profile",
+        "content_kind": "channels",
+        "messages": [],
+        "profile_basis": {
+          "version_id": "bd8f00da-9246-4191-bc0a-0e4cfb4e723b",
+          "version": 1,
+          "contract_sha256": "e6824228df48b8233e02ed858249b5c2872506d4b4353ebe29a5ed0d236fce4d"
+        }
+      },
+      "metrics": {
+        "preparation_id": "3465ac66-1b25-4a51-a2fb-46390ef8f280",
+        "preparation_revision": 8,
+        "observed_at": "2026-10-05T15:32:50.032661+08:00",
+        "items": [
+          {
+            "key": "intent",
+            "label": "原始输入意图",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 1338,
+            "sha256": "003bfd2cec47e0ed1b441876a6c14a7e584e62642d391ab1be88c614d13da334",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "resolved_inputs",
+            "label": "已解析输入与来源",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 9979,
+            "sha256": "a154fc571980be0cdffa99615769554d3e26a4a75f072ea7cfb0560acd7ba48f",
+            "current_limit_bytes": 262144,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "review_contract",
+            "label": "字段审核合同",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 36,
+            "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "evaluation",
+            "label": "准备评估",
+            "state": "recorded",
+            "basis": "canonical_json_utf8",
+            "schema_version": 1,
+            "size_bytes": 353,
+            "sha256": "b09039f580ae30048e1b972a339a68506160af8e79a067967093c27db3c0f75c",
+            "current_limit_bytes": 65536,
+            "over_current_limit_bytes": 0
+          },
+          {
+            "key": "prepared_request",
+            "label": "最终冻结请求文件",
+            "state": "not_generated",
+            "basis": "canonical_request_file_utf8",
+            "schema_version": null,
+            "size_bytes": null,
+            "sha256": null,
+            "current_limit_bytes": 8388608,
+            "over_current_limit_bytes": null
+          }
+        ]
+      }
+    }
+  ]
+}

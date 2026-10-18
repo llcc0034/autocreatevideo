@@ -8,9 +8,20 @@ contract lets another model reuse a primitive without adding a model branch.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from string import Formatter
+
+from django.core.exceptions import ValidationError
 
 
 REFERENCE_CONTEXT_ENGINE_KEY = "reference_context_ir_v1"
+
+
+def contribution_target(primitive_key):
+    """A primitive owns the render destination, independently of input paths."""
+    primitive = SOURCE_PROJECTION_PRIMITIVES.get(primitive_key)
+    if primitive is None or len(primitive.contribution_source_selectors) != 1:
+        raise ValidationError({"projection_primitive": "所选原语没有唯一的贡献接收项"})
+    return next(iter(primitive.contribution_source_selectors))
 
 
 @dataclass(frozen=True)
@@ -94,6 +105,37 @@ SOURCE_PROJECTION_PRIMITIVES = {
         ),
     )
 }
+
+
+def reference_result_fields(rules):
+    """Only the primitive outputs selected by this exact strategy."""
+    return frozenset(SOURCE_PROJECTION_PRIMITIVES[row["projection_primitive"]].result_field
+        for row in rules if row["source_selector"] == "projection.output")
+
+
+def reference_requires_units(*, prompt_type, result_fields, rendering):
+    """Reference declarations need units only when their templates consume them.
+
+    Temporal/direction primitives and video keep their explicit unit contract.
+    Unused templates must not introduce inputs into a reference-only image.
+    """
+    if (prompt_type != "image" or not result_fields
+            or set(result_fields) - {"subject_definitions", "retention_analysis"}
+            or rendering["unit_text_bindings"]):
+        return True
+    templates = {key for primitive in SOURCE_PROJECTION_PRIMITIVES.values()
+        if primitive.result_field in result_fields for key in primitive.rendering_template_keys}
+    return any(name == "shots" for key in templates
+        for _, name, _, _ in Formatter().parse(rendering["templates"][key]))
+
+
+def reference_profile_requires_units(contract):
+    rendering = contract["source_projection_config"]["primitive_options"][REFERENCE_CONTEXT_ENGINE_KEY]["rendering"]
+    return (any(row["source_selector"] == "projection.output" and (
+            row["generation_mode"] in {"model_generated", "translate_only"} or row["generation_context_selectors"])
+            for row in contract["rules"])
+        or reference_requires_units(prompt_type="image" if contract["operation"] == "image.generate" else "video",
+            result_fields=reference_result_fields(contract["rules"]), rendering=rendering))
 
 
 def source_projection_primitive_options() -> list[dict[str, object]]:

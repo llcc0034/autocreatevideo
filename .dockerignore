@@ -11,6 +11,12 @@ backups/**
 **/__pycache__
 **/*.pyc
 backend/db.sqlite3
+**/*.sqlite3
+**/*.sqlite3-wal
+**/*.sqlite3-shm
+**/*.sqlite3-journal
+.artifacts
+.artifacts/**
 backend/media
 backend/staticfiles
 frontend/node_modules

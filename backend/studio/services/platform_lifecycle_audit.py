@@ -7,19 +7,25 @@ from typing import Any
 from django.core.exceptions import ValidationError
 
 from studio.models import (
+    BusinessOutputVersion,
+    ContentSourceVersion,
     ConfigDefinition,
     ConfigRevision,
     ModelArtifact,
     ModelDeployment,
+    ModelExecutionInstance,
+    ModelExecutionInstanceVersion,
     ModelProfileVersion,
     PlatformLifecycleAuditEvent,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    FieldDefinition,
     PromptProfileFieldRule,
     PromptProfileVersion,
     ProductionRecipeVersion,
+    ProductionRun,
     ProviderProfile,
     RuntimeHost,
+    Style,
+    StyleCategory,
     WorkflowProjector,
     WorkflowProjectorVersion,
     WorkflowTemplateVersion,
@@ -58,14 +64,19 @@ def _time(value) -> str | None:
 
 def lifecycle_object_type(instance) -> str:
     mapping = (
+        (BusinessOutputVersion, "business_output_version"),
+        (ContentSourceVersion, "content_source_version"),
+        (Style, "visual_style"),
+        (StyleCategory, "style_category"),
         (ProviderProfile, "provider_profile"),
         (ModelProfileVersion, "model_profile_version"),
         (ModelDeployment, "model_deployment"),
+        (ModelExecutionInstance, "model_execution_instance"),
+        (ModelExecutionInstanceVersion, "model_execution_instance_version"),
         (ModelArtifact, "model_artifact"),
-        (PromptFieldDefinition, "prompt_field_definition"),
+        (FieldDefinition, "field_definition"),
         (PromptProfileVersion, "prompt_profile_version"),
         (PromptProfileFieldRule, "prompt_profile_field_rule"),
-        (PromptProfileBinding, "prompt_profile_binding"),
         (WorkflowProjector, "workflow_projector"),
         (WorkflowProjectorVersion, "workflow_projector_version"),
         (WorkflowTemplateVersion, "workflow_template_version"),
@@ -73,6 +84,7 @@ def lifecycle_object_type(instance) -> str:
         (ConfigRevision, "config_revision"),
         (RuntimeHost, "runtime_host"),
         (ProductionRecipeVersion, "production_recipe_version"),
+        (ProductionRun, "production_run"),
     )
     for model, object_type in mapping:
         if isinstance(instance, model):
@@ -82,7 +94,35 @@ def lifecycle_object_type(instance) -> str:
 
 def lifecycle_summary(instance) -> dict[str, Any]:
     """Return a flat allow-listed projection with no endpoint/path/raw JSON."""
+    if isinstance(instance, ContentSourceVersion):
+        return {"key": str(instance.source_key), "version": instance.version, "revision": instance.revision,
+            "status": instance.status, "source_selector": instance.reader_selector, "contract_sha256": instance.contract_sha256}
+    if isinstance(instance, StyleCategory):
+        return {"key": instance.key, "is_active": instance.is_active, "sort_order": instance.sort_order,
+            "sha256": _digest({"name": instance.name, "description": instance.description})}
+    if isinstance(instance, Style):
+        return {"key": instance.slug, "category": instance.category_id,
+            "is_active": instance.is_active, "is_system": instance.is_system,
+            "scope_type": "global" if instance.owner_id is None else "personal",
+            "sha256": _digest({"name": instance.name, "description": instance.description,
+                "visual_prompt": instance.visual_prompt, "negative_prompt": instance.negative_prompt,
+                "defaults": instance.defaults, "thumbnail_path": instance.thumbnail_path})}
+    if isinstance(instance, ProductionRun):
+        return {"allow_external_calls": instance.allow_external_calls, "cost_currency": instance.cost_currency}
 
+    if isinstance(instance, ModelExecutionInstance):
+        return {"key": instance.key, "is_active": instance.is_active, "revision": instance.revision}
+    if isinstance(instance, ModelExecutionInstanceVersion):
+        from studio.services.execution_instances import execution_version_configuration
+
+        return {
+            "version": instance.version, "revision": instance.revision, "status": instance.status,
+            "operation": instance.operation, "mode": instance.mode,
+            "prompt_profile_version_id": _id(instance.prompt_profile_version_id),
+            # Include child choices, not just the six resource selectors. Raw
+            # parameter/input content still never enters the flat audit record.
+            "sha256": _digest(execution_version_configuration(instance)),
+        }
     if isinstance(instance, ProviderProfile):
         return {
             "key": instance.key,
@@ -131,12 +171,9 @@ def lifecycle_summary(instance) -> dict[str, Any]:
             "verified_snapshot_id": _id(instance.verified_snapshot_id),
             "verified_at": _time(instance.verified_at),
         }
-    if isinstance(instance, PromptFieldDefinition):
+    if isinstance(instance, FieldDefinition):
         return {
             "key": instance.key,
-            "category": instance.category,
-            "value_type": instance.value_type,
-            "is_required": instance.is_required,
             "is_active": instance.is_active,
         }
     if isinstance(instance, PromptProfileVersion):
@@ -155,20 +192,10 @@ def lifecycle_summary(instance) -> dict[str, Any]:
         return {
             "profile_version_id": _id(instance.profile_version_id),
             "field_definition_id": _id(instance.field_definition_id),
+            "field_definition_version_id": _id(instance.field_definition_version_id),
             "source_selector": instance.source_selector,
             "channel": instance.channel,
             "position": instance.position,
-        }
-    if isinstance(instance, PromptProfileBinding):
-        return {
-            "key": instance.key,
-            "operation": instance.operation,
-            "model_family": instance.model_family,
-            "mode": instance.mode,
-            "model_profile_version_id": _id(instance.model_profile_version_id),
-            "prompt_profile_version_id": _id(instance.prompt_profile_version_id),
-            "priority": instance.priority,
-            "is_active": instance.is_active,
         }
     if isinstance(instance, WorkflowProjector):
         return {

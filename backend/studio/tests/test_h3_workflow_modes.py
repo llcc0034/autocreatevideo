@@ -2,7 +2,6 @@ import json
 import hashlib
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -10,9 +9,8 @@ from django.core.management import call_command
 from django.test import TestCase, override_settings
 from rest_framework.test import APIClient
 
-from studio.models import Asset, GenerationTask, PromptArtifact, Shot, WorkflowTemplate
+from studio.models import Asset, GenerationTask
 from studio.services.comfyui import ComfyUIError
-from studio.tests.media_prompt_fixtures import MediaPromptOptions, build_test_video_prompt
 from studio.services.task_queue import prepare_workflow
 from studio.tests.factories import build_story
 
@@ -54,34 +52,6 @@ class H3WorkflowModeContractTests(TestCase):
             checksum=hashlib.sha256(content).hexdigest(),
             metadata=metadata or {},
         )
-
-    def prompt(self, mode):
-        result = build_test_video_prompt(
-            self.project,
-            [self.shot],
-            MediaPromptOptions(
-                model_identifier="minimax-h3-test",
-                mode=mode,
-                duration_overrides={str(self.shot.id): 5000},
-                language_gate_mode="warn",
-            ),
-        )
-        return result, PromptArtifact(is_multi_shot=False,
-            project=self.project,
-            episode=self.episode,
-            shot=self.shot,
-            created_by=self.user,
-            prompt_type="video",
-            model="minimax-h3",
-            conditioning_mode=mode,
-            include_audio=True,
-            total_duration_ms=result.total_duration_ms,
-            prompt_text=result.text,
-            structured_payload=result.payload,
-            consistency_snapshot=result.consistency_snapshot,
-            content_hash=result.content_hash,
-        )
-
 
     def test_shot_api_defers_mode_rules_but_rejects_duplicate_first_last(self):
         first = self.asset(Asset.Kind.REFERENCE, "first.png", "image/png")
@@ -125,10 +95,6 @@ class H3WorkflowModeContractTests(TestCase):
 
         self.assertEqual(response.status_code, 400, response.data)
         self.assertIn("Smoke 专用素材不能用于生产分镜", str(response.data))
-
-
-
-
 
 
     def test_reference_media_upload_is_ffprobe_verified(self):
@@ -186,47 +152,10 @@ class H3WorkflowModeContractTests(TestCase):
         self.assertEqual(response.data["metadata"]["source_avg_frame_rate"], "0/0")
         self.assertEqual(response.data["metadata"]["source_r_frame_rate"], "0/0")
 
-    def test_unversioned_generated_workflow_is_rejected_before_staging(self):
-        result, prompt = self.prompt("T2VA")
-        prompt.save()
-        template = WorkflowTemplate.objects.get(
-            slug="minimax-h3-base-video", owner=None,
-        )
-        from studio.models import GeneratedWorkflow
-
-        generated = GeneratedWorkflow.objects.create(
-            project=self.project,
-            episode=self.episode,
-            prompt_artifact=prompt,
-            template=template,
-            created_by=self.user,
-            workflow_json={
-                "1": {
-                    "class_type": "SaveVideo",
-                    "inputs": {"video": "fixture", "filename_prefix": "output"},
-                },
-            },
-            injected_values={"prompt": result.text},
-            content_hash=result.content_hash,
-        )
-        task = GenerationTask.objects.create(
-            owner=self.user,
-            project=self.project,
-            episode=self.episode,
-            generated_workflow=generated,
-            kind="video",
-            max_attempts=3,
-        )
-
-        class UploadClient:
-            def __init__(self):
-                self.paths = []
-
-            def upload_input_file(self, path, *, subfolder, filename=None):
-                self.paths.append(Path(path))
-                return {"name": filename, "subfolder": subfolder, "type": "input"}
-
-        client = UploadClient()
-        with self.assertRaisesRegex(ComfyUIError, "GeneratedWorkflow"):
+    def test_task_without_primary_preparation_cannot_stage_any_file(self):
+        task = GenerationTask.objects.create(owner=self.user, project=self.project, episode=self.episode, kind="video")
+        client = Mock()
+        with self.assertRaisesRegex(ComfyUIError, "唯一的实际主调用与执行准备"):
             prepare_workflow(task, client)
-        self.assertEqual(client.paths, [])
+        client.upload_input_file.assert_not_called()
+        client.invoke.assert_not_called()

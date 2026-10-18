@@ -15,67 +15,18 @@ from django.utils import timezone
 
 from studio.models import (
     ConfigDefinition,
-    HostCapabilitySnapshot,
     ModelDeployment,
-    ModelProfileVersion,
     ProductionRecipeVersion,
-    ProviderProfile,
     SecretBinding,
     SecretVersion,
     WorkerLease,
-    WorkflowTemplateVersion,
 )
 from studio.services.configuration import ConfigurationResolutionError, resolve_configuration
-from studio.services.bible_reference_contract import BIBLE_IMAGE_GENERATION_STAGE_KEY
-from studio.services.comfyui_contract import (
-    ComfyUIContractError,
-    ComfyUIContractUnavailable,
-    validate_comfyui_api_contract,
-)
 from studio.services.distribution import DistributionError, distribution_configuration
-from studio.services.provider_registry import (
-    ProviderDriverError,
-    deployment_supports_script_generation,
-    driver_for,
-    resolve_credential,
-)
+from studio.services.provider_registry import ProviderDriverError, driver_for, resolve_credential
 from studio.services.secret_store import SecretStoreError, load_keyring, resolve_secret_version
-from studio.services.async_media_contract import fresh_smoke_snapshot
-from studio.services.runtime_platform import (
-    required_workflow_artifacts,
-    verified_artifact_availability,
-)
-from studio.services.script_generation_contract import (
-    SCRIPT_GENERATE_OPERATION,
-    validate_script_generation_model_profile,
-)
-from studio.services.script_structure import (
-    SCRIPT_STRUCTURE_OPERATION,
-    validate_script_structure_model_profile,
-)
-from studio.services.prompt_normalization import validate_prompt_normalization_model_profile
-from studio.services.prompt_normalization_contract import PROMPT_NORMALIZE_OPERATION
-
-
-from studio.services.production_visual_rules import (
-    VISUAL_RULES_OPERATION,
-    validate_visual_rules_model_profile,
-)
-from studio.services.media_capabilities import resolve_conditioning_contract
-from studio.services.model_profile_contracts import (
-    verified_model_profile_specification,
-)
-from studio.services.prompt_profiles import (
-    compatible_prompt_profile_bindings,
-    model_family_for_profile,
-    require_prompt_profile_binding,
-    validate_bible_image_prompt_profile,
-)
 from studio.services.security_boundaries import security_boundary_resolution_cache
-from studio.services.workflow_versions import (
-    declared_workflow_operation,
-    verify_published_workflow_capability,
-)
+from studio.services.execution_catalog_readiness import OUTPUT_KINDS
 
 
 READINESS_RUNTIME_KEYS = (
@@ -151,26 +102,6 @@ def _runtime_values_or_raise(runtime_values: object = _RUNTIME_VALUES_UNSET) -> 
 User = get_user_model()
 
 
-_TEXT_STAGE_OPERATIONS = {
-    "script_generate": SCRIPT_GENERATE_OPERATION,
-    "script_structure": SCRIPT_STRUCTURE_OPERATION,
-    "visual_rules_generate": VISUAL_RULES_OPERATION,
-    "script_normalize": PROMPT_NORMALIZE_OPERATION,
-}
-
-_TEXT_PROFILE_CONTRACT_REASON_CODES = {
-    SCRIPT_GENERATE_OPERATION: "script_profile_contract_invalid",
-    SCRIPT_STRUCTURE_OPERATION: "script_structure_profile_contract_invalid",
-    VISUAL_RULES_OPERATION: "visual_rules_profile_contract_invalid",
-    PROMPT_NORMALIZE_OPERATION: "prompt_normalize_profile_contract_invalid",
-}
-
-_TEXT_SMOKE_REASON_CODES = {
-    SCRIPT_GENERATE_OPERATION: "script_smoke_missing_or_stale",
-    SCRIPT_STRUCTURE_OPERATION: "script_structure_smoke_missing_or_stale",
-    VISUAL_RULES_OPERATION: "visual_rules_smoke_missing_or_stale",
-    PROMPT_NORMALIZE_OPERATION: "prompt_normalize_smoke_missing_or_stale",
-}
 
 
 def _result(ok: bool, message: str, **details) -> dict:
@@ -396,615 +327,63 @@ def _worker_check(
     )
 
 
-def _workflow_catalog_check() -> dict:
-    """Read only published/current database facts; never rebuild code-owned probes."""
-    try:
-        versions = list(
-            WorkflowTemplateVersion.objects.select_related(
-                "provider", "model_profile_version", "validated_deployment__profile_version",
-            ).prefetch_related("model_requirements__artifact").filter(
-                status=WorkflowTemplateVersion.Status.PUBLISHED,
-                is_current=True,
-            )
-        )
-        cloud = ModelDeployment.objects.filter(
-            runtime_host__isnull=True,
-            status=ModelDeployment.Status.ACTIVE,
-            profile_version__status="published",
-            profile_version__provider__is_active=True,
-        ).exists()
-    except Exception:
-        return _result(False, "无法读取平台能力目录", local_required=False, cloud_available=False)
-
-    local_versions = [
-        item for item in versions
-        if item.provider_id and item.provider.driver_type == "comfyui"
-    ]
-    if not local_versions:
-        return _result(
-            True,
-            "没有 production 本地工作流；远程能力独立判定",
-            local_required=False,
-            cloud_available=cloud,
-            production_workflow_count=len(versions),
-        )
-
-    failures = {}
-    for version in local_versions:
-        deployment = version.validated_deployment
-        if (
-            deployment is None
-            or deployment.status != ModelDeployment.Status.ACTIVE
-            or deployment.profile_version_id != version.model_profile_version_id
-        ):
-            failures[str(version.id)] = "validated_deployment_unavailable"
-            continue
-        try:
-            operation = declared_workflow_operation(version)
-            verify_published_workflow_capability(
-                version,
-                deployment,
-                operation=operation,
-            )
-            driver = driver_for(version.provider)
-            health = driver.invoke(deployment, "health", {})
-            object_info = driver.invoke(deployment, "object_info", {})
-            validate_comfyui_api_contract(version.graph, object_info)
-            if not isinstance(health, dict):
-                raise ProviderDriverError("invalid health response")
-        except ValidationError as exc:
-            failures[str(version.id)] = str(
-                getattr(exc, "code", None) or "workflow_capability_contract_invalid",
-            )
-        except (
-            ProviderDriverError,
-            ComfyUIContractError,
-            ComfyUIContractUnavailable,
-            ValueError,
-            TypeError,
-        ):
-            failures[str(version.id)] = "live_contract_unavailable"
-    return _result(
-        not failures,
-        "数据库 production 工作流能力可用" if not failures else "production 工作流实时能力不可用",
-        local_required=True,
-        cloud_available=cloud,
-        production_workflow_count=len(versions),
-        failures=failures,
-    )
-
-
 def _text_generation_worker_required(
-    *,
-    runtime_values: object = _RUNTIME_VALUES_UNSET,
-    requirements: dict[str, object] | None = None,
+    *, runtime_values: object = _RUNTIME_VALUES_UNSET, requirements=None,
 ) -> bool:
     if not _runtime_values_or_raise(runtime_values)["text_generation_worker_required"]:
         return False
-    if requirements is not None:
-        # The capability collector uses the same published recipe snapshot.
-        # Treating any declared AI text route as requiring the worker is at
-        # least as strict as the former per-recipe validator, while avoiding a
-        # second full validation pass over the same immutable definitions.
-        return bool(requirements["text_deployments"])
-    from studio.services.production_runs import validate_production_recipe_executability
+    current = requirements if requirements is not None else _published_recipe_requirements()
+    # A damaged recipe cannot be reported as requiring no worker.
+    return current.needs_text_worker or bool(current.invalid_recipe_ids)
 
-    for recipe in ProductionRecipeVersion.objects.filter(
-        status=ProductionRecipeVersion.Status.PUBLISHED,
-    ).iterator():
+
+def _text_provider_credentials_check(requirements=None) -> dict:
+    from studio.services.execution_catalog_readiness import worker_kind
+    current = requirements if requirements is not None else _published_recipe_requirements()
+    failures, checked = {}, set()
+    for version, definition in current.versions.values():
+        if worker_kind(definition) != "text_generation" or version.deployment_id in checked:
+            continue
+        deployment = version.deployment
+        checked.add(deployment.pk)
         try:
-            stages = validate_production_recipe_executability(recipe)
-        except Exception:
-            continue
-        if any(
-            item["key"] in _TEXT_STAGE_OPERATIONS
-            and item["mode"] == "ai"
-            for item in stages
-        ):
-            return True
-    return False
+            driver_for(deployment.provider).validate_execution_credentials(deployment)
+        except (ValidationError, ProviderDriverError):
+            failures[str(deployment.pk)] = "execution_transport_unavailable"
+    if current.invalid_recipe_ids:
+        failures["recipe"] = "recipe_contract_invalid"
+    return _result(not failures, "精确实例文本凭据可解析" if not failures else "精确实例文本凭据或引用不可核验",
+        required=bool(checked or current.invalid_recipe_ids), failures=failures)
 
 
-def _text_provider_credentials_check() -> dict:
-    deployment_ids: set[str] = set()
-    for recipe in ProductionRecipeVersion.objects.filter(
-        status=ProductionRecipeVersion.Status.PUBLISHED,
-    ).iterator():
-        definition = recipe.definition if isinstance(recipe.definition, dict) else {}
-        for stage in definition.get("stages") or []:
-            if not isinstance(stage, dict) or not (
-                stage.get("key") in _TEXT_STAGE_OPERATIONS
-                and stage.get("mode") == "ai"
-            ):
-                continue
-            routing = stage.get("routing") if isinstance(stage.get("routing"), dict) else {}
-            for route in routing.get("routes") or []:
-                if isinstance(route, dict) and route.get("model_deployment_id"):
-                    deployment_ids.add(str(route["model_deployment_id"]))
-    if not deployment_ids:
-        return _result(True, "没有已发布 AI 剧本配方需要文本凭据", required=False)
-    failures = {}
-    deployments = ModelDeployment.objects.select_related(
-        "profile_version__provider",
-    ).filter(pk__in=deployment_ids)
-    found = {str(item.id) for item in deployments}
-    for missing in sorted(deployment_ids - found):
-        failures[missing] = "deployment_missing"
-    for deployment in deployments:
-        provider = deployment.profile_version.provider
-        reference = deployment.credential or provider.credential
-        if provider.driver_type == provider.DriverType.LOCAL_QWEN and not reference:
-            continue
-        if not reference:
-            failures[str(deployment.id)] = "credential_missing"
-            continue
-        try:
-            resolve_credential(reference)
-        except ProviderDriverError as exc:
-            failures[str(deployment.id)] = exc.code
-    return _result(
-        not failures,
-        "AI 剧本文本凭据可解析" if not failures else "AI 剧本文本凭据后端未就绪",
-        required=True,
-        failures=failures,
-    )
+def _requirements_from_stages(stages):
+    from studio.services.execution_catalog_readiness import execution_requirements
+    return execution_requirements(stages)
 
 
-def _requirements_from_stages(stages: list[dict]) -> dict[str, object]:
-    requirements: dict[str, object] = {
-        "text_deployments": set(),
-        "text_operations": {},
-        "image_routes": [],
-        "video_routes": [],
-        "assembly": False,
-    }
-    for stage in stages:
-        if not isinstance(stage, dict) or stage.get("mode") == "skip":
-            continue
-        key = str(stage.get("key") or "")
-        if key == "assembly":
-            requirements["assembly"] = True
-            continue
-        routing = stage.get("routing") if isinstance(stage.get("routing"), dict) else {}
-        bible_route_group = object() if key == BIBLE_IMAGE_GENERATION_STAGE_KEY else None
-        for route in routing.get("routes") or []:
-            if not isinstance(route, dict) or not route.get("model_deployment_id"):
-                continue
-            if key in _TEXT_STAGE_OPERATIONS:
-                deployment_id = str(route["model_deployment_id"])
-                requirements["text_deployments"].add(deployment_id)
-                operation = _TEXT_STAGE_OPERATIONS[key]
-                requirements["text_operations"].setdefault(deployment_id, set()).add(operation)
-            elif key == "media_generation":
-                requirements["image_routes"].append(route)
-                requirements["video_routes"].append(route)
-            elif key == BIBLE_IMAGE_GENERATION_STAGE_KEY:
-                requirements["image_routes"].append({
-                    **route,
-                    # Bible routes form one exact-selection group: the UI and
-                    # create path require one binding that is valid for every
-                    # route in this stage, not merely a generic image profile.
-                    "_bible_route_group": bible_route_group,
-                })
-    return requirements
+def _published_recipe_requirements():
+    from studio.services.execution_catalog_readiness import published_execution_requirements
+    return published_execution_requirements()
 
 
-def _published_recipe_requirements() -> dict[str, object]:
-    requirements: dict[str, object] = {
-        "text_deployments": set(),
-        "text_operations": {},
-        "image_routes": [],
-        "video_routes": [],
-        "assembly": False,
-    }
-    for recipe in ProductionRecipeVersion.objects.filter(
-        status=ProductionRecipeVersion.Status.PUBLISHED,
-    ).iterator():
-        definition = recipe.definition if isinstance(recipe.definition, dict) else {}
-        current = _requirements_from_stages(definition.get("stages") or [])
-        requirements["text_deployments"].update(current["text_deployments"])
-        for deployment_id, operations in current["text_operations"].items():
-            requirements["text_operations"].setdefault(deployment_id, set()).update(operations)
-        requirements["image_routes"].extend(current["image_routes"])
-        requirements["video_routes"].extend(current["video_routes"])
-        requirements["assembly"] = bool(requirements["assembly"] or current["assembly"])
-    return requirements
-
-
-def _media_capability_readiness(
-    routes: list[dict],
-    *,
-    modality: str,
-    runtime_values: object = _RUNTIME_VALUES_UNSET,
-) -> dict:
-    if not routes:
-        return {"state": "not_required", "required": False, "reason_codes": []}
-    workflow_ids = {
-        str(item.get("workflow_version_id")) for item in routes if item.get("workflow_version_id")
-    }
-    workflows = {
-        str(item.id): item
-        for item in WorkflowTemplateVersion.objects.select_related("template").filter(
-            pk__in=workflow_ids,
-        )
-        if item.template.output_kind == modality
-    }
-    deployment_ids = {str(item.get("model_deployment_id")) for item in routes}
-    deployments = {
-        str(item.id): item
-        for item in ModelDeployment.objects.select_related(
-            "runtime_host", "profile_version__provider",
-        ).filter(pk__in=deployment_ids)
-    }
-    async_operation = {
-        "image": "image.text_to_image",
-        "video": "video.text_to_video",
-        "audio": "audio.text_to_audio",
-    }.get(modality)
-    if async_operation is None:
-        return None
-    relevant = []
-    invalid_model_profile_deployment_ids: set[str] = set()
-    for route in routes:
-        deployment = deployments.get(str(route.get("model_deployment_id")))
-        if deployment and deployment.provider.driver_type == ProviderProfile.DriverType.ASYNC_REST:
-            try:
-                specification = verified_model_profile_specification(
-                    deployment.profile_version,
-                )
-            except ValidationError:
-                invalid_model_profile_deployment_ids.add(str(deployment.id))
-                relevant.append(route)
-                continue
-            capabilities = specification.get("capabilities")
-            if isinstance(capabilities, list) and async_operation in capabilities:
-                relevant.append(route)
-        elif str(route.get("workflow_version_id")) in workflows:
-            relevant.append(route)
-    if not relevant:
-        return {"state": "not_required", "required": False, "reason_codes": []}
-
-    def compatible_choice_ids(
-        route: dict,
-        deployment: ModelDeployment,
-        prompt_mode: str,
-    ) -> set[str]:
-        try:
-            model_family = model_family_for_profile(deployment.profile_version)
-        except ValidationError:
-            invalid_model_profile_deployment_ids.add(str(deployment.id))
-            return set()
-        choices = compatible_prompt_profile_bindings(
-            operation=f"{modality}.generate",
-            model_family=model_family,
-            mode=prompt_mode,
-            model_profile_version=deployment.profile_version,
-        )
-        if route.get("_bible_route_group") is None:
-            return {str(item.binding.id) for item in choices}
-        bible_choices = set()
-        for item in choices:
-            try:
-                validate_bible_image_prompt_profile(item.profile_version)
-            except ValidationError:
-                continue
-            bible_choices.add(str(item.binding.id))
-        return bible_choices
-
-    bible_group_choice_ids: dict[int, set[str]] = {}
-    for route in relevant:
-        group = route.get("_bible_route_group")
-        if group is None:
-            continue
-        group_key = id(group)
-        deployment = deployments.get(str(route.get("model_deployment_id")))
-        route_choices = (
-            compatible_choice_ids(route, deployment, "")
-            if deployment is not None
-            else set()
-        )
-        if group_key in bible_group_choice_ids:
-            bible_group_choice_ids[group_key].intersection_update(route_choices)
-        else:
-            bible_group_choice_ids[group_key] = route_choices
-    reasons: set[str] = set()
-    ready_count = 0
-    viable_async_routes = 0
-    viable_comfy_routes = 0
-    for route in relevant:
-        deployment = deployments.get(str(route["model_deployment_id"]))
-        if deployment is None:
-            reasons.add("deployment_missing")
-            continue
-        if (
-            deployment.status != ModelDeployment.Status.ACTIVE
-            or deployment.profile_version.status != ModelProfileVersion.Status.PUBLISHED
-            or not deployment.profile_version.provider.is_active
-        ):
-            reasons.add("deployment_inactive")
-            continue
-        try:
-            model_specification = verified_model_profile_specification(
-                deployment.profile_version,
-            )
-        except ValidationError:
-            invalid_model_profile_deployment_ids.add(str(deployment.id))
-            reasons.add("model_profile_contract_invalid")
-            continue
-        workflow = workflows.get(str(route.get("workflow_version_id")))
-        prompt_modes = [""]
-        if modality == "video":
-            try:
-                conditioning_contract = resolve_conditioning_contract(
-                    workflow_input_contract=(
-                        workflow.input_contract if workflow is not None else None
-                    ),
-                    model_specification=model_specification,
-                    output_kind="video",
-                    required=True,
-                )
-            except ValidationError:
-                reasons.add("conditioning_contract_invalid")
-                continue
-            prompt_modes = [
-                str(item["key"])
-                for item in conditioning_contract["modes"]
-            ]
-        bible_group = route.get("_bible_route_group")
-        prompt_choices_ready = (
-            bool(bible_group_choice_ids.get(id(bible_group), set()))
-            if bible_group is not None
-            else all(
-                bool(compatible_choice_ids(route, deployment, prompt_mode))
-                for prompt_mode in prompt_modes
-            )
-        )
-        if not prompt_choices_ready:
-            reasons.add(
-                "model_profile_contract_invalid"
-                if str(deployment.id) in invalid_model_profile_deployment_ids
-                else "prompt_profile_binding_missing_or_invalid"
-            )
-            continue
-        if deployment.provider.driver_type == ProviderProfile.DriverType.ASYNC_REST:
-            if fresh_smoke_snapshot(deployment, async_operation) is None:
-                reasons.add("async_smoke_missing_or_stale")
-                continue
-            ready_count += 1
-            viable_async_routes += 1
-            continue
-        if workflow is None:
-            reasons.add("workflow_missing")
-            continue
-        try:
-            workflow_operation = declared_workflow_operation(workflow)
-            verify_published_workflow_capability(
-                workflow,
-                deployment,
-                operation=workflow_operation,
-            )
-        except ValidationError as exc:
-            reasons.add(str(
-                getattr(exc, "code", None)
-                or "workflow_capability_contract_invalid",
-            ))
-            continue
-        if deployment.runtime_host_id is None:
-            ready_count += 1
-            viable_comfy_routes += 1
-            continue
-        snapshot = HostCapabilitySnapshot.objects.filter(
-            host=deployment.runtime_host,
-        ).order_by("-captured_at").first()
-        if snapshot is None:
-            reasons.add("host_snapshot_missing")
-            continue
-        if snapshot.expires_at and snapshot.expires_at <= timezone.now():
-            reasons.add("host_snapshot_stale")
-            continue
-        try:
-            artifacts = required_workflow_artifacts(workflow)
-        except ValidationError:
-            reasons.add("workflow_artifact_requirements_invalid")
-            continue
-        if any(item.status != item.Status.AVAILABLE for item in artifacts):
-            reasons.add("artifact_not_verified")
-            continue
-        try:
-            for artifact in artifacts:
-                verified_artifact_availability(
-                    snapshot=snapshot,
-                    deployment=deployment,
-                    artifact=artifact,
-                )
-        except ValidationError:
-            reasons.add("artifact_observation_unverified")
-            continue
-        ready_count += 1
-        viable_comfy_routes += 1
-    comfy_worker = _worker_check(
-        "generation-worker-heartbeat",
-        "生成 Worker",
-        required=viable_comfy_routes > 0,
-        runtime_values=runtime_values,
-    )
-    async_worker = _worker_check(
-        "async-media-worker-heartbeat",
-        "异步媒体 Worker",
-        required=viable_async_routes > 0,
-        runtime_values=runtime_values,
-    )
-    if viable_comfy_routes and not comfy_worker["ok"]:
-        reasons.add("generation_worker_unavailable")
-    if viable_async_routes and not async_worker["ok"]:
-        reasons.add("async_media_worker_unavailable")
-    operational = bool(
-        (viable_comfy_routes and comfy_worker["ok"])
-        or (viable_async_routes and async_worker["ok"])
-    )
-    return {
-        "state": "ready" if ready_count and operational else "blocked",
-        "required": True,
-        "route_count": len(relevant),
-        "viable_route_count": ready_count,
-        "reason_codes": sorted(reasons),
-    }
-
-
-def _capability_readiness_for_requirements(
-    requirements: dict[str, object],
-    *,
-    runtime_values: object = _RUNTIME_VALUES_UNSET,
-) -> dict:
-    text_ids = requirements["text_deployments"]
-    text_operations = requirements.get("text_operations") or {}
-    if text_ids:
-        text_worker = _worker_check(
-            "text-generation-worker-heartbeat",
-            "文本生成 Worker",
-            required=True,
-            runtime_values=runtime_values,
-        )
-        deployments = {
-            str(item.id): item
-            for item in ModelDeployment.objects.select_related(
-                "profile_version__provider", "credential", "profile_version__provider__credential",
-            ).filter(pk__in=text_ids)
-        }
-        text_reasons: set[str] = set()
-        viable_text = 0
-        for deployment_id in sorted(text_ids):
-            deployment = deployments.get(str(deployment_id))
-            if deployment is None:
-                text_reasons.add("deployment_missing")
-                continue
-            if (
-                deployment.status != ModelDeployment.Status.ACTIVE
-                or deployment.profile_version.status != ModelProfileVersion.Status.PUBLISHED
-                or not deployment.profile_version.provider.is_active
-            ):
-                text_reasons.add("deployment_unavailable")
-                continue
-            required_operations = set(text_operations.get(deployment_id) or {
-                SCRIPT_GENERATE_OPERATION,
-            })
-            operation_contract_invalid = False
-            for operation in sorted(required_operations):
-                try:
-                    policy = (
-                        validate_script_structure_model_profile(deployment.profile_version)
-                        if operation == SCRIPT_STRUCTURE_OPERATION
-                        else validate_visual_rules_model_profile(deployment.profile_version)
-                        if operation == VISUAL_RULES_OPERATION
-                        else validate_prompt_normalization_model_profile(deployment.profile_version)
-                        if operation == PROMPT_NORMALIZE_OPERATION
-                        else validate_script_generation_model_profile(deployment.profile_version)
-                        if operation == SCRIPT_GENERATE_OPERATION
-                        else None
-                    )
-                except ValidationError:
-                    policy = None
-                if policy is None:
-                    text_reasons.add(_TEXT_PROFILE_CONTRACT_REASON_CODES.get(
-                        operation,
-                        "text_profile_contract_invalid",
-                    ))
-                    operation_contract_invalid = True
-                try:
-                    require_prompt_profile_binding(
-                        operation=operation,
-                        model_family=model_family_for_profile(deployment.profile_version),
-                        model_profile_version=deployment.profile_version,
-                    )
-                except ValidationError:
-                    text_reasons.add("prompt_profile_binding_missing_or_invalid")
-                    operation_contract_invalid = True
-            if operation_contract_invalid or not deployment_supports_script_generation(deployment):
-                if not operation_contract_invalid:
-                    text_reasons.add("script_profile_contract_invalid")
-                continue
-            reference = deployment.credential or deployment.profile_version.provider.credential
-            if not (
-                deployment.profile_version.provider.driver_type
-                == ProviderProfile.DriverType.LOCAL_QWEN and reference is None
-            ):
-                try:
-                    if reference is None:
-                        raise ProviderDriverError("credential missing", code="credential_missing")
-                    resolve_credential(reference)
-                except ProviderDriverError:
-                    text_reasons.add("credential_unavailable")
-                    continue
-            missing_smoke = [
-                operation for operation in sorted(required_operations)
-                if fresh_smoke_snapshot(deployment, operation) is None
-            ]
-            if missing_smoke:
-                for operation in missing_smoke:
-                    text_reasons.add(_TEXT_SMOKE_REASON_CODES.get(
-                        operation,
-                        "text_smoke_missing_or_stale",
-                    ))
-                continue
-            viable_text += 1
-        if not text_worker["ok"]:
-            text_reasons.add("text_worker_unavailable")
-        text = {
-            "state": "ready" if viable_text == len(text_ids) and not text_reasons else "blocked",
-            "required": True,
-            "deployment_count": len(text_ids),
-            "viable_deployment_count": viable_text,
-            "reason_codes": sorted(text_reasons),
-        }
-    else:
-        text = {"state": "not_required", "required": False, "reason_codes": []}
-    image = _media_capability_readiness(
-        requirements["image_routes"],
-        modality="image",
-        runtime_values=runtime_values,
-    )
-    video = _media_capability_readiness(
-        requirements["video_routes"],
-        modality="video",
-        runtime_values=runtime_values,
-    )
-    if requirements["assembly"]:
-        toolchain = _toolchain_check()
-        worker = _worker_check(
-            "assembly-worker-heartbeat",
-            "组装 Worker",
-            required=True,
-            runtime_values=runtime_values,
-        )
-        assembly_reasons = []
-        if not toolchain["ok"]:
-            assembly_reasons.append("toolchain_unavailable")
-        if not worker["ok"]:
-            assembly_reasons.append("assembly_worker_unavailable")
-        assembly = {
-            "state": "ready" if not assembly_reasons else "blocked",
-            "required": True,
-            "reason_codes": assembly_reasons,
-        }
-    else:
-        assembly = {"state": "not_required", "required": False, "reason_codes": []}
-    return {
-        "schema_version": 1,
-        "text": text,
-        "image": image,
-        "video": video,
-        "assembly": assembly,
-    }
+def _capability_readiness_for_requirements(requirements, *, runtime_values: object = _RUNTIME_VALUES_UNSET):
+    from studio.services.execution_catalog_readiness import catalog_capability_readiness
+    def worker(kind):
+        label = {"generation": "生成 Worker", "text_generation": "文本 Worker",
+            "async_media": "异步媒体 Worker", "assembly": "装配 Worker"}[kind]
+        return _worker_check(kind.replace("_", "-") + "-worker-heartbeat", label, required=True,
+            runtime_values=runtime_values)
+    return catalog_capability_readiness(requirements, worker_check=worker, toolchain_check=_toolchain_check)
 
 
 def collect_capability_readiness(
     *,
-    requirements: dict[str, object] | None = None,
+    requirements=None,
     runtime_values: object = _RUNTIME_VALUES_UNSET,
 ) -> dict:
     with security_boundary_resolution_cache():
         return _capability_readiness_for_requirements(
-            requirements or _published_recipe_requirements(),
+            requirements if requirements is not None else _published_recipe_requirements(),
             runtime_values=runtime_values,
         )
 
@@ -1015,83 +394,43 @@ def collect_production_readiness() -> dict:
 
 
 def _collect_production_readiness() -> dict:
-    """Return a redacted, per-published-recipe production closure report."""
+    """Redacted config/combination/pipeline report, never a per-call admission."""
+    from studio.services.production_runs import _recipe_stages, validate_production_recipe_executability
+    from studio.services.production_recipe_contracts import recipe_validation_errors
 
-    from studio.services.production_runs import validate_production_recipe_executability
-
-    recipes = list(ProductionRecipeVersion.objects.filter(
-        status=ProductionRecipeVersion.Status.PUBLISHED,
-    ).order_by("recipe_key", "version"))
-    if not recipes:
-        return {
-            "schema_version": 1,
-            "status": "unconfigured",
-            "reason_codes": ["published_recipe_missing"],
-            "recipes": [],
-        }
-    rows = []
-    overall_reasons: set[str] = set()
-    for recipe in recipes:
+    recipes = ProductionRecipeVersion.objects.filter(status=ProductionRecipeVersion.Status.PUBLISHED).only(
+        "id", "recipe_key", "version", "definition", "definition_schema_version", "definition_size_bytes", "definition_sha256"
+    ).order_by("recipe_key", "version")
+    rows, overall_reasons = [], set()
+    for recipe in recipes.iterator():
+        capabilities, reasons, errors = {}, set(), []
+        phase = "definition"
         try:
-            stages = validate_production_recipe_executability(
-                recipe,
-                require_delivery_closure=True,
-            )
-        except Exception as exc:
-            text = str(exc)
-            reason = (
-                "visual_rules_contract_invalid"
-                if "visual_rules_generate" in text or "visual_rules.generate" in text
-                else "script_structure_contract_invalid"
-                if "script_structure" in text or "script.structure" in text
-                else "script_generate_contract_invalid"
-                if "script_generate" in text or "script.generate" in text
-                else "recipe_contract_invalid"
-            )
-            capabilities = {}
-            state = "blocked"
-            reasons = [reason]
-        else:
-            capability_report = _capability_readiness_for_requirements(
-                _requirements_from_stages(stages),
-            )
-            capabilities = {
-                key: {
-                    "state": value["state"],
-                    "required": bool(value["required"]),
-                    "reason_codes": list(value.get("reason_codes") or []),
-                }
-                for key, value in capability_report.items()
-                if key != "schema_version"
-            }
-            blocked = [
-                value for value in capabilities.values()
-                if value["required"] and value["state"] != "ready"
-            ]
-            state = "blocked" if blocked else "ready"
-            reasons = sorted({
-                reason
-                for value in blocked
-                for reason in value["reason_codes"]
-            })
-            if blocked and not reasons:
-                reasons = ["required_capability_unavailable"]
+            stages = _recipe_stages(recipe)
+            phase = "requirements"
+            report = _capability_readiness_for_requirements(_requirements_from_stages(stages))
+            capabilities = {key: value for key, value in report.items() if key != "schema_version"}
+            reasons.update(code for value in capabilities.values() for code in value["reason_codes"])
+            try:
+                phase = "pipeline"
+                validate_production_recipe_executability(recipe)
+            except ValidationError as exc:
+                reasons.add("recipe_contract_invalid")
+                errors = recipe_validation_errors(exc, phase=phase, stages=stages)
+        except ValidationError as exc:
+            reasons.add("recipe_contract_invalid")
+            errors = recipe_validation_errors(exc, phase=phase, stages=recipe.definition.get("stages", []) if isinstance(recipe.definition, dict) else ())
+        except Exception:
+            # Configuration/database failure is visible and redacted; do not
+            # infer an operation from exception text or fall back to old facts.
+            reasons.add("readiness_evaluation_failed")
         overall_reasons.update(reasons)
-        rows.append({
-            "id": str(recipe.id),
-            "recipe_key": recipe.recipe_key,
-            "version": recipe.version,
-            "state": state,
-            "reason_codes": reasons,
-            "capabilities": capabilities,
-        })
-    status = "ready" if all(item["state"] == "ready" for item in rows) else "blocked"
-    return {
-        "schema_version": 1,
-        "status": status,
-        "reason_codes": sorted(overall_reasons),
-        "recipes": rows,
-    }
+        rows.append({"id": str(recipe.pk), "recipe_key": recipe.recipe_key, "version": recipe.version,
+            "state": "blocked" if reasons else "ready", "reason_codes": sorted(reasons), "capabilities": capabilities,
+            "validation_errors": errors})
+    return {"schema_version": 2, "request_checked": False,
+        "status": "unconfigured" if not rows else "blocked" if overall_reasons else "ready",
+        "reason_codes": ["published_recipe_missing"] if not rows else sorted(overall_reasons), "recipes": rows}
 
 
 def _safe_runtime_diagnostic(callback, message: str) -> dict:
@@ -1128,8 +467,10 @@ def _collect_readiness() -> dict:
             "secret_store": _result(False, "数据库状态未就绪，未执行受管凭据核对"),
         })
         blocked = {
+            "scope": "configuration_only", "request_checked": False,
             "state": "blocked", "required": True,
-            "reason_codes": ["database_or_migrations_unavailable"],
+            "reason_codes": ["database_or_migrations_unavailable"], "warning_codes": [],
+            "instance_count": None, "viable_instance_count": None,
         }
         return {
             "status": "not_ready",
@@ -1138,9 +479,8 @@ def _collect_readiness() -> dict:
             "checks": checks,
             "diagnostics": {},
             "capabilities": {
-                "schema_version": 1,
-                "text": dict(blocked), "image": dict(blocked),
-                "video": dict(blocked), "assembly": dict(blocked),
+                "schema_version": 2,
+                **{kind: dict(blocked) for kind in (*OUTPUT_KINDS, "assembly")},
             },
         }
     checks.update({
@@ -1182,7 +522,7 @@ def _collect_readiness() -> dict:
             "无法核对文本生成 Worker",
         ),
         "text_provider_credentials": _safe_runtime_diagnostic(
-            _text_provider_credentials_check, "无法核对文本凭据",
+            lambda: _text_provider_credentials_check(requirements), "无法核对文本凭据",
         ),
         "assembly_worker": _safe_runtime_diagnostic(
             lambda: _worker_check(
@@ -1204,13 +544,15 @@ def _collect_readiness() -> dict:
         )
     except Exception:
         capabilities = {
-            "schema_version": 1,
+            "schema_version": 2,
             **{
                 key: {
+                    "scope": "configuration_only", "request_checked": False,
                     "state": "blocked", "required": True,
-                    "reason_codes": ["readiness_evaluation_failed"],
+                    "reason_codes": ["readiness_evaluation_failed"], "warning_codes": [],
+                    "instance_count": None, "viable_instance_count": None,
                 }
-                for key in ("text", "image", "video", "assembly")
+                for key in (*OUTPUT_KINDS, "assembly")
             },
         }
     return {

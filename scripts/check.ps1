@@ -1,4 +1,21 @@
+[CmdletBinding()]
+param(
+    [string[]]$BackendTestLabels,
+    [switch]$RequirePostgreSql
+)
+
 $ErrorActionPreference = 'Stop'
+$SelectedBackendTests = $PSBoundParameters.ContainsKey('BackendTestLabels')
+if ($SelectedBackendTests) {
+    if ($BackendTestLabels.Count -eq 0) {
+        throw 'BackendTestLabels requires at least one explicit studio.tests label.'
+    }
+    foreach ($Label in $BackendTestLabels) {
+        if ($Label -cnotmatch '^studio\.tests(?:\.[A-Za-z_][A-Za-z0-9_]*)*$') {
+            throw 'BackendTestLabels accepts only dotted studio.tests module, class or test names.'
+        }
+    }
+}
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BackendRoot = Join-Path $ProjectRoot 'backend'
 $FrontendRoot = Join-Path $ProjectRoot 'frontend'
@@ -12,6 +29,61 @@ $LegacyOpenApiPath = Join-Path $BackendRoot 'openapi.yaml'
 function Assert-NativeSuccess([string]$Step) {
     if ($LASTEXITCODE -ne 0) {
         throw "$Step failed with exit code $LASTEXITCODE."
+    }
+}
+
+function Get-AutoPromptTestDatabase {
+    # Use Django's resolved configuration, never a second DATABASE_URL parser.
+    # This inspects backend capabilities without opening/creating a database.
+    $Probe = @'
+import json
+import os
+import sys
+try:
+    os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'autoprompt_backend.settings')
+    from django.db import connection
+    print(json.dumps({'vendor': connection.vendor, 'row_locks': connection.features.has_select_for_update}))
+except Exception:
+    # Configuration exceptions can include connection strings. Do not emit them.
+    sys.exit(2)
+'@
+    $Output = & $PythonPath -c $Probe
+    Assert-NativeSuccess 'Django test database configuration probe'
+    try { $Database = ($Output -join "`n") | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw 'Django test database configuration probe returned invalid evidence.' }
+    if ($null -eq $Database -or $Database -is [array] -or
+        $Database.vendor -cnotin @('sqlite', 'postgresql', 'mysql', 'oracle') -or
+        $Database.row_locks -isnot [bool]) {
+        throw 'Django test database configuration probe returned invalid evidence.'
+    }
+    return $Database
+}
+
+function Invoke-AutoPromptBackendTests([string[]]$Labels = @(), [switch]$RequirePostgreSql) {
+    $PreviousTestSecret = $env:DJANGO_SECRET_KEY
+    $PreviousTestJwtSecret = $env:AUTOPROMPT_JWT_SIGNING_KEY
+    $PreviousTestEncoding = $env:PYTHONIOENCODING
+    Push-Location $BackendRoot
+    try {
+        # Test-only signing keys; never print or depend on the developer's keys.
+        $env:DJANGO_SECRET_KEY = 'qa-only-7ba89b64754d9c1bb7b8901081db0f53edb1a24e576ef42c'
+        $env:AUTOPROMPT_JWT_SIGNING_KEY = 'qa-jwt-only-091d9b3e5b8f4d22a4c1738ed8f86e741b3c0e0f8f774def'
+        $env:PYTHONIOENCODING = 'utf-8'
+        $Database = Get-AutoPromptTestDatabase
+        Write-Host ("Django test backend: {0}; row-lock capability: {1}." -f $Database.vendor, $Database.row_locks)
+        if ($RequirePostgreSql -and ($Database.vendor -cne 'postgresql' -or -not $Database.row_locks)) {
+            throw 'PostgreSQL with row locks is required; no test database was created. Configure DATABASE_URL for an authorized isolated PostgreSQL test environment.'
+        }
+        if (-not $Database.row_locks) {
+            Write-Warning 'Row-lock concurrency tests will be skipped on this backend. A passing local suite is not PostgreSQL concurrency acceptance.'
+        }
+        & $PythonPath manage.py test @Labels --noinput --verbosity 2
+        Assert-NativeSuccess 'Django test suite'
+    } finally {
+        $env:DJANGO_SECRET_KEY = $PreviousTestSecret
+        $env:AUTOPROMPT_JWT_SIGNING_KEY = $PreviousTestJwtSecret
+        $env:PYTHONIOENCODING = $PreviousTestEncoding
+        Pop-Location
     }
 }
 
@@ -82,16 +154,21 @@ function Assert-NoLegacyConditioningFieldNames([string]$RootPath) {
 if (-not (Test-Path -LiteralPath $PythonPath)) {
     throw 'Run scripts\setup.ps1 first.'
 }
-Assert-AutoPromptOpenApiAuthority `
-    -RootContractPath $OpenApiPath `
-    -LegacyContractPath $LegacyOpenApiPath
-Assert-NoLegacyConditioningFieldNames -RootPath $ProjectRoot
-
 $FfmpegRuntime = Resolve-AutoPromptFfmpegRuntime -ProjectRoot $ProjectRoot
 if ($null -eq $FfmpegRuntime) {
     throw 'A complete FFmpeg/FFprobe runtime was not found. Run scripts\install_ffmpeg_runtime.ps1 to install the pinned runtime under .runtime\toolchains.'
 }
 Set-AutoPromptFfmpegEnvironment -Runtime $FfmpegRuntime
+if ($SelectedBackendTests) {
+    Write-Host ('Backend tests only: ' + ($BackendTestLabels -join ', '))
+    Invoke-AutoPromptBackendTests -Labels $BackendTestLabels -RequirePostgreSql:$RequirePostgreSql
+    Write-Host 'Selected backend tests passed. Full project checks were not run.' -ForegroundColor Green
+    return
+}
+Assert-AutoPromptOpenApiAuthority `
+    -RootContractPath $OpenApiPath `
+    -LegacyContractPath $LegacyOpenApiPath
+Assert-NoLegacyConditioningFieldNames -RootPath $ProjectRoot
 $NodeRuntime = Resolve-AutoPromptNodeRuntime -ProjectRoot $ProjectRoot
 if ($null -eq $NodeRuntime) {
     throw 'A complete Node.js 22/npm runtime was not found. Run scripts\install_node_runtime.ps1 to install the pinned runtime under .runtime\toolchains.'
@@ -161,19 +238,7 @@ try {
             Remove-Item -LiteralPath $GeneratedOpenApiPath -Force
         }
     }
-    $PreviousTestSecret = $env:DJANGO_SECRET_KEY
-    $PreviousTestJwtSecret = $env:AUTOPROMPT_JWT_SIGNING_KEY
-    try {
-        # Keep JWT/HMAC checks meaningful without depending on a developer's
-        # local .env secret length or leaking that secret into test output.
-        $env:DJANGO_SECRET_KEY = 'qa-only-7ba89b64754d9c1bb7b8901081db0f53edb1a24e576ef42c'
-        $env:AUTOPROMPT_JWT_SIGNING_KEY = 'qa-jwt-only-091d9b3e5b8f4d22a4c1738ed8f86e741b3c0e0f8f774def'
-        & $PythonPath manage.py test
-        Assert-NativeSuccess 'Django test suite'
-    } finally {
-        $env:DJANGO_SECRET_KEY = $PreviousTestSecret
-        $env:AUTOPROMPT_JWT_SIGNING_KEY = $PreviousTestJwtSecret
-    }
+    Invoke-AutoPromptBackendTests -RequirePostgreSql:$RequirePostgreSql
 } finally {
     Pop-Location
 }
@@ -184,42 +249,18 @@ try {
     Assert-NativeSuccess 'Vue typecheck'
     & $NpmPath run build
     Assert-NativeSuccess 'Vue production build'
-    & $NpmPath run test:translations
-    Assert-NativeSuccess 'Translation review and provider tests'
-    & $NpmPath run test:dialogue
-    Assert-NativeSuccess 'Dialogue adapter tests'
-    & $NpmPath run test:adapters
-    Assert-NativeSuccess 'Backend adapter tests'
-    & $NpmPath run test:bible-images
-    Assert-NativeSuccess 'Bible image history tests'
-    & $NpmPath run test:deferred-generation
-    Assert-NativeSuccess 'Deferred generation diagnostics tests'
-    & $NpmPath run test:shot-detail-field
-    Assert-NativeSuccess 'Storyboard detailed description tests'
-    & $NpmPath run test:manual
-    Assert-NativeSuccess 'Versioned production operator manual tests'
-    & $NpmPath run test:settings-guide
-    Assert-NativeSuccess 'System settings beginner guide and bilingual presentation tests'
-    & $NpmPath run test:workflow-selection
-    Assert-NativeSuccess 'Production workflow selection entry tests'
-    & $NpmPath run test:saved-workflow-import
-    Assert-NativeSuccess 'Saved Comfy workflow import tests'
-    & $NpmPath run test:workflow-inputs
-    Assert-NativeSuccess 'Workflow execution input and smoke fixture presentation tests'
-    & $NpmPath run test:task-grouping
-    Assert-NativeSuccess 'Task grouping tests'
-    & $NpmPath run test:projects
-    Assert-NativeSuccess 'Series project management tests'
-    & $NpmPath run test:assets
-    Assert-NativeSuccess 'Asset management tests'
-    & $NpmPath run test:platform
-    Assert-NativeSuccess 'Platform configuration, workflow and ProductionRun tests'
+    & $NpmPath run check:settings-guide
+    Assert-NativeSuccess 'Generated system settings guide parity'
+    & $NpmPath run test
+    Assert-NativeSuccess 'All discovered frontend tests'
 } finally {
     Pop-Location
 }
 
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_backup_restore.ps1')
 Assert-NativeSuccess 'Backup and restore safety tests'
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_check.ps1')
+Assert-NativeSuccess 'Check scope and backend runtime tests'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_setup_bootstrap.ps1')
 Assert-NativeSuccess 'Fresh-install setup bootstrap ordering tests'
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot 'test_restart_config.ps1')

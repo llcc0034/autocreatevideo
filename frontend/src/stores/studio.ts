@@ -2,8 +2,7 @@ import { computed, ref } from 'vue'
 import { defineStore } from 'pinia'
 import { repository } from '@/services/repository'
 import { applyProjectEpisodeSummary, buildProjectRedoPayload, createSessionEpoch, SessionInvalidatedError } from '@/services/projectManagement'
-import { acceptAuthoritativeCanonicalGlossary } from '@/services/translationReview'
-import type { AssemblyResult, Asset, AssetGenerationJob, AssetGenerationJobType, AssetGenerationMediaType, AssetGenerationResolutionOutcome, BibleDraftEntityType, CanonicalGlossaryEnsureResult, CanonicalGlossaryScope, Episode, ReleaseBundle, SeriesProject, Shot, StylePreset, Workflow, WorkflowBatchSlot } from '@/types'
+import type { AssemblyResult, Asset, AssetGenerationJob, AssetGenerationMediaType, AssetGenerationResolutionOutcome, BibleDraftEntityType, Episode, ReleaseBundle, SeriesProject, Shot, StylePreset, Workflow } from '@/types'
 
 const preserveWorkflowMedia = (next: Workflow, previous?: Workflow, preserveSignedUrls = true): Workflow => {
   if (!previous) return next
@@ -36,226 +35,25 @@ const preserveWorkflowMedia = (next: Workflow, previous?: Workflow, preserveSign
     }
   }
   type TaskAssets = Workflow['referenceAssets']
-  const stableAssetKey = (asset: TaskAssets[number], index: number) => asset.assetId || `${asset.mediaKind}:${asset.displayName}:${asset.inputLabel || index}`
+  const stableAssetKey = (asset: TaskAssets[number]) => `${asset.itemKey}:${asset.sourceSha256}:${asset.checksum}`
   const preserveAssetPreviews = (nextAssets: TaskAssets, previousAssets: TaskAssets): TaskAssets => {
-    if (!nextAssets.length || !previousAssets.length) return nextAssets
-    const previousByKey = new Map(previousAssets.map((asset, index) => [stableAssetKey(asset, index), asset]))
-    return nextAssets.map((asset, index) => {
-      const stable = previousByKey.get(stableAssetKey(asset, index))
+    if (!preserveSignedUrls || next.inputParameters?.request_sha256 !== previous.inputParameters?.request_sha256 || !nextAssets.length || !previousAssets.length) return nextAssets
+    const previousByKey = new Map(previousAssets.map(asset => [stableAssetKey(asset), asset]))
+    return nextAssets.map(asset => {
+      const stable = previousByKey.get(stableAssetKey(asset))
       return !asset.previewUrl && stable?.previewUrl ? { ...asset, previewUrl: stable.previewUrl } : asset
     })
   }
   const referenceAssets = preserveAssetPreviews(next.referenceAssets, previous.referenceAssets)
-  const continuityAssets = preserveAssetPreviews(next.continuityAssets, previous.continuityAssets)
-  return { ...next, outputMedia, referenceAssets, continuityAssets }
+  const contextMediaUses = preserveAssetPreviews(next.contextMediaUses, previous.contextMediaUses)
+  return { ...next, outputMedia, referenceAssets, contextMediaUses }
 }
 
-const batchSlotKey = (workflow: Workflow): string => (
-  workflow.batchId && workflow.batchIndex
-    ? `${workflow.batchId}:${workflow.batchIndex}`
-    : ''
-)
-
-const workflowBatchIndex = (workflow: Workflow): number => (
-  Number.isFinite(Number(workflow.batchIndex)) && Number(workflow.batchIndex) > 0
-    ? Number(workflow.batchIndex)
-    : 0
-)
-
-const workflowBatchSize = (workflow: Workflow): number => (
-  Number.isFinite(Number(workflow.batchSize)) && Number(workflow.batchSize) > 0
-    ? Number(workflow.batchSize)
-    : 0
-)
-
-const restoredVirtualBatchId = (batchId: string, slot: number): string => `episode-batch-${batchId}-${slot}-restored`
-
-const projectNameFromTaskTitle = (workflow: Workflow): string => (
-  workflow.projectTitle.split(' · 第')[0] || workflow.projectTitle.split(' · 镜头')[0] || workflow.projectTitle
-)
-
-const batchEpisodeShots = (workflow: Workflow, projects: SeriesProject[]): { episode?: Episode; shot?: Shot } => {
-  const project = projects.find((item) => item.id === workflow.projectId)
-  const episode = project?.episodes.find((item) => (
-    (workflow.episodeId && item.id === workflow.episodeId)
-    || (workflow.episodeNumber && item.number === workflow.episodeNumber)
-  ))
-  if (!episode) return {}
-  const slot = workflowBatchIndex(workflow)
-  const shot = episode.shots.slice().sort((left, right) => left.order - right.order)[slot - 1]
-  return { episode, shot }
-}
-
-const batchSlotVirtualState = (slot: WorkflowBatchSlot): { status: Workflow['status']; backendStatus: string; step: string; nodeStatus: 'pending' | 'running' | 'completed' | 'failed' } => {
-  if (slot.slotStatus === 'waiting_deferred') {
-    return {
-      status: 'queued',
-      backendStatus: slot.deferredGenerationStatus || slot.workflowMode || 'waiting_deferred',
-      step: slot.message || '等待上一镜尾帧抽取任务物化',
-      nodeStatus: 'pending',
-    }
-  }
-  if (slot.slotStatus === 'materialized') {
-    const taskStatus = slot.taskStatus || ''
-    const status: Workflow['status'] = taskStatus === 'succeeded' ? 'completed' : ['failed', 'cancelled'].includes(taskStatus) ? 'failed' : ['running', 'cancel_request', 'cancel_requested'].includes(taskStatus) ? 'running' : 'queued'
-    return {
-      status,
-      backendStatus: taskStatus || 'materialized',
-      step: slot.message || '该槽位已有真实任务；刷新后会显示最新任务状态',
-      nodeStatus: status === 'completed' ? 'completed' : status === 'failed' ? 'failed' : status === 'running' ? 'running' : 'pending',
-    }
-  }
-  if (slot.slotStatus === 'cancelled' || slot.slotStatus === 'cancelled_by_upstream') {
-    return {
-      status: 'paused',
-      backendStatus: slot.slotStatus,
-      step: slot.message || '上游任务已取消，后续链路已中断；重试上游任务后可恢复链路',
-      nodeStatus: 'pending',
-    }
-  }
-  return {
-    status: 'paused',
-    backendStatus: 'not_created',
-    step: slot.message || '没有 active deferred，也没有真实 GenerationTask；后续链路已中断，等待重试恢复',
-    nodeStatus: 'pending',
-  }
-}
-
-const virtualKindFromSlot = (slot: WorkflowBatchSlot): Workflow['virtualProductionUnitKind'] => (
-  slot.workflowMode === 'waiting_for_deferred_first_frame_source'
-    ? 'waiting_for_deferred_first_frame_source'
-    : slot.workflowMode === 'waiting_for_deferred_first_frame_chain'
-      ? 'waiting_for_deferred_first_frame_chain'
-      : 'deferred_first_frame_continuity'
-)
-
-const makeRestoredVirtualBatchUnit = (anchor: Workflow, slot: number, projects: SeriesProject[], slotFact: WorkflowBatchSlot): Workflow => {
-  const batchSize = workflowBatchSize(anchor)
-  const context = batchEpisodeShots({ ...anchor, batchIndex: slot }, projects)
-  const episode = context.episode
-  const shot = context.shot
-  const shotNumber = slotFact.shotNumber || shot?.order || slot
-  const shotTitle = slotFact.shotTitle || shot?.title || `镜头 ${String(shotNumber).padStart(2, '0')}`
-  const episodeTitle = slotFact.episodeTitle || episode?.title || anchor.episodeTitle
-  const episodeNumber = slotFact.episodeNumber || episode?.number || anchor.episodeNumber
-  const projectTitle = [
-    projectNameFromTaskTitle(anchor),
-    episodeNumber ? `第${episodeNumber}集` : '',
-    `镜头${String(shotNumber).padStart(2, '0')} ${shotTitle}`,
-  ].filter(Boolean).join(' · ')
-  const virtualState = batchSlotVirtualState(slotFact)
-  const workflowId = slotFact.taskId || restoredVirtualBatchId(anchor.batchId || '', slot)
-  return {
-    id: slotFact.taskId ? `batch-slot-${slotFact.batchId || anchor.batchId}-${slot}` : workflowId,
-    taskId: slotFact.taskId,
-    kind: shot?.mediaType === 'image' ? 'image' : anchor.kind,
-    backendStatus: virtualState.backendStatus,
-    projectId: anchor.projectId,
-    projectTitle,
-    status: virtualState.status,
-    progress: virtualState.status === 'completed' ? 100 : 0,
-    currentStep: `整集镜头 ${slot}/${batchSize} · ${virtualState.step}`,
-    referenceAssets: [],
-    continuityAssets: [],
-    nodes: [{
-      id: workflowId,
-      label: slotFact.slotStatus === 'materialized' ? '真实任务槽位' : '尾帧抽取与下游任务槽位',
-      type: 'compose',
-      status: virtualState.nodeStatus,
-      progress: virtualState.status === 'completed' ? 100 : 0,
-    }],
-    createdAt: slotFact.createdAt || anchor.createdAt,
-    eta: virtualState.status === 'queued' ? '等待上游镜头' : undefined,
-    batchId: anchor.batchId,
-    batchIndex: slot,
-    batchSize,
-    batchKind: anchor.batchKind || 'whole_episode',
-    batchTaskIds: anchor.batchTaskIds || [],
-    isVirtualProductionUnit: true,
-    virtualProductionUnitKind: virtualKindFromSlot(slotFact),
-    deferredGenerationRequestId: slotFact.deferredGenerationRequestId,
-    deferredGenerationStatus: slotFact.deferredGenerationStatus,
-    deferredUpstreamRequestId: slotFact.deferredUpstreamRequestId,
-    deferredFrameSlot: 'first_frame',
-    episodeId: slotFact.episodeId || episode?.id || anchor.episodeId,
-    episodeNumber,
-    episodeTitle,
-    shotId: slotFact.shotId || shot?.id,
-    shotIds: slotFact.shotId ? [slotFact.shotId] : shot ? [shot.id] : [],
-    shotNumber,
-    shotTitle,
-  }
-}
-
-const restoreVirtualBatchPlaceholders = (items: Workflow[], projects: SeriesProject[]): Workflow[] => {
-  const byBatch = new Map<string, Workflow[]>()
-  for (const item of items) {
-    if (!item.batchId || workflowBatchSize(item) <= 1) continue
-    const current = byBatch.get(item.batchId) || []
-    current.push(item)
-    byBatch.set(item.batchId, current)
-  }
-  const additions: Workflow[] = []
-  for (const [batchId, group] of byBatch.entries()) {
-    const batchSize = Math.max(...group.map(workflowBatchSize))
-    if (batchSize <= 1) continue
-    const slotFacts = new Map<number, WorkflowBatchSlot>()
-    for (const item of group) {
-      for (const slot of item.batchSlots || []) {
-        if (slot.batchId && slot.batchId !== batchId) continue
-        if (slot.batchIndex > 0) slotFacts.set(slot.batchIndex, slot)
-      }
-    }
-    if (!slotFacts.size) continue
-    const occupiedSlots = new Set(group.map(workflowBatchIndex).filter(Boolean))
-    const latestBySlot = new Map<number, Workflow>()
-    for (const item of group) {
-      const slot = workflowBatchIndex(item)
-      if (!slot) continue
-      const previous = latestBySlot.get(slot)
-      if (!previous || new Date(item.createdAt || 0).getTime() >= new Date(previous.createdAt || 0).getTime()) {
-        latestBySlot.set(slot, item)
-      }
-    }
-    const fallback = group.slice().sort((left, right) => {
-      const slotOrder = workflowBatchIndex(left) - workflowBatchIndex(right)
-      return slotOrder || (new Date(right.createdAt || 0).getTime() - new Date(left.createdAt || 0).getTime())
-    })[0]
-    for (let slot = 1; slot <= batchSize; slot += 1) {
-      if (occupiedSlots.has(slot)) continue
-      const slotFact = slotFacts.get(slot)
-      if (!slotFact) continue
-      const upstream = latestBySlot.get(slot - 1) || fallback
-      additions.push(makeRestoredVirtualBatchUnit({ ...upstream, batchId }, slot, projects, slotFact))
-    }
-  }
-  return additions.length ? [...items, ...additions] : items
-}
-
-const mergePolledWorkflows = (fresh: Workflow[], previous: Workflow[], preserveMediaUrls: boolean, projects: SeriesProject[]): Workflow[] => {
-  const previousById = new Map(previous.map((item) => [item.id, item]))
-  const hydrated = fresh.map((item) => (
-    preserveMediaUrls ? preserveWorkflowMedia(item, previousById.get(item.id)) : item
-  ))
-  const materializedBatchSlots = new Set(
-    hydrated
-      .filter((item) => !item.isVirtualProductionUnit)
-      .map(batchSlotKey)
-      .filter(Boolean),
-  )
-  const refreshedBatchIds = new Set(
-    hydrated
-      .map((item) => item.batchId)
-      .filter((value): value is string => Boolean(value)),
-  )
-  const hydratedIds = new Set(hydrated.map((item) => item.id))
-  const stillWaiting = previous.filter((item) => {
-    if (!item.isVirtualProductionUnit || hydratedIds.has(item.id)) return false
-    if (item.batchId && refreshedBatchIds.has(item.batchId)) return false
-    const key = batchSlotKey(item)
-    return !key || !materializedBatchSlots.has(key)
-  })
-  return restoreVirtualBatchPlaceholders([...hydrated, ...stillWaiting], projects)
+const mergePolledWorkflows = (fresh: Workflow[], previous: Workflow[], preserveMediaUrls: boolean): Workflow[] => {
+  const previousById = new Map(previous.map(item => [item.id, item]))
+  // Only server-returned tasks exist here. Pending work belongs to StageRun,
+  // not synthesized batch rows or stale local task caches.
+  return fresh.map(item => preserveMediaUrls ? preserveWorkflowMedia(item, previousById.get(item.id)) : item)
 }
 
 export const useStudioStore = defineStore('studio', () => {
@@ -270,6 +68,10 @@ export const useStudioStore = defineStore('studio', () => {
   const toast = ref<{ message: string; type: 'success' | 'error' | 'info' } | null>(null)
   const ready = ref(false)
   let initializeRequest: Promise<void> | null = null
+  let stylesRequest: Promise<void> | null = null
+  let navigationRequest: Promise<void> | null = null
+  let stylesReady = false
+  let navigationReady = false
   const projectDetailRequests = new Map<string, Promise<SeriesProject>>()
   const sessionEpoch = createSessionEpoch()
   let toastSequence = 0
@@ -294,7 +96,40 @@ export const useStudioStore = defineStore('studio', () => {
     styles.value = []; assets.value = []; assetGenerationJobs.value = []; projects.value = []; workflows.value = []
     loading.value = false; error.value = ''; toast.value = null; ready.value = false
     initializeRequest = null
+    stylesRequest = null; navigationRequest = null; stylesReady = false; navigationReady = false
     projectDetailRequests.clear()
+  }
+  const loadStyles = async (force = false) => {
+    if (force) {
+      if (stylesRequest) await stylesRequest
+      stylesReady = false
+    }
+    if (stylesReady) return
+    if (stylesRequest) return stylesRequest
+    const epoch = sessionEpoch.capture()
+    stylesRequest = (async () => {
+      try {
+        const rows = await repository.getStyles()
+        assertCurrentSession(epoch)
+        styles.value = rows; stylesReady = true
+      } finally { if (sessionEpoch.isCurrent(epoch)) stylesRequest = null }
+    })()
+    return stylesRequest
+  }
+  const initializeNavigation = async () => {
+    if (navigationReady) return
+    if (navigationRequest) return navigationRequest
+    const epoch = sessionEpoch.capture()
+    navigationRequest = (async () => {
+      try {
+        await loadStyles()
+        assertCurrentSession(epoch)
+        const rows = await repository.getProjects()
+        assertCurrentSession(epoch)
+        projects.value = rows; navigationReady = true
+      } finally { if (sessionEpoch.isCurrent(epoch)) navigationRequest = null }
+    })()
+    return navigationRequest
   }
   const initialize = async () => {
     if (ready.value) return
@@ -305,15 +140,11 @@ export const useStudioStore = defineStore('studio', () => {
       loading.value = true; error.value = ''
       try {
         // Project summaries are loaded once; full Bible/episode data is hydrated on demand.
-        const nextStyles = await repository.getStyles()
+        await initializeNavigation()
         assertCurrentSession(requestEpoch)
-        styles.value = nextStyles
-        const nextProjects = await repository.getProjects()
-        assertCurrentSession(requestEpoch)
-        projects.value = nextProjects
         const nextWorkflows = await repository.getWorkflows()
         assertCurrentSession(requestEpoch)
-        workflows.value = mergePolledWorkflows(nextWorkflows, [], false, projects.value)
+        workflows.value = mergePolledWorkflows(nextWorkflows, [], false)
         ready.value = true
       } catch (e) {
         assertCurrentSession(requestEpoch)
@@ -340,11 +171,7 @@ export const useStudioStore = defineStore('studio', () => {
   const refreshAsset = async (id:string, mergeIntoList=true) => {const requestEpoch=sessionEpoch.capture();const item=await repository.getAsset(id);assertCurrentSession(requestEpoch);if(mergeIntoList){const index=assets.value.findIndex((asset)=>asset.id===id);if(index>=0)assets.value[index]=item;else assets.value.unshift(item)}return item}
   const createAsset = async (payload: { file: File; mediaType: AssetGenerationMediaType; imageCategory?: BibleDraftEntityType|'reference'; name: string; description: string; promptHint: string; styleId?: string }) => { const requestEpoch=sessionEpoch.capture();const item=await repository.createAsset(payload);assertCurrentSession(requestEpoch);assets.value=[item,...assets.value.filter((asset)=>asset.id!==item.id)];notify('素材已入库');return item }
   const refreshAssetGenerationJobs = async () => {const requestEpoch=sessionEpoch.capture();const rows=await repository.getAssetGenerationJobs();assertCurrentSession(requestEpoch);assetGenerationJobs.value=rows;return rows}
-  const getAssetGenerationOptions = (jobType:AssetGenerationJobType,mediaType:AssetGenerationMediaType)=>repository.getAssetGenerationOptions(jobType,mediaType)
-  const getWorkflowInputAssets = () => repository.getAssets()
-  const createAssetGenerationJob = async (payload:Parameters<typeof repository.createAssetGenerationJob>[0]) => {const requestEpoch=sessionEpoch.capture();const job=await repository.createAssetGenerationJob(payload);assertCurrentSession(requestEpoch);assetGenerationJobs.value=[job,...assetGenerationJobs.value.filter((item)=>item.id!==job.id)];notify(job.jobType==='prompt'?'提示词生成任务已排队':'素材生成任务已排队');return job}
   const cancelAssetGenerationJob = async(id:string)=>{const requestEpoch=sessionEpoch.capture();const job=await repository.cancelAssetGenerationJob(id);assertCurrentSession(requestEpoch);assetGenerationJobs.value=assetGenerationJobs.value.map((item)=>item.id===id?job:item);notify('已提交取消请求','info');return job}
-  const retryAssetGenerationJob = async(id:string)=>{const requestEpoch=sessionEpoch.capture();const job=await repository.retryAssetGenerationJob(id);assertCurrentSession(requestEpoch);assetGenerationJobs.value=[job,...assetGenerationJobs.value.filter((item)=>item.id!==job.id)];notify('重试任务已排队');return job}
   const resolveUncertainAssetGenerationJob = async(id:string,payload:{outcome:AssetGenerationResolutionOutcome;note:string;providerRequestId?:string;actualCost?:string|null;costCurrency?:string;idempotencyKey:string})=>{const requestEpoch=sessionEpoch.capture();await repository.resolveUncertainAssetGenerationJob(id,payload);assertCurrentSession(requestEpoch);const rows=await repository.getAssetGenerationJobs();assertCurrentSession(requestEpoch);assetGenerationJobs.value=rows;notify('素材生成任务消歧结论已记录');return rows.find((item)=>item.id===id)}
   const updateAssetMetadata = async (assetId:string,payload:{name:string;description:string;promptHint:string;kind?:BibleDraftEntityType|'reference';styleId?:string}) => {const requestEpoch=sessionEpoch.capture();const item=await repository.updateAssetMetadata(assetId,payload);assertCurrentSession(requestEpoch);const index=assets.value.findIndex((asset)=>asset.id===assetId);if(index>=0)assets.value[index]=item;else assets.value.unshift(item);notify('素材说明已保存');return item}
   const deleteAsset = async (assetId:string) => {const requestEpoch=sessionEpoch.capture();await repository.deleteAsset(assetId);assertCurrentSession(requestEpoch);assets.value=assets.value.filter((asset)=>asset.id!==assetId);notify('素材已删除')}
@@ -391,23 +218,6 @@ export const useStudioStore = defineStore('studio', () => {
   const setProjectFavorite = async (project: SeriesProject, favorite: boolean) => { const requestEpoch=sessionEpoch.capture();const saved = await repository.setProjectFavorite(project, favorite);assertCurrentSession(requestEpoch);const index = projects.value.findIndex((item) => item.id === saved.id);if(index >= 0)projects.value[index] = saved;else projects.value.unshift(saved);notify(favorite ? '项目已收藏' : '已取消收藏', 'info');return saved }
   const duplicateProject = async (project: SeriesProject) => { const requestEpoch=sessionEpoch.capture();const item = await repository.createProject(buildProjectRedoPayload(project));assertCurrentSession(requestEpoch);projects.value.unshift(item);notify('已创建独立重做草稿，原项目保持不变');return item }
   const deleteProject = async (projectId: string) => { const requestEpoch=sessionEpoch.capture();await repository.deleteProject(projectId);assertCurrentSession(requestEpoch);projects.value = projects.value.filter((item) => item.id !== projectId);workflows.value = workflows.value.filter((item) => item.projectId !== projectId);notify('连续剧项目已删除', 'info') }
-  const ensureCanonicalGlossary = async (
-    project: SeriesProject,
-    options: { entries?: Array<{ scopeType: CanonicalGlossaryScope; scopeId: string }>; includeAllMissing?: boolean; ensureVisualIdentityTranslation?: boolean } = {},
-  ): Promise<CanonicalGlossaryEnsureResult> => {
-    const requestEpoch = sessionEpoch.capture()
-    const result = await repository.ensureCanonicalGlossary(project.id, options)
-    assertCurrentSession(requestEpoch)
-    const authoritative = acceptAuthoritativeCanonicalGlossary(result.translationGlossary)
-    project.translationGlossary = authoritative
-    if (result.updatedAt) project.updatedAt = result.updatedAt
-    const stored = projects.value.find((item) => item.id === project.id)
-    if (stored && stored !== project) {
-      stored.translationGlossary = { ...authoritative }
-      if (result.updatedAt) stored.updatedAt = result.updatedAt
-    }
-    return { ...result, translationGlossary: authoritative }
-  }
   const addEpisode = async (project: SeriesProject, payload: { title: string; synopsis: string; script?: string }) => { const requestEpoch=sessionEpoch.capture();const item = await repository.addEpisode(project.id, payload);assertCurrentSession(requestEpoch);project.episodes.push(item);applyProjectEpisodeSummary(project);await saveProject(project);assertCurrentSession(requestEpoch);notify(`第 ${item.number} 集已加入`);return item }
   const deleteEpisode = async (project: SeriesProject, episodeId: string) => { const requestEpoch=sessionEpoch.capture();await repository.deleteEpisode(project.id, episodeId);assertCurrentSession(requestEpoch);project.episodes = project.episodes.filter((item) => item.id !== episodeId);applyProjectEpisodeSummary(project);await saveProject(project);assertCurrentSession(requestEpoch);notify('剧集已删除', 'info') }
   const saveEpisode = async (project: SeriesProject, episode: Episode) => { const requestEpoch=sessionEpoch.capture();const saved = await repository.saveEpisode(project, episode);assertCurrentSession(requestEpoch);const index = project.episodes.findIndex((item) => item.id === saved.id);if(index >= 0)project.episodes[index] = saved;applyProjectEpisodeSummary(project);const storedProject=projects.value.find((item)=>item.id===project.id);if(storedProject&&storedProject!==project){const storedIndex=storedProject.episodes.findIndex((item)=>item.id===saved.id);if(storedIndex>=0)storedProject.episodes[storedIndex]=JSON.parse(JSON.stringify(saved));applyProjectEpisodeSummary(storedProject)}notify('分镜已保存');return saved }
@@ -438,7 +248,7 @@ export const useStudioStore = defineStore('studio', () => {
     const requestEpoch = sessionEpoch.capture()
     const fresh = await repository.getWorkflows()
     assertCurrentSession(requestEpoch)
-    workflows.value = mergePolledWorkflows(fresh, workflows.value, preserveMediaUrls, projects.value)
+    workflows.value = mergePolledWorkflows(fresh, workflows.value, preserveMediaUrls)
     return workflows.value
   }
   const mergeWorkflowDetail = (detail: Workflow, preserveMediaUrls = false, requestEpoch = sessionEpoch.capture()) => {
@@ -454,5 +264,5 @@ export const useStudioStore = defineStore('studio', () => {
   const getReleaseBundles = (projectId: string): Promise<ReleaseBundle[]> => repository.getReleaseBundles(projectId)
   const verifyReleaseBundle = (bundleId: string) => repository.verifyReleaseBundle(bundleId)
   const projectById = computed(() => (id: string) => projects.value.find((item) => item.id === id))
-  return { styles, assets, assetGenerationJobs, projects, workflows, loading, error, toast, ready, projectById, captureSessionEpoch, initialize, loadProject, resetSessionState, refreshAssets, refreshAsset, refreshAssetGenerationJobs, getAssetGenerationOptions, getWorkflowInputAssets, createAssetGenerationJob, cancelAssetGenerationJob, retryAssetGenerationJob, resolveUncertainAssetGenerationJob, refreshProjects, createAsset, updateAssetMetadata, deleteAsset, uploadReferenceAsset, createProject, saveProject, setProjectCover, setProjectFavorite, duplicateProject, deleteProject, ensureCanonicalGlossary, addEpisode, deleteEpisode, saveEpisode, saveShot, refreshWorkflows, mergeWorkflowDetail, getEpisodeAssemblies, getAssembly, getReleaseBundles, verifyReleaseBundle, notify }
+  return { styles, assets, assetGenerationJobs, projects, workflows, loading, error, toast, ready, projectById, captureSessionEpoch, initialize, initializeNavigation, loadStyles, loadProject, resetSessionState, refreshAssets, refreshAsset, refreshAssetGenerationJobs, cancelAssetGenerationJob, resolveUncertainAssetGenerationJob, refreshProjects, createAsset, updateAssetMetadata, deleteAsset, uploadReferenceAsset, createProject, saveProject, setProjectCover, setProjectFavorite, duplicateProject, deleteProject, addEpisode, deleteEpisode, saveEpisode, saveShot, refreshWorkflows, mergeWorkflowDetail, getEpisodeAssemblies, getAssembly, getReleaseBundles, verifyReleaseBundle, notify }
 })

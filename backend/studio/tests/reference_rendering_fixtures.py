@@ -1,13 +1,70 @@
-"""Explicit test configurations; never imported by runtime code."""
+"""Explicit renderer test facts and configurations; never imported by runtime code."""
 from copy import deepcopy
 from importlib import import_module
 
 FRAME_POLICY = {"fps": 24, "minimum_frames": 5, "maximum_frames": 3600, "alignment_modulus": 17, "alignment_remainder": 5}
 
 
+def generation_structure_fixture(profile, *, properties=("direction",)):
+    """Publish an explicit custom input fixture, not a map from legacy columns."""
+    from studio.tests.field_definition_fixtures import create_field_definition
+    from studio.services.data_structures import write_data_structure, transition_data_structure
+
+    nodes = []
+    for position, (key, kind, parent) in enumerate([("root", "object", None), *[(key, "text", "root") for key in properties]]):
+        field = create_field_definition(key=f"generation_{profile.pk.hex}_{key}", label=key, value_type=kind)
+        nodes.append({"node_key": key, "parent_key": parent,
+            "field_definition_version": str(field._fixture_version.pk),
+            **({"property_name": key, "required": True, "position": position} if parent else {})})
+    structure = write_data_structure(content={"name": "Explicit unit input fixture", "nodes": nodes})
+    profile.input_structure_version = transition_data_structure(version_id=structure.pk, status="published")
+    profile.save(update_fields=("input_structure_version",))
+
+
+def profile_compilation_fixture(*, sources, reference_context=None, reviewed_values=None,
+                                generation_contributions=None, source_language="Chinese", target_language="English"):
+    """Only construct explicit compiler inputs; no source lookup or approval."""
+    from studio.services.prompt_profile_compiler import PromptProfileCompilationFacts
+
+    return PromptProfileCompilationFacts(
+        sources=deepcopy(sources), source_language=source_language, target_language=target_language,
+        reference_context=deepcopy(reference_context),
+        reviewed_values=deepcopy({} if reviewed_values is None else reviewed_values),
+        generation_contributions=deepcopy({} if generation_contributions is None else generation_contributions),
+    )
+
+
+def reference_unit_fixture(**values):
+    """Empty explicit test unit; never read a Shot or infer dialogue/subjects."""
+    from studio.services.reference_context_facts import ReferenceUnitFacts
+    from studio.services.reference_rendering_inputs import UNIT_RENDER_SLOTS
+
+    return ReferenceUnitFacts(**deepcopy({
+        "unit_key": "fixture-unit", "duration_ms": 3500,
+        "render_values": {key: "" for key in UNIT_RENDER_SLOTS},
+        "subject_keys": (), "dialogue": (), "voice_profiles": (), "continuity_notes": "",
+        "requires_first_frame_continuity": False, "requires_last_frame_continuity": False,
+        "ambient_sound": "", **values,
+    }))
+
+
+def reference_context_fixture(*, ordered_units, **values):
+    """Explicit renderer test data; no owner, ORM, translation or selection."""
+    from studio.services.reference_context_facts import ReferenceContextFacts
+    from studio.tests.factories import conditioning_contract
+
+    return ReferenceContextFacts(**deepcopy({
+        "prompt_type": "video", "mode": "T2VA", "include_audio": True, "language": "Chinese",
+        "ordered_units": ordered_units, "subject_facts": (), "reference_bindings": (),
+        "conditioning_mode_contract": conditioning_contract("T2VA")["modes"][0],
+        "frame_policy": FRAME_POLICY, "color_script": "", "extra_direction": "",
+        "overall_soundscape": "", "non_diegetic_music": "", "generation_contributions": {}, **values,
+    }))
+
+
 def rendering_config():
     rendering = deepcopy(import_module("studio.migrations.0140_explicit_reference_rendering_drafts").RENDERING)
-    rendering.update(task_separator=" + ", unreferenced_task="reference generation", reference_rules=[
+    rendering.update(unit_text_bindings={}, task_separator=" + ", unreferenced_task="reference generation", reference_rules=[
         {"category": category, "purpose": purpose, "task": task, "relationship": relationship, "usage": usage}
         for category, purpose, task, relationship, usage in (
             ("character", "", "reference generation", "fully_preserved", "Preserve the referenced character identity."),

@@ -5,218 +5,153 @@ import { fileURLToPath } from 'node:url'
 
 import { createServer } from 'vite'
 
-import { adaptPromptArtifact } from '../src/services/promptArtifactAdapter.ts'
 import { adaptTaskProgressTelemetry, workflowProgressPresentation } from '../src/services/taskProgress.ts'
 
-test('image prompt keeps text-only conditioning and configured template metadata', () => {
-  const adapted = adaptPromptArtifact({
-    prompt_type: 'image',
-    model: 'fictional-image-v9',
-    prompt_text: 'cinematic wuxia portrait',
-    total_duration_ms: 5000,
-    include_audio: false,
-    is_multi_shot: false,
-    structured_payload: {
-      effective_conditioning_mode: 'TEXT_ONLY',
-      prompt_template_key: 'fictional_txt2img_v9',
-      duration_ms: 5000,
-      reference_bindings: [{ asset_id: 'must-not-become-an-image-input' }],
-      quality: {
-        status: 'ready',
-        language_policy: 'English image director prose',
-        prompt_character_count: 26,
-        prompt_word_count: 3,
-        prompt_word_count_is_approximate: true,
-        warnings: [],
-        fields_requiring_english_rewrite: []
-      }
-    }
-  })
-
-  assert.equal(adapted.mediaType, 'image')
-  assert.equal(adapted.effective_conditioning_mode, 'TEXT_ONLY')
-  assert.equal(adapted.prompt_template_key, 'fictional_txt2img_v9')
-  assert.equal(adapted.quality?.prompt_word_count, 3)
-  assert.equal(adapted.duration, undefined)
-  assert.equal(adapted.reference_bindings, undefined)
-})
-
-test('video prompt retains mode, duration and reference bindings', () => {
-  const bindings = [{ asset_id: 'reference-1' }]
-  const adapted = adaptPromptArtifact({
-    prompt_type: 'video',
-    model: 'fictional-video-v2',
-    conditioning_mode: 'Ref2VA',
-    total_duration_ms: 5000,
-    include_audio: true,
-    is_multi_shot: false,
-    prompt_text: 'camera tracks the swordsman',
-    structured_payload: {
-      effective_conditioning_mode: 'Ref2VA',
-      prompt_template_key: 'h3_r2v_classified_v1',
-      reference_bindings: bindings
-    }
-  })
-
-  assert.equal(adapted.mediaType, 'video')
-  assert.equal(adapted.mode, 'Ref2VA')
-  assert.equal(adapted.model, 'fictional-video-v2')
-  assert.equal(adapted.duration, 5)
-  assert.equal(adapted.includeAudio, true)
-  assert.equal(adapted.isMultiShot, false)
-  assert.deepEqual(adapted.reference_bindings, bindings)
-})
-
-test('prompt artifact adapter rejects missing authoritative runtime fields', () => {
-  assert.throws(() => adaptPromptArtifact({
-    structured_payload: {
-      model: 'old-structured-model',
-      mode: 'old-mode',
-      detailed_description: 'must not become the actual prompt',
-    },
-  }), /prompt_type/)
-  assert.throws(() => adaptPromptArtifact({
-    prompt_type: 'video',
-    model: 'fictional-video-v2',
-    conditioning_mode: 'T2VA',
-    prompt_text: 'one explicit prompt',
-    include_audio: false,
-    is_multi_shot: false,
-    structured_payload: {},
-  }), /effective_conditioning_mode/)
-  assert.throws(() => adaptPromptArtifact({
-    prompt_type: 'video', model: 'fictional-video-v2', conditioning_mode: 'T2VA',
-    prompt_text: 'one explicit prompt', structured_payload: { effective_conditioning_mode: 'T2VA' },
-    is_multi_shot: false,
-  }), /include_audio/)
-  assert.throws(() => adaptPromptArtifact({
-    prompt_type: 'video', model: 'fictional-video-v2', conditioning_mode: 'T2VA',
-    prompt_text: 'one explicit prompt', structured_payload: { effective_conditioning_mode: 'T2VA' },
-    include_audio: false,
-  }), /is_multi_shot/)
-  assert.throws(() => adaptPromptArtifact({
-    prompt_type: 'image', model: 'fictional-image-v2', prompt_text: 'still image',
-    structured_payload: {}, include_audio: true, is_multi_shot: false,
-  }), /图片 PromptArtifact 不能包含音频/)
-})
-
-test('Ref2VA first-frame continuity reference is serialized as a soft picture slot', async (context) => {
-  const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
-  const server = await createServer({
-    root: frontendRoot,
-    logLevel: 'silent',
-    appType: 'custom',
-    server: { middlewareMode: true, hmr: false },
-  })
+test('content saves preserve timing and episode settings without resurrecting retired creative columns', async (context) => {
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent',
+    appType: 'custom', server: { middlewareMode: true, hmr: false } })
   context.after(async () => { await server.close() })
-  const { referenceAssetIdsForShot, referenceBindingsPayload } = await server.ssrLoadModule('/src/services/backendAdapters.ts')
-  const bindings = {
-    firstFrameReferenceAssetId: 'asset-tail-frame',
-    characters: [{ entityId: 'character-1', assetId: 'asset-character' }],
-    props: [],
+  const { adaptShot, shotPersistencePayload, adaptCreatedEpisode } = await server.ssrLoadModule('/src/services/backendAdapters.ts')
+  const { api } = await server.ssrLoadModule('/src/services/api.ts')
+  const { repository } = await server.ssrLoadModule('/src/services/repository.ts')
+  const raw = { id: '29c81b7c-cdeb-44f0-8471-5db8f406a5b1', number: 1, title: 'test',
+    narrative: '[0s–2s] Boat drifts.\n[2s–5s] Boat stops.', action: 'Boat approaches a stone.', camera: '',
+    media_type: 'video', duration_ms: 5000, episode_start_ms: 45000, episode_end_ms: 50000,
+    include_audio: true, conditioning_mode: 'Ref2VA', dialogue: [], character_relations: [], props: [],
+    metadata: {}, reference_bindings: {}, continuity_notes: 'Keep the same light.' }
+  const project = { id: 'project', bible: { characters: [], scenes: [], props: [] } }
+  const shot = adaptShot(raw)
+  for (const key of ['narrative', 'action', 'framing', 'camera', 'negativePrompt', 'continuityNotes']) {
+    assert.equal(key in shot, false, key)
   }
-  assert.deepEqual(referenceBindingsPayload(bindings), {
-    first_frame_reference_asset_id: 'asset-tail-frame',
-    characters: [{ entity_id: 'character-1', asset_id: 'asset-character' }],
-  })
-  const shot = {
-    mode: 'Ref2VA',
-    referenceBindings: bindings,
+  const payload = shotPersistencePayload(project, shot)
+  for (const key of ['episode_start_ms', 'episode_end_ms', 'duration_ms', 'dialogue']) {
+    assert.deepEqual(payload[key], raw[key], key)
   }
-  assert.deepEqual(
-    referenceAssetIdsForShot(shot),
-    ['asset-tail-frame', 'asset-character'],
-  )
+  assert.deepEqual(payload.metadata, {})
+  assert.equal('reference_bindings' in payload, false)
+  assert.equal('reference_assets' in payload, false)
+  assert.equal('referenceBindings' in shot, false)
+  assert.equal('referenceAssetIds' in shot, false)
+  const empty = adaptShot({ ...raw, narrative: '', action: 'Only an action summary.' })
+  assert.equal('narrative' in shotPersistencePayload(project, empty), false)
+  const changed = { ...shot, narrative: 'Edited narrative', action: 'Edited summary' }
+  for (const key of ['narrative', 'action', 'camera', 'continuity_notes', 'negative_prompt', 'lighting', 'framing']) {
+    assert.equal(key in shotPersistencePayload(project, changed), false, key)
+  }
+  const settings = { include_audio: true, script_source: { id: 'confirmed-script', sha256: 'source' },
+    breakdown_method: 'test-parser', default_shot_duration_ms: 5000 }
+  const episode = adaptCreatedEpisode({ id: 'episode', number: 1, title: 'test', status: 'draft', prompt_settings: settings })
+  episode.shots = [shot]
+  episode.audioEnabled = false
+  const originalPatch = api.patch
+  const writes = []
+  api.patch = async (url, body) => {
+    writes.push({ url, body })
+    return { data: { id: url.includes('/episodes/') ? 'episode' : raw.id, ...body } }
+  }
+  try {
+    const saved = await repository.saveEpisode(project, episode)
+    assert.deepEqual(writes[0].body.prompt_settings, { ...settings, include_audio: false })
+    assert.deepEqual(saved.promptSettings, { ...settings, include_audio: false })
+    assert.equal(saved.shots[0].duration, 5)
+    assert.equal('narrative' in saved.shots[0], false)
+    assert.equal('action' in saved.shots[0], false)
+  } finally { api.patch = originalPatch }
 })
 
-test('task adapter preserves the safe frozen identity used by whole-episode grouping', async (context) => {
+test('shot persistence keeps exact independent identities and raw dialogue, including when audio is disabled', async (context) => {
+  const server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), logLevel: 'silent',
+    appType: 'custom', server: { middlewareMode: true, hmr: false } })
+  context.after(async () => { await server.close() })
+  const { adaptShot, shotPersistencePayload } = await server.ssrLoadModule('/src/services/backendAdapters.ts')
+  const first='11111111-1111-4111-8111-111111111111', second='22222222-2222-4222-8222-222222222222'
+  const raw={id:'33333333-3333-4333-8333-333333333333',number:1,media_type:'video',include_audio:false,duration_ms:6000,episode_start_ms:null,episode_end_ms:null,
+    narrative:'',dialogue:[{speaker_id:'S2',text:'  原文\n保留  ',delivery:' softly ',voiceover:true,start_ms:123,end_ms:987}],
+    character_relations:[{role:'visible',position:0,character_id:first},{role:'speaker',position:0,character_id:second}]}
+  const project={bible:{characters:[{id:first,name:'同名',stableSpeakerId:'S1'},{id:second,name:'同名',stableSpeakerId:'S2'}],scenes:[],props:[]}}
+  const shot=adaptShot(raw)
+  const result=shotPersistencePayload(project,shot)
+  assert.deepEqual(result.dialogue,raw.dialogue)
+  assert.deepEqual(result.character_relations,raw.character_relations)
+  assert.equal('characters' in result,false)
+  shot.characterRelations=shot.characterRelations.filter(row=>row.role==='speaker')
+  assert.equal(shotPersistencePayload(project,shot).character_relations.length,1)
+  shot.mediaType='image'
+  assert.deepEqual(shotPersistencePayload(project,shot).dialogue,raw.dialogue)
+  shot.characterRelations[0].character_id=first
+  assert.throws(()=>shotPersistencePayload(project,shot),/身份不一致/)
+  assert.throws(()=>adaptShot({...raw,character_relations:undefined,characters:[first,second]}),/不从旧人物池推断/)
+})
+
+test('task adapter preserves actual Run identity and strict prepared inputs', async (context) => {
   const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
-  const server = await createServer({
-    root: frontendRoot,
-    logLevel: 'silent',
-    appType: 'custom',
-    server: { middlewareMode: true, hmr: false },
-  })
+  const server = await createServer({ root: frontendRoot, logLevel: 'silent', appType: 'custom',
+    server: { middlewareMode: true, hmr: false } })
   context.after(async () => { await server.close() })
   const { adaptTasks } = await server.ssrLoadModule('/src/services/backendAdapters.ts')
-  const [task, invalid, legacy] = adaptTasks([{
-    id: 'task-1',
-    project_id: 'project-1',
-    episode_id: 'episode-1',
-    shot_id: 'shot-1',
-    status: 'queued',
-    kind: 'video',
-    production_run_id: '11111111-1111-4111-8111-111111111111',
-    production_variant_number: 2,
-    input_parameters: { reference_assets: [], continuity_assets: [] },
+  const execution = { production_run_id: 'run-1', stage_run_id: 'stage-1', stage_key: 'media_generation', stage_ordinal: 1,
+    unit_key: 'candidate-2', attempt_id: 'attempt', attempt_number: 1, preparation_id: 'prep',
+    execution_instance_version_id: 'instance', operation: 'video.generate' }
+  const frozen = () => ({ kind: 'video', execution, input_contract_status: 'available', input_contract_code: '', input_parameters: {
+    preparation_id: 'prep', attempt_id: 'attempt', execution_instance_version_id: 'instance',
+    workflow_version_id: 'workflow', request_sha256: 'request', operation: 'video.generate', output_kind: 'video',
+    prompt_mode: 'manual', prompt_profile_version_id: null, parameters: [], media_uses: [], prompt_channels: []
+  } })
+  const [task, unavailable] = adaptTasks([{
+    id: 'task-1', project: 'project-1', episode_id: null, episode_number: null, episode_title: '', project_title: 'Actual project',
+    status: 'queued', kind: 'video', production_run_id: 'OLD-IGNORED', production_variant_number: 2, ...frozen()
   }, {
-    id: 'task-2',
-    project_id: 'project-1',
-    status: 'queued',
-    kind: 'video',
-    production_variant_number: -1,
-    input_parameters: { reference_assets: [], continuity_assets: [] },
-  }, {
-    id: 'task-legacy',
-    project_id: 'project-1',
-    status: 'succeeded',
-    kind: 'video',
-    input_contract_status: 'unavailable',
-    input_contract_code: 'legacy_schema_unsupported',
-    input_parameters: null,
+    id: 'task-invalid', project: 'project-1', execution: null, status: 'failed', kind: 'video',
+    input_contract_status: 'unavailable', input_contract_code: 'frozen_contract_invalid', input_parameters: null
   }])
-
-  assert.equal(task.productionRunId, '11111111-1111-4111-8111-111111111111')
-  assert.equal(task.productionVariantNumber, 2)
-  assert.equal(invalid.productionVariantNumber, undefined)
-  assert.equal(legacy.inputContractStatus, 'unavailable')
-  assert.equal(legacy.inputContractCode, 'legacy_schema_unsupported')
-  assert.equal(legacy.inputParameters, undefined)
-  assert.equal(legacy.promptAvailable, false)
-  assert.deepEqual(legacy.referenceAssets, [])
-  assert.deepEqual(legacy.continuityAssets, [])
-  assert.throws(
-    () => adaptTasks([{ id: 'task-without-contract', status: 'queued', kind: 'video' }]),
-    /缺少冻结 input_parameters 合同/,
-  )
-  assert.throws(
-    () => adaptTasks([{
-      id: 'task-unavailable-without-code', status: 'succeeded', kind: 'video',
-      input_contract_status: 'unavailable', input_parameters: null,
-    }]),
-    /缺少稳定的输入合同不可用原因码/,
-  )
-  assert.throws(
-    () => adaptTasks([{
-      id: 'task-unavailable-with-fake-inputs', status: 'succeeded', kind: 'video',
-      input_contract_status: 'unavailable', input_contract_code: 'frozen_contract_invalid',
-      input_parameters: { reference_assets: [], continuity_assets: [] },
-    }]),
-    /不可用输入合同必须返回 null/,
-  )
-  assert.throws(
-    () => adaptTasks([{
-      id: 'task-without-media-kind',
-      status: 'queued',
-      kind: 'video',
-      input_parameters: {
-        reference_assets: [{ asset_id: 'asset-1', category: 'video' }],
-        continuity_assets: [],
-      },
-    }]),
-    /media_kind 缺失或无效/,
-  )
+  assert.equal(task.execution.productionRunId, 'run-1')
+  assert.equal(task.execution.unitKey, 'candidate-2')
+  assert.equal(task.productionVariantNumber, undefined)
+  assert.equal(task.productionRunId, undefined)
+  assert.equal(task.episodeNumber, undefined)
+  const cancelled = adaptTasks([{ ...frozen(), status: 'cancelled' }])[0]
+  assert.equal(cancelled.currentStep, '任务已取消；请返回所属制作轮次查看可用操作')
+  assert.doesNotMatch(cancelled.currentStep, /创建.*重试/)
+  assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.nodes[0].status, 'cancelled')
+  const cancelling = adaptTasks([{ ...frozen(), status: 'cancel_requested', progress_source:'comfyui', comfy_progress:75 }])[0]
+  assert.equal(cancelling.status, 'cancel_requested')
+  assert.equal(cancelling.nodes[0].status, 'cancel_requested')
+  assert.equal(workflowProgressPresentation(cancelled).compactLabel, '已取消')
+  assert.equal(workflowProgressPresentation(cancelled).percent, undefined)
+  assert.equal(workflowProgressPresentation(cancelling).compactLabel, '取消中')
+  assert.equal(workflowProgressPresentation(cancelling).percent, undefined)
+  assert.equal(unavailable.execution, null)
+  assert.equal(unavailable.inputContractStatus, 'unavailable')
+  assert.equal(unavailable.inputParameters, undefined)
+  assert.deepEqual(unavailable.referenceAssets, [])
+  assert.deepEqual(unavailable.contextMediaUses, [])
+  assert.throws(() => adaptTasks([{ id: 'missing', execution: null, status: 'queued', kind: 'video' }]), /状态缺失/)
+  assert.throws(() => adaptTasks([{ id: 'missing-code', kind: 'video', execution: null, input_contract_status: 'unavailable', input_parameters: null }]), /必须明确为空并提供原因/)
+  const audioSource = { ...frozen(), kind: 'audio' }
+  audioSource.input_parameters.output_kind = 'audio'
+  const audio = adaptTasks([audioSource])[0]
+  assert.equal(audio.kind, 'audio')
+  assert.equal(audio.nodes[0].type, 'audio')
+  assert.match(audio.nodes[0].label, /音频/)
+  assert.throws(() => adaptTasks([{ ...frozen(), kind: undefined }]), /产物类型/)
+  assert.throws(() => adaptTasks([{ ...frozen(), kind: 'audio' }]), /本次输入准备不一致/)
+  assert.throws(() => adaptTasks([{ ...frozen(), input_contract_status: 'unavailable', input_contract_code: 'frozen_contract_invalid' }]), /必须明确为空并提供原因/)
+  const malformed = frozen()
+  malformed.input_parameters.media_uses = [{ asset_id: 'asset-1', category: 'video' }] as never
+  assert.throws(() => adaptTasks([malformed]), /素材使用类型缺失/)
 })
 
-test('task page presents unavailable frozen contracts bilingually without detail hydration', () => {
+test('task page presents invalid prepared inputs without misleading legacy labels or detail hydration', () => {
   const source = readFileSync(
-    new URL('../src/views/WorkflowView.vue', import.meta.url),
+    new URL('../src/components/TaskMediaInspector.vue', import.meta.url),
     'utf8',
   )
 
-  assert.match(source, /历史执行合同不可展示 \/ LEGACY EXECUTION CONTRACT UNAVAILABLE/)
+  assert.match(source, /本次执行输入不可展示/)
   assert.match(source, /原因码 \/ Code/)
-  assert.match(source, /if\(workflow\.inputContractStatus==='unavailable'\)return workflow/)
+  assert.match(source, /selectedInputContractUnavailable/)
   assert.match(source, /v-if="!selectedInputContractUnavailable"[^>]+@click="copyInputParameters"/)
 })
 
@@ -266,12 +201,12 @@ test('style adapters use only backend facts and preserve unknown server identifi
     id: 'project-1', title: '项目', style: backendId, language: 'Chinese', aspect_ratio: '9:16', width: 768, height: 1344, production_settings: {},
   })
   assert.equal(project.styleId, 'wuxia')
-  assert.equal(project.defaultMode, '')
+  assert.equal('defaultMode' in project, false)
   assert.equal(project.language, 'Chinese')
   assert.equal(project.aspectRatio, '9:16')
 
   const payload = adapters.projectPayload({ title: '新项目', language: 'Chinese', aspectRatio: '9:16', width: 768, height: 1344 })
-  assert.equal(payload.production_settings.default_conditioning_mode, '')
+  assert.equal('default_conditioning_mode' in payload.production_settings, false)
   assert.equal('bible_image_prompt_config' in payload.production_settings, false)
   assert.equal(payload.language, 'Chinese')
   assert.equal(payload.aspect_ratio, '9:16')
@@ -286,20 +221,6 @@ test('style adapters use only backend facts and preserve unknown server identifi
     name: '仅服务端风格',
   }])
   assert.equal(withoutCount.assetCount, null)
-})
-
-test('prompt artifact adapter keeps backend-authoritative compiler freshness metadata', () => {
-  const adapted = adaptPromptArtifact({
-    id: 'artifact-1', revision: 7, created_at: '2026-08-10T09:30:00Z',
-    compiler_current: false, prompt_type: 'video', prompt_text: 'configured prompt',
-    model: 'fictional-video-v2', conditioning_mode: 'T2VA', include_audio: false, is_multi_shot: true,
-    structured_payload: { effective_conditioning_mode: 'T2VA' },
-  })
-
-  assert.equal(adapted.compiler_current, false)
-  assert.equal(adapted.artifact_id, 'artifact-1')
-  assert.equal(adapted.artifact_revision, 7)
-  assert.equal(adapted.artifact_created_at, '2026-08-10T09:30:00Z')
 })
 
 test('legacy running progress never guesses that the submission marker is quantifiable', () => {

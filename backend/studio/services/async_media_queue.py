@@ -3,26 +3,27 @@ from __future__ import annotations
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
+import json
 import math
 import time
 import uuid
+from functools import wraps
 
 from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from studio.models import GeneratedArtifact, GenerationAttempt, GenerationAttemptResolution, ProductionRun
-from studio.services.async_media_contract import (
-    ASYNC_MEDIA_OPERATIONS,
-    async_operation_contract,
-    frozen_async_deployment,
-    validate_standard_payload,
-)
+from studio.models import ExecutionTextResponseReview, GeneratedArtifact, GenerationAttempt, GenerationAttemptResolution, ProductionRun
+from studio.services.async_media_contract import ASYNC_MEDIA_OPERATIONS
+from studio.services.execution_production_media import read_prepared_production_media, production_media_peer
+from studio.services.execution_production_dispatch import begin_production_execution_submission
+from studio.services.execution_preparation_owners import locked_preparation_owner_rows
 from studio.services.configuration import resolve_configuration
-from studio.services.json_contracts import canonical_json_bytes, verify_json_contract
+from studio.services.json_contracts import canonical_json_bytes
 from studio.services.provider_registry import (
     ProviderDriverError,
+    ProviderCollectResponseError,
     driver_for,
     restricted_async_rest_runtime_budget,
 )
@@ -33,14 +34,9 @@ from studio.services.execution_deadlines import (
     validate_deadline_seconds,
 )
 from studio.services.remote_artifacts import archive_remote_artifacts
-from studio.services.bible_reference_contract import BIBLE_IMAGE_GENERATION_STAGE_KEY
 from studio.services.text_generation_queue import append_attempt_resolution
 from studio.services.production_run_auto_advance import schedule_production_run_advance
 from studio.services.security_boundaries import boundary_int
-
-
-def _stage_snapshot_max_bytes() -> int:
-    return boundary_int("security.snapshot.stage_max_bytes")
 
 
 def _attempt_deadline_seconds(attempt: GenerationAttempt) -> tuple[float, float]:
@@ -70,6 +66,8 @@ def claim_next_async_media_attempt(worker_id: str) -> GenerationAttempt | None:
         .select_related("stage_run__production_run", "model_deployment__profile_version__provider")
         .filter(
             operation__in=ASYNC_MEDIA_OPERATIONS,
+            execution_instance_version__deployment__profile_version__provider__driver_type="async_rest",
+            role="primary",
             status__in=(
                 GenerationAttempt.Status.QUEUED,
                 GenerationAttempt.Status.SUBMITTED,
@@ -77,71 +75,56 @@ def claim_next_async_media_attempt(worker_id: str) -> GenerationAttempt | None:
             ),
             claim_token__isnull=True,
         )
+        .exclude(status="queued", error_code="execution_resource_confirmation_required")
         .filter(Q(next_poll_at__isnull=True) | Q(next_poll_at__lte=now))
         .order_by("created_at")
         .first()
     )
     if attempt is None:
         return None
-    if attempt.deadline_started_at is None:
-        configured_idle, hard_seconds = _attempt_deadline_seconds(attempt)
-        deadlines = initial_deadlines(
-            idle_seconds=configured_idle,
-            hard_seconds=hard_seconds,
-            now=now,
-            marker="phase:claimed",
-        )
-        attempt.deadline_started_at = deadlines.started_at
-        attempt.hard_deadline_at = deadlines.hard_deadline_at
-        attempt.idle_deadline_at = deadlines.idle_deadline_at
-        attempt.last_meaningful_progress_at = deadlines.last_meaningful_progress_at
-        attempt.progress_marker = deadlines.progress_marker
     attempt.claim_token = uuid.uuid4()
     attempt.worker_id = str(worker_id)[:160]
     attempt.claimed_at = now
     attempt.heartbeat_at = now
     attempt.save(update_fields=(
         "claim_token", "worker_id", "claimed_at", "heartbeat_at",
-        "deadline_started_at", "hard_deadline_at", "idle_deadline_at",
-        "last_meaningful_progress_at", "progress_marker", "updated_at",
+        "updated_at",
     ))
     return attempt
 
 
-def _release_claim(attempt_id, claim_token) -> None:
-    GenerationAttempt.objects.filter(pk=attempt_id, claim_token=claim_token).update(
-        claim_token=None,
-        worker_id="",
-        claimed_at=None,
-        heartbeat_at=timezone.now(),
-        updated_at=timezone.now(),
-    )
-
-
 def _snapshot(attempt: GenerationAttempt) -> dict:
-    verify_json_contract(
-        attempt.request_snapshot,
-        schema_version=attempt.request_snapshot_schema_version,
-        size_bytes=attempt.request_snapshot_size_bytes,
-        sha256=attempt.request_snapshot_sha256,
-        max_bytes=_stage_snapshot_max_bytes(),
-    )
-    if attempt.request_sha256 != attempt.request_snapshot_sha256:
-        raise ValidationError("async attempt request identity 已漂移")
-    snapshot = attempt.request_snapshot
-    if (
-        not isinstance(snapshot, dict)
-        or snapshot.get("schema_version") != 1
-        or snapshot.get("transport") != "restricted_async_rest"
-        or snapshot.get("operation") not in ASYNC_MEDIA_OPERATIONS
-        or not isinstance(snapshot.get("route"), dict)
-        or not isinstance(snapshot.get("payload"), dict)
-    ):
-        raise ValidationError("async attempt request snapshot 无效")
-    return snapshot
+    return read_prepared_production_media(attempt)
 
 
-@transaction.atomic
+def _attempt_root_locked(function):
+    @wraps(function)
+    def call(attempt_id, *args, **kwargs):
+        stage_id = GenerationAttempt.objects.values_list("stage_run_id", flat=True).get(pk=attempt_id)
+        with locked_preparation_owner_rows([("stage_run_id", stage_id)]):
+            return function(attempt_id, *args, **kwargs)
+    return call
+
+
+@_attempt_root_locked
+def _initialize_attempt_deadlines(attempt_id, claim_token):
+    attempt = GenerationAttempt.objects.select_for_update().select_related("stage_run__production_run").get(pk=attempt_id)
+    if attempt.claim_token != claim_token or attempt.status not in {"queued", "submitted", "cancel_requested"}:
+        return attempt
+    if attempt.deadline_started_at is None:
+        if attempt.submission_started_at is not None or attempt.provider_request_id:
+            raise ValidationError("已提交媒体任务缺少原始时限，不能重置执行时间")
+        idle, hard = _attempt_deadline_seconds(attempt)
+        value = initial_deadlines(idle_seconds=idle, hard_seconds=hard, now=timezone.now(), marker="phase:claimed")
+        attempt.deadline_started_at, attempt.hard_deadline_at = value.started_at, value.hard_deadline_at
+        attempt.idle_deadline_at = value.idle_deadline_at
+        attempt.last_meaningful_progress_at, attempt.progress_marker = value.last_meaningful_progress_at, value.progress_marker
+        attempt.save(update_fields=("deadline_started_at", "hard_deadline_at", "idle_deadline_at",
+            "last_meaningful_progress_at", "progress_marker", "updated_at"))
+    return attempt
+
+
+@_attempt_root_locked
 def _fail(
     attempt_id,
     claim_token,
@@ -157,9 +140,9 @@ def _fail(
         run = ProductionRun.objects.select_for_update().get(
             pk=attempt.stage_run.production_run_id,
         )
-        run.committed_cost_total = max(
-            Decimal("0"), run.committed_cost_total - attempt.committed_cost,
-        )
+        if attempt.committed_cost > run.committed_cost_total:
+            raise ValidationError("媒体任务预留与运行账目不一致")
+        run.committed_cost_total -= attempt.committed_cost
         run.save(update_fields=("committed_cost_total", "updated_at"))
         attempt.committed_cost = Decimal("0")
     attempt.status = GenerationAttempt.Status.FAILED
@@ -179,11 +162,18 @@ def _fail(
     return attempt
 
 
-@transaction.atomic
+@_attempt_root_locked
 def _cancelled(attempt_id, claim_token, *, code: str, message: str) -> GenerationAttempt:
     attempt = GenerationAttempt.objects.select_for_update().get(pk=attempt_id)
     if attempt.claim_token != claim_token:
         return attempt
+    if attempt.submission_started_at is None and attempt.committed_cost:
+        run = ProductionRun.objects.select_for_update().get(pk=attempt.stage_run.production_run_id)
+        if attempt.committed_cost > run.committed_cost_total:
+            raise ValidationError("未提交媒体任务的预留账目不一致")
+        run.committed_cost_total -= attempt.committed_cost
+        run.save(update_fields=("committed_cost_total", "updated_at"))
+        attempt.committed_cost = Decimal("0")
     if code == "late_result_ignored":
         append_attempt_resolution(
             attempt,
@@ -207,7 +197,7 @@ def _cancelled(attempt_id, claim_token, *, code: str, message: str) -> Generatio
     attempt.next_poll_at = None
     attempt.save(update_fields=(
         "status", "error_code", "error_message", "finished_at", "claim_token",
-        "worker_id", "claimed_at", "heartbeat_at", "next_poll_at", "updated_at",
+        "worker_id", "claimed_at", "heartbeat_at", "next_poll_at", "committed_cost", "updated_at",
     ))
     schedule_production_run_advance(attempt.stage_run.production_run_id)
     return attempt
@@ -225,53 +215,74 @@ def _amount(value) -> Decimal | None:
     return result
 
 
-def _resolved_actual_cost(attempt: GenerationAttempt, collected: dict, config: dict) -> tuple[Decimal, str]:
+def _resolved_actual_cost(attempt: GenerationAttempt, collected: dict, config: dict) -> tuple[Decimal | None, str]:
     actual = _amount(collected.get("actual_cost"))
-    currency = str(collected.get("currency") or attempt.cost_currency or "").strip().upper()
-    pricing = config.get("pricing") if isinstance(config.get("pricing"), dict) else {}
-    if actual is None and set(pricing) == {"currency", "fixed_per_request"}:
-        actual = attempt.committed_cost
-        currency = str(pricing.get("currency") or currency).strip().upper()
     if actual is None:
-        raise ProviderDriverError(
-            "provider 未返回实际费用，需要管理员对账",
-            code="actual_cost_reconciliation_required",
-        )
-    if actual > 0 and not currency:
+        return None, attempt.cost_currency
+    currency = collected.get("currency")
+    if not isinstance(currency, str) or currency != attempt.cost_currency:
         raise ProviderDriverError("provider 实际费用缺少币种", code="actual_cost_invalid")
     return actual, currency
 
 
-@transaction.atomic
+def _settle_actual_bill(attempt, run, actual_cost, currency):
+    """Locked original ledger; absent bills remain unknown, repeat bills must agree."""
+    if actual_cost is None:
+        return
+    actual_cost = _amount(actual_cost)
+    if not currency or currency != attempt.cost_currency or (actual_cost and run.cost_currency and run.cost_currency != currency):
+        raise ProviderDriverError("实际费用币种与运行币种冲突", code="actual_cost_currency_conflict")
+    if attempt.actual_cost is not None:
+        if attempt.actual_cost != actual_cost:
+            raise ValidationError("同次媒体调用的实付回执不一致，不能覆盖原账目")
+        return
+    reserved = attempt.committed_cost
+    if reserved is None or reserved > run.committed_cost_total:
+        raise ValidationError("媒体任务预留与本次运行账目不一致")
+    attempt.actual_cost, attempt.cost_currency, attempt.committed_cost = actual_cost, currency, Decimal("0")
+    run.actual_cost_total += actual_cost
+    run.committed_cost_total -= reserved
+    if actual_cost:
+        run.cost_currency = currency
+    run.save(update_fields=("committed_cost_total", "actual_cost_total", "cost_currency", "updated_at"))
+    attempt.save(update_fields=("actual_cost", "cost_currency", "committed_cost", "updated_at"))
+
+
+@_attempt_root_locked
+def _record_actual_bill(attempt_id, claim_token, actual_cost, currency):
+    attempt = GenerationAttempt.objects.select_for_update().get(pk=attempt_id)
+    if attempt.claim_token != claim_token or attempt.status not in {"submitted", "cancel_requested"}:
+        raise ProviderDriverError("费用回执对应的任务租约已失效", code="async_claim_lost")
+    run = ProductionRun.objects.select_for_update().get(pk=attempt.stage_run.production_run_id)
+    _settle_actual_bill(attempt, run, actual_cost, currency)
+
+
+@_attempt_root_locked
 def _succeed(
     attempt_id,
     claim_token,
     *,
     artifacts: list[GeneratedArtifact],
-    actual_cost: Decimal,
+    actual_cost: Decimal | None,
     currency: str,
 ) -> GenerationAttempt:
     attempt = GenerationAttempt.objects.select_for_update().select_related("stage_run").get(pk=attempt_id)
-    if attempt.claim_token != claim_token:
+    if attempt.claim_token != claim_token or attempt.status not in {"submitted", "cancel_requested"}:
         return attempt
     run = ProductionRun.objects.select_for_update().get(pk=attempt.stage_run.production_run_id)
-    if run.cost_currency and currency and run.cost_currency != currency:
+    ids = [item.pk for item in artifacts]
+    current_artifacts = list(GeneratedArtifact.objects.select_for_update().filter(pk__in=ids,
+        generation_attempt=attempt, stage_run=attempt.stage_run, production_run=run).order_by("variant_index", "id"))
+    if (not ids or len(set(ids)) != len(ids) or len(current_artifacts) != len(ids)
+            or any(row.status != "available" or not row.sha256 or not row.manifest_metadata_sha256 or not row.size_bytes
+                for row in current_artifacts)):
+        raise ValidationError("媒体成功必须对应本次调用完整且尚未采用的真实候选")
+    artifacts = current_artifacts
+    if (actual_cost or attempt.committed_cost) and run.cost_currency and currency and run.cost_currency != currency:
         raise ProviderDriverError("实际费用币种与运行币种冲突", code="actual_cost_currency_conflict")
-    if attempt.actual_cost is None:
-        reserved = attempt.committed_cost or Decimal("0")
-        attempt.actual_cost = actual_cost
-        attempt.cost_currency = currency
-        attempt.committed_cost = Decimal("0")
-        run.actual_cost_total += actual_cost
-        run.committed_cost_total = max(
-            Decimal("0"), run.committed_cost_total - reserved,
-        )
-        if currency and not run.cost_currency:
-            run.cost_currency = currency
-        run.save(update_fields=(
-            "committed_cost_total", "actual_cost_total", "cost_currency", "updated_at",
-        ))
-    if attempt.ignore_late_result:
+    _settle_actual_bill(attempt, run, actual_cost, currency)
+    if attempt.ignore_late_result or attempt.status == "cancel_requested" or run.status in {"cancelled", "failed", "succeeded"}:
+        attempt.ignore_late_result = True
         append_attempt_resolution(
             attempt,
             outcome=GenerationAttemptResolution.Outcome.LATE_RESULT_IGNORED,
@@ -291,33 +302,13 @@ def _succeed(
         ).update(status=GeneratedArtifact.Status.REJECTED, updated_at=timezone.now())
     else:
         attempt.status = GenerationAttempt.Status.SUCCEEDED
-        if attempt.stage_run.stage_key != BIBLE_IMAGE_GENERATION_STAGE_KEY:
-            first = sorted(artifacts, key=lambda item: item.variant_index)[0]
-            if not GeneratedArtifact.objects.filter(
-                production_run=run,
-                variant_group=first.variant_group,
-                status=GeneratedArtifact.Status.SELECTED,
-            ).exists():
-                first.status = GeneratedArtifact.Status.SELECTED
-                first.save(update_fields=("status", "updated_at"))
         attempt.result_sha256 = hashlib.sha256(canonical_json_bytes([
             {"id": str(item.id), "sha256": item.sha256} for item in artifacts
         ])).hexdigest()
         attempt.error_code = ""
         attempt.error_message = ""
-        if run.budget_limit is not None and run.actual_cost_total > run.budget_limit:
-            stage = attempt.stage_run
-            stage.status = stage.Status.AWAITING_APPROVAL
-            stage.reason_code = "actual_budget_exceeded"
-            stage.reason = (
-                f"实际累计费用 {run.actual_cost_total} {run.cost_currency} "
-                f"超过预算 {run.budget_limit}；已保留真实产物，发布前必须提高预算。"
-            )
-            stage.save(update_fields=("status", "reason_code", "reason", "updated_at"))
-            run.status = run.Status.AWAITING_APPROVAL
-            run.blocked_code = stage.reason_code
-            run.blocked_reason = stage.reason
-            run.save(update_fields=("status", "blocked_code", "blocked_reason", "updated_at"))
+        from studio.services.execution_resource_policy import pause_production_actual_overage
+        pause_production_actual_overage(run, attempt.stage_run)
     attempt.finished_at = timezone.now()
     attempt.claim_token = None
     attempt.worker_id = ""
@@ -327,7 +318,7 @@ def _succeed(
     attempt.save(update_fields=(
         "status", "result_sha256", "committed_cost", "actual_cost", "cost_currency", "error_code",
         "error_message", "finished_at", "claim_token", "worker_id", "claimed_at",
-        "heartbeat_at", "next_poll_at", "updated_at",
+        "heartbeat_at", "next_poll_at", "ignore_late_result", "updated_at",
     ))
     schedule_production_run_advance(attempt.stage_run.production_run_id)
     return attempt
@@ -341,7 +332,7 @@ def _schedule(
     remote_status: str,
     progress_fraction: float | None = None,
 ) -> GenerationAttempt:
-    config = _config(frozen_async_deployment(_snapshot(attempt)["route"]))
+    config = _config(production_media_peer(attempt))
     runtime_budget = restricted_async_rest_runtime_budget(config)
     configured_idle, _hard_seconds = _attempt_deadline_seconds(attempt)
     interval = float(runtime_budget["poll_interval_seconds"])
@@ -389,16 +380,13 @@ def _schedule(
 
 
 def _submit(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment, driver) -> GenerationAttempt:
-    with transaction.atomic():
-        locked = GenerationAttempt.objects.select_for_update().get(pk=attempt.pk)
-        if locked.claim_token != claim_token or locked.status != GenerationAttempt.Status.QUEUED:
-            return locked
-        locked.status = GenerationAttempt.Status.SUBMITTING
-        locked.submission_started_at = timezone.now()
-        locked.heartbeat_at = locked.submission_started_at
-        locked.save(update_fields=("status", "submission_started_at", "heartbeat_at", "updated_at"))
+    from studio.services.execution_production_media import production_submission_payload
+    payload = production_submission_payload(attempt, snapshot)
+    allowed, attempt = begin_production_execution_submission(attempt)
+    if not allowed:
+        return attempt
     try:
-        response = driver.invoke(deployment, "submit", snapshot["payload"])
+        response = driver.invoke(deployment, "submit", payload)
     except ProviderDriverError as exc:
         code = "uncertain_remote_response" if exc.submission_uncertain else exc.code
         return _fail(
@@ -411,8 +399,8 @@ def _submit(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment,
             ),
             release_reservation=not exc.submission_uncertain,
         )
-    request_id = str(response.get("request_id") or "") if isinstance(response, dict) else ""
-    if not request_id:
+    request_id = response.get("request_id") if isinstance(response, dict) else None
+    if not isinstance(request_id, str) or not request_id.strip() or len(request_id) > 191:
         return _fail(
             attempt.pk,
             claim_token,
@@ -428,7 +416,7 @@ def _submit(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment,
             if locked.ignore_late_result
             else GenerationAttempt.Status.SUBMITTED
         )
-        locked.provider_request_id = request_id[:191]
+        locked.provider_request_id = request_id
         locked.remote_status = str(response.get("status") or "submitted")[:120]
         locked.submitted_at = timezone.now()
         configured_idle, _hard_seconds = _attempt_deadline_seconds(locked)
@@ -453,7 +441,71 @@ def _submit(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment,
         return locked
 
 
+def _read_collect_receipt(attempt):
+    from studio.services.execution_text_response_review import read_collect_receipt, read_retained_text_response
+    row = ExecutionTextResponseReview.objects.filter(attempt=attempt).first()
+    if row is None:
+        return None, ""
+    original, diagnostics, _, _ = read_retained_text_response(row)
+    return read_collect_receipt(original, request_id=attempt.provider_request_id), diagnostics.get("validation_code", "")
+
+
+@_attempt_root_locked
+def _retain_collect_receipt(attempt_id, claim_token, collected, *, terminal_success, validation_code=""):
+    """Commit the original call's observation before media validation/download."""
+    from django.core.files.storage import default_storage
+    from studio.services.execution_response_storage import store_response, ExecutionResponseStorageError
+    from studio.services.execution_text_response_review import COLLECT_RECEIPT_KIND, read_collect_receipt
+    from studio.services.execution_instances import execution_configuration_max_bytes
+    from studio.services.json_contracts import assign_json_contract
+
+    attempt = GenerationAttempt.objects.select_for_update().select_related("stage_run__production_run", "preparation").get(pk=attempt_id)
+    if attempt.claim_token != claim_token or claim_token is None:
+        raise ProviderDriverError("原回执返回前领取已失效", code="async_claim_lost")
+    if not isinstance(collected, dict) or collected.get("request_id") != attempt.provider_request_id:
+        raise ValidationError("生产 REST 回执与原远端请求身份不一致")
+    if (attempt.status == "cancel_requested" or attempt.cancel_requested_at is not None or attempt.ignore_late_result
+            or attempt.stage_run.status == "cancelled" or attempt.stage_run.production_run.status == "cancelled"):
+        return False
+    snapshot = read_prepared_production_media(attempt)
+    if (attempt.status != "submitted" or snapshot["driver_type"] != "async_rest"
+            or attempt.submission_started_at is None or attempt.submitted_at is None
+            or not attempt.provider_request_id or attempt.remote_status not in terminal_success):
+        raise ValidationError("生产 REST 回执缺少原请求的确切成功提交事实")
+    try:
+        text = json.dumps(collected, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValidationError("实际收集响应不是可保存的 JSON 回执") from exc
+    read_collect_receipt(text, request_id=attempt.provider_request_id)
+    existing, existing_code = _read_collect_receipt(attempt)
+    if existing is not None:
+        if existing != collected or existing_code != validation_code:
+            raise ValidationError("原调用已保留不同回执，不能覆盖")
+        return True
+    row = ExecutionTextResponseReview(attempt=attempt)
+    assign_json_contract(row, "diagnostics", {"schema_version": 1, "body_kind": COLLECT_RECEIPT_KIND,
+        "response_source": "async_rest_collect", "provider_request_id": attempt.provider_request_id,
+        "preparation_id": str(attempt.preparation_id), "request_sha256": attempt.request_sha256,
+        **({"validation_code": validation_code} if validation_code else {})},
+        max_bytes=execution_configuration_max_bytes())
+    key, row.original_size, row.original_sha256 = store_response(text)
+    row.original_file = key
+    try:
+        row.save()
+    except Exception as exc:
+        default_storage.delete(key)  # Only this failed write's newly created object.
+        raise ExecutionResponseStorageError("实际 REST 回执登记失败；不会自动重跑") from exc
+    return True
+
+
+def _record_collect_bill(attempt, claim_token, collected, deployment):
+    actual, currency = _resolved_actual_cost(attempt, collected, _config(deployment))
+    _record_actual_bill(attempt.pk, claim_token, actual, currency)
+    return actual, currency
+
+
 def _collect(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment, driver) -> GenerationAttempt:
+    from studio.services.execution_response_storage import ExecutionResponseStorageError
     last_heartbeat = [0.0]
     heartbeat_seconds = float(resolve_configuration(
         required_keys=("runtime.task_heartbeat_seconds",),
@@ -473,9 +525,35 @@ def _collect(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment
             raise ProviderDriverError("async attempt claim 已失效", code="async_claim_lost")
         last_heartbeat[0] = now_monotonic
 
+    collected, validation_code = None, ""
+    retained = True
     try:
-        collected = driver.invoke(deployment, "collect", {"request_id": attempt.provider_request_id})
+        collected, validation_code = _read_collect_receipt(attempt)
+        if collected is None:
+            try:
+                collected = driver.invoke(deployment, "collect", {"request_id": attempt.provider_request_id})
+            except ProviderCollectResponseError as exc:
+                collected, validation_code = exc.collect_receipt, exc.code
+            retained = _retain_collect_receipt(attempt.pk, claim_token, collected,
+                terminal_success=_config(deployment)["terminal_success"], validation_code=validation_code)
+        if validation_code:
+            if not retained:
+                return _cancelled(attempt.pk, claim_token, code="late_result_ignored", message="取消后的无效回执已忽略")
+            raise ProviderDriverError("原收集响应未通过驱动合同校验；实际回执已保留", code=validation_code)
         artifacts = collected.get("artifacts") if isinstance(collected, dict) else None
+        if not isinstance(collected, dict):
+            raise ProviderDriverError("媒体收取响应无效", code="artifact_response_invalid")
+        # A known real bill belongs to the remote call even if downloading its
+        # artifact fails or the user cancels before the bytes arrive.
+        try:
+            actual, currency = _record_collect_bill(attempt, claim_token, collected, deployment)
+        except (ProviderDriverError, ValidationError) as exc:
+            if not retained:
+                return _cancelled(attempt.pk, claim_token, code=getattr(exc, "code", None) or "actual_cost_conflict",
+                    message="调用已取消；晚到回执费用无效或与原账目冲突，未改写费用，请核对原调用。")
+            raise
+        if not retained:
+            return _cancelled(attempt.pk, claim_token, code="late_result_ignored", message="取消后的远端产物已忽略")
         archived = archive_remote_artifacts(
             attempt,
             artifacts=artifacts,
@@ -483,7 +561,6 @@ def _collect(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment
             expected_kind=str(snapshot["output_kind"]),
             heartbeat=heartbeat,
         )
-        actual, currency = _resolved_actual_cost(attempt, collected, _config(deployment))
         return _succeed(
             attempt.pk,
             claim_token,
@@ -491,6 +568,17 @@ def _collect(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment
             actual_cost=actual,
             currency=currency,
         )
+    except ExecutionResponseStorageError:
+        billing_note = ""
+        # The private receipt failing to persist cannot erase an otherwise
+        # valid, already received bill. Never infer it from a rejected body.
+        if isinstance(collected, dict) and collected.get("request_id") == attempt.provider_request_id and not validation_code:
+            try:
+                _record_collect_bill(attempt, claim_token, collected, deployment)
+            except (ProviderDriverError, ValidationError):
+                billing_note = " 同时无法确认回执费用，原账目未被覆盖，请核对。"
+        return _fail(attempt.pk, claim_token, code="execution_response_storage_failed",
+            message="原始媒体回执存储校验失败；未重收取或伪装素材成功。" + billing_note)
     except ProviderDriverError as exc:
         if exc.code == "late_result_ignored":
             return _cancelled(
@@ -556,19 +644,10 @@ def _poll(attempt: GenerationAttempt, claim_token, snapshot: dict, deployment, d
 
 def _cancel(attempt: GenerationAttempt, claim_token, deployment, driver) -> GenerationAttempt:
     if not attempt.provider_request_id:
-        with transaction.atomic():
-            locked = GenerationAttempt.objects.select_for_update().get(pk=attempt.pk)
-            if locked.claim_token == claim_token:
-                locked.status = GenerationAttempt.Status.CANCELLED
-                locked.finished_at = timezone.now()
-                locked.claim_token = None
-                locked.worker_id = ""
-                locked.claimed_at = None
-                locked.save(update_fields=(
-                    "status", "finished_at", "claim_token", "worker_id", "claimed_at", "updated_at",
-                ))
-                schedule_production_run_advance(locked.stage_run.production_run_id)
-                return locked
+        if attempt.submission_started_at is not None:
+            return _fail(attempt.pk, claim_token, code="uncertain_remote_response",
+                message="提交已开始但缺少远端标识，需要核对原请求；不能按未提交取消。")
+        return _cancelled(attempt.pk, claim_token, code="cancelled_before_submission", message="媒体请求尚未提交，已取消。")
     protocol = "cancel" if attempt.cancel_submitted_at is None else "poll"
     try:
         response = driver.invoke(deployment, protocol, {"request_id": attempt.provider_request_id})
@@ -602,6 +681,17 @@ def process_async_media_attempt(attempt: GenerationAttempt) -> GenerationAttempt
     claim_token = attempt.claim_token
     if claim_token is None:
         raise ValidationError("async attempt 未持有 claim")
+    # Claim first, validate in the worker: a damaged request must terminate its
+    # own job, not repeatedly kill the claimant and starve the whole queue.
+    try:
+        attempt = _initialize_attempt_deadlines(attempt.pk, claim_token)
+    except ValidationError:
+        attempt.refresh_from_db()
+        return _fail(attempt.pk, claim_token, code="async_attempt_invalid",
+            message="媒体任务的冻结请求或时限无效，请查看原准备；未使用当前默认值补齐。",
+            release_reservation=attempt.submission_started_at is None and not attempt.provider_request_id)
+    if attempt.claim_token != claim_token or attempt.status not in {"queued", "submitted", "cancel_requested"}:
+        return attempt
     deadline_kind = expired_kind(attempt)
     if deadline_kind and attempt.status != GenerationAttempt.Status.CANCEL_REQUESTED:
         if not attempt.provider_request_id:
@@ -631,11 +721,9 @@ def process_async_media_attempt(attempt: GenerationAttempt) -> GenerationAttempt
                 return locked
     try:
         snapshot = _snapshot(attempt)
-        deployment = frozen_async_deployment(snapshot["route"])
+        deployment = production_media_peer(attempt)
         if snapshot["operation"] != attempt.operation:
             raise ValidationError("async attempt operation 与冻结快照不一致")
-        contract = async_operation_contract(deployment.profile_version, attempt.operation)
-        validate_standard_payload(contract, snapshot["payload"])
         driver = driver_for(deployment.profile_version.provider)
         if attempt.status == GenerationAttempt.Status.QUEUED:
             return _submit(attempt, claim_token, snapshot, deployment, driver)
@@ -653,6 +741,7 @@ def process_async_media_attempt(attempt: GenerationAttempt) -> GenerationAttempt
             claim_token,
             code=getattr(exc, "code", None) or "async_attempt_invalid",
             message=str(exc),
+            release_reservation=attempt.submission_started_at is None and not attempt.provider_request_id,
         )
 
 
@@ -686,18 +775,18 @@ def recover_stale_async_media_attempts(minutes: float | None = None) -> dict[str
     terminal_run_ids = set()
     attempts = list(GenerationAttempt.objects.select_for_update().filter(
         operation__in=ASYNC_MEDIA_OPERATIONS,
+        execution_instance_version__deployment__profile_version__provider__driver_type="async_rest",
+        role="primary",
         claim_token__isnull=False,
         heartbeat_at__lt=cutoff,
     ))
     for attempt in attempts:
         # A CLI recovery setting is an operator preference, not permission to
         # steal a claim that can still be inside the driver's bounded request.
-        # Reconstruct the integrity-checked frozen deployment instead of using
-        # a process constant or the mutable live Provider configuration.  The
-        # shared validator also applies the current Security Boundary ceiling;
-        # a corrupt or now-forbidden frozen budget blocks recovery explicitly.
-        snapshot = _snapshot(attempt)
-        deployment = frozen_async_deployment(snapshot["route"])
+        # Verify the exact prepared target before reading its driver budget.
+        # A changed peer must not be used to recover a different remote job.
+        # The shared validator also applies the current Security Boundary.
+        deployment = production_media_peer(attempt)
         runtime_budget = restricted_async_rest_runtime_budget(_config(deployment))
         safe_seconds = max(
             requested_seconds,

@@ -6,6 +6,7 @@ import type {
 } from '../types/index.ts'
 
 type RawTaskProgress = Record<string, unknown>
+export const isWorkflowActive = (workflow: Workflow): boolean => ['queued', 'running', 'paused', 'cancel_requested'].includes(workflow.status)
 
 export interface AdaptedTaskProgressTelemetry {
   progressSource: WorkflowProgressSource
@@ -18,7 +19,7 @@ export interface AdaptedTaskProgressTelemetry {
   progressIndeterminate: boolean
 }
 
-export type WorkflowProgressMode = 'queued' | 'indeterminate' | 'comfyui' | 'terminal' | 'failed' | 'paused'
+export type WorkflowProgressMode = 'queued' | 'indeterminate' | 'comfyui' | 'terminal' | 'failed' | 'paused' | 'cancelled' | 'cancel_requested'
 
 export interface WorkflowProgressPresentation {
   mode: WorkflowProgressMode
@@ -74,7 +75,7 @@ export const adaptTaskProgressTelemetry = (
     progressTelemetryState,
     ...(optionalString(raw.progress_telemetry_error) ? { progressTelemetryError: optionalString(raw.progress_telemetry_error) } : {}),
     ...(optionalString(raw.remote_state) ? { remoteState: optionalString(raw.remote_state) } : {}),
-    progressIndeterminate: status === 'running' && !(progressSource === 'comfyui' && comfyProgress !== undefined),
+    progressIndeterminate: status === 'cancel_requested' || status === 'running' && !(progressSource === 'comfyui' && comfyProgress !== undefined),
   }
 }
 
@@ -111,6 +112,14 @@ const indeterminatePresentation = (workflow: ProgressWorkflow): WorkflowProgress
 
 /** Build one honest presentation model shared by every task progress surface. */
 export const workflowProgressPresentation = (workflow: ProgressWorkflow): WorkflowProgressPresentation => {
+  if (workflow.status === 'cancelled') return {
+    mode: 'cancelled', indeterminate: false,
+    heading: '任务已取消', valueLabel: '已取消', compactLabel: '已取消', summary: '任务已取消；未将取消记为执行失败或成功',
+  }
+  if (workflow.status === 'cancel_requested') return {
+    mode: 'cancel_requested', indeterminate: true,
+    heading: '取消请求处理中', valueLabel: '取消中', compactLabel: '取消中', summary: '已请求取消，尚未确认远端终态',
+  }
   if (workflow.status === 'completed') return {
     mode: 'terminal', indeterminate: false, percent: 100,
     heading: '任务已完成', valueLabel: '100%', compactLabel: '100%', summary: '生成任务已完成',

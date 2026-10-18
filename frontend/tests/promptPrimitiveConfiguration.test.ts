@@ -69,4 +69,11 @@ test('primitive summaries use saved version values and server-owned template rel
       assert.doesNotMatch(component,/platformApi|v-model|v-html|fetch\(/)
     }
   })
+  await context.test('declarative authoring grids can shrink without clipping fieldsets or long validation errors',async()=>{
+    const source = await readFile(new URL('../src/components/PromptProfileSettings.vue',import.meta.url),'utf8')
+    assert.match(source,/\.projection-config-fieldset,\.prompt-live-preview\{min-width:0\}/)
+    assert.match(source,/@media\(max-width:900px\)\{\.prompt-editor-live-layout\{grid-template-columns:minmax\(0,1fr\)\}/)
+    assert.match(source,/\.prompt-live-preview p,\.prompt-live-preview code\{overflow-wrap:anywhere\}/)
+    assert.match(source,/\.prompt-form-grid,\.projection-config-grid,\.preview-source-grid\{grid-template-columns:minmax\(0,1fr\)\}/)
+  })
 })

@@ -6,90 +6,59 @@ from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.test import TestCase, override_settings
 from django.urls import reverse
-from django.utils import timezone
 from rest_framework.test import APIClient
 
 from studio.media_signing import signed_media_token
-from studio.models import ConfigRevision, GeneratedWorkflow, GenerationTask, PromptArtifact, WorkflowTemplate
+from studio.models import ConfigRevision, GenerationTask
 from studio.services.configuration import create_config_revision, publish_config_revision
-from studio.tests.media_prompt_fixtures import (
-    MediaPromptOptions,
-    build_test_image_prompt,
-    build_test_video_prompt,
-)
-from studio.services.provenance import persist_task_provenance, task_manifest_path
-from studio.tests.factories import build_story, freeze_current_task_contract
+from studio.services.provenance import task_manifest_path
+from studio.tests import test_execution_production_workflow_requests as video_fixtures
+from studio.tests import test_execution_production_workflow_artifacts as image_fixtures
+from studio.tests.prepared_production_media_fixtures import PreparedProductionMediaFixture
 
 
-class GenerationTaskOutputMediaAPITests(TestCase):
+@override_settings(AI_PROVIDER_ALLOWED_HOSTS=("127.0.0.1",), DEPLOYMENT_PROFILE="development")
+class GenerationTaskOutputMediaAPITests(PreparedProductionMediaFixture, TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.output_root = Path(self.temp.name) / "comfy-output"
         self.output_root.mkdir()
-        self.media_root = Path(self.temp.name) / "media"
-        self.override = override_settings(
-            COMFYUI_OUTPUT_DIR=str(self.output_root), MEDIA_ROOT=self.media_root,
-        )
-        self.override.enable()
-        self.addCleanup(self.override.disable)
-
-        self.user, self.project, _, _, self.episode, self.shot, _ = build_story()
         self.superadmin = get_user_model().objects.create_superuser(
-            username="task-output-superadmin",
-            password="x",
-        )
-        self.shot.duration_ms = 5000
-        self.shot.save(update_fields=("duration_ms", "updated_at"))
+            username="task-output-superadmin", password="x")
         self.client = APIClient()
+
+    def prepare_task(self, kind):
+        self.media_kind = kind
+        fixture = (image_fixtures.ProductionWorkflowArtifactTests
+                   if kind == "image" else video_fixtures.ProductionWorkflowRequestTests)
+        fixture.setUp(self)
         self.client.force_authenticate(self.user)
-        self.template = WorkflowTemplate.objects.create(
-            name="task-output-media", slug="task-output-media", output_kind="video",
-            definition={"1": {"class_type": "Mock", "inputs": {}}},
-        )
+        self.task = self.attempt.generation_task
+        return self.task
 
     def _task(self, outputs, *, kind="video"):
-        result = (
-            build_test_image_prompt(self.project, self.shot)
-            if kind == "image"
-            else build_test_video_prompt(
-                self.project, [self.shot], MediaPromptOptions(
-                    model_identifier="minimax-h3-test", language_gate_mode="warn",
-                ),
-            )
-        )
-        prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
-            project=self.project, episode=self.episode, shot=self.shot, created_by=self.user,
-            prompt_type=kind, conditioning_mode="T2VA", prompt_text=result.text,
-            total_duration_ms=result.total_duration_ms, structured_payload=result.payload,
-            consistency_snapshot=result.consistency_snapshot, content_hash=result.content_hash,
-            request_options={"shot_ids": [str(self.shot.id)]},
-        )
-        template = self.template
-        if kind == "image":
-            template = WorkflowTemplate.objects.create(
-                name="task-output-media-image", slug="task-output-media-image",
-                output_kind="image",
-                definition={"1": {"class_type": "MockImage", "inputs": {}}},
-            )
-        workflow = GeneratedWorkflow.objects.create(
-            project=self.project, episode=self.episode, prompt_artifact=prompt,
-            template=template, created_by=self.user,
-            workflow_json=template.definition, content_hash="a" * 64,
-        )
-        return freeze_current_task_contract(GenerationTask.objects.create(
-            owner=self.user, project=self.project, episode=self.episode,
-            generated_workflow=workflow, kind=kind, status=GenerationTask.Status.SUCCEEDED,
-            progress=100, outputs=outputs, max_attempts=3,
-        ))
+        # Transport/API tests deliberately supply persisted receipts (including
+        # invalid paths). They do not fabricate execution contracts or Smoke.
+        output_root = self.output_root
+        task = self.prepare_task(kind)
+        self.output_root = output_root
+        setting = override_settings(COMFYUI_OUTPUT_DIR=str(output_root))
+        setting.enable()
+        self.addCleanup(setting.disable)
+        GenerationTask.objects.filter(pk=task.pk).update(status="succeeded", progress=100, outputs=outputs)
+        task.refresh_from_db()
+        return task
+
+    def sealed_task(self, kind="image", **kwargs):
+        # Hash/disclosure tests use real decoded PNG bytes and the normal
+        # preparation-backed archival writer, not a forged media observation.
+        self.archive_isolated_media(kind, **kwargs)
+        self.client.force_authenticate(self.user)
+        return self.task
 
     def test_persisted_mp4_is_previewable_and_downloadable_even_when_kind_is_images(self):
-        path = self.output_root / "episode-1" / "shot-01.mp4"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"fake-mp4")
-        task = self._task([{
-            "kind": "images", "filename": path.name, "subfolder": "episode-1", "type": "output",
-        }])
+        task = self.sealed_task("video", collection="images")
 
         detail = self.client.get(f"/api/v1/tasks/{task.id}/")
 
@@ -97,7 +66,7 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(len(detail.data["output_media"]), 1)
         media = detail.data["output_media"][0]
         self.assertEqual(media["kind"], "video")
-        self.assertEqual(media["filename"], "shot-01.mp4")
+        self.assertEqual(media["filename"], self.output.name)
         anonymous = APIClient()
         preview = anonymous.get(media["preview_url"])
         self.assertEqual(preview.status_code, 200)
@@ -112,13 +81,7 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         download.close()
 
     def test_persisted_png_image_is_previewable_and_downloadable(self):
-        path = self.output_root / "episode-1" / "shot-02.png"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"fake-png")
-        task = self._task([{
-            "kind": "images", "filename": path.name,
-            "subfolder": "episode-1", "type": "output",
-        }], kind="image")
+        task = self.sealed_task()
 
         detail = self.client.get(f"/api/v1/tasks/{task.id}/")
 
@@ -149,14 +112,7 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         )
         publish_config_revision(revision, published_by=self.superadmin)
         cache.clear()
-        path = self.output_root / "independent-media-rate.png"
-        path.write_bytes(b"signed-media-rate")
-        task = self._task([{
-            "kind": "images",
-            "filename": path.name,
-            "subfolder": "",
-            "type": "output",
-        }], kind="image")
+        task = self.sealed_task()
         preview_url = self.client.get(f"/api/v1/tasks/{task.id}/").data[
             "output_media"
         ][0]["preview_url"]
@@ -173,18 +129,12 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         second.close()
         self.assertEqual(anonymous.get("/api/v1/auth/register/").status_code, 200)
 
-    @override_settings(DEPLOYMENT_PROFILE="production")
     def test_production_master_remains_preview_only_until_distribution_is_ready(self):
-        path = self.output_root / "production-master.mp4"
-        path.write_bytes(b"production-master")
-        task = self._task([{
-            "kind": "videos", "filename": path.name, "subfolder": "", "type": "output",
-        }])
-
-        media = self.client.get(f"/api/v1/tasks/{task.id}/").data["output_media"][0]
-
-        self.assertEqual(media["download_url"], "")
-        self.assertEqual(APIClient().get(f'{media["preview_url"]}?download=1').status_code, 404)
+        task = self.sealed_task("video")
+        with override_settings(DEPLOYMENT_PROFILE="production"):
+            media = self.client.get(f"/api/v1/tasks/{task.id}/").data["output_media"][0]
+            self.assertEqual(media["download_url"], "")
+            self.assertEqual(APIClient().get(f'{media["preview_url"]}?download=1').status_code, 404)
 
     def test_task_output_signed_url_rejects_path_escape_unpersisted_index_and_wrong_owner(self):
         outside = Path(self.temp.name) / "outside.mp4"
@@ -216,12 +166,8 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(self.client.get(f"/api/v1/tasks/{task.id}/").status_code, 404)
 
     def test_preview_supports_single_byte_ranges_for_video_seeking(self):
-        payload = b"0123456789"
-        path = self.output_root / "seekable.mp4"
-        path.write_bytes(payload)
-        task = self._task([{
-            "kind": "videos", "filename": path.name, "subfolder": "", "type": "output",
-        }])
+        task = self.sealed_task("video")
+        payload = self.output.read_bytes()
         detail = self.client.get(f"/api/v1/tasks/{task.id}/")
         preview_url = detail.data["output_media"][0]["preview_url"]
         anonymous = APIClient()
@@ -230,14 +176,28 @@ class GenerationTaskOutputMediaAPITests(TestCase):
 
         self.assertEqual(partial.status_code, 206)
         self.assertEqual(partial["Accept-Ranges"], "bytes")
-        self.assertEqual(partial["Content-Range"], "bytes 2-5/10")
+        self.assertEqual(partial["Content-Range"], f"bytes 2-5/{len(payload)}")
         self.assertEqual(partial["Content-Length"], "4")
-        self.assertEqual(b"".join(partial.streaming_content), b"2345")
+        self.assertEqual(b"".join(partial.streaming_content), payload[2:6])
         partial.close()
 
-        invalid = anonymous.get(preview_url, HTTP_RANGE="bytes=99-100")
+        invalid = anonymous.get(preview_url, HTTP_RANGE=f"bytes={len(payload)}-{len(payload)+1}")
         self.assertEqual(invalid.status_code, 416)
-        self.assertEqual(invalid["Content-Range"], "bytes */10")
+        self.assertEqual(invalid["Content-Range"], f"bytes */{len(payload)}")
+
+    def test_missing_seal_is_not_repaired_by_preview(self):
+        task = self.sealed_task()
+        sidecar = task_manifest_path(task, 0)
+        sidecar.unlink()
+        unsealed = [{key: value for key, value in task.outputs[0].items() if key != "provenance"}]
+        GenerationTask.objects.filter(pk=task.pk).update(outputs=unsealed)
+        response = self.client.get(f"/api/v1/tasks/{task.id}/")
+        self.assertEqual(response.status_code, 200, response.data)
+        preview = APIClient().get(response.data["output_media"][0]["preview_url"])
+        self.assertEqual(preview.status_code, 404)
+        task.refresh_from_db()
+        self.assertEqual(task.outputs, unsealed)
+        self.assertFalse(sidecar.exists())
 
     def test_non_media_outputs_are_not_signed(self):
         task = self._task([{
@@ -248,26 +208,12 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(detail.data["output_media"], [])
 
     def test_sealed_task_provenance_is_tenant_bound_hash_only_and_disclosed_on_download(self):
-        path = self.output_root / "episode-1" / "sealed-shot.mp4"
-        path.parent.mkdir(parents=True)
-        path.write_bytes(b"sealed-video")
-        task = self._task([{
-            "kind": "videos", "filename": path.name,
-            "subfolder": "episode-1", "type": "output",
-        }])
-        task.staged_inputs = [{
-            "asset_id": "reference-asset",
-            "media_role": "reference_image",
-            "source_sha256": "1" * 64,
-            "submitted_sha256": "2" * 64,
-            "source_path": str(Path(self.temp.name) / "private" / "reference.png"),
-        }]
-        task.save(update_fields=("staged_inputs", "updated_at"))
-        persist_task_provenance(task, list(task.outputs), generated_at=timezone.now())
+        task = self.sealed_task()
+        payload = self.output.read_bytes()
 
         detail = self.client.get(f"/api/v1/tasks/{task.id}/")
         self.assertEqual(detail.status_code, 200, detail.data)
-        self.assertEqual(detail.data["staged_inputs"], [])
+        self.assertNotIn("staged_inputs", detail.data)
         media = detail.data["output_media"][0]
         self.assertTrue(media["ai_generated"])
         self.assertRegex(media["artifact_sha256"], r"^[0-9a-f]{64}$")
@@ -282,11 +228,11 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertTrue(document["disclosure"]["ai_generated"])
         self.assertEqual(document["verification"]["status"], "verified")
         self.assertEqual(document["generation"]["task_id"], str(task.id))
-        self.assertRegex(document["generation"]["prompt_sha256"], r"^[0-9a-f]{64}$")
-        self.assertEqual(document["source_media"][0]["source_sha256"], "1" * 64)
+        self.assertEqual(document["generation"]["request_sha256"], self.attempt.request_sha256)
+        self.assertEqual(document["generation"]["preparation_id"], str(self.preparation.pk))
+        self.assertEqual(document["source_media"][0]["source_sha256"], self.asset.checksum)
         serialized = json.dumps(document, ensure_ascii=False)
-        prompt_text = task.generated_workflow.prompt_artifact.prompt_text
-        self.assertNotIn(prompt_text, serialized)
+        self.assertNotIn("PRIVATE PROMPT", serialized)
         self.assertNotIn(str(Path(self.temp.name)), serialized)
 
         # Development mode intentionally allows downloading the exact signed
@@ -295,7 +241,7 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(media["distribution_status"], "development_master")
         download = anonymous.get(media["download_url"])
         self.assertEqual(download.status_code, 200)
-        self.assertEqual(b"".join(download.streaming_content), b"sealed-video")
+        self.assertEqual(b"".join(download.streaming_content), payload)
         download.close()
 
         other = get_user_model().objects.create_user(
@@ -316,12 +262,9 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         )
 
     def test_task_provenance_rejects_media_and_sidecar_tampering(self):
-        path = self.output_root / "tamper.mp4"
-        path.write_bytes(b"original-video")
-        task = self._task([{
-            "kind": "videos", "filename": path.name, "subfolder": "", "type": "output",
-        }])
-        persist_task_provenance(task, list(task.outputs), generated_at=timezone.now())
+        task = self.sealed_task()
+        path = self.output
+        original = path.read_bytes()
         detail = self.client.get(f"/api/v1/tasks/{task.id}/")
         media = detail.data["output_media"][0]
         anonymous = APIClient()
@@ -331,7 +274,7 @@ class GenerationTaskOutputMediaAPITests(TestCase):
         self.assertEqual(anonymous.get(media["preview_url"]).status_code, 404)
         self.assertEqual(anonymous.get(media["download_url"]).status_code, 404)
 
-        path.write_bytes(b"original-video")
+        path.write_bytes(original)
         sidecar = task_manifest_path(task, 0)
         document = json.loads(sidecar.read_text(encoding="utf-8"))
         document["generation"]["model"] = "tampered-model"

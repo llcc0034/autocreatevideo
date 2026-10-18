@@ -7,6 +7,7 @@ from copy import deepcopy
 import re
 
 from studio.services.security_boundaries import boundary_int
+from studio.services.media_capabilities import CONDITIONING_INPUT_MEDIA_KINDS
 
 
 ENGINE = "generic.references"
@@ -32,8 +33,8 @@ def _integer(value, minimum=0):
 
 def validate_group_config(definition):
     config = definition["projection"]["config"]
-    if not isinstance(config, dict) or set(config) != {"groups"}:
-        raise AssetGroupError("动态素材配置必须仅包含 groups")
+    if not isinstance(config, dict) or "groups" not in config or set(config) - {"groups", "capability"}:
+        raise AssetGroupError("动态素材配置仅支持 groups 与 capability")
     groups = config["groups"]
     limit = boundary_int("security.comfy.contract.max_autogrow_inputs")
     if not isinstance(groups, list) or not 1 <= len(groups) <= min(limit, 64):
@@ -78,12 +79,68 @@ def validate_group_config(definition):
                 raise AssetGroupError(f"{key} 工作流数量范围无效或混入模型数量来源")
         elif row["minimum_items"] is not None or row["maximum_items"] is not None or not row["conditioning_mode"] or not row["model_input"]:
             raise AssetGroupError(f"{key} 模型数量来源须选择 mode/input，不能另填数量覆盖模型合同")
+        elif CONDITIONING_INPUT_MEDIA_KINDS.get(row["model_input"]) != slot["media_kind"]:
+            raise AssetGroupError(
+                f"{key} 模型数量输入 {row['model_input']} 与素材槽媒体类型 {slot['media_kind']} 不匹配；"
+                "请选择同类的已注册输入，不能借用其他媒体的数量合同"
+            )
     if seen != set(slots):
         raise AssetGroupError("通用动态引擎的素材槽必须与动态组逐项对应")
 
 
 def _link(value):
     return isinstance(value, list) and len(value) == 2 and isinstance(value[0], str) and _integer(value[1])
+
+
+def _model_quantity(mode, model_input):
+    return {
+        "conditioning_mode": mode["key"], "model_input": model_input,
+        "total_images": deepcopy(mode["inputs"]["total_images"])
+        if CONDITIONING_INPUT_MEDIA_KINDS[model_input] == "image" else None,
+    }
+
+
+def _validate_shared_quantities(plans):
+    """Check each declared receiver, not guessed downstream model topology.
+
+    Every independent per-group choice must fit. We neither clamp a range nor
+    invent shared-budget allocation UI for combinations the contract cannot
+    represent. Fan-out reuses one group once per receiver.
+    """
+    by_target = {}
+    for plan in plans:
+        for target in plan["target_nodes"]:
+            by_target.setdefault(target, []).append(plan)
+    for target, groups in by_target.items():
+        modeled = [group for group in groups if "model_quantity" in group]
+        if not modeled:
+            continue
+        context = f"目标节点 {target} 的素材组 {', '.join(group['key'] for group in groups)}"
+        if len(modeled) != len(groups):
+            raise AssetGroupError(f"{context} 混用模型与 Projector 数量来源，无法核对共享模型输入；请明确统一映射，不能把未知归属当作已满足模型容量")
+        sources = [group["model_quantity"] for group in groups]
+        if len({source["conditioning_mode"] for source in sources}) != 1:
+            raise AssetGroupError(f"{context} 混用不同模型模式，不能合并为同一次接收的数量合同")
+        inputs = [source["model_input"] for source in sources]
+        if len(set(inputs)) != len(inputs):
+            raise AssetGroupError(f"{context} 重复引用模型输入 {', '.join(inputs)}；模型容量不能按组倍增，请用一组连接所需目标")
+        images = [group for group in groups if group["media_kind"] == "image"]
+        if not images:
+            continue
+        if "total_images" in inputs and len(images) > 1:
+            raise AssetGroupError(f"{context} 同时引用 total_images 与图片子槽，无法区分总量和分项，不能重复计算")
+        totals = [group["model_quantity"]["total_images"] for group in images]
+        if any(total != totals[0] for total in totals):
+            raise AssetGroupError(f"{context} 的冻结 total_images 来源不一致")
+        minimum = sum(group["min_items"] for group in images)
+        maximum = sum(group["max_items"] for group in images)
+        total = totals[0]
+        if minimum < total["minimum_items"] or maximum > total["maximum_items"]:
+            raise AssetGroupError(
+                f"{context} 的独立图片范围合计 {minimum}–{maximum} 超出模型 "
+                f"{sources[0]['conditioning_mode']}.total_images {total['minimum_items']}–{total['maximum_items']}；"
+                "当前接线不支持跨组共享额度，请使用能完整表达约束的接线合同，不自动截断或改写模型范围"
+            )
 
 
 def build_group_plans(definition, graph, object_info, model_profile):
@@ -100,6 +157,11 @@ def build_group_plans(definition, graph, object_info, model_profile):
             roles[role] = matches
     slots = {row["key"]: row for row in definition["asset_slots"]}
     plans, used_nodes, used_targets = [], set(), set()
+    conditioning = None
+    if any(slot["contract_source"] == "model_profile" for slot in slots.values()):
+        if model_profile is None:
+            raise AssetGroupError("动态素材数量需要选择精确模型版本")
+        conditioning = resolve_conditioning_contract(model_specification=verified_model_profile_specification(model_profile), required=True)
     for row in definition["projection"]["config"]["groups"]:
         slot = slots[row["key"]]
         try:
@@ -111,15 +173,14 @@ def build_group_plans(definition, graph, object_info, model_profile):
         except KeyError as exc:
             raise AssetGroupError("动态素材角色无法在来源图中唯一定位") from exc
         minimum, maximum = row["minimum_items"], row["maximum_items"]
+        quantity = None
         if slot["contract_source"] == "model_profile":
-            if model_profile is None:
-                raise AssetGroupError("动态素材数量需要选择精确模型版本")
-            conditioning = resolve_conditioning_contract(model_specification=verified_model_profile_specification(model_profile), required=True)
             mode = conditioning_mode_contract(conditioning, row["conditioning_mode"])
             bounds = mode.get("inputs", {}).get(row["model_input"])
             if not isinstance(bounds, dict):
                 raise AssetGroupError("模型模式未声明所选数量输入")
             minimum, maximum = bounds.get("minimum_items"), bounds.get("maximum_items")
+            quantity = _model_quantity(mode, row["model_input"])
         if not _integer(minimum) or not _integer(maximum, 1) or not minimum <= maximum <= boundary_int("security.comfy.contract.max_autogrow_inputs"):
             raise AssetGroupError("动态素材数量合同超出受控范围")
         if row["wiring"] == "reduce" and maximum < 2:
@@ -177,7 +238,9 @@ def build_group_plans(definition, graph, object_info, model_profile):
             "input_names": row["input_names"], "wiring": row["wiring"],
             "reducer_node": reducer, "reducer_inputs": row["reducer_inputs"],
             "reducer_output_index": row["reducer_output_index"],
+            **({"model_quantity": quantity} if quantity is not None else {}),
         })
+    _validate_shared_quantities(plans)
     projected_count = len(graph) + sum((p["max_items"] - 1) * len(p["branch_nodes"]) + (p["max_items"] - 2 if p["wiring"] == "reduce" else 0) for p in plans)
     if projected_count > boundary_int("security.comfy.canvas.max_nodes"):
         raise AssetGroupError("动态素材展开后的节点数超过受控画布预算")
@@ -279,7 +342,7 @@ def validate_frozen_groups(contract, definition=None):
     expanded_count = 0
     for plan in plans:
         fields = {"key", "media_kind", "min_items", "max_items", "source_node", "branch_nodes", "output_node", "output_index", "target_nodes", "input_names", "wiring", "reducer_node", "reducer_inputs", "reducer_output_index", "semantic_keys", "expanded_branches"}
-        if not isinstance(plan, dict) or set(plan) != fields:
+        if not isinstance(plan, dict) or set(plan) not in (fields, fields | {"model_quantity"}):
             raise AssetGroupError("冻结动态素材组结构不完整")
         if any(not isinstance(plan[field], str) for field in ("key", "media_kind", "source_node", "output_node", "wiring", "reducer_node")):
             raise AssetGroupError("冻结动态素材组名称无效")
@@ -289,6 +352,18 @@ def validate_frozen_groups(contract, definition=None):
         seen.add(key)
         if not _integer(plan["min_items"]) or not _integer(plan["max_items"], 1) or not plan["min_items"] <= plan["max_items"] <= boundary_int("security.comfy.contract.max_autogrow_inputs"):
             raise AssetGroupError("冻结素材数量范围无效")
+        if "model_quantity" in plan:
+            source = plan["model_quantity"]
+            if not isinstance(source, dict) or set(source) != {"conditioning_mode", "model_input", "total_images"}:
+                raise AssetGroupError(f"{key} 冻结模型数量来源结构无效")
+            if not isinstance(source["conditioning_mode"], str) or not source["conditioning_mode"].strip() or not isinstance(source["model_input"], str) or CONDITIONING_INPUT_MEDIA_KINDS.get(source["model_input"]) != plan["media_kind"]:
+                raise AssetGroupError(f"{key} 冻结模型模式或输入媒体类型无效")
+            total = source["total_images"]
+            if plan["media_kind"] == "image":
+                if not isinstance(total, dict) or set(total) != {"minimum_items", "maximum_items"} or not _integer(total["minimum_items"]) or not _integer(total["maximum_items"]) or not total["minimum_items"] <= total["maximum_items"] <= boundary_int("security.comfy.contract.max_autogrow_inputs"):
+                    raise AssetGroupError(f"{key} 冻结模型 total_images 数量无效")
+            elif total is not None:
+                raise AssetGroupError(f"{key} 非图片组不能声明 total_images")
         for field in ("branch_nodes", "target_nodes", "input_names", "semantic_keys", "reducer_inputs"):
             values = plan[field]
             if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values) or len(set(values)) != len(values):
@@ -328,8 +403,32 @@ def validate_frozen_groups(contract, definition=None):
                 raise AssetGroupError("冻结动态组与 Projector 接线不一致")
             if slot["contract_source"] == "workflow" and (plan["min_items"], plan["max_items"]) != (config["minimum_items"], config["maximum_items"]):
                 raise AssetGroupError("冻结动态组与 Projector 数量不一致")
+            source = plan.get("model_quantity")
+            if slot["contract_source"] == "workflow":
+                if "model_quantity" in plan:
+                    raise AssetGroupError(f"{key} Projector 数量不能伪装成模型数量")
+            elif source is None or any(source[field] != config[field] for field in ("conditioning_mode", "model_input")):
+                raise AssetGroupError(f"{key} 缺少或不匹配冻结模型数量来源；请重新生成新工作流合同，不能沿用旧验收")
     if definition is not None and seen != {row["key"] for row in definition["projection"]["config"]["groups"]}:
         raise AssetGroupError("冻结动态组未完整覆盖 Projector")
+    _validate_shared_quantities(plans)
+
+
+def validate_model_group_quantities(contract, model_specification):
+    """Import/publish validation against the selected immutable model version."""
+    from studio.services.media_capabilities import resolve_conditioning_contract, conditioning_mode_contract
+
+    validate_frozen_groups(contract)
+    modeled = [plan for plan in contract["asset_groups"] if "model_quantity" in plan]
+    if not modeled:
+        return
+    conditioning = resolve_conditioning_contract(model_specification=model_specification, required=True)
+    for plan in modeled:
+        source = plan["model_quantity"]
+        mode = conditioning_mode_contract(conditioning, source["conditioning_mode"])
+        bounds = mode["inputs"][source["model_input"]]
+        if (plan["min_items"], plan["max_items"]) != (bounds["minimum_items"], bounds["maximum_items"]) or source != _model_quantity(mode, source["model_input"]):
+            raise AssetGroupError(f"{plan['key']} 冻结数量与所选精确模型版本不一致，不能替换来源或放宽范围")
 
 
 def validate_group_selection(contract, selected_keys):

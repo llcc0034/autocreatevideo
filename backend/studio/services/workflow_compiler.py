@@ -5,16 +5,16 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
-from typing import Any, Callable
+from typing import Any
 
 from django.core.exceptions import ValidationError
 
-from studio.models import PromptArtifact, SeriesProject
 from studio.services.json_contracts import json_contract
 from studio.services.security_boundaries import boundary_int
 from studio.services.workflow import (
     WorkflowBuildError,
     aligned_frames,
+    validate_frame_policy,
     validate_comfy_graph,
 )
 from studio.services.workflow_family_registry import (
@@ -29,7 +29,7 @@ from studio.services.workflow_semantics import (
     contains_legacy_placeholder,
     execution_contract_payload,
     expected_value_type,
-    resolve_workflow_semantics,
+    resolve_workflow_semantic_values,
     validate_semantic_key,
     validate_resolution_strategy,
 )
@@ -146,7 +146,7 @@ def compiler_contract_from_input(input_contract: dict[str, Any]) -> tuple[str, i
     return compiler_id, version
 
 
-def _output_contract(contract: dict[str, Any], graph: dict[str, Any], expected_kind: str) -> dict[str, Any]:
+def workflow_primary_output_contract(contract: dict[str, Any], graph: dict[str, Any], expected_kind: str) -> dict[str, Any]:
     outputs = contract.get("outputs")
     if isinstance(outputs, dict) and isinstance(outputs.get("primary"), dict):
         primary = deepcopy(outputs["primary"])
@@ -176,75 +176,71 @@ def _output_contract(contract: dict[str, Any], graph: dict[str, Any], expected_k
     }
 
 
-def _compile_generic(
-    *,
-    workflow_snapshot: dict[str, Any],
-    prompt: PromptArtifact,
-    project: SeriesProject,
-    overrides: dict[str, Any] | None = None,
-    video_duration_policy: dict[str, int] | None = None,
-    _compiler_version: int = 1,
-) -> CompiledWorkflow:
-    graph = deepcopy(workflow_snapshot["graph"])
+
+
+def _compile_resolved_generic(*, workflow_snapshot, resolved, output_kind, compiler_version,
+                              classified_groups, classified_bindings, resolution_evidence):
     contract = workflow_snapshot["input_contract"]
-    if _compiler_version == 2:
-        from studio.services.workflow_asset_groups import validate_frozen_groups, AssetGroupError
-        try:
-            validate_frozen_groups(contract)
-        except AssetGroupError as exc:
-            raise WorkflowCompilerError(str(exc)) from exc
-        for key, value in (overrides or {}).items():
-            parameter = contract.get("parameters", {}).get(key, {})
-            if parameter.get("asset_group_constant") and value != parameter.get("default"):
-                raise WorkflowCompilerError("逐项模板参数不能在运行时单独改变")
-    bindings = canonical_binding_rows(workflow_snapshot.get("semantic_bindings") or [])
-    requirements = canonical_requirement_rows(workflow_snapshot.get("model_requirements") or [])
-    try:
-        validate_resolution_strategy(
-            graph=graph,
-            contract=contract,
-            bindings=bindings,
-            output_kind=prompt.prompt_type,
-        )
-    except WorkflowSemanticError as exc:
-        raise WorkflowCompilerError(str(exc)) from exc
-    if contains_legacy_placeholder(graph):
-        raise WorkflowCompilerError("generic workflow graph 仍包含 legacy ${TOKEN} 占位符")
-    resolved = resolve_workflow_semantics(
-        graph=graph,
-        contract=contract,
-        bindings=bindings,
-        requirements=requirements,
-        prompt=prompt,
-        project=project,
-        overrides=overrides,
-    )
     static_semantics = _validated_static_semantics(contract)
-    if any(key in (overrides or {}) and overrides[key] != value for key, value in static_semantics.items()):
-        raise WorkflowCompilerError("静态语义由冻结版本决定，不能运行时覆盖")
-    overlap = sorted(set(static_semantics) & set(resolved.values))
-    if overlap:
-        raise WorkflowCompilerError(
-            "static_semantics 不能重复 widget semantic: " + ", ".join(overlap),
-        )
+    if set(static_semantics) & set(resolved.values):
+        raise WorkflowCompilerError("static_semantics 不能重复 widget semantic")
     resolved_values = {**resolved.values, **static_semantics}
-    asset_bindings = resolved.asset_bindings
-    if contract.get("frame_policy"):
-        _validate_runtime_frame_policy(contract, resolved_values, prompt, video_duration_policy)
-    resolution_evidence = None
-    strategy = contract.get("resolution_strategy") or {}
-    if strategy.get("mode") == "source_image_derived":
-        from studio.services.workflow_resolution import resolve_source_image_resolution, WorkflowResolutionError
+    if resolution_evidence is not None:
+        resolved_values.update({"image.width": resolution_evidence["width"], "image.height": resolution_evidence["height"]})
+    if not isinstance(classified_bindings, list) or any(not isinstance(row, dict) for row in classified_bindings):
+        raise WorkflowCompilerError("分类素材缺少明确的来源绑定")
+    if classified_groups is None and classified_bindings:
+        raise WorkflowCompilerError("非分类图不能附带未消费的分类素材绑定")
+    asset_bindings = [*resolved.asset_bindings, *classified_bindings]
+    graph = workflow_snapshot["graph"]
+    bindings = canonical_binding_rows(workflow_snapshot.get("semantic_bindings") or [])
+    graph = materialize_generic_workflow_graph(graph=graph, contract=contract, bindings=bindings,
+        values=resolved.values, compiler_version=compiler_version, classified_groups=classified_groups)
+    if resolution_evidence is not None:
+        from studio.services.workflow_resolution import materialize_resolution_graph, WorkflowResolutionError
         try:
-            resolution_evidence = resolve_source_image_resolution(
-                strategy, resolved.asset_bindings, owner_id=project.owner_id,
-            )
+            graph = materialize_resolution_graph(graph, contract["resolution_strategy"], resolution_evidence["width"], resolution_evidence["height"])
         except WorkflowResolutionError as exc:
             raise WorkflowCompilerError(str(exc)) from exc
-        resolved_values.update({
-            "image.width": resolution_evidence["width"],
-            "image.height": resolution_evidence["height"],
-        })
+    try:
+        validate_comfy_graph(graph)
+    except WorkflowBuildError as exc:
+        raise WorkflowCompilerError(str(exc)) from exc
+    if contains_legacy_placeholder(graph):
+        raise WorkflowCompilerError("compiled workflow 仍包含 legacy 占位符")
+    output_contract = workflow_primary_output_contract(contract, graph, output_kind)
+    if resolution_evidence is not None:
+        output_contract = {**output_contract, "schema_version": 2, "resolution": resolution_evidence}
+    return CompiledWorkflow(
+        graph=graph,
+        graph_sha256=_canonical_sha256(graph),
+        compiler_id="generic.comfy",
+        compiler_version=compiler_version,
+        resolved_semantics=resolved_values,
+        resolved_semantics_sha256=json_contract(
+            resolved_values,
+            max_bytes=_workflow_graph_max_bytes(),
+        ).sha256,
+        asset_bindings=asset_bindings,
+        asset_bindings_sha256=_canonical_sha256(asset_bindings),
+        model_requirements=resolved.model_requirements,
+        model_requirements_sha256=resolved.model_requirements_sha256,
+        output_contract=output_contract,
+        workflow_contract_sha256=str(workflow_snapshot["execution_contract_sha256"]),
+    )
+
+
+def materialize_generic_workflow_graph(*, graph, contract, bindings, values, compiler_version,
+                                      classified_groups):
+    """One graph materializer for existing project and explicit request facts.
+
+    Inputs are already resolved typed semantics and verified frozen wiring.
+    No ORM owner, media download, default lookup or model-specific interpretation.
+    Never mutate the caller's frozen graph, even when optional slots are absent.
+    """
+    if type(compiler_version) is not int or compiler_version not in {1, 2, 3}:
+        raise WorkflowCompilerError("未注册的通用图编译版本")
+    graph = deepcopy(graph)
     seen_targets: set[tuple[str, str]] = set()
     for binding in bindings:
         target = (binding["node_id"], binding["input_name"])
@@ -264,7 +260,7 @@ def _compile_generic(
         ):
             raise WorkflowCompilerError("generic semantic binding 禁止覆盖 ComfyUI 节点连接")
         key = binding["semantic_key"]
-        if key not in resolved.values:
+        if key not in values:
             if binding["is_required"]:
                 raise WorkflowCompilerError(f"必填 semantic 未解析: {key}")
             # Optional upload-backed inputs are persisted with a managed
@@ -275,225 +271,56 @@ def _compile_generic(
             # reference at submit time.
             inputs.pop(binding["input_name"], None)
             continue
-        value = resolved.values[key]
+        value = values[key]
         if isinstance(value, (dict, list)):
             raise WorkflowCompilerError("semantic compiler 禁止向 widget 注入对象或数组")
         inputs[binding["input_name"]] = deepcopy(value)
-    if _compiler_version == 2:
+    if compiler_version == 2:
         from studio.services.workflow_asset_groups import materialize_group_graph, AssetGroupError
         try:
-            graph = materialize_group_graph(graph, contract, set(resolved.values))
+            graph = materialize_group_graph(graph, contract, set(values))
         except AssetGroupError as exc:
             raise WorkflowCompilerError(str(exc)) from exc
     elif contract.get("asset_groups"):
         raise WorkflowCompilerError("动态素材合同必须使用已注册动态编译能力")
-    if _compiler_version == 3:
-        from studio.services.workflow_classified_references import materialize, prompt_references, ClassifiedReferenceError
+    if compiler_version == 3:
+        from studio.services.workflow_classified_references import materialize_reference_groups, ClassifiedReferenceError
         try:
-            references = prompt_references(contract, prompt)
-            graph = materialize(graph, contract, references)
-            asset_bindings = [*asset_bindings, *_canonical_reference_asset_bindings(references)]
+            graph = materialize_reference_groups(graph, contract, classified_groups)
         except ClassifiedReferenceError as exc:
             raise WorkflowCompilerError(str(exc)) from exc
     elif contract.get("classified_references"):
         raise WorkflowCompilerError("分类素材必须使用已注册的通用分类编译器")
-    if resolution_evidence is not None:
-        from studio.services.workflow_resolution import materialize_resolution_graph, WorkflowResolutionError
-        try:
-            graph = materialize_resolution_graph(graph, strategy, resolution_evidence["width"], resolution_evidence["height"])
-        except WorkflowResolutionError as exc:
-            raise WorkflowCompilerError(str(exc)) from exc
-    try:
-        validate_comfy_graph(graph)
-    except WorkflowBuildError as exc:
-        raise WorkflowCompilerError(str(exc)) from exc
-    if contains_legacy_placeholder(graph):
-        raise WorkflowCompilerError("compiled workflow 仍包含 legacy 占位符")
-    output_contract = _output_contract(contract, graph, prompt.prompt_type)
-    if resolution_evidence is not None:
-        output_contract = {**output_contract, "schema_version": 2, "resolution": resolution_evidence}
-    return CompiledWorkflow(
-        graph=graph,
-        graph_sha256=_canonical_sha256(graph),
-        compiler_id="generic.comfy",
-        compiler_version=_compiler_version,
-        resolved_semantics=resolved_values,
-        resolved_semantics_sha256=json_contract(
-            resolved_values,
-            max_bytes=_workflow_graph_max_bytes(),
-        ).sha256,
-        asset_bindings=asset_bindings,
-        asset_bindings_sha256=_canonical_sha256(asset_bindings),
-        model_requirements=resolved.model_requirements,
-        model_requirements_sha256=resolved.model_requirements_sha256,
-        output_contract=output_contract,
-        workflow_contract_sha256=str(workflow_snapshot["execution_contract_sha256"]),
-    )
+    elif classified_groups is not None:
+        raise WorkflowCompilerError("固定图不能混入分类参考组")
+    return graph
 
 
-def _validate_runtime_frame_policy(contract, values, prompt, video_duration_policy):
+def _validate_runtime_frame_policy(contract, values, total_duration_ms, video_duration_policy):
     policy = {**contract["frame_policy"], "fps": values.get("video.fps")}
     frames = values.get("video.frames")
     try:
-        expected = aligned_frames(int(prompt.total_duration_ms or 0), policy)
+        validate_frame_policy(policy)
+        if total_duration_ms is not None and (type(total_duration_ms) is not int or total_duration_ms < 0):
+            raise WorkflowBuildError("视频时长必须是明确的非负整数毫秒")
+        if video_duration_policy is not None and total_duration_ms is None:
+            raise WorkflowBuildError("已指定分镜时长合同，不能缺少本次时长")
         if type(frames) is not int or not policy["minimum_frames"] <= frames <= policy["maximum_frames"] or (frames - policy["alignment_remainder"]) % policy["alignment_modulus"]:
             raise WorkflowBuildError("video.frames 不满足冻结范围或格点")
     except (WorkflowBuildError, KeyError, TypeError, ValueError) as exc:
         raise WorkflowCompilerError("视频时钟配置无效或参数不满足冻结范围") from exc
     if video_duration_policy is not None:
-        duration = int(prompt.total_duration_ms or 0)
+        duration = total_duration_ms
         if not video_duration_policy["minimum_duration_ms"] <= duration <= video_duration_policy["maximum_duration_ms"]:
             raise WorkflowCompilerError("工作流请求时长超出冻结的生产路由范围")
-        if frames != expected:
+        if frames != aligned_frames(duration, policy):
             raise WorkflowCompilerError("video.frames 与冻结分镜时长不一致")
 
 
-def _canonical_reference_asset_bindings(references: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Freeze only execution facts needed by staging and prompt provenance."""
-
-    result: list[dict[str, Any]] = []
-    for index, item in enumerate(references, start=1):
-        asset_id = str(item.get("asset_id") or "")
-        checksum = str(item.get("checksum") or "").casefold()
-        if not asset_id or len(checksum) != 64:
-            raise WorkflowCompilerError("reference binding 缺少 asset_id/checksum")
-        category = str(item.get("category") or "")
-        row = {
-            "semantic_key": f"asset.reference.{index}",
-            "asset_id": asset_id,
-            "token": f"__AUTOPROMPT_ASSET__:{asset_id}",
-            "media_kind": (
-                "video" if category == "video"
-                else "audio" if category == "audio"
-                else "image"
-            ),
-            "mime_type": str(item.get("mime_type") or ""),
-            "checksum": checksum,
-            "category": category,
-            "input_slot": item.get("input_slot"),
-            "input_label": item.get("input_label"),
-            "entity_id": item.get("entity_id"),
-            "entity_name": str(item.get("entity_name") or ""),
-            "purpose": item.get("purpose"),
-            "audio_asset_id": item.get("audio_asset_id"),
-            "audio_checksum": str(item.get("audio_checksum") or "").casefold(),
-            "audio_input_label": item.get("audio_input_label"),
-            "audio_purpose": item.get("audio_purpose"),
-            "use_embedded_audio": bool(item.get("use_embedded_audio", False)),
-        }
-        if row["audio_asset_id"] and len(row["audio_checksum"]) != 64:
-            raise WorkflowCompilerError("外部配套音频缺少 checksum")
-        result.append(row)
-    return result
 
 
-
-
-RuntimeOverrideBuilder = Callable[..., dict[str, Any]]
-
-
-def _require_runtime_semantic_bindings(
-    workflow_snapshot: dict[str, Any],
-    *,
-    required_keys: set[str],
-    adapter_label: str,
-) -> None:
-    binding_keys = {
-        str(item.get("semantic_key") or "")
-        for item in (workflow_snapshot.get("semantic_bindings") or [])
-        if isinstance(item, dict)
-    }
-    missing = sorted(required_keys - binding_keys)
-    if missing:
-        raise WorkflowCompilerError(
-            f"{adapter_label} workflow 缺少运行身份语义绑定: "
-            + ", ".join(missing),
-        )
-
-
-def _generic_runtime_overrides(
-    *,
-    workflow_snapshot: dict[str, Any],
-    prompt: PromptArtifact,
-    width: int,
-    height: int,
-    seed: int,
-    output_prefix: str,
-) -> dict[str, Any]:
-    derived = (workflow_snapshot.get("input_contract", {}).get("resolution_strategy") or {}).get("mode") == "source_image_derived"
-    values = {"sampling.seed": seed, "output.prefix": output_prefix}
-    if not derived:
-        values.update({"image.width": width, "image.height": height})
-    frame_policy = workflow_snapshot.get("input_contract", {}).get("frame_policy")
-    if frame_policy:
-        values["video.frames"] = aligned_frames(int(prompt.total_duration_ms or 0), frame_policy)
-    _require_runtime_semantic_bindings(
-        workflow_snapshot,
-        required_keys=set(values),
-        adapter_label="generic.comfy/v1",
-    )
-    return values
-
-
-
-
-_RUNTIME_OVERRIDE_BUILDERS: dict[tuple[str, int], RuntimeOverrideBuilder] = {
-    ("generic.comfy", 1): _generic_runtime_overrides,
-    ("generic.comfy", 2): _generic_runtime_overrides,
-    ("generic.comfy", 3): _generic_runtime_overrides,
-}
-
-
-def build_frozen_workflow_runtime_overrides(
-    *,
-    workflow_snapshot: dict[str, Any],
-    prompt: PromptArtifact,
-    width: int,
-    height: int,
-    seed: int,
-    output_prefix: str,
-) -> dict[str, Any]:
-    """Dispatch execution-identity binding through the registered compiler adapter."""
-
-    compiler_id, compiler_version = compiler_contract_from_input(
-        workflow_snapshot.get("input_contract") or {},
-    )
-    if (
-        workflow_snapshot.get("compiler_id") != compiler_id
-        or workflow_snapshot.get("compiler_version") != compiler_version
-    ):
-        raise WorkflowCompilerError(
-            "workflow snapshot compiler 与 input_contract 不一致",
-        )
-    builder = _RUNTIME_OVERRIDE_BUILDERS.get((compiler_id, compiler_version))
-    if builder is None:
-        raise WorkflowCompilerError(
-            f"workflow compiler {compiler_id}/v{compiler_version} "
-            "未注册运行身份绑定适配器",
-        )
-    return builder(
-        workflow_snapshot=workflow_snapshot,
-        prompt=prompt,
-        width=int(width),
-        height=int(height),
-        seed=int(seed),
-        output_prefix=str(output_prefix),
-    )
-
-
-register_workflow_family("generic.comfy", 1, _compile_generic)
-register_workflow_family("generic.comfy", 2, lambda **kwargs: _compile_generic(**kwargs, _compiler_version=2))
-register_workflow_family("generic.comfy", 3, lambda **kwargs: _compile_generic(**kwargs, _compiler_version=3))
-
-
-def compile_frozen_workflow(
-    *,
-    workflow_snapshot: dict[str, Any],
-    prompt: PromptArtifact,
-    project: SeriesProject,
-    overrides: dict[str, Any] | None = None,
-    video_duration_policy: dict[str, int] | None = None,
-) -> CompiledWorkflow:
+def validate_frozen_workflow_snapshot(workflow_snapshot):
+    """Shared frozen graph/Projector integrity; not current runtime admission."""
     if not isinstance(workflow_snapshot, dict):
         raise WorkflowCompilerError("workflow snapshot 必须是对象")
     if not str(workflow_snapshot.get("model_identifier") or "").strip():
@@ -545,15 +372,67 @@ def compile_frozen_workflow(
         raise WorkflowCompilerError("workflow semantic bindings hash 不一致")
     if payload["model_requirements_sha256"] != workflow_snapshot.get("model_requirements_sha256"):
         raise WorkflowCompilerError("workflow model requirements hash 不一致")
+    return compiler_id, compiler_version
+
+
+
+
+def compile_frozen_workflow_values(*, workflow_snapshot, scalar_values, resolve_asset,
+                                   classified_groups, classified_bindings, output_kind, total_duration_ms,
+                                   video_duration_policy=None):
+    """Adapt explicitly prepared request values to the SAME graph compiler.
+
+    The trusted preparation adapter supplies authorized media facts. This entry
+    does not create PromptArtifact/Project stand-ins, read template examples as
+    request defaults, or constitute permission to submit to ComfyUI.
+    """
+    compiler_id, compiler_version = validate_frozen_workflow_snapshot(workflow_snapshot)
     compiler = workflow_family_for(compiler_id, compiler_version)
-    compiler_kwargs = {
-        "workflow_snapshot": workflow_snapshot,
-        "prompt": prompt,
-        "project": project,
-        "overrides": overrides,
-    }
-    compiler_kwargs["video_duration_policy"] = video_duration_policy
+    contract, graph = workflow_snapshot["input_contract"], workflow_snapshot["graph"]
+    bindings = canonical_binding_rows(workflow_snapshot.get("semantic_bindings") or [])
+    requirements = canonical_requirement_rows(workflow_snapshot.get("model_requirements") or [])
+    media_types = {"model_artifact", "asset_image", "asset_video", "asset_audio"}
+    scalar_keys = {row["semantic_key"] for row in bindings if row["value_type"] not in media_types}
+    if not isinstance(scalar_values, dict) or set(scalar_values) - scalar_keys:
+        raise WorkflowCompilerError("逐次值只能包含明确接线的标量，不能覆盖模型文件或素材来源")
+    if not callable(resolve_asset):
+        raise WorkflowCompilerError("需要正式来源适配器解析素材，不能采用图中示例文件")
+    if compiler_version == 2:
+        from studio.services.workflow_asset_groups import validate_frozen_groups, AssetGroupError
+        try:
+            validate_frozen_groups(contract)
+        except AssetGroupError as exc:
+            raise WorkflowCompilerError(str(exc)) from exc
+        for key, definition in contract["parameters"].items():
+            if definition.get("asset_group_constant") and scalar_values.get(key) != definition["default"]:
+                raise WorkflowCompilerError("逐项模板常量必须使用冻结值")
     try:
-        return compiler(**compiler_kwargs)
+        validate_resolution_strategy(graph=graph, contract=contract, bindings=bindings, output_kind=output_kind)
+        if contains_legacy_placeholder(graph):
+            raise WorkflowCompilerError("generic workflow graph 仍包含 legacy ${TOKEN} 占位符")
+        resolved = resolve_workflow_semantic_values(graph=graph, contract=contract, bindings=bindings,
+            requirements=requirements, resolve_scalar=lambda key, definition, value_type: scalar_values.get(key),
+            resolve_asset=resolve_asset)
     except WorkflowSemanticError as exc:
         raise WorkflowCompilerError(str(exc)) from exc
+    resolution_evidence = None
+    if contract.get("resolution_strategy", {}).get("mode") == "source_image_derived":
+        from studio.services.workflow_resolution import resolve_prepared_image_resolution, WorkflowResolutionError
+        try:
+            resolution_evidence = resolve_prepared_image_resolution(contract["resolution_strategy"], resolved.asset_bindings)
+        except WorkflowResolutionError as exc:
+            raise WorkflowCompilerError(str(exc)) from exc
+    if contract.get("frame_policy"):
+        _validate_runtime_frame_policy(contract, {**resolved.values, **_validated_static_semantics(contract)},
+            total_duration_ms, video_duration_policy)
+    return compiler(workflow_snapshot=workflow_snapshot, resolved=resolved,
+        output_kind=output_kind, compiler_version=compiler_version, classified_groups=classified_groups,
+        classified_bindings=classified_bindings,
+        resolution_evidence=resolution_evidence)
+
+
+# Audited graph protocols share one explicit-facts implementation. No entry
+# accepts a Project/PromptArtifact or discovers values from mutable defaults.
+register_workflow_family("generic.comfy", 1, _compile_resolved_generic)
+register_workflow_family("generic.comfy", 2, _compile_resolved_generic)
+register_workflow_family("generic.comfy", 3, _compile_resolved_generic)

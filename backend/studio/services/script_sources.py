@@ -4,7 +4,9 @@ import hashlib
 import io
 import re
 import zipfile
+from copy import deepcopy
 from pathlib import Path
+from uuid import UUID
 
 from django.core.exceptions import ValidationError
 from django.core.files.base import ContentFile
@@ -44,6 +46,44 @@ class ScriptSourceValidationError(ValidationError):
         self.code = code
 
 
+def verify_script_text_source(content, *, source_reference, source_kind):
+    """Verify resolved source evidence without normalizing text or reading rows.
+
+    The authorized input resolver owns permission and selection. Literal and
+    fixture inputs cannot acquire revision identities by looking like a script.
+    """
+    if not isinstance(content, str):
+        raise ScriptSourceValidationError("剧本来源必须是文本。", code="script_structure_source_invalid")
+    try:
+        payload = content.encode("utf-8")
+    except UnicodeError as exc:
+        raise ScriptSourceValidationError("剧本来源含无效 Unicode，不能改写后提交。", code="script_structure_source_invalid") from exc
+    expected = {"id", "source_id", "revision", "content_sha256", "content_size_bytes"}
+    if not isinstance(source_reference, dict) or set(source_reference) != expected:
+        raise ScriptSourceValidationError("剧本来源标识不完整。", code="script_structure_source_invalid")
+    if source_kind in {"fixture", "literal"}:
+        if any(source_reference[key] is not None for key in ("id", "source_id", "revision")):
+            raise ScriptSourceValidationError("临时输入不能伪造剧本修订。", code="script_structure_source_invalid")
+    elif source_kind == "script_revision":
+        try:
+            for key in ("id", "source_id"):
+                if not isinstance(source_reference[key], str) or str(UUID(source_reference[key])) != source_reference[key]:
+                    raise ValueError("invalid source identity")
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise ScriptSourceValidationError("剧本来源标识无效。", code="script_structure_source_invalid") from exc
+        if type(source_reference["revision"]) is not int or source_reference["revision"] < 1:
+            raise ScriptSourceValidationError("剧本修订无效。", code="script_structure_source_invalid")
+    else:
+        raise ScriptSourceValidationError("未登记的剧本来源。", code="script_structure_source_invalid")
+    if (type(source_reference["content_size_bytes"]) is not int
+            or len(payload) != source_reference["content_size_bytes"]
+            or hashlib.sha256(payload).hexdigest() != source_reference["content_sha256"]):
+        raise ScriptSourceValidationError("剧本内容与冻结大小或 hash 不一致。", code="script_structure_revision_drift")
+    if not content.strip():
+        raise ScriptSourceValidationError("剧本来源为空。", code="script_structure_source_empty")
+    return deepcopy(source_reference)
+
+
 def _upload_limit(project: SeriesProject) -> int:
     resolved = resolve_configuration(
         project=project,
@@ -53,18 +93,23 @@ def _upload_limit(project: SeriesProject) -> int:
 
 
 def _validate_text(text: str, *, max_bytes: int) -> tuple[str, int, str]:
-    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    if "\x00" in normalized:
+    """Validate the actual text bytes, not a normalized replacement of them."""
+    if not isinstance(text, str):
+        raise ScriptSourceValidationError("剧本内容必须是文本", code="script_text_required")
+    if "\x00" in text:
         raise ScriptSourceValidationError("剧本文本包含 NUL 字符", code="script_binary_content")
-    if not normalized.strip():
+    if not text.strip():
         raise ScriptSourceValidationError("剧本文本为空", code="script_empty")
-    payload = normalized.encode("utf-8")
+    try:
+        payload = text.encode("utf-8")
+    except UnicodeError as exc:
+        raise ScriptSourceValidationError("剧本文本不是有效 Unicode", code="script_encoding_invalid") from exc
     if len(payload) > max_bytes:
         raise ScriptSourceValidationError(
             f"提取后的剧本文本超过 {max_bytes} 字节上限",
             code="script_too_large",
         )
-    return normalized, len(payload), hashlib.sha256(payload).hexdigest()
+    return text, len(payload), hashlib.sha256(payload).hexdigest()
 
 
 def _extract_docx(payload: bytes) -> str:
@@ -162,7 +207,9 @@ def normalize_script_asset_upload(uploaded_file) -> tuple[bytes, dict]:
     if not payload:
         raise ScriptSourceValidationError("上传文件为空", code="script_empty")
     extracted = _extract_upload(payload, source_format)
-    normalized, size, digest = _validate_text(extracted, max_bytes=max_bytes)
+    # Library ingestion explicitly owns utf8_markdown_v1 normalization. Project
+    # revisions, model responses and edits must not inherit that transformation.
+    normalized, size, digest = _validate_text(extracted.replace("\r\n", "\n").replace("\r", "\n"), max_bytes=max_bytes)
     canonical = normalized.encode("utf-8")
     return canonical, {
         "manifest_schema_version": 1,
@@ -179,7 +226,7 @@ def normalize_script_asset_upload(uploaded_file) -> tuple[bytes, dict]:
 
 
 def _create_revision(*, source, content, created_by, status=ScriptRevision.Status.PREVIEW):
-    normalized, size, digest = _validate_text(content, max_bytes=_upload_limit(source.project))
+    content, size, digest = _validate_text(content, max_bytes=_upload_limit(source.project))
     next_revision = (
         ScriptRevision.objects.filter(source=source).aggregate(value=Max("revision"))["value"]
         or 0
@@ -187,7 +234,7 @@ def _create_revision(*, source, content, created_by, status=ScriptRevision.Statu
     return ScriptRevision.objects.create(
         source=source,
         revision=next_revision,
-        content=normalized,
+        content=content,
         content_size_bytes=size,
         content_sha256=digest,
         status=status,
@@ -210,7 +257,7 @@ def create_pasted_script_source(
         ScriptSource.SourceFormat.FOUNTAIN,
     }:
         raise ScriptSourceValidationError("粘贴内容只支持 plain/markdown/fountain")
-    normalized, size, digest = _validate_text(content, max_bytes=_upload_limit(project))
+    content, size, digest = _validate_text(content, max_bytes=_upload_limit(project))
     source = ScriptSource.objects.create(
         owner=user,
         project=project,
@@ -221,7 +268,7 @@ def create_pasted_script_source(
         file_size_bytes=size,
         file_sha256=digest,
     )
-    revision = _create_revision(source=source, content=normalized, created_by=user)
+    revision = _create_revision(source=source, content=content, created_by=user)
     return source, revision
 
 
@@ -348,7 +395,7 @@ def create_script_source_from_asset(
             "剧本素材不是规范 UTF-8 文本",
             code="script_encoding_invalid",
         ) from exc
-    normalized, size, digest = _validate_text(content, max_bytes=max_bytes)
+    content, size, digest = _validate_text(content, max_bytes=max_bytes)
     source = ScriptSource.objects.create(
         owner=user,
         project=project,
@@ -362,16 +409,16 @@ def create_script_source_from_asset(
         file_sha256=digest,
         validation_message="已从素材库导入，等待人工确认。",
     )
-    revision = _create_revision(source=source, content=normalized, created_by=user)
+    revision = _create_revision(source=source, content=content, created_by=user)
     return source, revision
 
 
 @transaction.atomic
-def create_script_revision(*, source: ScriptSource, user, content: str) -> ScriptRevision:
+def create_script_revision(*, source: ScriptSource, user, content: str, allow_generated: bool = False) -> ScriptRevision:
     source = ScriptSource.objects.select_for_update().get(pk=source.pk)
     if source.status == ScriptSource.Status.FAILED:
         raise ScriptSourceValidationError("失败的 source 不能直接新增 revision")
-    if source.source_type == ScriptSource.SourceType.AI_GENERATED:
+    if source.source_type == ScriptSource.SourceType.AI_GENERATED and not allow_generated:
         raise ScriptSourceValidationError(
             "AI 生成的 source 只能通过对应 ProductionRun 审核，不能从公共 revision API 派生",
             code="production_run_review_required",

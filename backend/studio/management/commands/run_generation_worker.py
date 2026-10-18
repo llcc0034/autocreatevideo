@@ -6,7 +6,7 @@ import time
 
 from django.core.management.base import BaseCommand, CommandError
 
-from studio.models import AssetGenerationJob, GenerationTask
+from studio.models import AssetGenerationJob
 from studio.services.asset_generation import (
     claim_next_comfy_asset_job,
     fail_unhandled_asset_generation_job,
@@ -20,20 +20,17 @@ from studio.services.local_qwen_lock import (
 )
 from studio.services.task_queue import (
     claim_next_task,
-    comfy_client_for_task,
     fail_claimed_task_preflight,
     process_task,
     recover_stale_tasks,
 )
-from studio.services.deferred_generation import (
-    claim_next_deferred_request,
-    ensure_next_first_frame_deferred_for_task,
-    process_deferred_request,
-    recover_stale_deferred_requests,
-)
 from studio.services.worker_heartbeat import WorkerHeartbeat
+from studio.services.task_distribution_recovery import (
+    claim_task_distribution, process_task_distribution, recover_stale_task_distributions,
+)
 from studio.services.worker_database import retry_worker_database_step
 from studio.services.configuration import resolve_configuration
+from studio.services.execution_preparation_queue import advance_next_execution_preparation
 from studio.services.workflow_smoke_queue import (
     claim_next_workflow_smoke,
     process_workflow_smoke,
@@ -120,9 +117,6 @@ class Command(BaseCommand):
         recovered = recover_stale_tasks(startup_recover_minutes)
         if recovered:
             self.stdout.write(f"Recovered {recovered} stale tasks")
-        recovered_deferred = recover_stale_deferred_requests(startup_recover_minutes)
-        if recovered_deferred:
-            self.stdout.write(f"Recovered {recovered_deferred} stale deferred requests")
         recovered_smokes = recover_stale_workflow_smokes(startup_recover_minutes)
         if recovered_smokes:
             self.stdout.write(f"Recovered {recovered_smokes} stale workflow smoke attempts")
@@ -140,17 +134,13 @@ class Command(BaseCommand):
         if reconciled_assets["resumed"] or reconciled_assets["terminal"]:
             self.stdout.write(f"Reconciled ComfyUI asset jobs: {reconciled_assets}")
         last_recovery = time.monotonic()
+        recover_stale_task_distributions()
         while True:
             current = time.monotonic()
             if current - last_recovery >= recovery_interval:
                 recovered = recover_stale_tasks(recovery_minutes)
                 if recovered:
                     self.stdout.write(f"Recovered {recovered} stale tasks")
-                recovered_deferred = recover_stale_deferred_requests(recovery_minutes)
-                if recovered_deferred:
-                    self.stdout.write(
-                        f"Recovered {recovered_deferred} stale deferred requests",
-                    )
                 recovered_smokes = recover_stale_workflow_smokes(recovery_minutes)
                 if recovered_smokes:
                     self.stdout.write(
@@ -172,10 +162,21 @@ class Command(BaseCommand):
                         f"Reconciled ComfyUI asset jobs: {reconciled_assets}",
                     )
                 last_recovery = current
+                recover_stale_task_distributions()
+            # Resume original local post-processing before acquiring any GPU
+            # work. No Comfy client, generation claim or remote submission.
+            publication = retry_worker_database_step(claim_task_distribution, wait_seconds=poll_seconds)
+            if publication is not None:
+                result = process_task_distribution(publication)
+                self.stdout.write(f"Distribution {result.id}: {result.distribution_state}")
+                if options["once"]:
+                    return
+                continue
             task = None
             smoke_attempt = None
             asset_job = None
             try:
+                retry_worker_database_step(advance_next_execution_preparation, wait_seconds=poll_seconds)
                 # Claim while owning the same short cross-process gate used by
                 # local Qwen. The claim changes the database state to RUNNING;
                 # Qwen re-checks that state after acquiring the gate. Releasing
@@ -191,29 +192,12 @@ class Command(BaseCommand):
                 if task:
                     try:
                         self.stdout.write(
-                            f"Processing {task.id} attempt {task.attempts}/{task.max_attempts}",
+                            f"Processing {task.id} worker claim {task.attempts}",
                         )
                         result = process_task(
                             task,
-                            client=comfy_client_for_task(task),
                         )
                         self.stdout.write(f"Task {result.id}: {result.status}")
-                        if result.status == GenerationTask.Status.SUCCEEDED:
-                            try:
-                                created = ensure_next_first_frame_deferred_for_task(result)
-                            except Exception as exc:
-                                self.stderr.write(
-                                    "Deferred continuity registration failed for "
-                                    f"task {result.id}: {exc}",
-                                )
-                            else:
-                                if created:
-                                    deferred_request, is_new = created
-                                    verb = "Created" if is_new else "Reused"
-                                    self.stdout.write(
-                                        f"{verb} deferred request {deferred_request.id} "
-                                        f"for task {result.id}",
-                                    )
                     except Exception as exc:
                         # Client/config/capacity validation happens after the
                         # durable claim. Persist a terminal fact before moving
@@ -240,24 +224,9 @@ class Command(BaseCommand):
                 # short worker poll instead of claiming a task we cannot run.
                 task = None
 
-            deferred_request = None
-            if task is None and smoke_attempt is None and asset_job is None:
-                deferred_request = retry_worker_database_step(
-                    claim_next_deferred_request, worker_id, wait_seconds=poll_seconds,
-                )
-                if deferred_request:
-                    self.stdout.write(
-                        f"Processing deferred request {deferred_request.id} "
-                        f"attempt {deferred_request.attempts}/{deferred_request.max_attempts}",
-                    )
-                    result = process_deferred_request(deferred_request)
-                    self.stdout.write(
-                        f"Deferred request {result.id}: {result.status}",
-                    )
-
             if (
                 task is None and smoke_attempt is None and asset_job is None
-                and deferred_request is None and not options["once"]
+                and not options["once"]
             ):
                 time.sleep(poll_seconds)
             if options["once"]:

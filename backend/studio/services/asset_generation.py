@@ -4,18 +4,20 @@ from datetime import timedelta
 from copy import deepcopy
 from decimal import Decimal, InvalidOperation
 import hashlib
+import json
 import math
-from pathlib import Path, PurePosixPath
+import re
+from pathlib import Path
 import tempfile
 from urllib.parse import urlparse
 import uuid
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.core.exceptions import ValidationError
+from django.core.exceptions import PermissionDenied, ValidationError
 from django.core.files import File
 from django.core.files.base import ContentFile
-from django.db import IntegrityError, transaction
+from django.db import transaction
 from django.db.models import Max, Q
 from django.utils import timezone
 
@@ -25,67 +27,45 @@ from studio.models import (
     AssetGenerationJobResolution,
     GenerationTask,
     ModelDeployment,
-    ModelProfileVersion,
     ProviderProfile,
     Style,
     WorkflowSmokeAttempt,
-    WorkflowTemplateVersion,
     WorkerLease,
 )
-from studio.media_signing import classify_task_output
 from studio.services.async_media_contract import (
-    ASYNC_MEDIA_OUTPUT_KIND,
-    async_operation_contract,
-    deployment_target_sha256,
-    fresh_smoke_snapshot,
-    validate_async_model_profile,
     validate_standard_payload,
 )
 from studio.services.configuration import resolve_configuration
 from studio.services.generated_artifacts import verified_local_media_facts
-from studio.services.json_contracts import json_contract, verify_json_contract
-from studio.services.media_request_limits import media_prompt_absolute_max_chars
-from studio.services.model_profile_contracts import CHAT_REQUEST_OPTIONS_KEY
+from studio.services.execution_asset_dispatch import begin_asset_execution_submission, check_asset_execution_staging
+from studio.services.execution_asset_requests import read_asset_prompt_hint
+from studio.services.json_contracts import assign_json_contract, json_contract, verify_json_contract
+from studio.services.registry_reference_lock import registry_reference_writer
 from studio.services.provenance import ProvenanceError
 from studio.services.provider_registry import (
     ProviderDriverError,
     driver_for,
+    registered_driver_capabilities,
     restricted_async_rest_runtime_budget,
     restricted_comfyui_runtime_budget,
 )
 from studio.services.production_pipeline import can_execute_template
 from studio.services.remote_artifacts import download_remote_artifact
-from studio.services.script_generation_contract import (
-    SCRIPT_GENERATE_OPERATION,
-    validate_script_generation_model_profile,
-)
 from studio.services.security_boundaries import boundary_int
 from studio.services.content_contracts import normalize_audit_note
-from studio.services.media_processing_profiles import resolve_reference_media_profile
-from studio.services.workflow_smoke_fixtures import (
-    FIXTURE_SCHEMA_VERSION,
-    normalize_workflow_execution_inputs,
-    workflow_execution_conditioning_contract,
-    workflow_execution_input_schema,
-)
-from studio.services.workflow_versions import (
-    declared_workflow_operation,
-    materialize_workflow_execution_graph,
-    resolve_workflow_canvas_export_deployment,
-    verify_published_workflow_capability,
-    workflow_execution_target_sha256,
-)
 from studio.services.workflow_smoke_resolution import (
     unresolved_workflow_smoke_attempts,
 )
-from studio.services.task_queue import ComfyUIError, prepare_workflow
+from studio.services.task_queue import ComfyUIError
 
 
-MEDIA_OPERATION = {
-    AssetGenerationJob.MediaType.IMAGE: "image.text_to_image",
-    AssetGenerationJob.MediaType.VIDEO: "video.text_to_video",
-    AssetGenerationJob.MediaType.AUDIO: "audio.text_to_audio",
-}
+def _text_driver_types():
+    return tuple(key for key, contract in registered_driver_capabilities().items()
+        if "chat_completion" in contract.get("operations", []))
+
+
+def _is_text_job(job):
+    return job.model_deployment.provider.driver_type in _text_driver_types()
 
 
 def _stage_snapshot_max_bytes() -> int:
@@ -116,100 +96,7 @@ MEDIA_JOB_STATUSES = (
 )
 
 
-def _workflow_user_parameters(contract: dict) -> tuple[dict, dict]:
-    definitions = contract.get("parameters") if isinstance(contract, dict) else None
-    definitions = definitions if isinstance(definitions, dict) else {}
-    smoke_inputs = contract.get("smoke_inputs") if isinstance(contract, dict) else None
-    smoke_inputs = smoke_inputs if isinstance(smoke_inputs, dict) else {}
-    editable: dict[str, dict] = {}
-    defaults: dict[str, object] = {}
-    for key, raw_definition in definitions.items():
-        key = str(key or "")
-        if (
-            not key
-            or key.startswith("prompt.")
-            or key.startswith("model.")
-            or key.startswith("asset.")
-            or key == "output.prefix"
-            or key == "generation.batch_size"
-        ):
-            continue
-        definition = raw_definition if isinstance(raw_definition, dict) else {}
-        value_type = str(definition.get("type") or "")
-        if value_type not in {"string", "integer", "number", "boolean", "enum"}:
-            continue
-        editable[key] = {
-            field: definition[field]
-            for field in (
-                "type", "required", "default", "min", "max", "multiple_of",
-                "min_length", "max_length", "options",
-            )
-            if field in definition
-        }
-        if key in smoke_inputs:
-            value = smoke_inputs[key]
-        elif "default" in definition:
-            value = definition["default"]
-        else:
-            continue
-        # A canvas-exported value can be a valid-looking default yet violate a
-        # node's declared step/alignment constraint. The same normalization is applied to
-        # smoke fixtures; apply it here as well so the form's untouched values
-        # are executable through the asset-generation route.
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            minimum = definition.get("min")
-            maximum = definition.get("max")
-            if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
-                value = max(value, minimum)
-            if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
-                value = min(value, maximum)
-            multiple = definition.get("multiple_of")
-            if isinstance(multiple, int) and multiple > 1:
-                value = max(multiple, int(round(float(value) / multiple)) * multiple)
-                if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
-                    value = min(value, int(maximum))
-            if value_type == "integer":
-                value = int(value)
-        defaults[key] = value
-    return editable, defaults
 
-
-def _eligible_workflow_route(
-    version: WorkflowTemplateVersion,
-    *,
-    user,
-    media_type: str,
-) -> tuple[WorkflowTemplateVersion, ModelDeployment, WorkflowSmokeAttempt, str]:
-    if media_type not in MEDIA_OPERATION:
-        raise ValidationError("该素材类型不支持 ComfyUI 工作流")
-    version, deployment, _source = resolve_workflow_canvas_export_deployment(version)
-    if version.template.output_kind != media_type:
-        raise ValidationError("工作流必须是当前已发布、已烟测且输出类型匹配的版本")
-    primary = (
-        (version.input_contract.get("outputs") or {}).get("primary")
-        if isinstance(version.input_contract, dict) else None
-    )
-    primary_node = (
-        version.graph.get(str(primary.get("node_id") or ""))
-        if isinstance(primary, dict) and isinstance(version.graph, dict) else None
-    )
-    primary_class = str(primary_node.get("class_type") or "") if isinstance(primary_node, dict) else ""
-    durable_output_nodes = {
-        AssetGenerationJob.MediaType.IMAGE: {"SaveImage", "SaveImageAdvanced"},
-        AssetGenerationJob.MediaType.VIDEO: {"SaveVideo", "VHS_VideoCombine"},
-        AssetGenerationJob.MediaType.AUDIO: {"SaveAudioAdvanced"},
-    }
-    if primary_class not in durable_output_nodes.get(media_type, set()):
-        raise ValidationError("素材库工作流主输出必须是受支持的持久 Save 节点")
-    if not can_execute_template(version.template, user):
-        raise ValidationError("当前用户无权执行该工作流")
-    operation = declared_workflow_operation(version)
-    smoke, target_sha256 = verify_published_workflow_capability(
-        version,
-        deployment,
-        operation=operation,
-    )
-    return version, deployment, smoke, target_sha256
 
 
 def _combined_config(deployment: ModelDeployment) -> dict:
@@ -229,699 +116,252 @@ def _is_external(deployment: ModelDeployment) -> bool:
     return hostname not in {"localhost", "127.0.0.1", "::1"}
 
 
-def _eligible_deployment(
-    deployment: ModelDeployment,
-    *,
-    job_type: str,
-    media_type: str,
-    ) -> tuple[str, dict | None, object, dict | None]:
-    if (
-        deployment.status != ModelDeployment.Status.ACTIVE
-        or deployment.profile_version.status != ModelProfileVersion.Status.PUBLISHED
-        or not deployment.provider.is_active
-    ):
-        raise ValidationError("模型部署未处于已发布、启用状态")
-    if job_type == AssetGenerationJob.JobType.PROMPT or media_type == AssetGenerationJob.MediaType.SCRIPT:
-        policy = validate_script_generation_model_profile(deployment.profile_version)
-        if policy is None:
-            raise ValidationError("文本部署未声明 script.generate 受控能力")
-        operation = SCRIPT_GENERATE_OPERATION
-        contract = None
-        text_policy = policy
-    else:
-        operation = MEDIA_OPERATION.get(media_type)
-        if operation is None:
-            raise ValidationError("素材类型没有对应的受控生成能力")
-        if deployment.provider.driver_type != ProviderProfile.DriverType.ASYNC_REST:
-            raise ValidationError("媒体素材生成只接受 restricted async REST deployment")
-        if operation not in validate_async_model_profile(deployment.profile_version):
-            raise ValidationError(f"模型部署未声明 {operation}")
-        contract = async_operation_contract(deployment.profile_version, operation)
-        text_policy = None
-    smoke = fresh_smoke_snapshot(deployment, operation)
-    if smoke is None:
-        raise ValidationError(f"模型部署缺少 {operation} 的新鲜真实烟测证据")
-    return operation, contract, smoke, text_policy
 
 
-def asset_generation_options(*, user, job_type: str, media_type: str) -> list[dict]:
-    rows: list[dict] = []
-    deployments = ModelDeployment.objects.select_related(
-        "profile_version__provider",
-    ).filter(
-        status=ModelDeployment.Status.ACTIVE,
-        profile_version__status=ModelProfileVersion.Status.PUBLISHED,
-        profile_version__provider__is_active=True,
-    )
-    for deployment in deployments:
-        try:
-            operation, contract, smoke, text_policy = _eligible_deployment(
-                deployment,
-                job_type=job_type,
-                media_type=media_type,
-            )
-            external = _is_external(deployment)
-        except (ValidationError, ProviderDriverError, ValueError, TypeError):
-            continue
-        rows.append({
-            "target_kind": AssetGenerationJob.ExecutionKind.DEPLOYMENT,
-            "target_id": str(deployment.id),
-            "key": deployment.key,
-            "name": deployment.name,
-            "model_deployment_id": str(deployment.id),
-            "model_deployment_name": deployment.name,
-            "model_identifier": deployment.profile_version.model_identifier,
-            "operation": operation,
-            "is_external": external,
-            "smoke_evidence_id": str(smoke.id),
-            "smoke_expires_at": smoke.expires_at,
-            "request_schema": contract["request_schema"] if contract else None,
-            "parameter_defaults": {
-                key: value for key, value in (
-                    contract["smoke_inputs"] if contract else {
-                        "max_tokens": int((text_policy or {}).get("max_output_tokens") or 1),
-                    }
-                ).items()
-                if key not in {"prompt", "negative_prompt", "model"}
-            },
-            "workflow_input_schema": None,
-            "accepts_negative_prompt": bool(
-                contract
-                and "negative_prompt" in contract["request_schema"]["properties"]
-            ),
-            "workflow_version_id": None,
-            "workflow_name": "",
-            "workflow_version": None,
-        })
-    if (
-        job_type == AssetGenerationJob.JobType.ASSET
-        and media_type in MEDIA_OPERATION
-    ):
-        versions = WorkflowTemplateVersion.objects.select_related(
-            "template", "provider", "model_profile_version",
-            "validated_deployment__profile_version__provider",
-        ).prefetch_related(
-            "model_requirements__artifact", "semantic_bindings", "smoke_attempts",
-        ).filter(
-            status=WorkflowTemplateVersion.Status.PUBLISHED,
-            is_current=True,
-            template__output_kind=media_type,
-        )
-        for candidate in versions:
-            try:
-                version, deployment, smoke, _target_sha = _eligible_workflow_route(
-                    candidate,
-                    user=user,
-                    media_type=media_type,
-                )
-                external = _is_external(deployment)
-                input_schema = workflow_execution_input_schema(version)
-            except (ValidationError, ProviderDriverError, ValueError, TypeError):
-                continue
-            contract_parameters = (
-                version.input_contract.get("parameters")
-                if isinstance(version.input_contract, dict) else {}
-            )
-            rows.append({
-                "target_kind": AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW,
-                "target_id": str(version.id),
-                "key": f"workflow:{version.template.slug}:v{version.version}",
-                "name": f"{version.template.name} v{version.version}",
-                "model_deployment_id": str(deployment.id),
-                "model_deployment_name": deployment.name,
-                "model_identifier": deployment.profile_version.model_identifier,
-                "operation": declared_workflow_operation(version),
-                "is_external": external,
-                "smoke_evidence_id": str(smoke.id),
-                "smoke_expires_at": None,
-                "request_schema": None,
-                "parameter_defaults": {},
-                "workflow_input_schema": input_schema,
-                "accepts_negative_prompt": bool(
-                    isinstance(contract_parameters, dict)
-                    and "prompt.negative" in contract_parameters
-                ),
-                "workflow_version_id": str(version.id),
-                "workflow_name": version.template.name,
-                "workflow_version": version.version,
-            })
-    return rows
+def _asset_execution_output_kind(job_type, media_type):
+    """Business script files consume text output; catalogs and writes agree."""
+    return "text" if job_type == "prompt" or media_type == "script" else media_type
 
 
-def _text_payload(
-    *,
-    job_type: str,
-    media_type: str,
-    prompt: str,
-    style: Style | None,
-    parameters: dict,
-    policy: dict,
-) -> dict:
-    allowed = {"temperature", "max_tokens", "seed"}
-    unknown = sorted(set(parameters) - allowed)
-    if unknown:
-        raise ValidationError({"parameters": f"文本模型参数不受支持: {', '.join(unknown)}"})
-    normalized = dict(parameters)
-    temperature = normalized.pop("temperature", None)
-    if temperature is not None:
-        if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
-            raise ValidationError({"parameters": "temperature 必须是非负有限数值"})
-        if not math.isfinite(float(temperature)) or float(temperature) < 0:
-            raise ValidationError({"parameters": "temperature 必须是非负有限数值"})
-    seed = normalized.get("seed")
-    if seed is not None and (type(seed) is not int or not -(2**63) <= seed < 2**63):
-        raise ValidationError({"parameters": "seed 必须是 64 位有符号整数"})
-    max_allowed = int(policy["max_output_tokens"])
-    max_tokens = normalized.get("max_tokens", max_allowed)
-    if type(max_tokens) is not int or not 1 <= max_tokens <= max_allowed:
-        raise ValidationError({
-            "parameters": f"max_tokens 必须是 1 到已发布策略上限 {max_allowed} 的整数",
-        })
-    normalized["max_tokens"] = max_tokens
-    media_label = {
-        AssetGenerationJob.MediaType.IMAGE: "图片",
-        AssetGenerationJob.MediaType.VIDEO: "视频",
-        AssetGenerationJob.MediaType.AUDIO: "音频",
-        AssetGenerationJob.MediaType.SCRIPT: "剧本",
-    }[media_type]
-    if job_type == AssetGenerationJob.JobType.PROMPT:
-        system = (
-            f"你是短剧素材提示词编辑。根据需求生成一份可直接编辑和用于{media_label}模型的中文提示词。"
-            "只输出最终提示词正文，不要输出解释、标题或代码围栏。"
-        )
-    else:
-        system = (
-            "你是短剧剧本作者。根据创作需求生成完整、可人工审阅的 Markdown 剧本。"
-            "只输出剧本正文，不要输出解释或代码围栏。"
-        )
-    style_context = ""
-    if style is not None:
-        style_context = (
-            f"\n风格：{style.name}\n风格说明：{style.description}"
-            f"\n视觉提示：{style.visual_prompt}\n负面提示：{style.negative_prompt}"
-        )
-    payload = {
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": f"创作需求：{prompt}{style_context}"},
-        ],
-        "timeout_seconds": float(policy["timeout_seconds"]),
-        CHAT_REQUEST_OPTIONS_KEY: (
-            {"temperature": float(temperature)}
-            if temperature is not None else {}
-        ),
-        **normalized,
-    }
-    json_contract(payload, max_bytes=_text_provider_request_max_bytes())
-    return payload
+def asset_generation_options(*, user, job_type: str, media_type: str):
+    """Return a pageable exact-version catalog, without reading Smoke examples.
 
-
-def _media_payload(
-    *,
-    deployment: ModelDeployment,
-    contract: dict,
-    prompt: str,
-    negative_prompt: str,
-    parameters: dict,
-    idempotency_key: str,
-) -> dict:
-    protected = {"model", "prompt", "negative_prompt", "schema_version", "idempotency_key"}
-    overlap = sorted(set(parameters) & protected)
-    if overlap:
-        raise ValidationError({"parameters": f"这些字段由服务端冻结: {', '.join(overlap)}"})
-    payload = {
-        **parameters,
-        "model": deployment.profile_version.model_identifier,
-        "prompt": prompt,
-        "schema_version": 1,
-        "idempotency_key": idempotency_key,
-    }
-    if "negative_prompt" in contract["request_schema"]["properties"]:
-        payload["negative_prompt"] = negative_prompt
-    return validate_standard_payload(contract, payload)
+    Configuration choices are not executable permits. Input-contract detail and
+    root admission perform their own full checks; no catalog call invokes a model.
+    """
+    from studio.services.execution_instances import selectable_execution_versions
+    from studio.services.execution_field_contracts import FIELD_OPERATION_MODES
+    if job_type not in {"asset", "prompt"} or (media_type not in {"image", "video", "audio", "script"}
+            and (job_type, media_type) != ("prompt", "text")):
+        raise ValidationError("请选择正式任务与素材类型")
+    kind = _asset_execution_output_kind(job_type, media_type)
+    return selectable_execution_versions(user).exclude(operation__in=FIELD_OPERATION_MODES).filter(
+        Q(contract__definition__interface__output__kind=kind)
+        | Q(contract__definition__interface__output__contract__primary__kind=kind)
+    ).select_related("instance", "contract").only(
+        "id", "instance_id", "instance__id", "instance__key", "instance__name", "version", "operation", "mode", "prompt_mode",
+        "contract__id", "contract__version_id", "contract__sha256",
+    ).order_by("instance__key", "-version", "id")
 
 
 def _decimal_amount(value, *, field: str) -> Decimal | None:
     if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        raise ValidationError({field: "必须是非负有限金额"})
     try:
         amount = Decimal(str(value)).quantize(Decimal("0.000001"))
     except (InvalidOperation, TypeError, ValueError) as exc:
         raise ValidationError({field: "必须是非负有限金额"}) from exc
-    if not amount.is_finite() or amount < 0:
+    if not amount.is_finite() or amount < 0 or amount >= Decimal("100000000"):
         raise ValidationError({field: "必须是非负有限金额"})
     return amount
 
 
-@transaction.atomic
+def _actual_cost_currency(value) -> str:
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Z][A-Z0-9]{2,11}", value):
+        raise ValidationError({"cost_currency": "实际费用必须附带明确币种，不能从估算推断或截断"})
+    return value
+
+
+@registry_reference_writer
 def create_asset_generation_job(
-    *,
-    owner,
-    job_type: str,
-    media_type: str,
-    prompt: str,
-    execution_kind: str = AssetGenerationJob.ExecutionKind.DEPLOYMENT,
-    deployment: ModelDeployment | None = None,
-    workflow_version: WorkflowTemplateVersion | None = None,
-    negative_prompt: str = "",
-    parameters: dict | None = None,
-    workflow_inputs: dict | None = None,
-    style: Style | None = None,
-    image_category: str = "",
-    name: str = "",
-    description: str = "",
-    allow_external_calls: bool = False,
-    budget_limit=None,
-    client_idempotency_key: str = "",
+    *, owner, execution_instance_version_id, expected_definition_sha256,
+    job_type: str, media_type: str, inputs: dict, parameters: dict,
+    manual_channels: dict, subject_facts: list, source_language: str, target_language: str,
+    field_values: list, style: Style | None = None, image_category: str = "",
+    name: str = "", description: str = "", allow_external_calls: bool = False,
+    budget_limit=None, client_idempotency_key: str, appearance_target=None,
 ) -> tuple[AssetGenerationJob, bool]:
-    prompt = str(prompt or "").strip()
-    if not prompt:
-        raise ValidationError({"prompt": "创作需求或最终提示词不能为空"})
-    prompt_limit = media_prompt_absolute_max_chars()
-    if (
-        len(prompt) > prompt_limit
-        or len(str(negative_prompt or "")) > prompt_limit
-    ):
-        raise ValidationError({
-            "prompt": f"提示词不能超过当前安全边界 {prompt_limit} 字符",
-        })
-    parameters = parameters if isinstance(parameters, dict) else {}
-    workflow_inputs = workflow_inputs if isinstance(workflow_inputs, dict) else {}
+    """Create one real root plus its preparation; never queue a provider here.
+
+    The published instance is the only target selector. Missing editable fields
+    are a persisted wait, not a fake prompt or an implicit auxiliary approval.
+    """
+    from studio.services.execution_definitions import (
+        execution_definition_version, stored_execution_contract, verify_current_execution_definition,
+    )
+    from studio.services.execution_instances import execution_configuration_max_bytes
+    from studio.services.execution_request_storage import execution_request_max_bytes
+    from studio.services.execution_preparation_fields import create_manual_execution_field
+    from studio.services.execution_preparation_evaluation import evaluate_preparation_fields
+    from studio.services.execution_preparations import create_execution_instance_preparation, read_execution_preparation_detail
+    from studio.services.execution_request_preparation import resolve_execution_request_facts
+    from studio.services.execution_field_contracts import FIELD_OPERATION_MODES
+    from studio.services.media_generation_appearances import normalize_media_appearance_request
+
+    appearance_target = normalize_media_appearance_request(appearance_target)
+    if appearance_target is not None and (job_type != "asset" or media_type != "image"):
+        raise ValidationError("主图/变体声明仅用于图片素材生成")
+
+    if not owner or not owner.is_authenticated or not owner.is_active:
+        raise PermissionDenied("需要有效登录身份")
+    if type(allow_external_calls) is not bool:
+        raise ValidationError({"allow_external_calls": "必须明确授权或不授权外部调用"})
+    if job_type not in {AssetGenerationJob.JobType.ASSET, AssetGenerationJob.JobType.PROMPT}:
+        raise ValidationError({"job_type": "此入口只能创建素材或提示词候选，不能伪造辅助任务"})
+    if media_type not in {AssetGenerationJob.MediaType.IMAGE, AssetGenerationJob.MediaType.VIDEO,
+            AssetGenerationJob.MediaType.AUDIO, AssetGenerationJob.MediaType.SCRIPT} and not (job_type == "prompt" and media_type == "text"):
+        raise ValidationError({"media_type": "请选择正式素材类型"})
     if style is not None and style.owner_id not in (None, owner.id) and not owner.is_staff:
-        raise ValidationError({"style_id": "不能使用其他用户的风格"})
-    if job_type not in AssetGenerationJob.JobType.values:
-        raise ValidationError({"job_type": "任务类型无效"})
-    if media_type not in AssetGenerationJob.MediaType.values:
-        raise ValidationError({"media_type": "素材类型无效"})
-    if execution_kind not in AssetGenerationJob.ExecutionKind.values:
-        raise ValidationError({"execution_kind": "执行方案类型无效"})
-    if execution_kind == AssetGenerationJob.ExecutionKind.DEPLOYMENT:
-        if deployment is None or workflow_version is not None:
-            raise ValidationError("模型部署方案必须且只能指定 model deployment")
-        if workflow_inputs:
-            raise ValidationError({"workflow_inputs": "模型部署方案不接受工作流输入"})
-        target_id = str(deployment.pk)
-    else:
-        if workflow_version is None or deployment is not None:
-            raise ValidationError("ComfyUI 工作流方案必须且只能指定 workflow version")
-        if job_type != AssetGenerationJob.JobType.ASSET:
-            raise ValidationError("提示词候选不能使用 ComfyUI 工作流方案")
-        if parameters:
-            raise ValidationError({
-                "parameters": "ComfyUI 工作流参数统一放入 workflow_inputs.values",
-            })
-        target_id = str(workflow_version.pk)
+        raise PermissionDenied("不能使用其他用户的风格")
+    if not isinstance(name, str) or len(name) > 160 or not isinstance(description, str):
+        raise ValidationError("素材名称或描述格式无效")
     if job_type == AssetGenerationJob.JobType.ASSET:
-        if not str(name or "").strip():
+        if not name.strip():
             raise ValidationError({"name": "生成素材必须填写名称"})
         if media_type == AssetGenerationJob.MediaType.IMAGE:
-            image_category = str(image_category or Asset.Kind.REFERENCE)
             if image_category not in IMAGE_CATEGORIES:
-                raise ValidationError({"image_category": "图片类别只支持人物、场景、道具或通用"})
-            if image_category != Asset.Kind.REFERENCE and not str(description or "").strip():
+                raise ValidationError({"image_category": "图片类别需明确选择人物、场景、道具或通用"})
+            if image_category != Asset.Kind.REFERENCE and not description.strip():
                 raise ValidationError({"description": "分类图片素材必须填写基础描述"})
         elif image_category:
             raise ValidationError({"image_category": "只有图片素材可以设置图片类别"})
-
-    budget = _decimal_amount(budget_limit, field="budget_limit")
-    if client_idempotency_key:
-        raw_key = str(client_idempotency_key).strip()
-        if not raw_key or len(raw_key) > 191:
-            raise ValidationError("Idempotency-Key 长度必须在 1 到 191 之间")
-        key_hash = hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-        idempotency_key = f"asset-generation:{owner.id}:{key_hash}"
-    else:
-        idempotency_key = f"asset-generation:{uuid.uuid4()}"
-
-    # This fingerprint represents only the user's stable intent.  Live smoke,
-    # pricing and deployment evidence are frozen separately below and must not
-    # make an HTTP replay create a second billable request.
-    client_intent = json_contract({
-        "schema_version": 3,
-        "job_type": job_type,
-        "media_type": media_type,
-        "execution_kind": execution_kind,
-        "generation_target_id": target_id,
-        "style_id": str(style.id) if style else None,
-        "image_category": image_category,
-        "name": str(name or "")[:160],
-        "description": str(description or ""),
-        "prompt": prompt,
-        "negative_prompt": str(negative_prompt or ""),
-        "parameters": parameters,
-        "workflow_inputs": workflow_inputs,
-        "allow_external_calls": bool(allow_external_calls),
-        "budget_limit": str(budget) if budget is not None else None,
-    }, max_bytes=_stage_snapshot_max_bytes())
-    existing = AssetGenerationJob.objects.filter(idempotency_key=idempotency_key).first()
+    elif image_category:
+        raise ValidationError({"image_category": "提示词候选不设置图片素材类别"})
+    if not isinstance(field_values, list):
+        raise ValidationError({"field_values": "字段内容必须是明确列表"})
+    field_keys = set()
+    for row in field_values:
+        if (not isinstance(row, dict) or set(row) != {"unit_key", "field_key", "text"}
+                or any(not isinstance(row[key], str) for key in row)
+                or (row["unit_key"], row["field_key"]) in field_keys):
+            raise ValidationError({"field_values": "字段需明确单元、字段名和正文，不能重复或包含批准信息"})
+        field_keys.add((row["unit_key"], row["field_key"]))
+    if not isinstance(client_idempotency_key, str) or not client_idempotency_key.strip() or len(client_idempotency_key) > 191:
+        raise ValidationError({"Idempotency-Key": "创建需要1至191字符的稳定幂等键，重放请使用原键"})
+    if not isinstance(expected_definition_sha256, str) or not re.fullmatch(r"[a-f0-9]{64}", expected_definition_sha256):
+        raise ValidationError({"expected_definition_sha256": "需要明确的实例定义摘要"})
+    if budget_limit is not None:
+        raise ValidationError("资源提醒由系统配置统一管理，不再接受单次预算")
+    budget = None
+    requested = {"inputs": inputs, "parameters": parameters, "manual_channels": manual_channels,
+        "subject_facts": subject_facts, "source_language": source_language, "target_language": target_language}
+    client_intent = json_contract({"schema_version": 1,
+        "execution_instance_version_id": str(execution_instance_version_id), "definition_sha256": expected_definition_sha256,
+        "job_type": job_type, "media_type": media_type, "style_id": str(style.pk) if style else None,
+        "image_category": image_category, "name": name, "description": description,
+        "request": requested, "field_values": field_values, "allow_external_calls": allow_external_calls,
+        **({"appearance_target": appearance_target} if appearance_target is not None else {}),
+        "budget_limit": str(budget) if budget is not None else None}, max_bytes=execution_request_max_bytes())
+    key_hash = hashlib.sha256(client_idempotency_key.encode("utf-8")).hexdigest()
+    idempotency_key = f"asset-generation:{owner.pk}:{key_hash}"
+    # Serialize same-owner allocation as in the original tenant-scoped queue;
+    # a replay happens before current target/evidence checks or seed drawing.
+    get_user_model().objects.select_for_update().get(pk=owner.pk)
+    existing = AssetGenerationJob.objects.select_for_update().filter(idempotency_key=idempotency_key).first()
     if existing is not None:
-        existing_fingerprint = str(
-            (existing.request_snapshot or {}).get("client_request_sha256") or ""
-        )
-        if existing.owner_id != owner.id or existing_fingerprint != client_intent.sha256:
-            raise ValidationError("Idempotency-Key 已用于不同的素材生成请求")
+        header = _asset_request_header(existing)
+        if existing.owner_id != owner.pk or header["client_request_sha256"] != client_intent.sha256:
+            raise ValidationError("Idempotency-Key已用于不同的素材生成请求", code="execution_preparation_conflict")
+        preparation = existing.execution_preparations.get()
+        read_execution_preparation_detail(preparation)
         return existing, False
-
-    workflow_smoke = None
-    workflow_target_sha = ""
-    if execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
-        workflow_version = WorkflowTemplateVersion.objects.select_for_update().get(
-            pk=workflow_version.pk,
-        )
-        workflow_version, deployment, workflow_smoke, workflow_target_sha = (
-            _eligible_workflow_route(
-                workflow_version,
-                user=owner,
-                media_type=media_type,
-            )
-        )
-        operation = declared_workflow_operation(workflow_version)
-        contract = None
-        smoke = None
-        text_policy = None
-    else:
-        deployment = ModelDeployment.objects.select_for_update().select_related(
-            "profile_version__provider",
-        ).get(pk=deployment.pk)
-        operation, contract, smoke, text_policy = _eligible_deployment(
-            deployment,
-            job_type=job_type,
-            media_type=media_type,
-        )
+    version = execution_definition_version(execution_instance_version_id)
+    if version.status != "published" or not version.instance.is_active:
+        raise ValidationError("请选择启用执行实例的已发布精确版本")
+    if version.workflow_version_id and not can_execute_template(version.workflow_version.template, owner):
+        raise PermissionDenied("当前用户无权执行该工作流")
+    definition = verify_current_execution_definition(stored_execution_contract(version.pk))
+    if definition.sha256 != expected_definition_sha256:
+        raise ValidationError("执行定义与本次确认不一致，请重新读取", code="execution_preparation_conflict")
+    if version.operation in FIELD_OPERATION_MODES:
+        raise ValidationError("字段辅助叶子不能从素材生成入口直接调用")
+    output = definition.value["interface"]["output"]
+    output_kind = output["contract"]["primary"]["kind"] if version.workflow_version_id else output["kind"]
+    expected_kind = _asset_execution_output_kind(job_type, media_type)
+    if output_kind != expected_kind:
+        raise ValidationError({"media_type": "所选执行实例的实际输出合同与请求类型不一致"})
+    if field_values and version.prompt_mode != "profile":
+        raise ValidationError("完整人工提示词与策略字段不能同时提交")
+    deployment = version.deployment
     external = _is_external(deployment)
-    if (
-        execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-        and external
-    ):
-        raise ValidationError(
-            "远程 ComfyUI 尚无受控产物下载合同；当前只允许共享本地输出目录的 loopback 部署",
-        )
-    if external and not allow_external_calls:
-        raise ValidationError({"allow_external_calls": "外部模型调用必须显式授权"})
-    if external and budget is None:
-        raise ValidationError({"budget_limit": "外部模型调用必须设置预算上限"})
-
-    job_id = uuid.uuid4()
-    compiled = None
-    frozen_workflow_inputs = None
-    conditioning_contract = None
-    conditioning_mode_contract = None
-    reference_media_profile = None
-    server_managed_values: dict[str, object] = {}
-    if execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
-        frozen_workflow_inputs = normalize_workflow_execution_inputs(
-            workflow_version,
-            workflow_inputs,
-            owner=owner,
-        )
-        normalized_parameters = dict(frozen_workflow_inputs.values)
-        values = {
-            **normalized_parameters,
-            "prompt.positive": prompt,
-            "prompt.negative": str(negative_prompt or ""),
-        }
-        if workflow_version.semantic_bindings.filter(
-            semantic_key="generation.batch_size",
-        ).exists():
-            values["generation.batch_size"] = 1
-            server_managed_values["generation.batch_size"] = 1
-        output_prefix = f"autoprompt/assets/{owner.id}/{job_id}"
-        compiled = materialize_workflow_execution_graph(
-            workflow_version,
-            values=values,
-            reference_bindings=list(frozen_workflow_inputs.reference_bindings),
-            asset_facts=list(frozen_workflow_inputs.asset_facts),
-            output_prefix=output_prefix,
-            owner_id=owner.id,
-        )
-        conditioning_contract, conditioning_mode_contract = (
-            workflow_execution_conditioning_contract(
-                workflow_version,
-                normalized_parameters,
-            )
-        )
-        if conditioning_mode_contract is not None:
-            reference_media_profile = resolve_reference_media_profile()
-        primary = compiled.output_contract.get("primary")
-        if (
-            not isinstance(primary, dict)
-            or primary.get("kind") != media_type
-            or not str(primary.get("node_id") or "")
-        ):
-            raise ValidationError("工作流主输出合同与素材类型不一致")
-        payload = {
-            "workflow": compiled.graph,
-            "client_id": f"autoprompt-asset-{job_id}",
-            "submission_token": str(job_id),
-        }
-        parameters = normalized_parameters
-        output_kind = media_type
-    elif job_type == AssetGenerationJob.JobType.PROMPT or media_type == AssetGenerationJob.MediaType.SCRIPT:
-        payload = _text_payload(
-            job_type=job_type,
-            media_type=media_type,
-            prompt=prompt,
-            style=style,
-            parameters=parameters,
-            policy=text_policy or {},
-        )
-        output_kind = "text"
-    else:
-        payload = _media_payload(
-            deployment=deployment,
-            contract=contract,
-            prompt=prompt,
-            negative_prompt=str(negative_prompt or ""),
-            parameters=parameters,
-            idempotency_key=idempotency_key,
-        )
-        output_kind = ASYNC_MEDIA_OUTPUT_KIND[operation]
-
-    estimate = driver_for(deployment.provider).estimate(deployment, operation, payload)
-    if not isinstance(estimate, dict) or estimate.get("amount") is None:
-        raise ValidationError("素材生成前必须能确定模型请求费用")
-    estimated = _decimal_amount(estimate.get("amount"), field="estimated_cost")
-    currency = str(estimate.get("currency") or "").strip().upper()[:12]
-    if estimated and not currency:
-        raise ValidationError("模型费用缺少币种")
-    if budget is not None and estimated is not None and estimated > budget:
-        raise ValidationError({"budget_limit": "预算上限低于本次预估费用"})
-
-    target_sha = (
-        workflow_target_sha
-        if execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-        else deployment_target_sha256(deployment)
-    )
-    execution_config = _combined_config(deployment)
-    async_runtime_budget = (
-        restricted_async_rest_runtime_budget(execution_config)
-        if contract is not None
-        else None
-    )
-    comfy_runtime_budget = (
-        restricted_comfyui_runtime_budget(execution_config)
-        if execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-        else None
-    )
-    snapshot_payload = {
-        "schema_version": (
-            3
-            if execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-            else 1
-        ),
-        "client_request_sha256": client_intent.sha256,
-        "job_type": job_type,
-        "media_type": media_type,
-        "execution_kind": execution_kind,
-        "operation": operation,
-        "output_kind": output_kind,
-        "deployment_id": str(deployment.id),
-        "payload": payload,
-        "style_id": str(style.id) if style else None,
-        "image_category": image_category,
-        "name": str(name or "")[:160],
-        "description": str(description or ""),
-        "prompt": prompt,
-        "negative_prompt": str(negative_prompt or ""),
-        "is_external": external,
-        "estimated_cost": str(estimated) if estimated is not None else None,
-        "cost_currency": currency,
-        "max_poll_seconds": (
-            int(async_runtime_budget["max_poll_seconds"])
-            if async_runtime_budget is not None
-            else int(comfy_runtime_budget["max_poll_seconds"])
-            if comfy_runtime_budget is not None
-            else None
-        ),
-        "text_timeout_seconds": (
-            float((text_policy or {}).get("timeout_seconds") or 0)
-            if text_policy is not None else None
-        ),
-    }
-    if execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
-        reference_bindings = list(frozen_workflow_inputs.reference_bindings)
-        asset_facts = list(frozen_workflow_inputs.asset_facts)
-        asset_bindings = list(compiled.asset_bindings)
-        reference_bindings_contract = json_contract(
-            reference_bindings,
-            max_bytes=_stage_snapshot_max_bytes(),
-        )
-        asset_facts_contract = json_contract(
-            asset_facts,
-            max_bytes=_stage_snapshot_max_bytes(),
-        )
-        asset_bindings_contract = json_contract(
-            asset_bindings,
-            max_bytes=_stage_snapshot_max_bytes(),
-        )
-        snapshot_payload.update({
-            "workflow_version_id": str(workflow_version.id),
-            "workflow_version": workflow_version.version,
-            "workflow_graph_sha256": workflow_version.graph_sha256,
-            "workflow_execution_contract_sha256": (
-                workflow_version.execution_contract_sha256
-            ),
-            "workflow_validation_evidence_sha256": (
-                workflow_version.validation_evidence_sha256
-            ),
-            "workflow_smoke_attempt_id": str(workflow_smoke.id),
-            "workflow_target_sha256": target_sha,
-            "compiled_graph_sha256": compiled.graph_sha256,
-            "workflow_hash": compiled.graph_sha256,
-            "workflow_contract_sha256": workflow_version.execution_contract_sha256,
-            "workflow_compiler_id": workflow_version.compiler_id,
-            "workflow_compiler_version": workflow_version.compiler_version,
-            "compiled_output_contract": compiled.output_contract,
-            "output_prefix": output_prefix,
-            "parameter_values": parameters,
-            "workflow_input_request": frozen_workflow_inputs.request,
-            "server_managed_values": server_managed_values,
-            "reference_bindings": reference_bindings,
-            "reference_bindings_sha256": reference_bindings_contract.sha256,
-            "asset_facts": asset_facts,
-            "asset_facts_sha256": asset_facts_contract.sha256,
-            "asset_bindings": asset_bindings,
-            "asset_bindings_sha256": asset_bindings_contract.sha256,
-        })
-        if conditioning_contract is not None and conditioning_mode_contract is not None:
-            snapshot_payload.update({
-                "conditioning_contract": conditioning_contract,
-                "conditioning_contract_sha256": json_contract(
-                    conditioning_contract,
-                    max_bytes=_stage_snapshot_max_bytes(),
-                ).sha256,
-                "conditioning_mode_contract": conditioning_mode_contract,
-                "conditioning_mode_contract_sha256": json_contract(
-                    conditioning_mode_contract,
-                    max_bytes=_stage_snapshot_max_bytes(),
-                ).sha256,
-                "effective_conditioning_mode": str(
-                    conditioning_mode_contract.get("key") or ""
-                ),
-                "reference_media_profile": reference_media_profile.value,
-                "reference_media_profile_sha256": reference_media_profile.sha256,
-                "reference_media_profile_configuration_sha256": (
-                    reference_media_profile.configuration_sha256
-                ),
-            })
-    else:
-        snapshot_payload.update({
-            "deployment_target_sha256": target_sha,
-            "smoke_snapshot_id": str(smoke.id),
-            "smoke_expires_at": smoke.expires_at.isoformat(),
-        })
-    snapshot = json_contract(
-        snapshot_payload,
-        schema_version=int(snapshot_payload["schema_version"]),
-        max_bytes=_stage_snapshot_max_bytes(),
-    )
-    try:
-        # Keep the unique-key race inside its own savepoint.  Without the
-        # nested atomic block, PostgreSQL marks this outer transaction as
-        # broken after IntegrityError and the idempotent lookup below cannot
-        # run.
-        with transaction.atomic():
-            job = AssetGenerationJob.objects.create(
-                id=job_id,
-                owner=owner,
-                style=style,
-                model_deployment=deployment,
-                workflow_template_version=workflow_version,
-                job_type=job_type,
-                media_type=media_type,
-                execution_kind=execution_kind,
-                image_category=image_category,
-                name=str(name or "")[:160],
-                description=str(description or ""),
-                prompt=prompt,
-                negative_prompt=str(negative_prompt or ""),
-                parameters=parameters,
-                status=AssetGenerationJob.Status.QUEUED,
-                operation=operation,
-                is_external=external,
-                allow_external_calls=bool(allow_external_calls),
-                budget_limit=budget,
-                estimated_cost=estimated,
-                cost_currency=currency,
-                request_snapshot=snapshot.value,
-                request_snapshot_schema_version=snapshot.schema_version,
-                request_snapshot_size_bytes=snapshot.size_bytes,
-                request_snapshot_sha256=snapshot.sha256,
-                idempotency_key=idempotency_key,
-            )
-    except IntegrityError:
-        existing = AssetGenerationJob.objects.get(idempotency_key=idempotency_key)
-        existing_fingerprint = str(
-            (existing.request_snapshot or {}).get("client_request_sha256") or ""
-        )
-        if existing.owner_id != owner.id or existing_fingerprint != client_intent.sha256:
-            raise ValidationError("Idempotency-Key 已用于不同的素材生成请求")
-        return existing, False
+    if version.workflow_version_id and external:
+        raise ValidationError("远程ComfyUI尚无受控产物下载合同，不能创建可运行请求")
+    header = _execution_asset_header(definition, deployment, client_intent.sha256, output_kind)
+    job = AssetGenerationJob(owner=owner, style=style, execution_instance_version=version,
+        model_deployment=deployment, workflow_template_version=version.workflow_version,
+        job_type=job_type, media_type=media_type, operation=version.operation,
+        execution_kind="comfy_workflow" if version.workflow_version_id else "deployment",
+        image_category=image_category, name=name, description=description, prompt="",
+        status=AssetGenerationJob.Status.PREPARING, is_external=external,
+        allow_external_calls=allow_external_calls, budget_limit=budget)
+    job.idempotency_key = idempotency_key
+    assign_json_contract(job, "request_snapshot", header.value, max_bytes=execution_configuration_max_bytes())
+    # clean checks cross-table target identities, not an admission permission.
+    job.clean()
+    job.save()
+    def resolve(definition, root):
+        # This root owns a request, not a ProductionRun unit map. Explicit
+        # request-scoped media can feed its supplied units; real Shot scopes
+        # must not silently become global references.
+        from studio.services.media_generation_targets import MEDIA_KINDS, resolve_media_generation_target
+        resolver = resolve_media_generation_target if output_kind in MEDIA_KINDS else resolve_execution_request_facts
+        target_policy = {"candidate_count": 1, "candidate_evaluator": None,
+            "appearance_target": appearance_target} if output_kind in MEDIA_KINDS else {}
+        return resolver(definition, requested, **target_policy, owner=root.owner, unit_key="asset",
+            max_media_bytes=boundary_int("security.workflow_smoke.asset_max_file_bytes"),
+            review_contract=json_contract({"schema_version": 1, "mode": "manual"}, max_bytes=execution_configuration_max_bytes()),
+            parameter_policies=[], resolve_parameter_source=_reject_asset_parameter_source, scope_units={})
+    preparation = create_execution_instance_preparation(owner_ref=("asset_job_id", job.pk), version_id=version.pk,
+        expected_definition_sha256=definition.sha256, unit_key="asset", request_key=client_idempotency_key,
+        intent=json_contract({**requested, **({"appearance_target": appearance_target} if appearance_target is not None else {})},
+            max_bytes=execution_request_max_bytes()), resolve_facts=resolve, actor=owner)
+    for row in field_values:
+        create_manual_execution_field(preparation_id=preparation.pk, **row, revision=1,
+            expected_preparation_revision=preparation.revision, actor=owner)
+        preparation.refresh_from_db()
+    preparation = evaluate_preparation_fields(preparation_id=preparation.pk, expected_preparation_revision=preparation.revision, actor=owner)
+    from studio.services.execution_advancement import schedule_authorized_asset_fields
+    schedule_authorized_asset_fields(preparation)
     return job, True
 
 
-def _snapshot(job: AssetGenerationJob) -> dict:
-    snapshot = verify_json_contract(
-        job.request_snapshot,
-        schema_version=job.request_snapshot_schema_version,
-        size_bytes=job.request_snapshot_size_bytes,
-        sha256=job.request_snapshot_sha256,
-        max_bytes=_stage_snapshot_max_bytes(),
-    ).value
-    schema_version = snapshot.get("schema_version") if isinstance(snapshot, dict) else None
-    valid = (
-        isinstance(snapshot, dict)
-        and schema_version in {1, 2, 3}
-        and snapshot.get("operation") == job.operation
-        and str(snapshot.get("deployment_id")) == str(job.model_deployment_id)
-        and isinstance(snapshot.get("payload"), dict)
-    )
-    if schema_version in {2, 3}:
-        valid = bool(
-            valid
-            and job.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-            and job.workflow_template_version_id is not None
-            and str(snapshot.get("workflow_version_id"))
-            == str(job.workflow_template_version_id)
-            and snapshot.get("execution_kind")
-            == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-        )
-    elif schema_version == 1:
-        valid = bool(
-            valid
-            and job.execution_kind == AssetGenerationJob.ExecutionKind.DEPLOYMENT
-            and job.workflow_template_version_id is None
-        )
-    if not valid:
-        raise ValidationError("素材生成任务快照无效")
-    return snapshot
+def _reject_asset_parameter_source(_source):
+    raise ValidationError("素材请求没有生产步骤参数来源，必须按实例合同明确传入")
+
+
+def _execution_asset_header(definition, deployment, client_request_sha256, output_kind):
+    from studio.services.execution_instances import execution_configuration_max_bytes
+    config = _combined_config(deployment)
+    if definition.value["target"]["workflow"] is not None:
+        budget = restricted_comfyui_runtime_budget(config)
+    elif deployment.provider.driver_type == ProviderProfile.DriverType.ASYNC_REST:
+        budget = restricted_async_rest_runtime_budget(config)
+    else:
+        budget = {"timeout_seconds": config["timeout_seconds"]}
+    return json_contract({"schema_version": 1, "client_request_sha256": client_request_sha256,
+        "execution_instance_version_id": definition.value["version_id"], "definition_sha256": definition.sha256,
+        "output_kind": output_kind, "runtime_budget": budget}, max_bytes=execution_configuration_max_bytes())
+
+
+def _asset_request_header(job):
+    from studio.services.execution_instances import execution_configuration_max_bytes
+    header = verify_json_contract(job.request_snapshot, schema_version=job.request_snapshot_schema_version,
+        size_bytes=job.request_snapshot_size_bytes, sha256=job.request_snapshot_sha256,
+        max_bytes=execution_configuration_max_bytes()).value
+    if (not isinstance(header, dict) or set(header) != {"schema_version", "client_request_sha256",
+            "execution_instance_version_id", "definition_sha256", "output_kind", "runtime_budget"}
+            or type(header["schema_version"]) is not int or header["schema_version"] != 1
+            or job.request_snapshot_schema_version != header["schema_version"]
+            or header["execution_instance_version_id"] != str(job.execution_instance_version_id)
+            or any(not isinstance(header[key], str) or not re.fullmatch(r"[a-f0-9]{64}", header[key])
+                   for key in ("client_request_sha256", "definition_sha256"))
+            or not isinstance(header["runtime_budget"], dict)):
+        raise ValidationError("素材任务的当前请求头或执行实例关联不完整，不能恢复旧请求")
+    return header
+
+
+def _snapshot(job: AssetGenerationJob):
+    from studio.services.execution_asset_requests import read_prepared_asset_execution
+    return read_prepared_asset_execution(job, _asset_request_header(job))
 
 
 def _frozen_max_poll_seconds(snapshot: dict) -> int:
-    value = snapshot.get("max_poll_seconds")
+    value = snapshot.runtime_budget.get("max_poll_seconds")
     boundary_key = (
         "security.runtime.max_timeout_seconds"
-        if snapshot.get("execution_kind") == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
+        if snapshot.transport.value["driver_type"] == ProviderProfile.DriverType.COMFYUI
         else "security.provider.async_rest_max_poll_seconds"
     )
     maximum = boundary_int(boundary_key, minimum=1)
@@ -936,64 +376,24 @@ def _frozen_max_poll_seconds(snapshot: dict) -> int:
     return value
 
 
-def _verify_live_target(
-    job: AssetGenerationJob,
-    snapshot: dict,
-    *,
-    require_executable_route: bool = True,
-) -> ModelDeployment:
-    if job.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
-        if job.workflow_template_version_id is None:
-            raise ValidationError("ComfyUI 素材任务缺少工作流版本")
-        version = WorkflowTemplateVersion.objects.select_related(
-            "template", "validated_deployment__profile_version__provider",
-        ).prefetch_related("model_requirements__artifact").get(
-            pk=job.workflow_template_version_id,
-        )
-        if require_executable_route:
-            version, deployment, smoke, target_sha = _eligible_workflow_route(
-                version,
-                user=job.owner,
-                media_type=job.media_type,
-            )
-            smoke_matches = str(smoke.id) == str(
-                snapshot.get("workflow_smoke_attempt_id"),
-            )
-        else:
-            deployment = version.validated_deployment
-            if deployment is None:
-                raise ValidationError("ComfyUI 冻结任务缺少 validated deployment")
-            if (
-                deployment.status != ModelDeployment.Status.ACTIVE
-                or not deployment.provider.is_active
-                or deployment.profile_version.status != ModelProfileVersion.Status.PUBLISHED
-                or deployment.provider.driver_type != ProviderProfile.DriverType.COMFYUI
-            ):
-                raise ValidationError("ComfyUI 冻结部署当前不可用于远端状态对账")
-            target_sha = workflow_execution_target_sha256(version, deployment)
-            smoke_matches = True
-        if (
-            deployment.id != job.model_deployment_id
-            or not smoke_matches
-            or target_sha != snapshot.get("workflow_target_sha256")
-            or version.graph_sha256 != snapshot.get("workflow_graph_sha256")
-            or version.execution_contract_sha256
-            != snapshot.get("workflow_execution_contract_sha256")
-            or version.validation_evidence_sha256
-            != snapshot.get("workflow_validation_evidence_sha256")
-        ):
-            raise ValidationError("ComfyUI 工作流、Smoke 或部署证据已改变；冻结任务拒绝执行")
-        return deployment
-    deployment = ModelDeployment.objects.select_related(
-        "profile_version__provider",
-    ).get(pk=job.model_deployment_id)
-    if (
-        deployment.status != ModelDeployment.Status.ACTIVE
-        or not deployment.provider.is_active
-        or deployment_target_sha256(deployment) != snapshot.get("deployment_target_sha256")
-    ):
-        raise ValidationError("模型部署或凭据已改变；冻结任务拒绝执行")
-    return deployment
+def _verify_live_target(job: AssetGenerationJob, snapshot, *, require_executable_route: bool = True) -> ModelDeployment:
+    from studio.services.execution_definitions import stored_execution_contract, verify_current_execution_definition
+    from studio.services.execution_identity import execution_target_contract
+    from studio.services.execution_instances import selectable_execution_versions
+    if require_executable_route:
+        if not selectable_execution_versions(job.owner).filter(pk=job.execution_instance_version_id).exists():
+            raise ValidationError("执行实例已停用、退役或无执行权限，不能开始新的调用")
+        definition = verify_current_execution_definition(stored_execution_contract(job.execution_instance_version_id))
+        if definition.sha256 != snapshot.definition.sha256:
+            raise ValidationError("执行定义与原请求不一致")
+    else:
+        # Poll/cancel must still address the original peer after retirement.
+        # Resource identity drift is not permission to contact a new endpoint.
+        target = execution_target_contract(deployment_id=job.model_deployment_id,
+            workflow_version_id=job.workflow_template_version_id)
+        if target.sha256 != snapshot.definition.value["target_fingerprint"]:
+            raise ValidationError("执行资源已变化，不能到另一目标核对原任务")
+    return ModelDeployment.objects.select_related("profile_version__provider").get(pk=job.model_deployment_id)
 
 
 @transaction.atomic
@@ -1002,17 +402,19 @@ def _claim(worker_id: str, *, text: bool) -> AssetGenerationJob | None:
     queryset = AssetGenerationJob.objects.select_for_update(skip_locked=True).select_related(
         "model_deployment__profile_version__provider", "workflow_template_version",
         "owner", "style",
-    ).filter(claim_token__isnull=True)
+    ).filter(claim_token__isnull=True, execution_preparations__request_frozen_at__isnull=False).exclude(
+        status="queued", error_code="execution_resource_confirmation_required").filter(
+        Q(status=AssetGenerationJob.Status.CANCEL_REQUESTED) | Q(next_poll_at__isnull=True) | Q(next_poll_at__lte=now))
     if text:
         queryset = queryset.filter(
             execution_kind=AssetGenerationJob.ExecutionKind.DEPLOYMENT,
-            operation=SCRIPT_GENERATE_OPERATION,
+            model_deployment__profile_version__provider__driver_type__in=_text_driver_types(),
             status__in=TEXT_JOB_STATUSES,
         )
     else:
         queryset = queryset.filter(
             execution_kind=AssetGenerationJob.ExecutionKind.DEPLOYMENT,
-            operation__in=tuple(MEDIA_OPERATION.values()),
+            model_deployment__profile_version__provider__driver_type=ProviderProfile.DriverType.ASYNC_REST,
             status__in=MEDIA_JOB_STATUSES,
         ).filter(Q(next_poll_at__isnull=True) | Q(next_poll_at__lte=now))
     job = queryset.order_by("created_at").first()
@@ -1038,23 +440,24 @@ def claim_next_media_asset_job(worker_id: str) -> AssetGenerationJob | None:
 
 @transaction.atomic
 def claim_next_comfy_asset_job(worker_id: str) -> AssetGenerationJob | None:
+    from studio.services.execution_production_attempts import superseded_uncertain_task_ids
     WorkerLease.objects.get_or_create(key="generation-claim")
     WorkerLease.objects.select_for_update().get(key="generation-claim")
     if unresolved_workflow_smoke_attempts().exists():
         return None
     if WorkflowSmokeAttempt.objects.filter(
         status__in=(
-            WorkflowSmokeAttempt.Status.QUEUED,
             WorkflowSmokeAttempt.Status.SUBMITTING,
             WorkflowSmokeAttempt.Status.RUNNING,
             WorkflowSmokeAttempt.Status.CANCEL_REQUESTED,
         ),
     ).exists():
         return None
-    nonterminal_task_token = GenerationTask.objects.exclude(
+    nonterminal_task_token = GenerationTask.objects.exclude(pk__in=superseded_uncertain_task_ids()).exclude(
         submission_token="",
     ).exclude(
         submission_state__in=(
+            GenerationTask.SubmissionState.TERMINAL_SUCCEEDED,
             GenerationTask.SubmissionState.TERMINAL_FAILED,
             GenerationTask.SubmissionState.TERMINAL_CANCELLED,
         ),
@@ -1078,6 +481,7 @@ def claim_next_comfy_asset_job(worker_id: str) -> AssetGenerationJob | None:
     ).filter(
         claim_token__isnull=True,
         execution_kind=AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW,
+        execution_preparations__request_frozen_at__isnull=False,
     )
     job = base.filter(
         status__in=(
@@ -1088,6 +492,10 @@ def claim_next_comfy_asset_job(worker_id: str) -> AssetGenerationJob | None:
     ).filter(
         Q(next_poll_at__isnull=True) | Q(next_poll_at__lte=now),
     ).order_by("created_at").first()
+    if job is None and WorkflowSmokeAttempt.objects.filter(status=WorkflowSmokeAttempt.Status.QUEUED).exists():
+        # Pending Smoke wins over new generation, never over polling an
+        # already submitted asset. The Smoke worker waits for that asset.
+        return None
     active_remote = AssetGenerationJob.objects.filter(
         execution_kind=AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW,
     ).filter(
@@ -1103,7 +511,8 @@ def claim_next_comfy_asset_job(worker_id: str) -> AssetGenerationJob | None:
     if job is None and active_remote:
         return None
     if job is None:
-        job = base.filter(status=AssetGenerationJob.Status.QUEUED).order_by(
+        job = base.filter(status=AssetGenerationJob.Status.QUEUED).exclude(error_code="execution_resource_confirmation_required").filter(
+            Q(next_poll_at__isnull=True) | Q(next_poll_at__lte=now)).order_by(
             "created_at",
         ).first()
     if job is None:
@@ -1122,6 +531,9 @@ def _clear_claim(job: AssetGenerationJob) -> None:
     job.claim_token = None
     job.worker_id = ""
     job.claimed_at = None
+    if job.parent_preparation_id and job.status in {"succeeded", "failed", "cancelled", "uncertain"}:
+        from studio.services.execution_asset_auxiliaries import schedule_asset_parent_preparation
+        transaction.on_commit(lambda job_id=job.pk: schedule_asset_parent_preparation(job_id), robust=True)
 
 
 def _heartbeat_claim(job: AssetGenerationJob) -> None:
@@ -1145,8 +557,9 @@ def _fail(
     actual_cost=None,
     currency: str = "",
 ):
-    with transaction.atomic():
-        locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
+    from studio.services.execution_preparation_owners import locked_preparation_owner_rows
+    with locked_preparation_owner_rows([("asset_job_id", job.pk)]) as owners:
+        locked = owners[("asset_job_id", str(job.pk))]
         if job.claim_token is not None and locked.claim_token != job.claim_token:
             return locked
         cancelled_before_submission = (
@@ -1194,8 +607,9 @@ def _finish_cancelled(
     message: str = "",
     remote_status: str | None = None,
 ) -> AssetGenerationJob:
-    with transaction.atomic():
-        locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
+    from studio.services.execution_preparation_owners import locked_preparation_owner_rows
+    with locked_preparation_owner_rows([("asset_job_id", job.pk)]) as owners:
+        locked = owners[("asset_job_id", str(job.pk))]
         if job.claim_token is not None and locked.claim_token != job.claim_token:
             return locked
         locked.status = AssetGenerationJob.Status.CANCELLED
@@ -1254,29 +668,16 @@ def _asset_kind(job: AssetGenerationJob) -> str:
     return Asset.Kind.SCRIPT
 
 
-def _extension(mime_type: str, media_type: str) -> str:
-    return {
-        "image/jpeg": ".jpg",
-        "image/png": ".png",
-        "image/webp": ".webp",
-        "video/mp4": ".mp4",
-        "video/webm": ".webm",
-        "video/x-matroska": ".mkv",
-        "audio/wav": ".wav",
-        "audio/mpeg": ".mp3",
-        "audio/flac": ".flac",
-        "audio/ogg": ".ogg",
-        "audio/mp4": ".m4a",
-        "text/markdown": ".md",
-    }.get(mime_type, f".{media_type}")
-
-
 def _asset_metadata(job: AssetGenerationJob, facts: dict) -> dict:
+    request = _snapshot(job)
     observed = facts.get("observed_media") if isinstance(facts.get("observed_media"), dict) else {}
     metadata = {
         "manifest_schema_version": 1,
         "source": "model_generation",
         "generation_job_id": str(job.id),
+        "execution_instance_version_id": str(job.execution_instance_version_id),
+        "preparation_id": str(request.preparation.pk),
+        "prepared_request_sha256": request.preparation.request_sha256,
         "model_deployment_id": str(job.model_deployment_id),
         "execution_kind": job.execution_kind,
         "operation": job.operation,
@@ -1287,9 +688,7 @@ def _asset_metadata(job: AssetGenerationJob, facts: dict) -> dict:
     }
     if job.workflow_template_version_id:
         metadata["workflow_template_version_id"] = str(job.workflow_template_version_id)
-        metadata["compiled_graph_sha256"] = str(
-            (job.request_snapshot or {}).get("compiled_graph_sha256") or "",
-        )
+        metadata["compiled_graph_sha256"] = request.transport.value["payload"]["compiled_workflow"]["graph_sha256"]
     if job.media_type == AssetGenerationJob.MediaType.VIDEO:
         duration_ms = int(metadata.get("duration_ms") or 0)
         if duration_ms <= 0:
@@ -1327,6 +726,22 @@ def _asset_source_info(job: AssetGenerationJob) -> str:
     return f"{route}生成 · 素材生成任务 {job.id}"
 
 
+def read_generated_image_asset(job: AssetGenerationJob) -> Asset:
+    """Verify the original output and manifest; never materialize on a read."""
+    from studio.services.execution_media_sources import resolve_execution_asset_media
+    if (job.status != AssetGenerationJob.Status.SUCCEEDED or job.media_type != "image"
+            or not job.output_asset_id):
+        raise ValidationError("独立图片任务尚无已完成的原Asset")
+    actual = resolve_execution_asset_media(owner=job.owner, asset_id=job.output_asset_id,
+        expected_kind="image", max_media_bytes=None)
+    asset, facts = actual.asset, actual.media_facts
+    if (asset.owner_id != job.owner_id or asset.mime_type != facts["mime_type"]
+            or asset.metadata != _asset_metadata(job, {key: facts[key] for key in ("sha256", "size_bytes")})):
+        raise ValidationError("已登记图片Asset与原独立生成来源不一致")
+    return asset
+
+
+@registry_reference_writer
 def _finish_success(
     job: AssetGenerationJob,
     *,
@@ -1335,8 +750,9 @@ def _finish_success(
     actual_cost=None,
     currency: str = "",
 ):
-    with transaction.atomic():
-        locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
+    from studio.services.execution_preparation_owners import locked_preparation_owner_rows
+    with locked_preparation_owner_rows([("asset_job_id", job.pk)]) as owners:
+        locked = owners[("asset_job_id", str(job.pk))]
         if job.claim_token is not None and locked.claim_token != job.claim_token:
             if asset is not None:
                 stored_file = asset.file
@@ -1367,17 +783,15 @@ def _finish_success(
         encoded = result_text.encode("utf-8")
         locked.result_text_size_bytes = len(encoded)
         locked.result_text_sha256 = hashlib.sha256(encoded).hexdigest() if encoded else ""
-        locked.actual_cost = _decimal_amount(actual_cost, field="actual_cost")
-        if currency:
-            locked.cost_currency = str(currency).strip().upper()[:12]
-        if (
-            locked.status == AssetGenerationJob.Status.SUCCEEDED
-            and locked.budget_limit is not None
-            and locked.actual_cost is not None
-            and locked.actual_cost > locked.budget_limit
-        ):
-            locked.error_code = "actual_budget_exceeded"
-            locked.error_message = "实际费用超过预算；真实素材已保留，请人工核对费用。"
+        settled_cost = _decimal_amount(actual_cost, field="actual_cost")
+        if settled_cost is not None:
+            locked.cost_currency = _actual_cost_currency(currency)
+            locked.actual_cost = settled_cost
+        if locked.status == AssetGenerationJob.Status.SUCCEEDED and locked.actual_cost is not None:
+            from studio.services.execution_resource_policy import actual_cost_review_message
+            review_message = actual_cost_review_message(locked.actual_cost, locked.cost_currency)
+            if review_message:
+                locked.error_code, locked.error_message = "actual_budget_exceeded", review_message
         locked.finished_at = timezone.now()
         locked.next_poll_at = None
         _clear_claim(locked)
@@ -1388,14 +802,120 @@ def _finish_success(
             "error_message", "finished_at", "next_poll_at", "claim_token",
             "worker_id", "claimed_at", "heartbeat_at", "updated_at",
         ))
+        if locked.status == AssetGenerationJob.Status.SUCCEEDED and asset is not None and locked.media_type == "image":
+            from rest_framework.exceptions import ValidationError as APIValidationError
+            from studio.services.asset_references import register_generated_material
+            try:
+                register_generated_material(job=locked)
+            except APIValidationError as exc:
+                raise ValidationError(exc.detail) from exc
+        from studio.models import ExecutionTextResponseReview
+        if (locked.status == AssetGenerationJob.Status.SUCCEEDED
+                and not ExecutionTextResponseReview.objects.filter(asset_job=locked, confirmed_at__isnull=False).exists()):
+            from studio.services.execution_capacity_observations import capacity_observation_request, record_completed_capacity_observation
+            record_completed_capacity_observation(locked, capacity_observation_request(locked))
         return locked
 
 
+def _finish_text_asset_result(job: AssetGenerationJob, text: str, *, created_files=None):
+    """Persist a protocol-verified inline result, independent of transport."""
+    max_bytes = int(resolve_configuration(
+        required_keys=("script.max_upload_bytes",),
+    ).values["script.max_upload_bytes"])
+    if not isinstance(text, str):
+        raise ValidationError("文本结果必须为字符串")
+    encoded = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
+    if not text.strip() or len(encoded) > max_bytes or b"\x00" in encoded:
+        raise ValidationError("文本模型已返回但结果未通过安全合同", code="text_result_invalid")
+    if AssetGenerationJob.objects.filter(pk=job.pk, status=AssetGenerationJob.Status.CANCEL_REQUESTED).exists():
+        return _finish_success(job, asset=None)
+    from studio.services.execution_text_response_review import asset_text_correction
+    correction = asset_text_correction(job, text)
+    with transaction.atomic():
+        asset = None
+        if job.job_type == AssetGenerationJob.JobType.ASSET:
+            _tenant_quota_available(job.owner_id, len(encoded))
+            asset = Asset(
+                owner=job.owner, style=job.style, kind=Asset.Kind.SCRIPT,
+                name=job.name, description=job.description, prompt_hint=read_asset_prompt_hint(job),
+                source_info=_asset_source_info(job), mime_type="text/markdown",
+                checksum=hashlib.sha256(encoded).hexdigest(),
+                metadata=_asset_metadata(job, {"mime_type": "text/markdown",
+                    "size_bytes": len(encoded), "sha256": hashlib.sha256(encoded).hexdigest()}),
+            )
+            if correction is not None:
+                asset.source_info = f"人工补正 · 素材任务 {job.pk} · 修订 {correction['review_id']}"
+                asset.metadata.update(source="human_correction", text_response_correction=correction,
+                    corrected_file_sha256=asset.metadata.pop("generated_sha256"))
+            try:
+                asset.file.save(f"{job.name or 'script'}.md", ContentFile(encoded), save=False)
+                if created_files is not None:
+                    created_files.append(asset.file.name)
+                asset.save()
+            except Exception:
+                if asset.file:
+                    asset.file.delete(save=False)
+                raise
+        return _finish_success(job, asset=asset,
+            result_text=text if job.job_type in {AssetGenerationJob.JobType.PROMPT, AssetGenerationJob.JobType.FIELD} else "")
+
+
+def _retain_text_asset_output(job, snapshot, *, text, diagnostics, collection_request_id=None, collection_body_kind="text"):
+    """Return a stopped job, or None after retaining this original response."""
+    from studio.services.execution_text_response_review import retain_asset_text_response
+    from studio.services.execution_response_storage import ExecutionResponseStorageError
+    try:
+        retained = retain_asset_text_response(job=job, preparation_id=snapshot.preparation.pk,
+            request_sha256=snapshot.preparation.request_sha256, text=text, diagnostics=diagnostics,
+            collection_request_id=collection_request_id, collection_body_kind=collection_body_kind)
+    except ExecutionResponseStorageError:
+        return _fail(job, code="execution_response_storage_failed",
+            message="模型已经返回，但原始正文未能保存；没有可读取的原文或候选，不会自动重试。",
+            remote_status=job.remote_status if collection_request_id is not None else "response_storage_failed")
+    if not retained:
+        # Preserve this worker's claim: refreshing first could adopt a newer claim.
+        if AssetGenerationJob.objects.filter(pk=job.pk, claim_token=job.claim_token,
+                status=AssetGenerationJob.Status.CANCEL_REQUESTED).exists():
+            return _finish_cancelled(job)
+        job.refresh_from_db()
+        return job
+    return None
+
+
+def _read_media_collect_receipt(job):
+    from studio.models import ExecutionTextResponseReview
+    from studio.services.execution_text_response_review import read_collect_receipt, read_retained_text_response
+    retained = ExecutionTextResponseReview.objects.filter(asset_job=job).first()
+    if retained is None:
+        return None
+    original, _, _, _ = read_retained_text_response(retained)
+    return read_collect_receipt(original, request_id=job.provider_request_id)
+
+
+def _retain_media_collect_receipt(job, snapshot, collected):
+    from studio.services.execution_text_response_review import COLLECT_RECEIPT_KIND
+    if not isinstance(collected, dict) or collected.get("request_id") != job.provider_request_id:
+        raise ValidationError("媒体收集回执与原冻结请求不一致")
+    try:
+        receipt_text = json.dumps(collected, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError) as exc:
+        raise ValidationError("驱动收集回执不是可保存的 JSON，不会截断或伪造正文") from exc
+    return _retain_text_asset_output(job, snapshot, text=receipt_text,
+        diagnostics={"schema_version": 1, "contract_error_code": "media_collect_receipt_retained",
+            "summary": "已保留驱动实际收集回执；输出校验及物化结果以原任务状态为准，不代表素材已生成。"},
+        collection_request_id=collected["request_id"], collection_body_kind=COLLECT_RECEIPT_KIND)
+
+
 def process_text_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
+    from studio.services.execution_text_contracts import parse_execution_text_response
+    from studio.services.execution_text_response_usage import record_asset_text_response_usage
+    from studio.services.provider_registry import safe_chat_failure_details, safe_chat_failure_message
     if job.claim_token is None:
         raise ValidationError("素材文本任务没有 worker claim")
     try:
         snapshot = _snapshot(job)
+        if snapshot.transport.value["driver_type"] not in _text_driver_types():
+            raise ValidationError("文本worker只处理已冻结的聊天传输")
         current = AssetGenerationJob.objects.only(
             "status", "provider_request_id",
         ).get(pk=job.pk)
@@ -1404,44 +924,65 @@ def process_text_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
             and not current.provider_request_id
         ):
             return _finish_cancelled(job)
-        deployment = _verify_live_target(job, snapshot)
-        with transaction.atomic():
-            locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
-            if locked.claim_token != job.claim_token:
-                return locked
-            if locked.status == AssetGenerationJob.Status.CANCEL_REQUESTED:
-                locked.status = AssetGenerationJob.Status.CANCELLED
-                locked.finished_at = timezone.now()
-                _clear_claim(locked)
-                locked.save(update_fields=(
-                    "status", "finished_at", "claim_token", "worker_id", "claimed_at", "updated_at",
-                ))
-                return locked
-            locked.status = AssetGenerationJob.Status.SUBMITTING
-            locked.submission_started_at = timezone.now()
-            locked.started_at = locked.started_at or locked.submission_started_at
-            locked.heartbeat_at = locked.submission_started_at
-            locked.save(update_fields=(
-                "status", "submission_started_at", "started_at", "heartbeat_at", "updated_at",
-            ))
+        # Original target only here; current ownership/resource/Smoke/budget
+        # admission is shared with dispatch immediately before submission.
+        deployment = _verify_live_target(job, snapshot, require_executable_route=False)
+        permitted, job = begin_asset_execution_submission(job)
+        if not permitted:
+            return job
         try:
-            response = driver_for(deployment.provider).invoke(
-                deployment, "chat_completion", snapshot["payload"],
-            )
+            from studio.services.chat_http_evidence import observe_chat_http_body, record_asset_chat_body
+            with observe_chat_http_body(lambda facts: record_asset_chat_body(
+                    job, snapshot.preparation.pk, snapshot.preparation.request_sha256, facts)):
+                response = driver_for(deployment.provider).invoke(
+                    deployment, "chat_completion", snapshot.payload,
+                )
         except ProviderDriverError as exc:
+            failure = safe_chat_failure_details(exc)
+            usage = failure.get("usage")
+            if usage and not exc.submission_uncertain:
+                if not record_asset_text_response_usage(job, snapshot.preparation.pk, snapshot.preparation.request_sha256, usage):
+                    job.refresh_from_db()
+                    return job
+            if (not exc.submission_uncertain and failure.get("contract_error_code") == "response_output_budget_exhausted"
+                    and isinstance(getattr(exc, "partial_text", None), str)):
+                stopped = _retain_text_asset_output(job, snapshot, text=exc.partial_text,
+                    diagnostics={"schema_version": 1, **failure,
+                        "summary": "服务返回因输出额度耗尽而中断；已保留实际收到的部分正文，不是可用候选，不会自动重试。"})
+                if stopped is not None:
+                    return stopped
             return _fail(
                 job,
                 code="uncertain_remote_response" if exc.submission_uncertain else exc.code,
-                message=(
-                    "文本模型提交响应不确定；禁止自动重试，需人工核验远端。"
-                    if exc.submission_uncertain else str(exc)
-                ),
+                message=safe_chat_failure_message(exc),
                 uncertain=bool(exc.submission_uncertain),
             )
-        text = str(response.get("text") or "") if isinstance(response, dict) else ""
-        provider_request_id = (
-            str(response.get("request_id") or "") if isinstance(response, dict) else ""
-        )
+        if not record_asset_text_response_usage(job, snapshot.preparation.pk, snapshot.preparation.request_sha256,
+                response.get("usage") if isinstance(response, dict) else None):
+            job.refresh_from_db()
+            return job
+        # Parse once, but retain the actual returned text even when it is not
+        # a valid candidate. Do not put rejected output in result_text/Asset.
+        validation_error = None
+        try:
+            parsed = parse_execution_text_response(job.operation, response, field_request=snapshot.field_request,
+                operation_plan=snapshot.transport.value.get("operation_plan"), request_payload=snapshot.transport.value["payload"],
+                expected_output=snapshot.definition.value["interface"].get("business_output"))
+        except ValidationError as exc:
+            validation_error = exc
+        if isinstance(response, dict) and isinstance(response.get("text"), str):
+            from studio.services.execution_text_response_review import response_validation_diagnostic
+            diagnostics = response_validation_diagnostic(validation_error, response) if validation_error else {
+                "schema_version": 1, "contract_error_code": "response_contract_valid",
+                "summary": "已保存独立素材调用的原始返回；候选、素材与人工采用仍是独立事实。",
+                "warnings": parsed.get("warnings", [])}
+            stopped = _retain_text_asset_output(job, snapshot, text=response["text"], diagnostics=diagnostics)
+            if stopped is not None:
+                return stopped
+        provider_request_id = response.get("request_id", "") if isinstance(response, dict) else ""
+        if not isinstance(provider_request_id, str):
+            return _fail(job, code="invalid_provider_request_id",
+                message="文本模型返回的请求标识不是文本；无法核对原调用，禁止自动重试。", uncertain=True)
         provider_request_id_sha256 = (
             hashlib.sha256(provider_request_id.encode("utf-8")).hexdigest()
             if provider_request_id else ""
@@ -1465,61 +1006,16 @@ def process_text_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 ),
                 uncertain=True,
             )
-        max_bytes = int(resolve_configuration(
-            required_keys=("script.max_upload_bytes",),
-        ).values["script.max_upload_bytes"])
-        encoded = text.replace("\r\n", "\n").replace("\r", "\n").encode("utf-8")
-        if not text.strip() or len(encoded) > max_bytes or b"\x00" in encoded:
-            return _fail(
-                job,
-                code="text_result_invalid",
-                message="文本模型已返回但结果未通过安全合同；禁止直接重复付费请求，需人工核验。",
-                uncertain=True,
-            )
-        if AssetGenerationJob.objects.filter(
-            pk=job.pk,
-            status=AssetGenerationJob.Status.CANCEL_REQUESTED,
-        ).exists():
-            return _finish_success(
-                job,
-                asset=None,
-                actual_cost=job.estimated_cost,
-                currency=job.cost_currency,
-            )
-        with transaction.atomic():
-            asset = None
-            if job.job_type == AssetGenerationJob.JobType.ASSET:
-                _tenant_quota_available(job.owner_id, len(encoded))
-                asset = Asset(
-                    owner=job.owner,
-                    style=job.style,
-                    kind=Asset.Kind.SCRIPT,
-                    name=job.name,
-                    description=job.description,
-                    prompt_hint=job.prompt,
-                    source_info=_asset_source_info(job),
-                    mime_type="text/markdown",
-                    checksum=hashlib.sha256(encoded).hexdigest(),
-                    metadata=_asset_metadata(job, {
-                        "mime_type": "text/markdown",
-                        "size_bytes": len(encoded),
-                        "sha256": hashlib.sha256(encoded).hexdigest(),
-                    }),
-                )
-                try:
-                    asset.file.save(f"{job.name or 'script'}.md", ContentFile(encoded), save=False)
-                    asset.save()
-                except Exception:
-                    if asset.file:
-                        asset.file.delete(save=False)
-                    raise
-            return _finish_success(
-                job,
-                asset=asset,
-                result_text=text if job.job_type == AssetGenerationJob.JobType.PROMPT else "",
-                actual_cost=job.estimated_cost,
-                currency=job.cost_currency,
-            )
+        if validation_error is not None:
+            # The synchronous chat call returned. A rejected response is a known
+            # result, not an unknown submission. Storage/finalization failures
+            # below still follow the original uncertainty handling.
+            return _fail(job, code="asset_text_response_invalid",
+                message="模型已返回，但结果未通过本次合同校验，没有生成可用候选；有文本正文时可在任务详情查看原文与诊断。",
+                remote_status="response_rejected")
+        from studio.services.execution_native_text import NATIVE_TEXT_OPERATIONS
+        result_text = parsed["text"] if job.operation in NATIVE_TEXT_OPERATIONS else response["text"]
+        return _finish_text_asset_result(job, result_text)
     except (ValidationError, ProviderDriverError) as exc:
         crossed = _confirmed_remote_submission(job)
         return _fail(
@@ -1545,7 +1041,7 @@ def _schedule(
         locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
         if locked.claim_token != job.claim_token:
             return locked
-        config = _combined_config(locked.model_deployment)
+        config = _asset_request_header(locked)["runtime_budget"]
         interval = (
             float(restricted_async_rest_runtime_budget(config)["poll_interval_seconds"])
             if locked.execution_kind == AssetGenerationJob.ExecutionKind.DEPLOYMENT
@@ -1637,13 +1133,14 @@ def _materialize_downloaded_asset(job: AssetGenerationJob, path: Path, facts: di
             kind=_asset_kind(job),
             name=job.name,
             description=job.description,
-            prompt_hint=job.prompt,
+            prompt_hint=read_asset_prompt_hint(job),
             source_info=_asset_source_info(job),
             mime_type=staged_facts["mime_type"],
             checksum=staged_facts["sha256"],
             metadata=metadata,
         )
-        extension = _extension(staged_facts["mime_type"], job.media_type)
+        from studio.services.media_extensions import verified_media_extension
+        extension = verified_media_extension(staged_facts["mime_type"], job.media_type)
         with staged_path.open("rb") as handle:
             asset.file.save(
                 f"{job.name or job.media_type}{extension}",
@@ -1661,45 +1158,66 @@ def _materialize_downloaded_asset(job: AssetGenerationJob, path: Path, facts: di
     return asset
 
 
+def _finish_media_asset_result(job, path, facts, *, actual_cost=None, currency=""):
+    """Both transports share one atomic Asset/version completion and file guard."""
+    asset = None
+    try:
+        with transaction.atomic():
+            if not AssetGenerationJob.objects.filter(pk=job.pk, status=AssetGenerationJob.Status.CANCEL_REQUESTED).exists():
+                asset = _materialize_downloaded_asset(job, path, facts)
+            return _finish_success(job, asset=asset, actual_cost=actual_cost, currency=currency)
+    except Exception:
+        # This is only the newly materialized output, never input/shared media.
+        # The database rollback alone cannot remove a file saved before failure.
+        if asset is not None and asset.file:
+            asset.file.delete(save=False)
+        raise
+
+
+def _asset_cancel_protocol(job):
+    """Persist a single cancel attempt before I/O; recovery only polls it."""
+    from studio.services.execution_preparation_owners import locked_preparation_owner_rows
+    with locked_preparation_owner_rows([("asset_job_id", job.pk)]) as owners:
+        locked = owners[("asset_job_id", str(job.pk))]
+        if locked.claim_token != job.claim_token or locked.status != AssetGenerationJob.Status.CANCEL_REQUESTED:
+            return None, locked
+        if locked.cancel_submitted_at is not None:
+            return "poll", locked
+        locked.cancel_submitted_at = timezone.now()
+        locked.save(update_fields=("cancel_submitted_at", "updated_at"))
+        return "cancel", locked
+
+
 def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
     if job.claim_token is None:
         raise ValidationError("素材媒体任务没有 worker claim")
+    collecting_known_success = False
     try:
         snapshot = _snapshot(job)
         current = AssetGenerationJob.objects.only(
-            "status", "provider_request_id",
+            "status", "provider_request_id", "claim_token",
         ).get(pk=job.pk)
+        if current.claim_token != job.claim_token or current.status not in {
+                AssetGenerationJob.Status.QUEUED, AssetGenerationJob.Status.SUBMITTED,
+                AssetGenerationJob.Status.RUNNING, AssetGenerationJob.Status.CANCEL_REQUESTED}:
+            return current
         if (
             current.status == AssetGenerationJob.Status.CANCEL_REQUESTED
             and not current.provider_request_id
         ):
             return _finish_cancelled(job)
-        deployment = _verify_live_target(job, snapshot)
-        contract = async_operation_contract(deployment.profile_version, job.operation)
-        validate_standard_payload(contract, snapshot["payload"])
+        deployment = _verify_live_target(job, snapshot, require_executable_route=False)
+        if snapshot.transport.value["driver_type"] != ProviderProfile.DriverType.ASYNC_REST:
+            raise ValidationError("媒体worker只处理已冻结的受限异步传输")
+        contract = {"request_schema": snapshot.definition.value["interface"]["request_schema"]}
+        validate_standard_payload(contract, snapshot.payload)
         driver = driver_for(deployment.provider)
         if job.status == AssetGenerationJob.Status.QUEUED:
-            with transaction.atomic():
-                locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
-                if locked.claim_token != job.claim_token:
-                    return locked
-                if locked.status == AssetGenerationJob.Status.CANCEL_REQUESTED:
-                    locked.status = AssetGenerationJob.Status.CANCELLED
-                    locked.finished_at = timezone.now()
-                    _clear_claim(locked)
-                    locked.save(update_fields=(
-                        "status", "finished_at", "claim_token", "worker_id", "claimed_at", "updated_at",
-                    ))
-                    return locked
-                locked.status = AssetGenerationJob.Status.SUBMITTING
-                locked.submission_started_at = timezone.now()
-                locked.started_at = locked.started_at or locked.submission_started_at
-                locked.heartbeat_at = locked.submission_started_at
-                locked.save(update_fields=(
-                    "status", "submission_started_at", "started_at", "heartbeat_at", "updated_at",
-                ))
+            permitted, job = begin_asset_execution_submission(job)
+            if not permitted:
+                return job
             try:
-                response = driver.invoke(deployment, "submit", snapshot["payload"])
+                response = driver.invoke(deployment, "submit", snapshot.payload)
             except ProviderDriverError as exc:
                 return _fail(
                     job,
@@ -1710,12 +1228,12 @@ def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                     ),
                     uncertain=bool(exc.submission_uncertain),
                 )
-            request_id = str(response.get("request_id") or "") if isinstance(response, dict) else ""
-            if not request_id:
+            request_id = response.get("request_id") if isinstance(response, dict) else None
+            if not isinstance(request_id, str) or not request_id.strip():
                 return _fail(
                     job,
                     code="uncertain_remote_response",
-                    message="远端提交缺少 request_id；禁止自动重复 POST。",
+                    message="远端提交缺少有效的文本 request_id；禁止自动重复 POST。",
                     uncertain=True,
                 )
             request_id_sha256 = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
@@ -1782,12 +1300,10 @@ def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 )
             if not job.provider_request_id:
                 return _finish_cancelled(job)
-            protocol = "cancel" if job.cancel_submitted_at is None else "poll"
+            protocol, job = _asset_cancel_protocol(job)
+            if protocol is None:
+                return job
             response = driver.invoke(deployment, protocol, {"request_id": job.provider_request_id})
-            if protocol == "cancel":
-                AssetGenerationJob.objects.filter(pk=job.pk).update(
-                    cancel_submitted_at=timezone.now(), updated_at=timezone.now(),
-                )
             response_status = str(response.get("status") or job.remote_status)
             if response.get("terminal_cancelled"):
                 return _finish_cancelled(
@@ -1845,31 +1361,30 @@ def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 remote_status=str(response.get("status") or ""),
             )
 
+        collecting_known_success = True
+        if (not job.provider_request_id or job.submitted_at is None or job.submission_started_at is None
+                or job.provider_request_id_sha256 != hashlib.sha256(job.provider_request_id.encode()).hexdigest()):
+            raise ValidationError("REST 收集缺少本次冻结请求的确切提交事实")
         _heartbeat_claim(job)
-        collected = driver.invoke(deployment, "collect", {"request_id": job.provider_request_id})
+        collected = _read_media_collect_receipt(job)
+        if collected is None:
+            from studio.services.provider_registry import ProviderCollectResponseError
+            collect_error = None
+            try:
+                collected = driver.invoke(deployment, "collect", {"request_id": job.provider_request_id})
+            except ProviderCollectResponseError as exc:
+                collected, collect_error = exc.collect_receipt, exc
+            _heartbeat_claim(job)
+            if not job.ignore_late_result:
+                stopped = _retain_media_collect_receipt(job, snapshot, collected)
+                if stopped is not None:
+                    return stopped
+            if collect_error is not None:
+                raise collect_error
         _heartbeat_claim(job)
         artifacts = collected.get("artifacts") if isinstance(collected, dict) else None
-        expected_kind = str(snapshot["output_kind"])
-        attested_cost, _attested_currency = _latest_attested_resolution_cost(job)
-        collected_actual = collected.get("actual_cost")
-        if collected_actual is None:
-            actual = attested_cost if attested_cost is not None else job.estimated_cost
-        else:
-            actual = _decimal_amount(collected_actual, field="actual_cost")
-            if attested_cost is not None and actual != attested_cost:
-                raise ProviderDriverError(
-                    "远端 collect 费用与管理员消歧证据冲突，需重新人工对账",
-                    code="actual_cost_reconciliation_required",
-                )
-        actual = _decimal_amount(actual, field="actual_cost")
-        actual_currency = str(collected.get("currency") or job.cost_currency).strip().upper()[:12]
-        if actual and not actual_currency:
-            raise ValidationError("素材生成实际费用缺少币种")
-        if job.cost_currency and actual_currency and job.cost_currency != actual_currency:
-            raise ProviderDriverError(
-                "素材生成实际费用币种与冻结的预估币种冲突，需人工对账",
-                code="actual_cost_currency_conflict",
-            )
+        expected_kind = str(snapshot.output_kind)
+        actual, actual_currency = _collected_actual_cost(job, collected)
         if job.ignore_late_result:
             return _finish_success(
                 job,
@@ -1880,6 +1395,7 @@ def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
         if (
             not isinstance(artifacts, list)
             or len(artifacts) != 1
+            or not isinstance(artifacts[0], dict)
             or artifacts[0].get("kind") != expected_kind
         ):
             raise ProviderDriverError(
@@ -1909,20 +1425,7 @@ def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 max_bytes=max_bytes,
                 include_observed_media=expected_kind in {"video", "audio"},
             )
-            with transaction.atomic():
-                if AssetGenerationJob.objects.filter(
-                    pk=job.pk,
-                    status=AssetGenerationJob.Status.CANCEL_REQUESTED,
-                ).exists():
-                    asset = None
-                else:
-                    asset = _materialize_downloaded_asset(job, target, facts)
-                result = _finish_success(
-                    job,
-                    asset=asset,
-                    actual_cost=actual,
-                    currency=actual_currency,
-                )
+            result = _finish_media_asset_result(job, target, facts, actual_cost=actual, currency=actual_currency)
         finally:
             target.unlink(missing_ok=True)
             try:
@@ -1954,177 +1457,52 @@ def process_media_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 if exc.submission_uncertain else exc.code
             ),
             message=(
-                f"远端请求已受理后处理失败，禁止直接重试：{exc}"
-                if crossed else str(exc)
+                f"远端已确认完成，但收集或本地处理失败，不会自动重试：{exc}"
+                if collecting_known_success else (
+                    f"远端请求已受理后处理失败，禁止直接重试：{exc}" if crossed else str(exc))
             ),
-            uncertain=bool(exc.submission_uncertain or crossed),
+            uncertain=bool(exc.submission_uncertain or (crossed and not collecting_known_success)
+                or exc.code in {"actual_cost_reconciliation_required", "actual_cost_currency_conflict"}),
         )
-    except ValidationError as exc:
+    except (ValidationError, ProvenanceError) as exc:
         crossed = _confirmed_remote_submission(job)
         return _fail(
             job,
             code="asset_media_job_invalid",
             message=(
-                f"远端请求已受理后本地校验失败，禁止直接重试：{exc}"
-                if crossed else str(exc)
+                f"远端已确认完成，但本地校验失败，不会自动重试：{exc}"
+                if collecting_known_success else (
+                    f"远端请求已受理后本地校验失败，禁止直接重试：{exc}" if crossed else str(exc))
             ),
-            uncertain=crossed,
+            uncertain=crossed and not collecting_known_success,
         )
 
 
-def _comfy_output_path(item: dict, *, expected_prefix: str) -> Path:
-    output_root_raw = str(getattr(settings, "COMFYUI_OUTPUT_DIR", "") or "").strip()
-    if not output_root_raw:
-        raise ProviderDriverError(
-            "ComfyUI 素材生成需要可访问的受控输出目录",
-            code="comfyui_output_unavailable",
-        )
-    filename_raw = str(item.get("filename") or "").replace("\\", "/")
-    subfolder_raw = str(item.get("subfolder") or "").replace("\\", "/")
-    filename = PurePosixPath(filename_raw).name
-    subfolder = PurePosixPath(subfolder_raw)
-    if (
-        not filename
-        or filename != filename_raw
-        or subfolder.is_absolute()
-        or ".." in subfolder.parts
-        or str(item.get("type") or "") != "output"
-    ):
-        raise ProviderDriverError(
-            "ComfyUI 主输出路径或存储类型不受信",
-            code="comfyui_output_path_invalid",
-        )
-    expected_prefix = str(expected_prefix or "").replace("\\", "/").strip("/")
-    expected_path = PurePosixPath(expected_prefix)
-    expected_parent = PurePosixPath(*expected_path.parts[:-1])
-    expected_name = expected_path.name
-    invalid_windows_name = any(
-        ord(character) < 32
-        or ord(character) == 127
-        or character in '<>:"|?*'
-        for character in filename
-    )
-    if (
-        not expected_prefix
-        or expected_path.is_absolute()
-        or ".." in expected_path.parts
-        or subfolder != expected_parent
-        or not expected_name
-        or not filename.startswith(f"{expected_name}_")
-        or invalid_windows_name
-    ):
-        raise ProviderDriverError(
-            "ComfyUI 主输出未绑定本任务的冻结输出前缀",
-            code="comfyui_output_path_invalid",
-        )
-    root = Path(output_root_raw).resolve()
-    candidate = (root / Path(*subfolder.parts) / filename).resolve()
-    if not candidate.is_relative_to(root) or not candidate.is_file():
-        raise ProviderDriverError(
-            "ComfyUI 主输出文件不存在或越过受控目录",
-            code="comfyui_output_path_invalid",
-        )
-    return candidate
 
 
-def _frozen_output_prefix(snapshot: dict) -> str:
-    """Read the explicit task-owned output prefix from the frozen snapshot."""
-    explicit = str(snapshot.get("output_prefix") or "").strip()
-    if not explicit:
-        raise ProviderDriverError(
-            "ComfyUI 素材任务缺少冻结的输出前缀",
-            code="comfyui_output_prefix_missing",
-        )
-    return explicit
-
-
-class _AssetWorkflowStagingExecution:
-    """Small adapter exposing the shared GenerationTask staging contract."""
-
-    def __init__(self, job: AssetGenerationJob, snapshot: dict, graph: dict):
-        self._job = job
-        self.owner = job.owner
-        self.owner_id = job.owner_id
-        self.id = job.id
-        self.staged_inputs = deepcopy(job.staged_inputs or [])
-        self.capability_snapshot = snapshot
-        self.generated_workflow = type("FrozenAssetWorkflow", (), {
-            "workflow_json": graph,
-            "workflow_template_version_id": job.workflow_template_version_id,
-            "compiler_id": str(snapshot.get("workflow_compiler_id") or ""),
-            "content_hash": str(snapshot.get("compiled_graph_sha256") or ""),
-            "workflow_contract_sha256": str(
-                snapshot.get("workflow_contract_sha256") or ""
-            ),
-            "injected_values": {
-                "asset_bindings": deepcopy(snapshot.get("asset_bindings") or []),
-            },
-            "asset_bindings_sha256": str(
-                snapshot.get("asset_bindings_sha256") or ""
-            ),
-        })()
-
-    def save(self, *, update_fields=()):
-        if "staged_inputs" not in update_fields:
-            raise ValidationError("素材任务 staging adapter 只允许持久化 staged_inputs")
-        self._job.staged_inputs = deepcopy(self.staged_inputs)
-        self._job.save(update_fields=("staged_inputs", "updated_at"))
-
-
-class _AssetWorkflowUploadClient:
-    def __init__(self, driver, deployment: ModelDeployment):
-        self.driver = driver
-        self.deployment = deployment
-
-    def upload_input_file(self, source_path, *, subfolder: str, filename: str):
-        return self.driver.invoke(self.deployment, "upload", {
-            "source_path": str(source_path),
-            "subfolder": subfolder,
-            "filename": filename,
-        })
-
-
-def _prepared_comfy_asset_payload(
-    job: AssetGenerationJob,
-    snapshot: dict,
-    deployment: ModelDeployment,
-    driver,
-    payload: dict,
-) -> dict:
-    if snapshot.get("schema_version") == 2:
-        # Historical token-free jobs created before workflow input schema v3.
-        return deepcopy(payload)
-    asset_bindings = snapshot.get("asset_bindings")
-    reference_bindings = snapshot.get("reference_bindings")
-    asset_facts = snapshot.get("asset_facts")
-    if not all(isinstance(value, list) for value in (
-        asset_bindings, reference_bindings, asset_facts,
-    )):
-        raise ValidationError("ComfyUI 素材任务缺少冻结的工作流输入 manifest")
-    for value, sha_key in (
-        (asset_bindings, "asset_bindings_sha256"),
-        (reference_bindings, "reference_bindings_sha256"),
-        (asset_facts, "asset_facts_sha256"),
-    ):
-        if json_contract(
-            value,
-            max_bytes=_stage_snapshot_max_bytes(),
-        ).sha256 != str(snapshot.get(sha_key) or ""):
-            raise ValidationError(f"ComfyUI 素材任务冻结的 {sha_key} 已漂移")
-    runtime = deepcopy(payload)
-    execution = _AssetWorkflowStagingExecution(
-        job,
-        snapshot,
-        runtime["workflow"],
-    )
-    # Reuse the exact short-drama staging path: authorization, checksum,
-    # frozen preprocessing, durable upload cache and token replacement.
-    runtime["workflow"] = prepare_workflow(
-        execution,
-        _AssetWorkflowUploadClient(driver, deployment),
-    )
-    job.staged_inputs = deepcopy(execution.staged_inputs)
-    return runtime
+def _prepared_comfy_asset_payload(job, snapshot, deployment, driver, payload):
+    from studio.services.execution_workflow_staging import stage_execution_workflow_media, ExecutionWorkflowUploadClient
+    if payload != snapshot.payload:
+        raise ValidationError("素材提交参数必须来自本次冻结请求")
+    def check_active():
+        current = AssetGenerationJob.objects.only("status", "claim_token").get(pk=job.pk)
+        if job.claim_token is None or current.claim_token != job.claim_token or current.status != AssetGenerationJob.Status.QUEUED:
+            raise ValidationError("素材任务已取消、租约已变化或已经提交，不能继续上传")
+        _heartbeat_claim(job)
+    def persist(records):
+        with transaction.atomic():
+            current = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
+            if job.claim_token is None or current.claim_token != job.claim_token or current.status != AssetGenerationJob.Status.QUEUED:
+                raise ValidationError("上传期间素材任务已取消或租约已变化，不能写入回执")
+            current.staged_inputs = records
+            current.save(update_fields=("staged_inputs", "updated_at"))
+        job.staged_inputs = deepcopy(records)
+    result = stage_execution_workflow_media(definition=snapshot.definition, resolved_inputs=snapshot.resolved_inputs,
+        transport=snapshot.transport, owner=job.owner, root_id=job.pk,
+        client=ExecutionWorkflowUploadClient(driver, deployment), staged_inputs=job.staged_inputs,
+        persist_staged_inputs=persist, check_active=check_active,
+        max_media_bytes=boundary_int("security.workflow_smoke.asset_max_file_bytes", minimum=1))
+    return {**deepcopy(payload), "workflow": result.graph}
 
 
 def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
@@ -2136,7 +1514,11 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
         snapshot = _snapshot(job)
         if job.execution_kind != AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
             raise ValidationError("任务不是 ComfyUI 工作流执行方案")
-        current = AssetGenerationJob.objects.only("status", "provider_request_id").get(pk=job.pk)
+        current = AssetGenerationJob.objects.only("status", "provider_request_id", "claim_token").get(pk=job.pk)
+        if current.claim_token != job.claim_token or current.status not in {
+                AssetGenerationJob.Status.QUEUED, AssetGenerationJob.Status.SUBMITTED,
+                AssetGenerationJob.Status.RUNNING, AssetGenerationJob.Status.CANCEL_REQUESTED}:
+            return current
         if (
             current.status == AssetGenerationJob.Status.CANCEL_REQUESTED
             and not current.provider_request_id
@@ -2145,23 +1527,26 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
         deployment = _verify_live_target(
             job,
             snapshot,
-            require_executable_route=current.status == AssetGenerationJob.Status.QUEUED,
+            require_executable_route=False,
         )
-        payload = snapshot.get("payload")
+        payload = snapshot.payload
         graph = payload.get("workflow") if isinstance(payload, dict) else None
         if (
             not isinstance(graph, dict)
             or json_contract(
                 graph,
                 max_bytes=_workflow_graph_max_bytes(),
-            ).sha256 != snapshot.get("compiled_graph_sha256")
-            or str(payload.get("submission_token") or "") != str(job.id)
+            ).sha256 != snapshot.transport.value["payload"]["compiled_workflow"]["graph_sha256"]
+            or str(payload.get("submission_token") or "") != str(snapshot.preparation.pk)
         ):
             raise ValidationError("ComfyUI 冻结提交图或 submission token 无效")
         driver = driver_for(deployment.provider)
         runtime_payload = deepcopy(payload)
 
         if job.status == AssetGenerationJob.Status.QUEUED:
+            permitted, job = check_asset_execution_staging(job)
+            if not permitted:
+                return job
             runtime_payload = _prepared_comfy_asset_payload(
                 job,
                 snapshot,
@@ -2169,19 +1554,9 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 driver,
                 payload,
             )
-            with transaction.atomic():
-                locked = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
-                if locked.claim_token != job.claim_token:
-                    return locked
-                if locked.status == AssetGenerationJob.Status.CANCEL_REQUESTED:
-                    return _finish_cancelled(job)
-                locked.status = AssetGenerationJob.Status.SUBMITTING
-                locked.submission_started_at = timezone.now()
-                locked.started_at = locked.started_at or locked.submission_started_at
-                locked.heartbeat_at = locked.submission_started_at
-                locked.save(update_fields=(
-                    "status", "submission_started_at", "started_at", "heartbeat_at", "updated_at",
-                ))
+            permitted, job = begin_asset_execution_submission(job)
+            if not permitted:
+                return job
             try:
                 response = driver.invoke(deployment, "submit", runtime_payload)
             except ProviderDriverError as exc:
@@ -2205,7 +1580,7 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                     uncertain=True,
                 )
             request_id = str(response.get("request_id") or "") if isinstance(response, dict) else ""
-            if request_id != str(job.id):
+            if request_id != str(snapshot.preparation.pk):
                 request_hash = (
                     hashlib.sha256(request_id.encode("utf-8")).hexdigest()
                     if request_id else ""
@@ -2263,17 +1638,15 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 )
             if not job.provider_request_id:
                 return _finish_cancelled(job)
-            protocol = "cancel" if job.cancel_submitted_at is None else "poll"
+            protocol, job = _asset_cancel_protocol(job)
+            if protocol is None:
+                return job
             response = driver.invoke(
                 deployment,
                 protocol,
                 {"request_id": job.provider_request_id},
             )
             if protocol == "cancel":
-                AssetGenerationJob.objects.filter(pk=job.pk).update(
-                    cancel_submitted_at=timezone.now(),
-                    updated_at=timezone.now(),
-                )
                 return _schedule(
                     job,
                     status=AssetGenerationJob.Status.CANCEL_REQUESTED,
@@ -2298,8 +1671,6 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 return _finish_success(
                     job,
                     asset=None,
-                    actual_cost=job.estimated_cost,
-                    currency=job.cost_currency,
                 )
             return _schedule(
                 job,
@@ -2340,57 +1711,67 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 remote_status=remote_status or "running",
             )
 
+        if (
+                job.provider_request_id != str(snapshot.preparation.pk)
+                or job.provider_request_id_sha256 != hashlib.sha256(str(snapshot.preparation.pk).encode()).hexdigest()
+                or job.submitted_at is None or job.submission_started_at is None):
+            raise ValidationError("工作流收集缺少本次冻结请求的确切提交事实")
         _heartbeat_claim(job)
-        collected = driver.invoke(
-            deployment,
-            "collect",
-            {"request_id": job.provider_request_id},
-        )
+        retained = _read_media_collect_receipt(job) if snapshot.output_kind != "text" else None
+        if retained is None:
+            collected = driver.invoke(deployment, "collect", {"request_id": job.provider_request_id})
+        else:
+            collected = retained
         _heartbeat_claim(job)
-        outputs = collected.get("outputs") if isinstance(collected, dict) else None
-        primary = snapshot.get("compiled_output_contract", {}).get("primary")
-        expected_kind = str(snapshot.get("output_kind") or "")
-        expected_node_id = str(primary.get("node_id") or "") if isinstance(primary, dict) else ""
-        matching = [
-            item for item in (outputs or [])
-            if isinstance(item, dict)
-            and str(item.get("node_id") or "") == expected_node_id
-            and classify_task_output(item) == expected_kind
-        ]
-        if len(matching) != 1:
-            raise ProviderDriverError(
-                "ComfyUI 冻结主输出节点必须且只能产生一个类型匹配的文件",
-                code="comfyui_primary_output_invalid",
-            )
-        source = _comfy_output_path(
-            matching[0],
-            expected_prefix=_frozen_output_prefix(snapshot),
-        )
+        if snapshot.output_kind != "text" and retained is None:
+            stopped = _retain_media_collect_receipt(job, snapshot, collected)
+            if stopped is not None:
+                return stopped
+        from studio.services.execution_workflow_outputs import verify_comfy_primary_output
         max_bytes = int(resolve_configuration(
             required_keys=("artifact.max_bytes",),
         ).values["artifact.max_bytes"])
-        facts = verified_local_media_facts(
-            source,
-            expected_kind=expected_kind,
-            max_bytes=max_bytes,
-            include_observed_media=expected_kind in {"video", "audio"},
-        )
-        from studio.services.workflow_resolution import validate_resolved_image_output
-        validate_resolved_image_output(source, snapshot.get("compiled_output_contract") or {})
-        with transaction.atomic():
-            if AssetGenerationJob.objects.filter(
-                pk=job.pk,
-                status=AssetGenerationJob.Status.CANCEL_REQUESTED,
-            ).exists():
-                asset = None
-            else:
-                asset = _materialize_downloaded_asset(job, source, facts)
-            return _finish_success(
-                job,
-                asset=asset,
-                actual_cost=job.estimated_cost,
-                currency=job.cost_currency,
-            )
+        if snapshot.output_kind == "text":
+            from studio.services.execution_workflow_outputs import select_comfy_primary_output
+            from studio.services.execution_text_contracts import parse_execution_text_response
+            from studio.services.execution_text_response_review import response_validation_diagnostic
+            if (not isinstance(collected, dict) or collected.get("request_id") != str(snapshot.preparation.pk)
+                    or job.provider_request_id != str(snapshot.preparation.pk)):
+                raise ValidationError("工作流文本收集回执与原冻结请求不一致")
+            item = select_comfy_primary_output(collected, output_contract=snapshot.output_contract, expected_kind="text")
+            validation_error = None
+            try:
+                verify_comfy_primary_output(collected, output_contract=snapshot.output_contract,
+                    expected_kind="text", expected_prefix=snapshot.output_prefix,
+                    resolved_semantics=snapshot.transport.value["payload"]["compiled_workflow"]["resolved_semantics"], max_bytes=max_bytes)
+            except ValidationError as exc:
+                validation_error = exc
+                diagnostics = {"schema_version": 1, "contract_error_code": "comfyui_text_output_invalid",
+                    "summary": "已收到冻结节点的文本，但正文为空、大小或摘要未通过输出校验；只读留存，不作为成功候选。"}
+            if validation_error is None:
+                try:
+                    parsed = parse_execution_text_response(job.operation, {"text": item["text"]}, field_request=snapshot.field_request,
+                        operation_plan=snapshot.transport.value.get("operation_plan"), request_payload=snapshot.transport.value["payload"],
+                        expected_output=snapshot.definition.value["interface"].get("business_output"))
+                    diagnostics = {"schema_version": 1, "contract_error_code": "response_contract_valid",
+                        "summary": "已保存工作流实际文本返回；候选与人工采用仍是独立事实。", "warnings": parsed.get("warnings", [])}
+                except ValidationError as exc:
+                    validation_error = exc
+                    diagnostics = response_validation_diagnostic(exc, {})
+            if isinstance(item.get("text"), str):
+                stopped = _retain_text_asset_output(job, snapshot, text=item["text"], diagnostics=diagnostics,
+                    collection_request_id=collected["request_id"])
+                if stopped is not None:
+                    return stopped
+            if validation_error is not None:
+                return _fail(job, code="comfyui_asset_text_response_invalid",
+                    message="ComfyUI 远端已完成，但文本输出未通过本次合同校验；有明确节点正文时已保留，没有可用候选，不会自动重试。",
+                    remote_status="succeeded")
+            return _finish_text_asset_result(job, item["text"])
+        source, facts = verify_comfy_primary_output(collected, output_contract=snapshot.output_contract,
+            expected_kind=snapshot.output_kind, expected_prefix=snapshot.output_prefix,
+            resolved_semantics=snapshot.transport.value["payload"]["compiled_workflow"]["resolved_semantics"], max_bytes=max_bytes)
+        return _finish_media_asset_result(job, source, facts)
     except ProviderDriverError as exc:
         current = AssetGenerationJob.objects.get(pk=job.pk)
         if (
@@ -2424,8 +1805,6 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
                 not remote_succeeded and (crossed or exc.submission_uncertain)
             ),
             remote_status="succeeded" if remote_succeeded else None,
-            actual_cost=job.estimated_cost if remote_succeeded else None,
-            currency=job.cost_currency if remote_succeeded else "",
         )
     except (ValidationError, ProvenanceError, ComfyUIError) as exc:
         current = AssetGenerationJob.objects.get(pk=job.pk)
@@ -2442,8 +1821,6 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
             ),
             uncertain=bool(crossed and not remote_succeeded),
             remote_status="succeeded" if remote_succeeded else None,
-            actual_cost=job.estimated_cost if remote_succeeded else None,
-            currency=job.cost_currency if remote_succeeded else "",
         )
     except OSError as exc:
         current = AssetGenerationJob.objects.get(pk=job.pk)
@@ -2458,96 +1835,64 @@ def process_comfy_asset_job(job: AssetGenerationJob) -> AssetGenerationJob:
         raise
 
 
+_TERMINAL_ASSET_STATUSES = (AssetGenerationJob.Status.SUCCEEDED, AssetGenerationJob.Status.FAILED, AssetGenerationJob.Status.CANCELLED)
+
+
 @transaction.atomic
-def request_asset_generation_cancel(job: AssetGenerationJob) -> AssetGenerationJob:
-    job = AssetGenerationJob.objects.select_for_update().get(pk=job.pk)
+def _mark_asset_generation_cancel(job_id, *, child=False):
+    from studio.services.execution_preparations import read_execution_preparation_detail
+    job = AssetGenerationJob.objects.select_for_update().get(pk=job_id)
     if job.status == AssetGenerationJob.Status.CANCELLED:
         return job
-    if job.status in {
-        AssetGenerationJob.Status.SUCCEEDED,
-        AssetGenerationJob.Status.FAILED,
-        AssetGenerationJob.Status.UNCERTAIN,
-    }:
-        raise ValidationError("当前任务状态不能取消")
-    if job.status == AssetGenerationJob.Status.CANCEL_REQUESTED:
-        if not job.ignore_late_result:
+    if job.status in _TERMINAL_ASSET_STATUSES or job.status == AssetGenerationJob.Status.UNCERTAIN:
+        if not child:
+            raise ValidationError("当前任务状态不能取消；远端不确定任务须先消歧")
+        # Never rewrite an uncertain child's actual remote outcome.
+        if job.status == AssetGenerationJob.Status.UNCERTAIN and not job.ignore_late_result:
             job.ignore_late_result = True
-            job.save(update_fields=("ignore_late_result", "updated_at"))
+            job.cancel_requested_at = job.cancel_requested_at or timezone.now()
+            job.save(update_fields=("ignore_late_result", "cancel_requested_at", "updated_at"))
         return job
+    preparation = job.execution_preparations.select_for_update().get()
+    read_execution_preparation_detail(preparation)
+    if preparation.status != "cancelled":
+        preparation.status, preparation.reason_code, preparation.reason = "cancelled", "user_cancelled", "用户已取消本次请求"
+        preparation.revision += 1
+        preparation.next_check_at = None
+        preparation.save(update_fields=("status", "revision", "reason_code", "reason", "next_check_at", "updated_at"))
+    pending_children = preparation.auxiliary_asset_jobs.exclude(status__in=_TERMINAL_ASSET_STATUSES).exists()
     job.ignore_late_result = True
-    if job.status == AssetGenerationJob.Status.QUEUED and job.claim_token is None:
-        job.status = AssetGenerationJob.Status.CANCELLED
-        job.finished_at = timezone.now()
+    job.cancel_requested_at = job.cancel_requested_at or timezone.now()
+    if job.submission_started_at is None and job.claim_token is None and not pending_children:
+        job.status, job.finished_at, job.next_poll_at = AssetGenerationJob.Status.CANCELLED, timezone.now(), None
+        job.error_code, job.error_message = "user_cancelled", "用户取消了本次请求，未提交主调用"
     else:
-        job.status = AssetGenerationJob.Status.CANCEL_REQUESTED
-        job.cancel_requested_at = job.cancel_requested_at or timezone.now()
-        job.next_poll_at = timezone.now()
-    job.save(update_fields=(
-        "status", "finished_at", "cancel_requested_at", "ignore_late_result",
-        "next_poll_at", "updated_at",
-    ))
+        job.status, job.next_poll_at = AssetGenerationJob.Status.CANCEL_REQUESTED, timezone.now()
+    if pending_children and job.submission_started_at is None:
+        job.error_code, job.error_message = "awaiting_auxiliary_cancellation", "正在等待辅助任务取消或远端状态消歧；不会再提交主请求"
+    job.save(update_fields=("status", "finished_at", "cancel_requested_at", "ignore_late_result",
+        "next_poll_at", "error_code", "error_message", "updated_at"))
     return job
 
 
-def retry_asset_generation_job(
-    job: AssetGenerationJob,
-    *,
-    client_idempotency_key: str = "",
-) -> tuple[AssetGenerationJob, bool]:
-    if job.status not in {AssetGenerationJob.Status.FAILED, AssetGenerationJob.Status.CANCELLED}:
-        raise ValidationError("只有明确失败或已取消的任务可以重试；不确定任务必须先人工核验")
-    workflow_input_request: dict = {}
-    if job.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
-        if job.request_snapshot_schema_version != 3:
-            raise ValidationError(
-                "历史 ComfyUI 素材任务缺少 v3 workflow_inputs 冻结意图，不能自动重试；请重新创建任务",
-            )
-        snapshot = _snapshot(job)
-        workflow_input_request = snapshot.get("workflow_input_request")
-        if (
-            not isinstance(workflow_input_request, dict)
-            or workflow_input_request.get("schema_version") != FIXTURE_SCHEMA_VERSION
-        ):
-            raise ValidationError(
-                "ComfyUI 素材任务缺少完整的 workflow_input_request 冻结意图，不能自动重试；请重新创建任务",
-            )
-    return create_asset_generation_job(
-        owner=job.owner,
-        job_type=job.job_type,
-        media_type=job.media_type,
-        execution_kind=job.execution_kind,
-        deployment=(
-            job.model_deployment
-            if job.execution_kind == AssetGenerationJob.ExecutionKind.DEPLOYMENT
-            else None
-        ),
-        workflow_version=(
-            job.workflow_template_version
-            if job.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-            else None
-        ),
-        prompt=job.prompt,
-        negative_prompt=job.negative_prompt,
-        parameters=(
-            job.parameters
-            if job.execution_kind == AssetGenerationJob.ExecutionKind.DEPLOYMENT
-            else {}
-        ),
-        workflow_inputs=(
-            workflow_input_request
-            if job.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-            else {}
-        ),
-        style=job.style,
-        image_category=job.image_category,
-        name=job.name,
-        description=job.description,
-        allow_external_calls=job.allow_external_calls,
-        budget_limit=job.budget_limit,
-        client_idempotency_key=(
-            str(client_idempotency_key or "").strip() or f"retry:{job.id}"
-        ),
-    )
+def request_asset_generation_cancel(job: AssetGenerationJob) -> AssetGenerationJob:
+    # Stop the parent first, then lock each child in a separate transaction.
+    # No parent-root lock may be held while taking child-root locks.
+    job = _mark_asset_generation_cancel(job.pk)
+    if job.status == AssetGenerationJob.Status.CANCELLED:
+        return job
+    preparation = job.execution_preparations.get()
+    child_ids = list(preparation.auxiliary_asset_jobs.exclude(status__in=_TERMINAL_ASSET_STATUSES)
+        .order_by("id").values_list("id", flat=True))
+    for child_id in child_ids:
+        _mark_asset_generation_cancel(child_id, child=True)
+    # In-flight children still need the original remote cancellation/reconcile.
+    return _mark_asset_generation_cancel(job.pk)
+
+
+def retry_asset_generation_job(job: AssetGenerationJob, *, client_idempotency_key: str = "") -> tuple[AssetGenerationJob, bool]:
+    from studio.services.execution_asset_retries import retry_prepared_asset_job
+    return retry_prepared_asset_job(job, client_idempotency_key=client_idempotency_key)
 
 
 @transaction.atomic
@@ -2579,21 +1924,21 @@ def recover_stale_asset_generation_jobs(
     if execution_kind is not None:
         queryset = queryset.filter(execution_kind=execution_kind)
     if text is True:
-        queryset = queryset.filter(operation=SCRIPT_GENERATE_OPERATION)
+        queryset = queryset.filter(model_deployment__profile_version__provider__driver_type__in=_text_driver_types())
     elif (
         text is False
         and execution_kind != AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
     ):
-        queryset = queryset.filter(operation__in=tuple(MEDIA_OPERATION.values()))
+        queryset = queryset.filter(model_deployment__profile_version__provider__driver_type=ProviderProfile.DriverType.ASYNC_REST)
     now = timezone.now()
     for job in queryset:
         if (
-            job.operation == SCRIPT_GENERATE_OPERATION
+            _is_text_job(job)
             and job.status == AssetGenerationJob.Status.SUBMITTING
             and job.submission_started_at is not None
         ):
             timeout_seconds = float(
-                (job.request_snapshot or {}).get("text_timeout_seconds") or 0
+                _asset_request_header(job)["runtime_budget"]["timeout_seconds"]
             )
             if now < job.submission_started_at + timedelta(
                 seconds=timeout_seconds + text_submission_grace_seconds,
@@ -2644,9 +1989,9 @@ def reconcile_uncertain_comfy_asset_jobs(*, limit: int) -> dict[str, int]:
         ).get(pk=job_id)
         try:
             snapshot = _snapshot(job)
-            payload = snapshot.get("payload")
+            payload = snapshot.payload
             token = str(payload.get("submission_token") or "") if isinstance(payload, dict) else ""
-            if token != str(job.id):
+            if token != str(snapshot.preparation.pk):
                 raise ValidationError("ComfyUI uncertain 任务的冻结 submission token 无效")
             deployment = _verify_live_target(
                 job,
@@ -2713,16 +2058,52 @@ def reconcile_uncertain_comfy_asset_jobs(*, limit: int) -> dict[str, int]:
 def _latest_attested_resolution_cost(
     job: AssetGenerationJob,
 ) -> tuple[Decimal | None, str]:
-    for resolution in job.resolutions.order_by("-revision"):
-        evidence = resolution.evidence if isinstance(resolution.evidence, dict) else {}
-        raw_cost = evidence.get("actual_cost")
-        source = str(evidence.get("actual_cost_source") or "operator_attested")
-        if raw_cost is not None and source != "estimated_fallback":
-            return (
-                _decimal_amount(raw_cost, field="actual_cost"),
-                str(evidence.get("cost_currency") or "").strip().upper()[:12],
+    resolution = job.resolutions.filter(
+        outcome__in=AssetGenerationJobResolution.OPERATOR_OUTCOMES).order_by("-revision").first()
+    if resolution is None:
+        return None, ""
+    evidence = verify_json_contract(resolution.evidence,
+        schema_version=resolution.evidence_schema_version, size_bytes=resolution.evidence_size_bytes,
+        sha256=resolution.evidence_sha256, max_bytes=_stage_snapshot_max_bytes()).value
+    if not isinstance(evidence, dict) or evidence.get("job_id") != str(job.pk):
+        raise ValidationError("费用消歧证据与当前素材任务不一致")
+    source = evidence.get("actual_cost_source")
+    amount = _decimal_amount(evidence.get("actual_cost"), field="actual_cost")
+    if source == "unknown" and amount is None:
+        return None, ""
+    if source not in {"operator_attested", "carried_forward", "operator_confirmed_not_submitted"} or amount is None:
+        raise ValidationError("费用消歧证据没有有效的实际费用来源")
+    currency = evidence.get("cost_currency")
+    # Confirmed non-submission is an explicit zero, not a monetary receipt.
+    if source == "operator_confirmed_not_submitted" and amount == 0 and currency == "":
+        return amount, ""
+    return amount, _actual_cost_currency(currency)
+
+
+def _collected_actual_cost(job: AssetGenerationJob, collected: dict) -> tuple[Decimal | None, str]:
+    """Use only provider billing or verified operator evidence, never prices."""
+    if not isinstance(collected, dict):
+        raise ValidationError("远端 collect 响应无效")
+    attested_cost, attested_currency = _latest_attested_resolution_cost(job)
+    raw = collected.get("actual_cost")
+    if raw is None:
+        actual, currency = attested_cost, attested_currency
+    else:
+        actual = _decimal_amount(raw, field="actual_cost")
+        if actual is None:
+            raise ValidationError("远端实际费用为空字符串，不能视为有效费用")
+        currency = _actual_cost_currency(collected.get("currency"))
+        if attested_cost is not None and (actual != attested_cost or currency != attested_currency):
+            raise ProviderDriverError(
+                "远端 collect 费用与管理员消歧证据冲突，需重新人工对账",
+                code="actual_cost_reconciliation_required",
             )
-    return None, ""
+    if actual is not None and job.cost_currency and currency != job.cost_currency:
+        raise ProviderDriverError(
+            "素材生成实际费用币种与冻结的预估币种冲突，需人工对账",
+            code="actual_cost_currency_conflict",
+        )
+    return actual, currency
 
 
 @transaction.atomic
@@ -2742,17 +2123,15 @@ def resolve_uncertain_asset_generation_job(
     if not getattr(user, "is_staff", False):
         raise ValidationError("只有 staff 可以消歧素材生成任务")
     normalized_note = normalize_audit_note(note)
-    if outcome not in set(AssetGenerationJobResolution.Outcome.values):
+    if outcome not in AssetGenerationJobResolution.OPERATOR_OUTCOMES:
         raise ValidationError({"outcome": "素材生成消歧结果无效"})
     supplied_request_id = str(provider_request_id or "").strip()
     if len(supplied_request_id) > 191:
         raise ValidationError({"provider_request_id": "provider request id 过长"})
     parsed_cost = _decimal_amount(actual_cost, field="actual_cost")
     supplied_currency = str(cost_currency or "").strip().upper()
-    if len(supplied_currency) > 12:
-        raise ValidationError({"cost_currency": "费用币种过长"})
-    if parsed_cost is not None and not supplied_currency:
-        raise ValidationError({"cost_currency": "提供实际成本时必须提供币种"})
+    if supplied_currency or parsed_cost is not None:
+        supplied_currency = _actual_cost_currency(supplied_currency)
     request_intent = json_contract({
         "schema_version": 1,
         "outcome": outcome,
@@ -2769,21 +2148,26 @@ def resolve_uncertain_asset_generation_job(
         raise ValidationError({"idempotency_key": "消歧幂等键过长"})
     idempotency_key = raw_idempotency_key or f"auto:{request_intent.sha256}"
 
-    locked = AssetGenerationJob.objects.select_for_update().select_related(
-        "model_deployment__profile_version__provider",
-    ).get(pk=job.pk)
+    from studio.services.execution_preparation_owners import locked_preparation_owners
+    # The enclosing transaction.atomic retains these root locks after this
+    # nested guard, including the parent's budget lock for an auxiliary.
+    with locked_preparation_owners([("asset_job_id", job.pk)], user) as owners:
+        locked = owners[("asset_job_id", str(job.pk))]
     existing_resolution = locked.resolutions.filter(
         idempotency_key=idempotency_key,
     ).first()
     if existing_resolution is not None:
+        if existing_resolution.outcome not in AssetGenerationJobResolution.OPERATOR_OUTCOMES:
+            raise ValidationError("系统事件幂等键不能用于人工消歧")
         if existing_resolution.request_sha256 != request_intent.sha256:
             raise ValidationError("同一消歧幂等键不能用于不同请求")
         return existing_resolution, False
     if locked.status != AssetGenerationJob.Status.UNCERTAIN:
         raise ValidationError("只有 uncertain 素材生成任务可以人工消歧")
 
+    prepared = _snapshot(locked)
     if locked.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW:
-        frozen_comfy_token = str(locked.id)
+        frozen_comfy_token = str(prepared.preparation.pk)
         if supplied_request_id and supplied_request_id != frozen_comfy_token:
             raise ValidationError({
                 "provider_request_id": "ComfyUI 消歧只能使用任务冻结的 submission token",
@@ -2821,7 +2205,7 @@ def resolve_uncertain_asset_generation_job(
             })
         if parsed_cost not in (None, Decimal("0")):
             raise ValidationError({"actual_cost": "确认未提交时实际成本必须为空或 0"})
-    elif locked.operation != SCRIPT_GENERATE_OPERATION and not request_id_hash:
+    elif not _is_text_job(locked) and not request_id_hash:
         raise ValidationError({
             "provider_request_id": "媒体远端结论必须关联 provider request id 摘要",
         })
@@ -2832,17 +2216,11 @@ def resolve_uncertain_asset_generation_job(
     if effective_cost is None and prior_cost is not None:
         effective_cost = prior_cost
         actual_cost_source = "carried_forward"
-    if (
-        effective_cost is None
-        and outcome == AssetGenerationJobResolution.Outcome.CONFIRMED_REMOTE_SUCCEEDED
-        and (
-            locked.operation == SCRIPT_GENERATE_OPERATION
-            or not request_id
-            or locked.execution_kind == AssetGenerationJob.ExecutionKind.COMFY_WORKFLOW
-        )
-    ):
-        effective_cost = locked.estimated_cost
-        actual_cost_source = "estimated_fallback" if effective_cost is not None else "unknown"
+    if outcome == AssetGenerationJobResolution.Outcome.CONFIRMED_NOT_SUBMITTED:
+        # This zero is an explicit administrator fact, not an unknown-price
+        # fallback; release the possibly-spent reservation exactly once.
+        effective_cost = Decimal("0")
+        actual_cost_source = "operator_confirmed_not_submitted"
     effective_currency = supplied_currency or prior_currency or locked.cost_currency
     if locked.cost_currency and effective_currency and locked.cost_currency != effective_currency:
         raise ValidationError({"cost_currency": "实际费用币种与冻结币种冲突"})
@@ -2857,6 +2235,9 @@ def resolve_uncertain_asset_generation_job(
         "media_type": locked.media_type,
         "operation": locked.operation,
         "request_snapshot_sha256": locked.request_snapshot_sha256,
+        "execution_instance_version_id": str(locked.execution_instance_version_id),
+        "preparation_id": str(prepared.preparation.pk),
+        "prepared_request_sha256": prepared.preparation.request_sha256,
         "previous_status": locked.status,
         "previous_error_code": locked.error_code,
         "cancel_intent": locked.ignore_late_result,
@@ -2916,7 +2297,7 @@ def resolve_uncertain_asset_generation_job(
         locked.remote_status = "operator_confirmed_remote_cancelled"
         locked.error_code = "operator_confirmed_remote_cancelled"
         locked.error_message = "管理员确认远端已取消。"
-    elif locked.operation == SCRIPT_GENERATE_OPERATION:
+    elif _is_text_job(locked):
         locked.status = (
             AssetGenerationJob.Status.CANCELLED
             if locked.ignore_late_result else AssetGenerationJob.Status.FAILED

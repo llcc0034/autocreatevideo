@@ -1,73 +1,45 @@
 from datetime import datetime, timedelta, timezone as datetime_timezone
+from copy import deepcopy
+from unittest.mock import patch
 
-from django.test import TestCase
+from django.test import TestCase, override_settings
+from django.core.exceptions import ValidationError
 from django.utils import timezone
 from rest_framework.test import APIClient
 
 from studio.models import (
     ConfigRevision,
-    GeneratedWorkflow,
+    GenerationAttempt,
     GenerationTask,
-    PromptArtifact,
-    WorkflowTemplate,
 )
 from studio.services.configuration import create_config_revision, publish_config_revision
-from studio.tests.factories import build_story, freeze_current_task_contract
+from studio.services.execution_production_dispatch import dispatch_production_execution
+from studio.services.execution_preparations import read_frozen_execution_request
+from studio.services.execution_workflow_inspection import inspect_prepared_task_inputs
+from studio.services.json_contracts import json_contract
+from studio.tests import test_execution_production_workflow_requests as fixtures
+from studio.tests.test_execution_production_auxiliaries import production_observations
 
 
+@override_settings(AI_PROVIDER_ALLOWED_HOSTS=("127.0.0.1",))
 class GenerationTaskTimelineAPITests(TestCase):
+    _create_version = fixtures.ProductionWorkflowRequestTests._create_version
+    resolve = fixtures.ProductionWorkflowRequestTests.resolve
+
     def setUp(self):
-        (
-            self.user,
-            self.project,
-            _,
-            _,
-            self.episode,
-            self.shot,
-            _,
-        ) = build_story("task-timeline")
+        # Allocate through the current Run / Preparation / Attempt dispatcher.
+        # This API suite changes only persisted lifecycle facts, not the frozen
+        # request contract. Controlled admission is not real GPU acceptance.
+        fixtures.ProductionWorkflowRequestTests.setUp(self)
         self.client = APIClient()
         self.client.force_authenticate(self.user)
-        self.template = WorkflowTemplate.objects.create(
-            name="task-timeline-template",
-            slug="task-timeline-template",
-            output_kind="video",
-            definition={"1": {"class_type": "Mock", "inputs": {}}},
-            is_system=True,
-        )
-        self.prompt = PromptArtifact.objects.create(is_multi_shot=False, include_audio=True,
-            project=self.project,
-            episode=self.episode,
-            shot=self.shot,
-            created_by=self.user,
-            prompt_type="video",
-            total_duration_ms=self.shot.duration_ms,
-            prompt_text="timeline fixture",
-            structured_payload={},
-            consistency_snapshot={},
-            request_options={"shot_ids": [str(self.shot.id)]},
-            content_hash="1" * 64,
-        )
-        self.workflow = GeneratedWorkflow.objects.create(
-            project=self.project,
-            episode=self.episode,
-            prompt_artifact=self.prompt,
-            template=self.template,
-            created_by=self.user,
-            workflow_json=self.template.definition,
-            content_hash="2" * 64,
-        )
+
     def create_task(self, **overrides):
-        values = {
-            "owner": self.user,
-            "project": self.project,
-            "episode": self.episode,
-            "generated_workflow": self.workflow,
-            "kind": GenerationTask.Kind.VIDEO,
-            "max_attempts": 3,
-        }
-        values.update(overrides)
-        return freeze_current_task_contract(GenerationTask.objects.create(**values))
+        task = self.attempt.generation_task
+        if overrides:
+            GenerationTask.objects.filter(pk=task.pk).update(**overrides)
+            task.refresh_from_db()
+        return task
 
     def test_completed_task_exposes_persisted_times_durations_and_full_timeline(self):
         task = self.create_task()
@@ -112,7 +84,7 @@ class GenerationTaskTimelineAPITests(TestCase):
             "submission_state": GenerationTask.SubmissionState.SUBMITTED,
             "prompt_id": "prompt-123",
         })
-        self.assertEqual(timeline[-1]["occurred_at"], response.data["finished_at"])
+        self.assertNotIn("occurred_at", timeline[-1])
         self.assertEqual(timeline[-1]["timestamp"], response.data["finished_at"])
         self.assertEqual(timeline[-1]["status"], GenerationTask.Status.SUCCEEDED)
 
@@ -129,6 +101,10 @@ class GenerationTaskTimelineAPITests(TestCase):
         self.assertIsNone(response.data["duration_ms"])
         self.assertIsNone(response.data["total_duration_ms"])
         self.assertEqual([item["event"] for item in response.data["timeline"]], ["queued"])
+        parameters = {row["key"]: row for row in response.data["input_parameters"]["parameters"]}
+        self.assertEqual(parameters["audio.enabled"]["value"], True)
+        self.assertEqual(parameters["audio.enabled"]["value_source"], "workflow.static_semantics")
+        self.assertEqual(parameters["audio.enabled"]["rule"], {"const": True})
 
     def test_retry_task_timeline_is_linked_to_the_real_failed_source(self):
         source = self.create_task(
@@ -136,26 +112,41 @@ class GenerationTaskTimelineAPITests(TestCase):
             submission_state=GenerationTask.SubmissionState.TERMINAL_FAILED,
             error_message="verified remote failure",
         )
-        retry = self.create_task(
-            status=GenerationTask.Status.QUEUED,
-            capability_snapshot={"retry_of": str(source.id)},
-        )
+        GenerationAttempt.objects.filter(pk=self.attempt.pk).update(
+            status="failed", committed_cost=0, actual_cost=0,
+            error_code="execution_workflow_failed")
+        self.preparation.refresh_from_db()
+        with patch("studio.services.execution_production_dispatch.collect_production_execution_admission",
+                side_effect=lambda prep, definition, request, **_: production_observations(prep, definition, request)):
+            successor = dispatch_production_execution(preparation_id=self.preparation.pk,
+                expected_preparation_revision=self.preparation.revision,
+                actor=self.user, retry_of_id=self.attempt.pk)
+        retry = successor.generation_task
 
         response = self.client.get(f"/api/v1/tasks/{retry.id}/")
 
         self.assertEqual(response.status_code, 200, response.data)
-        self.assertEqual(response.data["retry_of"], str(source.id))
+        self.assertEqual(successor.retry_of.generation_task_id, source.pk)
+        self.assertEqual(response.data["execution"]["attempt_id"], str(successor.pk))
+        self.assertEqual(response.data["execution"]["attempt_number"], 2)
+        self.assertNotIn("retry_of", response.data)
         self.assertEqual(
             [item["event"] for item in response.data["timeline"]],
-            ["retry_created", "queued"],
-        )
-        self.assertEqual(
-            response.data["timeline"][0]["details"],
-            {"source_task_id": str(source.id)},
+            ["queued"],
         )
 
+    def test_input_projection_rejects_changed_static_value_or_source(self):
+        detail, definition, request = read_frozen_execution_request(self.preparation)
+        for field, replacement in (("values", False), ("sources", "request")):
+            broken = deepcopy(request.value)
+            broken["parameters"][field]["audio.enabled"] = replacement
+            with self.subTest(field=field), patch(
+                    "studio.services.execution_workflow_inspection.read_frozen_execution_request",
+                    return_value=(detail, definition, json_contract(broken))), self.assertRaises(ValidationError):
+                inspect_prepared_task_inputs(self.create_task())
+
     def test_retryable_attempt_finish_is_reported_as_requeued_not_terminal_failure(self):
-        task = self.create_task(status=GenerationTask.Status.QUEUED, attempts=1, max_attempts=3)
+        task = self.create_task(status=GenerationTask.Status.QUEUED, attempts=1)
         queued_at = datetime(2026, 8, 8, 3, 0, tzinfo=datetime_timezone.utc)
         started_at = queued_at + timedelta(seconds=2)
         finished_at = queued_at + timedelta(seconds=4)
@@ -198,8 +189,10 @@ class GenerationTaskTimelineAPITests(TestCase):
 
         self.assertEqual(active.status_code, 200, active.data)
         self.assertTrue(active.data["stalled"])
-        self.assertTrue(active.data["can_cancel"])
-        self.assertFalse(active.data["can_retry"])
+        # Actions belong to the original ProductionRun, not a second task API.
+        self.assertEqual(active.data["execution"]["production_run_id"], str(self.run.pk))
+        self.assertNotIn("can_cancel", active.data)
+        self.assertNotIn("can_retry", active.data)
         self.assertFalse(active.data["retry_requires_reconciliation"])
         self.assertIsNotNone(active.data["heartbeat_at"])
 
@@ -210,7 +203,7 @@ class GenerationTaskTimelineAPITests(TestCase):
         cancelling = self.client.get(f"/api/v1/tasks/{task.id}/")
 
         self.assertEqual(cancelling.status_code, 200, cancelling.data)
-        self.assertTrue(cancelling.data["can_cancel"])
+        self.assertEqual(cancelling.data["status"], "cancel_requested")
 
         GenerationTask.objects.filter(pk=task.pk).update(
             status=GenerationTask.Status.FAILED,
@@ -220,7 +213,7 @@ class GenerationTaskTimelineAPITests(TestCase):
         )
         failed = self.client.get(f"/api/v1/tasks/{task.id}/")
 
-        self.assertFalse(failed.data["can_cancel"])
-        self.assertFalse(failed.data["can_retry"])
+        self.assertEqual(failed.status_code, 200, failed.data)
+        self.assertEqual(failed.data["status"], "failed")
         self.assertTrue(failed.data["retry_requires_reconciliation"])
         self.assertIn("stalled", [item["event"] for item in failed.data["timeline"]])

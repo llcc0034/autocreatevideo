@@ -20,8 +20,8 @@ class ModelArtifactPublishConcurrencyTests(TransactionTestCase):
     """Prove the immutable publish boundary with real database row locks.
 
     SQLite deliberately skips this suite because its select_for_update is a
-    no-op.  CI's PostgreSQL lane exercises separate connections and actual
-    blocking, rather than a mocked queryset call order.
+    no-op. Run on an isolated PostgreSQL test database to exercise separate
+    connections and actual blocking, rather than a mocked queryset call order.
     """
 
     reset_sequences = True

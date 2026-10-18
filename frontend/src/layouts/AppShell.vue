@@ -13,7 +13,7 @@ const nav = computed(() => [
   { label: '制作总览', to: '/', icon: LayoutDashboard, match: (path: string) => path === '/' },
   { label: '连续剧项目', to: '/projects', icon: Clapperboard, match: (path: string) => path.startsWith('/projects') },
   { label: '风格素材库', to: '/assets', icon: Images, match: (path: string) => path.startsWith('/assets') },
-  { label: '生产工作流', to: '/workflows', icon: Workflow, match: (path: string) => path.startsWith('/workflows') },
+  { label: '任务中心', to: '/workflows', icon: Workflow, match: (path: string) => path.startsWith('/workflows') },
   { label: '操作手册', to: '/manual', icon: BookOpenCheck, match: (path: string) => path.startsWith('/manual') }
 ])
 const pageTitle = computed(() => String(route.meta.title || 'AutoPrompt Studio'))
@@ -21,8 +21,18 @@ const toggleCollapse = () => { collapsed.value = !collapsed.value; localStorage.
 const logout = () => { studio.resetSessionState(); auth.logout(); router.replace('/login') }
 const unauthorized = () => logout()
 const passwordChangeRequired = () => { void router.replace('/change-password') }
-onMounted(() => { void studio.initialize().catch(() => undefined); window.addEventListener('cineforge:unauthorized', unauthorized); window.addEventListener('cineforge:password-change-required', passwordChangeRequired) })
-onBeforeUnmount(() => { window.removeEventListener('cineforge:unauthorized', unauthorized); window.removeEventListener('cineforge:password-change-required', passwordChangeRequired) })
+const sessionStorageChanged = (event: StorageEvent) => {
+  if (event.storageArea !== localStorage || (event.key !== null && !['cineforge_token', 'cineforge_refresh_token', 'cineforge_user'].includes(event.key))) return
+  const previousUserId = auth.user?.id
+  auth.syncSession()
+  if (previousUserId !== auth.user?.id || !auth.isAuthenticated) {
+    studio.resetSessionState()
+    // Drop all account-scoped page state, without clearing the other tab's login.
+    window.location.reload()
+  }
+}
+onMounted(() => { void studio.initializeNavigation().catch(() => { studio.error = '最近项目加载失败，请在连续剧项目页重试。' }); window.addEventListener('cineforge:unauthorized', unauthorized); window.addEventListener('cineforge:password-change-required', passwordChangeRequired); window.addEventListener('storage', sessionStorageChanged) })
+onBeforeUnmount(() => { window.removeEventListener('cineforge:unauthorized', unauthorized); window.removeEventListener('cineforge:password-change-required', passwordChangeRequired); window.removeEventListener('storage', sessionStorageChanged) })
 </script>
 
 <template>

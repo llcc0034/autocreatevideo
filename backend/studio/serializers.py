@@ -16,6 +16,8 @@ from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.password_validation import validate_password
 from django.core.files.base import ContentFile
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.db import transaction
 from django.db.models import Q
 from django.urls import reverse
 from django.utils.dateparse import parse_datetime
@@ -32,33 +34,27 @@ from studio.models import (
     AssemblyJob,
     CharacterBible,
     ConsistencyLock,
-    DeferredGenerationRequest,
     Episode,
-    GeneratedWorkflow,
     GenerationTask,
+    ModelExecutionInstanceVersion,
     PromptFieldTranslation,
-    PromptArtifact,
     PropBible,
     ReleaseBundle,
     SceneBible,
     SeriesProject,
     Shot,
+    ShotCharacterRelation,
     Style,
+    StyleCategory,
     WorkflowTemplate,
 )
 from studio.media_signing import classify_task_output, signed_media_token
 from studio.services.provenance import ProvenanceError, assembly_manifest_path
-from studio.services.reference_bindings import (
-    ReferenceBindingError,
-    normalize_shot_reference_bindings,
-)
-from studio.services.media_capabilities import SAFE_CONDITIONING_IDENTIFIER_PATTERN
 from studio.services.dialogue import (
     DialogueContractError,
     normalize_dialogue,
     validate_dialogue_timing,
 )
-from studio.services.prompt_compiler_contract import PROMPT_COMPILER_VERSION
 from studio.services.prompt_translation import (
     CanonicalTargetCollisionError,
     TranslationValidationError,
@@ -78,14 +74,8 @@ from studio.services.media_processing_profiles import (
     resolve_reference_media_profile,
 )
 from studio.services.access_control import role_for_user, security_profile_for
-from studio.services.production_batch_slots import (
-    build_production_batch_slots,
-    effective_batch_snapshot_for_task,
-)
 from studio.services.bible_reference_contract import (
     BIBLE_IMAGE_GENERATION_PURPOSE,
-    RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,
-    RETIRED_BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
 )
 from studio.services.shot_versions import RESERVED_SHOT_VERSION_METADATA_KEYS
 from studio.services.script_bible import (
@@ -103,8 +93,6 @@ from studio.services.visual_reference_policy import (
 from studio.services.json_contracts import json_contract
 from studio.services.security_boundaries import boundary_int
 from studio.services.content_contracts import (
-    canonical_glossary_max_entities,
-    translation_promotion_max_entries,
     translation_request_max_entries,
     translation_text_max_characters,
 )
@@ -126,8 +114,8 @@ def _asset_runtime_limits() -> dict[str, int]:
     return resolve_configuration(required_keys=keys).values
 
 SCRIPT_BIBLE_METADATA_HELP = (
-    "扩展元数据对象。script_bible_v1 是完整剧本候选 apply 专属保留成员；"
-    "通用创建、更新和 sync-bibles 不得注入、替换或删除。"
+    "扩展元数据对象。script_bible_v1 是已停用的旧来源记录，无写入入口；"
+    "通用创建、更新和 sync-bibles 不得注入、修改或删除已有保留成员。"
 )
 
 
@@ -145,7 +133,7 @@ class FormalBibleAssetImmutableConflict(APIException):
     status_code = 409
     default_code = "bible_reference_asset_immutable"
     default_detail = (
-        "已审核的 Bible 参考图是不可变生产事实；"
+        "已登记的 Bible 生成参考图是不可变生产事实，登记不等于审核采用；"
         "请新建 Asset 并通过新的 ProductionRun 重新审核绑定。"
     )
 
@@ -261,14 +249,83 @@ class RegisterSerializer(serializers.ModelSerializer):
         return user
 
 
+class StyleScopeField(serializers.ChoiceField):
+    def __init__(self, **kwargs):
+        super().__init__(choices=[("personal", "我的风格"), ("global", "共享风格")], **kwargs)
+
+    def get_attribute(self, instance):
+        return "global" if instance.owner_id is None else "personal"
+
+
+class StyleCategorySerializer(serializers.ModelSerializer):
+    style_count = serializers.IntegerField(read_only=True)
+    can_manage = serializers.SerializerMethodField()
+
+    def get_can_manage(self, obj) -> bool:
+        return bool(self.context["request"].user.is_staff)
+
+    class Meta:
+        model = StyleCategory
+        fields = "__all__"
+        read_only_fields = ("id", "key", "created_at", "updated_at")
+
+
 class StyleSerializer(serializers.ModelSerializer):
     owner = serializers.PrimaryKeyRelatedField(read_only=True)
+    category = serializers.SlugRelatedField(slug_field="key", queryset=StyleCategory.objects.all(), allow_null=True, required=False)
+    category_label = serializers.CharField(source="category.name", read_only=True, default="")
+    category_active = serializers.BooleanField(source="category.is_active", read_only=True, allow_null=True, default=None)
     asset_count = serializers.IntegerField(read_only=True)
+    project_count = serializers.IntegerField(read_only=True)
+    generation_job_count = serializers.IntegerField(read_only=True)
+    can_manage = serializers.SerializerMethodField()
+    scope = StyleScopeField(required=False)
+    # Stable technical identity is server-owned; changing a display name must
+    # not change existing project/asset mappings.
+    slug = serializers.SlugField(read_only=True)
+
+    def get_can_manage(self, obj) -> bool:
+        user = self.context["request"].user
+        return bool(user.is_staff or obj.owner_id == user.pk)
+
+    def validate(self, attrs):
+        category = attrs.get("category")
+        if category and not category.is_active and (not self.instance or self.instance.category_id != category.key):
+            raise serializers.ValidationError({"category": "此题材分类已停用，不能用于新关联；原有分类可以保留。"})
+        scope = attrs.get("scope")
+        if self.instance and scope and scope != ("global" if self.instance.owner_id is None else "personal"):
+            raise serializers.ValidationError({"scope": "创建后不能更改共享范围，请新建另一风格。"})
+        if not self.instance and scope == "global" and not self.context["request"].user.is_staff:
+            raise serializers.ValidationError({"scope": "只有管理员可以创建共享风格。"})
+        for key in ("description", "visual_prompt", "negative_prompt"):
+            if key in attrs and len(attrs[key].encode("utf-8")) > 65536:
+                raise serializers.ValidationError({key: "内容不能超过 64 KiB。"})
+        return attrs
+
+    def update(self, instance, validated_data):
+        validated_data.pop("scope", None)
+        return super().update(instance, validated_data)
 
     class Meta:
         model = Style
         fields = "__all__"
         read_only_fields = ("id", "owner", "is_system", "created_at", "updated_at")
+
+
+class StyleReferenceSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    name = serializers.CharField()
+    kind = serializers.ChoiceField(choices=["projects", "assets", "jobs"])
+
+
+class StyleChoiceSerializer(serializers.Serializer):
+    value = serializers.CharField()
+    display_name = serializers.CharField()
+
+
+class StyleCatalogSerializer(serializers.Serializer):
+    scopes = StyleChoiceSerializer(many=True)
+    can_manage_categories = serializers.BooleanField()
 
 
 class AssetSerializer(serializers.ModelSerializer):
@@ -290,6 +347,8 @@ class AssetSerializer(serializers.ModelSerializer):
         user = self.context["request"].user
         if style and style.owner_id not in (None, user.id) and not user.is_staff:
             raise serializers.ValidationError("不能使用其他用户的风格")
+        if style and not style.is_active and (not self.instance or self.instance.style_id != style.pk):
+            raise serializers.ValidationError("此风格已停用，不能用于新关联；已有引用可保留。")
         return style
     def validate_kind(self, value):
         if self.instance is not None and value != self.instance.kind:
@@ -297,13 +356,11 @@ class AssetSerializer(serializers.ModelSerializer):
                 Asset.Kind.CHARACTER,
                 Asset.Kind.SCENE,
                 Asset.Kind.PROP,
+                Asset.Kind.REFERENCE,
             }
-            if value not in editable_kinds or not (
-                self.instance.kind in editable_kinds
-                or self.instance.kind == Asset.Kind.REFERENCE
-            ):
+            if value not in editable_kinds or self.instance.kind not in editable_kinds:
                 raise serializers.ValidationError(
-                    "只允许在人物、场景和道具图片之间更正类别；其他素材类型不可转换。"
+                    "只允许在通用、人物、场景和道具图片之间更正类别；其他素材类型不可转换。"
                 )
         return value
 
@@ -338,6 +395,10 @@ class AssetSerializer(serializers.ModelSerializer):
             if self.instance is not None and isinstance(self.instance.metadata, dict)
             else {}
         )
+        if "metadata" in attrs:
+            incoming_metadata = attrs.get("metadata") or {}
+            if "cleared_history_origin" in incoming_metadata and incoming_metadata["cleared_history_origin"] != existing_metadata.get("cleared_history_origin"):
+                raise serializers.ValidationError({"metadata": "历史清理来源由服务端维护，不能伪造、删除或改写。"})
         if (
             self.instance is not None
             and AssetGenerationJob.objects.filter(output_asset=self.instance).exists()
@@ -515,7 +576,8 @@ class AssetSerializer(serializers.ModelSerializer):
             })
         uploaded = attrs.get("file")
         if uploaded:
-            attrs["source_info"] = "用户本地上传"
+            from studio.services.asset_provenance import ASSET_UPLOAD_SOURCE_INFO
+            attrs["source_info"] = ASSET_UPLOAD_SOURCE_INFO
             kind = attrs.get("kind", getattr(self.instance, "kind", None))
             if kind == Asset.Kind.SCRIPT:
                 try:
@@ -851,6 +913,7 @@ class ProjectDeleteErrorDetailsSerializer(serializers.Serializer):
     active_generation_tasks = serializers.IntegerField(required=False, min_value=0)
     unresolved_remote_tasks = serializers.IntegerField(required=False, min_value=0)
     active_assembly_jobs = serializers.IntegerField(required=False, min_value=0)
+    active_translation_jobs = serializers.IntegerField(required=False, min_value=0)
 
 
 class ProjectDeleteErrorSerializer(serializers.Serializer):
@@ -904,6 +967,8 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
         user = self.context["request"].user
         if style and style.owner_id not in (None, user.id) and not user.is_staff:
             raise serializers.ValidationError("不能使用其他用户的风格")
+        if style and not style.is_active and (not self.instance or self.instance.style_id != style.pk):
+            raise serializers.ValidationError("此风格已停用，不能用于新关联；已有引用可保留。")
         return style
 
     def validate_cover_asset(self, asset):
@@ -953,6 +1018,8 @@ class SeriesProjectSerializer(serializers.ModelSerializer):
     def validate_production_settings(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("production_settings 必须是 JSON 对象")
+        if "default_conditioning_mode" in value:
+            raise serializers.ValidationError("项目不再配置默认视频输入模式，请在生产工作台选择执行实例。")
         if self.instance is not None:
             try:
                 ensure_no_canonical_target_collisions(
@@ -1166,24 +1233,8 @@ class ProjectOwnedSerializer(serializers.ModelSerializer):
                     raise serializers.ValidationError({
                         "metadata": "参考素材版本已变化；请重新生成设定草稿。",
                     })
-            project = attrs.get("project") or getattr(self.instance, "project", None)
-            raw_name = attrs.get("name", getattr(self.instance, "name", ""))
-            normalized_name = unicodedata.normalize(
-                "NFKC", str(raw_name or ""),
-            ).strip().casefold()
-            if project is not None and normalized_name:
-                for bible_model in (CharacterBible, SceneBible, PropBible):
-                    queryset = bible_model.objects.filter(project=project).only("id", "name")
-                    if isinstance(self.instance, bible_model):
-                        queryset = queryset.exclude(pk=self.instance.pk)
-                    if any(
-                        unicodedata.normalize("NFKC", str(item.name or "")).strip().casefold()
-                        == normalized_name
-                        for item in queryset
-                    ):
-                        raise serializers.ValidationError({
-                            "name": "项目内人物、场景和道具名称不可重复；请修改名称后再保存。",
-                        })
+            # Display names are not identities. Exact declaration keys, Bible
+            # IDs and scoped reference names own identity/ambiguity checks.
         if self.instance and getattr(self.instance, "is_locked", False) and attrs.get("is_locked", True):
             changed = []
             for key, value in attrs.items():
@@ -1205,7 +1256,41 @@ class ProjectOwnedSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class CharacterBibleSerializer(ProjectOwnedSerializer):
+class BibleEntitySerializer(ProjectOwnedSerializer):
+    """Entity metadata is not a second setting writer."""
+
+    def get_field_names(self, declared_fields, info):
+        return [name for name in super().get_field_names(declared_fields, info)
+            if name != "image_binding_review"]
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and "image_binding_review" in data:
+            raise serializers.ValidationError({"image_binding_review": "图片审核引用只能由原审核写入。"})
+        if isinstance(data, dict) and "visual_identity" in data:
+            raise serializers.ValidationError({
+                "visual_identity": "旧视觉锚点字段已停用；请通过主图/变体设定另存修订。",
+            })
+        return super().to_internal_value(data)
+
+    def update(self, instance, validated_data):
+        from studio.services.bible_material_bindings import reviewed_binding
+        binding = None
+        if instance.image_binding_review_id and {"anchor_asset", "reference_assets"}.intersection(validated_data):
+            kind = {CharacterBible: "character", SceneBible: "scene", PropBible: "prop"}[type(instance)]
+            binding = reviewed_binding(instance, kind)
+        instance = super().update(instance, validated_data)
+        if binding is not None:
+            retained = {str(value) for value in instance.reference_assets.values_list("pk", flat=True)}
+            if instance.anchor_asset_id:
+                retained.add(str(instance.anchor_asset_id))
+            original = {binding["anchor_asset_id"], *binding["reference_asset_ids"]}
+            if not original.intersection(retained):
+                instance.image_binding_review = None
+                instance.save(update_fields=("image_binding_review",))
+        return instance
+
+
+class CharacterBibleSerializer(BibleEntitySerializer):
     metadata = serializers.JSONField(
         required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
     )
@@ -1231,7 +1316,7 @@ class CharacterBibleSerializer(ProjectOwnedSerializer):
         return asset
 
 
-class SceneBibleSerializer(ProjectOwnedSerializer):
+class SceneBibleSerializer(BibleEntitySerializer):
     metadata = serializers.JSONField(
         required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
     )
@@ -1242,7 +1327,7 @@ class SceneBibleSerializer(ProjectOwnedSerializer):
         read_only_fields = ("id", "created_at", "updated_at")
 
 
-class PropBibleSerializer(ProjectOwnedSerializer):
+class PropBibleSerializer(BibleEntitySerializer):
     metadata = serializers.JSONField(
         required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
     )
@@ -1316,47 +1401,23 @@ class EpisodeSerializer(serializers.ModelSerializer):
         return attrs
 
 
-class ReferenceEntityBindingSchema(serializers.Serializer):
-    entity_id = serializers.UUIDField()
-    asset_id = serializers.UUIDField()
 
 
-class ReferenceVideoBindingSchema(serializers.Serializer):
-    asset_id = serializers.UUIDField()
-    purpose = serializers.RegexField(SAFE_CONDITIONING_IDENTIFIER_PATTERN)
-    use_embedded_audio = serializers.BooleanField()
-    audio_asset_id = serializers.UUIDField(required=False)
-    audio_purpose = serializers.RegexField(
-        SAFE_CONDITIONING_IDENTIFIER_PATTERN,
-        required=False,
-    )
+class ShotCharacterRelationValueSerializer(serializers.Serializer):
+    role = serializers.ChoiceField(choices=ShotCharacterRelation.Role.choices)
+    position = serializers.IntegerField(min_value=0)
+    character_id = serializers.UUIDField()
 
 
-class ReferenceAudioBindingSchema(serializers.Serializer):
-    asset_id = serializers.UUIDField()
-    purpose = serializers.RegexField(SAFE_CONDITIONING_IDENTIFIER_PATTERN)
-
-
-class ReferenceBindingsSchema(serializers.Serializer):
-    """OpenAPI shape only; runtime validation remains the strict canonical service."""
-
-    first_frame_asset_id = serializers.UUIDField(required=False)
-    last_frame_asset_id = serializers.UUIDField(required=False)
-    first_frame_reference_asset_id = serializers.UUIDField(required=False)
-    characters = ReferenceEntityBindingSchema(many=True, required=False)
-    scene = ReferenceEntityBindingSchema(required=False)
-    props = ReferenceEntityBindingSchema(many=True, required=False)
-    videos = ReferenceVideoBindingSchema(many=True, required=False)
-    audios = ReferenceAudioBindingSchema(many=True, required=False)
-
-
-@extend_schema_field(ReferenceBindingsSchema)
-class ReferenceBindingsJSONField(serializers.JSONField):
-    """Preserve raw JSON so unknown keys still reach strict service validation."""
+@extend_schema_field(ShotCharacterRelationValueSerializer(many=True))
+class ShotCharacterRelationsField(serializers.JSONField):
+    def to_representation(self, value):
+        return [{"role": row.role, "position": row.position, "character_id": str(row.character_id)}
+                for row in value.all()]
 
 
 class ShotSerializer(serializers.ModelSerializer):
-    reference_bindings = ReferenceBindingsJSONField(required=False)
+    character_relations = ShotCharacterRelationsField(required=False)
     include_audio = serializers.BooleanField(required=False)
     duration_ms = serializers.IntegerField(
         min_value=1, required=False,
@@ -1364,8 +1425,65 @@ class ShotSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Shot
-        fields = "__all__"
+        fields = ("id", "episode", "number", "title", "dialogue", "duration_ms",
+            "episode_start_ms", "episode_end_ms", "media_type", "conditioning_mode", "include_audio",
+            "scene", "props", "character_relations", "requires_first_frame_continuity",
+            "requires_last_frame_continuity", "metadata", "created_at", "updated_at")
         read_only_fields = ("id", "created_at", "updated_at")
+
+    def to_internal_value(self, data):
+        retired_content = {key: "固定创作列已停用；请通过确切结构化字段和独立字段修订保存原值"
+            for key in ("narrative", "detailed_description", "camera", "action",
+                "sound_effects", "music", "continuity_notes") if key in data}
+        if retired_content:
+            raise serializers.ValidationError(retired_content)
+        if "characters" in data:
+            raise serializers.ValidationError({"characters": "旧混合人物池已停用，请提交 character_relations 的出镜/逐行发言关系"})
+        retired = {key: "旧镜头素材绑定已停用，请通过生产运行的逐次素材引用选择；内容保存不会修改素材选择"
+            for key in ("reference_bindings", "reference_assets") if key in data}
+        if retired:
+            raise serializers.ValidationError(retired)
+        return super().to_internal_value(data)
+
+    def validate_metadata(self, value):
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("metadata 必须是 JSON 对象")
+        if {"framing", "negative_prompt"} & value.keys():
+            raise serializers.ValidationError("固定构图/负面提示词已停用；请使用独立结构化字段")
+        return value
+
+    def to_representation(self, instance):
+        result = super().to_representation(instance)
+        result["metadata"] = {key: value for key, value in result["metadata"].items()
+            if key not in {"framing", "negative_prompt"}}
+        return result
+
+    @transaction.atomic
+    def create(self, validated_data):
+        relations = validated_data.pop("character_relations", [])
+        shot = super().create(validated_data)
+        ShotCharacterRelation.objects.bulk_create([
+            ShotCharacterRelation(shot=shot, **row) for row in relations
+        ])
+        return shot
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        # Revalidate against locked current facts, not a pre-lock dialogue/pool.
+        self.instance = Shot.objects.select_for_update().select_related("episode__project", "scene").get(pk=instance.pk)
+        validated_data = self.validate(validated_data)
+        relations = validated_data.pop("character_relations", None)
+        shot = super().update(self.instance, validated_data)
+        if relations is not None:
+            current = [{"role": row.role, "position": row.position, "character_id": str(row.character_id)}
+                for row in shot.character_relations.all()]
+            identity = lambda row: (row["role"], row["position"], row["character_id"])
+            if sorted(current, key=identity) != sorted(relations, key=identity):
+                shot.character_relations.all().delete()
+                ShotCharacterRelation.objects.bulk_create([
+                    ShotCharacterRelation(shot=shot, **row) for row in relations
+                ])
+        return shot
 
     def _episode(self, attrs):
         return attrs.get("episode") or getattr(self.instance, "episode", None)
@@ -1447,7 +1565,16 @@ class ShotSerializer(serializers.ModelSerializer):
                 duration_policy["default_duration_ms"],
             ),
         )
-        if self.instance is None and "duration_ms" not in attrs:
+        from studio.services.shot_timing import episode_interval_duration
+        try:
+            start_ms = attrs.get("episode_start_ms", getattr(self.instance, "episode_start_ms", None))
+            end_ms = attrs.get("episode_end_ms", getattr(self.instance, "episode_end_ms", None))
+            duration_ms = episode_interval_duration(start_ms, end_ms,
+                duration_ms=(attrs.get("duration_ms") if {"episode_start_ms", "episode_end_ms"} & attrs.keys()
+                    and start_ms is not None and end_ms is not None else duration_ms))
+        except ValueError as exc:
+            raise serializers.ValidationError({"episode_start_ms": str(exc)}) from exc
+        if duration_ms is not None and (self.instance is None or {"episode_start_ms", "episode_end_ms"} & attrs.keys()):
             attrs["duration_ms"] = duration_ms
         _validate_video_shot_duration(
             media_type,
@@ -1460,36 +1587,36 @@ class ShotSerializer(serializers.ModelSerializer):
         scene = attrs.get("scene")
         if scene and scene.project_id != project_id:
             raise serializers.ValidationError({"scene": "场景与分镜不属于同一项目"})
-        for field in ("characters", "props"):
+        for field in ("props",):
             values = attrs.get(field)
             if values is not None and any(value.project_id != project_id for value in values):
                 raise serializers.ValidationError({field: "条目与分镜不属于同一项目"})
-        reference_assets = attrs.get("reference_assets")
-        user = self.context["request"].user
-        if reference_assets is not None and any(
-            _is_project_cover_asset(asset) for asset in reference_assets
-        ):
-            raise serializers.ValidationError({
-                "reference_assets": "连续剧封面是项目展示专用素材，不能用于分镜生成。",
-            })
-        if reference_assets is not None and not user.is_staff:
-            if any(asset.owner_id not in (None, user.id) for asset in reference_assets):
-                raise serializers.ValidationError({"reference_assets": "不能使用其他用户的素材"})
-        characters = attrs.get("characters")
-        if characters is None and self.instance:
-            characters = self.instance.characters.all()
-        speaker_ids = {item.stable_speaker_id for item in (characters or [])}
         dialogue = attrs.get("dialogue", getattr(self.instance, "dialogue", []))
         try:
-            attrs["dialogue"] = validate_dialogue_timing(
+            dialogue = validate_dialogue_timing(
                 dialogue, duration_ms=duration_ms,
             )
-            dialogue = attrs["dialogue"]
+            if "dialogue" in attrs:
+                attrs["dialogue"] = dialogue
         except DialogueContractError as exc:
             raise serializers.ValidationError({"dialogue": str(exc)}) from exc
-        unknown = {item["speaker_id"] for item in dialogue if item.get("speaker_id") not in speaker_ids}
-        if unknown:
-            raise serializers.ValidationError({"dialogue": f"未绑定的人物 speaker_id: {', '.join(sorted(unknown))}"})
+        from studio.services.shot_character_relations import shot_character_relations
+        relations = attrs.get("character_relations")
+        if relations is None:
+            relations = ([{"role": row.role, "position": row.position, "character_id": str(row.character_id)}
+                for row in self.instance.character_relations.all()] if self.instance else [])
+        try:
+            shot_character_relations({"character_relations": relations, "dialogue": dialogue})
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"character_relations": exc.messages}) from exc
+        identities = {row["character_id"] for row in relations}
+        characters_by_id = {str(row.pk): row for row in CharacterBible.objects.filter(
+            pk__in=identities, project_id=project_id)}
+        if set(characters_by_id) != identities:
+            raise serializers.ValidationError({"character_relations": "人物不存在或与分镜不属于同一项目"})
+        for row in relations:
+            if row["role"] == "speaker" and dialogue[row["position"]]["speaker_id"] != characters_by_id[row["character_id"]].stable_speaker_id:
+                raise serializers.ValidationError({"character_relations": f"对白第{row['position'] + 1}行与明确发言者的 speaker_id 不一致"})
         mode = str(
             attrs.get(
                 "conditioning_mode",
@@ -1497,128 +1624,14 @@ class ShotSerializer(serializers.ModelSerializer):
             )
             or ""
         ).strip()
-        if media_type == Shot.MediaType.VIDEO and not mode:
-            settings_value = (
-                episode.project.production_settings
-                if isinstance(episode.project.production_settings, dict)
-                else {}
-            )
-            mode = str(settings_value.get("default_conditioning_mode") or "").strip()
-            if not mode:
-                raise serializers.ValidationError({
-                    "conditioning_mode": "视频镜头必须明确选择已配置的条件输入模式",
-                })
-            attrs["conditioning_mode"] = mode
+        # Unselected planning mode is valid; execution validates its own frozen contract.
         if media_type == Shot.MediaType.IMAGE:
             if mode and "conditioning_mode" in attrs:
                 raise serializers.ValidationError({
                     "conditioning_mode": "图片镜头不接受视频条件输入模式",
                 })
             attrs["conditioning_mode"] = ""
-        bindings = attrs.get(
-            "reference_bindings", getattr(self.instance, "reference_bindings", {}),
-        )
-        scene = attrs.get("scene", getattr(self.instance, "scene", None))
-        characters = attrs.get("characters")
-        if characters is None:
-            characters = list(self.instance.characters.all()) if self.instance else []
-        props = attrs.get("props")
-        if props is None:
-            props = list(self.instance.props.all()) if self.instance else []
-        shot_assets = attrs.get("reference_assets")
-        if shot_assets is None:
-            shot_assets = list(self.instance.reference_assets.all()) if self.instance else []
-        if media_type == Shot.MediaType.IMAGE:
-            if bindings and "reference_bindings" in attrs:
-                raise serializers.ValidationError({
-                    "reference_bindings": "图片镜头不接受视频条件输入绑定",
-                })
-            attrs["reference_bindings"] = {}
-            return attrs
-        try:
-            attrs["reference_bindings"] = normalize_shot_reference_bindings(
-                mode=mode, bindings=bindings, project=episode.project,
-                characters=list(characters), scene=scene, props=list(props),
-                shot_reference_assets=list(shot_assets), user=user,
-            )
-        except ReferenceBindingError as exc:
-            raise serializers.ValidationError({"reference_bindings": str(exc)}) from exc
         return attrs
-
-
-class BibleSyncBaseSerializer(serializers.Serializer):
-    id = serializers.UUIDField(required=False)
-    slug = serializers.SlugField(max_length=80)
-    name = serializers.CharField(max_length=160)
-    description = serializers.CharField(required=False, allow_blank=True)
-    visual_identity = serializers.CharField(required=False, allow_blank=True)
-    negative_constraints = serializers.CharField(required=False, allow_blank=True)
-    anchor_asset = serializers.PrimaryKeyRelatedField(
-        queryset=Asset.objects.all(), required=False, allow_null=True,
-    )
-    reference_assets = serializers.PrimaryKeyRelatedField(
-        queryset=Asset.objects.all(), many=True, required=False,
-    )
-    metadata = serializers.JSONField(
-        required=False, help_text=SCRIPT_BIBLE_METADATA_HELP,
-    )
-    is_locked = serializers.BooleanField(required=False)
-
-    def validate_metadata(self, value):
-        if not isinstance(value, dict):
-            raise serializers.ValidationError("metadata 必须是 JSON 对象")
-        return value
-
-
-class CharacterBibleSyncItemSerializer(BibleSyncBaseSerializer):
-    stable_speaker_id = serializers.RegexField(r"^S[1-9][0-9]*$", max_length=16)
-    role = serializers.CharField(max_length=120, required=False, allow_blank=True)
-    age_appearance = serializers.CharField(max_length=120, required=False, allow_blank=True)
-    face_identity = serializers.CharField(required=False, allow_blank=True)
-    wardrobe = serializers.CharField(required=False, allow_blank=True)
-    voice_profile = serializers.CharField(required=False, allow_blank=True)
-    personality = serializers.CharField(required=False, allow_blank=True)
-
-    def validate_metadata(self, value):
-        value = super().validate_metadata(value)
-        try:
-            validate_visual_reference_policy_metadata(value)
-        except VisualReferencePolicyError as exc:
-            raise serializers.ValidationError(str(exc)) from exc
-        return value
-
-
-class SceneBibleSyncItemSerializer(BibleSyncBaseSerializer):
-    location = serializers.CharField(max_length=200, required=False, allow_blank=True)
-    time_of_day = serializers.CharField(max_length=80, required=False, allow_blank=True)
-    lighting = serializers.CharField(required=False, allow_blank=True)
-    color_palette = serializers.CharField(required=False, allow_blank=True)
-    ambient_sound = serializers.CharField(required=False, allow_blank=True)
-
-
-class PropBibleSyncItemSerializer(BibleSyncBaseSerializer):
-    material = serializers.CharField(max_length=160, required=False, allow_blank=True)
-    distinctive_marks = serializers.CharField(required=False, allow_blank=True)
-    continuity_state = serializers.CharField(required=False, allow_blank=True)
-
-
-
-
-class PromptArtifactSerializer(serializers.ModelSerializer):
-    compiler_current = serializers.SerializerMethodField()
-
-    @staticmethod
-    def get_compiler_current(obj) -> bool:
-        try:
-            version = int((obj.structured_payload or {}).get("prompt_compiler_version", 0))
-        except (TypeError, ValueError):
-            return False
-        return version == PROMPT_COMPILER_VERSION
-
-    class Meta:
-        model = PromptArtifact
-        fields = "__all__"
-        read_only_fields = tuple(field.name for field in PromptArtifact._meta.fields)
 
 
 class DurationOverrideSerializer(serializers.Serializer):
@@ -1644,246 +1657,109 @@ class WorkflowTemplateSerializer(serializers.ModelSerializer):
 
 
 
-class GeneratedWorkflowSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = GeneratedWorkflow
-        fields = "__all__"
-        read_only_fields = tuple(field.name for field in GeneratedWorkflow._meta.fields)
-
-
-
-
 class GenerationTaskTimelineEventSerializer(serializers.Serializer):
     event = serializers.CharField(read_only=True)
     status = serializers.ChoiceField(choices=GenerationTask.Status.choices, read_only=True)
     label = serializers.CharField(read_only=True)
     timestamp = serializers.DateTimeField(read_only=True)
-    occurred_at = serializers.DateTimeField(
-        read_only=True,
-        help_text="Deprecated compatibility alias of timestamp.",
-    )
     details = serializers.JSONField(read_only=True)
 
 
-class GenerationTaskReferenceAssetSummarySerializer(serializers.Serializer):
-    """Public, path-free summary of one persisted task-related media asset."""
-
-    asset_id = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    name = serializers.CharField(allow_blank=True, read_only=True)
-    category = serializers.CharField(allow_blank=True, read_only=True)
-    input_slot = serializers.IntegerField(allow_null=True, read_only=True)
-    input_label = serializers.CharField(allow_blank=True, read_only=True)
-    project_slot = serializers.IntegerField(allow_null=True, read_only=True)
-    entity_id = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    entity_name = serializers.CharField(allow_blank=True, read_only=True)
-    entity_label = serializers.CharField(allow_blank=True, read_only=True)
-    checksum = serializers.CharField(allow_blank=True, read_only=True)
-    use_embedded_audio = serializers.BooleanField(read_only=True)
-    audio_asset_id = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    audio_input_label = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    audio_name = serializers.CharField(allow_blank=True, read_only=True)
-    audio_checksum = serializers.CharField(allow_blank=True, read_only=True)
-    source_fps = serializers.FloatField(allow_null=True, read_only=True)
-    effective_fps = serializers.IntegerField(allow_null=True, read_only=True)
-    effective_duration_ms = serializers.IntegerField(allow_null=True, read_only=True)
-    cfr_guaranteed = serializers.BooleanField(allow_null=True, read_only=True)
-    paired_audio_duration_aligned = serializers.BooleanField(allow_null=True, read_only=True)
-    media_kind = serializers.CharField(
-        read_only=True, help_text="Browser media kind: image, video, or audio.",
-    )
+class GenerationTaskMediaUseSerializer(serializers.Serializer):
+    reference_binding = serializers.JSONField(read_only=True, help_text="原准备逐使用对应：position为逻辑输入内0起序号；original_name原名；reference_name/name_disambiguated/input_slot为原策略保存的引用名、消歧标记及槽序号，无策略对应时为null；shot_reference为已校验确切使用、版本和设定修订，未记录为null。不查询当前版本或重新消歧。")
+    item_key = serializers.CharField(read_only=True)
+    input_key = serializers.CharField(read_only=True)
+    kind = serializers.ChoiceField(choices=("image", "video", "audio"), read_only=True)
+    asset_id = serializers.UUIDField(allow_null=True, read_only=True)
+    artifact_id = serializers.UUIDField(allow_null=True, read_only=True)
     display_name = serializers.CharField(allow_blank=True, read_only=True)
+    purpose = serializers.CharField(allow_null=True, read_only=True)
+    paired_to = serializers.CharField(allow_null=True, read_only=True)
+    source_sha256 = serializers.CharField(read_only=True)
+    checksum = serializers.CharField(read_only=True)
+    input_label = serializers.CharField(allow_null=True, read_only=True)
+    ports = serializers.ListField(child=serializers.JSONField(), read_only=True)
+    staging_status = serializers.ChoiceField(choices=("staged", "not_staged", "not_applicable"), read_only=True)
     preview_url = serializers.CharField(allow_blank=True, read_only=True)
 
 
-class GenerationTaskInputParametersSerializer(serializers.Serializer):
-    """Stable task-detail contract assembled from immutable execution inputs."""
+class GenerationTaskParameterValueSerializer(serializers.Serializer):
+    key = serializers.CharField(read_only=True)
+    value = serializers.JSONField(read_only=True)
+    value_source = serializers.CharField(read_only=True)
+    rule = serializers.JSONField(read_only=True)
 
-    model = serializers.CharField(allow_blank=True, read_only=True)
-    model_profile = serializers.CharField(allow_blank=True, read_only=True)
-    conditioning_mode = serializers.CharField(allow_blank=True, read_only=True)
-    effective_conditioning_mode = serializers.CharField(allow_blank=True, read_only=True)
-    workflow_mode = serializers.CharField(allow_blank=True, read_only=True)
-    template_slug = serializers.CharField(allow_blank=True, read_only=True)
-    source_workflow = serializers.CharField(allow_blank=True, read_only=True)
-    workflow_parameters = serializers.JSONField(read_only=True)
-    prompt_template_key = serializers.CharField(allow_blank=True, read_only=True)
-    resolution_profile = serializers.CharField(allow_blank=True, read_only=True)
-    width = serializers.IntegerField(read_only=True)
-    height = serializers.IntegerField(read_only=True)
-    resolution_multiple = serializers.IntegerField(read_only=True)
-    fps = serializers.IntegerField(read_only=True)
-    requested_duration_ms = serializers.IntegerField(read_only=True)
-    effective_duration_ms = serializers.IntegerField(read_only=True)
-    effective_frames = serializers.IntegerField(read_only=True)
-    seed = serializers.IntegerField(read_only=True)
-    include_audio = serializers.BooleanField(read_only=True)
-    reference_assets = GenerationTaskReferenceAssetSummarySerializer(many=True, read_only=True)
-    reference_asset_count = serializers.IntegerField(read_only=True)
-    reference_input_count = serializers.IntegerField(read_only=True)
-    reference_image_count = serializers.IntegerField(read_only=True)
-    reference_video_count = serializers.IntegerField(read_only=True)
-    reference_audio_count = serializers.IntegerField(read_only=True)
-    continuity_assets = GenerationTaskReferenceAssetSummarySerializer(
-        many=True,
-        read_only=True,
-        help_text=(
-            "Frozen continuity assets associated with the task but not connected "
-            "to the execution graph."
-        ),
-    )
-    continuity_asset_count = serializers.IntegerField(
-        read_only=True,
-        help_text="Number of continuity assets that were not connected to the execution graph.",
-    )
-    prompt_available = serializers.BooleanField(read_only=True)
-    prompt_character_count = serializers.IntegerField(read_only=True)
-    negative_prompt_character_count = serializers.IntegerField(read_only=True)
-    shot_count = serializers.IntegerField(read_only=True)
-    shot_ids = serializers.ListField(child=serializers.CharField(), read_only=True)
-    batch_id = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    batch_kind = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    batch_role = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
-    batch_index = serializers.IntegerField(allow_null=True, read_only=True)
-    batch_size = serializers.IntegerField(allow_null=True, read_only=True)
-    whole_episode = serializers.BooleanField(read_only=True)
-    idempotency_key = serializers.CharField(allow_blank=True, allow_null=True, read_only=True)
+
+class GenerationTaskPromptSummarySerializer(serializers.Serializer):
+    key = serializers.CharField(read_only=True)
+    semantic_key = serializers.CharField(read_only=True)
+    character_count = serializers.IntegerField(read_only=True)
+
+
+class GenerationTaskInputParametersSerializer(serializers.Serializer):
+    """Exact prepared parameter values and distinct media uses; no raw prompts."""
+    preparation_id = serializers.UUIDField(read_only=True)
+    attempt_id = serializers.UUIDField(read_only=True)
+    execution_instance_version_id = serializers.UUIDField(read_only=True)
+    workflow_version_id = serializers.UUIDField(read_only=True)
+    request_sha256 = serializers.CharField(read_only=True)
+    operation = serializers.CharField(read_only=True)
+    output_kind = serializers.ChoiceField(choices=("image", "video", "audio"), read_only=True)
+    parameters = GenerationTaskParameterValueSerializer(many=True, read_only=True)
+    media_uses = GenerationTaskMediaUseSerializer(many=True, read_only=True)
+    prompt_mode = serializers.ChoiceField(choices=ModelExecutionInstanceVersion.PromptMode.choices, read_only=True)
+    prompt_profile_version_id = serializers.UUIDField(allow_null=True, read_only=True)
+    prompt_channels = GenerationTaskPromptSummarySerializer(many=True, read_only=True)
+
+
+class GenerationTaskPromptChannelSerializer(serializers.Serializer):
+    key = serializers.CharField(read_only=True)
+    semantic_key = serializers.CharField(read_only=True)
+    text = serializers.CharField(allow_blank=True, read_only=True)
+    character_count = serializers.IntegerField(read_only=True)
+    value_source = serializers.CharField(read_only=True)
 
 
 class GenerationTaskInputPromptSerializer(serializers.Serializer):
-    """Lazily loaded prompt text and its immutable artifact provenance."""
+    """Lazily loaded frozen request channels, not proof of remote acceptance."""
 
     task_id = serializers.UUIDField(read_only=True)
-    prompt_artifact_id = serializers.UUIDField(read_only=True)
-    prompt_type = serializers.ChoiceField(choices=PromptArtifact.PromptType.choices, read_only=True)
-    model = serializers.CharField(allow_blank=True, read_only=True)
-    conditioning_mode = serializers.CharField(allow_blank=True, read_only=True)
-    effective_conditioning_mode = serializers.CharField(allow_blank=True, read_only=True)
-    prompt_template_key = serializers.CharField(allow_blank=True, read_only=True)
-    content_hash = serializers.CharField(allow_blank=True, read_only=True)
-    prompt = serializers.CharField(allow_blank=True, read_only=True)
-    negative_prompt = serializers.CharField(allow_blank=True, read_only=True)
-    prompt_character_count = serializers.IntegerField(read_only=True)
-    negative_prompt_character_count = serializers.IntegerField(read_only=True)
-    negative_prompt_submitted = serializers.BooleanField(read_only=True)
-    prompt_source = serializers.ChoiceField(
-        choices=(
-            (
-                "generated_workflow.injected_values.resolved_semantics.prompt.positive",
-                "generated_workflow.injected_values.resolved_semantics.prompt.positive",
-            ),
-        ),
-        read_only=True,
-    )
-    negative_prompt_source = serializers.ChoiceField(
-        choices=(
-            (
-                "generated_workflow.injected_values.resolved_semantics.prompt.negative",
-                "generated_workflow.injected_values.resolved_semantics.prompt.negative",
-            ),
-            ("not_submitted", "not_submitted"),
-        ),
-        read_only=True,
-    )
+    attempt_id = serializers.UUIDField(read_only=True)
+    preparation_id = serializers.UUIDField(read_only=True)
+    execution_instance_version_id = serializers.UUIDField(read_only=True)
+    request_sha256 = serializers.CharField(read_only=True)
+    prompt_mode = serializers.ChoiceField(choices=ModelExecutionInstanceVersion.PromptMode.choices, read_only=True)
+    prompt_profile_version_id = serializers.UUIDField(allow_null=True, read_only=True)
+    channels = GenerationTaskPromptChannelSerializer(many=True, read_only=True)
+    declared_reference_labels = serializers.ListField(child=serializers.CharField(), read_only=True)
 
 
-class GenerationTaskBibleTargetSerializer(serializers.Serializer):
-    """Safe public projection of one frozen Bible image candidate target."""
-
-    schema_version = serializers.IntegerField(
-        min_value=RETIRED_BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
-        max_value=RETIRED_BIBLE_IMAGE_CANDIDATE_SCHEMA_VERSION,
-    )
-    reference_category = serializers.ChoiceField(
-        choices=("character", "scene", "prop"),
-    )
-    entity_id = serializers.UUIDField()
-    entity_name = serializers.CharField(max_length=160, trim_whitespace=False)
-    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
-
-    def to_internal_value(self, data):
-        expected_fields = {
-            "schema_version",
-            "reference_category",
-            "entity_id",
-            "entity_name",
-            "source_fingerprint",
-        }
-        if not isinstance(data, dict) or set(data) != expected_fields:
-            raise serializers.ValidationError("Invalid frozen Bible target shape.")
-        if type(data.get("schema_version")) is not int:
-            raise serializers.ValidationError({
-                "schema_version": "schema_version must be an integer.",
-            })
-        for field_name in (
-            "reference_category", "entity_id", "entity_name", "source_fingerprint",
-        ):
-            if type(data.get(field_name)) is not str:
-                raise serializers.ValidationError({
-                    field_name: f"{field_name} must be a string.",
-                })
-        entity_name = data["entity_name"]
-        if not entity_name or any(
-            unicodedata.category(character).startswith("C") for character in entity_name
-        ):
-            raise serializers.ValidationError({
-                "entity_name": "entity_name must be non-empty and contain no control characters.",
-            })
-        return super().to_internal_value(data)
+class GenerationTaskObservationSerializer(serializers.ModelSerializer):
+    class Meta:
+        from studio.models import GenerationTaskObservation
+        model = GenerationTaskObservation
+        fields = ("id", "task", "kind", "status", "claim_number", "claim_started_at", "started_at", "finished_at",
+            "created_at", "request_sha256", "node_count", "link_count", "schema_sha256", "policy_sha256",
+            "unload_models", "free_memory", "http_status", "error_code")
+        read_only_fields = fields
 
 
-class GenerationTaskBibleTargetSchemaExtension(OpenApiSerializerExtension):
-    target_class = GenerationTaskBibleTargetSerializer
-
-    def map_serializer(self, auto_schema, direction):
-        schema = auto_schema._map_serializer(
-            self.target, direction, bypass_extensions=True,
-        )
-        schema["additionalProperties"] = False
-        return schema
-
-
-class GenerationTaskBatchSlotSerializer(serializers.Serializer):
-    batch_id = serializers.CharField(read_only=True, allow_null=True)
-    batch_kind = serializers.CharField(read_only=True, allow_null=True)
-    shot_version_key = serializers.CharField(
-        read_only=True, allow_blank=True, required=False,
-    )
-    shot_version_label = serializers.CharField(
-        read_only=True, allow_blank=True, required=False,
-    )
-    batch_index = serializers.IntegerField(read_only=True)
-    batch_size = serializers.IntegerField(read_only=True)
-    slot_status = serializers.ChoiceField(
-        choices=(
-            "materialized",
-            "waiting_deferred",
-            "cancelled",
-            "cancelled_by_upstream",
-            "not_created",
-        ),
-        read_only=True,
-    )
-    message = serializers.CharField(read_only=True)
-    workflow_mode = serializers.CharField(read_only=True, allow_null=True, required=False)
-    task_id = serializers.UUIDField(read_only=True, allow_null=True)
-    task_status = serializers.CharField(read_only=True, allow_null=True)
-    workflow_id = serializers.UUIDField(read_only=True, allow_null=True)
-    deferred_generation_request_id = serializers.UUIDField(read_only=True, allow_null=True)
-    deferred_generation_status = serializers.CharField(read_only=True, allow_null=True)
-    deferred_upstream_request_id = serializers.UUIDField(read_only=True, allow_null=True)
-    episode_id = serializers.UUIDField(read_only=True, allow_null=True)
-    episode_number = serializers.IntegerField(read_only=True, allow_null=True)
-    episode_title = serializers.CharField(read_only=True, allow_blank=True)
-    shot_id = serializers.UUIDField(read_only=True, allow_null=True)
-    shot_number = serializers.IntegerField(read_only=True, allow_null=True)
-    shot_title = serializers.CharField(read_only=True, allow_blank=True)
-    created_at = serializers.DateTimeField(read_only=True, allow_null=True)
-    updated_at = serializers.DateTimeField(read_only=True, allow_null=True)
+class GenerationTaskExecutionSerializer(serializers.Serializer):
+    production_run_id = serializers.UUIDField(read_only=True)
+    stage_run_id = serializers.UUIDField(read_only=True)
+    stage_key = serializers.CharField(read_only=True)
+    stage_ordinal = serializers.IntegerField(read_only=True)
+    unit_key = serializers.CharField(read_only=True)
+    attempt_id = serializers.UUIDField(read_only=True)
+    attempt_number = serializers.IntegerField(read_only=True)
+    preparation_id = serializers.UUIDField(read_only=True)
+    execution_instance_version_id = serializers.UUIDField(read_only=True)
+    operation = serializers.CharField(read_only=True)
 
 
 class GenerationTaskSerializer(serializers.ModelSerializer):
-    generation_purpose = serializers.SerializerMethodField()
-    bible_target = serializers.SerializerMethodField()
+    execution = serializers.SerializerMethodField()
+    project_title = serializers.CharField(source="project.title", read_only=True)
     input_parameters = serializers.SerializerMethodField()
     output_media = serializers.SerializerMethodField()
     completed_at = serializers.SerializerMethodField()
@@ -1891,301 +1767,39 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
     queue_wait_ms = serializers.SerializerMethodField()
     total_duration_ms = serializers.SerializerMethodField()
     timeline = serializers.SerializerMethodField()
-    batch_id = serializers.SerializerMethodField()
-    batch_kind = serializers.SerializerMethodField()
-    batch_role = serializers.SerializerMethodField()
-    batch_index = serializers.SerializerMethodField()
-    batch_size = serializers.SerializerMethodField()
-    batch_slots = serializers.SerializerMethodField()
-    production_run_id = serializers.SerializerMethodField()
-    production_variant_number = serializers.SerializerMethodField()
-    episode_id = serializers.SerializerMethodField()
+    episode_id = serializers.UUIDField(read_only=True, allow_null=True)
     episode_number = serializers.SerializerMethodField()
     episode_title = serializers.SerializerMethodField()
-    shot_ids = serializers.SerializerMethodField()
-    shot_id = serializers.SerializerMethodField()
-    shot_number = serializers.SerializerMethodField()
-    shot_order = serializers.SerializerMethodField()
-    shot_title = serializers.SerializerMethodField()
-    retry_of = serializers.SerializerMethodField()
     stalled = serializers.SerializerMethodField()
-    can_retry = serializers.SerializerMethodField()
-    can_cancel = serializers.SerializerMethodField()
     retry_requires_reconciliation = serializers.SerializerMethodField()
+    input_contract_status = serializers.SerializerMethodField()
+    input_contract_code = serializers.SerializerMethodField()
+
+    def get_input_contract_status(self, obj) -> str:
+        return "available"
+
+    def get_input_contract_code(self, obj) -> str:
+        return ""
 
     class Meta:
         model = GenerationTask
-        exclude = ("capability_snapshot", "progress_marker")
-        read_only_fields = (
-            "id", "owner", "project", "episode", "kind", "status", "progress", "attempts",
-            "comfy_prompt_id", "client_id", "outputs", "error_message", "queued_at", "started_at",
-            "finished_at", "created_at", "updated_at",
-            "backend", "model_profile", "workflow_version", "seed", "effective_frames",
-            "effective_duration_ms", "staged_inputs",
-            "submission_token", "submission_state", "submission_prepared_at", "submission_submitted_at",
-            "heartbeat_at", "stalled_at", "remote_state", "remote_error",
+        fields = (
+            "id", "owner", "project", "project_title", "episode_id", "episode_number", "episode_title",
+            "execution", "kind", "status", "priority", "progress", "attempts",
+            "comfy_prompt_id", "client_id", "error_message", "queued_at", "started_at", "finished_at",
+            "created_at", "updated_at", "submission_token", "submission_state",
+            "submission_prepared_at", "submission_submitted_at",
+            "heartbeat_at", "stalled_at", "stalled", "remote_state", "remote_error",
             "progress_source", "comfy_progress", "progress_node_id", "progress_updated_at",
             "progress_telemetry_state", "progress_telemetry_error",
-            "deadline_started_at", "hard_deadline_at", "idle_deadline_at",
-            "last_meaningful_progress_at",
+            "deadline_started_at", "hard_deadline_at", "idle_deadline_at", "last_meaningful_progress_at",
+            "input_parameters", "input_contract_status", "input_contract_code", "output_media",
+            "completed_at", "duration_ms", "queue_wait_ms", "total_duration_ms", "timeline",
+            "retry_requires_reconciliation",
         )
+        read_only_fields = fields
 
-    @staticmethod
-    def _task_mapping(value) -> dict:
-        return value if isinstance(value, dict) else {}
 
-    @classmethod
-    def _task_execution_contract(cls, obj) -> tuple[dict, dict, dict, dict]:
-        """Verify the single immutable contract used by current task projections."""
-
-        def invalid(detail: str):
-            raise serializers.ValidationError({
-                "input_parameters": (
-                    "任务缺少当前版本的冻结执行合同，不能从其他记录推断展示；"
-                    f"请从 ProductionRun 新建任务。{detail}"
-                ),
-            })
-
-        snapshot = cls._task_mapping(obj.capability_snapshot)
-        workflow = obj.generated_workflow
-        injected = cls._task_mapping(workflow.injected_values)
-        if injected.get("schema_version") != 2:
-            invalid("GeneratedWorkflow schema_version 无效。")
-
-        workflow_metadata = injected.get("execution_metadata")
-        task_metadata = snapshot.get("execution_metadata")
-        workflow_digest = str(injected.get("execution_metadata_sha256") or "")
-        task_digest = str(snapshot.get("execution_metadata_sha256") or "")
-        if (
-            not isinstance(workflow_metadata, dict)
-            or not isinstance(task_metadata, dict)
-            or workflow_metadata != task_metadata
-            or not workflow_digest
-            or workflow_digest != task_digest
-            or json_contract(
-                workflow_metadata,
-                max_bytes=_stage_snapshot_max_bytes(),
-            ).sha256 != workflow_digest
-        ):
-            invalid("execution_metadata 缺失、漂移或哈希不一致。")
-
-        required_snapshot_keys = {
-            "generated_workflow_id", "workflow_hash", "prompt_artifact_id",
-            "prompt_content_hash", "template_id", "template_slug", "model",
-            "conditioning_mode", "effective_conditioning_mode",
-            "prompt_template_key", "workflow_mode", "source_workflow",
-            "workflow_parameters", "resolution_profile", "resolution_multiple",
-            "width", "height", "shot_ids", "shot_count", "whole_episode",
-            "asset_bindings", "asset_bindings_sha256", "continuity_assets",
-            "continuity_assets_sha256", "resolved_semantics_sha256",
-        }
-        missing = sorted(required_snapshot_keys - set(snapshot))
-        if missing:
-            invalid("缺少字段：" + ", ".join(missing) + "。")
-        prompt_content_hash = str(snapshot.get("prompt_content_hash") or "")
-        if (
-            len(prompt_content_hash) != 64
-            or any(character not in "0123456789abcdef" for character in prompt_content_hash.casefold())
-        ):
-            invalid("prompt_content_hash 无效。")
-        if "reference_assets" in snapshot:
-            invalid("旧 reference_assets 副本字段已退役。")
-        prompt = workflow.prompt_artifact
-        identity_checks = (
-            (snapshot.get("generated_workflow_id"), str(workflow.id), "generated_workflow_id"),
-            (snapshot.get("workflow_hash"), workflow.content_hash, "workflow_hash"),
-            (snapshot.get("prompt_artifact_id"), str(prompt.id), "prompt_artifact_id"),
-            (snapshot.get("template_id"), str(workflow.template_id), "template_id"),
-        )
-        for actual, expected, field_name in identity_checks:
-            if str(actual or "") != str(expected or ""):
-                invalid(f"{field_name} 与当前冻结对象不一致。")
-
-        semantics = injected.get("resolved_semantics")
-        semantics_digest = str(workflow.resolved_semantics_sha256 or "")
-        if (
-            not isinstance(semantics, dict)
-            or not semantics_digest
-            or json_contract(
-                semantics,
-                max_bytes=_stage_snapshot_max_bytes(),
-            ).sha256 != semantics_digest
-            or snapshot.get("resolved_semantics_sha256") != semantics_digest
-            or snapshot.get("workflow_parameters") != semantics
-        ):
-            invalid("resolved_semantics 缺失、漂移或哈希不一致。")
-
-        asset_bindings = snapshot.get("asset_bindings")
-        binding_digest = str(snapshot.get("asset_bindings_sha256") or "")
-        if (
-            not isinstance(asset_bindings, list)
-            or asset_bindings != injected.get("asset_bindings")
-            or not binding_digest
-            or binding_digest != str(workflow.asset_bindings_sha256 or "")
-            or json_contract(
-                asset_bindings,
-                max_bytes=_stage_snapshot_max_bytes(),
-            ).sha256 != binding_digest
-        ):
-            invalid("asset_bindings 缺失、漂移或哈希不一致。")
-
-        continuity_assets = snapshot.get("continuity_assets")
-        continuity_digest = str(snapshot.get("continuity_assets_sha256") or "")
-        if (
-            not isinstance(continuity_assets, list)
-            or not continuity_digest
-            or json_contract(
-                continuity_assets,
-                max_bytes=_stage_snapshot_max_bytes(),
-            ).sha256 != continuity_digest
-        ):
-            invalid("continuity_assets 缺失、漂移或哈希不一致。")
-
-        template_metadata = workflow_metadata.get("template")
-        required_multiple = workflow_metadata.get("required_dimension_multiple")
-        width = snapshot.get("width")
-        height = snapshot.get("height")
-        if (
-            workflow_metadata.get("schema_version") != 1
-            or not isinstance(template_metadata, dict)
-            or str(template_metadata.get("output_kind") or "") != str(obj.kind)
-            or not str(workflow_metadata.get("model_identifier") or "").strip()
-            or isinstance(required_multiple, bool)
-            or not isinstance(required_multiple, int)
-            or required_multiple <= 0
-            or snapshot.get("resolution_multiple") != required_multiple
-            or isinstance(width, bool)
-            or not isinstance(width, int)
-            or width <= 0
-            or isinstance(height, bool)
-            or not isinstance(height, int)
-            or height <= 0
-            or not str(snapshot.get("resolution_profile") or "").strip()
-        ):
-            invalid("输出类型或分辨率执行元数据无效。")
-
-        metadata_checks = (
-            (snapshot.get("template_slug"), template_metadata.get("slug"), "template_slug"),
-            (snapshot.get("model"), workflow_metadata.get("model_identifier"), "model"),
-            (snapshot.get("workflow_mode"), workflow_metadata.get("workflow_mode"), "workflow_mode"),
-            (snapshot.get("source_workflow"), workflow_metadata.get("source_workflow"), "source_workflow"),
-            (snapshot.get("width"), semantics.get("image.width"), "width"),
-            (snapshot.get("height"), semantics.get("image.height"), "height"),
-        )
-        for actual, expected, field_name in metadata_checks:
-            if actual != expected:
-                invalid(f"{field_name} 与冻结 execution metadata 不一致。")
-        if (
-            not isinstance(snapshot.get("shot_ids"), list)
-            or isinstance(snapshot.get("shot_count"), bool)
-            or not isinstance(snapshot.get("shot_count"), int)
-            or snapshot.get("shot_count") < 0
-            or not isinstance(snapshot.get("whole_episode"), bool)
-        ):
-            invalid("任务范围合同无效。")
-
-        if obj.kind == GenerationTask.Kind.VIDEO:
-            selected_mode = workflow_metadata.get("conditioning_mode_contract")
-            if (
-                not isinstance(selected_mode, dict)
-                or str(selected_mode.get("key") or "")
-                != str(snapshot.get("effective_conditioning_mode") or "")
-            ):
-                invalid("视频 conditioning mode 合同与任务快照不一致。")
-            for field_name in ("fps", "requested_duration_ms", "include_audio"):
-                if field_name not in snapshot:
-                    invalid(f"视频任务缺少 {field_name}。")
-            semantic_frames = semantics.get("video.frames")
-            semantic_fps = semantics.get("video.fps")
-            semantic_duration_ms = semantics.get("video.duration_ms")
-            semantic_audio_enabled = semantics.get("audio.enabled")
-            if (
-                isinstance(semantic_frames, bool)
-                or not isinstance(semantic_frames, int)
-                or semantic_frames <= 0
-            ):
-                invalid("视频任务缺少有效的冻结 video.frames。")
-            if (
-                isinstance(semantic_fps, bool)
-                or not isinstance(semantic_fps, (int, float))
-            ):
-                invalid("视频任务缺少有效的冻结 video.fps。")
-            try:
-                semantic_fps_fraction = Fraction(semantic_fps)
-            except (TypeError, ValueError, OverflowError):
-                invalid("视频任务缺少有效的冻结 video.fps。")
-            if semantic_fps_fraction <= 0:
-                invalid("视频任务缺少有效的冻结 video.fps。")
-            expected_effective_duration_ms = round(
-                Fraction(semantic_frames * 1000, 1) / semantic_fps_fraction,
-            )
-            if (
-                isinstance(snapshot["fps"], bool)
-                or not isinstance(snapshot["fps"], int)
-                or snapshot["fps"] <= 0
-                or isinstance(snapshot["requested_duration_ms"], bool)
-                or not isinstance(snapshot["requested_duration_ms"], int)
-                or snapshot["requested_duration_ms"] <= 0
-                or not isinstance(snapshot["include_audio"], bool)
-                or snapshot["fps"] != semantics.get("video.fps")
-                or obj.effective_frames != semantic_frames
-                or obj.effective_duration_ms != expected_effective_duration_ms
-            ):
-                invalid("视频时钟或音频合同与 resolved_semantics 不一致。")
-            # Some registered compilers bind only frames/FPS into the executable
-            # graph.  requested_duration_ms and include_audio remain explicit,
-            # immutable task-snapshot facts in that case; absence from
-            # resolved_semantics is not permission to infer either value from
-            # another record.  When a compiler does bind the semantic key, the
-            # two frozen layers must still agree exactly.
-            if (
-                semantic_duration_ms is not None
-                and snapshot["requested_duration_ms"] != semantic_duration_ms
-            ):
-                invalid("视频请求时长与冻结 resolved_semantics 不一致。")
-            if (
-                semantic_audio_enabled is not None
-                and snapshot["include_audio"] != semantic_audio_enabled
-            ):
-                invalid("视频音频开关与冻结 resolved_semantics 不一致。")
-        elif any(
-            field_name in snapshot
-            for field_name in ("fps", "requested_duration_ms", "include_audio")
-        ):
-            invalid("图片任务包含已退役的视频参数。")
-        return snapshot, injected, workflow_metadata, semantics
-
-    @staticmethod
-    def _task_optional_int(value) -> int | None:
-        if value is None or value == "":
-            return None
-        try:
-            return int(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-
-    @staticmethod
-    def _task_optional_float(value) -> float | None:
-        if value is None or value == "":
-            return None
-        try:
-            return float(value)
-        except (TypeError, ValueError, OverflowError):
-            return None
-
-    @staticmethod
-    def _task_bool(value, default: bool = False) -> bool:
-        if value is None:
-            return default
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, str):
-            normalized = value.strip().lower()
-            if normalized in {"true", "1", "yes", "on"}:
-                return True
-            if normalized in {"false", "0", "no", "off", ""}:
-                return False
-        return bool(value)
 
     @staticmethod
     def _task_public_text(value, default: str = "") -> str:
@@ -2204,106 +1818,6 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
             return default
         return text
 
-    @staticmethod
-    def _task_uuid_text(value) -> str | None:
-        if value in (None, ""):
-            return None
-        try:
-            return str(UUID(str(value)))
-        except (TypeError, ValueError, AttributeError):
-            return None
-
-    @classmethod
-    def _task_reference_assets(cls, raw_assets) -> list[dict]:
-        """Whitelist reference metadata; executable filesystem locations never leave the API."""
-        if not isinstance(raw_assets, list):
-            return []
-        summaries = []
-        for index, raw in enumerate(raw_assets):
-            if not isinstance(raw, dict):
-                raise serializers.ValidationError({
-                    "input_parameters": f"任务冻结素材第 {index + 1} 项必须是对象。",
-                })
-            asset_id = cls._task_uuid_text(raw.get("asset_id"))
-            if asset_id is None:
-                raise serializers.ValidationError({
-                    "input_parameters": f"任务冻结素材第 {index + 1} 项缺少有效 asset_id。",
-                })
-            audio_asset_id = cls._task_uuid_text(raw.get("audio_asset_id"))
-            if raw.get("audio_asset_id") not in (None, "") and audio_asset_id is None:
-                raise serializers.ValidationError({
-                    "input_parameters": f"任务冻结素材第 {index + 1} 项的 audio_asset_id 无效。",
-                })
-            media_metadata = raw.get("media_metadata")
-            if not isinstance(media_metadata, dict):
-                media_metadata = {}
-            summaries.append({
-                "asset_id": asset_id,
-                "name": cls._task_public_text(raw.get("name")),
-                "category": cls._task_public_text(raw.get("category")),
-                "media_kind": cls._task_public_text(raw.get("media_kind")).casefold(),
-                "input_slot": cls._task_optional_int(raw.get("input_slot")),
-                "input_label": cls._task_public_text(raw.get("input_label")),
-                "project_slot": cls._task_optional_int(raw.get("project_slot")),
-                "entity_id": cls._task_uuid_text(raw.get("entity_id")),
-                "entity_name": cls._task_public_text(raw.get("entity_name")),
-                "entity_label": cls._task_public_text(raw.get("entity_label")),
-                "checksum": cls._task_public_text(raw.get("checksum")),
-                "use_embedded_audio": cls._task_bool(raw.get("use_embedded_audio")),
-                "audio_asset_id": audio_asset_id,
-                "audio_input_label": (
-                    cls._task_public_text(raw.get("audio_input_label"))
-                    if raw.get("audio_input_label") is not None else None
-                ),
-                "audio_name": cls._task_public_text(raw.get("audio_name")),
-                "audio_checksum": cls._task_public_text(raw.get("audio_checksum")),
-                "source_fps": cls._task_optional_float(
-                    raw.get("source_fps", media_metadata.get("source_fps")),
-                ),
-                "effective_fps": cls._task_optional_int(
-                    raw.get("effective_fps"),
-                ),
-                "effective_duration_ms": cls._task_optional_int(
-                    raw.get("effective_duration_ms"),
-                ),
-                "cfr_guaranteed": (
-                    cls._task_bool(raw.get("cfr_guaranteed"))
-                    if raw.get("cfr_guaranteed") is not None else None
-                ),
-                "paired_audio_duration_aligned": (
-                    cls._task_bool(raw.get("paired_audio_duration_aligned"))
-                    if raw.get("paired_audio_duration_aligned") is not None else None
-                ),
-            })
-        return summaries
-
-    @staticmethod
-    def _task_reference_counts(reference_assets: list[dict]) -> tuple[int, int, int]:
-        image_count = video_count = audio_count = 0
-        for item in reference_assets:
-            media_kind = str(item.get("media_kind") or "").casefold()
-            if media_kind == "video":
-                video_count += 1
-                if (
-                    item.get("audio_asset_id")
-                    or item.get("audio_input_label")
-                    or item.get("use_embedded_audio")
-                ):
-                    audio_count += 1
-            elif media_kind == "audio":
-                audio_count += 1
-            else:
-                image_count += 1
-        return image_count, video_count, audio_count
-
-    @staticmethod
-    def _task_reference_media_kind(item: dict) -> str:
-        media_kind = str(item.get("media_kind") or "").casefold()
-        if media_kind not in {"image", "video", "audio"}:
-            raise serializers.ValidationError({
-                "input_parameters": "任务冻结素材缺少显式 media_kind。",
-            })
-        return media_kind
 
     def _task_asset_preview_url(self, asset: Asset) -> str:
         """Reuse the public asset URL policy only when its backing source is usable."""
@@ -2328,210 +1842,40 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         except (OSError, ValueError):
             return ""
 
-    def _task_reference_assets_for_request(self, raw_assets) -> list[dict]:
-        summaries = self._task_reference_assets(raw_assets)
-        request = self.context.get("request")
-        view = self.context.get("view")
-        user = getattr(request, "user", None)
-        visible_assets: dict[str, Asset] = {}
-        asset_ids = [item["asset_id"] for item in summaries if item.get("asset_id")]
-        # Task lists are polled frequently.  Only an explicit detail retrieve
-        # may query current Asset state or touch its storage backend.
-        include_live_previews = getattr(view, "action", None) == "retrieve"
-        if include_live_previews and asset_ids and getattr(user, "is_authenticated", False):
-            queryset = Asset.objects.filter(pk__in=asset_ids, is_active=True)
-            if not getattr(user, "is_staff", False):
-                queryset = queryset.filter(Q(owner=user) | Q(owner__isnull=True))
-            visible_assets = {str(asset.id): asset for asset in queryset}
-        result = []
-        for item in summaries:
-            asset = visible_assets.get(item.get("asset_id"))
-            display_name = (
-                item.get("name") or item.get("entity_name")
-                or (asset.name if asset is not None else "")
-                or item.get("input_label") or "参考素材"
-            )
-            result.append({
-                **item,
-                "media_kind": self._task_reference_media_kind(item),
-                "display_name": self._task_public_text(display_name),
-                "preview_url": self._task_asset_preview_url(asset) if asset is not None else "",
-            })
-        return result
-
-    @classmethod
-    def build_input_prompt_payload(cls, obj) -> dict:
-        """Resolve the exact persisted text submitted by this generated workflow."""
-        workflow = obj.generated_workflow
-        snapshot, _injected, execution_metadata, resolved_semantics = (
-            cls._task_execution_contract(obj)
-        )
-        prompt_artifact = workflow.prompt_artifact
-        prompt_text = resolved_semantics.get("prompt.positive")
-        if not isinstance(prompt_text, str) or not prompt_text:
-            raise serializers.ValidationError({
-                "input_prompt": "冻结 resolved_semantics 缺少实际提交的正向提示词。",
-            })
-        prompt_source = (
-            "generated_workflow.injected_values.resolved_semantics.prompt.positive"
-        )
-        if isinstance(resolved_semantics.get("prompt.negative"), str):
-            negative_prompt = str(resolved_semantics["prompt.negative"])
-            negative_prompt_source = (
-                "generated_workflow.injected_values.resolved_semantics.prompt.negative"
-            )
-            negative_prompt_submitted = True
-        else:
-            negative_prompt = ""
-            negative_prompt_source = "not_submitted"
-            negative_prompt_submitted = False
-        conditioning_mode = (
-            cls._task_public_text(snapshot["conditioning_mode"])
-            if obj.kind == GenerationTask.Kind.VIDEO else ""
-        )
-        effective_conditioning_mode = cls._task_public_text(
-            snapshot["effective_conditioning_mode"],
-        )
-        return {
-            "task_id": str(obj.id),
-            "prompt_artifact_id": str(prompt_artifact.id),
-            "prompt_type": obj.kind,
-            "model": cls._task_public_text(execution_metadata["model_identifier"]),
-            "conditioning_mode": conditioning_mode,
-            "effective_conditioning_mode": effective_conditioning_mode,
-            "prompt_template_key": cls._task_public_text(snapshot["prompt_template_key"]),
-            "content_hash": cls._task_public_text(snapshot["prompt_content_hash"]),
-            "prompt": prompt_text,
-            "negative_prompt": negative_prompt,
-            "prompt_character_count": len(prompt_text),
-            "negative_prompt_character_count": len(negative_prompt),
-            "negative_prompt_submitted": negative_prompt_submitted,
-            "prompt_source": prompt_source,
-            "negative_prompt_source": negative_prompt_source,
-        }
-
     @extend_schema_field(GenerationTaskInputParametersSerializer)
     def get_input_parameters(self, obj) -> dict:
-        snapshot, _injected, execution_metadata, semantics = (
-            self._task_execution_contract(obj)
-        )
-        is_image = obj.kind == GenerationTask.Kind.IMAGE
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from studio.services.execution_workflow_inspection import inspect_prepared_task_inputs
 
-        workflow_parameters = {}
-        for key, value in semantics.items():
-            if not isinstance(key, str) or key.startswith("prompt."):
-                continue
-            if isinstance(value, bool):
-                workflow_parameters[key] = value
-            elif isinstance(value, int):
-                workflow_parameters[key] = value
-            elif isinstance(value, float):
-                workflow_parameters[key] = value if value == value else None
-            elif value is not None:
-                workflow_parameters[key] = self._task_public_text(value)
-
-        reference_assets = self._task_reference_assets_for_request(
-            snapshot["asset_bindings"],
-        )
-        continuity_assets = self._task_reference_assets_for_request(
-            snapshot["continuity_assets"],
-        )
-        staged_by_asset = {
-            str(row.get("asset_id")): row
-            for row in (obj.staged_inputs or [])
-            if isinstance(row, dict) and row.get("asset_id")
-        }
-        for summary in reference_assets:
-            staged = staged_by_asset.get(str(summary.get("asset_id")))
-            if staged and staged.get("media_role") == "reference_video":
-                summary.update({
-                    "source_fps": self._task_optional_float(staged.get("source_fps")),
-                    "effective_fps": self._task_optional_int(staged.get("effective_fps")),
-                    "effective_duration_ms": self._task_optional_int(
-                        staged.get("effective_duration_ms"),
-                    ),
-                    "cfr_guaranteed": staged.get("cfr_guaranteed") is True,
-                })
-            paired_audio = staged_by_asset.get(str(summary.get("audio_asset_id")))
-            if paired_audio and paired_audio.get("media_role") == "paired_reference_audio":
-                summary["paired_audio_duration_aligned"] = (
-                    paired_audio.get("duration_aligned") is True
-                )
-        image_count, video_count, audio_count = self._task_reference_counts(reference_assets)
-        shot_ids = []
-        for value in snapshot["shot_ids"]:
-            normalized = self._task_uuid_text(value)
-            if normalized and normalized not in shot_ids:
-                shot_ids.append(normalized)
-        if len(shot_ids) != snapshot["shot_count"]:
-            raise serializers.ValidationError({
-                "input_parameters": "任务冻结 shot_ids 与 shot_count 不一致。",
-            })
-        input_prompt = self.build_input_prompt_payload(obj)
-        template_metadata = execution_metadata["template"]
-        parameters = {
-            "model": self._task_public_text(execution_metadata["model_identifier"]),
-            "model_profile": self._task_public_text(obj.model_profile),
-            "conditioning_mode": self._task_public_text(snapshot["conditioning_mode"]),
-            "effective_conditioning_mode": self._task_public_text(
-                snapshot["effective_conditioning_mode"],
-            ),
-            "workflow_mode": self._task_public_text(execution_metadata["workflow_mode"]),
-            "template_slug": self._task_public_text(template_metadata["slug"]),
-            "source_workflow": self._task_public_text(execution_metadata["source_workflow"]),
-            "workflow_parameters": workflow_parameters,
-            "prompt_template_key": self._task_public_text(snapshot["prompt_template_key"]),
-            "resolution_profile": self._task_public_text(snapshot["resolution_profile"]),
-            "width": snapshot["width"],
-            "height": snapshot["height"],
-            "resolution_multiple": execution_metadata["required_dimension_multiple"],
-            "seed": obj.seed,
-            "reference_assets": reference_assets,
-            "reference_asset_count": len(reference_assets),
-            "reference_input_count": image_count + video_count + audio_count,
-            "reference_image_count": image_count,
-            "reference_video_count": video_count,
-            "reference_audio_count": audio_count,
-            "continuity_assets": continuity_assets,
-            "continuity_asset_count": len(continuity_assets),
-            "prompt_available": bool(input_prompt["prompt"]),
-            "prompt_character_count": input_prompt["prompt_character_count"],
-            "negative_prompt_character_count": input_prompt["negative_prompt_character_count"],
-            "shot_count": snapshot["shot_count"],
-            "shot_ids": shot_ids,
-            "batch_id": self._task_public_text(snapshot.get("batch_id")) or None,
-            "batch_kind": self._task_public_text(snapshot.get("batch_kind")) or None,
-            "batch_role": self._task_public_text(snapshot.get("batch_role")) or None,
-            "batch_index": self._task_optional_int(snapshot.get("batch_index")),
-            "batch_size": self._task_optional_int(snapshot.get("batch_size")),
-            "whole_episode": snapshot["whole_episode"],
-            "idempotency_key": (
-                self._task_public_text(snapshot.get("idempotency_key")) or None
-            ),
-        }
-        if not is_image:
-            parameters.update({
-                "fps": snapshot["fps"],
-                "requested_duration_ms": snapshot["requested_duration_ms"],
-                "effective_duration_ms": obj.effective_duration_ms,
-                "effective_frames": obj.effective_frames,
-                "include_audio": snapshot["include_audio"],
-            })
+        try:
+            parameters = inspect_prepared_task_inputs(obj)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({"input_parameters": exc.messages}) from exc
+        # Names and usages are frozen. Only preview availability is current,
+        # and never substitutes another asset or changed source bytes.
+        request = self.context.get("request")
+        user = getattr(request, "user", None)
+        visible = {}
+        if getattr(self.context.get("view"), "action", None) == "retrieve" and getattr(user, "is_authenticated", False):
+            ids = [row["asset_id"] for row in parameters["media_uses"] if row["asset_id"]]
+            queryset = Asset.objects.filter(pk__in=ids, is_active=True)
+            if not user.is_staff:
+                queryset = queryset.filter(Q(owner=user) | Q(owner__isnull=True))
+            visible = {str(asset.pk): asset for asset in queryset}
+        for item in parameters["media_uses"]:
+            item["display_name"] = self._task_public_text(item["display_name"])
+            asset = visible.get(item["asset_id"])
+            if asset is not None and asset.checksum == item["checksum"]:
+                item["preview_url"] = self._task_asset_preview_url(asset)
         return parameters
 
     def to_representation(self, instance):
         representation = super().to_representation(instance)
-        # Worker staging records can contain ComfyUI routing identifiers and
-        # legacy absolute paths.  The public input_parameters field is the
-        # whitelisted audit snapshot; raw staging state never leaves the API.
-        representation["staged_inputs"] = []
         view = self.context.get("view")
         if getattr(view, "action", None) == "list":
             # Polling responses expose the stable, path-free input_parameters
             # summary instead of raw worker payloads and verbose detail logs.
             representation.update({
-                "staged_inputs": [],
-                "outputs": [],
                 "error_message": "",
                 "remote_error": "",
                 "timeline": [],
@@ -2552,24 +1896,6 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         threshold = float(_asset_runtime_limits()["runtime.task_stall_threshold_seconds"])
         return (timezone.now() - last_activity).total_seconds() > threshold
 
-    def get_can_retry(self, obj) -> bool:
-        if obj.status != GenerationTask.Status.FAILED:
-            return False
-        if obj.outputs:
-            return False
-        safe_retry_boundary = (
-            (
-                obj.submission_state == GenerationTask.SubmissionState.UNPREPARED
-                and not obj.submission_token
-                and not obj.comfy_prompt_id
-            )
-            or obj.submission_state == GenerationTask.SubmissionState.TERMINAL_FAILED
-        )
-        if not safe_retry_boundary:
-            return False
-        return not GenerationTask.objects.filter(
-            capability_snapshot__retry_of=str(obj.id),
-        ).exists()
 
     @staticmethod
     def get_retry_requires_reconciliation(obj) -> bool:
@@ -2578,18 +1904,12 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
             and not obj.outputs
             and obj.submission_token
             and obj.submission_state not in {
+                GenerationTask.SubmissionState.TERMINAL_SUCCEEDED,
                 GenerationTask.SubmissionState.TERMINAL_FAILED,
                 GenerationTask.SubmissionState.TERMINAL_CANCELLED,
             }
         )
 
-    @staticmethod
-    def get_can_cancel(obj) -> bool:
-        return obj.status in {
-            GenerationTask.Status.QUEUED,
-            GenerationTask.Status.RUNNING,
-            GenerationTask.Status.CANCEL_REQUESTED,
-        }
 
     def get_output_media(self, obj) -> list[dict]:
         if obj.status != GenerationTask.Status.SUCCEEDED:
@@ -2704,59 +2024,7 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
                         if kind == "image" and isinstance(item, dict) else ""
                     ),
                 })
-        media.extend(self._derived_frame_output_media(obj, len(media)))
         return media
-
-    def _derived_frame_output_media(self, obj, start_index: int) -> list[dict]:
-        """Expose extracted continuity frames as source-task image outputs on detail reads."""
-        request = self.context.get("request")
-        view = self.context.get("view")
-        user = getattr(request, "user", None)
-        if getattr(view, "action", None) not in {"retrieve", "list"} or not getattr(user, "is_authenticated", False):
-            return []
-        queryset = (
-            DeferredGenerationRequest.objects
-            .select_related("derived_asset")
-            .filter(source_task=obj, derived_asset__isnull=False)
-            .order_by("created_at", "id")
-        )
-        if not getattr(user, "is_staff", False):
-            queryset = queryset.filter(owner=user)
-        result: list[dict] = []
-        for offset, deferred in enumerate(queryset):
-            asset = deferred.derived_asset
-            if asset is None:
-                continue
-            preview_url = self._task_asset_preview_url(asset)
-            filename = ""
-            if asset.file:
-                filename = Path(str(asset.file.name)).name
-            filename = filename or asset.name or f"deferred-frame-{deferred.id}.png"
-            public_label = (
-                "尾帧抽取图"
-                if deferred.frame_slot == DeferredGenerationRequest.FrameSlot.FIRST_FRAME
-                else "首帧抽取图"
-            )
-            result.append({
-                "index": start_index + offset,
-                "kind": "image",
-                "filename": self._task_public_text(filename),
-                "preview_url": preview_url,
-                "download_url": f"{preview_url}?download=1" if preview_url else "",
-                "ai_generated": True,
-                "provenance_url": "",
-                "artifact_sha256": self._task_public_text(asset.checksum),
-                "manifest_sha256": self._task_public_text(deferred.source_manifest_sha256),
-                "distribution_status": "not_prepared",
-                "distribution_error": "",
-                "public_provenance_url": "",
-                "public_artifact_sha256": "",
-                "public_manifest_sha256": "",
-                "public_label": public_label,
-                "public_version": "deferred-frame-v1",
-                "promoted_asset_id": str(asset.id),
-            })
-        return result
 
     @extend_schema_field(serializers.DateTimeField(allow_null=True))
     def get_completed_at(self, obj):
@@ -2798,7 +2066,7 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
 
         GenerationTask does not currently persist every transient ComfyUI polling
         update.  Consequently this method deliberately exposes only transitions
-        backed by an existing timestamp or retry reference; it must not turn UI
+        backed by an existing timestamp; it must not turn UI
         progress estimates into fabricated history.
         """
         events: list[tuple[object, int, dict]] = []
@@ -2810,25 +2078,11 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
             events.append((timestamp, order, {
                 "event": event,
                 "status": status,
-                # ``timestamp`` is the canonical public key.  ``occurred_at``
-                # remains as a compatibility alias for clients built while
-                # this endpoint was being introduced.
                 "timestamp": represented,
-                "occurred_at": represented,
                 "label": label,
                 "details": details or {},
             }))
 
-        retry_of = self.get_retry_of(obj)
-        if retry_of:
-            append_event(
-                obj.created_at,
-                0,
-                event="retry_created",
-                status=GenerationTask.Status.QUEUED,
-                label="已创建重试任务",
-                details={"source_task_id": retry_of},
-            )
 
         append_event(
             obj.queued_at,
@@ -2904,168 +2158,49 @@ class GenerationTaskSerializer(serializers.ModelSerializer):
         events.sort(key=lambda item: (item[0], item[1]))
         return [item[2] for item in events]
 
-    @staticmethod
-    def _snapshot(obj) -> dict:
-        return obj.capability_snapshot if isinstance(obj.capability_snapshot, dict) else {}
-
-    @staticmethod
-    def _batch_snapshot(obj) -> dict:
-        return effective_batch_snapshot_for_task(obj)
-
-    @extend_schema_field(serializers.ChoiceField(
-        choices=(RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,),
-        allow_null=True,
-    ))
-    def get_generation_purpose(self, obj) -> str | None:
-        snapshot = self._snapshot(obj)
-        if snapshot.get("generation_purpose") == RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE:
-            return RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE
-        return None
-
-    @extend_schema_field(GenerationTaskBibleTargetSerializer(allow_null=True))
-    def get_bible_target(self, obj) -> dict | None:
-        snapshot = self._snapshot(obj)
-        if snapshot.get("generation_purpose") != RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE:
+    @extend_schema_field(GenerationTaskExecutionSerializer(allow_null=True))
+    def get_execution(self, obj) -> dict | None:
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        from studio.services.execution_production_workflow_queue import _linked_task_attempt
+        try:
+            attempt = _linked_task_attempt(obj)
+        except DjangoValidationError:
+            # A list can still expose a broken task's real lifecycle. Never
+            # manufacture its business identity from a trace, cache or JSON.
             return None
-        target = GenerationTaskBibleTargetSerializer(data=snapshot.get("bible_target"))
-        if not target.is_valid():
-            return None
-        validated = target.validated_data
+        stage = attempt.stage_run
         return {
-            "schema_version": validated["schema_version"],
-            "reference_category": validated["reference_category"],
-            "entity_id": str(validated["entity_id"]),
-            "entity_name": validated["entity_name"],
-            "source_fingerprint": validated["source_fingerprint"],
+            "production_run_id": str(stage.production_run_id),
+            "stage_run_id": str(stage.pk), "stage_key": stage.stage_key,
+            "stage_ordinal": stage.ordinal, "unit_key": attempt.unit_key,
+            "attempt_id": str(attempt.pk), "attempt_number": attempt.attempt_number,
+            "preparation_id": str(attempt.preparation_id),
+            "execution_instance_version_id": str(attempt.execution_instance_version_id),
+            "operation": attempt.operation,
         }
 
-    @staticmethod
-    def _episode(obj):
-        if obj.episode_id:
-            return obj.episode
-        return obj.generated_workflow.prompt_artifact.episode
-
-    @staticmethod
-    def _shot(obj):
-        return obj.generated_workflow.prompt_artifact.shot
-
-    def get_batch_id(self, obj) -> str | None:
-        return self._batch_snapshot(obj).get("batch_id") or None
-
-    def get_batch_kind(self, obj) -> str | None:
-        return self._batch_snapshot(obj).get("batch_kind") or None
-
-    def get_batch_role(self, obj) -> str | None:
-        return self._batch_snapshot(obj).get("batch_role") or None
-
-    def get_batch_index(self, obj) -> int | None:
-        return self._batch_snapshot(obj).get("batch_index")
-
-    def get_batch_size(self, obj) -> int | None:
-        return self._batch_snapshot(obj).get("batch_size")
-
-    @extend_schema_field(GenerationTaskBatchSlotSerializer(many=True))
-    def get_batch_slots(self, obj) -> list[dict]:
-        snapshot = self._batch_snapshot(obj)
-        batch_id = snapshot.get("batch_id")
-        batch_size = self._task_optional_int(snapshot.get("batch_size")) or 0
-        if not batch_id or batch_size <= 1:
-            return []
-        cache = self.context.setdefault("_production_batch_slots_cache", {})
-        cache_key = (str(obj.owner_id), str(obj.project_id), str(batch_id))
-        if cache_key not in cache:
-            cache[cache_key] = build_production_batch_slots(obj)
-        return cache[cache_key]
-
-    @extend_schema_field(serializers.UUIDField(allow_null=True))
-    def get_production_run_id(self, obj) -> str | None:
-        """Expose only the validated immutable run identity used for UI grouping."""
-
-        return self._task_uuid_text(self._snapshot(obj).get("production_run_id"))
-
-    @extend_schema_field(serializers.IntegerField(min_value=1, allow_null=True))
-    def get_production_variant_number(self, obj) -> int | None:
-        snapshot = self._snapshot(obj)
-        execution_identity = self._task_mapping(snapshot.get("execution_identity"))
-        raw_value = execution_identity.get("variant_number")
-        if isinstance(raw_value, bool):
-            return None
-        value = self._task_optional_int(raw_value)
-        return value if value is not None and value > 0 else None
-
-    def get_episode_id(self, obj) -> str | None:
-        snapshot = self._snapshot(obj)
-        episode = self._episode(obj)
-        return snapshot.get("episode_id") or (str(episode.id) if episode else None)
-
     def get_episode_number(self, obj) -> int | None:
-        snapshot = self._snapshot(obj)
-        episode = self._episode(obj)
-        return snapshot.get("episode_number", episode.number if episode else None)
+        return obj.episode.number if obj.episode_id else None
 
     def get_episode_title(self, obj) -> str:
-        snapshot = self._snapshot(obj)
-        episode = self._episode(obj)
-        return snapshot.get("episode_title", episode.title if episode else "")
-
-    def get_shot_ids(self, obj) -> list[str]:
-        snapshot = self._snapshot(obj)
-        if isinstance(snapshot.get("shot_ids"), list):
-            return [str(value) for value in snapshot["shot_ids"]]
-        prompt = obj.generated_workflow.prompt_artifact
-        request_ids = (prompt.request_options or {}).get("shot_ids")
-        if isinstance(request_ids, list):
-            return [str(value) for value in request_ids]
-        return [str(prompt.shot_id)] if prompt.shot_id else []
-
-    def get_shot_id(self, obj) -> str | None:
-        snapshot = self._snapshot(obj)
-        shot = self._shot(obj)
-        return snapshot.get("shot_id") or (str(shot.id) if shot else None)
-
-    def get_shot_number(self, obj) -> int | None:
-        snapshot = self._snapshot(obj)
-        shot = self._shot(obj)
-        return snapshot.get("shot_number", shot.number if shot else None)
-
-    def get_shot_order(self, obj) -> int | None:
-        return self.get_shot_number(obj)
-
-    def get_shot_title(self, obj) -> str:
-        snapshot = self._snapshot(obj)
-        shot = self._shot(obj)
-        return snapshot.get("shot_title", shot.title if shot else "")
-
-    def get_retry_of(self, obj) -> str | None:
-        return self._snapshot(obj).get("retry_of") or None
-
-    def validate_generated_workflow(self, workflow):
-        user = self.context["request"].user
-        if workflow.project.owner_id != user.id and not user.is_staff:
-            raise serializers.ValidationError("不能使用其他用户的工作流")
-        return workflow
+        return obj.episode.title if obj.episode_id else ""
 
 
 class GenerationTaskListSerializer(GenerationTaskSerializer):
-    """List projection that preserves audit rows without inventing old inputs.
+    """List projection that never invents inputs for damaged task relations.
 
-    Current frozen contracts keep the same safe ``input_parameters`` projection
-    as task detail.  Unsupported or damaged contracts remain visible as task
-    audit facts, while their runtime inputs are explicitly unavailable.  Detail
-    and input-prompt endpoints continue to fail closed through
-    ``GenerationTaskSerializer``.
+    Actual preparations keep the same safe input projection as task detail.
+    Missing/damaged relations remain explicit and cannot revive an old path.
     """
 
     INPUT_CONTRACT_AVAILABLE = "available"
     INPUT_CONTRACT_UNAVAILABLE = "unavailable"
-    INPUT_CONTRACT_LEGACY_SCHEMA_UNSUPPORTED = "legacy_schema_unsupported"
     INPUT_CONTRACT_FROZEN_INVALID = "frozen_contract_invalid"
 
     input_parameters = serializers.SerializerMethodField(
         help_text=(
-            "当前冻结合同可验证时返回安全输入投影；历史或损坏合同返回 null。 "
-            "Returns the safe input projection only for a verifiable frozen contract; "
-            "legacy or invalid contracts return null."
+            "本次实际准备与回执可验证时返回安全输入投影；缺失或损坏时返回 null。 "
+            "Verified prepared inputs only; absent or invalid facts return null."
         ),
     )
     input_contract_status = serializers.SerializerMethodField(
@@ -3094,15 +2229,9 @@ class GenerationTaskListSerializer(GenerationTaskSerializer):
                 super().get_input_parameters(obj),
             )
         except serializers.ValidationError:
-            injected = self._task_mapping(obj.generated_workflow.injected_values)
-            reason_code = (
-                self.INPUT_CONTRACT_LEGACY_SCHEMA_UNSUPPORTED
-                if injected.get("schema_version") != 2
-                else self.INPUT_CONTRACT_FROZEN_INVALID
-            )
             projection = (
                 self.INPUT_CONTRACT_UNAVAILABLE,
-                reason_code,
+                self.INPUT_CONTRACT_FROZEN_INVALID,
                 None,
             )
         cache[cache_key] = projection
@@ -3122,7 +2251,6 @@ class GenerationTaskListSerializer(GenerationTaskSerializer):
     @extend_schema_field(serializers.ChoiceField(
         choices=(
             "",
-            INPUT_CONTRACT_LEGACY_SCHEMA_UNSUPPORTED,
             INPUT_CONTRACT_FROZEN_INVALID,
         ),
         allow_blank=True,
@@ -3136,12 +2264,17 @@ class ComfyUIWorkflowExportSerializer(serializers.Serializer):
     """Read-only description of a task's API graph or importable UI canvas."""
 
     task_id = serializers.UUIDField(read_only=True)
-    generated_workflow_id = serializers.UUIDField(read_only=True)
+    attempt_id = serializers.UUIDField(read_only=True)
+    preparation_id = serializers.UUIDField(read_only=True)
+    execution_instance_version_id = serializers.UUIDField(read_only=True)
+    workflow_version_id = serializers.UUIDField(read_only=True)
+    request_sha256 = serializers.CharField(read_only=True)
+    definition_sha256 = serializers.CharField(read_only=True)
+    graph_state = serializers.ChoiceField(choices=("prepared", "staged"), read_only=True)
+    missing_receipt_count = serializers.IntegerField(read_only=True)
     format = serializers.ChoiceField(choices=("comfyui_api", "comfyui_ui"), read_only=True)
     filename = serializers.CharField(read_only=True)
     content_hash = serializers.CharField(read_only=True)
-    template_slug = serializers.CharField(read_only=True)
-    template_version = serializers.IntegerField(read_only=True)
     workflow = serializers.JSONField(read_only=True)
     import_ready = serializers.BooleanField(read_only=True)
     open_reason = serializers.CharField(read_only=True)
@@ -3248,118 +2381,22 @@ class StrictSerializer(serializers.Serializer):
         return super().to_internal_value(data)
 
 
-class ScriptBibleEvidenceSerializer(serializers.Serializer):
-    line = serializers.IntegerField(min_value=1)
-    kind = serializers.ChoiceField(choices=(
-        "body_mention", "dialogue_speaker", "shot_setting",
-    ))
-    excerpt = serializers.CharField(max_length=240)
-
-
-class ScriptBibleDiagnosticSerializer(serializers.Serializer):
-    line = serializers.IntegerField(min_value=1, required=False, allow_null=True)
-    severity = serializers.ChoiceField(choices=("info", "warning", "error"))
-    code = serializers.CharField(max_length=64)
-    detail = serializers.CharField(required=False)
-    entity_type = serializers.ChoiceField(
-        choices=("character", "scene", "prop"), required=False,
-    )
-    candidate_id = serializers.RegexField(r"^[0-9a-f]{64}$", required=False)
-
-
-class ScriptBibleCandidateSerializer(serializers.Serializer):
-    candidate_id = serializers.RegexField(r"^[0-9a-f]{64}$")
-    entity_type = serializers.ChoiceField(choices=("character", "scene", "prop"))
-    name = serializers.CharField(max_length=160)
-    description = serializers.CharField(max_length=2_000, allow_blank=True)
-    visual_identity_en = serializers.CharField(max_length=3_000, allow_blank=True)
-    declaration_line = serializers.IntegerField(min_value=1)
-    occurrence = serializers.IntegerField(min_value=0)
-    evidence = ScriptBibleEvidenceSerializer(many=True)
-    recommended = serializers.BooleanField()
-    matched_bible_id = serializers.UUIDField(allow_null=True)
-    existing = serializers.BooleanField()
-    confirmed = serializers.BooleanField()
-    conflict_code = serializers.ChoiceField(
-        choices=(
-            "script_bible_cross_type_name_conflict",
-            "script_bible_content_conflict",
-            "script_bible_reviewed_content_conflict",
-            "script_bible_provenance_conflict",
-        ),
-        allow_null=True,
-    )
-
-
-class ScriptBibleCandidatesResponseSerializer(serializers.Serializer):
-    schema_version = serializers.IntegerField(min_value=1, max_value=1)
-    project_id = serializers.UUIDField()
-    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$")
-    has_block = serializers.BooleanField()
-    candidates = ScriptBibleCandidateSerializer(many=True)
-    diagnostics = ScriptBibleDiagnosticSerializer(many=True)
-
-
-class ScriptBibleReviewedSelectionSerializer(StrictSerializer):
-    candidate_id = serializers.RegexField(r"^[0-9a-f]{64}$")
-    reviewed = serializers.BooleanField()
-    name = serializers.CharField(max_length=160, trim_whitespace=False)
-    description = serializers.CharField(
-        max_length=2_000, allow_blank=True, trim_whitespace=False,
-    )
-    visual_identity_en = serializers.CharField(
-        max_length=3_000, allow_blank=True, trim_whitespace=False,
-    )
-
-    def to_internal_value(self, data):
-        if not isinstance(data, dict) or data.get("reviewed") is not True:
-            raise serializers.ValidationError({
-                "reviewed": "只有字面 JSON true 才表示已人工确认。",
-            })
-        return super().to_internal_value(data)
-
-    def validate_reviewed(self, value):
-        if value is not True:
-            raise serializers.ValidationError("只有人工确认的候选才能应用。")
-        return value
-
-
-
-
-
-
-
-
-
-
-class ScriptBibleErrorDetailsSerializer(serializers.Serializer):
-    detail = serializers.CharField()
-    line = serializers.IntegerField(min_value=1, required=False, allow_null=True)
-    diagnostic = ScriptBibleDiagnosticSerializer(required=False)
-    source_fingerprint = serializers.RegexField(r"^[0-9a-f]{64}$", required=False)
-    current_source_fingerprint = serializers.RegexField(
-        r"^[0-9a-f]{64}$", required=False,
-    )
-    pending_count = serializers.IntegerField(min_value=0, required=False)
-    conflict_count = serializers.IntegerField(min_value=0, required=False)
-    candidates = ScriptBibleCandidateSerializer(many=True, required=False)
-
-
-class ScriptBibleErrorSerializer(serializers.Serializer):
-    status_code = serializers.IntegerField()
-    code = serializers.CharField(max_length=64)
-    details = ScriptBibleErrorDetailsSerializer()
-
-
-class ScriptBibleErrorEnvelopeSerializer(serializers.Serializer):
-    error = ScriptBibleErrorSerializer()
-
-
 class PromptFieldTranslationSerializer(serializers.ModelSerializer):
     runtime_metadata = serializers.SerializerMethodField()
     revision_history = serializers.SerializerMethodField()
     context_current = serializers.SerializerMethodField()
-    promoted_fields = serializers.SerializerMethodField()
+    canonical_value = serializers.SerializerMethodField()
+    confirmation_target = serializers.SerializerMethodField()
+
+    @extend_schema_field(serializers.ChoiceField(choices=("field_review", "canonical_glossary")))
+    def get_confirmation_target(self, obj):
+        from studio.services.canonical_glossary import is_canonical_name
+        return "canonical_glossary" if is_canonical_name(obj.scope_type, obj.field_key) else "field_review"
+
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_canonical_value(self, obj):
+        from studio.services.canonical_glossary import project_glossary
+        return project_glossary(obj.project).get(obj.source_text) if self.get_confirmation_target(obj) == "canonical_glossary" else None
 
     @extend_schema_field(serializers.DictField())
     def get_runtime_metadata(self, obj: PromptFieldTranslation) -> dict:
@@ -3393,25 +2430,13 @@ class PromptFieldTranslationSerializer(serializers.ModelSerializer):
             obj, project=obj.project, current_source=current_source,
         )
 
-    @extend_schema_field(serializers.ListField(child=serializers.DictField()))
-    def get_promoted_fields(self, obj: PromptFieldTranslation) -> list[dict]:
-        promotion = (obj.runtime_metadata or {}).get("promotion") or {}
-        if not promotion.get("promoted"):
-            return []
-        dialogue_index = promotion.get("dialogue_index")
-        return [{
-            "field_key": obj.field_key,
-            "value": obj.translated_text,
-            "dialogue_index": dialogue_index if isinstance(dialogue_index, int) else None,
-        }]
-
     class Meta:
         model = PromptFieldTranslation
         fields = (
             "id", "project", "scope_type", "scope_id", "field_key",
             "source_text", "translated_text", "status", "revision",
             "provider", "model", "error_message", "runtime_metadata",
-            "revision_history", "context_current", "promoted_fields",
+            "revision_history", "context_current", "confirmation_target", "canonical_value",
             "confirmed_by", "confirmed_at", "created_at", "updated_at",
         )
         read_only_fields = fields
@@ -3456,23 +2481,6 @@ class PromptTranslationEntryRequestSerializer(serializers.Serializer):
         return attrs
 
 
-class PromptTranslationBatchRequestSerializer(serializers.Serializer):
-    entries = PromptTranslationEntryRequestSerializer(many=True, allow_empty=False)
-    model_deployment_id = serializers.UUIDField()
-    source_lang = serializers.ChoiceField(choices=("Chinese",), default="Chinese")
-    target_lang = serializers.ChoiceField(choices=("English",), default="English")
-
-    def validate_entries(self, entries):
-        maximum = translation_request_max_entries()
-        if len(entries) > maximum:
-            raise serializers.ValidationError(f"单次最多翻译 {maximum} 个字段")
-        seen = set()
-        for item in entries:
-            key = (item["scope_type"], item.get("scope_id"), item["field_key"])
-            if key in seen:
-                raise serializers.ValidationError("同一批次不能重复提交同一字段")
-            seen.add(key)
-        return entries
 
 
 class PromptTranslationManualBatchRequestSerializer(serializers.Serializer):
@@ -3493,115 +2501,6 @@ class PromptTranslationManualBatchRequestSerializer(serializers.Serializer):
         return entries
 
 
-class CanonicalGlossaryEntryRequestSerializer(serializers.Serializer):
-    """Select one current Bible entity without trusting a browser-supplied name."""
-
-    scope_type = serializers.ChoiceField(choices=("character", "scene", "prop"))
-    scope_id = serializers.UUIDField()
-
-
-class CanonicalGlossaryEnsureSerializer(serializers.Serializer):
-    entries = CanonicalGlossaryEntryRequestSerializer(
-        many=True, required=False, allow_empty=True,
-    )
-    include_all_missing = serializers.BooleanField(default=False)
-    ensure_visual_identity_translation = serializers.BooleanField(default=False)
-
-    def validate(self, attrs):
-        entries = attrs.get("entries", [])
-        if not entries and not attrs["include_all_missing"]:
-            raise serializers.ValidationError(
-                "entries 至少选择一个 Bible 实体，或将 include_all_missing 设为 true",
-            )
-        maximum = canonical_glossary_max_entities()
-        if len(entries) > maximum:
-            raise serializers.ValidationError(
-                f"单次最多处理 {maximum} 个 Bible 实体",
-            )
-        keys = [(item["scope_type"], item["scope_id"]) for item in entries]
-        if len(keys) != len(set(keys)):
-            raise serializers.ValidationError("同一 Bible 实体不能重复提交")
-        return attrs
-
-
-class CanonicalGlossaryResultEntrySerializer(serializers.Serializer):
-    scope_type = serializers.ChoiceField(choices=("character", "scene", "prop"))
-    scope_id = serializers.UUIDField()
-    name = serializers.CharField(allow_blank=True)
-    canonical_english = serializers.CharField(allow_blank=True)
-    status = serializers.ChoiceField(choices=("generated", "reused", "conflict", "failed"))
-    origin = serializers.ChoiceField(choices=("model", "existing", "source_english", "none"))
-    retryable = serializers.BooleanField()
-    error_code = serializers.CharField(allow_blank=True)
-    message = serializers.CharField(allow_blank=True)
-
-
-class CanonicalGlossarySummarySerializer(serializers.Serializer):
-    requested = serializers.IntegerField(min_value=0)
-    generated = serializers.IntegerField(min_value=0)
-    reused = serializers.IntegerField(min_value=0)
-    conflict = serializers.IntegerField(min_value=0)
-    failed = serializers.IntegerField(min_value=0)
-
-
-class CanonicalGlossaryVisualSummarySerializer(serializers.Serializer):
-    requested = serializers.IntegerField(min_value=0)
-    generated = serializers.IntegerField(min_value=0)
-    reused = serializers.IntegerField(min_value=0)
-    not_required = serializers.IntegerField(min_value=0)
-    conflict = serializers.IntegerField(min_value=0)
-    failed = serializers.IntegerField(min_value=0)
-
-
-class CanonicalGlossaryVisualTranslationSerializer(serializers.Serializer):
-    scope_type = serializers.ChoiceField(choices=("character", "scene", "prop"))
-    scope_id = serializers.UUIDField()
-    field_key = serializers.CharField()
-    source_text = serializers.CharField(allow_blank=True)
-    translated_text = serializers.CharField(allow_blank=True)
-    translation_id = serializers.UUIDField(allow_null=True)
-    translation_status = serializers.CharField(allow_blank=True)
-    revision = serializers.IntegerField(min_value=1, allow_null=True)
-    status = serializers.ChoiceField(choices=(
-        "generated", "reused", "not_required", "conflict", "failed",
-    ))
-    origin = serializers.ChoiceField(choices=(
-        "model", "existing", "source_english", "none",
-    ))
-    context_current = serializers.BooleanField()
-    retryable = serializers.BooleanField()
-    error_code = serializers.CharField(allow_blank=True)
-    message = serializers.CharField(allow_blank=True)
-
-
-class CanonicalGlossaryEnsureResponseSerializer(serializers.Serializer):
-    project_id = serializers.UUIDField()
-    updated_at = serializers.DateTimeField()
-    translation_glossary = serializers.DictField(child=serializers.CharField())
-    summary = CanonicalGlossarySummarySerializer()
-    entries = CanonicalGlossaryResultEntrySerializer(many=True)
-    visual_summary = CanonicalGlossaryVisualSummarySerializer()
-    visual_translations = CanonicalGlossaryVisualTranslationSerializer(many=True)
-    runtime = serializers.DictField()
-
-
-class PromptTranslationRetranslateSerializer(serializers.Serializer):
-    model_deployment_id = serializers.UUIDField()
-    source_text = serializers.CharField(
-        trim_whitespace=False, required=False,
-    )
-    source_lang = serializers.ChoiceField(choices=("Chinese",), default="Chinese")
-    target_lang = serializers.ChoiceField(choices=("English",), default="English")
-
-    def validate_source_text(self, value):
-        maximum = translation_text_max_characters()
-        if len(value) > maximum:
-            raise serializers.ValidationError(
-                f"不能超过当前安全边界 {maximum} 个字符",
-            )
-        return value
-
-
 class PromptTranslationConfirmSerializer(serializers.Serializer):
     expected_revision = serializers.IntegerField(min_value=1)
     translation = serializers.CharField(
@@ -3617,6 +2516,30 @@ class PromptTranslationConfirmSerializer(serializers.Serializer):
         return value
 
 
+class CanonicalGlossaryConfirmSerializer(PromptTranslationConfirmSerializer):
+    expected_canonical = serializers.CharField(allow_null=True, trim_whitespace=False)
+    expected_project_updated_at = serializers.DateTimeField()
+    translation = serializers.CharField(trim_whitespace=False)
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or set(data) != {"expected_revision", "expected_canonical", "expected_project_updated_at", "translation"}:
+            raise serializers.ValidationError({"non_field_errors": ["需明确候选修订、所见术语值和最终译名"]})
+        if type(data["expected_revision"]) is not int or not isinstance(data["translation"], str) or (
+            data["expected_canonical"] is not None and not isinstance(data["expected_canonical"], str)
+        ):
+            raise serializers.ValidationError({"non_field_errors": ["术语确认字段类型无效"]})
+        return super().to_internal_value(data)
+
+
+class CanonicalGlossaryConfirmResponseSerializer(serializers.Serializer):
+    entry = PromptFieldTranslationSerializer()
+    project_id = serializers.UUIDField()
+    source_text = serializers.CharField()
+    canonical_english = serializers.CharField()
+    previous_canonical = serializers.CharField(allow_null=True)
+    updated_at = serializers.DateTimeField()
+
+
 class PromptTranslationConflictErrorSerializer(serializers.Serializer):
     status_code = serializers.IntegerField()
     code = serializers.CharField()
@@ -3627,39 +2550,8 @@ class PromptTranslationConflictErrorResponseSerializer(serializers.Serializer):
     error = PromptTranslationConflictErrorSerializer()
 
 
-class PromptTranslationPromotionEntrySerializer(serializers.Serializer):
-    entry_id = serializers.UUIDField()
-    expected_revision = serializers.IntegerField(min_value=1)
-
-
-class PromptTranslationPromoteShotSerializer(serializers.Serializer):
-    shot_id = serializers.UUIDField()
-    entries = PromptTranslationPromotionEntrySerializer(many=True, allow_empty=True)
-
-    def validate(self, attrs):
-        entries = attrs["entries"]
-        if not entries:
-            raise serializers.ValidationError({
-                "entries": "至少选择一个已确认译文",
-            })
-        maximum = translation_promotion_max_entries()
-        if len(entries) > maximum:
-            raise serializers.ValidationError({
-                "entries": f"单次最多同步 {maximum} 个镜头导演字段",
-            })
-        entry_ids = [item["entry_id"] for item in entries]
-        if len(entry_ids) != len(set(entry_ids)):
-            raise serializers.ValidationError({"entries": "同一翻译条目不能重复提交"})
-        return attrs
-
-
-class PromptTranslationPromoteShotResponseSerializer(serializers.Serializer):
-    shot_id = serializers.UUIDField()
-    promoted_fields = serializers.ListField(child=serializers.DictField())
-    entries = PromptFieldTranslationSerializer(many=True)
-
-
 class AssemblyJobSerializer(serializers.ModelSerializer):
+    source_media_count = serializers.SerializerMethodField()
     output_url = serializers.SerializerMethodField()
     download_url = serializers.SerializerMethodField()
     provenance_url = serializers.SerializerMethodField()
@@ -3668,7 +2560,11 @@ class AssemblyJobSerializer(serializers.ModelSerializer):
     class Meta:
         model = AssemblyJob
         fields = "__all__"
-        read_only_fields = tuple(field.name for field in AssemblyJob._meta.fields) + ("source_tasks",)
+        read_only_fields = tuple(field.name for field in AssemblyJob._meta.fields)
+
+    def get_source_media_count(self, obj) -> int:
+        count = getattr(obj, "_source_media_count", None)
+        return count if count is not None else obj.source_items.count()
 
     def get_output_url(self, obj) -> str:
         if (
@@ -3684,8 +2580,16 @@ class AssemblyJobSerializer(serializers.ModelSerializer):
         return f"{output_url}?download=1" if output_url else ""
 
     @staticmethod
-    def get_ai_generated(obj) -> bool:
-        return True
+    def get_ai_generated(obj) -> bool | None:
+        """Recorded model source, not live integrity verification or a human-origin claim."""
+        if obj.status != AssemblyJob.Status.SUCCEEDED:
+            return None
+        count = getattr(obj, "_model_source_count", None)
+        if count is not None:
+            return True if count > 0 else None
+        return True if obj.source_items.filter(
+            generated_artifact__generation_attempt__isnull=False,
+        ).exists() else None
 
     def get_provenance_url(self, obj) -> str:
         if (
@@ -3707,30 +2611,44 @@ class AssemblyJobSerializer(serializers.ModelSerializer):
 
 
 
+class ReleaseBundleBatchListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        from studio.models import ProductionRunPlan
+        rows = list(data.all() if hasattr(data, "all") else data)
+        run_ids = {row.production_run_id for row in rows if row.status != ReleaseBundle.Status.DRAFT}
+        plans = ProductionRunPlan.objects.filter(run_id__in=run_ids).select_related("run__project").only(
+            "run_id", "source", "stage_catalog_key", "stage_catalog_version", "stage_catalog_sha256",
+            "definition", "definition_schema_version", "definition_size_bytes", "definition_sha256",
+            "run__id", "run__project_id", "run__plan_source", "run__recipe_version_id", "run__project__owner_id",
+        )
+        self.child._release_run_plan_records = {row.run_id: row for row in plans}
+        return super().to_representation(rows)
+
+
 class ReleaseBundleSerializer(serializers.ModelSerializer):
     verification_status = serializers.SerializerMethodField()
 
     class Meta:
         model = ReleaseBundle
+        list_serializer_class = ReleaseBundleBatchListSerializer
         fields = (
-            "id", "owner", "project", "created_by", "version", "title", "notes",
+            "id", "owner", "project", "production_run", "created_by", "version", "title", "notes",
             "status", "selection", "manifest", "manifest_sha256", "sealed_at",
             "released_at", "verification_status", "created_at", "updated_at",
         )
         read_only_fields = (
-            "id", "owner", "project", "created_by", "version", "status", "manifest",
+            "id", "owner", "project", "production_run", "created_by", "version", "status", "manifest",
             "manifest_sha256", "sealed_at", "released_at", "verification_status",
             "created_at", "updated_at",
         )
 
-    @staticmethod
-    def get_verification_status(obj) -> str:
+    def get_verification_status(self, obj) -> str:
         if obj.status == ReleaseBundle.Status.DRAFT:
             return "draft"
         try:
             from studio.services.release_bundles import verified_release_bundle
 
-            verified_release_bundle(obj)
+            verified_release_bundle(obj, run_plan_records=getattr(self, "_release_run_plan_records", None))
             return "verified"
         except (ValueError, TypeError):
             return "invalid"

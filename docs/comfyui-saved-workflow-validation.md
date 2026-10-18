@@ -54,6 +54,8 @@ preview 必须命中完全一致的 candidate，否则返回 `workflow_candidate
 
 preview 中的画布当前值和服务端推荐值仅用于理解 Schema。具体 smoke 参数和 Asset 不进入 candidate、draft 或提升请求；它们只属于后续 attempt。
 
+通用固定/动态 Projector 必须在“执行引擎与接线 → 执行能力”明确选择文生图、图片生图等已登记能力。该选择描述这张图能做什么，须与主输出和所选模型版本同时匹配；不能因主输出都是图片就推断两种能力相同。扫描推荐可保留未选择的配置供人工补充，但生成草稿会显示明确阻断，不能提升。补齐并发布 Projector 后，从同一候选生成后继合同；无需修改模型名称，也不会补写已有工作流。
+
 ### 3.1 输入图片决定输出尺寸
 
 子图展开与尺寸支持是两道独立校验。Qwen Image Edit 2511 一类工作流可以成功展开子图、识别模型文件，但其尺寸不是显式 `width/height`，必须另有可证明的执行合同。
@@ -79,6 +81,17 @@ preview 中的画布当前值和服务端推荐值仅用于理解 Schema。具�
 - 建议维护专用方案，不直接改变通用兜底方案的业务范围。配置了目标尺寸但来源图不满足受支持的尺寸链时，导入阻断，不能静默忽略配置。动态素材组和分类参考引擎不因此自动获得可改写图片尺寸链的能力。
 - Live Validate 对每组配置尺寸使用同一编译函数构造 `ImageScale` 探测图，以目标部署实时 `object_info` 校验节点、宽高范围、插值和裁切选项；缺少节点或任一尺寸不支持都失败，不提交 GPU。通过后仍需真实 Smoke 验证模型可运行性与实际产物。
 - 运行 `output_contract.resolution` 记录实际 Asset、输入尺寸、最终尺寸以及所用尺寸列表；三条产物收集路径统一核验。规则配置不宣称所有模型、显存环境都能运行任意合法尺寸。
+
+### 3.3 合同生成响应丢失后的只读恢复
+
+此路径需要后台已应用迁移 `0236_comfy_workflow_preview_receipt` 并加载匹配代码；代码／隔离验收不等于现用服务已更新。上线条件见[部署边界](production-deployment.md#合同回执更新的部署边界)。
+
+1. 返回“设置 → 工作流”的导入区域，在“核对未确认的工作流导入”查看原请求。同一浏览器保留的待核对请求跨刷新有效；使用原操作账号，不清除浏览器记录来解除防重。
+2. 点击“只读核对原请求”。这里只读取平台保存的原回执，不扫描 ComfyUI、不生成合同、不重发原写入；展开“查看已核对的原合同”核对完整输入约定、参数、素材槽和输出。
+3. 原候选已加载且模型、主输出及来源选择仍一致时，页面恢复该合同；候选未加载或选择改变时只展示原合同，保留待核对项，不覆盖当前表单。需要继续原合同，应先加载同一候选并明确恢复原选择，再只读核对；加载来源的扫描本身可能访问主机，不能与无主机访问的回执读取混为一谈。
+4. 回读成功只证明原合同保存结果。符合提升条件后，仍由用户明确勾选和提交版本提升，不自动提升、Validate、Smoke 或发布。
+
+404、权限不足、响应损坏或请求身份不一致时保留“未知”，不证明原写入失败，也不解锁重复生成。旧请求没有原回执时不能从相似草稿、最新版本或当前配置补造；升级不会补齐历史回执。回执与合同草稿原子保存于数据库，备份沿[既有数据库备份流程](backup-restore.md)，不另建客户端合同事实源。精确请求键、权限和错误语义见[正式 API](api.md#comfyui-已保存工作流纳管)。
 
 ## 4. WorkflowProjectorVersion 配置化边界
 
@@ -112,7 +125,11 @@ preview 中的画布当前值和服务端推荐值仅用于理解 Schema。具�
 4. 草稿冻结 projector version UUID、family key、版本号、definition SHA、engine key/version 和 adapter keys；提升时逐项复验这些身份，不查询“当前最新版”替换它。
 5. 后继 projector 发布后只服务新的 preview。旧 candidate 仍保存原始来源，旧 contract draft、WorkflowTemplateVersion、Smoke 和 ProductionRun 继续使用各自冻结的版本事实；需要采用新规则时可对同一 candidate 重新生成 draft 并 promote 新版本。只有工作流源文件本身变化时才重新 scan → candidate。
 
-Projector 是由服务端自动匹配的，不由导入人手选。超级管理员可以对任何已纳管且已确定唯一主输出的 candidate 生成一份候选专用建议，包括已经由 fallback 命中或已经提升过工作流版本的候选。建议只进入本地未保存表单；人工调整并发布专用方案后，页面通过“用当前已发布 Projector 生成后继合同”显式重投影，并只允许追加到原 template。不得停用 Generic fallback 来人为制造未匹配状态。
+Projector 是由服务端自动匹配的，不由导入人手选。超级管理员可以对任何已纳管且已确定唯一主输出的 candidate 生成一份候选专用建议，包括已经由 fallback 命中或已经提升过工作流版本的候选。建议只进入本地未保存表单；人工调整并发布专用方案后，页面通过“用当前已发布 Projector 生成后继合同”显式重投影，并只允许追加到原 template。原方案已符合要求、仅需重新取得运行证据时，也可直接使用这一入口，不必为了绕过去重修改来源图或发布相同 Projector。不得停用 Generic fallback 来人为制造未匹配状态。
+
+显式后继提升携带 `successor_of`，页面在发起重建时固定原前驱，不随扫描结果变化；同一草稿和完整请求重放返回原后继。新请求要求前驱是原模板最高版本（包含 draft/validated/published/retired），且存在同路径、同来源作用域的正式登记；已有更高版本时拒绝从旧前驱另开分支。即使结构完全相同也创建新的未校验草稿，旧来源、版本与证据不变。普通导入仍保持原去重行为。提交结果未知时先回读版本；刷新后不可将新扫描版本作为原请求的前驱直接重试。前驱状态不授予运行资格，新后继仍需独立 Live Validate、Smoke 与发布。
+
+后继导入或重投影失败不会覆盖原发布版本及其执行准备。成功建立的新版本仍是草稿，须取得自身精确目标的Validate/Smoke证据；原版本的通过结论不能继承。已发布/退役版本再次发布明确返回400，连同直接调用共用发布服务，都不能因目标漂移把历史版本降为草稿或清空原证据。读取发现历史Smoke过期时保留历史成功事实，另行显示当前不可用；是否重新运行真实Smoke按具体授权执行。
 
 当前迁移提供四个受管 family：`generic.comfy.fixed`、`minimax_h3.dual_clock_t2va`、`minimax_h3.dual_clock_fl2va` 和 `minimax_h3.classified_ref2va`。它们是可审计版本数据，不表示任何模型、节点包或 Deployment 已在目标主机就绪。
 
@@ -230,7 +247,7 @@ Projector **不负责**保存工作流源 JSON、下载模型、创建 Deploymen
 1. 在目标**模型能力版本**审阅 `conditioning_contract` 对应 mode 的 `inputs`，包括 `entity_images`、`total_images`、`reference_videos`、`paired_video_audios`、`reference_audios` 的 `minimum_items/maximum_items`，以及用途、配对等拓扑约束；变更已发布模型时创建新版本，不原地扩大旧合同。
 2. 新建通用分类参考方案或复制已有版本。四组 `images/videos/video_audios/audios` 对应 image/video/audio/audio；每组选择“Projector 中配置”或“模型版本合同”。前者填写 minimum/maximum 且不能超出模型能力；后者按 `mode_input` 读取所选模式输入合同。端口使用有序名称列表或从 0 编号的完整前缀，二选一。
 3. 对同一候选生成新合同：`project_plan` 解析数量来源，冻结 `classified_references` 和收窄后的 conditioning 合同。通用在线校验检查最少、最多以及仅后部视频携带音轨的接线图；端口缺失、类型错误、数量超界或原端口已有连接时阻断。
-4. 提升为新 Workflow 版本并 Live Validate。[`_dynamic_reference_schema`](../backend/studio/services/workflow_smoke_fixtures.py) 把冻结合同转为 Smoke/生产表单：图片上限是 `min(total_images.maximum_items, entity_images.maximum_items)`，视频/音频还读取相应 topology；所有选择仍受物理素材总上限、用途和音轨配对约束。
+4. 提升为新 Workflow 版本并 Live Validate。工作流详情的 `workflow_input_schema` 展示冻结的参数和素材声明；实际资源烟测通过 `smoke-contract` 读取共同 Preparation 输入端口。图片数量由总量与分类限制共同约束，视频/音频还读取相应 topology；所有选择仍受物理素材总上限、用途和音轨配对约束。缺少默认值不会自动补测试值，默认值不符合范围或步长时明确报错，不静默缩小尺寸、改种子或对齐帧数。
 5. 本次 Smoke 表单按冻结范围增减素材；[`workflow_classified_references.py`](../backend/studio/services/workflow_classified_references.py) 根据规范化引用添加加载节点和连接。图片/视频/音频分别排序，配套音频保持所属视频位置。通过真实 Smoke 并核对媒体后再发布。
 
 例如希望一次选 1–3 张图片：相应模型 mode 的 `entity_images` 应允许 `minimum_items=1, maximum_items=3`，`total_images.maximum_items` 也至少为 3；节点、其他模式约束和总素材预算均须支持。这个数值只是配置例子，不是对当前模型能力的断言。只改 Projector、不生成新合同/工作流版本，旧 Smoke 表单不会变化；只提升工作流也不等于执行验收通过。
@@ -268,52 +285,27 @@ validate 使用受管素材 token 检查槽位结构，不要求先选择具体 
 
 模型文件路径以安全的 models 相对路径作为平台中立身份，`/` 与 `\\` 仅作为目录分隔符时视为同一文件。Live Validate 仍会从目标 Deployment 的实时 `object_info` 中解析且只接受唯一匹配，并把 ComfyUI 返回的精确原值（包括 Windows 反斜杠）冻结为 validation evidence 的 `submission_filename`；执行前仅用该证据值覆盖对应模型 widget。缺少匹配、出现多个规范化后等价的枚举，或冻结 graph 指向不同模型时均失败关闭。仅分隔符不同不需要重存 ComfyUI 工作流或重新导入版本。
 
-### 6.2 编辑本次 Smoke fixture
+### 6.2 配置本次基础烟测
 
-版本详情的 `smoke_fixture_schema` 是唯一表单来源：
+执行实例改造处于P4隔离验证阶段；真实服务切换状态以[改造计划](optimization/execution-instance-unification-plan.md)为准。工作流详情的 `workflow_input_schema` 仅供查看冻结参数、默认值与素材结构，不再提供烟测样例默认值。创建烟测使用正式 `smoke-options/smoke-contract` 和共用输入表单。
 
-- `parameters[]` 给出 semantic key、类型、required、min/max、multiple、options、selection group 和推荐值；
-- `asset_slots[]` 给出 semantic key、media kind、category、input slot、required 与 cardinality；
-- `available=false` 表示版本结构合同不能生成安全 fixture，必须修复并导入新版本。
+1. 先完成本版本Live Validate；基础工作流烟测只使用其已校验的部署，不能临时换成另一个实例。
+2. 明确选择本次能力、模式及人工通道或无提示词模式；基础图不隐含调用提示词策略。要验证策略与工作流组合，应在执行实例版本上创建组合烟测。
+3. 按返回合同填写参数、受管素材与人工通道。数量、顺序、配对、尺寸和对齐规则来自精确合同；不按H3或其他模型名推测，不自动填入业务样例。
+4. 使用共用受管素材选择或正式本地上传；上传后引用Asset身份。无素材输入时按合同提交空输入，不虚构素材或默认文件。
+5. 核对本次输入和授权后创建准备；从“准备与输入”恢复原Preparation，确认所需字段后继续。缺失输入明确等待人工，不自动调用辅助模型。
 
-操作规则：
+### 6.3 创建、继续与查看结果
 
-1. 参数仅提交 Schema 声明的 key，值必须满足类型、范围、枚举和联动约束。
-2. width/height 同一联动组必须成对修改；只改一边会失败。
-3. required 素材槽各选一个合格全局受管 Asset；optional 槽可以不选。
-4. 没有素材槽时保持空 Asset 列表即可，不妨碍导入、validate 或 smoke。
-5. 素材候选由 `GET /api/v1/assets/workflow-smoke-candidates/` 返回；必须 `smoke_eligible=true` 且 MIME 与槽位一致。
-6. 点击“创建烟测任务”前再次核对参数和素材摘要。
+原 `POST smoke-test` 使用明确的Idempotency-Key，首次返回202，同键同请求返回200；响应包含原SmokeAttempt与Preparation，Location指向准备详情。只有准备通过并进入原队列，才开始主烟测计时。
 
-### 6.2.1 动态 Ref2VA（图片 / 视频 / 音频）专项 smoke
+- 原任务包含preparing、queued、submitting、running、cancel_requested及终态；preparing不是远端正在执行。
+- 相同幂等请求只恢复原对象；不同请求遇到同一资源的活动或未消歧任务返回409，不通过fixture相同偷偷复用。
+- 从“准备与输入”可查看原素材、参数、通道与审核选择；任务和Workflow证据只引用同次准备、结果及摘要，不另存一份业务输入。
+- 成功必须有原worker已提交、冻结图匹配以及真实产物校验；过期或配置漂移不能被历史成功覆盖。
+- 提交结果不确定时先核对远端任务并在原任务消歧；人工结论不会改成烟测通过，也不刷新TTL。需要重测时明确创建新请求，不自动重发。
 
-动态 Ref2VA 不是把 T2VA 改名：H3 示例 Projector 的 detector 限定了 T8 双时钟基图；通用分类参考引擎本身不按模型名限定图族，按各方案的目标角色与端口配置在运行时注入实际引用。页面与服务端唯一读取当前版本的 `smoke_fixture_schema.dynamic_reference_modes`；图片、视频和音频数量、用途、配对、预处理、帧率与 steps 都不是页面常量。当前 H3 验收版本的示例规则为：
-
-1. `pictures`：0–9 项，使用角色、场景、道具或一张连续性图；Comfy 输入从 `ref_image_0` 开始连续编号，对应提示词 `<Picture 1>` 起。
-2. `videos`：0–3 项，目的只能是镜头运动、视频编辑或视频续接；每条须为已探测的 24fps CFR、2–15 秒 `reference_video`。
-3. 每条视频可选择其内嵌音轨，或选择一条 `reference_audio` 作为外部配套音频，二者严格互斥。配套音频与视频槽位一一对应，允许稀疏，例如只给第 2 条视频配音频。
-4. `audios`：0–3 项，为独立参考/复用音频。音频标签先按视频配套音频排序，再按独立音频排序，不能复用同一 Asset。
-5. 图片、视频、外部配套音频和独立音频合计最多 18 个物理素材。保存的 attempt 冻结每个素材的 ID、SHA-256、MIME、大小、时长、是否有音轨和视频源 fps；文件或元数据改变后不可复用证据。
-
-上述 purpose 只声明业务意图，不是 motion-only 内容隔离。原生 Ref2VA 会读取完整参考视频；正式生产应选择与目标镜头同一故事、且人物、场景、道具不冲突的素材。`metadata.fixture_scope=workflow_smoke` 的测试素材只用于本页真实烟测候选，不能进入 ProductionRun 生产选择器。
-
-动态 Ref2VA 的宽高与帧数以每个 attempt 冻结的 fixture 为准，24fps 与 4 steps 仍由审核合同固定。当前 H3 0.2MP 低成本烟测使用 `352×608`、`22 frames`、24fps、4 steps；22 帧是合法的 `5 + 17×1` 双时钟长度，对应约 0.917 秒输出。烟测通过不仅要求 ComfyUI 返回成功，还会用 FFprobe 检查输出 MP4 存在视频和音频轨，并逐项匹配该 attempt 冻结的宽高、帧率与帧数。若只得到无声视频或任一媒体事实不一致，attempt 必须失败，不能发布。
-
-### 6.3 创建并轮询真实 smoke
-
-点击“创建烟测任务”后，API 返回 202 与 `Location`。页面轮询持久 WorkflowSmokeAttempt：
-
-- active：`queued/submitting/running/cancel_requested`；
-- terminal：`succeeded/failed/cancelled/uncertain`。
-
-同一 workflow/deployment 已有 active attempt 时：
-
-- fixture hash 相同：复用现有 attempt；
-- fixture hash 不同：返回 `workflow_smoke_fixture_conflict`，等待或取消现有 attempt 后再提交。
-
-只有 attempt `succeeded`，且刷新版本后 `smoke_test_state=passed`、smoke evidence 中的 attempt、fixture、compiled graph、target 和输出证据互相匹配，才算 smoke 通过。
-
-轮询响应不包含原始 fixture 参数值；操作员只能在提交前核对本次页面选择，提交后以 `fixture_values_schema_version`、`fixture_values_size_bytes`、`fixture_values_sha256`、`fixture_sha256` 和 `asset_bindings` 核对持久事实。
+基础Deployment/Workflow的验收与执行实例组合验收分别展示，不能相互替代。动态分类参考与通用素材分组共用同一冻结输入和接线协议，不存在模型专用Smoke入口。
 
 ### 6.4 Publish
 
@@ -321,7 +313,7 @@ validate 使用受管素材 token 检查槽位结构，不要求先选择具体 
 
 1. validation 与 smoke 均为 passed；
 2. 两份 evidence hash 有效；
-3. smoke evidence 指向成功 attempt，且 fixture/compiled graph hash 完整；
+3. smoke evidence指向成功的基础Attempt与原Preparation，请求、编译图、产物及结果摘要完整且未过期；
 4. validated deployment 仍 active，Provider、model profile、artifact 与 target hash 未漂移；
 5. 本次 evidence 属于当前不可变 execution contract。
 
@@ -400,7 +392,7 @@ Live Validate 成功后版本进入 `validated`，验收页随即开放“本次
 
 | 状态或代码 | 恢复 |
 | --- | --- |
-| `workflow_fixture_contract_invalid` | 当前版本不能生成 fixture Schema；修复参数/binding/槽结构并导入新版本 |
+| `workflow_input_contract_invalid` | 当前版本的只读输入合同不可核验；检查冻结参数、语义绑定与素材槽结构，不能当作没有输入 |
 | HTTP 400 `invalid` 且 `details.fixture` 非空 | 修正未知/缺失参数、联动值、required 槽、MIME、checksum 或素材预算；无 attempt 写入 |
 | `workflow_smoke_fixture_conflict` | 同目标已有不同 fixture 的 active attempt；等待或取消后再创建 |
 | `cancelled_before_submission` | 未提交远端；确认仍需执行后可创建新 attempt |

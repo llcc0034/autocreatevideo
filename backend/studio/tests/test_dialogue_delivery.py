@@ -1,19 +1,20 @@
-from unittest.mock import patch
-
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from rest_framework.test import APIClient
+from studio.models import ShotCharacterRelation
 
-from studio.models import Shot
 from studio.services.dialogue import (
     DialogueContractError,
     normalize_dialogue,
     parse_delivery_annotation,
 )
 from studio.services.configuration import create_config_revision, publish_config_revision
-from studio.tests.media_prompt_fixtures import MediaPromptOptions, build_test_video_prompt
-from studio.services.script_breakdown import breakdown_script
-from studio.tests.factories import build_story
+from dataclasses import replace
+from studio.services.reference_context import compile_reference_context, reference_context_advisories
+from studio.services.reference_context_facts import ReferenceSubjectFacts
+from studio.services.prompt_compiler_contract import PromptBuildError
+from studio.tests.reference_rendering_fixtures import reference_context_fixture, reference_unit_fixture, rendering_config
+from studio.tests.factories import build_story, conditioning_contract
 
 
 class DialogueContractTests(TestCase):
@@ -22,6 +23,8 @@ class DialogueContractTests(TestCase):
             self.user, self.project, self.character, self.scene, self.episode,
             self.shot1, self.shot2,
         ) = build_story(username="dialogue-contract")
+        ShotCharacterRelation.objects.bulk_create([ShotCharacterRelation(shot=shot, character=self.character,
+            role=role, position=0) for shot in (self.shot1, self.shot2) for role in ("visible", "speaker")])
         self.project.production_settings = {"default_conditioning_mode": "T2VA"}
         self.project.save(update_fields=("production_settings", "updated_at"))
         self.client = APIClient()
@@ -101,12 +104,14 @@ class DialogueContractTests(TestCase):
         self.shot1.save(update_fields=("duration_ms", "updated_at"))
         dialogue = [{
             "speaker_id": "S1", "text": "原文。",
+            "language": "Chinese",
             "delivery": "softly", "voiceover": True,
             "start_ms": 500, "end_ms": 6500,
         }]
         response = self.client.patch(
             f"/api/v1/shots/{self.shot1.id}/",
-            {"duration_ms": 8_000, "dialogue": dialogue},
+            {"duration_ms": 8_000, "dialogue": dialogue, "character_relations": [
+                {"role":"speaker", "position":0, "character_id":str(self.character.pk)}]},
             format="json",
         )
         self.assertEqual(response.status_code, 200, response.data)
@@ -131,189 +136,65 @@ class DialogueContractTests(TestCase):
         self.assertEqual(rejected.status_code, 400, rejected.data)
         self.assertIn("未知字段", str(rejected.data))
 
-    def test_script_breakdown_preserves_parenthetical_delivery_and_voiceover(self):
-        self.episode.delete()
-        result = breakdown_script(
-            self.project,
-            "第1集：归来\n镜头1【时长=8秒】【首帧连续=否】【尾帧连续=是】：林默站在窗边。\n"
-            "[0-2.5秒] 动作：林默抬手触碰窗框。\n"
-            "[2.5-6秒] 林默（voiceover; softly, with controlled breath）：我又回到了这里。\n"
-            "镜头2：林默转身。\nS1（in a low, restrained voice）：别动。",
-            episode_count_hint=1,
-            multi_shot=True,
-            include_audio=True,
-            default_shot_media_type=Shot.MediaType.VIDEO,
-        )
-        shots = list(result.episodes[0].shots.order_by("number"))
-        self.assertEqual(shots[0].duration_ms, 8000)
-        self.assertFalse(shots[0].requires_first_frame_continuity)
-        self.assertTrue(shots[0].requires_last_frame_continuity)
-        self.assertIn("[0s–2.5s] 林默抬手触碰窗框。", shots[0].narrative)
-        self.assertEqual(shots[0].dialogue, [{
-            "speaker_id": "S1",
-            "text": "我又回到了这里。",
-            "start_ms": 2500,
-            "end_ms": 6000,
-            "delivery": "softly, with controlled breath",
-            "voiceover": True,
-        }])
-        self.assertEqual(shots[1].dialogue, [{
-            "speaker_id": "S1", "text": "别动。",
-            "start_ms": 0, "end_ms": 5000,
-            "delivery": "in a low, restrained voice",
-        }])
-        self.assertIn("场景与光线事实", shots[0].detailed_description)
-        self.assertIn("人物=林默", shots[0].detailed_description)
-        self.assertIn("结构化对白 0 条、画外音 1 条", shots[0].detailed_description)
-        self.assertIn("[0s–2.5s] 林默抬手触碰窗框。", shots[0].detailed_description)
-        self.assertIn("同步画内声景", shots[0].sound_effects)
-        self.assertIn("不得遮盖对白", shots[0].music)
-        self.assertIn("允许近乎无配乐", shots[0].music)
+    def render(self, context):
+        return compile_reference_context(context, rendering_config()["primitive_options"]["reference_context_ir_v1"]["rendering"])
 
-    def test_script_breakdown_keeps_full_authored_text_outside_display_titles(self):
-        self.episode.delete()
-        authored = "林默看着窗外" + ("雨" * 600)
-
-        result = breakdown_script(
-            self.project,
-            f"第1集：长文本\n镜头1：{authored}",
-            episode_count_hint=1,
-            multi_shot=False,
-            include_audio=True,
-            default_shot_media_type=Shot.MediaType.VIDEO,
-        )
-
-        episode = result.episodes[0]
-        shot = episode.shots.get(number=1)
-        self.assertIn(authored, episode.synopsis)
-        self.assertIn(authored, episode.script)
-        self.assertIn(authored, shot.narrative)
-        self.assertEqual(
-            len(shot.title),
-            Shot._meta.get_field("title").max_length,
-        )
-
-    def test_script_breakdown_warns_and_uses_configured_defaults_for_invalid_ranges(self):
-        self.episode.delete()
-        result = breakdown_script(
-            self.project,
-            "第1集：回退\n镜头1【时长=99秒】【首帧连续=未知】：林默停下。\n"
-            "[4-2秒] 动作：林默回头。\n[7-9秒] 林默：别动。",
-            episode_count_hint=1,
-            multi_shot=True,
-            include_audio=True,
-            default_shot_media_type=Shot.MediaType.VIDEO,
-            default_shot_duration_ms=5000,
-            default_first_frame_continuity=True,
-            default_last_frame_continuity=False,
-        )
-        shot = result.episodes[0].shots.get(number=1)
-        self.assertEqual(shot.duration_ms, 5000)
-        self.assertTrue(shot.requires_first_frame_continuity)
-        self.assertFalse(shot.requires_last_frame_continuity)
-        self.assertIn("[0s–5s] 林默回头。", shot.narrative)
-        self.assertEqual(shot.dialogue[0]["start_ms"], 0)
-        self.assertEqual(shot.dialogue[0]["end_ms"], 5000)
-        self.assertTrue(any("已使用默认" in warning for warning in result.warnings))
-        self.assertTrue(any("整镜范围" in warning for warning in result.warnings))
-
-    def test_h3_prompt_keeps_delivery_outside_verbatim_dialogue_and_closes_lips_for_vo(self):
-        self.shot1.dialogue = [{
-            "speaker_id": "S1",
-            "text": "别动！？“原样”",
-            "delivery": "in a low, restrained voice",
-            "voiceover": True,
-            "start_ms": 500,
-            "end_ms": 2500,
-        }]
-        self.shot1.requires_first_frame_continuity = True
-        self.shot1.requires_last_frame_continuity = True
-        result = build_test_video_prompt(
-            self.project, [self.shot1],
-            MediaPromptOptions(
-                model_identifier="minimax-h3-test", mode="T2VA", language_gate_mode="warn",
-            ),
-        )
+    def test_renderer_keeps_delivery_outside_verbatim_dialogue_and_closes_lips_for_vo(self):
+        entry = {"speaker_id": "S1", "text": "别动！？“原样”", "language": "Chinese", "delivery": "in a low, restrained voice",
+            "voiceover": True, "start_ms": 500, "end_ms": 2500, "subject": "", "voice_profile": "low voice"}
+        unit = reference_unit_fixture(dialogue=(entry,), requires_first_frame_continuity=True,
+            requires_last_frame_continuity=True)
+        text = str(self.render(reference_context_fixture(ordered_units=(unit,)))["fields"])
         for fact in ("500–2500 ms", "(S1)", "in a low, restrained voice",
                      "<d>[Chinese] 别动！？“原样”</d>", "Off-screen voiceover",
                      "No on-screen lip movement", "First-frame continuity required: True",
                      "last-frame continuity required: True"):
-            self.assertIn(fact, result.text)
-        self.assertNotIn("in a low, restrained voice</d>", result.text)
+            self.assertIn(fact, text)
+        self.assertNotIn("in a low, restrained voice</d>", text)
+        self.assertEqual(entry["text"], "别动！？“原样”")
 
-    def test_ref2va_voiceover_keeps_subject_and_speaker_binding(self):
-        self.shot1.dialogue = [{
-            "speaker_id": "S1", "text": "原文。", "voiceover": True,
-        }]
-        binding = {
-            "category": "character",
-            "entity_id": str(self.character.id),
-            "entity_name": self.character.name,
-            "input_label": "<Picture 1>",
-            "entity_label": "<Subject 1>",
-            "name": "canonical portrait",
-        }
-        with patch(
-            "studio.tests.media_prompt_fixtures.resolve_group_reference_bindings",
-            return_value=[binding],
-        ):
-            result = build_test_video_prompt(
-                self.project, [self.shot1],
-                MediaPromptOptions(
-                    model_identifier="minimax-h3-test", mode="Ref2VA", language_gate_mode="warn",
-                ),
-            )
-        for fact in ("0–3500 ms", "Off-screen voiceover <Subject 1> (S1)",
+    def test_ref2va_voiceover_keeps_explicit_subject_and_speaker_binding(self):
+        unit = reference_unit_fixture(subject_keys=(("character", "subject-1"),), dialogue=({
+            "speaker_id": "S1", "text": "原文。", "language": "Chinese", "voiceover": True, "delivery": "", "voice_profile": "",
+            "subject": "<Subject 1>", "start_ms": 123, "end_ms": 3123,
+        },))
+        context = reference_context_fixture(ordered_units=(unit,), mode="Ref2VA",
+            conditioning_mode_contract=conditioning_contract("Ref2VA", input_kind="classified_references")["modes"][0],
+            subject_facts=(ReferenceSubjectFacts("character", "subject-1", ()),),
+            reference_bindings=({"category": "character", "entity_id": "subject-1",
+                "input_label": "<Picture 1>", "entity_label": "<Subject 1>", "name": "canonical portrait"},))
+        text = str(self.render(context)["fields"])
+        for fact in ("123–3123 ms", "Off-screen voiceover <Subject 1> (S1)",
                      "<d>[Chinese] 原文。</d>", "No on-screen lip movement"):
-            self.assertIn(fact, result.text)
-        self.assertNotIn("<Subject 1> (S1) says", result.text)
+            self.assertIn(fact, text)
+        self.assertNotIn("<Subject 1> (S1) says", text)
 
-    def test_chinese_delivery_but_not_chinese_dialogue_enters_language_gate(self):
-        self.shot1.dialogue = [{
-            "speaker_id": "S1", "text": "中文对白。", "delivery": "压低声音",
-        }]
-        result = build_test_video_prompt(
-            self.project, [self.shot1],
-            MediaPromptOptions(
-                model_identifier="minimax-h3-test", mode="T2VA", language_gate_mode="warn",
-            ),
-        )
-        fields = result.payload["quality"]["fields_requiring_english_rewrite"]
-        self.assertIn("fixture_detailed_description", fields)
-        self.assertIn("压低声音", result.text)
-        self.assertFalse(any(value.endswith("对白原文") for value in fields))
+    def test_authored_dialogue_cannot_be_silently_discarded_when_audio_is_disabled(self):
+        unit = reference_unit_fixture(dialogue=({"speaker_id": "S1", "text": "中文对白。", "language": "Chinese",
+            "delivery": "压低声音", "voiceover": False, "start_ms": 100, "end_ms": 2100,
+            "subject": "", "voice_profile": ""},))
+        context = reference_context_fixture(ordered_units=(unit,))
+        text = str(self.render(context)["fields"])
+        self.assertIn("压低声音", text)
+        self.assertIn("<d>[Chinese] 中文对白。</d>", text)
+        with self.assertRaisesMessage(PromptBuildError, "不能静默丢弃"):
+            self.render(replace(context, include_audio=False))
+        explicit_silent = replace(context, include_audio=False, ordered_units=(replace(unit, dialogue=()),))
+        silent_text = str(self.render(explicit_silent)["fields"])
+        self.assertNotIn("压低声音", silent_text)
+        self.assertNotIn("中文对白。", silent_text)
 
-        audio_disabled = build_test_video_prompt(
-            self.project,
-            [self.shot1],
-            MediaPromptOptions(
-                model_identifier="minimax-h3-test",
-                mode="T2VA", include_audio=False, language_gate_mode="warn",
-            ),
-        )
-        disabled_fields = audio_disabled.payload["quality"]["fields_requiring_english_rewrite"]
-        self.assertNotIn("压低声音", audio_disabled.text)
-        self.assertNotIn("中文对白。", audio_disabled.text)
-
-    def test_ref2va_video_editing_skips_generation_word_count_guidance(self):
-        binding = {
-            "category": "video",
-            "entity_id": None,
-            "input_label": "<Video 1>",
-            "entity_label": "",
-            "purpose": "video_editing",
-            "prompt_hint": "Replace only the final hand movement.",
-            "audio_input_label": None,
-        }
-        with patch(
-            "studio.tests.media_prompt_fixtures.resolve_group_reference_bindings",
-            return_value=[binding],
-        ):
-            result = build_test_video_prompt(
-                self.project, [self.shot1],
-                MediaPromptOptions(
-                    model_identifier="minimax-h3-test", mode="Ref2VA", language_gate_mode="warn",
-                ),
-            )
-        warnings = result.payload["quality"]["warnings"]
-        self.assertFalse(any("350–500" in warning for warning in warnings))
+    def test_video_editing_uses_its_rule_not_motion_camera_guidance(self):
+        binding = {"category": "video", "input_label": "<Video 1>", "entity_label": "",
+            "purpose": "video_editing", "prompt_hint": "Edit."}
+        context = reference_context_fixture(ordered_units=(reference_unit_fixture(),), mode="Ref2VA",
+            conditioning_mode_contract=conditioning_contract("Ref2VA", input_kind="classified_references")["modes"][0],
+            reference_bindings=(binding,))
+        fields = self.render(context)["fields"]
+        self.assertIn("video editing", fields["summary"])
+        self.assertIn("partially_preserved", str(fields["retention_analysis"]))
+        config = rendering_config()["quality_advisories"]
+        self.assertEqual(reference_context_advisories(context, {}, config), [])
+        motion = replace(context, reference_bindings=({**binding, "purpose": "motion_camera_reference"},))
+        self.assertTrue(any("运镜参考说明未达到本策略建议值" in item
+            for item in reference_context_advisories(motion, {}, config)))

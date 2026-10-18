@@ -325,6 +325,17 @@ class ComfyUIContractTests(TestCase):
 
         self.assertEqual(report.node_count, 9)
 
+    def test_media_use_placeholders_cannot_be_submitted_or_mislabeled_as_uploaded(self):
+        from studio.services.workflow_media_tokens import workflow_media_use_token
+        token = workflow_media_use_token(item_key="actual-use", source_sha256="a" * 64)
+        graph = self.graph()
+        graph["6"]["inputs"]["file"] = token
+        for relaxed in (False, True):
+            with self.subTest(relaxed=relaxed), self.assertRaises(ComfyUIContractError) as caught:
+                validate_comfyui_api_contract(graph, self.object_info(), uploaded_paths={*self.CONFIRMED_UPLOADS, token},
+                    allow_managed_asset_tokens=relaxed, allow_unverified_upload_names=relaxed)
+            self.assertIn("未上传的素材使用占位符", str(caught.exception))
+
     def test_upload_loader_requires_live_choice_or_confirmed_task_upload(self):
         graph = self.graph()
         graph["6"]["inputs"]["file"] = "autoprompt/another-task/unknown.mp4"

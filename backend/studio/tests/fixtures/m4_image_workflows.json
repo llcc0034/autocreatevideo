@@ -1,0 +1,1965 @@
+{
+  "_comment": [
+    "Batch344 M4-08 isolated lifecycle contracts, exported read-only on 2026-10-06.",
+    "Source: E:/aicoding/autoprompt/.artifacts/batch344/image-workflow-contracts.json",
+    "Source file SHA256: ed384f4762666930811769bc9499a3ddaf6821e6443cf682986e043b257c5231",
+    "Exact Z Workflow 1fc7a10a5af0478a84a34c998d3d8ceb v4 and Qwen Workflow a86647e3f7ac491a94e17491ac8095ac v2.",
+    "Graph, input_contract, semantic bindings, requirements, model specification and projector definition are copied without modifying their contract content.",
+    "No operational validation, Smoke, preparation, request, response or acceptance result is included.",
+    "Tests allocate new isolated workflow/artifact IDs and produce their own lifecycle evidence; execution_contract_sha256 below is source provenance, not the hash of the new isolated artifact bindings."
+  ],
+  "z_image": {
+    "id": "1fc7a10a5af0478a84a34c998d3d8ceb",
+    "version": 4,
+    "graph": {
+      "1": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "managed prompt",
+          "clip": [
+            "4",
+            0
+          ]
+        }
+      },
+      "2": {
+        "class_type": "KSampler",
+        "inputs": {
+          "model": [
+            "6",
+            0
+          ],
+          "seed": 287675003516752,
+          "steps": 9,
+          "cfg": 1,
+          "sampler_name": "euler",
+          "scheduler": "simple",
+          "positive": [
+            "1",
+            0
+          ],
+          "negative": [
+            "8",
+            0
+          ],
+          "latent_image": [
+            "9",
+            0
+          ],
+          "denoise": 1
+        }
+      },
+      "3": {
+        "class_type": "VAEDecode",
+        "inputs": {
+          "samples": [
+            "2",
+            0
+          ],
+          "vae": [
+            "5",
+            0
+          ]
+        }
+      },
+      "4": {
+        "class_type": "CLIPLoader",
+        "inputs": {
+          "clip_name": "qwen_3_4b.safetensors",
+          "type": "lumina2",
+          "device": "default"
+        }
+      },
+      "5": {
+        "class_type": "VAELoader",
+        "inputs": {
+          "vae_name": "ae.safetensors"
+        }
+      },
+      "6": {
+        "class_type": "ModelSamplingAuraFlow",
+        "inputs": {
+          "model": [
+            "7",
+            0
+          ],
+          "shift": 3
+        }
+      },
+      "7": {
+        "class_type": "UNETLoader",
+        "inputs": {
+          "unet_name": "z_image_turbo_bf16.safetensors",
+          "weight_dtype": "default"
+        }
+      },
+      "8": {
+        "class_type": "CLIPTextEncode",
+        "inputs": {
+          "text": "managed prompt",
+          "clip": [
+            "4",
+            0
+          ]
+        }
+      },
+      "9": {
+        "class_type": "EmptySD3LatentImage",
+        "inputs": {
+          "width": 768,
+          "height": 1280,
+          "batch_size": 1
+        }
+      },
+      "10": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "images": [
+            "3",
+            0
+          ],
+          "filename_prefix": "autoprompt/managed-output"
+        }
+      }
+    },
+    "graph_sha256": "bdb0dcb3799b14038a7d804e5a80fa4d89fc14268b6b7dec1bc62f922608caeb",
+    "input_contract": {
+      "schema_version": 3,
+      "workflow_mode": "semantic",
+      "compiler": {
+        "id": "generic.comfy",
+        "version": 1
+      },
+      "parameters": {
+        "prompt.positive": {
+          "type": "string",
+          "required": true
+        },
+        "prompt.negative": {
+          "type": "string",
+          "required": true
+        },
+        "output.prefix": {
+          "type": "string",
+          "required": true
+        },
+        "model.text_encoder_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "text_encoder_1"
+        },
+        "model.vae_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "vae_1"
+        },
+        "model.diffusion_model_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "diffusion_model_1"
+        },
+        "generation.batch_size": {
+          "type": "integer",
+          "required": true,
+          "default": 1,
+          "min": 1,
+          "max": 4096
+        },
+        "image.height": {
+          "type": "integer",
+          "required": true,
+          "default": 1280,
+          "min": 16,
+          "max": 16384,
+          "multiple_of": 16,
+          "selection_group": "resolution.explicit.node_9"
+        },
+        "image.width": {
+          "type": "integer",
+          "required": true,
+          "default": 768,
+          "min": 16,
+          "max": 16384,
+          "multiple_of": 16,
+          "selection_group": "resolution.explicit.node_9"
+        },
+        "parameter.c_l_i_p_loader.device": {
+          "type": "enum",
+          "required": true,
+          "default": "default",
+          "min": null,
+          "max": null,
+          "options": [
+            "default",
+            "cpu"
+          ]
+        },
+        "parameter.c_l_i_p_loader.type": {
+          "type": "enum",
+          "required": true,
+          "default": "lumina2",
+          "min": null,
+          "max": null,
+          "options": [
+            "stable_diffusion",
+            "stable_cascade",
+            "sd3",
+            "stable_audio",
+            "mochi",
+            "ltxv",
+            "pixart",
+            "cosmos",
+            "lumina2",
+            "wan",
+            "hidream",
+            "chroma",
+            "ace",
+            "omnigen2",
+            "qwen_image",
+            "hunyuan_image",
+            "flux2",
+            "ovis",
+            "longcat_image",
+            "cogvideox",
+            "lens",
+            "pixeldit",
+            "ideogram4",
+            "boogu",
+            "krea2",
+            "joyimage",
+            "mage",
+            "minimax"
+          ]
+        },
+        "parameter.model_sampling_aura_flow.shift": {
+          "type": "number",
+          "required": true,
+          "default": 3,
+          "min": 0.0,
+          "max": 100.0
+        },
+        "parameter.u_n_e_t_loader.weight_dtype": {
+          "type": "enum",
+          "required": true,
+          "default": "default",
+          "min": null,
+          "max": null,
+          "options": [
+            "default",
+            "fp8_e4m3fn",
+            "fp8_e4m3fn_fast",
+            "fp8_e5m2"
+          ]
+        },
+        "sampling.cfg_scale": {
+          "type": "number",
+          "required": true,
+          "default": 1,
+          "min": 0.0,
+          "max": 100.0
+        },
+        "sampling.denoise": {
+          "type": "number",
+          "required": true,
+          "default": 1,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "sampling.sampler": {
+          "type": "enum",
+          "required": true,
+          "default": "euler",
+          "min": null,
+          "max": null,
+          "options": [
+            "euler",
+            "euler_cfg_pp",
+            "euler_ancestral",
+            "euler_ancestral_cfg_pp",
+            "heun",
+            "heunpp2",
+            "exp_heun_2_x0",
+            "exp_heun_2_x0_sde",
+            "dpm_2",
+            "dpm_2_ancestral",
+            "lms",
+            "dpm_fast",
+            "dpm_adaptive",
+            "dpmpp_2s_ancestral",
+            "dpmpp_2s_ancestral_cfg_pp",
+            "dpmpp_sde",
+            "dpmpp_sde_gpu",
+            "dpmpp_2m",
+            "dpmpp_2m_cfg_pp",
+            "dpmpp_2m_sde",
+            "dpmpp_2m_sde_gpu",
+            "dpmpp_2m_sde_heun",
+            "dpmpp_2m_sde_heun_gpu",
+            "dpmpp_3m_sde",
+            "dpmpp_3m_sde_gpu",
+            "ddpm",
+            "lcm",
+            "ipndm",
+            "ipndm_v",
+            "deis",
+            "res_multistep",
+            "res_multistep_cfg_pp",
+            "res_multistep_ancestral",
+            "res_multistep_ancestral_cfg_pp",
+            "gradient_estimation",
+            "gradient_estimation_cfg_pp",
+            "er_sde",
+            "seeds_2",
+            "seeds_3",
+            "sa_solver",
+            "sa_solver_pece",
+            "ddim",
+            "uni_pc",
+            "uni_pc_bh2"
+          ]
+        },
+        "sampling.scheduler": {
+          "type": "enum",
+          "required": true,
+          "default": "simple",
+          "min": null,
+          "max": null,
+          "options": [
+            "simple",
+            "sgm_uniform",
+            "karras",
+            "exponential",
+            "ddim_uniform",
+            "beta",
+            "normal",
+            "linear_quadratic",
+            "kl_optimal"
+          ]
+        },
+        "sampling.seed": {
+          "type": "integer",
+          "required": true,
+          "default": 287675003516752,
+          "min": 0,
+          "max": 9007199254740991
+        },
+        "sampling.steps": {
+          "type": "integer",
+          "required": true,
+          "default": 9,
+          "min": 1,
+          "max": 10000
+        }
+      },
+      "resolution_strategy": {
+        "mode": "explicit_width_height",
+        "node_ids": [
+          "9"
+        ]
+      },
+      "required_dimension_multiple": 16,
+      "outputs": {
+        "primary": {
+          "node_id": "10",
+          "kind": "image",
+          "required": true
+        }
+      },
+      "workflow_adapters": {
+        "compiler": "generic.comfy/v1",
+        "output": "comfy.primary/v1",
+        "dynamic": "none/v1"
+      },
+      "projector_asset_slots": [],
+      "capability": "image.text_to_image",
+      "contract_projector": {
+        "id": "z_image.text_to_image",
+        "version": 1,
+        "version_id": "8fdc158f-05d3-400e-92ef-412928eb5706",
+        "definition_sha256": "3a7b4b91cc843b5474c02ede5dc7f6977695a3ae996516d81c586285cb8ca768",
+        "provider_driver_type": "comfyui",
+        "operation": "workflow.import",
+        "output_kind": "image",
+        "engine": {
+          "key": "generic.fixed",
+          "version": 1
+        }
+      }
+    },
+    "input_contract_sha256": "6b32ec28dd57c9ce59bcb4111288bed6b2e89e4a3d88a8d1cb89d99a518f880c",
+    "compiler_id": "generic.comfy",
+    "compiler_version": 1,
+    "execution_contract_sha256": "3e0ed39d730451ed1af0fe52bddc146d208965a412ae4d36a9bbe14f50fb5022",
+    "semantic_bindings": [
+      {
+        "semantic_key": "generation.batch_size",
+        "node_id": "9",
+        "input_name": "batch_size",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "image.height",
+        "node_id": "9",
+        "input_name": "height",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "image.width",
+        "node_id": "9",
+        "input_name": "width",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.diffusion_model_1.filename",
+        "node_id": "7",
+        "input_name": "unet_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.text_encoder_1.filename",
+        "node_id": "4",
+        "input_name": "clip_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.vae_1.filename",
+        "node_id": "5",
+        "input_name": "vae_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "output.prefix",
+        "node_id": "10",
+        "input_name": "filename_prefix",
+        "value_type": "string",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.c_l_i_p_loader.device",
+        "node_id": "4",
+        "input_name": "device",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.c_l_i_p_loader.type",
+        "node_id": "4",
+        "input_name": "type",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.model_sampling_aura_flow.shift",
+        "node_id": "6",
+        "input_name": "shift",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.u_n_e_t_loader.weight_dtype",
+        "node_id": "7",
+        "input_name": "weight_dtype",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "prompt.negative",
+        "node_id": "8",
+        "input_name": "text",
+        "value_type": "string",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "prompt.positive",
+        "node_id": "1",
+        "input_name": "text",
+        "value_type": "string",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.cfg_scale",
+        "node_id": "2",
+        "input_name": "cfg",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.denoise",
+        "node_id": "2",
+        "input_name": "denoise",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.sampler",
+        "node_id": "2",
+        "input_name": "sampler_name",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.scheduler",
+        "node_id": "2",
+        "input_name": "scheduler",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.seed",
+        "node_id": "2",
+        "input_name": "seed",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.steps",
+        "node_id": "2",
+        "input_name": "steps",
+        "value_type": "integer",
+        "is_required": 1
+      }
+    ],
+    "model_requirements": [
+      {
+        "role": "diffusion_model",
+        "alias": "diffusion_model_1",
+        "expected_filename": "z_image_turbo_bf16.safetensors",
+        "expected_sha256": "2407613050b809ffdff18a4ac99af83ea6b95443ecebdf80e064a79c825574a6",
+        "is_required": 1
+      },
+      {
+        "role": "text_encoder",
+        "alias": "text_encoder_1",
+        "expected_filename": "qwen_3_4b.safetensors",
+        "expected_sha256": "6c671498573ac2f7a5501502ccce8d2b08ea6ca2f661c458e708f36b36edfc5a",
+        "is_required": 1
+      },
+      {
+        "role": "vae",
+        "alias": "vae_1",
+        "expected_filename": "ae.safetensors",
+        "expected_sha256": "afc8e28272cd15db3919bacdb6918ce9c1ed22e96cb12c4d5ed0fba823529e38",
+        "is_required": 1
+      }
+    ],
+    "model_profile": {
+      "model_identifier": "z-image-turbo",
+      "specification": {
+        "schema_version": 1,
+        "capabilities": [
+          "image.text_to_image"
+        ],
+        "model_family": "z-image",
+        "execution_monitoring": {
+          "schema_version": 1
+        }
+      },
+      "specification_sha256": "893f1f3b40204fdabc8571bb68f7f6ded3c15331f6c1120c63275ba7933cfd70"
+    },
+    "projector": {
+      "version": 1,
+      "provider_driver_type": "comfyui",
+      "operation": "workflow.import",
+      "output_kind": "image",
+      "engine_key": "generic.fixed",
+      "engine_version": 1,
+      "definition": {
+        "schema_version": 1,
+        "priority": 100,
+        "detector": {
+          "fallback": false,
+          "allow_other_nodes": false,
+          "node_counts": {
+            "CLIPLoader": 1,
+            "CLIPTextEncode": 2,
+            "EmptySD3LatentImage": 1,
+            "KSampler": 1,
+            "ModelSamplingAuraFlow": 1,
+            "SaveImage": 1,
+            "UNETLoader": 1,
+            "VAEDecode": 1,
+            "VAELoader": 1
+          },
+          "optional_node_counts": {},
+          "input_equals": []
+        },
+        "output_nodes": {
+          "SaveImage": "image"
+        },
+        "model_selectors": [
+          {
+            "node_type": "CLIPLoader",
+            "input_name": "clip_name",
+            "role": "text_encoder",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          },
+          {
+            "node_type": "UNETLoader",
+            "input_name": "unet_name",
+            "role": "diffusion_model",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          },
+          {
+            "node_type": "VAELoader",
+            "input_name": "vae_name",
+            "role": "vae",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          }
+        ],
+        "node_roles": {
+          "node_c_l_i_p_loader": {
+            "node_type": "CLIPLoader",
+            "cardinality": "one"
+          },
+          "node_empty_s_d3_latent_image": {
+            "node_type": "EmptySD3LatentImage",
+            "cardinality": "one"
+          },
+          "node_k_sampler": {
+            "node_type": "KSampler",
+            "cardinality": "one"
+          },
+          "node_model_sampling_aura_flow": {
+            "node_type": "ModelSamplingAuraFlow",
+            "cardinality": "one"
+          },
+          "output": {
+            "node_type": "SaveImage",
+            "cardinality": "one"
+          },
+          "node_u_n_e_t_loader": {
+            "node_type": "UNETLoader",
+            "cardinality": "one"
+          },
+          "node_v_a_e_decode": {
+            "node_type": "VAEDecode",
+            "cardinality": "one"
+          },
+          "node_v_a_e_loader": {
+            "node_type": "VAELoader",
+            "cardinality": "one"
+          }
+        },
+        "required_edges": [
+          {
+            "from_role": "node_v_a_e_decode",
+            "output_index": 0,
+            "to_role": "output",
+            "input_name": "images"
+          },
+          {
+            "from_role": "node_empty_s_d3_latent_image",
+            "output_index": 0,
+            "to_role": "node_k_sampler",
+            "input_name": "latent_image"
+          },
+          {
+            "from_role": "node_model_sampling_aura_flow",
+            "output_index": 0,
+            "to_role": "node_k_sampler",
+            "input_name": "model"
+          },
+          {
+            "from_role": "node_k_sampler",
+            "output_index": 0,
+            "to_role": "node_v_a_e_decode",
+            "input_name": "samples"
+          },
+          {
+            "from_role": "node_v_a_e_loader",
+            "output_index": 0,
+            "to_role": "node_v_a_e_decode",
+            "input_name": "vae"
+          },
+          {
+            "from_role": "node_u_n_e_t_loader",
+            "output_index": 0,
+            "to_role": "node_model_sampling_aura_flow",
+            "input_name": "model"
+          }
+        ],
+        "parameter_policies": [
+          {
+            "semantic_key": "generation.batch_size",
+            "node_role": "node_empty_s_d3_latent_image",
+            "input_name": "batch_size",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "image.height",
+            "node_role": "node_empty_s_d3_latent_image",
+            "input_name": "height",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "image.width",
+            "node_role": "node_empty_s_d3_latent_image",
+            "input_name": "width",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.c_l_i_p_loader.device",
+            "node_role": "node_c_l_i_p_loader",
+            "input_name": "device",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.c_l_i_p_loader.type",
+            "node_role": "node_c_l_i_p_loader",
+            "input_name": "type",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.model_sampling_aura_flow.shift",
+            "node_role": "node_model_sampling_aura_flow",
+            "input_name": "shift",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.u_n_e_t_loader.weight_dtype",
+            "node_role": "node_u_n_e_t_loader",
+            "input_name": "weight_dtype",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.cfg_scale",
+            "node_role": "node_k_sampler",
+            "input_name": "cfg",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.denoise",
+            "node_role": "node_k_sampler",
+            "input_name": "denoise",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.sampler",
+            "node_role": "node_k_sampler",
+            "input_name": "sampler_name",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.scheduler",
+            "node_role": "node_k_sampler",
+            "input_name": "scheduler",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.seed",
+            "node_role": "node_k_sampler",
+            "input_name": "seed",
+            "policy": "runtime",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.steps",
+            "node_role": "node_k_sampler",
+            "input_name": "steps",
+            "policy": "object_info",
+            "value": null
+          }
+        ],
+        "asset_slots": [],
+        "adapters": {
+          "compiler": "generic.comfy/v1",
+          "output": "comfy.primary/v1",
+          "dynamic": "none/v1"
+        },
+        "projection": {
+          "kind": "generic_fixed",
+          "config": {
+            "capability": "image.text_to_image"
+          }
+        }
+      },
+      "definition_sha256": "3a7b4b91cc843b5474c02ede5dc7f6977695a3ae996516d81c586285cb8ca768"
+    }
+  },
+  "qwen_edit": {
+    "id": "a86647e3f7ac491a94e17491ac8095ac",
+    "version": 2,
+    "graph": {
+      "1": {
+        "class_type": "TextEncodeQwenImageEditPlus",
+        "inputs": {
+          "clip": [
+            "4",
+            0
+          ],
+          "prompt": "managed prompt",
+          "vae": [
+            "7",
+            0
+          ],
+          "image1": [
+            "8",
+            0
+          ],
+          "image2": [
+            "ag_references_1_8",
+            0
+          ],
+          "image3": [
+            "ag_references_2_8",
+            0
+          ]
+        }
+      },
+      "2": {
+        "class_type": "KSampler",
+        "inputs": {
+          "model": [
+            "13",
+            0
+          ],
+          "seed": 779843715960775,
+          "steps": 4,
+          "cfg": 1,
+          "sampler_name": "euler",
+          "scheduler": "simple",
+          "positive": [
+            "1",
+            0
+          ],
+          "negative": [
+            "3",
+            0
+          ],
+          "latent_image": [
+            "6",
+            0
+          ],
+          "denoise": 1
+        }
+      },
+      "3": {
+        "class_type": "TextEncodeQwenImageEditPlus",
+        "inputs": {
+          "clip": [
+            "4",
+            0
+          ],
+          "prompt": "managed prompt",
+          "vae": [
+            "7",
+            0
+          ],
+          "image1": [
+            "8",
+            0
+          ],
+          "image2": [
+            "ag_references_1_8",
+            0
+          ],
+          "image3": [
+            "ag_references_2_8",
+            0
+          ]
+        }
+      },
+      "4": {
+        "class_type": "CLIPLoader",
+        "inputs": {
+          "clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+          "type": "qwen_image",
+          "device": "default"
+        }
+      },
+      "5": {
+        "class_type": "ModelSamplingAuraFlow",
+        "inputs": {
+          "model": [
+            "12",
+            0
+          ],
+          "shift": 3
+        }
+      },
+      "6": {
+        "class_type": "EmptySD3LatentImage",
+        "inputs": {
+          "width": 1696,
+          "height": 768,
+          "batch_size": 1
+        }
+      },
+      "7": {
+        "class_type": "VAELoader",
+        "inputs": {
+          "vae_name": "qwen_image_vae.safetensors"
+        }
+      },
+      "8": {
+        "class_type": "LoadImage",
+        "inputs": {
+          "image": "__AUTOPROMPT_ASSET__:managed"
+        }
+      },
+      "9": {
+        "class_type": "VAEDecode",
+        "inputs": {
+          "samples": [
+            "2",
+            0
+          ],
+          "vae": [
+            "7",
+            0
+          ]
+        }
+      },
+      "10": {
+        "class_type": "SaveImage",
+        "inputs": {
+          "images": [
+            "9",
+            0
+          ],
+          "filename_prefix": "autoprompt/managed-output"
+        }
+      },
+      "11": {
+        "class_type": "DiffusionModelLoaderKJ",
+        "inputs": {
+          "model_name": "qwen_image_edit_2511_int8_convrot.safetensors",
+          "weight_dtype": "default",
+          "compute_dtype": "default",
+          "patch_cublaslinear": false,
+          "sage_attention": "disabled",
+          "enable_fp16_accumulation": false
+        }
+      },
+      "12": {
+        "class_type": "LoraLoaderModelOnly",
+        "inputs": {
+          "model": [
+            "11",
+            0
+          ],
+          "lora_name": "qwen2511\\Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+          "strength_model": 1
+        }
+      },
+      "13": {
+        "class_type": "CFGNorm",
+        "inputs": {
+          "model": [
+            "5",
+            0
+          ],
+          "strength": 1,
+          "pre_cfg": false
+        }
+      },
+      "ag_references_1_8": {
+        "class_type": "LoadImage",
+        "inputs": {
+          "image": "__AUTOPROMPT_ASSET__:managed"
+        }
+      },
+      "ag_references_2_8": {
+        "class_type": "LoadImage",
+        "inputs": {
+          "image": "__AUTOPROMPT_ASSET__:managed"
+        }
+      }
+    },
+    "graph_sha256": "297a512dcdf5f4a27c9306d76722eadbf24aa2460244dc0b1b0ae5533935ea36",
+    "input_contract": {
+      "schema_version": 3,
+      "workflow_mode": "semantic",
+      "compiler": {
+        "id": "generic.comfy",
+        "version": 2
+      },
+      "parameters": {
+        "asset.image.source": {
+          "type": "asset_image",
+          "required": true,
+          "input_slot": 1,
+          "asset_category": "image",
+          "media_kind": "image",
+          "min_items": 1,
+          "max_items": 1,
+          "asset_group": "references"
+        },
+        "asset.image.source_2": {
+          "type": "asset_image",
+          "required": false,
+          "input_slot": 2,
+          "asset_category": "image",
+          "media_kind": "image",
+          "min_items": 0,
+          "max_items": 1,
+          "asset_group": "references"
+        },
+        "asset.image.source_3": {
+          "type": "asset_image",
+          "required": false,
+          "input_slot": 3,
+          "asset_category": "image",
+          "media_kind": "image",
+          "min_items": 0,
+          "max_items": 1,
+          "asset_group": "references"
+        },
+        "prompt.positive": {
+          "type": "string",
+          "required": true
+        },
+        "prompt.negative": {
+          "type": "string",
+          "required": true
+        },
+        "output.prefix": {
+          "type": "string",
+          "required": true
+        },
+        "model.text_encoder_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "text_encoder_1"
+        },
+        "model.vae_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "vae_1"
+        },
+        "model.diffusion_model_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "diffusion_model_1"
+        },
+        "model.lora_1.filename": {
+          "type": "model_artifact",
+          "required": true,
+          "requirement_alias": "lora_1"
+        },
+        "generation.batch_size": {
+          "type": "integer",
+          "required": true,
+          "default": 1,
+          "min": 1,
+          "max": 4096
+        },
+        "image.height": {
+          "type": "integer",
+          "required": true,
+          "default": 768,
+          "min": 16,
+          "max": 16384,
+          "multiple_of": 16,
+          "selection_group": "resolution.explicit.node_6"
+        },
+        "image.width": {
+          "type": "integer",
+          "required": true,
+          "default": 1696,
+          "min": 16,
+          "max": 16384,
+          "multiple_of": 16,
+          "selection_group": "resolution.explicit.node_6"
+        },
+        "parameter.c_f_g_norm.strength": {
+          "type": "number",
+          "required": true,
+          "default": 1,
+          "min": 0.0,
+          "max": 100.0
+        },
+        "parameter.c_l_i_p_loader.device": {
+          "type": "enum",
+          "required": true,
+          "default": "default",
+          "min": null,
+          "max": null,
+          "options": [
+            "default",
+            "cpu"
+          ]
+        },
+        "parameter.c_l_i_p_loader.type": {
+          "type": "enum",
+          "required": true,
+          "default": "qwen_image",
+          "min": null,
+          "max": null,
+          "options": [
+            "stable_diffusion",
+            "stable_cascade",
+            "sd3",
+            "stable_audio",
+            "mochi",
+            "ltxv",
+            "pixart",
+            "cosmos",
+            "lumina2",
+            "wan",
+            "hidream",
+            "chroma",
+            "ace",
+            "omnigen2",
+            "qwen_image",
+            "hunyuan_image",
+            "flux2",
+            "ovis",
+            "longcat_image",
+            "cogvideox",
+            "lens",
+            "pixeldit",
+            "ideogram4",
+            "boogu",
+            "krea2",
+            "joyimage",
+            "mage",
+            "minimax"
+          ]
+        },
+        "parameter.diffusion_model_loader_k_j.compute_dtype": {
+          "type": "enum",
+          "required": true,
+          "default": "default",
+          "min": null,
+          "max": null,
+          "options": [
+            "default",
+            "fp16",
+            "bf16",
+            "fp32"
+          ]
+        },
+        "parameter.diffusion_model_loader_k_j.sage_attention": {
+          "type": "enum",
+          "required": true,
+          "default": "disabled",
+          "min": null,
+          "max": null,
+          "options": [
+            "disabled",
+            "auto",
+            "sageattn_qk_int8_pv_fp16_cuda",
+            "sageattn_qk_int8_pv_fp16_triton",
+            "sageattn_qk_int8_pv_fp8_cuda",
+            "sageattn_qk_int8_pv_fp8_cuda++",
+            "sageattn3",
+            "sageattn3_per_block_mean"
+          ]
+        },
+        "parameter.diffusion_model_loader_k_j.weight_dtype": {
+          "type": "enum",
+          "required": true,
+          "default": "default",
+          "min": null,
+          "max": null,
+          "options": [
+            "default",
+            "fp8_e4m3fn",
+            "fp8_e4m3fn_fast",
+            "fp8_e5m2",
+            "fp16",
+            "bf16",
+            "fp32"
+          ]
+        },
+        "parameter.lora_loader_model_only.strength_model": {
+          "type": "number",
+          "required": true,
+          "default": 1,
+          "min": -100.0,
+          "max": 100.0
+        },
+        "parameter.model_sampling_aura_flow.shift": {
+          "type": "number",
+          "required": true,
+          "default": 3,
+          "min": 0.0,
+          "max": 100.0
+        },
+        "sampling.cfg_scale": {
+          "type": "number",
+          "required": true,
+          "default": 1,
+          "min": 0.0,
+          "max": 100.0
+        },
+        "sampling.denoise": {
+          "type": "number",
+          "required": true,
+          "default": 1,
+          "min": 0.0,
+          "max": 1.0
+        },
+        "sampling.sampler": {
+          "type": "enum",
+          "required": true,
+          "default": "euler",
+          "min": null,
+          "max": null,
+          "options": [
+            "euler",
+            "euler_cfg_pp",
+            "euler_ancestral",
+            "euler_ancestral_cfg_pp",
+            "heun",
+            "heunpp2",
+            "exp_heun_2_x0",
+            "exp_heun_2_x0_sde",
+            "dpm_2",
+            "dpm_2_ancestral",
+            "lms",
+            "dpm_fast",
+            "dpm_adaptive",
+            "dpmpp_2s_ancestral",
+            "dpmpp_2s_ancestral_cfg_pp",
+            "dpmpp_sde",
+            "dpmpp_sde_gpu",
+            "dpmpp_2m",
+            "dpmpp_2m_cfg_pp",
+            "dpmpp_2m_sde",
+            "dpmpp_2m_sde_gpu",
+            "dpmpp_2m_sde_heun",
+            "dpmpp_2m_sde_heun_gpu",
+            "dpmpp_3m_sde",
+            "dpmpp_3m_sde_gpu",
+            "ddpm",
+            "lcm",
+            "ipndm",
+            "ipndm_v",
+            "deis",
+            "res_multistep",
+            "res_multistep_cfg_pp",
+            "res_multistep_ancestral",
+            "res_multistep_ancestral_cfg_pp",
+            "gradient_estimation",
+            "gradient_estimation_cfg_pp",
+            "er_sde",
+            "seeds_2",
+            "seeds_3",
+            "sa_solver",
+            "sa_solver_pece",
+            "ddim",
+            "uni_pc",
+            "uni_pc_bh2"
+          ]
+        },
+        "sampling.scheduler": {
+          "type": "enum",
+          "required": true,
+          "default": "simple",
+          "min": null,
+          "max": null,
+          "options": [
+            "simple",
+            "sgm_uniform",
+            "karras",
+            "exponential",
+            "ddim_uniform",
+            "beta",
+            "normal",
+            "linear_quadratic",
+            "kl_optimal"
+          ]
+        },
+        "sampling.seed": {
+          "type": "integer",
+          "required": true,
+          "default": 779843715960775,
+          "min": 0,
+          "max": 9007199254740991
+        },
+        "sampling.steps": {
+          "type": "integer",
+          "required": true,
+          "default": 4,
+          "min": 1,
+          "max": 10000
+        }
+      },
+      "resolution_strategy": {
+        "mode": "explicit_width_height",
+        "node_ids": [
+          "6"
+        ]
+      },
+      "required_dimension_multiple": 16,
+      "outputs": {
+        "primary": {
+          "node_id": "10",
+          "kind": "image",
+          "required": true
+        }
+      },
+      "workflow_adapters": {
+        "compiler": "generic.comfy/v2",
+        "output": "comfy.primary/v1",
+        "dynamic": "generic.asset_groups/v1"
+      },
+      "projector_asset_slots": [
+        {
+          "key": "references",
+          "media_kind": "image",
+          "dynamic": true,
+          "contract_source": "workflow"
+        }
+      ],
+      "capability": "image.image_to_image",
+      "asset_groups": [
+        {
+          "key": "references",
+          "media_kind": "image",
+          "min_items": 1,
+          "max_items": 3,
+          "source_node": "8",
+          "branch_nodes": [
+            "8"
+          ],
+          "output_node": "8",
+          "output_index": 0,
+          "target_nodes": [
+            "1",
+            "3"
+          ],
+          "input_names": [
+            "image1",
+            "image2",
+            "image3"
+          ],
+          "wiring": "ordered_ports",
+          "reducer_node": "",
+          "reducer_inputs": [],
+          "reducer_output_index": 0,
+          "semantic_keys": [
+            "asset.image.source",
+            "asset.image.source_2",
+            "asset.image.source_3"
+          ],
+          "expanded_branches": [
+            [
+              "8"
+            ],
+            [
+              "ag_references_1_8"
+            ],
+            [
+              "ag_references_2_8"
+            ]
+          ]
+        }
+      ],
+      "contract_projector": {
+        "id": "qwen_edit.image_to_image",
+        "version": 1,
+        "version_id": "bdb002f8-bcd3-495c-be4c-14f24d4eea93",
+        "definition_sha256": "e20534f6f44751dd46716a79f941718f47d1a50772b85975f898ad046740c4e3",
+        "provider_driver_type": "comfyui",
+        "operation": "workflow.import",
+        "output_kind": "image",
+        "engine": {
+          "key": "generic.references",
+          "version": 1
+        }
+      }
+    },
+    "input_contract_sha256": "4e046101603bec5641a45d99344b8d6989dc6d626e92b1b4c4622d77a747dda2",
+    "compiler_id": "generic.comfy",
+    "compiler_version": 2,
+    "execution_contract_sha256": "19024a6ee08fe8e8f2a5528a769e319615549efff8c712d0178725743c2907f8",
+    "semantic_bindings": [
+      {
+        "semantic_key": "asset.image.source",
+        "node_id": "8",
+        "input_name": "image",
+        "value_type": "asset_image",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "asset.image.source_2",
+        "node_id": "ag_references_1_8",
+        "input_name": "image",
+        "value_type": "asset_image",
+        "is_required": 0
+      },
+      {
+        "semantic_key": "asset.image.source_3",
+        "node_id": "ag_references_2_8",
+        "input_name": "image",
+        "value_type": "asset_image",
+        "is_required": 0
+      },
+      {
+        "semantic_key": "generation.batch_size",
+        "node_id": "6",
+        "input_name": "batch_size",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "image.height",
+        "node_id": "6",
+        "input_name": "height",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "image.width",
+        "node_id": "6",
+        "input_name": "width",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.diffusion_model_1.filename",
+        "node_id": "11",
+        "input_name": "model_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.lora_1.filename",
+        "node_id": "12",
+        "input_name": "lora_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.text_encoder_1.filename",
+        "node_id": "4",
+        "input_name": "clip_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "model.vae_1.filename",
+        "node_id": "7",
+        "input_name": "vae_name",
+        "value_type": "model_artifact",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "output.prefix",
+        "node_id": "10",
+        "input_name": "filename_prefix",
+        "value_type": "string",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.c_f_g_norm.strength",
+        "node_id": "13",
+        "input_name": "strength",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.c_l_i_p_loader.device",
+        "node_id": "4",
+        "input_name": "device",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.c_l_i_p_loader.type",
+        "node_id": "4",
+        "input_name": "type",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.diffusion_model_loader_k_j.compute_dtype",
+        "node_id": "11",
+        "input_name": "compute_dtype",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.diffusion_model_loader_k_j.sage_attention",
+        "node_id": "11",
+        "input_name": "sage_attention",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.diffusion_model_loader_k_j.weight_dtype",
+        "node_id": "11",
+        "input_name": "weight_dtype",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.lora_loader_model_only.strength_model",
+        "node_id": "12",
+        "input_name": "strength_model",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "parameter.model_sampling_aura_flow.shift",
+        "node_id": "5",
+        "input_name": "shift",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "prompt.negative",
+        "node_id": "3",
+        "input_name": "prompt",
+        "value_type": "string",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "prompt.positive",
+        "node_id": "1",
+        "input_name": "prompt",
+        "value_type": "string",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.cfg_scale",
+        "node_id": "2",
+        "input_name": "cfg",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.denoise",
+        "node_id": "2",
+        "input_name": "denoise",
+        "value_type": "number",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.sampler",
+        "node_id": "2",
+        "input_name": "sampler_name",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.scheduler",
+        "node_id": "2",
+        "input_name": "scheduler",
+        "value_type": "enum",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.seed",
+        "node_id": "2",
+        "input_name": "seed",
+        "value_type": "integer",
+        "is_required": 1
+      },
+      {
+        "semantic_key": "sampling.steps",
+        "node_id": "2",
+        "input_name": "steps",
+        "value_type": "integer",
+        "is_required": 1
+      }
+    ],
+    "model_requirements": [
+      {
+        "role": "diffusion_model",
+        "alias": "diffusion_model_1",
+        "expected_filename": "qwen_image_edit_2511_int8_convrot.safetensors",
+        "expected_sha256": "11b5af5ac601821d73930c84846c9a158e67177356daf927ce1c8d10f3963829",
+        "is_required": 1
+      },
+      {
+        "role": "lora",
+        "alias": "lora_1",
+        "expected_filename": "qwen2511/Qwen-Image-Edit-2511-Lightning-4steps-V1.0-bf16.safetensors",
+        "expected_sha256": "22226e8d05d354bb356627d428809f5afd7819399b077238a2b70a82883a904f",
+        "is_required": 1
+      },
+      {
+        "role": "text_encoder",
+        "alias": "text_encoder_1",
+        "expected_filename": "qwen_2.5_vl_7b_fp8_scaled.safetensors",
+        "expected_sha256": "cb5636d852a0ea6a9075ab1bef496c0db7aef13c02350571e388aea959c5c0b4",
+        "is_required": 1
+      },
+      {
+        "role": "vae",
+        "alias": "vae_1",
+        "expected_filename": "qwen_image_vae.safetensors",
+        "expected_sha256": "a70580f0213e67967ee9c95f05bb400e8fb08307e017a924bf3441223e023d1f",
+        "is_required": 1
+      }
+    ],
+    "model_profile": {
+      "model_identifier": "qwen-image-edit-2511",
+      "specification": {
+        "schema_version": 1,
+        "capabilities": [
+          "image.image_to_image"
+        ],
+        "model_family": "qwen-image-edit",
+        "execution_monitoring": {
+          "schema_version": 1
+        }
+      },
+      "specification_sha256": "c97d70c704d2a9bdf130e521aae4c1645290231e14f1286036205033b6df3bd2"
+    },
+    "projector": {
+      "version": 1,
+      "provider_driver_type": "comfyui",
+      "operation": "workflow.import",
+      "output_kind": "image",
+      "engine_key": "generic.references",
+      "engine_version": 1,
+      "definition": {
+        "schema_version": 1,
+        "priority": 100,
+        "detector": {
+          "fallback": false,
+          "allow_other_nodes": false,
+          "node_counts": {
+            "CFGNorm": 1,
+            "CLIPLoader": 1,
+            "DiffusionModelLoaderKJ": 1,
+            "EmptySD3LatentImage": 1,
+            "KSampler": 1,
+            "LoadImage": 1,
+            "LoraLoaderModelOnly": 1,
+            "ModelSamplingAuraFlow": 1,
+            "SaveImage": 1,
+            "TextEncodeQwenImageEditPlus": 2,
+            "VAEDecode": 1,
+            "VAELoader": 1
+          },
+          "optional_node_counts": {},
+          "input_equals": []
+        },
+        "output_nodes": {
+          "SaveImage": "image"
+        },
+        "model_selectors": [
+          {
+            "node_type": "CLIPLoader",
+            "input_name": "clip_name",
+            "role": "text_encoder",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          },
+          {
+            "node_type": "DiffusionModelLoaderKJ",
+            "input_name": "model_name",
+            "role": "diffusion_model",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          },
+          {
+            "node_type": "LoraLoaderModelOnly",
+            "input_name": "lora_name",
+            "role": "lora",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          },
+          {
+            "node_type": "VAELoader",
+            "input_name": "vae_name",
+            "role": "vae",
+            "inventory_folder": "",
+            "inventory_node_type": "",
+            "inventory_input_name": ""
+          }
+        ],
+        "node_roles": {
+          "node_c_f_g_norm": {
+            "node_type": "CFGNorm",
+            "cardinality": "one"
+          },
+          "node_c_l_i_p_loader": {
+            "node_type": "CLIPLoader",
+            "cardinality": "one"
+          },
+          "node_diffusion_model_loader_k_j": {
+            "node_type": "DiffusionModelLoaderKJ",
+            "cardinality": "one"
+          },
+          "node_empty_s_d3_latent_image": {
+            "node_type": "EmptySD3LatentImage",
+            "cardinality": "one"
+          },
+          "node_k_sampler": {
+            "node_type": "KSampler",
+            "cardinality": "one"
+          },
+          "node_load_image": {
+            "node_type": "LoadImage",
+            "cardinality": "one"
+          },
+          "node_lora_loader_model_only": {
+            "node_type": "LoraLoaderModelOnly",
+            "cardinality": "one"
+          },
+          "node_model_sampling_aura_flow": {
+            "node_type": "ModelSamplingAuraFlow",
+            "cardinality": "one"
+          },
+          "output": {
+            "node_type": "SaveImage",
+            "cardinality": "one"
+          },
+          "node_v_a_e_decode": {
+            "node_type": "VAEDecode",
+            "cardinality": "one"
+          },
+          "node_v_a_e_loader": {
+            "node_type": "VAELoader",
+            "cardinality": "one"
+          },
+          "dynamic_target": {
+            "node_type": "TextEncodeQwenImageEditPlus",
+            "cardinality": "many"
+          }
+        },
+        "required_edges": [
+          {
+            "from_role": "node_v_a_e_decode",
+            "output_index": 0,
+            "to_role": "output",
+            "input_name": "images"
+          },
+          {
+            "from_role": "node_diffusion_model_loader_k_j",
+            "output_index": 0,
+            "to_role": "node_lora_loader_model_only",
+            "input_name": "model"
+          },
+          {
+            "from_role": "node_model_sampling_aura_flow",
+            "output_index": 0,
+            "to_role": "node_c_f_g_norm",
+            "input_name": "model"
+          },
+          {
+            "from_role": "node_empty_s_d3_latent_image",
+            "output_index": 0,
+            "to_role": "node_k_sampler",
+            "input_name": "latent_image"
+          },
+          {
+            "from_role": "node_c_f_g_norm",
+            "output_index": 0,
+            "to_role": "node_k_sampler",
+            "input_name": "model"
+          },
+          {
+            "from_role": "node_lora_loader_model_only",
+            "output_index": 0,
+            "to_role": "node_model_sampling_aura_flow",
+            "input_name": "model"
+          },
+          {
+            "from_role": "node_k_sampler",
+            "output_index": 0,
+            "to_role": "node_v_a_e_decode",
+            "input_name": "samples"
+          },
+          {
+            "from_role": "node_v_a_e_loader",
+            "output_index": 0,
+            "to_role": "node_v_a_e_decode",
+            "input_name": "vae"
+          }
+        ],
+        "parameter_policies": [
+          {
+            "semantic_key": "generation.batch_size",
+            "node_role": "node_empty_s_d3_latent_image",
+            "input_name": "batch_size",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "image.height",
+            "node_role": "node_empty_s_d3_latent_image",
+            "input_name": "height",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "image.width",
+            "node_role": "node_empty_s_d3_latent_image",
+            "input_name": "width",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.c_f_g_norm.strength",
+            "node_role": "node_c_f_g_norm",
+            "input_name": "strength",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.c_l_i_p_loader.device",
+            "node_role": "node_c_l_i_p_loader",
+            "input_name": "device",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.c_l_i_p_loader.type",
+            "node_role": "node_c_l_i_p_loader",
+            "input_name": "type",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.diffusion_model_loader_k_j.compute_dtype",
+            "node_role": "node_diffusion_model_loader_k_j",
+            "input_name": "compute_dtype",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.diffusion_model_loader_k_j.sage_attention",
+            "node_role": "node_diffusion_model_loader_k_j",
+            "input_name": "sage_attention",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.diffusion_model_loader_k_j.weight_dtype",
+            "node_role": "node_diffusion_model_loader_k_j",
+            "input_name": "weight_dtype",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.lora_loader_model_only.strength_model",
+            "node_role": "node_lora_loader_model_only",
+            "input_name": "strength_model",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "parameter.model_sampling_aura_flow.shift",
+            "node_role": "node_model_sampling_aura_flow",
+            "input_name": "shift",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.cfg_scale",
+            "node_role": "node_k_sampler",
+            "input_name": "cfg",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.denoise",
+            "node_role": "node_k_sampler",
+            "input_name": "denoise",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.sampler",
+            "node_role": "node_k_sampler",
+            "input_name": "sampler_name",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.scheduler",
+            "node_role": "node_k_sampler",
+            "input_name": "scheduler",
+            "policy": "object_info",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.seed",
+            "node_role": "node_k_sampler",
+            "input_name": "seed",
+            "policy": "runtime",
+            "value": null
+          },
+          {
+            "semantic_key": "sampling.steps",
+            "node_role": "node_k_sampler",
+            "input_name": "steps",
+            "policy": "object_info",
+            "value": null
+          }
+        ],
+        "asset_slots": [
+          {
+            "key": "references",
+            "media_kind": "image",
+            "dynamic": true,
+            "contract_source": "workflow"
+          }
+        ],
+        "adapters": {
+          "compiler": "generic.comfy/v2",
+          "output": "comfy.primary/v1",
+          "dynamic": "generic.asset_groups/v1"
+        },
+        "projection": {
+          "kind": "generic_references",
+          "config": {
+            "groups": [
+              {
+                "key": "references",
+                "source_role": "node_load_image",
+                "branch_roles": [
+                  "node_load_image"
+                ],
+                "output_role": "node_load_image",
+                "output_index": 0,
+                "target_roles": [
+                  "dynamic_target"
+                ],
+                "input_names": [
+                  "image1",
+                  "image2",
+                  "image3"
+                ],
+                "wiring": "ordered_ports",
+                "reducer_role": "",
+                "reducer_inputs": [],
+                "reducer_output_index": 0,
+                "minimum_items": 1,
+                "maximum_items": 3,
+                "conditioning_mode": "",
+                "model_input": ""
+              }
+            ],
+            "capability": "image.image_to_image"
+          }
+        }
+      },
+      "definition_sha256": "e20534f6f44751dd46716a79f941718f47d1a50772b85975f898ad046740c4e3"
+    }
+  }
+}

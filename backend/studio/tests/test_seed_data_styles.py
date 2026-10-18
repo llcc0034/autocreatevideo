@@ -22,7 +22,7 @@ EXPECTED_SYSTEM_STYLE_SLUGS = {
 
 
 class SeedDataStyleTests(TestCase):
-    def test_seed_keeps_all_eleven_system_styles_active(self):
+    def test_seed_creates_defaults_without_disabling_other_shared_styles(self):
         Style.objects.create(
             owner=None,
             slug="retired-system-style",
@@ -38,9 +38,23 @@ class SeedDataStyleTests(TestCase):
             is_system=True,
             is_active=True,
         ).values_list("slug", flat=True))
-        self.assertEqual(active_slugs, EXPECTED_SYSTEM_STYLE_SLUGS)
+        self.assertEqual(active_slugs, EXPECTED_SYSTEM_STYLE_SLUGS | {"retired-system-style"})
         self.assertTrue(Style.objects.get(slug="glamour-wuxia", owner=None).is_active)
-        self.assertFalse(Style.objects.get(slug="retired-system-style", owner=None).is_active)
+        self.assertTrue(Style.objects.get(slug="retired-system-style", owner=None).is_active)
+
+    def test_seed_preserves_edits_and_disabled_state(self):
+        call_command("seed_data", stdout=StringIO(), verbosity=0)
+        row = Style.objects.get(slug="wuxia", owner=None)
+        row.name = "自定名称"
+        row.description = "自定简介"
+        row.visual_prompt = "authored prompt"
+        row.negative_prompt = "authored exclusions"
+        row.is_active = False
+        row.save()
+        call_command("seed_data", stdout=StringIO(), verbosity=0)
+        row.refresh_from_db()
+        self.assertEqual((row.name, row.description, row.visual_prompt, row.negative_prompt, row.is_active),
+            ("自定名称", "自定简介", "authored prompt", "authored exclusions", False))
 
     def test_seeded_glamour_wuxia_style_is_recognized_by_asset_import(self):
         call_command("seed_data", stdout=StringIO(), verbosity=0)

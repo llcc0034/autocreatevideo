@@ -447,8 +447,8 @@ test('saved workflow import freezes only the server-derived structural contract'
     assert.equal(apiSource.includes(retired) || source.includes(retired), false, retired)
   }
   assert.match(apiSource, /\/assets\/workflow-smoke-candidates\//)
-  assert.match(editorSource, /smokeFixtureRequest\(\)/)
-  assert.match(editorSource, /本次 Smoke 输入/)
+  assert.match(editorSource, /ResourceSmokeCreateForm/)
+  assert.ok(editorSource.replace(/\s/g, '').includes("router.push({name:'workflows',query:{category:'smoke',kind:'preparation',id}})"))
   assert.match(editorSource, /smokeAttempt\.fixtureSha256/)
   assert.doesNotMatch(source, /\/settings\/workflows\/new/)
   assert.doesNotMatch(apiSource, /importWorkflowVersion/)
@@ -526,6 +526,7 @@ test('matched and imported candidates can request a dedicated Projector and immu
   assert.match(successorFlow, /draft\.useExistingTemplate = true/)
   assert.match(successorFlow, /draft\.templateId = item\.templateId/)
   assert.match(successorFlow, /draft\.projectorSuccessorRequested = true/)
+  assert.match(successorFlow, /draft\.successorOf \|\|= item\.workflowVersionId/)
   assert.match(successorFlow, /await previewSavedWorkflow\(item\)/)
 
   assert.match(source, /基于此候选生成专用 Projector 建议/)
@@ -533,6 +534,32 @@ test('matched and imported candidates can request a dedicated Projector and immu
   assert.match(source, /当前工作流已冻结自动匹配的 Projector/)
   assert.match(source, /item\.contractUpgradeRequired\s*\|\|\s*draft\.projectorSuccessorRequested/)
   assert.doesNotMatch(source, /savedWorkflowNeedsProjectorRecommendation/)
+})
+
+test('only an explicit successor unlocks a matched import model target', async () => {
+  const vite = await server()
+  try {
+    const { savedWorkflowModelSelectionLocked } = await vite.ssrLoadModule('/src/services/savedWorkflowModelContext.ts')
+    assert.equal(savedWorkflowModelSelectionLocked({ matchStatus: 'matched' }, { projectorSuccessorRequested: false }), true)
+    assert.equal(savedWorkflowModelSelectionLocked({ matchStatus: 'matched' }, { projectorSuccessorRequested: true }), false)
+    assert.equal(savedWorkflowModelSelectionLocked({ matchStatus: 'unmatched' }, { projectorSuccessorRequested: false }), false)
+    const source = await readFile(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf8')
+    assert.match(source, /savedWorkflowModelSelectionLocked\(item,savedWorkflowDrafts\[savedWorkflowKey\(item\)\]\)/)
+    assert.match(source, /@change="refreshSavedWorkflowContract\(item\)"/)
+  } finally { await vite.close() }
+})
+
+test('successor promotion pins its predecessor instead of using the refreshed scan version', async () => {
+  const source = await readFile(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf8')
+  const payload = source.slice(source.indexOf('const savedWorkflowBatchPayload ='), source.indexOf('const batchImportSavedWorkflows ='))
+  assert.match(payload, /successorOf: draft\.projectorSuccessorRequested \? draft\.successorOf : null/)
+  assert.doesNotMatch(payload, /item\.workflowVersionId/)
+  assert.match(source, /本批结果可能未知/)
+  const api = await readFile(new URL('../src/services/platformApi.ts', import.meta.url), 'utf8')
+  assert.match(api, /successor_of: item\.successorOf \|\| null/)
+  const editor = await readFile(new URL('../src/views/WorkflowVersionEditorView.vue', import.meta.url), 'utf8')
+  assert.match(editor, /仅重新验收时可在导入中心用当前已发布 Projector 生成后继合同/)
+  assert.doesNotMatch(editor, /如需重新验收，请从 ComfyUI 保存新 revision/)
 })
 
 test('storage write and removal failures are explicit to the caller', async () => {

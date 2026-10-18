@@ -1,9 +1,12 @@
 [CmdletBinding()]
 param(
-    [switch]$WithDemoProject
+    [switch]$WithDemoProject,
+    [switch]$ImportAssetLibrary,
+    [switch]$Fresh
 )
 
 $ErrorActionPreference = 'Stop'
+if ($Fresh -and $WithDemoProject) { throw '-Fresh cannot be combined with -WithDemoProject.' }
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $BackendRoot = Join-Path $ProjectRoot 'backend'
 $FrontendRoot = Join-Path $ProjectRoot 'frontend'
@@ -164,6 +167,10 @@ Push-Location $BackendRoot
 try {
     & $PythonPath manage.py migrate
     Assert-NativeSuccess 'Database migration'
+    if ($Fresh) {
+        & $PythonPath manage.py assert_clean_install
+        Assert-NativeSuccess 'Fresh installation history check (read-only)'
+    }
     & $PythonPath manage.py bootstrap_superadmin --if-missing
     Assert-NativeSuccess 'Initial super administrator bootstrap'
     $SeedArguments = @('manage.py', 'seed_data')
@@ -172,8 +179,10 @@ try {
     }
     & $PythonPath @SeedArguments
     Assert-NativeSuccess 'System style and optional local demo seeding'
-    & $PythonPath manage.py import_asset_library --manifest (Join-Path $ProjectRoot 'assets\library\manifest.json')
-    Assert-NativeSuccess 'Asset library import'
+    if ($ImportAssetLibrary) {
+        & $PythonPath manage.py import_asset_library --manifest (Join-Path $ProjectRoot 'assets\library\manifest.json')
+        Assert-NativeSuccess 'Explicit asset library import'
+    }
 } finally {
     Pop-Location
 }

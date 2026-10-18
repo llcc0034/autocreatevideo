@@ -1,0 +1,20 @@
+.projector-reference-editor{display:grid;gap:12px;min-width:0;font-family:var(--font);font-size:var(--config-body-size);letter-spacing:0}
+.projector-reference-editor>article{display:grid;gap:12px;min-width:0;border-top:1px solid #303b46;padding:12px 0}
+.projector-reference-editor header{display:flex;justify-content:space-between;align-items:start;flex-wrap:wrap;gap:8px}
+.projector-reference-editor .fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}
+.projector-reference-editor label{display:grid;gap:6px;min-width:0;color:#b7c7d5;font-size:var(--config-body-size)}
+.projector-reference-editor input,.projector-reference-editor select,.projector-reference-editor textarea,.projector-reference-editor button{min-width:0;max-width:100%;min-height:36px;box-sizing:border-box;background:#0b1015;color:#d9e2ea;border:1px solid #354350;border-radius:var(--config-radius);padding:8px;font:inherit;white-space:normal;overflow-wrap:anywhere}
+.projector-reference-editor input[type=checkbox]{min-height:auto}
+.projector-reference-editor button,.projector-reference-editor summary{cursor:pointer}
+.projector-reference-editor button:disabled{opacity:.5;cursor:not-allowed}
+.projector-reference-editor fieldset{min-width:0;display:flex;flex-wrap:wrap;gap:12px;border:1px solid #354350}
+.projector-reference-editor p,.projector-reference-editor small{margin:0;font-size:var(--config-help-size);color:#92a3b3;line-height:1.6;overflow-wrap:anywhere}
+.projector-reference-editor p[role=alert]{color:var(--red,#ed858d)}
+.projector-reference-editor .check{display:flex;align-items:center}
+.projector-reference-editor textarea{resize:vertical}
+.projector-reference-editor output{padding:8px;border:1px solid #354350;border-radius:var(--config-radius);overflow-wrap:anywhere}
+.projector-reference-editor details{min-width:0}
+.projector-reference-editor summary{min-height:36px;padding:8px 0;box-sizing:border-box;font-size:var(--config-body-size);color:#c5d0da}
+.projector-reference-editor .reference-implementation[open]{display:grid;gap:12px}
+.projector-reference-editor :is(input,select,textarea,button,summary):focus-visible{outline:2px solid #d8a051;outline-offset:2px}
+@media(max-width:700px){.projector-reference-editor .fields{grid-template-columns:1fr}.projector-reference-editor :is(button,select,summary,input:not([type=checkbox])){min-height:44px}}

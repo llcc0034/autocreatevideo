@@ -19,25 +19,20 @@ test('Bible image candidates expose read-only history without create or promotio
 
 test('ProductionRun candidate preview and selection trust only verified history facts', () => {
   const view = readFileSync(new URL('../src/views/ProductionRunView.vue', import.meta.url), 'utf8')
-  const match = view.match(
-    /const bibleCandidatePreview = \(artifactId: string, expectedSha256: string\) => \{([\s\S]*?)\n\}\nconst bibleEntityKey/,
-  )
-  assert.ok(match, 'Bible candidate preview helper must remain a single auditable gate')
-  const body = match[1]
-  assert.match(body, /bibleImageHistoryByArtifactId\.value\[artifactId\]/)
-  assert.match(body, /history\.sha256 === expectedSha256/)
-  assert.match(body, /history\.sourceCurrent/)
-  assert.match(body, /history\.integrityStatus === 'valid'/)
-  assert.match(body, /\? history\.previewUrl/)
+  const editor = readFileSync(new URL('../src/components/BibleImageSelectionEditor.vue', import.meta.url), 'utf8')
+  const body = readFileSync(new URL('../src/services/bibleImageSelections.ts', import.meta.url), 'utf8')
+  assert.match(view, /reviewedBibleImageBindings\(bibleImageReview\.value\.value\?\.entities/)
+  assert.match(editor, /verifiedBibleCandidatePreview\(props.history, id, hash\)/)
+  assert.match(body, /row.sha256 === hash && row.sourceCurrent && row.integrityStatus === 'valid' \? row.previewUrl : ''/)
   assert.doesNotMatch(body, /currentRun|\.artifacts|previewUrl\s*\|\|/)
   assert.match(
-    view,
+    editor,
     /:disabled="!bibleCandidatePreview\(candidate\.artifactId,candidate\.sha256\)"/,
   )
 })
 
 test('ProductionRun distinguishes preview verification from a verified missing preview', () => {
-  const view = readFileSync(new URL('../src/views/ProductionRunView.vue', import.meta.url), 'utf8')
+  const view = readFileSync(new URL('../src/components/BibleImageSelectionEditor.vue', import.meta.url), 'utf8')
   const image = view.indexOf('<img v-if="bibleCandidatePreview(candidate.artifactId,candidate.sha256)"')
   const loading = view.indexOf('<div v-else-if="bibleImageHistoryLoading" class="bible-image-review-placeholder" role="status"><LoaderCircle class="spin" :size="28"/><span>正在校验预览…</span></div>', image)
   const unavailable = view.indexOf('<div v-else class="bible-image-review-placeholder"><Image :size="28"/><span>预览不可用，禁止盲选</span></div>', loading)
@@ -64,16 +59,17 @@ test('materialized candidate remains readable when it is no longer bound', async
     artifact_id: artifactId,
     production_run_id: '55555555-5555-4555-8555-555555555555',
     stage_run_id: '66666666-6666-4666-8666-666666666666',
-    generation_attempt_id: null,
+    generation_attempt_id: '99999999-9999-4999-8999-999999999999',
     generation_task_id: null,
-    prompt_artifact_id: null,
+    preparation_id: '77777777-7777-4777-8777-777777777777',
+    execution_instance_version_id: '88888888-8888-4888-8888-888888888888',
+    execution_instance_name: '精确图片实例',
+    request_sha256: 'c'.repeat(64),
     workflow_version_id: null,
-    model_profile_version_id: null,
+    model_profile_version_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
     model_identifier: '',
     prompt_profile_version_id: null,
-    prompt_profile_binding_key: '',
-    prompt_profile_contract_sha256: '',
-    source_snapshot_sha256: 'a'.repeat(64),
+    target_snapshot_sha256: 'a'.repeat(64),
     source_current: true,
     integrity_status: 'valid',
     integrity_error_code: '',
@@ -111,6 +107,9 @@ test('materialized candidate remains readable when it is no longer bound', async
 
   assert.equal(result.candidates[0].latestCandidate?.bindingRole, 'unbound')
   assert.equal(result.candidates[0].latestCandidate?.materializedAsset?.id, assetId)
+  assert.equal(result.candidates[0].latestCandidate?.preparationId, candidate.preparation_id)
+  assert.equal(result.candidates[0].latestCandidate?.executionInstanceName, candidate.execution_instance_name)
+  assert.equal('promptArtifactId' in result.candidates[0].latestCandidate!, false)
 })
 
 test('Bible approval freezes library Asset checksums and regeneration has a distinct idempotent API', async (context) => {
@@ -154,7 +153,7 @@ test('Bible approval freezes library Asset checksums and regeneration has a dist
   api.post = async (url: string, payload: unknown) => {
     capturedUrl = url
     capturedPayload = payload
-    return { data: { id: runId, project: '', created_at: '', updated_at: '' } }
+    return { data: { id: runId, project: '', plan_source: 'recipe', recipe_version: 'fixture-recipe', created_at: '', updated_at: '' } }
   }
   await platformApi.regenerateBibleImages(runId, {
     requestId,
@@ -183,19 +182,21 @@ test('regenerated Bible review snapshot keeps old and new candidates visible', a
   const generationStageId = '22222222-2222-4222-8222-222222222222'
   const candidate = (index: number, historical: boolean) => ({
     artifact_id: `${index + 2}3333333-3333-4333-8333-333333333333`,
-    variant_group: `bible:character:${entityId}:candidate:${index}`,
+    variant_group: `opaque-group-${index}`,
     variant_index: index,
-    status: 'available',
+    eligibility: 'eligible',
     sha256: String(index).repeat(64),
+    manifest_sha256: 'b'.repeat(64),
     attempt_id: `${index + 4}5555555-5555-4555-8555-555555555555`,
-    prompt_artifact_id: `${index + 6}7777777-7777-4777-8777-777777777777`,
-    prompt_profile_version_id: `${index + 7}8888888-8888-4888-8888-888888888888`,
-    prompt_profile_binding_key: 'bible-character-image',
-    source_snapshot_sha256: 'c'.repeat(64),
+    preparation_id: `${index + 6}7777777-7777-4777-8777-777777777777`,
+    execution_instance_version_id: `${index + 7}8888888-8888-4888-8888-888888888888`,
+    request_sha256: 'e'.repeat(64),
+    prompt_profile_version_id: null,
+    target_snapshot_sha256: 'c'.repeat(64),
     origin_production_run_id: `${index + 1}2222222-2222-4222-8222-222222222222`,
     historical,
   })
-  const parsed = parseBibleImageReviewPayload([{
+  const stages = [{
     id: generationStageId,
     ordinal: 8,
     stageKey: 'bible_image_generation',
@@ -210,22 +211,37 @@ test('regenerated Bible review snapshot keeps old and new candidates visible', a
           entity_type: 'character',
           entity_id: entityId,
           entity_name: '林雾',
-          source_snapshot_sha256: 'c'.repeat(64),
+          target_content_sha256: 'c'.repeat(64),
           candidates: [candidate(1, true), candidate(2, false)],
         }],
       },
     },
-  }])
+  }]
+  const parsed = parseBibleImageReviewPayload(stages)
   assert.equal(parsed.error, '')
   assert.equal(parsed.value?.entities[0].candidates.length, 2)
   assert.deepEqual(parsed.value?.entities[0].candidates.map((item: { historical: boolean }) => item.historical), [true, false])
+  assert.equal(parsed.value?.entities[0].candidates[0].promptProfileVersionId, null)
+  assert.equal(parsed.value?.entities[0].candidates[0].eligibility, 'eligible')
+  assert.equal(parsed.value?.entities[0].candidates[0].variantGroup, 'opaque-group-1')
+  for (const key of ['preparation_id', 'execution_instance_version_id', 'request_sha256', 'manifest_sha256', 'target_snapshot_sha256']) {
+    const broken = structuredClone(stages)
+    delete broken[0].outputSnapshot.canonical.entities[0].candidates[0][key]
+    // An old prompt identity cannot repair a missing current preparation.
+    broken[0].outputSnapshot.canonical.entities[0].candidates[0].prompt_artifact_id = '77777777-7777-4777-8777-777777777777'
+    assert.ok(parseBibleImageReviewPayload(broken).error, key)
+  }
+  const onlyLibrary = structuredClone(stages)
+  onlyLibrary[0].outputSnapshot.canonical.entities[0].candidates = []
+  assert.equal(parseBibleImageReviewPayload(onlyLibrary).error, '')
 })
 
 test('Bible review UI excludes project covers and does not reuse generic retry for regeneration', () => {
   const view = readFileSync(new URL('../src/views/ProductionRunView.vue', import.meta.url), 'utf8')
-  assert.match(view, /asset\.metadata\?\.usage !== 'project_cover'/)
-  assert.match(view, /expectedSha256: bibleLibraryAsset\(assetId\)\?\.checksum \|\| ''/)
-  assert.match(view, /anchorLibraryAssetId: selection\.anchorAssetId \|\| undefined/)
+  const selection = readFileSync(new URL('../src/services/bibleImageSelections.ts', import.meta.url), 'utf8')
+  assert.match(selection, /asset\.metadata\?\.usage !== 'project_cover'/)
+  assert.match(view, /expectedSha256: asset.expected_sha256/)
+  assert.match(view, /anchorLibraryAssetId: binding.anchor_library_asset_id \|\| undefined/)
   assert.match(view, /requestId: crypto\.randomUUID\(\)/)
   assert.match(view, /platformApi\.regenerateBibleImages/)
   const confirmation = view.match(/const confirmBibleRegeneration = async \(\) => \{([\s\S]*?)\n\}\nconst requestRunConfirmation/)
@@ -248,6 +264,6 @@ test('SeriesStudio exposes a configured blocking cross-shot continuity readiness
     '前往 ProductionRun 补齐参考图',
   ]) assert.match(view, new RegExp(fragment.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), fragment)
   assert.match(view, /bibleContinuityEntities\.value\.length > 0 && bibleMissingAnchorEntities\.value\.length === 0/)
-  assert.match(view, /:to="`\/projects\/\$\{project\.id\}\/production`"/)
+  assert.match(view, /:to="projectProductionTarget"/)
   assert.doesNotMatch(view, /@click="[^"]*(?:generate|regenerate).*Bible/i)
 })

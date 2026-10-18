@@ -78,6 +78,12 @@ test('workflow version review does not expose monitoring or node-contract mutati
   for (const retired of ['execution_monitoring.node_overrides', 'updateNodeIdleTimeout', 'inputContractText', 'WorkflowNodeDrilldown']) {
     assert.equal(source.includes(retired), false, retired)
   }
+  const sync = source.split('const syncDeploymentEvidence = () => {')[1].split('const changeDeployment')[0]
+  assert.match(sync, /validationRequestFailed.value = false/)
+  assert.match(sync, /smokeRequestFailed.value = false/)
+  assert.match(sync, /contractResult.value = evidenceMatches/)
+  assert.match(sync, /smokeResult.value = evidenceMatches/)
+  assert.doesNotMatch(sync, /RequestFailed.value = !evidenceMatches/)
 })
 
 test('novice settings guide explains the future-version migration and telemetry boundary', () => {
@@ -88,7 +94,8 @@ test('novice settings guide explains the future-version migration and telemetry 
   const content = JSON.stringify(guide)
   assert.match(content, /execution_monitoring/)
   assert.match(content, /SamplerCustomAdvanced=5400 秒/)
-  assert.match(content, /缺少 GeneratedWorkflow\/GenerationTask 双层合同会直接 fail closed/)
+  assert.match(content, /唯一主 GenerationAttempt 读取同次 ExecutionPreparation 的冻结合同/)
+  assert.match(content, /缺失或不一致会明确停止，不从旧工作流缓存补齐/)
   assert.match(content, /开发环境统一清理旧任务\/产物/)
   assert.match(content, /WebSocket 不报告节点切换/)
   assert.match(content, /hard deadline 始终不续期/)

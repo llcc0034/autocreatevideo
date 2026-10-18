@@ -12,15 +12,16 @@ from PIL import Image
 
 from studio.models import Asset
 from studio.services.json_contracts import json_contract
+from studio.services.generated_artifacts import verified_local_media_facts
+from studio.services.provenance import ProvenanceError
+from studio.services.workflow_media_tokens import workflow_media_use_token
 from studio.services.workflow_compiler import (
-    compile_frozen_workflow, workflow_execution_contract, WorkflowCompilerError,
-    build_frozen_workflow_runtime_overrides,
+    compile_frozen_workflow_values, workflow_execution_contract, WorkflowCompilerError,
 )
 from studio.services.workflow_resolution import (
     infer_source_image_resolution, validate_source_image_resolution,
     kontext_dimensions, KONTEXT_RESOLUTIONS, WorkflowResolutionError,
     validate_resolved_image_output,
-    resolve_source_image_resolution,
     configure_source_image_resolution, CONFIGURED_RESOLUTION_ADAPTER,
     image_resolution_options, validate_image_resolution_policy, materialize_resolution_graph,
 )
@@ -84,10 +85,21 @@ class WorkflowResolutionTests(TestCase):
                                     mime_type="image/png", checksum=sha256(path.read_bytes()).hexdigest())
 
     def compile(self, asset=None, overrides=None):
-        project = SimpleNamespace(id="test", owner_id=None, width=64, height=64, continuity_seed=12)
-        references = [] if asset is None else [{"asset_id": str(asset.id), "checksum": asset.checksum, "category": "image", "input_slot": 1}]
-        prompt = SimpleNamespace(id="prompt", project=project, prompt_type="image", structured_payload={"reference_bindings": references})
-        return compile_frozen_workflow(workflow_snapshot=self.snapshot(), project=project, prompt=prompt, overrides=overrides)
+        # Compiler protocol fixture. Business ownership and source selection are
+        # exercised by ExecutionInputResolution, not a fabricated Project/Prompt.
+        binding = None
+        if asset is not None:
+            media = verified_local_media_facts(Path(asset.local_path), expected_kind="image",
+                max_bytes=1000000, include_observed_media=True)
+            self.assertEqual(media["sha256"], asset.checksum)
+            binding = {"semantic_key": "asset.image.source", "item_key": "resolution-source",
+                "asset_id": str(asset.pk), "artifact_id": None, "kind": "image", "media_facts": media}
+            binding["source_sha256"] = json_contract(binding).sha256
+            binding["token"] = workflow_media_use_token(item_key=binding["item_key"], source_sha256=binding["source_sha256"])
+        return compile_frozen_workflow_values(workflow_snapshot=self.snapshot(),
+            scalar_values={"sampling.seed": 12, "output.prefix": "test/resolution", **(overrides or {})},
+            resolve_asset=lambda key, rule: (None, None) if binding is None else (binding["token"], binding),
+            classified_groups=None, classified_bindings=[], output_kind="image", total_duration_ms=None)
 
     def test_resolution_table_and_orientation(self):
         for size in KONTEXT_RESOLUTIONS:
@@ -202,7 +214,7 @@ class WorkflowResolutionTests(TestCase):
     def test_corrupt_bytes_rejected(self):
         asset = self.asset()
         Path(asset.local_path).write_bytes(b"corrupt")
-        with self.assertRaises(WorkflowCompilerError):
+        with self.assertRaises(ProvenanceError):
             self.compile(asset)
 
     def test_missing_or_drifted_frozen_policy_rejected(self):
@@ -233,11 +245,6 @@ class WorkflowResolutionTests(TestCase):
             with self.assertRaises(WorkflowResolutionError):
                 validate_source_image_resolution(self.graph, {**self.contract, **extra}, self.bindings)
 
-    def test_production_identity_does_not_inject_project_size(self):
-        overrides = build_frozen_workflow_runtime_overrides(
-            workflow_snapshot=self.snapshot(), prompt=SimpleNamespace(), width=64, height=64, seed=12, output_prefix="test/out")
-        self.assertEqual(overrides, {"sampling.seed": 12, "output.prefix": "test/out"})
-
     def test_real_output_must_match_frozen_dimensions(self):
         compiled = self.compile(self.asset())
         output = self.root / "output.png"
@@ -254,37 +261,13 @@ class WorkflowResolutionTests(TestCase):
         compiled = self.compile(self.asset())
         output = self.root / "wrong.png"
         Image.new("RGB", (64, 64)).save(output)
-        task = SimpleNamespace(capability_snapshot={"output_contract": compiled.output_contract})
+        task = SimpleNamespace()
         with patch("studio.services.generated_artifacts.resolve_task_output_path", return_value=output):
             with self.assertRaisesMessage(ProvenanceError, "实际图片尺寸"):
                 _archive_task_output(task, 0, {"filename": "wrong.png"}, expected_kind="image",
-                                     expected_sha256=sha256(output.read_bytes()).hexdigest(), max_bytes=1000000)
+                                     expected_sha256=sha256(output.read_bytes()).hexdigest(), max_bytes=1000000,
+                                     output_contract=compiled.output_contract)
 
-    def test_owned_uploaded_image_and_foreign_owner_boundary(self):
-        owner = get_user_model().objects.create_user(username="size-owner")
-        other = get_user_model().objects.create_user(username="size-other")
-        relative = Path("assets") / str(owner.id) / "source.png"
-        path = self.root / relative
-        path.parent.mkdir(parents=True)
-        Image.new("RGB", (600, 600)).save(path)
-        asset = Asset.objects.create(owner=owner, name="uploaded size source", file=relative.as_posix(),
-                                     mime_type="image/png", checksum=sha256(path.read_bytes()).hexdigest())
-        binding = {"semantic_key": "asset.image.source", "asset_id": str(asset.id), "checksum": asset.checksum}
-        with self.settings(MEDIA_ROOT=str(self.root)):
-            evidence = resolve_source_image_resolution(self.contract["resolution_strategy"], [binding], owner_id=owner.id)
-            self.assertEqual((evidence["width"], evidence["height"]), (1024, 1024))
-            with self.assertRaises(WorkflowResolutionError):
-                resolve_source_image_resolution(self.contract["resolution_strategy"], [binding], owner_id=other.id)
-
-    def test_smoke_fixture_cannot_be_used_for_production_size_resolution(self):
-        asset = self.asset()
-        asset.metadata = {"fixture_scope": "workflow_smoke"}
-        asset.save(update_fields=["metadata"])
-        compiled = self.compile(asset)
-        self.assertEqual(compiled.resolved_semantics["image.width"], 1392)
-        owner = get_user_model().objects.create_user(username="production-size-owner")
-        with self.assertRaises(WorkflowResolutionError):
-            resolve_source_image_resolution(self.contract["resolution_strategy"], compiled.asset_bindings, owner_id=owner.id)
 
     def test_scan_summary_uses_non_dominated_candidates_without_changing_evidence(self):
         rows = [

@@ -8,8 +8,8 @@ from typing import Any
 from django.conf import settings
 from django.core.exceptions import ValidationError
 
-from studio.models import Asset, WorkflowSmokeAttempt, WorkflowTemplateVersion
-from studio.services.json_contracts import canonical_json_bytes, json_contract
+from studio.models import Asset, WorkflowTemplateVersion
+from studio.services.json_contracts import json_contract
 from studio.services.media_capabilities import (
     conditioning_mode_contract,
     resolve_conditioning_contract,
@@ -63,11 +63,6 @@ def _fixture_max_assets() -> int:
     return boundary_int("security.workflow_smoke.fixture_max_assets")
 
 
-class WorkflowSmokeFixtureConflict(ValidationError):
-    code = "workflow_smoke_fixture_conflict"
-
-    def __init__(self, message):
-        super().__init__(message, code=type(self).code)
 
 
 def _fixture_error(section: str, message: str) -> ValidationError:
@@ -76,16 +71,6 @@ def _fixture_error(section: str, message: str) -> ValidationError:
     return ValidationError({"fixture": f"{section}: {message}"})
 
 
-@dataclass(frozen=True)
-class FrozenWorkflowSmokeFixture:
-    values: dict[str, Any]
-    reference_bindings: tuple[dict[str, Any], ...]
-    asset_facts: tuple[dict[str, Any], ...]
-    persisted_values: dict[str, Any]
-    values_size_bytes: int
-    values_sha256: str
-    fixture_sha256: str
-    materialized_graph_sha256: str = ""
 
 
 @dataclass(frozen=True)
@@ -186,167 +171,8 @@ def _parameters_and_bindings(
     return parameters, bindings
 
 
-def _bounded_numeric(value: Any, definition: dict[str, Any]) -> Any:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return value
-    minimum = definition.get("min")
-    maximum = definition.get("max")
-    result = value
-    if isinstance(minimum, (int, float)) and not isinstance(minimum, bool):
-        result = max(result, minimum)
-    if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
-        result = min(result, maximum)
-    multiple = definition.get("multiple_of")
-    if isinstance(multiple, int) and multiple > 1:
-        result = max(multiple, int(round(float(result) / multiple)) * multiple)
-        if isinstance(maximum, (int, float)) and not isinstance(maximum, bool):
-            result = min(result, int(maximum))
-    return int(result) if definition.get("type") == "integer" else result
 
 
-def _default_smoke_value(key: str, definition: dict[str, Any]) -> Any:
-    if "default" in definition:
-        source = definition["default"]
-        if key == "sampling.seed":
-            return _bounded_numeric(1, definition)
-        if key == "parameter.text.max_length" and isinstance(source, int):
-            return _bounded_numeric(min(source, 64), definition)
-        if key in {"parameter.seedvr2.resolution", "parameter.seedvr2.max_resolution"}:
-            return _bounded_numeric(min(int(source), 1024), definition)
-        if key == "parameter.image.scale_megapixels":
-            return _bounded_numeric(min(float(source), 0.25), definition)
-        if key == "image.megapixels":
-            return _bounded_numeric(min(float(source), 0.4), definition)
-        if isinstance(source, (int, float)) and not isinstance(source, bool):
-            # Imported canvas defaults are not guaranteed to respect a custom
-            # node's step/multiple constraint. Smoke fixtures must always be
-            # executable, so normalize numeric defaults before validation.
-            return _bounded_numeric(source, definition)
-        return source
-    if key in {"video.fps", "video.duration_ms", "video.frames"}:
-        minimum = definition.get("min")
-        candidate = minimum if isinstance(minimum, (int, float)) else 1
-        return _bounded_numeric(candidate, definition)
-    return {
-        "prompt.positive": "smoke test",
-        "prompt.negative": "",
-        "sampling.seed": 1,
-        "image.width": 256,
-        "image.height": 256,
-        "image.aspect_ratio": "16:9",
-        "image.megapixels": 0.0625,
-        "audio.enabled": False,
-        "generation.batch_size": 1,
-    }.get(key)
-
-
-def _apply_grouped_smoke_defaults(
-    values: dict[str, Any],
-    parameters: dict[str, dict[str, Any]],
-    explicit_keys: set[str],
-) -> None:
-    groups: dict[str, list[str]] = {}
-    for key, definition in parameters.items():
-        group = str(definition.get("selection_group") or "")
-        if group and key in values:
-            groups.setdefault(group, []).append(key)
-    for keys in groups.values():
-        if set(keys) != {"image.width", "image.height"}:
-            continue
-        if {"image.width", "image.height"} & explicit_keys:
-            # A paired resolution selection is atomic.  Supplying only one
-            # side would silently alter aspect ratio, so reject it below.
-            if not {"image.width", "image.height"} <= explicit_keys:
-                raise _fixture_error("values", "image.width/image.height 必须成对提交")
-            continue
-        width = values.get("image.width")
-        height = values.get("image.height")
-        if (
-            isinstance(width, bool) or isinstance(height, bool)
-            or not isinstance(width, int) or not isinstance(height, int)
-            or width <= 0 or height <= 0
-        ):
-            continue
-        target = min(max(width, height), 768)
-        scale = target / max(width, height)
-        values["image.width"] = _bounded_numeric(
-            width * scale,
-            parameters["image.width"],
-        )
-        values["image.height"] = _bounded_numeric(
-            height * scale,
-            parameters["image.height"],
-        )
-
-
-def _normalize_values(
-    version: WorkflowTemplateVersion,
-    requested: Any,
-) -> tuple[dict[str, Any], int, str]:
-    if requested is None:
-        requested = {}
-    if not isinstance(requested, dict):
-        raise _fixture_error("values", "必须是对象")
-    if len(requested) > _fixture_max_values():
-        raise _fixture_error("values", "参数项过多")
-    parameters, bindings = _parameters_and_bindings(version)
-    allowed = {
-        key for key, row in bindings.items()
-        if str(row.get("value_type") or "") not in _ASSET_VALUE_TYPES | {"model_artifact"}
-        and key != "output.prefix"
-        and not parameters.get(key, {}).get("asset_group_constant")
-    }
-    unknown = sorted(set(requested) - allowed)
-    if unknown:
-        raise _fixture_error(
-            "values", "包含未声明或不可覆盖的参数: " + ", ".join(unknown),
-        )
-    values: dict[str, Any] = {}
-    for key in sorted(allowed):
-        definition = parameters.get(key)
-        if not isinstance(definition, dict):
-            raise ValidationError({"fixture": f"{key} 缺少参数定义"})
-        value_type = str(definition.get("type") or "")
-        value = requested[key] if key in requested else _default_smoke_value(key, definition)
-        required = bool(definition.get("required", True)) or bool(
-            bindings[key].get("is_required", True),
-        )
-        if value is None:
-            if required:
-                raise _fixture_error("values", f"缺少必填参数 {key}")
-            continue
-        if (
-            isinstance(value, int)
-            and not isinstance(value, bool)
-            and abs(value) > JSON_INTEROPERABLE_INTEGER_MAX
-        ):
-            raise _fixture_error("values", f"{key} 超出浏览器可精确表达的整数范围")
-        try:
-            values[key] = _validate_value(key, value, definition, value_type)
-        except WorkflowSemanticError as exc:
-            raise _fixture_error("values", str(exc)) from exc
-    _apply_grouped_smoke_defaults(values, parameters, set(requested))
-    for key, value in values.items():
-        try:
-            values[key] = _validate_value(
-                key,
-                value,
-                parameters[key],
-                str(parameters[key].get("type") or ""),
-            )
-        except WorkflowSemanticError as exc:
-            raise _fixture_error("values", str(exc)) from exc
-    payload = canonical_json_bytes(values)
-    values_max_bytes = _fixture_values_max_bytes()
-    if len(payload) > values_max_bytes:
-        raise _fixture_error(
-            "values",
-            f"规范化参数超过安全边界 {values_max_bytes} bytes",
-        )
-    return values, len(payload), json_contract(
-        values,
-        max_bytes=_fixture_values_max_bytes(),
-    ).sha256
 
 
 def _execution_parameter_contract(
@@ -376,9 +202,9 @@ def _execution_default_value(
     key: str,
     definition: dict[str, Any],
 ) -> Any:
-    if "default" in definition:
-        return _bounded_numeric(definition["default"], definition)
-    return None
+    # Defaults are part of the declared contract, not permission to repair it.
+    # The normal value validator rejects an out-of-range or unaligned default.
+    return definition.get("default")
 
 
 def _normalize_execution_values(
@@ -966,56 +792,6 @@ def _normalize_dynamic_references(
     return records, facts
 
 
-def normalize_workflow_smoke_fixture(
-    version: WorkflowTemplateVersion,
-    fixture: Any,
-) -> FrozenWorkflowSmokeFixture:
-    if not isinstance(fixture, dict):
-        raise ValidationError({"fixture": "必须是对象"})
-    if set(fixture) - {"schema_version", "values", "assets", "references"}:
-        raise ValidationError({"fixture": "包含未注册字段"})
-    if fixture.get("schema_version", FIXTURE_SCHEMA_VERSION) != FIXTURE_SCHEMA_VERSION:
-        raise ValidationError({"fixture": "schema_version 不受支持"})
-    values, _, _ = _normalize_values(version, fixture.get("values"))
-    references, dynamic_assets = _normalize_dynamic_references(
-        version,
-        fixture.get("references"),
-        conditioning_mode=str(values.get("CONDITIONING_MODE") or ""),
-    )
-    if references or _dynamic_reference_mode_contract(
-        version,
-        str(values.get("CONDITIONING_MODE") or ""),
-    ) is not None:
-        if fixture.get("assets") not in (None, []):
-            raise _fixture_error("assets", "动态参考模式不接受固定 semantic 素材槽")
-        assets = dynamic_assets
-    else:
-        assets = _normalize_assets(version, fixture.get("assets"))
-    persisted = {
-        "parameters": values,
-        "reference_bindings": references,
-        "media_facts": assets,
-        "materialized_graph_sha256": "",
-    }
-    payload = canonical_json_bytes(persisted)
-    fixture_max_bytes = _fixture_values_max_bytes()
-    if len(payload) > fixture_max_bytes:
-        raise _fixture_error(
-            "fixture",
-            f"规范化烟测事实超过安全边界 {fixture_max_bytes} bytes",
-        )
-    return FrozenWorkflowSmokeFixture(
-        values=values,
-        reference_bindings=tuple(references),
-        asset_facts=tuple(assets),
-        persisted_values=persisted,
-        values_size_bytes=len(payload),
-        values_sha256=json_contract(
-            persisted,
-            max_bytes=_fixture_values_max_bytes(),
-        ).sha256,
-        fixture_sha256="",
-    )
 
 
 def normalize_workflow_execution_inputs(
@@ -1024,11 +800,11 @@ def normalize_workflow_execution_inputs(
     *,
     owner,
 ) -> FrozenWorkflowExecutionInputs:
-    """Normalize production inputs with the same workflow contracts as smoke.
+    """Normalize declared workflow inputs without generating business samples.
 
-    Smoke-only defaults and global-fixture restrictions deliberately stay out
-    of this path.  The returned request contains only user-selected scalar
-    values and Asset IDs; file paths and upload details are server-authored.
+    The returned request contains explicit/declared scalar values and selected
+    Asset IDs; file paths and upload details are server-authored. Resource
+    Smoke uses its shared ExecutionPreparation contract, not this input shape.
     """
 
     if workflow_inputs is None:
@@ -1113,47 +889,6 @@ def normalize_workflow_execution_inputs(
     )
 
 
-def finalize_workflow_smoke_fixture(
-    fixture: FrozenWorkflowSmokeFixture,
-    *,
-    materialized_graph_sha256: str,
-) -> FrozenWorkflowSmokeFixture:
-    if not _SHA256.fullmatch(str(materialized_graph_sha256 or "").casefold()):
-        raise _fixture_error("fixture", "materialized graph hash 无效")
-    persisted = {
-        "parameters": fixture.values,
-        "reference_bindings": list(fixture.reference_bindings),
-        "media_facts": list(fixture.asset_facts),
-        "materialized_graph_sha256": str(materialized_graph_sha256).casefold(),
-    }
-    payload = canonical_json_bytes(persisted)
-    fixture_max_bytes = _fixture_values_max_bytes()
-    if len(payload) > fixture_max_bytes:
-        raise _fixture_error(
-            "fixture",
-            f"规范化烟测事实超过安全边界 {fixture_max_bytes} bytes",
-        )
-    fixture_sha = json_contract(
-        {
-            "schema_version": FIXTURE_SCHEMA_VERSION,
-            "values": persisted,
-            "assets": list(fixture.asset_facts),
-        },
-        max_bytes=_fixture_values_max_bytes(),
-    ).sha256
-    return FrozenWorkflowSmokeFixture(
-        values=fixture.values,
-        reference_bindings=fixture.reference_bindings,
-        asset_facts=fixture.asset_facts,
-        persisted_values=persisted,
-        values_size_bytes=len(payload),
-        values_sha256=json_contract(
-            persisted,
-            max_bytes=_fixture_values_max_bytes(),
-        ).sha256,
-        fixture_sha256=fixture_sha,
-        materialized_graph_sha256=str(materialized_graph_sha256).casefold(),
-    )
 
 
 def _dynamic_reference_schema(
@@ -1207,38 +942,8 @@ def _dynamic_reference_schema(
     }
 
 
-def workflow_smoke_fixture_schema(version: WorkflowTemplateVersion) -> dict[str, Any]:
-    """Project an editable fixture form without changing version identity."""
-
-    from studio.services.workflow_asset_groups import group_form_schema
-    parameters, bindings = _parameters_and_bindings(version)
-    mode_definition, _mode_binding = _conditioning_mode_parameter(version)
-    seed_values = {}
-    if mode_definition is not None and "default" not in mode_definition:
-        seed_values["CONDITIONING_MODE"] = mode_definition["options"][0]
-    recommended, _, _ = _normalize_values(version, seed_values)
-    if seed_values:
-        recommended["CONDITIONING_MODE"] = None
-    value_rows = []
-    for key in sorted(recommended):
-        definition = parameters[key]
-        value_rows.append({
-            "semantic_key": key,
-            "type": str(definition.get("type") or ""),
-            "required": bool(definition.get("required", True)) or bool(
-                bindings[key].get("is_required", True),
-            ),
-            "min": definition.get("min"),
-            "max": definition.get("max"),
-            "multiple_of": definition.get("multiple_of"),
-            "alignment_modulus": definition.get("alignment_modulus"),
-            "alignment_remainder": definition.get("alignment_remainder"),
-            "options": [definition["const"]] if "const" in definition else list(definition.get("options") or [])
-            if "const" in definition or definition.get("type") == "enum" else [],
-            "selection_group": str(definition.get("selection_group") or ""),
-            "recommended_value": recommended[key],
-        })
-    asset_rows = [{
+def _asset_slot_schema(version: WorkflowTemplateVersion) -> list[dict[str, Any]]:
+    return [{
         "semantic_key": key,
         "input_slot": slot["input_slot"],
         "media_kind": slot["media_kind"],
@@ -1247,23 +952,8 @@ def workflow_smoke_fixture_schema(version: WorkflowTemplateVersion) -> dict[str,
         "max_items": 1,
         "required": slot["required"],
     } for key, slot in sorted(_asset_slot_contracts(version).items())]
-    dynamic_modes = {
-        str(mode["key"]): _dynamic_reference_schema(
-            mode,
-            maximum_assets=_fixture_max_assets(),
-        )
-        for mode in _dynamic_reference_mode_contracts(version)
-    }
-    dynamic_schema = next(iter(dynamic_modes.values())) if len(dynamic_modes) == 1 else None
-    return {
-        "schema_version": FIXTURE_SCHEMA_VERSION,
-        "available": True,
-        "parameters": value_rows,
-        "asset_slots": asset_rows,
-        "dynamic_references": dynamic_schema,
-        "dynamic_reference_modes": dynamic_modes,
-        "asset_groups": group_form_schema(version.input_contract),
-    }
+
+
 
 
 def workflow_execution_input_schema(version: WorkflowTemplateVersion) -> dict[str, Any]:
@@ -1292,7 +982,6 @@ def workflow_execution_input_schema(version: WorkflowTemplateVersion) -> dict[st
             "selection_group": str(definition.get("selection_group") or ""),
             "recommended_value": _execution_default_value(key, definition),
         })
-    smoke_schema = workflow_smoke_fixture_schema(version)
     dynamic_modes = {
         str(mode["key"]): _dynamic_reference_schema(
             mode,
@@ -1305,7 +994,7 @@ def workflow_execution_input_schema(version: WorkflowTemplateVersion) -> dict[st
         "available": True,
         "reason_code": "",
         "parameters": parameters,
-        "asset_slots": smoke_schema["asset_slots"],
+        "asset_slots": _asset_slot_schema(version),
         "dynamic_references": (
             next(iter(dynamic_modes.values())) if len(dynamic_modes) == 1 else None
         ),
@@ -1328,147 +1017,3 @@ def workflow_execution_conditioning_contract(
     if not selected:
         raise ValidationError({"workflow_inputs": "必须选择 CONDITIONING_MODE"})
     return conditioning, conditioning_mode_contract(conditioning, selected)
-
-
-def verify_persisted_workflow_smoke_fixture(
-    attempt: WorkflowSmokeAttempt,
-) -> FrozenWorkflowSmokeFixture:
-    persisted = attempt.fixture_values if isinstance(attempt.fixture_values, dict) else None
-    if persisted is None:
-        raise ValidationError("workflow smoke fixture values 无效")
-    payload = canonical_json_bytes(persisted)
-    if (
-        len(payload) != attempt.fixture_values_size_bytes
-        or json_contract(
-            persisted,
-            max_bytes=_fixture_values_max_bytes(),
-        ).sha256
-        != attempt.fixture_values_sha256
-    ):
-        raise ValidationError("workflow smoke fixture values 完整性校验失败")
-    if attempt.fixture_values_schema_version != FIXTURE_SCHEMA_VERSION:
-        raise ValidationError("workflow smoke fixture schema version 不受支持")
-    if set(persisted) != {
-        "parameters", "reference_bindings", "media_facts", "materialized_graph_sha256",
-    }:
-        raise ValidationError("workflow smoke fixture v2 envelope 无效")
-    values = persisted.get("parameters")
-    references = persisted.get("reference_bindings")
-    frozen_media_facts = persisted.get("media_facts")
-    materialized_graph_sha256 = str(persisted.get("materialized_graph_sha256") or "")
-    if (
-        not isinstance(values, dict)
-        or not isinstance(references, list)
-        or any(not isinstance(row, dict) for row in references)
-        or not isinstance(frozen_media_facts, list)
-        or any(not isinstance(row, dict) for row in frozen_media_facts)
-        or not _SHA256.fullmatch(materialized_graph_sha256.casefold())
-    ):
-        raise ValidationError("workflow smoke fixture v2 facts 无效")
-    slots = _asset_slot_contracts(attempt.workflow_version)
-    rows = list(attempt.asset_bindings.select_related("asset").order_by("semantic_key"))
-    if len(rows) != len({row.semantic_key for row in rows}):
-        raise ValidationError("workflow smoke fixture 素材绑定不唯一")
-    by_semantic = {row.semantic_key: row for row in rows}
-    budget = ManagedSmokeAssetBudget()
-    facts: list[dict[str, Any]] = []
-    dynamic_mode = _dynamic_reference_mode_contract(
-        attempt.workflow_version,
-        str(values.get("CONDITIONING_MODE") or ""),
-    )
-    if dynamic_mode is not None:
-        expected_keys = {
-            str(row.get("semantic_key") or "") for row in frozen_media_facts
-        }
-        if set(by_semantic) != expected_keys:
-            raise ValidationError("workflow smoke fixture 动态素材集合已漂移")
-        try:
-            validate_dynamic_reference_bindings_against_mode_contract(
-                {
-                    "videos": [row for row in references if row.get("category") == "video"],
-                    "audios": [row for row in references if row.get("category") == "audio"],
-                },
-                dynamic_mode,
-            )
-        except ValueError as exc:
-            raise ValidationError("workflow smoke fixture 动态用途合同已漂移") from exc
-    else:
-        missing = sorted(
-            key for key, slot in slots.items()
-            if slot["required"] and key not in by_semantic
-        )
-        unknown = sorted(set(by_semantic) - set(slots))
-        if missing or unknown or references:
-            raise ValidationError("workflow smoke fixture 素材槽位合同已漂移")
-    frozen_by_semantic = {
-        str(row.get("semantic_key") or ""): row for row in frozen_media_facts
-    }
-    # Preserve the logical reference order used while finalizing the fixture.
-    # Lexical semantic sorting would put asset.reference.10 before .2 and make a
-    # valid dynamic attempt fail integrity verification after it is queued.
-    ordered_keys = (
-        [str(row.get("semantic_key") or "") for row in frozen_media_facts]
-        if dynamic_mode is not None
-        else sorted(by_semantic)
-    )
-    for key in ordered_keys:
-        row = by_semantic[key]
-        if dynamic_mode is not None:
-            frozen_fact = frozen_by_semantic.get(key) or {}
-            media_kind = str(frozen_fact.get("media_kind") or "")
-            category = str(frozen_fact.get("category") or "")
-            preprocessing_group = (
-                "videos" if media_kind == "video"
-                else "paired_video_audios" if category == "video_audio"
-                else "reference_audios" if media_kind == "audio"
-                else ""
-            )
-            fact = _dynamic_asset_fact(
-                row.asset,
-                semantic_key=key,
-                input_slot=int(frozen_fact.get("input_slot") or 0),
-                media_kind=media_kind,
-                category=category,
-                preprocessing=(
-                    _reference_preprocessing_contract(dynamic_mode, preprocessing_group)
-                    if preprocessing_group else None
-                ),
-                budget=budget,
-            )
-        else:
-            fact = _asset_fact(row.asset, slots[key], budget=budget)
-        frozen = {
-            "semantic_key": row.semantic_key,
-            "input_slot": row.input_slot,
-            "asset_id": str(row.asset_id),
-            "media_kind": row.media_kind,
-            "category": row.category,
-            "checksum": row.checksum,
-            "mime_type": row.mime_type,
-            "size_bytes": row.size_bytes,
-        }
-        if {key: fact[key] for key in frozen} != frozen:
-            raise ValidationError("workflow smoke fixture 素材事实或文件已漂移")
-        if dynamic_mode is not None and fact != frozen_by_semantic.get(key):
-            raise ValidationError("workflow smoke fixture 媒体元数据或文件已漂移")
-        facts.append(fact)
-    fixture_sha = json_contract(
-        {
-            "schema_version": FIXTURE_SCHEMA_VERSION,
-            "values": persisted,
-            "assets": facts,
-        },
-        max_bytes=_fixture_values_max_bytes(),
-    ).sha256
-    if fixture_sha != attempt.fixture_sha256:
-        raise ValidationError("workflow smoke fixture hash 不一致")
-    return FrozenWorkflowSmokeFixture(
-        values=values,
-        reference_bindings=tuple(references),
-        asset_facts=tuple(facts),
-        persisted_values=persisted,
-        values_size_bytes=len(payload),
-        values_sha256=attempt.fixture_values_sha256,
-        fixture_sha256=fixture_sha,
-        materialized_graph_sha256=materialized_graph_sha256,
-    )

@@ -10,7 +10,7 @@ from django.test import TestCase, override_settings
 from PIL import Image
 from rest_framework.test import APIClient
 
-from studio.models import Asset
+from studio.models import Asset, ShotReferenceUse
 from studio.services.security_boundaries import boundary_int
 from studio.tests.factories import build_story
 
@@ -198,6 +198,20 @@ class AssetManagementAPITests(TestCase):
         )
         self.assertIn("必须保留上传文件", str(explicitly_source_less.data))
 
+    def test_image_categories_cannot_convert_to_or_from_other_media_types(self):
+        image = self.upload(kind=Asset.Kind.REFERENCE)
+        for kind in (Asset.Kind.REFERENCE_VIDEO, Asset.Kind.REFERENCE_AUDIO, Asset.Kind.SCRIPT):
+            with self.subTest(kind=kind):
+                changed = self.client.patch(f"/api/v1/assets/{image.pk}/", {"kind": kind}, format="json")
+                self.assertEqual(changed.status_code, 400, changed.data)
+                other = Asset.objects.create(owner=self.user, kind=kind, name="Different media")
+                changed = self.client.patch(f"/api/v1/assets/{other.pk}/", {"kind": Asset.Kind.REFERENCE}, format="json")
+                self.assertEqual(changed.status_code, 400, changed.data)
+                other.refresh_from_db()
+                self.assertEqual(other.kind, kind)
+        image.refresh_from_db()
+        self.assertEqual(image.kind, Asset.Kind.REFERENCE)
+
     def test_bible_or_shot_reference_blocks_reclassification_and_deletion(self):
         bible_asset = self.character.anchor_asset
         bible_asset.description = "人物基础描述"
@@ -219,12 +233,16 @@ class AssetManagementAPITests(TestCase):
         self.assertEqual(self.character.anchor_asset_id, bible_asset.id)
 
         shot_asset = self.upload(kind=Asset.Kind.PROP, name="分镜道具")
-        self.shot.reference_assets.add(shot_asset)
+        use = ShotReferenceUse.objects.create(shot=self.shot, use_key="prop", position=0, media_kind="image",
+            asset=shot_asset, asset_sha256=shot_asset.checksum, source_mode="existing")
+        shot_changed = self.client.patch(f"/api/v1/assets/{shot_asset.id}/", {"kind": Asset.Kind.SCENE}, format="json")
+        self.assertEqual(shot_changed.status_code, 400, shot_changed.data)
         shot_deleted = self.client.delete(f"/api/v1/assets/{shot_asset.id}/")
         self.assertEqual(shot_deleted.status_code, 400, shot_deleted.data)
         self.assertIn("分镜参考", str(shot_deleted.data))
         self.assertTrue(Asset.objects.filter(pk=shot_asset.id).exists())
-        self.assertTrue(self.shot.reference_assets.filter(pk=shot_asset.id).exists())
+        use.refresh_from_db()
+        self.assertEqual(use.asset_id, shot_asset.pk)
 
     def test_unreferenced_upload_delete_removes_database_row_and_file_after_commit(self):
         asset = self.upload(kind=Asset.Kind.SCENE, name="可删除场景")
@@ -237,6 +255,54 @@ class AssetManagementAPITests(TestCase):
         self.assertEqual(response.status_code, 204, response.data)
         self.assertFalse(Asset.objects.filter(pk=asset.id).exists())
         self.assertFalse(path.exists())
+
+    def test_batch_delete_is_atomic_and_preserves_shared_file(self):
+        first = self.upload(kind=Asset.Kind.SCENE, name="批量一")
+        second = self.upload(kind=Asset.Kind.SCENE, name="批量二")
+        shared = Asset.objects.create(owner=self.user, kind=first.kind, name="保留共用文件", file=first.file.name)
+        path = Path(first.file.path)
+        with self.captureOnCommitCallbacks(execute=True):
+            response = self.client.post("/api/v1/assets/batch-delete/", {
+                "asset_ids": [str(first.pk), str(second.pk)], "confirmation": "DELETE_SELECTED_ASSETS",
+            }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["deleted_count"], 2)
+        self.assertFalse(Asset.objects.filter(pk__in=[first.pk, second.pk]).exists())
+        self.assertTrue(Asset.objects.filter(pk=shared.pk).exists())
+        self.assertTrue(path.exists())
+
+    def test_batch_delete_referenced_member_rolls_back_entire_selection(self):
+        first = self.upload(kind=Asset.Kind.SCENE, name="不能部分删")
+        response = self.client.post("/api/v1/assets/batch-delete/", {
+            "asset_ids": [str(first.pk), str(self.character.anchor_asset_id)],
+            "confirmation": "DELETE_SELECTED_ASSETS",
+        }, format="json")
+        self.assertEqual(response.status_code, 400, response.data)
+        self.assertTrue(Asset.objects.filter(pk=first.pk).exists())
+        self.assertTrue(Path(first.file.path).exists())
+
+    def test_batch_delete_rejects_missing_foreign_duplicates_and_no_confirmation(self):
+        asset = self.upload(kind=Asset.Kind.SCENE, name="受保护")
+        for body in ({"asset_ids": [str(asset.pk)]},
+                     {"asset_ids": [str(asset.pk)] * 2, "confirmation": "DELETE_SELECTED_ASSETS"},
+                     {"asset_ids": [], "confirmation": "DELETE_SELECTED_ASSETS"}):
+            self.assertEqual(self.client.post("/api/v1/assets/batch-delete/", body, format="json").status_code, 400)
+        other = get_user_model().objects.create_user(username="batch-other")
+        self.client.force_authenticate(other)
+        response = self.client.post("/api/v1/assets/batch-delete/", {
+            "asset_ids": [str(asset.pk)], "confirmation": "DELETE_SELECTED_ASSETS",
+        }, format="json")
+        self.assertEqual(response.status_code, 404, response.data)
+        self.assertTrue(Asset.objects.filter(pk=asset.pk).exists())
+
+    def test_superuser_can_batch_delete_unreferenced_global_assets(self):
+        asset = Asset.objects.create(owner=None, kind="reference", name="可清理的内置素材")
+        self.user.is_staff = self.user.is_superuser = True; self.user.save()
+        response = self.client.post("/api/v1/assets/batch-delete/", {
+            "asset_ids": [str(asset.pk)], "confirmation": "DELETE_SELECTED_ASSETS",
+        }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertFalse(Asset.objects.filter(pk=asset.pk).exists())
 
     def test_script_asset_upload_download_and_project_preview_import(self):
         upload = SimpleUploadedFile(

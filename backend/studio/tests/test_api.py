@@ -13,16 +13,10 @@ from rest_framework.test import APIClient
 
 from studio.models import (
     Asset,
-    CharacterBible,
-    DeferredGenerationRequest,
-    GeneratedWorkflow,
-    GenerationTask,
-    PromptArtifact,
-    PropBible,
     SeriesProject,
     Shot,
+    ShotCharacterRelation,
     Style,
-    WorkflowTemplate,
 )
 from studio.services.configuration import (
     create_config_revision,
@@ -39,6 +33,11 @@ class APIFlowTests(TestCase):
             self.user, self.project, self.character, self.scene,
             self.episode, self.shot1, self.shot2,
         ) = build_story()
+        for shot in (self.shot1, self.shot2):
+            ShotCharacterRelation.objects.create(shot=shot, character=self.character, role="visible", position=0)
+            ShotCharacterRelation.objects.create(shot=shot, character=self.character, role="speaker", position=0)
+            shot.dialogue[0]["voiceover"] = False
+            shot.save(update_fields=["dialogue"])
         self.client = APIClient()
         self.client.force_authenticate(self.user)
 
@@ -48,7 +47,7 @@ class APIFlowTests(TestCase):
         response = self.client.get(f"/api/v1/projects/{self.project.id}/")
         self.assertEqual(response.status_code, 404)
 
-    def test_h3_project_default_shot_duration_is_guarded(self):
+    def test_project_default_shot_duration_obeys_configured_policy(self):
         self.assertEqual(self.project.default_shot_duration_ms, 5000)
         response = self.client.patch(f"/api/v1/projects/{self.project.id}/", {
             "default_shot_duration_ms": 4999,
@@ -126,11 +125,30 @@ class APIFlowTests(TestCase):
         self.assertEqual(rejected.status_code, 400, rejected.data)
         self.assertIn("4000–8000ms", str(rejected.data))
 
-    def test_switching_video_shot_to_image_clears_video_only_fields(self):
+    def test_switching_video_shot_to_image_clears_video_flags_not_reference_facts(self):
+        import hashlib
+        import tempfile
+        from io import BytesIO
+        from PIL import Image
+        from django.core.files.uploadedfile import SimpleUploadedFile
+        root = self.enterContext(tempfile.TemporaryDirectory())
+        self.enterContext(override_settings(MEDIA_ROOT=root))
+        image = BytesIO()
+        Image.new("RGB", (2, 2), "blue").save(image, format="PNG")
+        content = image.getvalue()
+        reference = Asset.objects.create(owner=self.user, style=self.project.style,
+            kind="character", name="Explicit character source", mime_type="image/png",
+            file=SimpleUploadedFile("character.png", content, content_type="image/png"),
+            checksum=hashlib.sha256(content).hexdigest())
+        self.character.reference_assets.add(reference)
         self.shot1.conditioning_mode = "T2VA"
-        self.shot1.reference_bindings = {"legacy_video_reference": "stale"}
+        from studio.models import ShotReferenceUse
+        use = ShotReferenceUse.objects.create(shot=self.shot1, use_key="portrait", position=0,
+            media_kind="image", purpose="原始外观描述", source_mode="existing", asset=reference,
+            asset_sha256=reference.checksum)
+        references = ShotReferenceUse.objects.values().get(pk=use.pk)
         self.shot1.save(update_fields=(
-            "conditioning_mode", "reference_bindings", "updated_at",
+            "conditioning_mode", "updated_at",
         ))
 
         changed = self.client.patch(
@@ -144,7 +162,13 @@ class APIFlowTests(TestCase):
         self.assertEqual(self.shot1.media_type, Shot.MediaType.IMAGE)
         self.assertFalse(self.shot1.include_audio)
         self.assertEqual(self.shot1.conditioning_mode, "")
-        self.assertEqual(self.shot1.reference_bindings, {})
+        self.assertEqual(ShotReferenceUse.objects.values().get(pk=use.pk), references)
+
+        # Content persistence cannot change per-use selection.
+        cleared = self.client.patch(f"/api/v1/shots/{self.shot1.id}/", {"reference_bindings": {}}, format="json")
+        self.assertEqual(cleared.status_code, 400, cleared.data)
+        self.shot1.refresh_from_db()
+        self.assertEqual(ShotReferenceUse.objects.values().get(pk=use.pk), references)
 
         rejected = self.client.patch(
             f"/api/v1/shots/{self.shot2.id}/",
@@ -157,6 +181,14 @@ class APIFlowTests(TestCase):
         )
         self.assertEqual(rejected.status_code, 400, rejected.data)
         self.assertIn("conditioning_mode", str(rejected.data))
+
+    def test_retired_reference_storage_does_not_block_or_change_content_save(self):
+        self.assertNotIn("reference_bindings", {field.name for field in Shot._meta.get_fields()})
+        response = self.client.patch(f"/api/v1/shots/{self.shot1.pk}/", {"media_type": "image"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertNotIn("reference_bindings", response.data)
+        self.shot1.refresh_from_db()
+        self.assertEqual(self.shot1.media_type, "image")
 
     def test_video_shot_api_has_no_stale_100ms_floor(self):
         revision = create_config_revision(
@@ -220,7 +252,7 @@ class APIFlowTests(TestCase):
         self.shot2.duration_ms = 100
         self.shot2.save(update_fields=("media_type", "duration_ms", "updated_at"))
         long_video = Shot.objects.create(include_audio=True,
-            episode=self.episode, number=3, narrative="超长视频", duration_ms=20000,
+            episode=self.episode, number=3, duration_ms=20000,
             media_type=Shot.MediaType.VIDEO,
         )
 
@@ -277,7 +309,8 @@ class APIFlowTests(TestCase):
         self.assertEqual(shot.media_type, Shot.MediaType.IMAGE)
         self.assertFalse(shot.include_audio)
         self.assertEqual(shot.conditioning_mode, "")
-        self.assertEqual(shot.reference_bindings, {})
+        self.assertEqual(list(shot.character_relations.order_by("role").values_list("role", "position")),
+            [("speaker", 0), ("visible", 0)])
 
     def test_jwt_token_endpoint(self):
         self.client.force_authenticate(user=None)

@@ -74,22 +74,22 @@ const evidenceStatus = (value: AcceptanceSmokeEvidenceSummary) => value.fresh ? 
 const actionKindLabel = (kind: string) => ({
   live_validate: 'Live Validate', workflow_smoke: 'Workflow Smoke', publish: '发布',
   deployment_smoke: 'Deployment Smoke', runtime_host_probe: '运行主机探测',
-  deployment_probe: '实例探测', view_workflow_associations: '查看 Workflow 关联',
+  deployment_probe: '部署探测', view_workflow_associations: '查看 Workflow 关联',
   resolve_workflow_smoke_uncertain: '处理待消歧 Workflow Smoke',
 }[kind] || kind)
 const reasonCodeLabel = (code: string) => ({
   ready: '可执行',
-  validation_target_unavailable: '当前实例或模型合同不可用于校验',
-  workflow_validation_precheck_failed: '工作流合同或实例目标预检失败',
+  validation_target_unavailable: '当前部署或模型合同不可用于校验',
+  workflow_validation_precheck_failed: '工作流合同或部署目标预检失败',
   workflow_smoke_resolution_required: '需先处理待消歧任务',
-  workflow_not_validated_for_selected_deployment: '需先对当前实例执行 Live Validate',
+  workflow_not_validated_for_selected_deployment: '需先对当前部署执行 Live Validate',
   live_validation_stale: 'Live Validate 未完成或已失效',
   workflow_smoke_stale: 'Workflow Smoke 未通过或已失效',
   attempt_in_progress_or_resolution_required: '已有执行中或待消歧任务',
-  deployment_smoke_not_applicable: '当前实例不支持直接 Smoke',
+  deployment_smoke_not_applicable: '当前部署不支持直接 Smoke',
   model_profile_contract_invalid: '模型合同不可核验',
-  deployment_target_invalid: '实例目标不可核验',
-  deployment_inactive: '实例未启用',
+  deployment_target_invalid: '部署目标不可核验',
+  deployment_inactive: '部署未启用',
   use_workflow_smoke: '请通过精确 Workflow 完成验收与烟测',
   deployment_smoke_not_configured: '模型未声明可用的直接 Smoke operation',
 }[code] || code || '不可用')
@@ -127,9 +127,9 @@ const deploymentPrimaryAction = (row: AcceptanceSmokeDeploymentRow): { to: strin
   const smokeAction = row.deploymentSmoke.operations
     .map((operation) => operation.action)
     .find((action) => action.enabled)
-  if (smokeAction) return { to: smokeAction.uiUrl, label: '前往模型实例 Smoke' }
+  if (smokeAction) return { to: smokeAction.uiUrl, label: '前往模型部署 Smoke' }
   const probeAction = row.actions.find((action) => action.kind === 'deployment_probe' && action.enabled)
-  return probeAction ? { to: probeAction.uiUrl, label: '前往模型实例探测' } : null
+  return probeAction ? { to: probeAction.uiUrl, label: '前往模型部署探测' } : null
 }
 const deploymentPrimaryTarget = (row: AcceptanceSmokeDeploymentRow) => deploymentPrimaryAction(row)?.to || ''
 const deploymentPrimaryLabel = (row: AcceptanceSmokeDeploymentRow) => deploymentPrimaryAction(row)?.label || '当前无可执行动作'
@@ -196,7 +196,7 @@ watch(queryKey, () => { void load() }, { immediate: true })
       <div>
         <span class="eyebrow">验收与烟测 / ACCEPTANCE &amp; SMOKE</span>
         <h2>能力关联与验收中心</h2>
-        <p>集中查看模型实例与 Workflow 的关联、历史验收、当前证据新鲜度和下一步动作。此页只读；真实提交仍在各对象唯一执行页完成。</p>
+        <p>集中查看模型部署与 Workflow 的关联、历史验收、当前证据新鲜度和下一步动作。此页只读；真实提交仍在各对象唯一执行页完成。</p>
       </div>
       <button v-if="!showRelations" class="button ghost small" type="button" :disabled="loading||refreshing" @click="load(true)"><RefreshCw :size="14" :class="{spin:refreshing}"/>{{ refreshing ? '刷新中…' : '重新读取' }}</button>
     </header>
@@ -206,14 +206,14 @@ watch(queryKey, () => { void load() }, { immediate: true })
     <nav class="acceptance-subject-tabs" aria-label="验收对象类型">
       <button type="button" :class="{active:showRelations}" :aria-pressed="showRelations" @click="router.push({path:route.path,query:{view:'relations'}})"><span><strong>能力与关联总览</strong><small>配置关系、缺口说明与原页面入口</small></span></button>
       <button type="button" :class="{active:!showRelations&&subject==='workflow'}" :aria-pressed="!showRelations&&subject==='workflow'" @click="selectSubject('workflow')"><Workflow :size="16"/><span><strong>Workflow 验收</strong><small>Live Validate、Workflow Smoke 与发布门禁</small></span></button>
-      <button type="button" :class="{active:!showRelations&&subject==='deployment'}" :aria-pressed="!showRelations&&subject==='deployment'" @click="selectSubject('deployment')"><Server :size="16"/><span><strong>模型实例 Smoke</strong><small>实例健康、直接 Smoke 与反向 Workflow 关联</small></span></button>
+      <button type="button" :class="{active:!showRelations&&subject==='deployment'}" :aria-pressed="!showRelations&&subject==='deployment'" @click="selectSubject('deployment')"><Server :size="16"/><span><strong>模型部署 Smoke</strong><small>部署健康、直接 Smoke 与反向 Workflow 关联</small></span></button>
     </nav>
 
     <RegistryRelationsPanel v-if="showRelations"/>
     <template v-else>
     <section class="acceptance-query" aria-label="验收与烟测筛选">
       <form @submit.prevent="submitSearch">
-        <label><span>搜索当前对象</span><div><Search :size="14"/><input v-model="searchDraft" type="search" :placeholder="subject==='workflow'?'工作流名称、slug、版本或 ID':'实例名称、key、驱动或 ID'"/></div></label>
+        <label><span>搜索当前对象</span><div><Search :size="14"/><input v-model="searchDraft" type="search" :placeholder="subject==='workflow'?'工作流名称、slug、版本或 ID':'部署名称、key、驱动或 ID'"/></div></label>
         <button class="button primary small" type="submit">查询</button>
       </form>
       <div v-if="deploymentId" class="acceptance-filter-chip"><span>Deployment 筛选：<code>{{ deploymentId }}</code></span><button type="button" @click="clearDeploymentFilter">清除</button></div>
@@ -228,7 +228,7 @@ watch(queryKey, () => { void load() }, { immediate: true })
       <section class="acceptance-page-summary" aria-label="当前页状态摘要">
         <article><span>全部结果</span><strong>{{ pageData?.count || 0 }}</strong><small>当前显示 {{ pageStart }}–{{ pageEnd }}</small></article>
         <article><span>本页需要处理</span><strong>{{ subject==='workflow' ? workflowAttentionCount : deploymentAttentionCount }}</strong><small>未完成、失效、失败或待消歧</small></article>
-        <article v-if="subject==='workflow'"><span>本页已冻结实例</span><strong>{{ workflowRows.filter((row)=>row.association.validatedDeploymentMatches).length }}</strong><small>不含仅 Profile 兼容</small></article>
+        <article v-if="subject==='workflow'"><span>本页已冻结部署</span><strong>{{ workflowRows.filter((row)=>row.association.validatedDeploymentMatches).length }}</strong><small>不含仅 Profile 兼容</small></article>
         <article v-else><span>本页已验收 Workflow</span><strong>{{ deploymentRows.reduce((total,row)=>total+row.workflowAssociationSummary.validatedCount,0) }}</strong><small>按 Deployment 反向汇总</small></article>
       </section>
 
@@ -236,20 +236,20 @@ watch(queryKey, () => { void load() }, { immediate: true })
         <article v-for="row in workflowRows" :key="row.workflow.id" class="acceptance-record">
           <header><div><span class="acceptance-kind"><Workflow :size="13"/>Workflow</span><strong>{{ row.workflow.templateName || row.workflow.templateSlug }} · v{{ row.workflow.version }}</strong><small><code>{{ row.workflow.id }}</code> · {{ row.workflow.outputKind }} · {{ row.workflow.isCurrent ? '当前版本' : '非当前版本' }}</small></div><PlatformStatusPill :status="row.workflow.status"/></header>
           <div class="acceptance-record-facts">
-            <section><span>模型与实例关联</span><strong>{{ workflowAssociationLabel(row.association) }}</strong><small>Profile <code>{{ row.workflow.modelProfileVersionId }}</code></small><small v-if="row.deployment">{{ deploymentLabel(row) }} · <code>{{ row.deployment.id }}</code></small><small v-else>尚未冻结具体 Deployment</small></section>
+            <section><span>模型与部署关联</span><strong>{{ workflowAssociationLabel(row.association) }}</strong><small>Profile <code>{{ row.workflow.modelProfileVersionId }}</code></small><small v-if="row.deployment">{{ deploymentLabel(row) }} · <code>{{ row.deployment.id }}</code></small><small v-else>尚未冻结具体 Deployment</small></section>
             <section><span>Live Validate</span><PlatformStatusPill :status="evidenceStatus(row.validation)"/><small>{{ row.validation.message || row.validation.reasonCode || '服务端未返回说明' }}</small><small>历史状态 {{ row.validation.storedState || 'not_run' }} · evidence <code :title="row.validation.evidenceSha256">{{ shortHash(row.validation.evidenceSha256) }}</code></small><small v-if="row.validation.storedTargetSha256||row.validation.currentTargetSha256">target <code :title="row.validation.storedTargetSha256">{{ shortHash(row.validation.storedTargetSha256) }}</code> → <code :title="row.validation.currentTargetSha256">{{ shortHash(row.validation.currentTargetSha256) }}</code></small></section>
-            <section><span>Workflow Smoke</span><PlatformStatusPill :status="evidenceStatus(row.smoke)"/><small>{{ row.smoke.message || row.smoke.reasonCode || '服务端未返回说明' }}</small><small v-if="row.smoke.evidenceDeploymentId">历史证据实例 <code>{{ row.smoke.evidenceDeploymentId }}</code></small><small v-if="row.smoke.latestAttempt">attempt {{ row.smoke.latestAttempt.id.slice(0,8) }} · {{ row.smoke.latestAttempt.status }}<template v-if="row.smoke.latestAttempt.resolutionRequired"> · 待消歧</template></small><small v-else>尚无 Smoke attempt</small></section>
+            <section><span>Workflow Smoke</span><PlatformStatusPill :status="evidenceStatus(row.smoke)"/><small>{{ row.smoke.message || row.smoke.reasonCode || '服务端未返回说明' }}</small><small v-if="row.smoke.evidenceDeploymentId">历史证据部署 <code>{{ row.smoke.evidenceDeploymentId }}</code></small><small v-if="row.smoke.latestAttempt">attempt {{ row.smoke.latestAttempt.id.slice(0,8) }} · {{ row.smoke.latestAttempt.status }}<template v-if="row.smoke.latestAttempt.resolutionRequired"> · 待消歧</template></small><small v-else>尚无 Smoke attempt</small></section>
           </div>
           <footer><small v-if="row.actions.length">服务端建议：{{ actionSummary(row) }}</small><RouterLink class="button primary small" :to="workflowTarget(row)"><ShieldCheck :size="13"/>{{ workflowActionLabel(row) }}</RouterLink></footer>
         </article>
       </section>
 
-      <section v-else class="acceptance-record-list" aria-label="模型实例 Smoke 记录">
+      <section v-else class="acceptance-record-list" aria-label="模型部署 Smoke 记录">
         <article v-for="row in deploymentRows" :key="row.deployment.id" class="acceptance-record">
           <header><div><span class="acceptance-kind"><Server :size="13"/>Deployment</span><strong>{{ deploymentLabel(row) }}</strong><small><code>{{ row.deployment.id }}</code> · {{ row.deployment.providerDriver }} · Profile <code>{{ row.deployment.profileVersionId }}</code></small></div><PlatformStatusPill :status="row.deployment.status"/></header>
           <div class="acceptance-record-facts">
-            <section><span>实例健康</span><PlatformStatusPill :status="deploymentHealthDisplayStatus(row)"/><small v-if="row.deployment.profileContractState!=='current'">模型合同不可核验 · {{ row.deployment.profileContractReasonCode }}</small><small v-else-if="row.deployment.targetState!=='current'">实例目标不可核验 · {{ row.deployment.targetReasonCode }}</small><small v-if="row.health">{{ row.health.targetMatches ? '快照目标与当前实例一致' : '快照目标与当前实例不一致' }} · {{ row.health.fresh ? '证据有效' : '证据过期或漂移' }}</small><small v-else>尚无健康快照历史</small><small v-if="row.deployment.runtimeHostId">Runtime Host <code>{{ row.deployment.runtimeHostId }}</code></small><small v-else>远端或未绑定 Runtime Host</small></section>
-            <section><template v-if="row.deployment.providerDriver==='comfyui'"><span>实例直接 Smoke</span><PlatformStatusPill status="not_applicable"/><small>ComfyUI 实例 Smoke 不适用；请通过精确 Workflow 完成 Live Validate 与真实 Smoke。</small></template><DeploymentCapabilitySmoke v-else :row="row" :loading="refreshing" :error="error" @refresh="load(true)"/></section>
+            <section><span>部署健康</span><PlatformStatusPill :status="deploymentHealthDisplayStatus(row)"/><small v-if="row.deployment.profileContractState!=='current'">模型合同不可核验 · {{ row.deployment.profileContractReasonCode }}</small><small v-else-if="row.deployment.targetState!=='current'">部署目标不可核验 · {{ row.deployment.targetReasonCode }}</small><small v-if="row.health">{{ row.health.targetMatches ? '快照目标与当前部署一致' : '快照目标与当前部署不一致' }} · {{ row.health.fresh ? '证据有效' : '证据过期或漂移' }}</small><small v-else>尚无健康快照历史</small><small v-if="row.deployment.runtimeHostId">Runtime Host <code>{{ row.deployment.runtimeHostId }}</code></small><small v-else>远端或未绑定 Runtime Host</small></section>
+            <section><template v-if="row.deployment.providerDriver==='comfyui'"><span>部署直接 Smoke</span><PlatformStatusPill status="not_applicable"/><small>ComfyUI 部署 Smoke 不适用；请通过精确 Workflow 完成 Live Validate 与真实 Smoke。</small></template><DeploymentCapabilitySmoke v-else :row="row" :loading="refreshing" :error="error" @refresh="load(true)"/></section>
             <section><span>Workflow 反向关联</span><strong>已验收 {{ row.workflowAssociationSummary.validatedCount }} · 仅 Profile 兼容 {{ row.workflowAssociationSummary.compatibleOnlyCount }}</strong><small>校验有效 {{ row.workflowAssociationSummary.freshValidationCount }} · 漂移 {{ row.workflowAssociationSummary.driftedValidationCount }}</small><small>Smoke 历史 {{ row.workflowAssociationSummary.smokeHistoryCount }} · 有效 {{ row.workflowAssociationSummary.freshSmokeCount }} · 待消歧 {{ row.workflowAssociationSummary.unresolvedSmokeCount }}</small></section>
           </div>
           <footer><small v-if="row.actions.length">服务端建议：{{ actionSummary(row) }}</small><RouterLink v-if="deploymentPrimaryTarget(row)" class="button primary small" :to="deploymentPrimaryTarget(row)"><ShieldCheck :size="13"/>{{ deploymentPrimaryLabel(row) }}</RouterLink><button v-else class="button primary small" type="button" disabled><ShieldCheck :size="13"/>当前无可执行动作</button></footer>
@@ -257,8 +257,8 @@ watch(queryKey, () => { void load() }, { immediate: true })
       </section>
 
       <div v-if="!rows.length" class="platform-empty acceptance-empty">
-        <strong>{{ search||deploymentId ? '当前筛选没有结果' : subject==='workflow' ? '尚无 Workflow 验收对象' : '尚无模型实例 Smoke 对象' }}</strong>
-        <span>{{ search||deploymentId ? '清除筛选或调整搜索条件后重试。' : subject==='workflow' ? '先从系统设置的工作流目录扫描并导入版本。' : '先发布模型版本并创建运行实例。' }}</span>
+        <strong>{{ search||deploymentId ? '当前筛选没有结果' : subject==='workflow' ? '尚无 Workflow 验收对象' : '尚无模型部署 Smoke 对象' }}</strong>
+        <span>{{ search||deploymentId ? '清除筛选或调整搜索条件后重试。' : subject==='workflow' ? '先从系统设置的工作流目录扫描并导入版本。' : '先发布模型版本并创建模型部署。' }}</span>
       </div>
 
       <nav v-if="(pageData?.count||0)>pageSize" class="acceptance-pagination" aria-label="验收与烟测分页">

@@ -6,6 +6,8 @@ only owns reviewed media loading primitives and indexed/pair-indexed wiring.
 from copy import deepcopy
 import re
 
+from django.core.exceptions import ValidationError
+
 from studio.services.media_capabilities import conditioning_mode_contract, resolve_conditioning_contract, normalize_conditioning_contract
 from studio.services.security_boundaries import boundary_int
 
@@ -13,6 +15,9 @@ ENGINE = "generic.classified"
 COMPILER = ("generic.comfy", 3)
 MEDIA_GROUPS = {"images": "image", "videos": "video", "video_audios": "audio", "audios": "audio"}
 MODEL_INPUTS = {"images": "entity_images", "videos": "reference_videos", "video_audios": "paired_video_audios", "audios": "reference_audios"}
+# This is the registered classified-input protocol, not a model/name rule.
+# Counts bound supplied audio; port indexes follow the parent video sequence.
+CLASSIFIED_GROUP_INDEX_SOURCES = {"video_audios": "videos"}
 CONFIG_FIELDS = {"capability", "conditioning_mode", "target_role", "prompt_template_keys", "static_semantics", "dynamic_groups"}
 GROUP_FIELDS = {"input_names", "prefix", "mode_input", "minimum_items", "maximum_items"}
 
@@ -94,12 +99,28 @@ def project_plan(definition, graph, model_specification):
             raise ClassifiedReferenceError(f"素材组 {key} 数量超出安全边界")
         model_bounds = mode["inputs"][row["mode_input"]]
         if minimum < model_bounds["minimum_items"] or maximum > model_bounds["maximum_items"]:
-            raise ClassifiedReferenceError(f"素材组 {key} 的 Projector 范围不能超出模型版本能力")
+            raise ClassifiedReferenceError(
+                f"素材组 {key} 的 Projector 范围 {minimum}–{maximum} 不能超出模型模式 "
+                f"{config['conditioning_mode']} / {row['mode_input']} 的 "
+                f"{model_bounds['minimum_items']}–{model_bounds['maximum_items']}；"
+                "请调整 Projector，或修正模型合同后创建新版本"
+            )
+        if key == "images":
+            total = mode["inputs"]["total_images"]
+            if minimum < total["minimum_items"] or maximum > total["maximum_items"]:
+                raise ClassifiedReferenceError(
+                    f"素材组 images 的数量 {minimum}–{maximum} 不能超出模型模式 "
+                    f"{config['conditioning_mode']} / total_images 的 "
+                    f"{total['minimum_items']}–{total['maximum_items']}；"
+                    "分类参考图片仍受图片总量合同约束，请在 Projector 中显式收窄范围"
+                )
         # Paired audio is indexed by VIDEO position, not by audio count. It may
         # use the last video port even when only one of many videos has audio.
-        video_config = config["dynamic_groups"]["videos"]
-        video_maximum = mode["inputs"]["reference_videos"]["maximum_items"] if slots["videos"]["contract_source"] == "model_profile" else video_config["maximum_items"]
-        capacity = video_maximum if key == "video_audios" and maximum else maximum
+        index_source = CLASSIFIED_GROUP_INDEX_SOURCES.get(key)
+        capacity = maximum
+        if index_source is not None and maximum:
+            parent_config = config["dynamic_groups"][index_source]
+            capacity = mode["inputs"][parent_config["mode_input"]]["maximum_items"] if slots[index_source]["contract_source"] == "model_profile" else parent_config["maximum_items"]
         ports = row["input_names"] or [f"{row['prefix']}{index}" for index in range(capacity)]
         if len(ports) != capacity or occupied.intersection(ports):
             raise ClassifiedReferenceError("素材组端口数量与上限不一致或存在重叠")
@@ -109,8 +130,6 @@ def project_plan(definition, graph, model_specification):
         groups[key] = {"input_names": ports, "min_items": minimum, "max_items": maximum, "media_kind": MEDIA_GROUPS[key]}
     if groups["video_audios"]["max_items"] > groups["videos"]["max_items"]:
         raise ClassifiedReferenceError("配套音频数量不能超过视频数量")
-    if groups["images"]["max_items"] > mode["inputs"]["total_images"]["maximum_items"]:
-        raise ClassifiedReferenceError("图片数量不能超过模型总图片上限")
     selected = deepcopy(mode)
     for key, group in groups.items():
         selected["inputs"][MODEL_INPUTS[key]] = {"minimum_items": group["min_items"], "maximum_items": group["max_items"]}
@@ -124,7 +143,16 @@ def project_plan(definition, graph, model_specification):
                 if purpose["minimum_items"] > purpose_maximum:
                     raise ClassifiedReferenceError("Projector 数量范围与模型素材用途的最少数量冲突")
                 purpose["maximum_items"] = min(purpose["maximum_items"], purpose_maximum)
-    frozen_conditioning = normalize_conditioning_contract({**conditioning, "modes": [selected]})
+    try:
+        frozen_conditioning = normalize_conditioning_contract({**conditioning, "modes": [selected]})
+    except ValidationError as exc:
+        detail = "; ".join(
+            f"{path}: {', '.join(messages)}" for path, messages in exc.message_dict.items()
+        ) if hasattr(exc, "message_dict") else "; ".join(exc.messages)
+        raise ClassifiedReferenceError(
+            f"模型模式 {config['conditioning_mode']} 与 Projector 收窄后的合同冲突：{detail}。"
+            "请调整 Projector 或创建修正后的模型版本；不会自动删除用途、配对或预处理规则"
+        ) from exc
     return {
         "schema_version": 1, "target_node_id": targets[0], "groups": groups,
         "conditioning_mode": config["conditioning_mode"],
@@ -177,77 +205,84 @@ def partition(references):
     return result
 
 
-def prompt_references(contract, prompt):
-    """Check canonical provenance without recognizing a model's prompt syntax."""
-    payload = prompt.structured_payload
-    if not isinstance(payload, dict):
-        raise ClassifiedReferenceError("提示词缺少结构化参考合同")
-    references = payload.get("reference_bindings", [])
-    if not isinstance(references, list) or any(not isinstance(row, dict) for row in references):
-        raise ClassifiedReferenceError("reference_bindings 必须为规范化对象数组")
-    mode = contract["classified_references"]["conditioning_mode"]
-    if prompt.conditioning_mode != mode or payload.get("effective_conditioning_mode") != mode:
-        raise ClassifiedReferenceError("提示词模式与冻结分类素材合同不一致")
-    keys = contract["prompt_template_keys"]
-    if keys and payload.get("prompt_template_key") not in keys:
-        raise ClassifiedReferenceError("提示词模板键不在 Projector 配置的允许列表中")
-    identities = [row.get("asset_id") for row in references]
-    identities += [row["audio_asset_id"] for row in references if row.get("audio_asset_id")]
-    if any(not isinstance(value, str) or not value for value in identities) or len(set(identities)) != len(identities):
-        raise ClassifiedReferenceError("参考素材 ID 必须存在且全局唯一")
-    groups = partition(references)
-    labels = []
-    for key in ("images", "videos", "audios"):
-        rows = groups[key]
-        if [row.get("input_slot") for row in rows] != list(range(1, len(rows) + 1)):
-            raise ClassifiedReferenceError(f"{key} 素材序号必须连续")
-        for row in rows:
-            label = row.get("input_label")
-            if not isinstance(label, str) or not label or label not in prompt.prompt_text:
-                raise ClassifiedReferenceError("提示词缺少参考素材标签")
-            labels.append(label)
-    for row in groups["videos"]:
-        paired = bool(row.get("audio_asset_id") or row.get("use_embedded_audio"))
-        label = row.get("audio_input_label")
-        if bool(label) != paired or paired and (not isinstance(label, str) or label not in prompt.prompt_text):
-            raise ClassifiedReferenceError("视频配套音轨标签与实际来源不一致")
-        if paired:
-            labels.append(label)
-    if len(labels) != len(set(labels)):
-        raise ClassifiedReferenceError("参考素材标签不能重复")
-    return references
 
 
 def materialize(graph, contract, references):
+    """Adapt governed Asset references to the common token-based graph core."""
+    return materialize_reference_groups(graph, contract, asset_reference_groups(references))
+
+
+def asset_reference_groups(references):
+    """Project actual Asset references; generated artifacts use their own facts."""
+    groups = partition(references)
+    token_groups = {key: [] for key in ("images", "videos", "audios")}
+    for key in token_groups:
+        for item in groups[key]:
+            row = {"token": f"__AUTOPROMPT_ASSET__:{item['asset_id']}"}
+            if key == "videos":
+                row["paired_audio"] = (
+                    {"kind": "external", "token": f"__AUTOPROMPT_ASSET__:{item['audio_asset_id']}"}
+                    if item.get("audio_asset_id") else {"kind": "embedded"} if item.get("use_embedded_audio") else None)
+            token_groups[key].append(row)
+    return token_groups
+
+
+def materialize_reference_groups(graph, contract, groups):
+    """Materialize already authorized media tokens, independently of Asset IDs.
+
+    A token represents one resolved use, so callers can keep two different
+    uses of one source file and can reference a selected generated artifact.
+    This pure graph operation does not authorize, upload or inspect sources.
+    """
+    if not isinstance(groups, dict) or set(groups) != {"images", "videos", "audios"}:
+        raise ClassifiedReferenceError("分类图物化需要明确的三类素材使用组")
+    for key, rows in groups.items():
+        if not isinstance(rows, list):
+            raise ClassifiedReferenceError("分类素材使用组必须是有序数组")
+        for row in rows:
+            expected = {"token", "paired_audio"} if key == "videos" else {"token"}
+            if not isinstance(row, dict) or set(row) != expected or not isinstance(row["token"], str) or not row["token"]:
+                raise ClassifiedReferenceError("素材使用必须提供明确token及配对事实，不推断文件身份")
+            if key == "videos" and row["paired_audio"] is not None:
+                audio = row["paired_audio"]
+                if not isinstance(audio, dict) or audio.get("kind") not in {"external", "embedded"}:
+                    raise ClassifiedReferenceError("视频配套音频来源必须明确")
+                if audio["kind"] == "embedded":
+                    if set(audio) != {"kind"}:
+                        raise ClassifiedReferenceError("内嵌音轨不能同时提供外部token")
+                elif set(audio) != {"kind", "token"} or not isinstance(audio["token"], str) or not audio["token"]:
+                    raise ClassifiedReferenceError("外部配套音频缺少明确token")
     plan = contract["classified_references"]
     target = plan["target_node_id"]
     result = deepcopy(graph)
     if target not in result or any(key.startswith("cr_") for key in result):
         raise ClassifiedReferenceError("动态素材目标不存在或来源图占用了保留节点 ID")
-    groups = partition(references)
-    for key, rows in groups.items():
+    counts = {key: len(rows) for key, rows in groups.items()}
+    counts["video_audios"] = sum(row["paired_audio"] is not None for row in groups["videos"])
+    for key, count in counts.items():
         spec = plan["groups"][key]
-        if not spec["min_items"] <= len(rows) <= spec["max_items"]:
+        if not spec["min_items"] <= count <= spec["max_items"]:
             raise ClassifiedReferenceError(f"{key} 数量不满足冻结范围 {spec['min_items']}–{spec['max_items']}")
     target_inputs = result[target]["inputs"]
     if any(port in target_inputs for spec in plan["groups"].values() for port in spec["input_names"]):
         raise ClassifiedReferenceError("动态素材不能覆盖基础图中的已有连接")
-    def load(kind, asset_id, node_id):
+    def load(kind, token, node_id):
         node_type, port = {"image": ("LoadImage", "image"), "video": ("LoadVideo", "file"), "audio": ("LoadAudio", "audio")}[kind]
-        result[node_id] = {"class_type": node_type, "inputs": {port: f"__AUTOPROMPT_ASSET__:{asset_id}"}}
+        result[node_id] = {"class_type": node_type, "inputs": {port: token}}
         return [node_id, 0]
     for key in ("images", "videos", "audios"):
         for index, item in enumerate(groups[key]):
-            link = load(MEDIA_GROUPS[key], item["asset_id"], f"cr_{key}_{index}")
+            link = load(MEDIA_GROUPS[key], item["token"], f"cr_{key}_{index}")
             if key == "videos":
                 components = f"cr_components_{index}"
                 result[components] = {"class_type": "GetVideoComponents", "inputs": {"video": link}}
                 link = [components, 0]
-                if item.get("audio_asset_id") or item.get("use_embedded_audio"):
+                if item["paired_audio"] is not None:
                     ports = plan["groups"]["video_audios"]["input_names"]
                     if index >= len(ports):
                         raise ClassifiedReferenceError("视频配套音轨的序号超出已配置端口范围")
-                    target_inputs[ports[index]] = load("audio", item["audio_asset_id"], f"cr_paired_audio_{index}") if item.get("audio_asset_id") else [components, 1]
+                    audio = item["paired_audio"]
+                    target_inputs[ports[index]] = load("audio", audio["token"], f"cr_paired_audio_{index}") if audio["kind"] == "external" else [components, 1]
             target_inputs[plan["groups"][key]["input_names"][index]] = link
     if len(result) > boundary_int("security.comfy.canvas.max_nodes"):
         raise ClassifiedReferenceError("动态素材图超过节点预算")

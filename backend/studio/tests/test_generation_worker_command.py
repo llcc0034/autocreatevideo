@@ -7,6 +7,7 @@ from django.core.management import call_command
 from django.test import TestCase, override_settings
 
 from studio.management.commands import run_generation_worker
+from studio.models import GenerationTask
 from studio.services.local_qwen_lock import local_qwen_runtime_lock
 
 
@@ -19,22 +20,17 @@ class GenerationWorkerCommandTests(TestCase):
         self.settings_override.enable()
         self.addCleanup(self.settings_override.disable)
         comfy_client = patch(
-            "studio.management.commands.run_generation_worker.comfy_client_for_task",
+            "studio.services.task_queue.comfy_client_for_task",
             return_value=SimpleNamespace(),
         )
         comfy_client.start()
         self.addCleanup(comfy_client.stop)
 
     @patch("studio.management.commands.run_generation_worker.claim_next_task", return_value=None)
-    @patch(
-        "studio.management.commands.run_generation_worker.recover_stale_deferred_requests",
-        return_value=0,
-    )
     @patch("studio.management.commands.run_generation_worker.recover_stale_tasks", return_value=0)
     def test_startup_recovery_can_use_a_separate_threshold(
         self,
         recover,
-        _recover_deferred,
         _claim,
     ):
         call_command(
@@ -69,10 +65,6 @@ class GenerationWorkerCommandTests(TestCase):
                 return_value=0,
             ),
             patch(
-                "studio.management.commands.run_generation_worker.recover_stale_deferred_requests",
-                return_value=0,
-            ),
-            patch(
                 "studio.management.commands.run_generation_worker.recover_stale_workflow_smokes",
                 return_value=0,
             ),
@@ -94,10 +86,6 @@ class GenerationWorkerCommandTests(TestCase):
             ),
             patch(
                 "studio.management.commands.run_generation_worker.claim_next_task",
-                return_value=None,
-            ),
-            patch(
-                "studio.management.commands.run_generation_worker.claim_next_deferred_request",
                 return_value=None,
             ),
         ):
@@ -125,33 +113,30 @@ class GenerationWorkerCommandTests(TestCase):
 
         claim.assert_not_called()
 
-    @patch("studio.management.commands.run_generation_worker.process_deferred_request")
-    @patch("studio.management.commands.run_generation_worker.claim_next_deferred_request")
+    @patch("studio.management.commands.run_generation_worker.advance_next_execution_preparation")
     @patch("studio.management.commands.run_generation_worker.claim_next_task", return_value=None)
-    @patch("studio.management.commands.run_generation_worker.recover_stale_deferred_requests", return_value=0)
     @patch("studio.management.commands.run_generation_worker.recover_stale_tasks", return_value=0)
-    def test_worker_does_not_claim_retired_shot_detail_queue(
-        self,
-        _recover_tasks,
-        _recover_deferred,
-        _claim_task,
-        claim_deferred,
-        process_deferred,
-    ):
-        deferred_request = SimpleNamespace(
-            id="deferred-1",
-            attempts=1,
-            max_attempts=3,
-            status="waiting_upstream",
-        )
-        processed = SimpleNamespace(id="deferred-1", status="materialized")
-        claim_deferred.return_value = deferred_request
-        process_deferred.return_value = processed
-
+    def test_worker_resumes_original_preparation_without_legacy_queue(self, _recover, _claim, advance):
         call_command("run_generation_worker", once=True, recover_minutes=30)
+        advance.assert_called_once_with()
+        for symbol in ("claim_next_deferred_request", "process_deferred_request", "recover_stale_deferred_requests",
+                "ensure_next_first_frame_deferred_for_task", "claim_next_shot_detail_item",
+                "process_shot_detail_item", "recover_stale_shot_detail_items"):
+            self.assertFalse(hasattr(run_generation_worker, symbol), symbol)
 
-        claim_deferred.assert_called_once()
-        process_deferred.assert_called_once_with(deferred_request)
-        self.assertFalse(hasattr(run_generation_worker, "claim_next_shot_detail_item"))
-        self.assertFalse(hasattr(run_generation_worker, "process_shot_detail_item"))
-        self.assertFalse(hasattr(run_generation_worker, "recover_stale_shot_detail_items"))
+    @patch("studio.management.commands.run_generation_worker.advance_next_execution_preparation", return_value=None)
+    @patch("studio.management.commands.run_generation_worker.process_task")
+    @patch("studio.management.commands.run_generation_worker._claim_generation_work")
+    @patch("studio.management.commands.run_generation_worker.recover_stale_tasks", return_value=0)
+    def test_successful_task_does_not_create_implicit_next_shot(self, _recover, claim, process, _advance):
+        # Deliberately has no GeneratedWorkflow/PromptArtifact. A new task must
+        # finish without a second implicit selection or continuity side path.
+        # Use the real schema so a removed task field cannot survive in a
+        # permissive fixture and crash the worker before remote submission.
+        task = GenerationTask(attempts=1, status=GenerationTask.Status.SUCCEEDED)
+        claim.return_value = (None, None, task)
+        process.return_value = task
+        with patch("studio.management.commands.run_generation_worker.fail_claimed_task_preflight") as fail:
+            call_command("run_generation_worker", once=True, recover_minutes=30)
+        process.assert_called_once()
+        fail.assert_not_called()

@@ -242,7 +242,7 @@ for (const item of guide.glossary) line(`- **${item.chinese}（${item.english}�
 line()
 line('---')
 line()
-line('待优化计划与当前能力分开维护。Provider 能力声明字段的收敛计划见 [`OPT-SETTINGS-001`](optimization/README.md)。')
+line('待优化计划与当前能力分开维护。最新范围与决策见[待办复核清单](optimization/backlog-review-2026-09-28.md)；Provider 受控目录的已完成范围与历史证据见原台账 `OPT-SETTINGS-001`，不重复列为待开发。')
 line()
 line('正文唯一来源：`frontend/src/content/systemSettingsGuide.json`。网页路由 `/manual/settings` 与本 Markdown 使用同一份结构化数据。')
 line()

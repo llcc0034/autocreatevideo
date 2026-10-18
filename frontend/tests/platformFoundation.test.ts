@@ -1,4 +1,9 @@
 import assert from 'node:assert/strict'
+import { integerConstraintsFixture } from './fixtures/textConstraints.ts'
+import {scriptContractFixture} from './helpers/scriptContractFixture.ts'
+import {asyncMediaFixture} from './helpers/asyncMediaFixture.ts'
+import {referenceTopologyFixture} from './helpers/referenceTopologyFixture.ts'
+import {visualRulesOutputRaw} from './visualRulesOutputFixture.ts'
 import test from 'node:test'
 import { existsSync, readdirSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -6,7 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { createServer } from 'vite'
 
 const frontendRoot = fileURLToPath(new URL('..', import.meta.url))
-const server = () => createServer({ root: frontendRoot, logLevel: 'silent', appType: 'custom', server: { middlewareMode: true } })
+const server = () => createServer({ root: frontendRoot, logLevel: 'silent', appType: 'custom', server: { middlewareMode: true, hmr: false } })
 const fictionalConditioningModes = [{
   key: 'cinema_text', label: '虚构影片文本模式', description: '只使用文本', input_kind: 'text_only',
   requires_entity_reference_bible: false, supports_native_audio: false,
@@ -20,7 +25,29 @@ test('storyboard no longer trusts or displays retired optimizer claims', () => {
   assert.equal(view.includes('quality.optimizer'), false)
   assert.equal(view.includes('promptQuality.optimizer'), false)
   assert.equal(view.includes('source_fields_optimized'), false)
-  assert.ok(view.includes('gate.would_block_enqueue'))
+  assert.equal(view.includes('gate.would_block_enqueue'), false)
+  assert.ok(view.includes('执行准备中查看并确认本次内容'))
+  assert.ok(view.includes('任务中心 → 任务详情 → 输入与实际提示词'))
+  assert.ok(view.includes('进入生产工作台'))
+})
+
+test('storyboard save failure stays visible until the next explicit save', () => {
+  const view = readFileSync(join(frontendRoot, 'src/views/StoryboardView.vue'), 'utf8')
+  assert.ok(view.includes("const saveError = ref('')"))
+  assert.match(view, /v-if="saveError" role="alert"/)
+  assert.ok(view.includes('页面内容尚不能视为已入库'))
+  assert.match(view, /catch\(e\)\{saveError\.value=e instanceof Error\?e\.message/)
+  assert.match(view, /saving\.value=true;saveError\.value='';try\{await persistEpisodeKeepingSelection/)
+})
+
+test('workflow details read the frozen input contract and never render missing schema as zero inputs', () => {
+  const view = readFileSync(join(frontendRoot, 'src/views/WorkflowVersionEditorView.vue'), 'utf8')
+  assert.ok(view.includes('savedVersion.value?.workflowInputSchema'))
+  assert.ok(view.includes("workflowInputError.value ? '不可核验'"))
+  assert.ok(view.includes('v-if="!workflowInputError"'))
+  assert.ok(view.includes('不能将读取失败视为没有参数或素材槽位'))
+  assert.ok(view.includes("默认 {{ item.recommendedValue ?? '未声明' }}"))
+  assert.equal(view.includes('smokeFixtureSchema'), false)
 })
 
 test('runtime source has no mock data module or environment fallback switch', () => {
@@ -113,8 +140,6 @@ test('production capability accepts the canonical configured timeout contract', 
       script_breakdown_default_shot_duration_ms: 5000,
       script_breakdown_default_first_frame_continuity: false,
       script_breakdown_default_last_frame_continuity: false,
-      script_breakdown_auto_split_trigger_chars: 320,
-      script_breakdown_auto_split_target_chars: 220,
       active_task_count: 0,
       user_active_task_count: 0,
       queue_guidance_enforcement: 'advisory',
@@ -125,7 +150,6 @@ test('production capability accepts the canonical configured timeout contract', 
         max_reference_bindings: 64, max_bible_candidates_per_entity: 10, max_bible_reference_assets_per_entity: 10, max_bible_regeneration_entities_per_request: 10,
         dialogue_max_entries: 64, dialogue_speaker_id_max_characters: 160, dialogue_text_max_characters: 2000, dialogue_delivery_max_characters: 500,
         execution_monitoring_max_node_type_overrides: 128, execution_monitoring_max_node_overrides: 256, execution_monitoring_max_idle_timeout_seconds: 86400,
-        prompt_review_max_candidates: 100, prompt_review_max_advisories: 200, prompt_review_max_input_bytes: 524288, prompt_review_max_field_characters: 30000, prompt_review_max_usage_count: 1000000000,
         audit_note_min_characters: 8, audit_note_max_characters: 4000,
       },
       creation_defaults: {
@@ -136,9 +160,6 @@ test('production capability accepts the canonical configured timeout contract', 
       },
       configuration_public_sha256: 'a'.repeat(64),
       configuration_sources: { 'production.task_timeout_seconds': 'system' },
-      conditioning_modes: fictionalConditioningModes,
-      conditioning_contract_sha256: 'b'.repeat(64),
-      default_conditioning_mode: 'cinema_text',
     } }
   }
 
@@ -146,6 +167,8 @@ test('production capability accepts the canonical configured timeout contract', 
   assert.equal(capability.taskTimeoutSeconds, 21600)
   assert.equal(capability.configuredTaskTimeoutSeconds, 21600)
   assert.equal(capability.scriptBreakdownDefaultShotDurationMs, 5000)
+  assert.equal('scriptBreakdownAutoSplitTriggerChars' in capability, false)
+  assert.equal('scriptBreakdownAutoSplitTargetChars' in capability, false)
   assert.equal(capability.creationDefaults.shotsPerEpisode, 8)
   assert.equal(capability.creationDefaults.defaultLanguage, 'Chinese')
   assert.equal(capability.creationDefaults.defaultAspectRatio, '9:16')
@@ -158,6 +181,9 @@ test('production capability accepts the canonical configured timeout contract', 
   assert.deepEqual(capability.queueAdvisories, [])
   assert.equal('confirmationRequired' in capability, false)
   assert.equal('deploymentTaskTimeoutSeconds' in capability, false)
+  assert.equal('conditioningModes' in capability, false)
+  assert.equal('conditioningContractSha256' in capability, false)
+  assert.equal('defaultConditioningMode' in capability, false)
   queueAdvisories = [{
     schema_version: 1,
     code: 'recommended_max_active_per_user_exceeded',
@@ -182,10 +208,38 @@ test('production capability accepts the canonical configured timeout contract', 
   )
 })
 
+test('video conditioning catalog distinguishes empty, malformed and failed reads', async (context) => {
+  const vite = await server()
+  context.after(async () => { await vite.close() })
+  const { repository } = await vite.ssrLoadModule('/src/services/repository.ts')
+  const { api } = await vite.ssrLoadModule('/src/services/api.ts')
+  const originalGet = api.get
+  context.after(() => { api.get = originalGet })
+  let data: Record<string, unknown> = { conditioning_modes: fictionalConditioningModes, conditioning_contract_sha256: 'b'.repeat(64) }
+  api.get = async (url: string) => { assert.equal(url, '/capabilities/video-conditioning/'); return { data } }
+  const populated = await repository.getVideoConditioningCapability()
+  assert.equal(populated.conditioningModes.length, fictionalConditioningModes.length)
+  assert.equal(populated.conditioningContractSha256, 'b'.repeat(64))
+  data = { ...data, conditioning_modes: [] }
+  assert.deepEqual((await repository.getVideoConditioningCapability()).conditioningModes, [])
+  data = { conditioning_contract_sha256: 'b'.repeat(64) }
+  await assert.rejects(repository.getVideoConditioningCapability())
+  data = { conditioning_modes: [], conditioning_contract_sha256: '' }
+  await assert.rejects(repository.getVideoConditioningCapability(), /合同指纹/)
+  api.get = async () => { throw Error('catalog invalid') }
+  await assert.rejects(repository.getVideoConditioningCapability(), /catalog invalid/)
+})
+
 test('shared API error presentation keeps codes and fields but hides raw provider diagnostics', async () => {
   const vite = await server()
   try {
     const errors = await vite.ssrLoadModule('/src/services/apiErrorPresentation.ts')
+    for (const data of [
+      {code:'execution_preparation_conflict',detail:['已有确切后继', '请重新读取']},
+      {error:{code:'execution_preparation_conflict',details:{detail:['已有确切后继', '请重新读取']}}},
+    ]) {
+      assert.equal(errors.apiErrorSummary({response:{status:409,data}}), '[execution_preparation_conflict] 已有确切后继；请重新读取')
+    }
     const shown = errors.apiErrorPresentation({ response: { status: 400, headers: { 'content-type': 'application/json' }, data: {
       error: { code: 'config_invalid', message: '配置未通过校验', details: {
         value: ['必须是整数'], provider_response: 'raw upstream body', traceback: 'secret stack',
@@ -256,7 +310,7 @@ test('platform adapters preserve unknown backend strings and artifact metadata',
   const vite = await server()
   try {
     const adapters = await vite.ssrLoadModule('/src/services/platformAdapters.ts')
-    const run = adapters.adaptProductionRun({ id: 'run-1', status: 'future_server_state', current_stage_key: 'custom_stage', created_at: '', updated_at: '' })
+    const run = adapters.adaptProductionRun({ ...{ plan_source: 'recipe', recipe_version: 'fixture-recipe' }, id: 'run-1', status: 'future_server_state', current_stage_key: 'custom_stage', created_at: '', updated_at: '' })
     assert.equal(run.status, 'future_server_state')
     assert.equal(run.currentStageKey, 'custom_stage')
     assert.deepEqual(adapters.presentPlatformStatus('future_server_state'), { label: '未知状态', tone: 'unknown' })
@@ -280,46 +334,7 @@ test('platform adapters preserve unknown backend strings and artifact metadata',
     assert.equal(artifact.status, 'server_selected_v2')
     assert.deepEqual(artifact.manifestMetadata, { task_id: 't-1', output_index: 3 })
     assert.deepEqual(artifact.comparisonParameters, { model: 'model-v2', generation: { seed: 29 } })
-    const mediaRoutes = adapters.adaptProductionRecipeMediaRouteOptions({
-      schema_version: 2,
-      recipe_version_id: 'recipe-1',
-      recipe_definition_sha256: 'c'.repeat(64),
-      routes: [{
-        route_index: 2,
-        workflow_version_id: 'workflow-1',
-        workflow_label: 'H3 参考生视频 · v3',
-        model_deployment_id: 'deployment-1',
-        deployment_label: 'Local ComfyUI',
-        model_identifier: 'minimax-h3',
-        driver_type: 'comfyui',
-        output_kinds: ['video'],
-        conditioning_modes: fictionalConditioningModes,
-        conditioning_contract_sha256: 'e'.repeat(64),
-        media_operations: [],
-        is_selectable: false,
-        reason_codes: ['workflow_smoke_missing'],
-        reasons: ['工作流未通过 smoke'],
-        prompt_profile_requirements: [{
-          operation: 'video.generate', mode: 'Ref2VA', choices: [{
-            binding_id: 'binding-1', binding_key: 'h3-ref-cinematic', binding_name: '电影感参考生视频',
-            prompt_profile_version_id: 'prompt-profile-1', profile_key: 'h3.ref.cinematic', profile_version: 3,
-            profile_name: 'H3 电影感参考策略', contract_sha256: 'd'.repeat(64), priority: 20,
-            binding_scope: 'exact_model',
-          }],
-        }],
-      }],
-      bible_image_generation: null,
-    })
-    assert.equal(mediaRoutes.schemaVersion, 2)
-    assert.equal(mediaRoutes.routes[0].routeIndex, 2)
-    assert.deepEqual(mediaRoutes.routes[0].conditioningModes.map((item: { key: string }) => item.key), ['cinema_text'])
-    assert.equal(mediaRoutes.routes[0].conditioningContractSha256, 'e'.repeat(64))
-    assert.deepEqual(mediaRoutes.routes[0].reasonCodes, ['workflow_smoke_missing'])
-    assert.deepEqual(mediaRoutes.routes[0].conditioningModes[0].inputs.referenceVideos, {
-      minimumItems: 0, maximumItems: 0,
-    })
-    assert.equal(mediaRoutes.routes[0].promptProfileRequirements[0].choices[0].bindingId, 'binding-1')
-    const snapshotted = adapters.adaptProductionRun({
+    const snapshotted = adapters.adaptProductionRun({ ...{ plan_source: 'recipe', recipe_version: 'fixture-recipe' },
       id: 'run-snapshots', created_at: '', updated_at: '',
       stages: [{
         id: 'stage-1', stage_key: 'script_generate', created_at: '', updated_at: '',
@@ -356,7 +371,14 @@ test('settings registry adapters preserve immutable review evidence after refres
     })
     assert.equal(profile.publishedBy, 'reviewer-1')
     assert.equal(profile.specificationSha256, 'a'.repeat(64))
-    const registryOptions = adapters.adaptModelProfileRegistryOptions({
+    const registryOptionsRaw = {
+      visual_rules_output: visualRulesOutputRaw,
+      execution_monitoring: {max_idle_timeout_seconds:86400,max_node_type_overrides:128},
+      media_constraints: {schema_version:1,resolution_fields:[{key:'width_multiple',label:'宽度倍数',unit:'像素',minimum:1,maximum:32768}],resolution_pairs:[],fps:{minimum:1,maximum:120,maximum_items:64},duration_ms:{minimum:1,maximum:3600000}},
+      text_execution: {schema_version:1,integer_constraints:integerConstraintsFixture(),operations:[{value:'prompt.draft',label:'提示词起草'}],parameters:[{value:'seed',label:'随机种子',description:'仅声明物理范围',required:false,require_maximum:false,template:{type:'integer',required:false}}]},
+      chat_request_options: {schema_version:1,temperature_minimum:0,response_format_types:[{value:'text',label:'文本'}],assembly_description:'正文同名字段',boundary_description:'不是能力证明'},
+      script_contracts: scriptContractFixture,
+      async_media: asyncMediaFixture,
       specification_schema_version: 1,
       provider_drivers: [{ value: 'comfyui', label: 'ComfyUI', modalities: ['image'], operations: ['submit'] }],
       modalities: [{ value: 'image', label: '图片' }],
@@ -364,13 +386,24 @@ test('settings registry adapters preserve immutable review evidence after refres
       capabilities: [{ value: 'image.text_to_image', label: '文生图', modalities: ['image'], driver_types: ['comfyui'], legacy: false }],
       model_families: ['sdxl'],
       conditioning_contract: {
+        dynamic_reference_topology: referenceTopologyFixture(),
         schema_version: 1, adapter_key: 'media_conditioning_v1',
         input_kinds: [{value:'classified_references',label:'多参考素材'}],
         input_slots: [{value:'total_images',label:'图片总数'}],
         maximum_items: 64, maximum_modes: 16, identifier_pattern: '^[A-Za-z][A-Za-z0-9_.-]{0,63}$',
         mode_template: { inputs: { total_images: {minimum_items:0,maximum_items:0} } },
       },
-    })
+    }
+    const registryOptions = adapters.adaptModelProfileRegistryOptions(registryOptionsRaw)
+    assert.deepEqual(registryOptions.textExecution.integerConstraints.valueFields,integerConstraintsFixture().value_fields)
+    for(const integer_constraints of [undefined,{}, {...integerConstraintsFixture(),seed_policies:[]}, {...integerConstraintsFixture(),value_fields:[...integerConstraintsFixture().value_fields.slice(0,3),integerConstraintsFixture().value_fields[0]]}]) {
+      assert.throws(()=>adapters.adaptModelProfileRegistryOptions({...registryOptionsRaw,text_execution:{...registryOptionsRaw.text_execution,integer_constraints}}))
+    }
+    assert.deepEqual(registryOptions.executionMonitoring, {maxSeconds:86400,maxOverrides:128})
+    for (const invalid of [undefined, {}, {max_idle_timeout_seconds:0,max_node_type_overrides:128},
+      {max_idle_timeout_seconds:true,max_node_type_overrides:128}, {max_idle_timeout_seconds:86400,max_node_type_overrides:1.5}]) {
+      assert.throws(() => adapters.adaptModelProfileRegistryOptions({...registryOptionsRaw,execution_monitoring:invalid}), /模型等待时限目录不完整/)
+    }
     assert.equal(registryOptions.specificationSchemaVersion, 1)
     assert.deepEqual(registryOptions.providerDrivers[0].operations, ['submit'])
     assert.deepEqual(registryOptions.capabilities[0].driverTypes, ['comfyui'])
@@ -446,7 +479,7 @@ test('settings registry adapters preserve immutable review evidence after refres
       smoke_test_evidence: { output_sha256: 'd'.repeat(64) },
       validation_evidence_sha256: 'e'.repeat(64), smoke_test_evidence_sha256: 'f'.repeat(64),
       execution_contract_sha256: '1'.repeat(64), published_by: 'reviewer-2', created_at: '', updated_at: '',
-      smoke_fixture_schema: {
+      workflow_input_schema: {
         schema_version: 2, available: true,
         parameters: [{ semantic_key: 'sampling.seed', type: 'integer', required: true, min: 0, max: 100, multiple_of: 1, alignment_modulus: null, alignment_remainder: null, options: [], selection_group: '', recommended_value: 1 }],
         asset_slots: [{ semantic_key: 'asset.image.source', input_slot: 1, media_kind: 'image', category: 'image', min_items: 1, max_items: 1, required: true }],
@@ -457,12 +490,12 @@ test('settings registry adapters preserve immutable review evidence after refres
     assert.equal(workflow.validatedDeployment, 'deployment-1')
     assert.deepEqual(workflow.validationEvidence, { object_info_sha256: 'c'.repeat(64) })
     assert.deepEqual(workflow.smokeTestEvidence, { output_sha256: 'd'.repeat(64) })
-    assert.equal(workflow.smokeFixtureSchema?.parameters[0].recommendedValue, 1)
-    assert.equal(workflow.smokeFixtureSchema?.assetSlots[0].minItems, 1)
-    assert.equal(workflow.smokeFixtureSchema?.schemaVersion, 2)
-    assert.equal(workflow.smokeFixtureSchema?.dynamicReferences?.videos.maxItems, 3)
-    assert.equal(workflow.smokeFixtureSchema?.dynamicReferences?.videos.defaultPurposeKey, 'orbit_rhythm_v7')
-    assert.equal(workflow.smokeFixtureSchema?.dynamicReferences?.videos.supportsEmbeddedAudio, true)
+    assert.equal(workflow.workflowInputSchema?.parameters[0].recommendedValue, 1)
+    assert.equal(workflow.workflowInputSchema?.assetSlots[0].minItems, 1)
+    assert.equal(workflow.workflowInputSchema?.schemaVersion, 2)
+    assert.equal(workflow.workflowInputSchema?.dynamicReferences?.videos.maxItems, 3)
+    assert.equal(workflow.workflowInputSchema?.dynamicReferences?.videos.defaultPurposeKey, 'orbit_rhythm_v7')
+    assert.equal(workflow.workflowInputSchema?.dynamicReferences?.videos.supportsEmbeddedAudio, true)
     assert.equal(workflow.publishedBy, 'reviewer-2')
     const parameterBase = {
       semantic_key: 'video.frames', type: 'integer', required: true,
@@ -472,7 +505,7 @@ test('settings registry adapters preserve immutable review evidence after refres
       recommended_value: -12,
     }
     const adaptParameter = (parameter: Record<string, unknown>) => (
-      adapters.adaptWorkflowSmokeFixtureSchema({
+      adapters.adaptWorkflowInputSchema({
         schema_version: 2, available: true, parameters: [parameter],
         asset_slots: [], dynamic_reference_modes: {}, dynamic_references: null,
       })
@@ -494,11 +527,11 @@ test('settings registry adapters preserve immutable review evidence after refres
     const historicalWorkflow = {
       id: 'workflow-historical', template: 'template-1', version: 1, created_at: '', updated_at: '',
       input_contract: { schema_version: 1, parameters: { 'prompt.positive': { type: 'text', required: true } }, outputs: { primary: { node_id: '13', kind: 'video', required: true } } },
-      smoke_fixture_schema: { schema_version: 2, available: true, parameters: [], asset_slots: [] },
+      workflow_input_schema: { schema_version: 2, available: true, parameters: [], asset_slots: [] },
     }
     assert.throws(() => adapters.adaptWorkflowTemplateVersion(historicalWorkflow), /缺少 dynamic_reference_modes/)
     const historicalAudit = adapters.adaptWorkflowTemplateVersionForAudit(historicalWorkflow)
-    assert.match(historicalAudit.smokeFixtureSchemaError, /缺少 dynamic_reference_modes/)
+    assert.match(historicalAudit.workflowInputSchemaError, /缺少 dynamic_reference_modes/)
     assert.equal(historicalAudit.inputContract.outputs.primary.node_id, '13')
     const artifact = adapters.adaptModelArtifact({
       id: 'artifact-1', profile_version: 'profile-1', verified_snapshot: 'snapshot-1',
@@ -1116,6 +1149,7 @@ test('workflow smoke candidate and attempt adapters preserve server-issued fixtu
     assert.equal(JSON.stringify(asset).includes('hidden'), false)
     const attempt = adapters.adaptWorkflowSmokeAttempt({
       id: 'attempt-1', workflow_version: 'version-1', deployment: 'deployment-1', status: 'uncertain',
+      scope: 'resource', execution_instance_version: null, preparation_id: 'prep-1',
       fixture_values_schema_version: 2,
       fixture_values_size_bytes: 19, fixture_values_sha256: 'b'.repeat(64), fixture_sha256: 'c'.repeat(64),
       asset_bindings: [{ semantic_key: 'asset.image.source', input_slot: 1, asset: 'asset-1', media_kind: 'image', category: 'image', checksum: 'a'.repeat(64), mime_type: 'image/png', size_bytes: 42, created_at: '' }],
@@ -1204,11 +1238,11 @@ test('config schema validation matches typed controls and blocks invalid dirty v
     assert.equal(schema.configValueEditorKind(definition('enabled', 'boolean')), 'boolean')
     assert.equal(schema.configValueEditorKind(definition('mode', 'string', { enum: ['safe', 'fast'] })), 'enum')
     assert.equal(schema.configValueEditorKind(definition('normalizer', 'string', {
-      resource_ref: { resource: 'model_deployment', capability: 'prompt.normalize', allow_empty: true, require_ready: true },
+      resource_ref: { resource: 'execution_instance_version', capability: 'prompt.normalize', allow_empty: true },
     })), 'resource')
     assert.match(schema.configValueConstraintSummary(definition('normalizer', 'string', {
-      resource_ref: { resource: 'model_deployment', capability: 'prompt.normalize' },
-    })), /依赖 model_deployment · prompt\.normalize/)
+      resource_ref: { resource: 'execution_instance_version', capability: 'prompt.normalize' },
+    })), /推荐精确实例版本 · prompt\.normalize/)
     assert.equal(schema.parseConfigValue(definition('count', 'integer', { minimum: 1, maximum: 3 }), '4').error, 'count 不能大于 3')
     assert.match(schema.parseConfigValue(definition('name', 'string', { pattern: '[a-z]+' }), '"中文"').error, /格式约束/)
     assert.match(schema.parseConfigValue(definition('workflow.path', 'string', {
@@ -1264,7 +1298,7 @@ test('settings safety category fails closed and uses catalog permissions with se
     'revisionsForCurrentSection', 'changesSecurityBoundaries', 'unknownConfigRevisionClassifications', 'canWriteConfigRevision',
     "item.configurationClass === currentConfigurationClass.value",
   ]) assert.ok(settings.includes(marker), `SettingsView safety convergence misses ${marker}`)
-  for (const marker of ['SettingsListFilter', 'filterSettingsList', 'filteredFields', 'filteredProfiles', 'filteredBindings']) {
+  for (const marker of ['SettingsListFilter', 'filterSettingsList', 'filteredProfiles']) {
     assert.ok(prompts.includes(marker), `PromptProfile settings misses shared filtering marker ${marker}`)
   }
   assert.ok(filterComponent.includes('显示已退役/停用记录（Include retired/inactive）'))
@@ -1310,12 +1344,14 @@ test('model registry groups versions, files and runtime instances without mergin
   for (const marker of [
     "'deployment-status'", "'retire-deployment'", 'retireDeployment', '删除复核', '退役保留历史',
     'buildModelRegistryFamilies', 'modelRegistryFamilies', '管理服务连接', '新建模型',
-    '新建下一版本', '新增文件声明', '新增运行实例', '实例状态', ':acceptance-loading="loading"',
+    '新建下一版本', '新增文件声明', '新增模型部署', '部署状态', ':acceptance-loading="deploymentAcceptanceLoading"',
     'ModelDeploymentExecutionSummary', '工作流验收', 'deploymentAcceptanceRows',
     'sectionErrors.deploymentAcceptance', 'listAcceptanceSmokeDeploymentRows',
     'latestModelProfileForFamily', 'createNextModelProfile', 'model-registry-workbench',
     'model-family-browser', 'model-family-inspector', 'model-version-tabs',
     'model-section-tabs', 'model-version-detail', '.model-instance-list article>.model-instance-actions',
+    '.model-instance-list article{grid-template-columns:minmax(0,1fr) auto}',
+    '.model-instance-list article>.model-instance-actions{grid-column:1/-1;min-width:0;',
     'selectedModelFamilyKey', 'selectedModelProfileId', 'selectedModelSection',
     'selectedModelFamily', 'selectedModelVersionGroup', 'selectModelFamily', 'selectModelVersion',
     'modelCapabilitySearchHit', 'modelArtifactSearchHit', 'modelDeploymentSearchHit',
@@ -1353,7 +1389,7 @@ test('model registry groups versions, files and runtime instances without mergin
   assert.ok(api.includes('/model-profile-versions/options/'))
   assert.ok(api.includes("fetchAllPages<unknown>('/acceptance-smoke/'"))
   assert.ok(api.includes("row.subject !== 'deployment'"))
-  assert.ok(api.includes('模型实例验收响应包含重复 Deployment'))
+  assert.ok(api.includes('模型部署验收响应包含重复 Deployment'))
   assert.ok(types.includes('ModelProfileRegistryOptions'))
   assert.ok(types.includes("'active' | 'disabled' | 'error' | 'retired'"))
 
@@ -1531,12 +1567,13 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
       },
     }
     const recipeEditorOptions = {
-      definitionSchemaVersion: 1,
+      definitionSchemaVersion: 3,
+      effectiveLimits: { maxRoutingRoutes: 3, maxVariants: 4 },
+      interactionModeOptions: [{ value: 'assisted', label: '人工辅助' }, { value: 'unattended', label: '无人值守' }],
+      fieldReviewPolicyOptions: [], sourceKindOptions: [], textOutputOptions: [], parameterPolicyOptions: [], scopeOptions: [],
       stageOptions: [
         { value: 'script_generate', modes: ['ai'], requiresRouting: true },
         { value: 'script_structure', modes: ['ai'], requiresRouting: true },
-        { value: 'script_normalize', modes: ['ai', 'manual'], requiresRouting: true },
-        { value: 'script_normalize_review', modes: ['review'], requiresRouting: false },
         { value: 'bible_materialize', modes: ['deterministic'], requiresRouting: false },
         { value: 'bible_review', modes: ['review', 'manual'], requiresRouting: false },
         { value: 'storyboard_review', modes: ['review'], requiresRouting: false },
@@ -1557,6 +1594,7 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
         ],
       }],
     }
+    recipeEditorOptions.stageOptions = recipeEditorOptions.stageOptions.map(row=>({...row, label: row.value, repeatable: false, candidateEvaluatorOptions: [], routingModes: row.requiresRouting ? row.modes.filter(mode=>!['manual','review','skip'].includes(mode)) : [], decisionPolicy: null}))
     const emptyDependencies = { providers: [], modelProfiles: [], deployments: [], runtimeHosts: [], workflowVersions: [], modelProfileOptions, configDefinitionOptions, recipeEditorOptions }
     const recipeFields = schema.resourceEditorFields('recipe', {
       recipe_key: 'series-ai-production', version: 99, name: 'AI production',
@@ -1653,18 +1691,16 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
     for (const path of [
       'specification.prompt_normalization.max_input_bytes',
       'specification.prompt_normalization.input_byte_warning_threshold',
-      'specification.prompt_normalization.max_output_tokens',
-      'specification.prompt_normalization.output_token_warning_threshold',
       'specification.prompt_normalization.max_items_per_batch',
       'specification.prompt_normalization.timeout_seconds',
       'specification.prompt_normalization.chat_request_options',
     ]) assert.ok(promptNormalizationFields.some((field: { path: string }) => field.path === path), `missing prompt.normalize typed field ${path}`)
     assert.equal(modelFields.some((field: { path: string }) => field.path.startsWith('specification.prompt_normalization.')), false)
+    assert.equal(promptNormalizationFields.some((field: { path: string }) => /max_output_tokens|output_token_warning_threshold/.test(field.path)), false)
+    assert.match(schema.promptNormalizationValidationErrors({max_input_bytes:16000,max_items_per_batch:1,timeout_seconds:180,chat_request_options:{},max_output_tokens:8192}).join(' '), /未知字段.*max_output_tokens/)
     assert.deepEqual(schema.promptNormalizationValidationErrors({
       max_input_bytes: 16000,
       input_byte_warning_threshold: 8000,
-      max_output_tokens: 8192,
-      output_token_warning_threshold: 4096,
       max_items_per_batch: 1,
       timeout_seconds: 180,
       chat_request_options: {
@@ -1676,29 +1712,25 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
     assert.match(schema.promptNormalizationValidationErrors({
       max_input_bytes: 16000,
       input_byte_warning_threshold: 16001,
-      max_output_tokens: 8192,
       max_items_per_batch: 1,
       timeout_seconds: 180,
       chat_request_options: {},
     }).join(' '), /输入字节建议阈值不能大于/)
     assert.match(schema.promptNormalizationValidationErrors({
       max_input_bytes: 16000,
-      max_output_tokens: 8192,
       output_token_warning_threshold: 8193,
       max_items_per_batch: 1,
       timeout_seconds: 180,
       chat_request_options: {},
-    }).join(' '), /建议阈值不能大于/)
+    }).join(' '), /未知字段.*output_token_warning_threshold/)
     assert.deepEqual(schema.promptNormalizationValidationErrors({
       max_input_bytes: 12000,
-      max_output_tokens: 8192,
       max_items_per_batch: 1,
       timeout_seconds: 180,
       chat_request_options: {},
     }), [], 'generic editor range must not hard-code the current H3 capacity instance')
     assert.match(schema.promptNormalizationValidationErrors({
       max_input_bytes: 16000,
-      max_output_tokens: 8192,
       max_items_per_batch: 1,
       timeout_seconds: 180,
       chat_request_options: { nested: { messages: [] }, clientSecret: 'must-not-save' },
@@ -1710,15 +1742,14 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
     for (const path of [
       'specification.visual_rules.max_input_bytes',
       'specification.visual_rules.input_byte_warning_threshold',
-      'specification.visual_rules.max_output_tokens',
-      'specification.visual_rules.output_token_warning_threshold',
       'specification.visual_rules.timeout_seconds',
-      'specification.visual_rules.quality_advisories',
       'specification.visual_rules.chat_request_options',
     ]) assert.ok(visualRulesFields.some((field: { path: string }) => field.path === path), `missing visual_rules.generate typed field ${path}`)
+    assert.ok(!visualRulesFields.some((field:{path:string})=>field.path==='specification.visual_rules.quality_advisories'))
+    const {adaptVisualRulesOutputOptions}=await vite.ssrLoadModule('/src/services/visualRulesOutput.ts')
+    const visualOutput=adaptVisualRulesOutputOptions(visualRulesOutputRaw)
     assert.deepEqual(schema.visualRulesValidationErrors({
       max_input_bytes: 65536,
-      max_output_tokens: 131072,
       timeout_seconds: 600,
       chat_request_options: { temperature: 0, response_format: { type: 'json_object' } },
       quality_advisories: {
@@ -1733,26 +1764,23 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
         negative_prompt_max_chars: 8000,
         color_script_max_chars: 2000,
       },
-    }), [])
+    }, visualOutput), [])
     assert.deepEqual(schema.visualRulesValidationErrors({
       max_input_bytes: 65536,
-      max_output_tokens: 131072,
       timeout_seconds: 600,
       chat_request_options: {},
-    }), [], 'omitted visual-rules quality policy must not enable hidden recommendations')
+    }, visualOutput), [], 'omitted visual-rules quality policy must not enable hidden recommendations')
     assert.deepEqual(schema.visualRulesValidationErrors({
       max_input_bytes: 65536,
-      max_output_tokens: 131072,
       timeout_seconds: 600,
       chat_request_options: {},
       quality_advisories: {
         schema_version: 1,
         continuity_summary_max_chars: 70 * 1024,
       },
-    }), [], 'quality recommendations above 64 KiB remain valid below the absolute Provider JSON envelope')
+    }, visualOutput), [], 'quality recommendations above 64 KiB remain valid below the absolute Provider JSON envelope')
     assert.match(schema.visualRulesValidationErrors({
       max_input_bytes: 65536,
-      max_output_tokens: 131072,
       timeout_seconds: 600,
       chat_request_options: {},
       quality_advisories: {
@@ -1760,17 +1788,16 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
         base_colors_min_items: 4,
         base_colors_max_items: 3,
       },
-    }).join(' '), /base_colors_min_items 不能大于/)
+    }, visualOutput).join(' '), /基础色建议最少数量不能大于基础色建议最多数量/)
     assert.match(schema.visualRulesValidationErrors({
       max_input_bytes: 65536,
-      max_output_tokens: 131072,
       timeout_seconds: 600,
       chat_request_options: {},
       quality_advisories: {
         schema_version: 1,
         recommended_negative_clauses: ['identity drift', 'Identity Drift'],
       },
-    }).join(' '), /recommended_negative_clauses 不能包含重复项/)
+    }, visualOutput).join(' '), /建议负面短语不能重复/)
     const artifactKindField = providerFields.find((field: { path: string }) => field.path === 'driver_config.artifact_kind_field')
     assert.match(artifactKindField?.description || '', /图片（image）.*视频（video）.*音频（audio）/)
     const artifactFields = schema.resourceEditorFields('artifact', {}, emptyDependencies)
@@ -1826,65 +1853,8 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
     const recipeStageOptions = schema.recipeStageOptions(recipeEditorOptions)
     assert.ok(recipeStageOptions.some((item: { value: string }) => item.value === 'script_structure'))
     const recipeStageOrder = recipeStageOptions.map((item: { value: string }) => item.value)
-    assert.ok(recipeStageOrder.indexOf('script_normalize_review') < recipeStageOrder.indexOf('storyboard_review'))
-    assert.deepEqual(schema.recipeStageModes(recipeEditorOptions).script_normalize, ['ai', 'manual'])
-    assert.equal(schema.recipeStageRequiresRouting({ key: 'script_normalize', mode: 'ai' }, recipeEditorOptions), true)
-    assert.equal(schema.recipeStageRequiresRouting({ key: 'script_normalize', mode: 'manual' }, recipeEditorOptions), false)
     assert.equal(schema.recipeStageRequiresRouting({ key: 'media_generation', mode: 'existing_pipeline' }, recipeEditorOptions), true)
 
-    const bibleImages = [
-      { key: 'bible_image_generation', mode: 'existing_pipeline', approval: 'auto' },
-      { key: 'bible_image_review', mode: 'review', approval: 'required' },
-    ]
-    assert.deepEqual(schema.recipeBibleSourceValidationErrors({
-      schema_version: 1,
-      stages: [
-        { key: 'bible_materialize', mode: 'deterministic', approval: 'auto' },
-        { key: 'bible_review', mode: 'review', approval: 'required' },
-        ...bibleImages,
-      ],
-    }), [])
-    assert.deepEqual(schema.recipeBibleSourceValidationErrors({
-      schema_version: 1,
-      stages: [
-        { key: 'script_input', mode: 'manual', approval: 'auto' },
-        { key: 'bible_review', mode: 'manual', approval: 'required' },
-        ...bibleImages,
-      ],
-    }), [])
-    assert.match(schema.recipeBibleSourceValidationErrors({
-      schema_version: 1,
-      stages: [
-        { key: 'bible_materialize', mode: 'deterministic', approval: 'auto' },
-        { key: 'bible_review', mode: 'manual', approval: 'required' },
-        ...bibleImages,
-      ],
-    })[0], /必须且只能选择一种文本 Bible 来源/)
-    assert.deepEqual(schema.recipeBibleSourceValidationErrors({
-      schema_version: 1,
-      stages: [
-        { key: 'script_generate', mode: 'ai', approval: 'auto' },
-        { key: 'bible_review', mode: 'manual', approval: 'required' },
-        ...bibleImages,
-      ],
-    }), [])
-    assert.equal(
-      schema.standardRecipeStages('ai', recipeEditorOptions).find((stage: { key: string }) => stage.key === 'bible_materialize')?.mode,
-      'deterministic',
-    )
-    assert.equal(
-      schema.standardRecipeStages('ai', recipeEditorOptions).find((stage: { key: string }) => stage.key === 'bible_review')?.mode,
-      'review',
-    )
-    assert.deepEqual(schema.recipeBibleSourceValidationErrors({
-      schema_version: 2,
-      interaction_mode: 'unattended',
-      stages: [
-        { key: 'bible_materialize', mode: 'deterministic', approval: 'auto' },
-        { key: 'bible_review', mode: 'review', approval: 'policy' },
-        ...bibleImages,
-      ],
-    }), [])
   } finally { await vite.close() }
 
   const settings = readFileSync(join(frontendRoot, 'src', 'views', 'SettingsView.vue'), 'utf8')
@@ -1902,13 +1872,12 @@ test('registry resources use typed schemas, explicit defaults and prerequisite b
   ]) assert.ok(settings.includes(marker), `SettingsView misses minimized ConfigDefinition payload marker ${marker}`)
   assert.equal(settings.includes('structuredClone(editorPayload.value)'), false)
   assert.equal(editor.includes('structuredClone(recipeStages.value)'), false)
-  assert.ok(editor.indexOf('const recipeErrors = computed') < editor.indexOf('const validation = computed'), 'recipe validation must initialize recipeErrors before the immediate watcher reads it')
-  for (const marker of ['影响：', '套用 AI 起稿链路', 'active Deployment', '高级 JSON · 同一对象完整视图']) {
+  assert.ok(editor.indexOf('const recipeErrors = ref') < editor.indexOf('const validation = computed'), 'recipe validation must initialize before the immediate watcher reads it')
+  for (const marker of ['影响：', '高级 JSON · 同一对象完整视图']) {
     assert.ok(editor.includes(marker), `RegistryResourceEditor misses ${marker}`)
   }
-  for (const marker of ['recipeStageRequiresRouting(stages[index], recipeEditorOptions.value)', 'v-if="recipeStageRequiresRouting(stage,recipeEditorOptions)"']) {
-    assert.ok(editor.includes(marker), `RegistryResourceEditor misses mode-aware routing marker ${marker}`)
-  }
+  assert.ok(editor.includes('<ProductionRecipeEditor'))
+  assert.equal(editor.includes('workflowOptions(route)'), false)
   for (const marker of ['请先发布模型版本', '前置依赖', 'driver_config.base_url', 'driver_config.progress_field', 'driver_config.pricing.currency', 'standardRecipeStages']) {
     assert.ok(registrySchema.includes(marker), `registryResourceSchema misses ${marker}`)
   }
@@ -1959,8 +1928,7 @@ test('workflow acceptance unlocks Smoke and publish in the validated lifecycle s
 
     const editor = readFileSync(join(frontendRoot, 'src', 'views', 'WorkflowVersionEditorView.vue'), 'utf8')
     for (const marker of [
-      'acceptancePhase.canConfigureSmoke', 'smokeStartBlockReason', 'smokeInputDisabled',
-      'smokeDraftRequiresAssetCandidates', 'void loadSmokeAssetCandidates()', '成功后即可编辑本次 Smoke 输入',
+      'smokeStartBlockReason', 'ResourceSmokeCreateForm', 'resourceSmokeCreated',
       'deploymentId.value !== version.validatedDeployment', 'syncDeploymentEvidence()',
     ]) assert.ok(editor.includes(marker), `workflow acceptance UI misses ${marker}`)
     assert.equal(editor.includes("savedVersion.status!=='draft'||savedVersion.validationState!=='passed'"), false)
@@ -1971,7 +1939,7 @@ test('workflow version review is read-only and saved-workflow scan is the only c
   const workflow = readFileSync(join(frontendRoot, 'src', 'views', 'WorkflowVersionEditorView.vue'), 'utf8')
   const platformApi = readFileSync(join(frontendRoot, 'src', 'services', 'platformApi.ts'), 'utf8')
   const settings = readFileSync(join(frontendRoot, 'src', 'views', 'SettingsView.vue'), 'utf8')
-  for (const marker of ['不修改节点图或创建新版本', '模板固定', '执行任务冻结', 'validateWorkflow', 'createWorkflowSmokeAttempt', 'publishWorkflow']) {
+  for (const marker of ['不修改节点图或创建新版本', '模板固定', '执行任务冻结', 'validateWorkflow', 'ResourceSmokeCreateForm', 'publishWorkflow']) {
     assert.ok(workflow.includes(marker), `WorkflowVersionEditor misses ${marker}`)
   }
   for (const retired of ['VueFlow', '导入 JSON', '保存新版本', '添加动态节点', 'importWorkflowVersion', 'inputContractText']) {
@@ -2023,16 +1991,15 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
   try {
     const adapters = await vite.ssrLoadModule('/src/services/platformAdapters.ts')
     const previewExamples = await vite.ssrLoadModule('/src/services/promptProfilePreviewExamples.ts')
-    const field = adapters.adaptPromptFieldDefinition({
-      id: 'field-1', key: 'lighting', label: '灯光', category: 'visual', description: '场景照明', impact: '影响画面层次',
-      value_type: 'enum', default_value: 'cinematic', value_options: ['cinematic', 'natural'],
-      preview_example: 'natural',
-      is_required: true, is_active: true, display_order: 10, created_at: '', updated_at: '',
+    const field = adapters.adaptFieldDefinition({
+      id: 'field-1', key: 'lighting',
+      is_active: true, display_order: 10, created_at: '', updated_at: '',
     })
-    assert.equal(field.valueType, 'enum')
-    assert.deepEqual(field.valueOptions, ['cinematic', 'natural'])
-    assert.equal(field.previewExample, 'natural')
-    assert.equal(field.isRequired, true)
+    assert.equal(field.key, 'lighting')
+    assert.equal('valueType' in field, false)
+    assert.equal('previewExample' in field, false)
+    assert.equal('isRequired' in field, false)
+    assert.equal('defaultValue' in field, false)
     assert.deepEqual(
       previewExamples.mergePromptProfilePreviewExamples({}, [
         { inputKey: 'list', previewExample: ['first', 'second'] },
@@ -2055,22 +2022,22 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
     )
     const rawOptions = {
       operations: ['video.generate'], model_families: ['minimax-h3'], modes: ['text_to_video'],
-      field_value_types: [{ value: 'text', label: '短文本' }], field_categories: [{ value: 'visual', label: 'visual' }],
-      custom_entry_fields: ['field_category', 'operation', 'mode', 'language_policy'],
-      field_system_defaults: { default_value: null, value_options: [], is_required: false, is_active: true, display_order: 'append' },
+      custom_entry_fields: ['operation', 'mode', 'language_policy'],
       rule_system_defaults: { label_style: 'label_colon', separator: 'newline', required: false, omit_if_empty: true, max_chars: 2000, generation_output_semantics: 'final', generation_required: false, language_policy: 'inherit', length_unit: 'none', generation_validator_keys: [], generation_context_selectors: [] },
-      source_selectors: [{ value: 'request.lighting', label: '请求灯光' }],
+      source_selectors: [{ value: 'request.lighting', label: '请求灯光', group_label: '本次请求输入', description: '本次灯光要求', record_location: '创建执行准备', execution_usage: '明确接线后填写' }],
       channels: [{ value: 'positive', label: '正向提示词' }], label_styles: [{ value: 'label_colon', label: '字段名加冒号' }], separators: [{ value: 'newline', label: '换行' }],
       generation_modes: [{ value: 'model_generated', label: '模型生成 / Model generated' }],
+      generation_leaf_operations: ['prompt.fields.generate', 'prompt.fields.translate'],
       generation_source_selectors: [{
-        value: 'shot.narrative', label: '当前镜头叙事', scope_type: 'shot', group: 'shot', group_label: '当前镜头 / Target shot',
-        description: '读取当前镜头已确认的叙事。', availability: '适用于模型生成和仅翻译。', scope: '仅当前镜头；不自动读取对白或其他镜头。',
-        dialogue_exposure: 'not_explicit', cross_shot_exposure: 'target_shot_only', cardinality: 'single', status: 'active',
+        value: 'request.action', label: '本次动作原文', scope_type: 'request', group: 'request_text/v1', group_label: '本次请求输入',
+        description: '明确提供的本次动作。', availability: '适用于模型生成和仅翻译。', scope: '按本次输入合同提供原值，不查询镜头列。',
+        dialogue_exposure: 'explicit_input_only', cross_shot_exposure: 'explicit_input_only', cardinality: 'single', status: 'active',
         generation_modes: ['model_generated', 'translate_only'],
       }],
       generation_context_selectors: [{ value: 'target_shot.linked_bible', label: '目标镜头关联 Bible / Target shot linked Bible', description: '当前目标镜头已关联的人物、场景和道具一致性事实。' }],
       generation_output_semantics: [{ value: 'final', label: '最终字段值 / Final field value' }],
       source_projection_keys: [{ value: 'direct_v1', label: '直接字段装配' }], source_projection_primitives: [{value:'test.summary',label:'测试摘要',engine_key:'test',contribution_source_selectors:[],rendering_template_keys:['summary']}],
+      reference_rendering_text_slots: [{value:'action',label:'动作'}],
       reference_rendering_fields: [{ key: 'summary', label: '任务摘要', placeholders: ['mode', 'duration_seconds'],
         description:'任务概要', assembly:'任务摘要原语', requirement:'必填',
         placeholder_help:{mode:{label:'生成模式',description:'本次模式',example:'Ref2VA'},duration_seconds:{label:'秒数',description:'本次总时长',example:'4.0'}},
@@ -2086,6 +2053,7 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
     assert.throws(()=>adapters.adaptPromptProfileOptions({...rawOptions,source_projection_primitives:[{value:'test.summary'}]}),/rendering_template_keys/)
     const {placeholder_help, ...renderingField} = rawOptions.reference_rendering_fields[0]
     assert.deepEqual(options.referenceRenderingFields, [{...renderingField, placeholderHelp:placeholder_help}])
+    assert.deepEqual(options.referenceRenderingTextSlots, [{value:'action',label:'动作'}])
     for (const invalid of [
       [{ key: 'summary', label: '任务摘要' }],
       [{ key: 'summary', label: '', placeholders: [] }],
@@ -2094,12 +2062,15 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
       [{...rawOptions.reference_rendering_fields[0],placeholder_help:{}}],
       [{...rawOptions.reference_rendering_fields[0],example:{template:'{mode}'}}],
     ]) assert.throws(() => adapters.adaptPromptProfileOptions({ ...rawOptions, reference_rendering_fields: invalid }))
-    assert.deepEqual(options.sourceSelectors[0], { value: 'request.lighting', label: '请求灯光' })
+    assert.deepEqual(options.sourceSelectors[0], { value: 'request.lighting', label: '请求灯光', groupLabel: '本次请求输入', description: '本次灯光要求', recordLocation: '创建执行准备', executionUsage: '明确接线后填写' })
+    for (const field of ['group_label','description','record_location','execution_usage']) {
+      assert.throws(() => adapters.adaptPromptProfileOptions({...rawOptions, source_selectors:[{...rawOptions.source_selectors[0], [field]:''}]}), /来源目录缺少/)
+    }
     assert.equal(options.generationModes[0].value, 'model_generated')
     assert.deepEqual(options.generationSourceSelectors[0], {
-      value: 'shot.narrative', label: '当前镜头叙事', scopeType: 'shot', group: 'shot', groupLabel: '当前镜头 / Target shot',
-      description: '读取当前镜头已确认的叙事。', availability: '适用于模型生成和仅翻译。', scope: '仅当前镜头；不自动读取对白或其他镜头。',
-      dialogueExposure: 'not_explicit', crossShotExposure: 'target_shot_only', cardinality: 'single', status: 'active',
+      value: 'request.action', label: '本次动作原文', scopeType: 'request', group: 'request_text/v1', groupLabel: '本次请求输入',
+      description: '明确提供的本次动作。', availability: '适用于模型生成和仅翻译。', scope: '按本次输入合同提供原值，不查询镜头列。',
+      dialogueExposure: 'explicit_input_only', crossShotExposure: 'explicit_input_only', cardinality: 'single', status: 'active',
       generationModes: ['model_generated', 'translate_only'],
     })
     assert.equal(options.generationContextSelectors[0].value, 'target_shot.linked_bible')
@@ -2111,13 +2082,13 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
       id: 'rule-1', profile_version: 'profile-1', field_definition: 'field-1', field_key: 'lighting', field_label: '灯光',
       field_value_type: 'long_text', source_selector: 'request.lighting', channel: 'positive_prompt', position: 1,
       label_style: 'label_colon', separator: 'newline', required: true, omit_if_empty: false, max_chars: 2000,
-      generation_mode: 'model_generated', generation_source_selector: 'shot.narrative', generation_required: true,
+      generation_mode: 'model_generated', generation_source_selector: 'request.action', generation_required: true,
       generation_context_selectors: ['project.style', 'target_shot.linked_bible'],
       language_policy: 'en', length_unit: 'english_words', generation_min: 120, generation_max: 240,
       generation_validator_keys: ['non_empty'], created_at: '', updated_at: '',
     })
     assert.equal(rule.generationMode, 'model_generated')
-    assert.equal(rule.generationSourceSelector, 'shot.narrative')
+    assert.equal(rule.generationSourceSelector, 'request.action')
     assert.deepEqual(rule.generationContextSelectors, ['project.style', 'target_shot.linked_bible'])
     assert.deepEqual(rule.generationValidatorKeys, ['non_empty'])
     const preview = adapters.adaptPromptProfilePreview({
@@ -2137,7 +2108,7 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
   const api = readFileSync(join(frontendRoot, 'src', 'services', 'platformApi.ts'), 'utf8')
   assert.ok(sectionCatalog.includes("id: 'prompts'"), 'settings section catalog misses prompts')
   for (const marker of ["tab==='prompts'", 'PromptProfileSettings']) assert.ok(settings.includes(marker), `SettingsView misses ${marker}`)
-  for (const marker of ['通用字段字典', '最终提示词预览', '运行时绑定', '官方来源', 'system_instruction', 'definition.default', 'Published PromptProfile', '不会调用模型', '字段内容如何获得', '最终提示词如何排版', '内容生成方式', '主要内容来源', '这不是文件地址或数据库路径', '读取什么', '什么时候可用', '作用范围', '生成时可参考的额外信息', '不含对白正文', '必须显式选择', 'options API', 'Language policy', 'Controlled validators', '不支持表达式、脚本、函数或自定义正则', 'length_advisory', '实时最终提示词', '当前未保存设置', '400ms 后自动组合', '服务端已自动填入通用示例', '恢复通用示例', 'mergePromptProfilePreviewExamples']) {
+  for (const marker of ['字段维护', '最终提示词预览', '执行实例明确引用', '官方来源', 'system_instruction', 'fixed.value', '不会调用模型', '字段内容如何获得', '最终提示词如何排版', '内容生成方式', '主要内容来源', '这不是文件地址或数据库路径', '读取什么', '什么时候可用', '作用范围', '生成时可参考的额外信息', '不含对白正文', '必须显式选择', 'options API', 'Language policy', 'Controlled validators', '不支持表达式、脚本、函数或自定义正则', 'length_advisory', '实时最终提示词', '当前未保存设置', '400ms 后自动组合', '普通来源使用通用示例', '恢复通用示例', 'mergePromptProfilePreviewExamples']) {
     assert.ok(component.includes(marker), `PromptProfileSettings misses ${marker}`)
   }
   assert.equal(component.includes('第二层'), false, 'PromptProfileSettings must not require Layer 2 numbering')
@@ -2152,7 +2123,7 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
   assert.ok(component.includes('generationSourceIncompatible'))
   assert.ok(component.includes('当前草稿必须从下拉目录重新选择后才能保存或预览'))
   assert.ok(component.includes('contributionSourceSelectionBlocked'))
-  assert.ok(component.includes('请先在下方选择声明式投影输出与确定性原语'))
+  assert.ok(component.includes('请先在输入与来源段选择声明式投影输出与确定性原语'))
   assert.ok(component.includes('rememberGenerationModeBeforeUserChange'))
   assert.ok(component.includes('onRuleGenerationModeChange'))
   assert.ok(component.includes('lockedGenerationModes.includes(generationModeBeforeUserChange.value)'))
@@ -2160,9 +2131,10 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
   assert.ok(component.includes('当前候选主要内容来源'))
   assert.ok(component.includes('ruleGenerationModeOptions'))
   assert.ok(component.includes('selectedProfileSupportsModelGeneration'))
-  assert.ok(component.includes('字段级模型生成目前由图像/视频 ProductionRun 执行'))
+  assert.ok(component.includes('所有使用策略的业务输入字段共用生成、翻译和采用链路'))
+  assert.ok(component.includes('辅助叶子不能再调用辅助模型'))
   assert.equal(component.includes('候选规则已按'), false, 'preview must not claim validation before a server response')
-  for (const marker of ['void runPreview(requestSerial)', '}, 400)', 'requestSerial !== previewRequestSerial', 'expectedBaseContractSha256', 'previewResult.channels', 'previewResult.executedStages', '示例不会保存', '上次有效预览；等待当前设置重新组合', 'previewBusy.value = false', ':open="!previewResult"']) {
+  for (const marker of ['void runPreview(requestSerial)', '}, 400)', 'requestSerial !== previewRequestSerial', 'expectedBaseContractSha256', 'previewResult.channels', 'previewResult.executedStages', '样例不会保存', '上次有效预览；等待当前设置重新组合', 'previewBusy.value = false', ':open="!previewResult"']) {
     assert.ok(component.includes(marker), `PromptProfile live preview misses ${marker}`)
   }
   for (const marker of ['CatalogChoiceField v-model="profileForm.operation"', ':options="operationCatalog"', '登记新 Operation（高级）', '日常配置从服务端目录选择', 'Provider driver 证据']) {
@@ -2172,32 +2144,35 @@ test('PromptProfile settings expose typed CRUD, deterministic preview and publis
   assert.equal(/<input[^>]+v-model(?:\.trim)?="profileForm\.operation"/.test(component), false, 'PromptProfile operation must use the shared controlled catalog')
   assert.ok(component.includes('pattern="^[a-z][a-z0-9_.-]{1,99}$"'), 'PromptProfile advanced operation registration misses the controlled key format')
   assert.equal(/<input[^>]+v-model\.number="profileForm\.version"/.test(component), false, 'PromptProfile version is server-assigned and must not be an input')
-  for (const marker of ['/prompt-field-definitions/', '/prompt-profile-versions/', '/prompt-profile-field-rules/', '/prompt-profile-bindings/', 'previewPromptProfileVersion', 'publishPromptProfileVersion', 'retirePromptProfileVersion']) {
+  for (const marker of ['/field-definitions/', '/prompt-profile-versions/', '/prompt-profile-field-rules/', 'previewPromptProfileVersion', 'publishPromptProfileVersion', 'retirePromptProfileVersion']) {
     assert.ok(api.includes(marker), `platformApi misses ${marker}`)
   }
   assert.equal(component.includes('window.prompt'), false)
   assert.equal(component.includes('v-model="rawJson"'), false)
-  assert.ok(component.includes('Binding Key 创建后不可修改；如需新 Key，请新建绑定并停用旧绑定。'))
-  assert.ok(component.includes('v-model="bindingForm.key" :disabled="Boolean(bindingForm.id)"'))
+  assert.equal(component.includes('bindingForm'), false)
+  assert.equal(api.includes('/prompt-profile-bindings/'), false)
   assert.ok(component.includes('generation_context_selectors: [...ruleForm.generationContextSelectors]'))
   assert.ok(component.includes('v-model="ruleForm.generationContextSelectors"'))
   assert.ok(component.includes('promptOptionsReady'))
   assert.ok(component.includes('contextOptions.some((item) => !item.value.trim() || !item.label.trim() || !item.description.trim())'))
   assert.ok(component.includes('generation_context_selectors 受控目录，字段规则编辑已停止'))
-  assert.ok(component.includes('allowedContextSelectors.has(item)'))
+  assert.ok(component.includes('contextSelectorError(item, allowedContextSelectors, inputStructureSchema.value, modelGenerationSourceMode.value)'))
   assert.ok(component.includes(':disabled="!activeFields.length||!promptOptionsReady"'))
   for (const marker of [
     'primitiveEngineKeysForSelectedProfile', 'compatibleProjectionPrimitiveOptions',
     'primitiveEngineKeysForSelectedProfile.value.has(item.engineKey)',
-    'profileProjectionLocked', "profileForm.sourceProjectionKey !== 'declarative_v1') return {}",
-    'changedTopLevelPayload', 'delete payload.profile_key', 'delete payload.key',
+    'profileProjectionChanged', "profileForm.sourceProjectionKey !== 'declarative_v1') return {}",
+    'changedTopLevelPayload', 'delete payload.profile_key',
     'direct_v1 只接受 final',
     ':disabled="selectedProfile?.sourceProjectionKey===\'direct_v1\'&&item.value===\'contribution\'"',
     ':open="!ruleForm.id||!ruleForm.languagePolicy||!ruleForm.lengthUnit||',
   ]) assert.ok(component.includes(marker), `PromptProfile projection editor misses ${marker}`)
+  assert.equal(component.includes('profileProjectionLocked'), false, 'Draft conversion must not require deleting existing rules')
+  assert.ok(component.includes('不删除或改写已有字段规则'))
   assert.equal(component.includes('sourceProjectionConfigText'), false, 'PromptProfile must not expose a free projection contract JSON editor')
   for (const marker of ['options.referenceRenderingFields', 'PromptRenderingTemplateEditor', 'profileForm.renderingTemplates[item.key]',
-    'schema_version: 4', 'rendering: {', 'renderingTemplateKey', '服务端参考渲染字段目录为空或重复']) {
+    'schema_version: 5', 'rendering: {', 'renderingTemplateKey', 'renderingReferenceRules.map',
+    '服务端参考渲染字段目录为空或重复']) {
     assert.ok(component.includes(marker), `PromptProfile configured rendering misses ${marker}`)
   }
   assert.equal(component.includes('reference_context_policy:'), false, 'new policies must not emit the retired built-in rendering configuration')
@@ -2223,14 +2198,14 @@ test('uncertain resolution UIs use safe projections, staff actions and modal-loc
 
 test('settings deployment smoke operations include every supported production capability', () => {
   const settings = readFileSync(join(frontendRoot, 'src', 'views', 'SettingsView.vue'), 'utf8')
-  for (const capability of ['image.text_to_image', 'video.text_to_video', 'audio.text_to_audio', 'prompt.normalize', 'script.generate', 'script.structure', 'visual_rules.generate']) {
-    assert.ok(settings.includes(`'${capability}'`), `SettingsView deployment smoke operations miss ${capability}`)
-  }
   assert.ok(settings.includes('profileFor(item.profileVersion)?.specification.capabilities'))
-  assert.ok(settings.includes('actionSmokeOperations'))
+  const resource = readFileSync(join(frontendRoot, 'src', 'components', 'ResourceSmokeCreateForm.vue'), 'utf8')
+  assert.ok(resource.includes('options.target.operations'))
+  assert.ok(resource.includes('resourceSmokeApi.choices'))
+  assert.equal(settings.includes('actionSmokeOperations'), false)
   const routingLoad = settings.slice(
     settings.indexOf("else if (requestedTab === 'routing')"),
-    settings.indexOf("else if (requestedTab === 'defaults')"),
+    settings.indexOf("else if (requestedTab === 'defaults' ||"),
   )
   assert.ok(routingLoad.includes('platformApi.listModelProfiles()'), 'routing must load model profiles before capability filtering')
   assert.ok(routingLoad.includes('modelProfiles.value = value'), 'routing must retain model profiles for typed route options')
@@ -2242,6 +2217,7 @@ test('async deployment smoke and lifecycle audit preserve durable server facts',
     const adapters = await vite.ssrLoadModule('/src/services/platformAdapters.ts')
     const attempt = adapters.adaptModelDeploymentSmokeAttempt({
       id: 'attempt-1', deployment: 'deployment-1', operation: 'image.text_to_image',
+      scope: 'resource', execution_instance_version: null, preparation_id: 'prep-1',
       status: 'submitted', request_sha256: 'a'.repeat(64), target_sha256: 'b'.repeat(64),
       provider_request_id_sha256: 'c'.repeat(64), poll_count: 3,
       remote_status: 'processing', error_code: '', error_message: '',
@@ -2250,6 +2226,21 @@ test('async deployment smoke and lifecycle audit preserve durable server facts',
     assert.equal(attempt.status, 'submitted')
     assert.equal(attempt.pollCount, 3)
     assert.equal(attempt.providerRequestIdSha256, 'c'.repeat(64))
+    assert.equal(attempt.scope, 'resource')
+    assert.equal(attempt.executionInstanceVersion, null)
+    assert.equal(attempt.preparationId, 'prep-1')
+    for (const adapt of [adapters.adaptModelDeploymentSmokeAttempt, adapters.adaptWorkflowSmokeAttempt]) {
+      assert.throws(() => adapt({}), /验收范围/)
+      assert.throws(() => adapt({ scope: 'resource', execution_instance_version: 'instance-1' }), /验收范围/)
+      assert.throws(() => adapt({ scope: 'instance', execution_instance_version: null }), /验收范围/)
+      assert.throws(() => adapt({ scope: 'resource', execution_instance_version: null }), /验收范围/)
+      assert.equal(adapt({scope:'resource',execution_instance_version:null,preparation_id:null}).preparationId,null)
+      const combination = adapt({ scope: 'instance', execution_instance_version: 'instance-1', preparation_id: 'prep-2', status: 'preparing',
+        evidence_expires_at: null, result_schema_version: 1, result_size_bytes: 2, result_sha256: '' })
+      assert.equal(combination.executionInstanceVersion, 'instance-1')
+      assert.equal(combination.evidenceExpiresAt, '')
+      assert.equal(combination.status, 'preparing')
+    }
     const audit = adapters.adaptPlatformLifecycleAuditEvent({
       id: 'audit-1', actor: 'staff-1', actor_username: 'reviewer', action: 'retire',
       object_type: 'model_profile_version', object_id: 'model-1', reason_code: 'planned_change',
@@ -2265,18 +2256,18 @@ test('async deployment smoke and lifecycle audit preserve durable server facts',
   const settings = readFileSync(join(frontendRoot, 'src', 'views', 'SettingsView.vue'), 'utf8')
   const api = readFileSync(join(frontendRoot, 'src', 'services', 'platformApi.ts'), 'utf8')
   for (const marker of [
-    'const attempt = await platformApi.smokeTestDeployment', 'deploymentSmokeTerminalStatuses',
+    'ResourceSmokeCreateForm', 'resourceSmokeCreated', 'deploymentSmokeTerminalStatuses',
     'restoreDeploymentSmokeAttempts', 'refreshDeploymentSmokeAttempts',
     'cancelDeploymentSmoke', 'listPlatformLifecycleAuditEvents',
     'filteredLifecycleAudit', 'actionReasonRequired',
   ]) assert.ok(settings.includes(marker), `SettingsView misses ${marker}`)
   for (const marker of [
-    'response.status !== 202', 'getDeploymentSmokeAttempt',
+    'getDeploymentSmokeAttempt',
     'listDeploymentSmokeAttempts', 'cancelDeploymentSmokeAttempt',
     'X-Audit-Reason-Code', 'listPlatformLifecycleAuditEvents',
   ]) assert.ok(api.includes(marker), `platformApi misses ${marker}`)
-  assert.ok(settings.includes('真实烟测任务已创建'))
-  assert.ok(settings.includes('页面将持续读取持久状态'))
+  assert.ok(settings.replace(/\s/g, '').includes("router.push({name:'workflows',query:{category:'smoke',kind:'preparation',id}})"))
+  assert.ok(!settings.includes('ExecutionPreparationWorkbench'))
 })
 
 test('runtime host probes are durable and expose trusted artifact facts without paths', async () => {
@@ -2340,9 +2331,13 @@ test('settings presents global recipe readiness in routing and host facts from o
     settings.indexOf('<template v-else>', settings.indexOf(`<template v-else-if="tab==='runtime'">`)),
   )
 
-  assert.ok(routingLoad.includes('platformApi.getProductionReadiness()'))
+  assert.ok(routingLoad.includes('void loadProductionReadiness(requestStillCurrent)'))
+  assert.equal(routingLoad.includes('await loadProductionReadiness('), false)
+  const readinessLoad = settings.slice(settings.indexOf('const loadProductionReadiness = async'), settings.indexOf('const loadDefaults = async'))
+  assert.ok(readinessLoad.includes('platformApi.getProductionReadiness()'))
   assert.equal(runtimeLoad.includes('platformApi.getProductionReadiness()'), false)
-  assert.ok(routingTemplate.includes('配方生产就绪概览'))
+  assert.ok(routingTemplate.includes('配方配置与生产链核对'))
+  assert.ok(routingTemplate.includes('本次素材、参数、容量和预算仍由执行准备单独核对'))
   assert.ok(routingTemplate.includes('全部仍处于 published'))
   assert.equal(runtimeTemplate.includes('production-readiness'), false)
   assert.ok(routingTemplate.indexOf('配方生产就绪概览') < routingTemplate.indexOf('生产配方（Production Recipe）'))
@@ -2371,8 +2366,6 @@ test('production recipe script mode switches AI and confirmed revision inputs', 
     assert.equal(adapters.productionRecipeScriptMode({ stages: [
       { key: 'script_generate', mode: 'ai' },
       { key: 'script_review', mode: 'review' },
-      { key: 'script_normalize', mode: 'ai' },
-      { key: 'script_normalize_review', mode: 'review' },
     ] }), 'ai')
     assert.equal(adapters.productionRecipeScriptMode({ stages: [
       { key: 'script_input', mode: 'confirmed_revision' },
@@ -2388,7 +2381,7 @@ test('production recipe script mode switches AI and confirmed revision inputs', 
       { key: 'script_normalize', mode: 'manual' },
       { key: 'script_normalize_review', mode: 'review' },
       { key: 'media_generation', mode: 'existing_pipeline' },
-    ] }), 'downstream')
+    ] }), 'invalid')
     for (const definition of [
       { stages: [] },
       { stages: [{ key: 'media_generation', mode: 'existing_pipeline' }] },
@@ -2424,10 +2417,13 @@ test('production recipe script mode switches AI and confirmed revision inputs', 
         { key: 'script_input', mode: 'confirmed_revision' },
       ] },
     ]) assert.equal(adapters.productionRecipeScriptMode(definition), 'invalid')
-    assert.equal(adapters.productionRecipeInteractionMode({ schema_version: 1, stages: [] }), 'assisted')
-    assert.equal(adapters.productionRecipeInteractionMode({ schema_version: 2, interaction_mode: 'unattended', stages: [] }), 'unattended')
-    assert.equal(adapters.productionRecipeInteractionMode({ schema_version: 2, interaction_mode: 'assisted', stages: [] }), 'invalid')
-    assert.equal(adapters.productionRecipeInteractionMode({ schema_version: 1, interaction_mode: 'unattended', stages: [] }), 'invalid')
+    assert.equal(adapters.productionRecipeInteractionMode({ schema_version: 3, interaction_mode: 'assisted' }), 'assisted')
+    assert.equal(adapters.productionRecipeInteractionMode({ schema_version: 3, interaction_mode: 'unattended' }), 'unattended')
+    for (const definition of [
+      { schema_version: 1 }, { schema_version: 2, interaction_mode: 'unattended' },
+      { schema_version: 3 }, { schema_version: 3, interaction_mode: 'unknown' },
+      { schema_version: '3', interaction_mode: 'unattended' }, { schema_version: 4, interaction_mode: 'unattended' },
+    ]) assert.equal(adapters.productionRecipeInteractionMode(definition), 'invalid')
   } finally { await vite.close() }
 })
 
@@ -2520,149 +2516,32 @@ test('ProductionRun request payload has one authoritative shape for each script 
   const vite = await server()
   try {
     const { buildProductionRunRequestPayload, plannedAverageShotDurationMs } = await vite.ssrLoadModule('/src/services/productionRunPayload.ts')
-    const {
-      createUnattendedReferenceInputDrafts,
-      selectedUnattendedReferenceInputs,
-      unattendedReferenceInputDraftError,
-    } = await vite.ssrLoadModule('/src/services/unattendedReferenceInputs.ts')
     const common = {
       projectId: 'project-1', recipeVersionId: 'recipe-1', idempotencyKey: 'request-1',
-      allowExternalCalls: true, budgetLimit: '20.0000', maxGenerationTasks: 42, configOverrides: { seed: 9 },
+      planSource: 'recipe',
+      allowExternalCalls: true, configOverrides: { seed: 9 },
       scriptRevisionId: 'revision-should-be-omitted', idea: '岛上的谜案', styleHint: '黑色电影',
       episodeCount: 6, shotsPerEpisode: 8, episodeDurationSeconds: 90,
       episodeIds: ['episode-b', 'episode-a', 'episode-b'],
-      effectiveLimits: { maxRoutingRoutes: 15, maxReferenceBindings: 64 },
     }
     const ai = buildProductionRunRequestPayload({ ...common, scriptMode: 'ai' })
     assert.equal(plannedAverageShotDurationMs(1, 1), 1000)
     assert.equal(plannedAverageShotDurationMs(3, 10), 3333)
     assert.throws(() => plannedAverageShotDurationMs(0, 1), /每集镜数必须是正整数/)
     assert.deepEqual(ai, {
+      plan_source: 'recipe',
       project_id: 'project-1', recipe_version_id: 'recipe-1', idempotency_key: 'request-1',
-      allow_external_calls: true, budget_limit: '20.0000', max_generation_tasks: 42,
+      allow_external_calls: true,
       config_overrides: { seed: 9 }, idea: '岛上的谜案', style_hint: '黑色电影',
       episode_count: 6, shots_per_episode: 8, episode_duration_seconds: 90,
     })
     assert.equal('script_revision_id' in ai, false)
     assert.equal('episode_ids' in ai, false)
 
-    const unattended = buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'ai',
-      unattendedConfirmed: true,
-      referenceInputs: [{
-        assetId: 'reference-video-1',
-        purpose: 'orbit_rhythm_v7',
-        useEmbeddedAudio: false,
-      }],
-    })
+    const unattended = buildProductionRunRequestPayload({ ...common, scriptMode: 'ai', unattendedConfirmed: true })
     assert.equal(unattended.unattended_confirmed, true)
-    assert.deepEqual(unattended.reference_inputs, [{
-      asset_id: 'reference-video-1',
-      purpose: 'orbit_rhythm_v7',
-      use_embedded_audio: false,
-    }])
-    const multipleReferences = buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'ai',
-      unattendedConfirmed: true,
-      referenceInputs: [
-        {
-          assetId: 'reference-video-1',
-          purpose: 'motion_camera_reference',
-          useEmbeddedAudio: false,
-        },
-        {
-          assetId: 'reference-video-2',
-          purpose: 'audio_reference',
-          useEmbeddedAudio: true,
-        },
-      ],
-    })
-    assert.deepEqual(multipleReferences.reference_inputs, [
-      {
-        asset_id: 'reference-video-1',
-        purpose: 'motion_camera_reference',
-        use_embedded_audio: false,
-      },
-      {
-        asset_id: 'reference-video-2',
-        purpose: 'audio_reference',
-        use_embedded_audio: true,
-      },
-    ])
-    assert.throws(() => buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'ai',
-      unattendedConfirmed: true,
-      referenceInputs: Array.from({ length: 65 }, (_, index) => ({
-        assetId: `reference-video-${index}`,
-        purpose: 'motion_camera_reference',
-        useEmbeddedAudio: false,
-      })),
-    }), /服务端有效绑定上限 64 条/)
-    assert.throws(() => buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'ai',
-      unattendedConfirmed: false,
-      referenceInputs: [],
-    }), /显式确认/)
-    const optionalReference = buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'ai',
-      unattendedConfirmed: true,
-      referenceInputs: [],
-    })
-    assert.deepEqual(optionalReference.reference_inputs, [])
-
-    const drafts = createUnattendedReferenceInputDrafts(
-      { minimumItems: 2, maximumItems: 3 },
-      'motion_camera_reference',
-    )
-    drafts[0].assetId = 'reference-video-1'
-    drafts[1].assetId = 'reference-video-2'
-    drafts[1].purpose = 'audio_reference'
-    drafts[1].useEmbeddedAudio = true
-    const topology = {
-      schemaVersion: 1,
-      videos: {
-        minimumItems: 0,
-        maximumItems: 3,
-        defaultPurposeKey: 'motion_camera_reference',
-        purposes: [
-          { key: 'motion_camera_reference', label: '运镜参考', description: '', minimumItems: 0, maximumItems: 3 },
-          { key: 'audio_reference', label: '音频参考', description: '', minimumItems: 0, maximumItems: 1 },
-        ],
-      },
-      audios: { minimumItems: 0, maximumItems: 0, defaultPurposeKey: null, purposes: [] },
-      preprocessing: { videos: null, pairedVideoAudios: null, referenceAudios: null },
-      pairingRules: [{
-        key: 'embedded-audio', label: '内嵌音轨', description: '',
-        sourceMediaKind: 'video', targetMediaKind: 'audio',
-        sourcePurposeKeys: ['audio_reference'], targetPurposeKeys: ['reference_audio'],
-        defaultTargetPurposeKey: 'reference_audio', minimumTargetsPerSource: 1,
-        maximumTargetsPerSource: 1, allowEmbeddedSource: true,
-        allowExternalTarget: false, sourceAndExternalMutuallyExclusive: true,
-      }],
-      mutualExclusionRules: [],
-    }
-    assert.equal(unattendedReferenceInputDraftError({
-      drafts,
-      cardinality: { minimumItems: 2, maximumItems: 3 },
-      availableAssetIds: new Set(['reference-video-1', 'reference-video-2']),
-      topology,
-    }), '')
-    assert.deepEqual(selectedUnattendedReferenceInputs(drafts), [
-      { assetId: 'reference-video-1', purpose: 'motion_camera_reference', useEmbeddedAudio: false },
-      { assetId: 'reference-video-2', purpose: 'audio_reference', useEmbeddedAudio: true },
-    ])
-    drafts[1].assetId = 'reference-video-1'
-    assert.match(unattendedReferenceInputDraftError({
-      drafts,
-      cardinality: { minimumItems: 2, maximumItems: 3 },
-      availableAssetIds: new Set(['reference-video-1', 'reference-video-2']),
-      topology,
-    }), /不能重复选择/)
+    assert.equal('reference_inputs' in unattended, false)
+    assert.throws(() => buildProductionRunRequestPayload({ ...common, scriptMode: 'ai', unattendedConfirmed: false }), /显式确认/)
 
     const confirmed = buildProductionRunRequestPayload({ ...common, scriptMode: 'confirmed_revision', scriptRevisionId: 'revision-1' })
     assert.equal(confirmed.script_revision_id, 'revision-1')
@@ -2678,8 +2557,9 @@ test('ProductionRun request payload has one authoritative shape for each script 
       episodeDurationSeconds: 1,
     })
     assert.deepEqual(structuredImport, {
+      plan_source: 'recipe',
       project_id: 'project-1', recipe_version_id: 'recipe-1', idempotency_key: 'request-1',
-      allow_external_calls: true, budget_limit: '20.0000', max_generation_tasks: 42,
+      allow_external_calls: true,
       config_overrides: { seed: 9 }, script_revision_id: 'revision-1',
       episode_count: 1, shots_per_episode: 1, episode_duration_seconds: 1,
     })
@@ -2694,7 +2574,7 @@ test('ProductionRun request payload has one authoritative shape for each script 
     const seriesStudioView = readFileSync(join(frontendRoot, 'src', 'views', 'SeriesStudioView.vue'), 'utf8')
     const creationModeIndex = seriesStudioView.indexOf('<div class="form-section"><div class="section-number">01</div>')
     const structuredPlanIndex = seriesStudioView.indexOf('class="form-section onboarding-structure-plan-section"')
-    const workflowIndex = seriesStudioView.indexOf('class="form-section onboarding-workflow-section"')
+    const workflowIndex = seriesStudioView.indexOf('<RecipeExecutionSummary')
     assert.ok(creationModeIndex >= 0 && structuredPlanIndex > creationModeIndex)
     assert.ok(workflowIndex > structuredPlanIndex)
     assert.match(seriesStudioView, /structuredImportPlan:\s*scriptMode === 'confirmed_revision' && selectedCreationRecipeSummary\.value\.hasStructure/)
@@ -2702,62 +2582,13 @@ test('ProductionRun request payload has one authoritative shape for each script 
 
     const downstream = buildProductionRunRequestPayload({ ...common, scriptMode: 'downstream' })
     assert.deepEqual(downstream.episode_ids, ['episode-a', 'episode-b'])
+    assert.throws(() => buildProductionRunRequestPayload({ ...common, scriptMode: 'downstream', episodeIds: [] }), /至少一个已有剧集/)
     for (const key of ['script_revision_id', 'idea', 'style_hint', 'episode_count', 'shots_per_episode', 'episode_duration_seconds']) assert.equal(key in downstream, false)
 
-    const uniform = buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'downstream',
-      workflowSelection: {
-        schemaVersion: 2,
-        mode: 'uniform',
-        routeIndex: 1,
-        promptProfileSelections: [{
-          operation: 'video.generate', mode: 'T2VA', promptProfileBindingId: 'binding-video',
-        }],
-      },
-      bibleImagePromptProfileBindingId: 'binding-bible',
-    })
-    assert.deepEqual(uniform.workflow_selection, {
-      schema_version: 2, mode: 'uniform', route_index: 1, shot_routes: [],
-      prompt_profile_selections: [{
-        operation: 'video.generate', mode: 'T2VA', prompt_profile_binding_id: 'binding-video',
-      }],
-    })
-    assert.equal(uniform.bible_image_prompt_profile_binding_id, 'binding-bible')
-    const perShot = buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'downstream',
-      workflowSelection: {
-        schemaVersion: 2,
-        mode: 'per_shot',
-        shotRoutes: [
-          { shotId: 'shot-a', routeIndex: 0, promptProfileBindingId: 'binding-a' },
-          { shotId: 'shot-b', routeIndex: 1, promptProfileBindingId: 'binding-b' },
-        ],
-      },
-    })
-    assert.deepEqual(perShot.workflow_selection, {
-      schema_version: 2,
-      mode: 'per_shot',
-      route_index: null,
-      prompt_profile_selections: [],
-      shot_routes: [
-        { shot_id: 'shot-a', route_index: 0, prompt_profile_binding_id: 'binding-a' },
-        { shot_id: 'shot-b', route_index: 1, prompt_profile_binding_id: 'binding-b' },
-      ],
-    })
-    assert.throws(() => buildProductionRunRequestPayload({
-      ...common,
-      scriptMode: 'downstream',
-      workflowSelection: {
-        schemaVersion: 2,
-        mode: 'per_shot',
-        shotRoutes: [
-          { shotId: 'shot-a', routeIndex: 0, promptProfileBindingId: 'binding-a' },
-          { shotId: 'shot-a', routeIndex: 1, promptProfileBindingId: 'binding-b' },
-        ],
-      },
-    }), /不能重复/)
+    for (const field of ['workflowSelection', 'bibleImagePromptProfileBindingId', 'referenceInputs', 'unknownField']) {
+      assert.throws(() => buildProductionRunRequestPayload({ ...common, scriptMode: 'downstream', [field]: {} }), /未声明字段/)
+    }
+    for (const field of ['workflow_selection', 'bible_image_prompt_profile_binding_id', 'reference_inputs']) assert.equal(field in downstream, false)
   } finally { await vite.close() }
 })
 
@@ -2771,276 +2602,26 @@ test('review payload parsers require immutable source snapshots and hashes', asy
     const attemptId = '33333333-3333-4333-8333-333333333333'
     const contentHash = 'a'.repeat(64)
     const stageHash = 'b'.repeat(64)
-    const scriptRun = adapters.adaptProductionRun({
-      id: 'run-1', created_at: '', updated_at: '', stages: [{
-        id: 'stage-script', stage_key: 'script_generate', ordinal: 1, status: 'succeeded',
-        created_at: '', updated_at: '', output_snapshot_sha256: stageHash,
-        output_snapshot: {
-          stage_key: 'script_generate', canonical: { id: revisionId, content_sha256: contentHash },
-          review_payload: {
-            kind: 'generated_script_preview', script_revision_id: revisionId, artifact_id: artifactId,
-            attempt_id: attemptId, content_sha256: contentHash, result_sha256: 'c'.repeat(64),
-            title: '潮汐', logline: '岛上失踪案。', warnings: ['结尾需复核'],
-          },
-        },
-      }],
-    })
-    const parsedScript = review.parseScriptReviewPayload(scriptRun.stages)
-    assert.equal(parsedScript.error, '')
-    assert.equal(parsedScript.value.scriptRevisionId, revisionId)
-    assert.equal(parsedScript.value.snapshotSha256, stageHash)
-    assert.equal(parsedScript.value.sourceStageKey, 'script_generate')
 
-    scriptRun.stages[0].outputSnapshot.review_payload.kind = 'other_preview'
-    assert.match(review.parseScriptReviewPayload(scriptRun.stages).error, /kind/)
-
-    const structuredRun = adapters.adaptProductionRun({
-      id: 'run-structured', created_at: '', updated_at: '', stages: [{
-        id: 'stage-structured', stage_key: 'script_structure', ordinal: 2, status: 'succeeded',
-        created_at: '', updated_at: '', output_snapshot_sha256: '1'.repeat(64),
-        output_snapshot: {
-          stage_key: 'script_structure', canonical: { id: revisionId, content_sha256: contentHash },
-          review_payload: {
-            kind: 'structured_script_preview', submission_semantics: 'no_submission',
-            script_revision_id: revisionId, artifact_id: artifactId, attempt_id: null,
-            content_sha256: contentHash, result_sha256: '', title: '导入剧本', logline: '原稿已符合正式结构。',
-          },
-        },
-      }],
-    })
-    const parsedStructured = review.parseScriptReviewPayload(structuredRun.stages)
-    assert.equal(parsedStructured.error, '')
-    assert.equal(parsedStructured.value.sourceStageKey, 'script_structure')
-    assert.equal(parsedStructured.value.attemptId, null)
-    assert.equal(parsedStructured.value.submissionSemantics, 'no_submission')
-
-    const candidate = (entityType, suffix) => ({
-      candidate_id: `candidate-${suffix}`, entity_type: entityType, name: `名称-${suffix}`,
-      description: '描述', visual_identity_en: 'visual identity', occurrence: 1, recommended: true,
-      reviewed_content_sha256: suffix.repeat(64),
-    })
-    const bibleRun = adapters.adaptProductionRun({
-      id: 'run-2', created_at: '', updated_at: '', stages: [{
-        id: 'stage-bible', stage_key: 'bible_materialize', ordinal: 2, status: 'succeeded',
-        created_at: '', updated_at: '', output_snapshot_sha256: 'd'.repeat(64),
-        output_snapshot: {
-          stage_key: 'bible_materialize', review_payload: {
-            kind: 'script_bible_candidates', script_revision_id: revisionId,
-            script_content_sha256: contentHash, source_fingerprint: 'e'.repeat(64), candidate_sha256: 'f'.repeat(64),
-            collections: {
-              characters: [candidate('character', '1')], scenes: [candidate('scene', '2')], props: [candidate('prop', '3')],
-            },
-            diagnostics: [{ code: 'parsed', severity: 'info' }],
-          },
-        },
-      }],
-    })
-    const parsedBible = review.parseBibleReviewPayload(bibleRun.stages)
-    assert.equal(parsedBible.error, '')
-    assert.equal(parsedBible.value.collections.characters[0].name, '名称-1')
-    assert.deepEqual(parsedBible.value.diagnostics, [{ code: 'parsed', severity: 'info' }])
-    bibleRun.stages[0].outputSnapshotSha256 = ''
-    assert.match(review.parseBibleReviewPayload(bibleRun.stages).error, /hash/)
-
-    const reviewLimits = { maxReferenceBindings: 64, promptReviewMaxCandidates: 100, promptReviewMaxAdvisories: 200, promptReviewMaxInputBytes: 512 * 1024, promptReviewMaxFieldCharacters: 30_000, promptReviewMaxUsageCount: 1_000_000_000 }
-    const storyboardRun = adapters.adaptProductionRun({ id: 'run-storyboard', stages: [{
-      id: 'stage-storyboard', stage_key: 'storyboard', ordinal: 3, status: 'succeeded', created_at: '', updated_at: '',
-      output_snapshot_sha256: '7'.repeat(64), output_snapshot: {
-        stage_key: 'storyboard', formal_object_type: 'storyboard', canonical_sha256: '8'.repeat(64),
-        canonical: { episodes: [{ id: revisionId, number: 1, title: '第一集', shots: [
-          { id: artifactId, number: 1, title: '定场', duration_ms: 2500, media_type: 'image', conditioning_mode: '', include_audio: false, character_ids: [], visual_reference_character_ids: [], scene_id: null, prop_ids: [], reference_bindings: {}, requires_first_frame_continuity: false, requires_last_frame_continuity: false },
-          { id: attemptId, number: 2, title: '推进', duration_ms: 5000, media_type: 'video', conditioning_mode: 'vendor.frame', conditioning_mode_capability: { key: 'vendor.frame', label: '首帧模式', description: '', input_kind: 'frame_slots', requires_entity_reference_bible: false, supports_native_audio: true, inputs: { total_images: { minimum_items: 0, maximum_items: 2 }, first_frame: { minimum_items: 0, maximum_items: 1 }, last_frame: { minimum_items: 0, maximum_items: 1 }, entity_images: { minimum_items: 0, maximum_items: 0 }, reference_videos: { minimum_items: 0, maximum_items: 0 }, paired_video_audios: { minimum_items: 0, maximum_items: 0 }, reference_audios: { minimum_items: 0, maximum_items: 0 } } }, include_audio: true, character_ids: [], visual_reference_character_ids: [], scene_id: null, prop_ids: [], reference_bindings: {}, requires_first_frame_continuity: false, requires_last_frame_continuity: false },
-        ] }] },
-      },
-    }] })
-    const storyboard = review.parseStoryboardReviewPayload(storyboardRun.stages, reviewLimits)
-    assert.equal(storyboard.error, '')
-    assert.deepEqual({ shots: storyboard.value.shotCount, images: storyboard.value.imageCount, videos: storyboard.value.videoCount, audio: storyboard.value.audioShotCount, duration: storyboard.value.durationMs }, { shots: 2, images: 1, videos: 1, audio: 1, duration: 7500 })
-    assert.deepEqual(storyboard.value.episodes[0].shots[1].conditioningModeCapability.inputs.referenceVideos, { minimumItems: 0, maximumItems: 0 })
-    storyboardRun.stages[0].outputSnapshot.canonical_sha256 = ''
-    assert.match(review.parseStoryboardReviewPayload(storyboardRun.stages, reviewLimits).error, /hash/)
-
-    const normalizationRun = adapters.adaptProductionRun({ id: 'run-normalization', stages: [{
-      id: 'stage-normalization', stage_key: 'script_normalize', ordinal: 4, status: 'succeeded', created_at: '', updated_at: '',
-      output_snapshot_sha256: '9'.repeat(64), output_snapshot: {
-        stage_key: 'script_normalize', review_payload: {
-          kind: 'prompt_normalization_candidates', attempt_id: attemptId, result_sha256: '6'.repeat(64),
-          provider: 'deepseek', model: 'deepseek-chat', submission_semantics: 'durable_single_submit_manual_resolution',
-          advisories: [
-            { schema_version: 1, code: 'recommended_input_bytes_exceeded', severity: 'warning', measured: 25093, recommended_maximum: 16000, hard_maximum: 65536, batch_index: 0 },
-            { schema_version: 1, code: 'recommended_output_tokens_exceeded', severity: 'warning', usage_field: 'completion_tokens', measured: 40001, recommended_maximum: 32768, hard_maximum: 131072, batch_index: 0 },
-            { schema_version: 1, code: 'recommended_length_out_of_range', severity: 'warning', request_id: 'candidate-character-name', field_key: 'detailed_description', measured: 229, minimum: 350, maximum: 500, length_unit: 'english_words', request_index: 0, batch_index: 0 },
-          ],
-          candidates: [{
-            request_id: 'candidate-character-name', scope_type: 'character', scope_id: revisionId,
-            field_key: 'character.name', label: '角色名', source_text: '林雾',
-            source_hash: '4'.repeat(64), context_hash: '5'.repeat(64), translated_text: 'S1',
-          }],
-        },
-      },
-    }] })
-    const normalization = review.parsePromptNormalizationReviewPayload(normalizationRun.stages, reviewLimits)
-    assert.equal(normalization.error, '')
-    assert.equal(normalization.value.candidates[0].requestId, 'candidate-character-name')
-    assert.equal(normalization.value.candidates[0].translatedText, 'S1')
-    assert.equal(normalization.value.snapshotSha256, '9'.repeat(64))
-    assert.equal(normalization.value.reviewOrigin, 'model_candidate')
-    assert.equal(normalization.value.retryPolicy, null)
-    assert.equal(normalization.value.advisories.length, 3)
-    assert.equal(normalization.value.advisories[0].code, 'recommended_input_bytes_exceeded')
-
-    const humanFallbackRun = adapters.adaptProductionRun({ id: 'run-normalization-human', stages: [{
-      id: 'stage-normalization-human', stage_key: 'script_normalize', ordinal: 4, status: 'succeeded', created_at: '', updated_at: '',
-      output_snapshot_sha256: '1'.repeat(64), output_snapshot: {
-        stage_key: 'script_normalize', review_payload: {
-          kind: 'prompt_normalization_candidates', review_origin: 'human_after_validation_retry_exhausted',
-          stop_reason: 'retry_limit_reached',
-          attempt_id: attemptId, result_sha256: '2'.repeat(64), provider: 'deepseek', model: 'deepseek-chat',
-          submission_semantics: 'durable_single_submit_manual_resolution',
-          retry_policy: { config_key: 'production.prompt_field_retry_limit', retry_limit: 2, max_attempts: 3, attempts_used: 3 },
-          validation_failures: [1, 2, 3].map((attemptNumber) => ({
-            attempt_id: attemptNumber === 3 ? attemptId : `${attemptNumber}`.repeat(8) + '-1111-4111-8111-' + `${attemptNumber}`.repeat(12),
-            attempt_number: attemptNumber,
-            route_index: 0,
-            unit_key: 'prompt-normalization:001:model_generated',
-            batch_index: 0,
-            error_code: 'provider_response_invalid',
-            error_message: 'Provider 返回的响应未通过严格合同校验。',
-            resolution_id: `${attemptNumber}`.repeat(8) + '-2222-4222-8222-' + `${attemptNumber}`.repeat(12),
-            resolution_evidence_sha256: `${attemptNumber}`.repeat(64),
-            contract_error_code: 'prompt_field_generation_contract_invalid',
-            reason_code: 'length_out_of_range',
-            validation_context: {
-              schema_version: 1,
-              field_key: 'shot.detailed_description',
-              measured: 100,
-              minimum: 350,
-              maximum: 500,
-              length_unit: 'english_words',
-              request_index: 0,
-            },
-          })),
-          candidates: [{
-            request_id: 'candidate-shot-narrative', scope_type: 'shot', scope_id: revisionId,
-            field_key: 'shot.narrative', label: '镜头叙事', source_text: '林雾进入旧宅。',
-            source_hash: '4'.repeat(64), context_hash: '5'.repeat(64), translated_text: '',
-          }],
-        },
-      },
-    }] })
-    const humanFallback = review.parsePromptNormalizationReviewPayload(humanFallbackRun.stages, reviewLimits)
-    assert.equal(humanFallback.error, '')
-    assert.equal(humanFallback.value.reviewOrigin, 'human_after_validation_retry_exhausted')
-    assert.equal(humanFallback.value.retryPolicy?.maxAttempts, 3)
-    assert.equal(humanFallback.value.stopReason, 'retry_limit_reached')
-    assert.equal(humanFallback.value.validationFailures[0].errorCode, 'provider_response_invalid')
-    assert.equal(humanFallback.value.validationFailures[0].reasonCode, 'length_out_of_range')
-    assert.equal(humanFallback.value.validationFailures[0].validationContext?.requestIndex, 0)
-    assert.equal(humanFallback.value.candidates[0].translatedText, '')
-    const failureAttemptIds = humanFallback.value.validationFailures.map((failure: { attemptId: string }) => failure.attemptId)
-    const retryAttempts = [
-      adapters.adaptGenerationAttempt({
-        id: failureAttemptIds[0], operation: 'prompt.normalize', attempt_number: 1,
-        repair_of_attempt_id: '', retry_feedback_sha256: '', created_at: '', updated_at: '',
-      }),
-      adapters.adaptGenerationAttempt({
-        id: failureAttemptIds[1], operation: 'prompt.normalize', attempt_number: 2,
-        repair_of_attempt_id: failureAttemptIds[0], retry_feedback_sha256: 'a'.repeat(64), created_at: '', updated_at: '',
-      }),
-      adapters.adaptGenerationAttempt({
-        id: failureAttemptIds[2], operation: 'prompt.normalize', attempt_number: 3,
-        repair_of_attempt_id: failureAttemptIds[1], retry_feedback_sha256: 'b'.repeat(64), created_at: '', updated_at: '',
-      }),
-    ]
-    const repairEvidence = review.parsePromptNormalizationRetryRepairs(retryAttempts, humanFallback.value.validationFailures)
-    assert.equal(repairEvidence.error, '')
-    assert.deepEqual(repairEvidence.value.map((item: { failureAttemptId: string; retryFeedbackSha256: string }) => [item.failureAttemptId, item.retryFeedbackSha256]), [
-      [failureAttemptIds[0], 'a'.repeat(64)],
-      [failureAttemptIds[1], 'b'.repeat(64)],
-    ])
-    retryAttempts[1].retryFeedbackSha256 = 'provider-authored unknown text'
-    assert.match(review.parsePromptNormalizationRetryRepairs(retryAttempts, humanFallback.value.validationFailures).error, /反馈 hash 无效/)
-    retryAttempts[1].retryFeedbackSha256 = 'a'.repeat(64)
-    humanFallbackRun.stages[0].outputSnapshot.review_payload.validation_failures[0].provider_text = 'must never render'
-    assert.match(review.parsePromptNormalizationReviewPayload(humanFallbackRun.stages, reviewLimits).error, /未知字段/)
-    delete humanFallbackRun.stages[0].outputSnapshot.review_payload.validation_failures[0].provider_text
-
-    humanFallbackRun.stages[0].outputSnapshot.review_payload.stop_reason = 'safe_feedback_unavailable'
-    humanFallbackRun.stages[0].outputSnapshot.review_payload.retry_policy.attempts_used = 1
-    humanFallbackRun.stages[0].outputSnapshot.review_payload.validation_failures = [
-      humanFallbackRun.stages[0].outputSnapshot.review_payload.validation_failures[0],
-    ]
-    humanFallbackRun.stages[0].outputSnapshot.review_payload.attempt_id = failureAttemptIds[0]
-    const safeFeedbackFallback = review.parsePromptNormalizationReviewPayload(humanFallbackRun.stages, reviewLimits)
-    assert.equal(safeFeedbackFallback.error, '')
-    assert.equal(safeFeedbackFallback.value.stopReason, 'safe_feedback_unavailable')
-
-    const humanOnlyRun = adapters.adaptProductionRun({ id: 'run-normalization-human-only', stages: [{
-      id: 'stage-normalization-human-only', stage_key: 'script_normalize', ordinal: 4, status: 'succeeded', created_at: '', updated_at: '',
-      output_snapshot_sha256: '7'.repeat(64), output_snapshot: {
-        stage_key: 'script_normalize', review_payload: {
-          kind: 'prompt_normalization_candidates', review_origin: 'human_only_recipe',
-          attempt_id: null, result_sha256: '8'.repeat(64), provider: '', model: '',
-          submission_semantics: 'human_only_no_submission',
-          candidates: [{
-            request_id: 'candidate-shot-human-only', scope_type: 'shot', scope_id: revisionId,
-            field_key: 'shot.narrative', label: '镜头叙事', source_text: '林雾进入旧宅。',
-            source_hash: '4'.repeat(64), context_hash: '5'.repeat(64), translated_text: '',
-          }],
-        },
-      },
-    }] })
-    const humanOnly = review.parsePromptNormalizationReviewPayload(humanOnlyRun.stages, reviewLimits)
-    assert.equal(humanOnly.error, '')
-    assert.equal(humanOnly.value.reviewOrigin, 'human_only_recipe')
-    assert.equal(humanOnly.value.submissionSemantics, 'human_only_no_submission')
-    assert.equal(humanOnly.value.attemptId, null)
-    assert.equal(humanOnly.value.candidates[0].translatedText, '')
-    humanOnlyRun.stages[0].outputSnapshot.review_payload.review_origin = 'human_only_external_disabled'
-    const legacyHumanOnly = review.parsePromptNormalizationReviewPayload(humanOnlyRun.stages, reviewLimits)
-    assert.equal(legacyHumanOnly.error, '')
-    assert.equal(legacyHumanOnly.value.reviewOrigin, 'human_only_external_disabled')
-    humanOnlyRun.stages[0].outputSnapshot.review_payload.submission_semantics = 'no_submission'
-    assert.match(review.parsePromptNormalizationReviewPayload(humanOnlyRun.stages, reviewLimits).error, /来源与提交语义不匹配/)
-
-    const noOpRun = adapters.adaptProductionRun({ id: 'run-normalization-no-op', stages: [{
-      id: 'stage-normalization-no-op', stage_key: 'script_normalize', ordinal: 4, status: 'succeeded', created_at: '', updated_at: '',
-      output_snapshot_sha256: '3'.repeat(64), output_snapshot: {
-        stage_key: 'script_normalize', review_payload: {
-          kind: 'prompt_normalization_candidates', attempt_id: null, result_sha256: '2'.repeat(64),
-          provider: '', model: '', submission_semantics: 'no_submission', candidates: [],
-        },
-      },
-    }] })
-    const noOpNormalization = review.parsePromptNormalizationReviewPayload(noOpRun.stages, reviewLimits)
-    assert.equal(noOpNormalization.error, '')
-    assert.equal(noOpNormalization.value.attemptId, null)
-    assert.equal(noOpNormalization.value.reviewOrigin, 'no_submission')
-    assert.deepEqual(noOpNormalization.value.candidates, [])
+    // Bible content now uses the shared complete review API; its exact
+    // confirmation and source invariants are covered in productionManualBible.test.ts.
 
     const productionView = readFileSync(join(frontendRoot, 'src', 'views', 'ProductionRunView.vue'), 'utf8')
     const platformApiSource = readFileSync(join(frontendRoot, 'src', 'services', 'platformApi.ts'), 'utf8')
-    assert.match(productionView, /英文执行字段人工审核/)
-    assert.match(productionView, /normalizationHumanOnly/)
-    assert.match(productionView, /script_normalize\/manual 纯人工方式执行/)
-    assert.match(productionView, /历史纯人工来源/)
-    assert.match(productionView, /纯人工输入证据摘要/)
-    assert.match(productionView, /candidateOverrides/)
     assert.match(productionView, /expectedSourceSnapshotSha256/)
-    assert.match(productionView, /adoptGeneratedMetadata/)
+    const textReview = readFileSync(join(frontendRoot, 'src', 'components', 'ProductionTextCandidateReview.vue'), 'utf8')
+    assert.match(productionView, /ProductionTextCandidateReview/)
+    assert.doesNotMatch(textReview, /adoptGeneratedMetadata|adoptMetadata/)
+    assert.match(textReview, /保留项目原标题与梗概/)
     assert.match(platformApiSource, /candidate_overrides:\s*input\.candidateOverrides/)
     assert.match(platformApiSource, /expected_source_snapshot_sha256:\s*input\.expectedSourceSnapshotSha256/)
-    assert.match(platformApiSource, /adopt_generated_metadata:\s*input\.adoptGeneratedMetadata/)
-    assert.match(productionView, /shotReferenceBindings/)
-    assert.match(productionView, /逐镜精确参考素材/)
-    for (const marker of [
-      'parsePromptNormalizationRetryRepairs', '受控原因码', 'validationContext.requestIndex',
-      'retry_feedback SHA-256', '反馈正文不可查看或编辑',
-    ]) assert.ok(productionView.includes(marker), `ProductionRunView misses safe retry audit marker ${marker}`)
+    assert.doesNotMatch(platformApiSource, /adopt_generated_metadata|adoptGeneratedMetadata/)
+    assert.match(productionView, /expectedSelectionSha256/)
+    assert.match(productionView, /RecipeStoryboardReferences/)
     assert.equal(productionView.includes('failure.errorMessage'), false)
     assert.match(platformApiSource, /listGenerationAttempts/)
-    assert.match(platformApiSource, /shot_reference_bindings:\s*input\.shotReferenceBindings/)
-    assert.match(platformApiSource, /shotReferenceBindingsPayload/)
+    assert.match(platformApiSource, /expected_selection_sha256:\s*input\.expectedSelectionSha256/)
+    assert.doesNotMatch(platformApiSource, /shot_reference_bindings|shotReferenceBindingsPayload/)
   } finally { await vite.close() }
 })
 
@@ -3085,73 +2666,10 @@ test('production navigation restores only one actionable run and validates deep-
       createViewStart,
       productionView.indexOf('\n    <template v-else>\n      <section class="run-command-bar"', createViewStart),
     )
-    assert.match(createView, /创建生产运行（ProductionRun）/)
-    assert.match(createView, /历史生产运行（ProductionRun）/)
-  } finally { await vite.close() }
-})
-
-test('FL2VA storyboard review preserves zero, first, last, and dual frame contracts', async () => {
-  const vite = await server()
-  try {
-    const reference = await vite.ssrLoadModule('/src/services/storyboardReferenceBindings.ts')
-    const shot = {
-      id: '11111111-1111-4111-8111-111111111111', number: 3, title: '转场',
-      mediaType: 'video', conditioningMode: 'vendor.frames', conditioningModeCapability: { key: 'vendor.frames', label: '首尾帧', description: '', inputKind: 'frame_slots', requiresEntityReferenceBible: false, supportsNativeAudio: true, inputs: { totalImages: { minimumItems: 0, maximumItems: 2 }, firstFrame: { minimumItems: 0, maximumItems: 1 }, lastFrame: { minimumItems: 0, maximumItems: 1 }, entityImages: { minimumItems: 0, maximumItems: 0 }, referenceVideos: { minimumItems: 0, maximumItems: 0 }, pairedVideoAudios: { minimumItems: 0, maximumItems: 0 }, referenceAudios: { minimumItems: 0, maximumItems: 0 } } }, includeAudio: false, durationMs: 4000,
-      characterIds: [], visualReferenceCharacterIds: [], sceneId: null, propIds: [],
-    }
-    const first = '22222222-2222-4222-8222-222222222222'
-    const last = '33333333-3333-4333-8333-333333333333'
-    const cases = [
-      [{}, {}],
-      [{ firstFrameAssetId: first }, { firstFrameAssetId: first }],
-      [{ lastFrameAssetId: last }, { lastFrameAssetId: last }],
-      [{ firstFrameAssetId: first, lastFrameAssetId: last }, { firstFrameAssetId: first, lastFrameAssetId: last }],
-    ]
-    for (const [values, expected] of cases) {
-      const draft = { ...reference.emptyStoryboardReferenceDraft(), ...values }
-      assert.deepEqual(reference.buildStoryboardShotReferenceBindings(shot, draft), expected)
-      assert.equal(reference.validateStoryboardFrameDraft(shot, draft, (assetId) => [first, last].includes(assetId)), '')
-    }
-    const duplicate = { ...reference.emptyStoryboardReferenceDraft(), firstFrameAssetId: first, lastFrameAssetId: first }
-    assert.match(reference.validateStoryboardFrameDraft(shot, duplicate, () => true), /不能复用/)
-  } finally { await vite.close() }
-})
-
-test('storyboard visual bindings omit voice-only speakers while preserving story membership', async () => {
-  const vite = await server()
-  try {
-    const reference = await vite.ssrLoadModule('/src/services/storyboardReferenceBindings.ts')
-    const visibleCharacterId = '11111111-1111-4111-8111-111111111111'
-    const voiceOnlyCharacterId = '22222222-2222-4222-8222-222222222222'
-    const visibleAssetId = '33333333-3333-4333-8333-333333333333'
-    const voiceOnlyAssetId = '44444444-4444-4444-8444-444444444444'
-    const shot = {
-      id: '55555555-5555-4555-8555-555555555555', number: 1, title: '画外对白',
-      mediaType: 'video', conditioningMode: 'vendor.references',
-      conditioningModeCapability: {
-        key: 'vendor.references', label: '分类参考', description: '',
-        inputKind: 'classified_references', requiresEntityReferenceBible: true,
-        supportsNativeAudio: true,
-      },
-      includeAudio: true, durationMs: 4000,
-      characterIds: [visibleCharacterId, voiceOnlyCharacterId],
-      visualReferenceCharacterIds: [visibleCharacterId],
-      sceneId: null, propIds: [],
-    }
-    const draft = {
-      ...reference.emptyStoryboardReferenceDraft(),
-      characterAssetIds: {
-        [visibleCharacterId]: visibleAssetId,
-        [voiceOnlyCharacterId]: voiceOnlyAssetId,
-      },
-    }
-
-    const bindings = reference.buildStoryboardShotReferenceBindings(shot, draft)
-    assert.deepEqual(bindings.characters, [{
-      entityId: visibleCharacterId,
-      assetId: visibleAssetId,
-    }])
-    assert.deepEqual(shot.characterIds, [visibleCharacterId, voiceOnlyCharacterId])
+    assert.match(createView, /本项目制作记录/)
+    assert.match(createView, /新建配方生产/)
+    assert.match(createView, /新建无配方制作/)
+    assert.match(createView, /route.query.view==='new'/)
   } finally { await vite.close() }
 })
 
@@ -3172,6 +2690,7 @@ test('status tones separate lifecycle facts from verified success', async () => 
     const adapters = await vite.ssrLoadModule('/src/services/platformAdapters.ts')
     for (const status of ['active', 'published', 'configured']) assert.notEqual(adapters.presentPlatformStatus(status).tone, 'success')
     for (const status of ['ready', 'passed', 'succeeded']) assert.equal(adapters.presentPlatformStatus(status).tone, 'success')
+    assert.deepEqual(adapters.presentPlatformStatus('expired'), { label: '已过期', tone: 'warning' })
     assert.deepEqual(adapters.presentPlatformStatus('not_applicable'), { label: '不适用', tone: 'muted' })
   } finally { await vite.close() }
 })

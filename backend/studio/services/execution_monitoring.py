@@ -21,6 +21,14 @@ def _max_type_overrides() -> int:
     return boundary_int("security.execution.max_type_overrides")
 
 
+def model_execution_monitoring_editor_options() -> dict[str, int]:
+    """Model edit limits share runtime validation, without production admission."""
+    return {
+        "max_idle_timeout_seconds": _max_idle_timeout_seconds(),
+        "max_node_type_overrides": _max_type_overrides(),
+    }
+
+
 def _max_node_overrides() -> int:
     return boundary_int("security.execution.max_node_overrides")
 
@@ -132,7 +140,7 @@ def normalize_execution_monitoring_source(
     if source == "workflow":
         allowed.add("node_overrides")
     _exact_keys(value, allowed, label=label)
-    if value.get("schema_version") != EXECUTION_MONITORING_SCHEMA_VERSION:
+    if type(value.get("schema_version")) is not int or value["schema_version"] != EXECUTION_MONITORING_SCHEMA_VERSION:
         raise ValidationError({label: "schema_version 必须为 1"})
     default = value.get("default_idle_timeout_seconds")
     return {
@@ -157,7 +165,7 @@ def normalize_execution_monitoring_source(
 
 
 def empty_execution_monitoring_contract() -> dict[str, Any]:
-    """Canonical contract preserving the historical global idle timeout."""
+    """Canonical absence of node overrides; use the root's frozen idle limit."""
 
     return {
         "schema_version": EXECUTION_MONITORING_SCHEMA_VERSION,
@@ -182,7 +190,7 @@ def normalize_frozen_execution_monitoring_contract(value: object) -> dict[str, A
         },
         label="execution_monitoring",
     )
-    if value.get("schema_version") != EXECUTION_MONITORING_SCHEMA_VERSION:
+    if type(value.get("schema_version")) is not int or value["schema_version"] != EXECUTION_MONITORING_SCHEMA_VERSION:
         raise ValidationError({"execution_monitoring": "schema_version 必须为 1"})
     default = value.get("default_idle_timeout_seconds")
     node_overrides = value.get("node_overrides")

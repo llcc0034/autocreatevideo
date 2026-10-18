@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { configValueConstraintSummary, configValueEditorKind, parseConfigValue, type ConfigResourceOption } from '@/services/configValueSchema'
+import { configEnumLabel, configValueConstraintSummary, configValueEditorKind, parseConfigValue, type ConfigResourceOption } from '@/services/configValueSchema'
 import type { ConfigDefinition } from '@/services/platformTypes'
+import SystemResourcePolicyEditor from './SystemResourcePolicyEditor.vue'
 
 const props = defineProps<{ definition: ConfigDefinition; modelValue: string; disabled?: boolean; resourceOptions?: ConfigResourceOption[] }>()
 const emit = defineEmits<{ 'update:modelValue': [value: string]; change: [] }>()
@@ -17,11 +18,13 @@ const updateRaw = (event: Event) => update((event.target as HTMLInputElement | H
 
 <template>
   <div class="config-value-editor" :class="{ invalid: Boolean(validation.error) }">
+    <SystemResourcePolicyEditor v-if="definition.key==='execution.resources.review_policy'" :model-value="modelValue" :disabled="disabled" @update:model-value="update"/>
+    <template v-else>
     <select v-if="kind==='boolean'" :value="modelValue" :disabled="disabled" @change="updateRaw">
       <option value="true">启用（true）</option><option value="false">停用（false）</option>
     </select>
-    <select v-else-if="kind==='enum'" :value="modelValue" :disabled="disabled" @change="updateRaw">
-      <option v-for="option in enumOptions" :key="JSON.stringify(option)" :value="JSON.stringify(option)">{{ typeof option==='string' ? option : JSON.stringify(option) }}</option>
+    <select v-else-if="kind==='enum'" :aria-label="definition.description" :value="modelValue" :disabled="disabled" @change="updateRaw">
+      <option v-for="option in enumOptions" :key="JSON.stringify(option)" :value="JSON.stringify(option)">{{ configEnumLabel(definition, option) }}</option>
     </select>
     <select v-else-if="kind==='resource'" :value="modelValue" :disabled="disabled" @change="updateRaw">
       <option :value="JSON.stringify('')">请选择满足依赖的已发布资源</option>
@@ -34,7 +37,8 @@ const updateRaw = (event: Event) => update((event.target as HTMLInputElement | H
     </p>
     <input v-else-if="kind==='number'" :value="scalarValue" type="number" :step="definition.valueType==='integer'?1:'any'" :min="definition.valueSchema.minimum!==undefined&&Number.isFinite(Number(definition.valueSchema.minimum))?Number(definition.valueSchema.minimum):undefined" :max="definition.valueSchema.maximum!==undefined&&Number.isFinite(Number(definition.valueSchema.maximum))?Number(definition.valueSchema.maximum):undefined" :disabled="disabled" @input="updateRaw"/>
     <input v-else-if="kind==='string'" :value="scalarValue" type="text" :pattern="typeof definition.valueSchema.pattern==='string'?definition.valueSchema.pattern:undefined" :placeholder="definition.valueSchema.format==='comfyui-saved-workflow-directory'?'workflows 或 workflows/子目录':undefined" :minlength="Number.isInteger(Number(definition.valueSchema.minLength))?Number(definition.valueSchema.minLength):undefined" :maxlength="Number.isInteger(Number(definition.valueSchema.maxLength))?Number(definition.valueSchema.maxLength):undefined" :disabled="disabled" @input="updateString"/>
-    <textarea v-else :value="modelValue" rows="5" spellcheck="false" :disabled="disabled" @input="updateRaw"></textarea>
+    <textarea v-else-if="kind==='json'" :value="modelValue" rows="5" spellcheck="false" :disabled="disabled" @input="updateRaw"></textarea>
+    </template>
     <small>{{ configValueConstraintSummary(definition) }}</small>
     <p v-if="validation.error" class="config-value-error">{{ validation.error }}</p>
   </div>

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from studio.services.security_boundaries import boundary_int
@@ -19,8 +20,46 @@ def dynamic_widget_definitions(
     config: dict,
     *,
     selected_value: Any,
+    resolve_value: Callable[[str, object], Any] | None = None,
 ) -> tuple[tuple[str, object, bool], ...]:
-    """Expand the two reviewed Comfy dynamic-widget schema encodings.
+    """Expand selected dynamic branches in depth-first widget order.
+
+    The resolver reads an explicit API value, or consumes the next canvas
+    widget. It never supplies schema defaults. All nesting shares one bounded
+    traversal; callers still validate every returned definition and value.
+    """
+    pending = list(reversed(_direct_dynamic_widget_definitions(
+        parent_name, input_type, config, selected_value=selected_value,
+    )))
+    rows: list[tuple[str, object, bool]] = []
+    seen = {parent_name}
+    limit = _dynamic_widgets_max_items()
+    while pending:
+        if len(rows) + len(pending) > limit:
+            raise ValueError(f"{parent_name}: dynamic widgets exceed configured limit {limit}")
+        name, definition, required = pending.pop()
+        if name in seen:
+            raise ValueError(f"{parent_name}: duplicate dynamic input {name!r}")
+        seen.add(name)
+        rows.append((name, definition, required))
+        if resolve_value is None:
+            continue
+        value = resolve_value(name, definition)
+        if not isinstance(definition, (list, tuple)) or not definition:
+            continue  # The consumer reports the malformed definition.
+        raw_type = definition[0]
+        child_type = "COMBO" if isinstance(raw_type, (list, tuple)) else raw_type
+        child_config = definition[1] if len(definition) > 1 and isinstance(definition[1], dict) else {}
+        pending.extend(reversed(_direct_dynamic_widget_definitions(
+            name, child_type, child_config, selected_value=value,
+        )))
+    return tuple(rows)
+
+
+def _direct_dynamic_widget_definitions(
+    parent_name: str, input_type: str, config: dict, *, selected_value: Any,
+) -> tuple[tuple[str, object, bool], ...]:
+    """Read the two reviewed Comfy dynamic-widget schema encodings.
 
     Comfy's V3 dynamic combo exposes nested ``inputs`` under the selected
     option and serializes them as ``parent.child`` API inputs. VHS exposes
@@ -54,7 +93,7 @@ def dynamic_widget_definitions(
                     return ()
                 rows.append((f"{parent_name}.{child_name}", definition, category == "required"))
     formats = config.get("formats")
-    if isinstance(formats, dict) and selected_value in formats:
+    if isinstance(formats, dict) and isinstance(selected_value, (str, int, float, bool)) and selected_value in formats:
         definitions = formats[selected_value]
         if not isinstance(definitions, list):
             return ()
@@ -72,11 +111,6 @@ def dynamic_widget_definitions(
                 else {}
             )
             rows.append((definition[0], [definition[1], child_config], True))
-    if len(rows) > _dynamic_widgets_max_items():
-        return ()
-    names = [row[0] for row in rows]
-    if len(set(names)) != len(names):
-        return ()
     return tuple(rows)
 
 

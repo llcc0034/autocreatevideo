@@ -143,8 +143,16 @@ def exact_object_info_model_option(
         raise ValueError(
             f"object_info 模型输入 {node_type}.{input_name} 必须唯一声明",
         )
+    return exact_model_input_option(definitions[0], expected_filename=expected_filename)
+
+
+def exact_model_input_option(definition, *, expected_filename: str) -> str:
+    """Keep the live widget spelling while verifying the portable file identity."""
+    expected = safe_model_relative_filename(expected_filename)
+    if expected is None:
+        raise ValueError("model artifact filename 不是安全的 models 相对路径")
     matches = []
-    for raw_value in object_info_input_options(definitions[0]):
+    for raw_value in object_info_input_options(definition):
         if (
             safe_model_relative_filename(raw_value) == expected
             and raw_value not in matches
@@ -152,11 +160,11 @@ def exact_object_info_model_option(
             matches.append(raw_value)
     if not matches:
         raise ValueError(
-            f"object_info 模型输入 {node_type}.{input_name} 缺少 {expected_filename}",
+            f"object_info 模型输入缺少 {expected_filename}",
         )
     if len(matches) != 1:
         raise ValueError(
-            f"object_info 模型输入 {node_type}.{input_name} 对 {expected_filename} "
+            f"object_info 模型输入对 {expected_filename} "
             "返回多个等价枚举值",
         )
     return matches[0]

@@ -17,7 +17,6 @@ export type ProjectRedoPayload = Pick<
   SeriesProject,
   | 'title'
   | 'logline'
-  | 'masterScript'
   | 'isFavorite'
   | 'continuitySummary'
   | 'translationGlossary'
@@ -28,7 +27,6 @@ export type ProjectRedoPayload = Pick<
   | 'resolution'
   | 'width'
   | 'height'
-  | 'defaultMode'
   | 'bible'
 >
 
@@ -53,7 +51,6 @@ const redoTitle = (title: string): string => {
 export const buildProjectRedoPayload = (project: SeriesProject): ProjectRedoPayload => ({
   title: redoTitle(project.title),
   logline: project.logline,
-  masterScript: project.masterScript,
   isFavorite: false,
   continuitySummary: '',
   translationGlossary: {},
@@ -64,7 +61,6 @@ export const buildProjectRedoPayload = (project: SeriesProject): ProjectRedoPayl
   resolution: project.resolution,
   width: project.width,
   height: project.height,
-  defaultMode: project.defaultMode,
   bible: createEmptyProjectBible(),
 })
 

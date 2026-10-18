@@ -872,6 +872,8 @@ class ComfyUIClient:
 
     @staticmethod
     def extract_outputs(history: dict) -> list[dict]:
+        if not isinstance(history, dict) or (history.get("outputs") is not None and not isinstance(history["outputs"], dict)):
+            raise ComfyUIError("ComfyUI history.outputs 必须是节点输出对象")
         found = []
         for node_id, node_outputs in (history.get("outputs") or {}).items():
             if not isinstance(node_outputs, dict):
@@ -890,10 +892,11 @@ class ComfyUIClient:
                 else:
                     raise ComfyUIError("ComfyUI text 输出合同无效")
             if text_contract_present:
-                text = "\n".join(text_values).strip()
+                # Extraction preserves the received strings, including empty
+                # text and whitespace. Candidate validation happens downstream;
+                # stripping/rejecting here would erase the original response.
+                text = "\n".join(text_values)
                 payload = text.encode("utf-8")
-                if not payload:
-                    raise ComfyUIError("ComfyUI text 输出为空")
                 if len(payload) > ComfyUIClient.TEXT_OUTPUT_MAX_BYTES:
                     raise ComfyUIError("ComfyUI text 输出超过 64 KiB 上限")
                 found.append({

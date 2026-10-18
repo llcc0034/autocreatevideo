@@ -4,6 +4,7 @@ import type {
   JsonObject,
   ModelDeployment,
   ModelProfileRegistryOptions,
+  VisualRulesOutputOptions,
   ModelProfileVersion,
   ProviderProfile,
   ProductionRecipe,
@@ -13,6 +14,7 @@ import type {
 } from './platformTypes'
 import { driverLabel, freshnessLabel, stageLabel, valueTypeLabel } from './presentationLabels'
 import { nodeIdleOverrideErrors, type NodeIdleLimits } from './modelNodeIdleOverrides'
+import { visualRulesAdvisoryErrors } from './visualRulesOutput'
 
 export type RegistryResource = 'provider' | 'model' | 'deployment' | 'artifact' | 'recipe' | 'config-definition'
 
@@ -26,7 +28,7 @@ export interface RegistryOption {
 export interface RegistryFieldSchema {
   path: string
   label: string
-  kind: 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'catalog' | 'multiselect' | 'readonly' | 'tags' | 'mapping' | 'json' | 'node-idle-overrides'
+  kind: 'text' | 'textarea' | 'number' | 'boolean' | 'select' | 'catalog' | 'multiselect' | 'readonly' | 'tags' | 'mapping' | 'json' | 'node-idle-overrides' | 'chat-options'
   description: string
   impact: string
   required?: boolean
@@ -101,18 +103,6 @@ const modelHasPromptNormalization = (payload: JsonObject): boolean => {
 const modelHasVisualRules = (payload: JsonObject): boolean => {
   const capabilities = getPath(payload, 'specification.capabilities')
   return Array.isArray(capabilities) && capabilities.some((value) => value === 'visual_rules.generate')
-}
-
-const requestFieldLabels: Record<string, string> = {
-  model: '模型（model）',
-  prompt: '提示词（prompt）',
-  negative_prompt: '负面提示词（negative_prompt）',
-  width: '宽度（width）',
-  height: '高度（height）',
-  duration_seconds: '时长秒数（duration_seconds）',
-  fps: '帧率（fps）',
-  seed: '随机种子（seed）',
-  audio: '音频（audio）',
 }
 
 const driverConfigFields: RegistryFieldSchema[] = [
@@ -265,7 +255,6 @@ const driverConfigFields: RegistryFieldSchema[] = [
   {
     path: 'driver_config.request_field_map', label: '请求字段映射', kind: 'mapping', required: true,
     description: '将平台标准语义映射到远程接口（API）的单层字段名；模型（model）和提示词（prompt）必须配置。', impact: '该合同决定真实生成请求如何装配，错误会阻断保存或烟测。',
-    options: Object.entries(requestFieldLabels).map(([value, label]) => ({ value, label })),
     visibleWhen: (payload) => payload.driver_type === 'async_rest',
   },
   {
@@ -434,25 +423,24 @@ const basicFields = (dependencies: RegistryEditorDependencies, payload: JsonObje
     { path: 'specification.model_family', label: '提示词策略族', kind: 'select', required: true, options: familyOptions, description: '从服务端已有策略族中选择；新模型也可显式选择以当前 Profile Key 登记同名策略族。', impact: '影响提示词策略（Prompt Profile）匹配，不会从 Provider 或模型名自动猜测。' },
     { path: 'specification.prompt_normalization.max_input_bytes', label: '标准化最大输入字节 / Max input bytes', kind: 'number', required: true, min: 1, step: 1, description: '单批实际聊天消息允许的 UTF-8 字节上限；只在能力列表包含 prompt.normalize 时显示。', impact: '最终可接受范围由当前服务端安全边界校验；前端不复制上限。', visibleWhen: modelHasPromptNormalization },
     { path: 'specification.prompt_normalization.input_byte_warning_threshold', label: '输入字节建议阈值 / Input byte advisory threshold', kind: 'number', min: 1, step: 1, description: '可选软阈值；实际聊天消息超过后记录警告，但不会拆批、重试或判定失败。', impact: '只要不大于本版本 max_input_bytes 即可；不设置隐含默认。', visibleWhen: modelHasPromptNormalization },
-    { path: 'specification.prompt_normalization.max_output_tokens', label: '标准化最大输出令牌 / Max output tokens', kind: 'number', required: true, min: 1, step: 1, description: '每批模型响应的最大令牌预算。', impact: '安全绝对上限由服务端当前配置校验，该值随模型版本冻结。', visibleWhen: modelHasPromptNormalization },
-    { path: 'specification.prompt_normalization.output_token_warning_threshold', label: '输出令牌建议阈值 / Output token advisory threshold', kind: 'number', min: 1, step: 1, description: '可选软阈值；实际输出超过后记录警告，但不会因此判定失败。', impact: '只要不大于本版本 max_output_tokens 即可。', visibleWhen: modelHasPromptNormalization },
+
+
     { path: 'specification.prompt_normalization.max_items_per_batch', label: '标准化每批最大字段数 / Max items per batch', kind: 'number', required: true, min: 1, step: 1, description: '每次 prompt.normalize 请求最多包含的字段条数。', impact: '当前安全上限由服务端校验，不会把成功批次随失败批次重复提交。', visibleWhen: modelHasPromptNormalization },
     { path: 'specification.prompt_normalization.timeout_seconds', label: '标准化请求超时 / Timeout seconds', kind: 'number', required: true, step: 0.5, description: '单批文本模型传输的有限正数秒数。', impact: '服务端按当前安全边界校验；不改变 ProductionRun 总体任务时限。', visibleWhen: modelHasPromptNormalization },
-    { path: 'specification.prompt_normalization.chat_request_options', label: '受控请求选项 / Controlled request options', kind: 'json', required: true, advanced: true, description: '必须显式冻结的非敏感 JSON 对象；可为空，也可按当前 Provider 能力声明 temperature、response_format、thinking 等选项。', impact: '不得包含凭据、传输地址/超时，不得覆盖 model、messages、输出预算、seed 或包装字段；字节和结构上限读取当前安全配置。', visibleWhen: modelHasPromptNormalization },
-    { path: 'specification.visual_rules.max_input_bytes', label: '影视规则最大输入字节 / Visual-rules max input bytes', kind: 'number', required: true, min: 1, step: 1, description: '完整已确认剧本、Bible 与规则上下文允许的 UTF-8 硬容量；只在能力列表包含 visual_rules.generate 时显示。', impact: '安全绝对上限由服务端当前配置校验；前端不复制上限。', visibleWhen: modelHasVisualRules },
-    { path: 'specification.visual_rules.input_byte_warning_threshold', label: '影视规则输入建议阈值 / Input advisory threshold', kind: 'number', min: 1, step: 1, description: '可选建议值；超过后只记录告警，仍提交完整剧本。', impact: '不得大于本版本 max_input_bytes。', visibleWhen: modelHasVisualRules },
-    { path: 'specification.visual_rules.max_output_tokens', label: '影视规则最大输出令牌 / Visual-rules max output tokens', kind: 'number', required: true, min: 1, step: 1, description: 'Provider 请求的真实最大完成预算，不是推荐篇幅。', impact: '安全绝对上限由服务端校验；Provider 明示 length 仍表示结果不完整。', visibleWhen: modelHasVisualRules },
-    { path: 'specification.visual_rules.output_token_warning_threshold', label: '影视规则输出建议阈值 / Output advisory threshold', kind: 'number', min: 1, step: 1, description: '可选建议值；已通过严格结构校验的输出超过后只告警，不阻断审核。', impact: '不得大于本版本 max_output_tokens。', visibleWhen: modelHasVisualRules },
+    { path: 'specification.prompt_normalization.chat_request_options', label: '标准化请求选项', kind: 'chat-options', required: true, description: '常用字段通过固定表单配置，接口扩展单独维护。', impact: '随模型版本冻结，未配置字段不自动补入请求。', visibleWhen: modelHasPromptNormalization },
+    { path: 'specification.visual_rules.max_input_bytes', label: '影视规则最大输入字节 / Visual-rules max input bytes', kind: 'number', required: true, min: 1, step: 1, description: '按本次明确输入与提示词策略组成的实际消息允许的 UTF-8 硬容量；只在能力列表包含 visual_rules.generate 时显示。', impact: '安全绝对上限由服务端当前配置校验；前端不复制上限。', visibleWhen: modelHasVisualRules },
+    { path: 'specification.visual_rules.input_byte_warning_threshold', label: '影视规则输入建议阈值 / Input advisory threshold', kind: 'number', min: 1, step: 1, description: '可选建议值；超过后只记录告警，不截断已确认输入，也不自动追加剧本。', impact: '不得大于本版本 max_input_bytes。', visibleWhen: modelHasVisualRules },
+
+
     { path: 'specification.visual_rules.timeout_seconds', label: '影视规则请求超时 / Visual-rules timeout', kind: 'number', required: true, step: 0.5, description: '单次 visual_rules.generate 的有限正数传输时长。', impact: '当前安全上限由服务端校验；不改变 ProductionRun 总体任务硬时限。', visibleWhen: modelHasVisualRules },
-    { path: 'specification.visual_rules.quality_advisories', label: '影视规则质量建议 / Visual-rules quality advisories', kind: 'json', advanced: true, description: '可选 schema_version=1 对象。可按需声明 base_colors_min/max_items、negative_constraints_min/max_items、negative_constraint_max_chars、recommended_negative_clauses，以及 continuity_summary、negative_prompt、color_script 的 max_chars；省略任一字段就不启用该项隐含建议。', impact: '命中只写入候选 warnings 与 advisory audit；建议负面短语只在配置存在时合并且人工可移除，不截断、不重试、不阻断结构完整且安全的候选。数组类型、枚举、唯一性、可打印英文、来源回显和绝对 JSON/请求上限仍硬校验。', visibleWhen: modelHasVisualRules },
-    { path: 'specification.visual_rules.chat_request_options', label: '影视规则受控请求选项 / Visual-rules request options', kind: 'json', required: true, advanced: true, description: '当前模型版本必须显式冻结的非敏感 JSON；可为空，也可配置 temperature、response_format、thinking 等已声明选项。', impact: '不得覆盖模型、消息、输出预算、种子、传输地址或超时，也不得包含凭据。', visibleWhen: modelHasVisualRules },
+    { path: 'specification.visual_rules.chat_request_options', label: '影视规则请求选项', kind: 'chat-options', required: true, description: '常用字段通过固定表单配置，接口扩展单独维护。', impact: '不代替业务输出版本中的解析合同或模型支持验证。', visibleWhen: modelHasVisualRules },
     { path: 'specification.execution_monitoring.schema_version', label: '执行监控合同版本 / Execution monitoring schema', kind: 'readonly', required: true, defaultValue: 1, description: '媒体模型的通用长节点监控合同版本；由系统维护，当前只支持 1。', impact: '发布后冻结，新合同版本需新建模型版本。', visibleWhen: (payload) => ['image', 'video', 'multimodal'].includes(String(payload.modality || '')) },
     { path: 'specification.execution_monitoring.default_idle_timeout_seconds', label: '默认静默时限 / Default idle timeout', kind: 'number', step: 1, description: '没有更具体节点规则时使用的正整数秒数；留空则沿用任务冻结的全局静默时限。', impact: '当前安全范围由服务端配置校验；只影响未来任务且不能延长硬时限。', visibleWhen: (payload) => ['image', 'video', 'multimodal'].includes(String(payload.modality || '')) },
     { path: 'specification.execution_monitoring.node_type_overrides', label: '特定节点等待时限（高级）', kind: 'node-idle-overrides', advanced: true, description: '通常无需设置；从节点目录选择类型，按分钟填写等待时长。', impact: '保存在同一模型合同中，仍按正整数秒冻结；不改变任务总超时。', visibleWhen: (payload) => ['image', 'video', 'multimodal'].includes(String(payload.modality || '')) },
-    { path: 'specification', label: '完整模型规格', kind: 'json', advanced: true, description: '同一 specification 事实的完整 JSON 视图，用于异步媒体请求（async_media）的结构约束（Schema）、烟测输入（smoke_inputs）等扩展能力合同；上方类型化字段会直接读写这个对象。', impact: '不是第二套配置；发布后不可原地修改，服务端会校验秘密字段和媒体合同。' },
+    { path: 'specification', label: '完整模型规格', kind: 'json', advanced: true, description: '同一 specification 的完整视图；已表单化的媒体、原生剧本、文本参数、请求选项及 async_media 合同（含 Smoke 样例）在固定表单调整，此处仅核对。未表单化专有扩展仍须符合服务端协议。', impact: '不是第二套配置；发布后不可原地修改，服务端会校验秘密字段和媒体合同。' },
   ],
   deployment: [
-    { path: 'key', label: '部署键（Deployment Key）', kind: 'text', required: true, pattern: '^[a-z][a-z0-9_.-]{1,99}$', description: '运行部署的稳定机器标识。', impact: '配方路由和审计通过该标识识别部署。', placeholder: 'deepseek-prod-01' },
+    { path: 'key', label: '部署键（Deployment Key）', kind: 'text', required: true, pattern: '^[a-z][a-z0-9_.-]{1,99}$', description: '模型部署的稳定机器标识。', impact: '配方路由和审计通过该标识识别部署。', placeholder: 'deepseek-prod-01' },
     { path: 'name', label: '显示名称', kind: 'text', required: true, description: '管理员识别部署的名称。', impact: '仅影响页面显示。' },
     { path: 'profile_version', label: '已发布模型版本', kind: 'select', required: true, options: dependencies.modelProfiles.filter((item) => item.status === 'published').map((item) => ({ value: item.id, label: `${item.profileKey} v${item.version} · ${item.modelIdentifier}` })), description: '只能选择已发布且未退役的模型版本。', impact: '决定模型标识、服务提供方（Provider）及能力合同。' },
     { path: 'runtime_host', label: '运行主机', kind: 'select', options: [{ value: '', label: '远端服务 / 不绑定本地主机' }, ...dependencies.runtimeHosts.map((item) => ({ value: item.id, label: `${item.name} · ${freshnessLabel(item.status)}`, disabled: item.status !== 'active' }))], description: '本地模型和 ComfyUI 工作流执行器应选择已探测为启用（active）的主机；远端接口（API）可不绑定。', impact: '主机不可用会阻断本地生产任务。' },
@@ -542,6 +530,7 @@ export const resourceEditorFields = (
   return basicFields(dependencies, payload)[resource]
     .filter((field) => !field.visibleWhen || field.visibleWhen(contextualPayload))
     .map((field) => {
+      if (field.path.endsWith('.request_field_map')) field = { ...field, options: (dependencies.modelProfileOptions?.asyncMedia?.fields || []).map(row=>({value:row.key,label:`${row.label} · ${row.key}`})) }
       const driverType = String(contextualPayload.driver_type || '')
       const configPrefix = resource === 'deployment' ? 'runtime_config.' : 'driver_config.'
       if (field.path.startsWith(configPrefix)) {
@@ -607,9 +596,17 @@ export const buildRegistryResourcePayload = (
   resource: RegistryResource,
   payload: JsonObject,
   dependencies: RegistryEditorDependencies,
-): JsonObject => resourceEditorFields(resource, payload, dependencies)
-  .filter((field) => field.submit === false)
-  .reduce((result, field) => setPath(result, field.path, undefined), cloneJson(payload))
+): JsonObject => {
+  const result = resourceEditorFields(resource, payload, dependencies)
+    .filter((field) => field.submit === false)
+    .reduce((result, field) => setPath(result, field.path, undefined), cloneJson(payload))
+  if (resource === 'recipe') {
+
+
+
+  }
+  return result
+}
 
 const empty = (value: unknown): boolean => value === undefined || value === null || value === ''
   || (Array.isArray(value) && value.length === 0)
@@ -683,7 +680,7 @@ const isReservedChatRequestField = (value: string): boolean => {
     || CHAT_REQUEST_TRANSPORT_FIELD_MARKERS.some((marker) => normalized.includes(marker))
 }
 
-const chatRequestOptionErrors = (value: unknown): string[] => {
+export const chatRequestOptionErrors = (value: unknown): string[] => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ['受控请求选项必须是 JSON 对象']
   const errors: string[] = []
   const root = value as JsonObject
@@ -728,8 +725,8 @@ const chatRequestOptionErrors = (value: unknown): string[] => {
 export const promptNormalizationValidationErrors = (value: unknown): string[] => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ['prompt.normalize 容量合同必须是 JSON 对象']
   const contract = value as JsonObject
-  const required = ['max_input_bytes', 'max_output_tokens', 'max_items_per_batch', 'timeout_seconds', 'chat_request_options']
-  const allowed = new Set([...required, 'input_byte_warning_threshold', 'output_token_warning_threshold'])
+  const required = ['max_input_bytes', 'max_items_per_batch', 'timeout_seconds', 'chat_request_options']
+  const allowed = new Set([...required, 'input_byte_warning_threshold'])
   const errors: string[] = []
   const missing = required.filter((key) => !Object.prototype.hasOwnProperty.call(contract, key))
   const unknown = Object.keys(contract).filter((key) => !allowed.has(key))
@@ -750,15 +747,6 @@ export const promptNormalizationValidationErrors = (value: unknown): string[] =>
       errors.push('输入字节建议阈值不能大于标准化最大输入字节')
     }
   }
-  positiveInteger('max_output_tokens', '标准化最大输出令牌')
-  if (Object.prototype.hasOwnProperty.call(contract, 'output_token_warning_threshold')) {
-    positiveInteger('output_token_warning_threshold', '输出令牌建议阈值')
-    if (typeof contract.output_token_warning_threshold === 'number'
-      && typeof contract.max_output_tokens === 'number'
-      && contract.output_token_warning_threshold > contract.max_output_tokens) {
-      errors.push('输出令牌建议阈值不能大于标准化最大输出令牌')
-    }
-  }
   positiveInteger('max_items_per_batch', '标准化每批最大字段数')
   const timeout = contract.timeout_seconds
   if (typeof timeout !== 'number' || !Number.isFinite(timeout) || timeout <= 0) {
@@ -773,11 +761,11 @@ export const promptNormalizationValidationErrors = (value: unknown): string[] =>
   return errors
 }
 
-export const visualRulesValidationErrors = (value: unknown): string[] => {
+export const visualRulesValidationErrors = (value: unknown, options?: VisualRulesOutputOptions | null): string[] => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ['visual_rules.generate 容量合同必须是 JSON 对象']
   const contract = value as JsonObject
-  const required = ['max_input_bytes', 'max_output_tokens', 'timeout_seconds', 'chat_request_options']
-  const allowed = new Set([...required, 'input_byte_warning_threshold', 'output_token_warning_threshold', 'quality_advisories'])
+  const required = ['max_input_bytes', 'timeout_seconds', 'chat_request_options']
+  const allowed = new Set([...required, 'input_byte_warning_threshold', 'quality_advisories'])
   const errors: string[] = []
   const missing = required.filter((key) => !Object.prototype.hasOwnProperty.call(contract, key))
   const unknown = Object.keys(contract).filter((key) => !allowed.has(key))
@@ -790,10 +778,10 @@ export const visualRulesValidationErrors = (value: unknown): string[] => {
     }
   }
   positiveInteger('max_input_bytes', '影视规则最大输入字节')
-  positiveInteger('max_output_tokens', '影视规则最大输出令牌')
+
   for (const [field, maximumField, label] of [
     ['input_byte_warning_threshold', 'max_input_bytes', '影视规则输入建议阈值'],
-    ['output_token_warning_threshold', 'max_output_tokens', '影视规则输出建议阈值'],
+
   ] as const) {
     if (!Object.prototype.hasOwnProperty.call(contract, field)) continue
     positiveInteger(field, label)
@@ -811,101 +799,11 @@ export const visualRulesValidationErrors = (value: unknown): string[] => {
     errors.push(...chatRequestOptionErrors(contract.chat_request_options))
   }
   if (Object.prototype.hasOwnProperty.call(contract, 'quality_advisories')) {
-    const raw = contract.quality_advisories
-    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
-      errors.push('影视规则质量建议必须是 schema_version=1 的 JSON 对象')
-    } else {
-      const advisories = raw as JsonObject
-      const advisoryFields = new Set([
-        'schema_version',
-        'base_colors_min_items', 'base_colors_max_items',
-        'negative_constraints_min_items', 'negative_constraints_max_items',
-        'negative_constraint_max_chars', 'recommended_negative_clauses', 'continuity_summary_max_chars',
-        'negative_prompt_max_chars', 'color_script_max_chars',
-      ])
-      const advisoryUnknown = Object.keys(advisories).filter((key) => !advisoryFields.has(key))
-      if (advisories.schema_version !== 1) errors.push('影视规则质量建议 schema_version 只能为 1')
-      if (advisoryUnknown.length) errors.push(`影视规则质量建议包含未知字段：${advisoryUnknown.join('、')}`)
-      for (const field of ['base_colors_min_items', 'base_colors_max_items'] as const) {
-        if (!Object.prototype.hasOwnProperty.call(advisories, field)) continue
-        const candidate = advisories[field]
-        if (typeof candidate !== 'number' || !Number.isInteger(candidate) || candidate < 0 || candidate > 21) {
-          errors.push(`${field} 必须是 0–21 的整数`)
-        }
-      }
-      for (const field of ['negative_constraints_min_items', 'negative_constraints_max_items'] as const) {
-        if (!Object.prototype.hasOwnProperty.call(advisories, field)) continue
-        const candidate = advisories[field]
-        if (typeof candidate !== 'number' || !Number.isInteger(candidate) || candidate < 0 || candidate > 1024 * 1024) {
-          errors.push(`${field} 必须是 0–1048576 的整数`)
-        }
-      }
-      for (const field of ['negative_constraint_max_chars', 'continuity_summary_max_chars', 'negative_prompt_max_chars', 'color_script_max_chars'] as const) {
-        if (!Object.prototype.hasOwnProperty.call(advisories, field)) continue
-        const candidate = advisories[field]
-        if (typeof candidate !== 'number' || !Number.isInteger(candidate) || candidate < 1 || candidate > 1024 * 1024) {
-          errors.push(`${field} 必须是 1–1048576 的整数`)
-        }
-      }
-      if (Object.prototype.hasOwnProperty.call(advisories, 'recommended_negative_clauses')) {
-        const clauses = advisories.recommended_negative_clauses
-        if (!Array.isArray(clauses)) {
-          errors.push('recommended_negative_clauses 必须是数组')
-        } else {
-          const normalized: string[] = []
-          for (const [index, rawClause] of clauses.entries()) {
-            const clause = typeof rawClause === 'string' ? rawClause.replace(/^[ .]+|[ .]+$/g, '') : ''
-            if (!clause || !/^[\x20-\x7e]+$/.test(clause) || /[,;\r\n]/.test(clause) || /<\/?[A-Za-z][^>]*>/.test(clause)) {
-              errors.push(`recommended_negative_clauses[${index}] 必须是单条非空、无 HTML/控制字符/列表分隔符的可打印英文`)
-            }
-            normalized.push(clause.toLocaleLowerCase('en-US'))
-          }
-          if (new Set(normalized).size !== normalized.length) {
-            errors.push('recommended_negative_clauses 不能包含重复项')
-          }
-        }
-      }
-      for (const [minimum, maximum] of [
-        ['base_colors_min_items', 'base_colors_max_items'],
-        ['negative_constraints_min_items', 'negative_constraints_max_items'],
-      ] as const) {
-        if (typeof advisories[minimum] === 'number' && typeof advisories[maximum] === 'number'
-          && advisories[minimum] > advisories[maximum]) errors.push(`${minimum} 不能大于 ${maximum}`)
-      }
-    }
+    errors.push(...visualRulesAdvisoryErrors(contract.quality_advisories, options))
   }
   return errors
 }
 
-export const recipeBibleSourceValidationErrors = (definition: JsonObject): string[] => {
-  const stages = Array.isArray(definition.stages)
-    ? definition.stages.filter((value): value is JsonObject => Boolean(value && typeof value === 'object' && !Array.isArray(value)))
-    : []
-  const byKey = new Map(stages.map((stage) => [String(stage.key || ''), stage]))
-  const hasBibleImages = byKey.has('bible_image_generation') || byKey.has('bible_image_review')
-  if (!hasBibleImages) return []
-
-  // schema v2 unattended recipes carry stronger policy/approval contracts that
-  // are validated by the existing backend path. Keep that contract untouched.
-  if (Number(definition.schema_version) === 2 && definition.interaction_mode === 'unattended') return []
-
-  const materialize = byKey.get('bible_materialize')
-  const review = byKey.get('bible_review')
-  const deterministicSource = Boolean(
-    materialize?.mode === 'deterministic'
-    && review?.mode === 'review'
-    && review?.approval === 'required',
-  )
-  const manualSource = Boolean(
-    !materialize
-    && review?.mode === 'manual'
-    && review?.approval === 'required',
-  )
-  if (!deterministicSource && !manualSource) {
-    return ['带 Bible 参考图的配方必须且只能选择一种文本 Bible 来源：bible_materialize/deterministic + bible_review/review(required)，或不含 bible_materialize 且使用 bible_review/manual(required)']
-  }
-  return []
-}
 
 export const validateRegistryResource = (
   resource: RegistryResource,
@@ -983,7 +881,8 @@ export const validateRegistryResource = (
       errors.push(...promptNormalizationValidationErrors(getPath(payload, 'specification.prompt_normalization')))
     }
     if (modelHasVisualRules(payload)) {
-      errors.push(...visualRulesValidationErrors(getPath(payload, 'specification.visual_rules')))
+      errors.push(...visualRulesValidationErrors(getPath(payload, 'specification.visual_rules'), dependencies.modelProfileOptions?.visualRulesOutput))
+      if (getPath(payload, 'specification.visual_rules.quality_advisories') !== undefined) errors.push('请从本模型草稿移除旧质量建议，改在业务输出版本配置并由执行实例引用。')
     }
   }
   if (resource === 'deployment' && !dependencies.modelProfiles.some((item) => item.status === 'published')) errors.push('请先发布模型版本，再创建部署')
@@ -1048,14 +947,14 @@ export const validateRegistryResource = (
       for (const [index, rawStage] of stages.entries()) {
         const stage = rawStage && typeof rawStage === 'object' && !Array.isArray(rawStage) ? rawStage as JsonObject : {}
         if (!approvals.has(String(stage.approval || ''))) errors.push(`阶段 ${index + 1} 的审核门禁不在服务端目录中`)
-        if (recipeStageRequiresRouting(stage, registry)) {
-          const routing = stage.routing && typeof stage.routing === 'object' && !Array.isArray(stage.routing) ? stage.routing as JsonObject : {}
+        for (const key of ['routing','variant_routing']) {
+          if (!recipeStageRequiresRouting(stage, registry) || stage[key] === undefined) continue
+          const routing = stage[key] && typeof stage[key] === 'object' && !Array.isArray(stage[key]) ? stage[key] as JsonObject : {}
           if (!routingModes.has(String(routing.mode || ''))) errors.push(`阶段 ${index + 1} 的路由策略不在服务端目录中`)
         }
       }
     }
-    if (recipeDefinition) errors.push(...recipeBibleSourceValidationErrors(recipeDefinition))
-    if (!dependencies.deployments.some((item) => item.status === 'active')) warnings.push('当前没有 active Deployment；需要路由的阶段将无法发布')
+    if (recipeDefinition && !registry?.interactionModeOptions.some(o=>o.value===recipeDefinition.interaction_mode)) errors.push('请选择制作方式')
   }
   return { errors: [...new Set(errors)], warnings: [...new Set(warnings)] }
 }
@@ -1071,8 +970,7 @@ export const recipeStageRequiresRouting = (
   stage: JsonObject,
   options?: ProductionRecipeEditorOptions | null,
 ): boolean => (
-  options?.stageOptions.find((item) => item.value === String(stage.key || ''))?.requiresRouting === true
-  && !(String(stage.key || '') === 'script_normalize' && String(stage.mode || '') === 'manual')
+  options?.stageOptions.find((item) => item.value === String(stage.key || ''))?.routingModes.includes(String(stage.mode || '')) === true
 )
 
 export const recipeStageOptions = (

@@ -28,33 +28,23 @@ from studio.services.assembly_queue import (
 from studio.services.provenance import persist_assembly_provenance
 from studio.services.json_contracts import assign_json_contract, json_contract
 from studio.services.production_runs import retry_production_run
-from studio.tests.factories import build_story
+from studio.tests import test_assembly as assembly_fixtures
+from studio.models import AssemblySourceItem, GeneratedArtifact
 
 
 class AssemblyQueueTests(TestCase):
+    _selected_artifact = assembly_fixtures.AssemblyTests._selected_artifact
+    _read_fixture_candidate = assembly_fixtures.AssemblyTests._read_fixture_candidate
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.media_root = Path(self.temp.name) / "media"
-        self.override = override_settings(
-            MEDIA_ROOT=self.media_root,
-        )
-        self.override.enable()
-        self.addCleanup(self.override.disable)
-        self.source_verification_patcher = patch(
-            "studio.services.assembly_queue.verify_assembly_sources",
-            return_value=None,
-        )
-        self.source_verification_patcher.start()
-        self.addCleanup(self.source_verification_patcher.stop)
-        self.user, self.project, _, _, self.episode, _, _ = build_story()
+        assembly_fixtures.AssemblyTests.setUp(self)
 
     def _queued_job(self, *, max_attempts=3, filename="assembled.mp4"):
         output = (
             self.media_root / "assemblies" / str(self.user.id)
             / str(self.project.id) / filename
         )
-        return AssemblyJob.objects.create(
+        job = AssemblyJob.objects.create(
             owner=self.user,
             project=self.project,
             episode=self.episode,
@@ -67,80 +57,67 @@ class AssemblyQueueTests(TestCase):
             max_attempts=max_attempts,
         )
 
-    def _link_assembly_run_with_delivery_gate(self, job):
-        recipe_contract = json_contract({"schema_version": 1, "stages": []})
-        recipe = ProductionRecipeVersion.objects.create(
-            recipe_key=f"assembly-auto-{job.id}",
-            version=1,
-            name="Assembly auto advance fixture",
-            definition=recipe_contract.value,
-            definition_schema_version=recipe_contract.schema_version,
-            definition_size_bytes=recipe_contract.size_bytes,
-            definition_sha256=recipe_contract.sha256,
-        )
-        config = json_contract({"schema_version": 1})
-        run_input = json_contract({
-            "schema_version": 1,
-            "episode_ids": [str(self.episode.id)],
-        })
-        run = ProductionRun.objects.create(
-            owner=self.user,
-            project=self.project,
-            recipe_version=recipe,
-            idempotency_key=f"assembly-auto-{job.id}",
-            request_sha256="e" * 64,
-            status=ProductionRun.Status.RUNNING,
-            current_stage_key="assembly",
-            config_snapshot=config.value,
-            config_snapshot_schema_version=config.schema_version,
-            config_snapshot_size_bytes=config.size_bytes,
-            config_snapshot_sha256=config.sha256,
-            input_snapshot=run_input.value,
-            input_snapshot_schema_version=run_input.schema_version,
-            input_snapshot_size_bytes=run_input.size_bytes,
-            input_snapshot_sha256=run_input.sha256,
-        )
+        command = ["ffmpeg-test"]
+        for ordinal, shot in enumerate((self.shot1, self.shot2), 1):
+            if str(shot.pk) not in self.sources:
+                self._selected_artifact(shot, f"source-{ordinal}.mp4")
+            artifact = GeneratedArtifact.objects.get(pk=self.sources[str(shot.pk)]["generated_artifact_id"])
+            AssemblySourceItem.objects.create(assembly_job=job, ordinal=ordinal, shot=shot, generated_artifact=artifact,
+                storage_backend=artifact.storage_backend, object_key=artifact.object_key, mime_type=artifact.mime_type,
+                size_bytes=artifact.size_bytes, sha256=artifact.sha256, media_kind=artifact.kind,
+                duration_ms=shot.duration_ms)
+            command.extend(("-i", str(self.media_root / artifact.object_key)))
+        job.ffmpeg_command = [*command, str(output)]
+        job.save(update_fields=("ffmpeg_command",))
+        return job
 
-        def stage_row(*, key, ordinal, mode, status, approval_required=False):
-            stage = StageRun(
-                production_run=run,
-                stage_key=key,
-                ordinal=ordinal,
-                mode=mode,
-                status=status,
-                approval_required=approval_required,
-                idempotency_key=f"{run.id}:{ordinal}:{key}",
-            )
-            for field, payload in (
-                ("routing", {"schema_version": 1}),
-                ("routing_decision", {"schema_version": 1}),
-                ("config_snapshot", {"schema_version": 1}),
-                ("input_snapshot", {"schema_version": 1, "stage_key": key}),
-            ):
-                assign_json_contract(stage, field, payload)
+    def _link_assembly_run_with_delivery_gate(self, job):
+        from studio.services.json_contracts import assign_json_contract
+        from studio.services.production_run_plans import freeze_run_execution_plan
+        from studio.services.production_stage_catalog import production_stage_catalog
+        # Exact schema3 in-flight storage fixture, not publication/admission.
+        catalog = production_stage_catalog()
+        definition = {"schema_version": 3, "interaction_mode": "assisted", "stages": [
+            {"key": "media_generation", "mode": "existing_pipeline", "approval": "required"},
+            {"key": "assembly", "mode": "existing_pipeline", "approval": "auto"},
+            {"key": "delivery", "mode": "existing_pipeline", "approval": "required"}]}
+        recipe = ProductionRecipeVersion(recipe_key=f"assembly-{job.pk}", version=1, name="Assembly queue fixture", status="published")
+        assign_json_contract(recipe, "definition", definition, schema_version=3)
+        recipe.save()
+        run = self.run
+        run.plan_source, run.recipe_version, run.current_stage_key = "recipe", recipe, "assembly"
+        assign_json_contract(run, "input_snapshot", {"schema_version": 1})
+        run.save()
+        freeze_run_execution_plan(run=run, scope={"kind": "episodes", "episode_ids": [str(self.episode.pk)]},
+            delivery={"kind": "episode_masters"}, initial_content=None, stage_catalog_key=catalog.value["key"],
+            expected_stage_catalog_sha256=catalog.sha256, actor=self.user)
+        from studio.tests.recipe_request_fixtures import freeze_recipe_request_fixture
+        freeze_recipe_request_fixture(run, authorized=False)
+        ordinals = {row["key"]: index for index, row in enumerate(definition["stages"], start=1)}
+        self.stage.ordinal, self.stage.mode, self.stage.status = ordinals["media_generation"], "existing_pipeline", "succeeded"
+        assign_json_contract(self.stage, "output_snapshot", {"schema_version": 1})
+        self.stage.save()
+
+        def stage_row(key, mode, status, approval):
+            stage = StageRun(production_run=run, stage_key=key, ordinal=ordinals[key],
+                mode=mode, status=status, approval_required=approval, idempotency_key=str(uuid.uuid4()))
+            for field in ("routing", "routing_decision", "output_snapshot"):
+                assign_json_contract(stage, field, {"schema_version": 1})
             stage.save()
             return stage
 
-        assembly_stage = stage_row(
-            key="assembly",
-            ordinal=1,
-            mode="existing_pipeline",
-            status=StageRun.Status.RUNNING,
-        )
-        delivery_gate = stage_row(
-            key="delivery",
-            ordinal=2,
-            mode="manual",
-            status=StageRun.Status.PENDING,
-            approval_required=True,
-        )
-        ProductionAssemblyLink.objects.create(
-            production_run=run,
-            stage_run=assembly_stage,
-            episode=self.episode,
-            assembly_job=job,
-        )
-        return run, assembly_stage, delivery_gate
+        assembly = stage_row("assembly", "existing_pipeline", "running", False)
+        delivery = stage_row("delivery", "existing_pipeline", "pending", True)
+        from studio.services.production_runs import _freeze_stage_config, _freeze_stage_input
+        _freeze_stage_config(run, assembly)
+        _freeze_stage_input(run, assembly)
+        # Explicit isolated creation facts; live historical jobs are never backfilled.
+        job.consumer_stage = assembly
+        job.consumer_input_sha256 = assembly.input_snapshot_sha256
+        job.save(update_fields=("consumer_stage", "consumer_input_sha256"))
+        ProductionAssemblyLink.objects.create(production_run=run, stage_run=assembly,
+            episode=self.episode, assembly_job=job)
+        return run, assembly, delivery
 
     @staticmethod
     def _successful_ffmpeg(command, **kwargs):
@@ -228,7 +205,7 @@ class AssemblyQueueTests(TestCase):
         self.assertEqual(assembly_stage.status, StageRun.Status.BLOCKED)
         self.assertEqual(assembly_stage.reason_code, "assembly_failed")
         self.assertEqual(delivery_gate.status, StageRun.Status.PENDING)
-        self.assertEqual(run.status, ProductionRun.Status.BLOCKED)
+        self.assertEqual(run.status, ProductionRun.Status.AWAITING_INPUT)
         self.assertEqual(run.current_stage_key, "assembly")
         link = ProductionAssemblyLink.objects.get(production_run=run)
         self.assertEqual(link.assembly_job_id, queued.id)
@@ -254,7 +231,8 @@ class AssemblyQueueTests(TestCase):
             "studio.services.production_runs.create_assembly",
             return_value=replacement,
         ):
-            retried = retry_production_run(run, user=self.user)
+            from studio.services.production_execution_retry import stage_retry_context
+            retried = retry_production_run(run, user=self.user, **stage_retry_context(assembly_stage))
 
         link = ProductionAssemblyLink.objects.get(production_run=run)
         assembly_stage.refresh_from_db()

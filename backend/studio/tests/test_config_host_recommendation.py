@@ -19,6 +19,7 @@ from studio.models import (
     ModelArtifact,
     ModelDeployment,
     ModelDeploymentCapabilitySnapshot,
+    ModelExecutionInstanceVersion,
     ModelProfileVersion,
     ProductionRecipeVersion,
     ProductionRun,
@@ -28,7 +29,6 @@ from studio.models import (
     RuntimeHost,
     RuntimeModelAvailability,
     SeriesProject,
-    StageRun,
     WorkerLease,
     WorkflowTemplate,
     WorkflowModelRequirement,
@@ -41,10 +41,12 @@ from studio.services.configuration import (
     create_config_revision,
     publish_config_revision,
     resolve_configuration,
+    resolve_configuration_from_snapshot,
 )
 from studio.services.json_contracts import assign_json_contract, json_contract
 from studio.services.security_boundaries import boundary_int
-from studio.services.production_runs import _freeze_stage_config
+from studio.services.production_run_plans import freeze_run_execution_plan
+from studio.services.production_stage_catalog import production_stage_catalog
 from studio.services.runtime_platform import (
     RecommendationStale,
     _gpu_probe,
@@ -146,28 +148,15 @@ class ConfigurationLayeringTests(TestCase):
         return model, workflow
 
     def _run(self, snapshot: dict) -> ProductionRun:
-        recipe = ProductionRecipeVersion.objects.filter(status="published").first()
-        if recipe is None:
-            recipe = ProductionRecipeVersion(
-                recipe_key="test-layer-recipe",
-                version=1,
-                name="Test layer recipe",
-                status=ProductionRecipeVersion.Status.PUBLISHED,
-            )
-            assign_json_contract(recipe, "definition", {
-                "schema_version": 1,
-                "stages": [{"key": "script_input", "mode": "confirmed_revision"}],
-            })
-            recipe.save()
         contract = json_contract(
             snapshot,
             max_bytes=boundary_int("security.snapshot.stage_max_bytes"),
         )
         input_contract = json_contract({"schema_version": 1})
-        return ProductionRun.objects.create(
+        run = ProductionRun.objects.create(
             owner=self.user,
             project=self.project,
-            recipe_version=recipe,
+            plan_source="manual",
             idempotency_key="configuration-layer-test",
             request_sha256="1" * 64,
             config_snapshot=contract.value,
@@ -179,8 +168,12 @@ class ConfigurationLayeringTests(TestCase):
             input_snapshot_size_bytes=input_contract.size_bytes,
             input_snapshot_sha256=input_contract.sha256,
         )
+        catalog = production_stage_catalog()
+        freeze_run_execution_plan(run=run, scope={"kind": "project"}, delivery={"kind": "episode_masters"}, initial_content=None,
+            stage_catalog_key=catalog.value["key"], expected_stage_catalog_sha256=catalog.sha256, actor=self.user)
+        return run
 
-    def test_five_layers_report_source_and_stage_snapshot_stays_frozen(self):
+    def test_five_layers_report_source_and_run_snapshot_stays_frozen(self):
         key = "test.layered.value"
         self._definition(key)
         model, workflow = self._model_and_workflow(key)
@@ -215,14 +208,6 @@ class ConfigurationLayeringTests(TestCase):
         self.assertEqual(effective.values[key], 50)
         self.assertEqual(effective.sources[key]["source"], "run")
 
-        deployment = ModelDeployment(
-            key="layered-text-deployment",
-            name="Layered text deployment",
-            profile_version=model,
-            status=ModelDeployment.Status.ACTIVE,
-        )
-        assign_json_contract(deployment, "runtime_config", {})
-        deployment.save()
         run_snapshot = effective.snapshot()
         run_contract = json_contract(
             run_snapshot,
@@ -236,46 +221,23 @@ class ConfigurationLayeringTests(TestCase):
             "config_snapshot", "config_snapshot_schema_version",
             "config_snapshot_size_bytes", "config_snapshot_sha256", "updated_at",
         ))
-        routing = json_contract({
-            "schema_version": 1,
-            "mode": "fixed",
-            "routes": [{
-                "index": 0,
-                "model_deployment_id": str(deployment.id),
-                "workflow_version_id": str(workflow.id),
-            }],
-            "variant_count": 1,
-            "evaluator": None,
-        })
-        decision = json_contract({"schema_version": 1, "state": "selected"})
-        stage = StageRun.objects.create(
-            production_run=run,
-            stage_key="layered",
-            ordinal=1,
-            mode="ai",
-            idempotency_key=f"{run.id}:layered",
-            routing=routing.value,
-            routing_schema_version=routing.schema_version,
-            routing_size_bytes=routing.size_bytes,
-            routing_sha256=routing.sha256,
-            routing_decision=decision.value,
-            routing_decision_schema_version=decision.schema_version,
-            routing_decision_size_bytes=decision.size_bytes,
-            routing_decision_sha256=decision.sha256,
-            selected_route_index=0,
-        )
-        _freeze_stage_config(run, stage)
-        frozen_sha = stage.config_snapshot_sha256
-        frozen_value = stage.config_snapshot["routes"]["0"]["values"][key]
+        # This tests configuration layering, not an AI route or recipe admission.
+        # Native media-stage freezing is covered in ProductionMediaTests.
+        frozen_sha = run.config_snapshot_sha256
+        frozen = resolve_configuration_from_snapshot(run.config_snapshot)
+        self.assertEqual(frozen.values[key], 50)
+        self.assertEqual(frozen.sources[key]["source"], "run")
 
         newer = create_config_revision(
             scope_type="project", project=self.project, values={key: 60}, created_by=self.user,
         )
         publish_config_revision(newer, published_by=self.user)
-        _freeze_stage_config(run, stage)
-        stage.refresh_from_db()
-        self.assertEqual(stage.config_snapshot_sha256, frozen_sha)
-        self.assertEqual(stage.config_snapshot["routes"]["0"]["values"][key], frozen_value)
+        self.assertEqual(resolve_configuration(project=self.project).values[key], 60)
+        run.refresh_from_db()
+        self.assertEqual(run.config_snapshot_sha256, frozen_sha)
+        resolved_again = resolve_configuration_from_snapshot(run.config_snapshot)
+        self.assertEqual(resolved_again.values[key], 50)
+        self.assertEqual(resolved_again.sources[key], frozen.sources[key])
 
     def test_project_put_patch_unset_empty_replace_and_owner_permission(self):
         client = APIClient()
@@ -557,12 +519,9 @@ class ConfigurationLayeringTests(TestCase):
             "project",
         )
         self.assertRegex(response.data["configuration_public_sha256"], r"^[0-9a-f]{64}$")
-        self.assertIsInstance(response.data["conditioning_modes"], list)
-        self.assertRegex(
-            response.data["conditioning_contract_sha256"],
-            r"^[0-9a-f]{64}$",
-        )
-        self.assertEqual(response.data["default_conditioning_mode"], "")
+        self.assertNotIn("conditioning_modes", response.data)
+        self.assertNotIn("conditioning_contract_sha256", response.data)
+        self.assertNotIn("default_conditioning_mode", response.data)
 
         client.force_authenticate(self.other)
         denied = client.get(
@@ -583,29 +542,6 @@ class HostRecommendationTests(TestCase):
         self.provider = ModelProfileVersion.objects.get(
             profile_key="sdxl-image", version=1,
         ).provider
-        recipe = ProductionRecipeVersion(
-            recipe_key="recommendation-base-recipe",
-            version=1,
-            name="Recommendation base recipe",
-            status=ProductionRecipeVersion.Status.PUBLISHED,
-            published_at=timezone.now(),
-        )
-        assign_json_contract(recipe, "definition", {
-            "schema_version": 1,
-            "stages": [
-                {"key": "script_input", "mode": "confirmed_revision", "approval": "auto"},
-                {"key": "script_review", "mode": "review", "approval": "required"},
-                {"key": "bible_review", "mode": "review", "approval": "required"},
-                {"key": "storyboard", "mode": "deterministic", "approval": "auto"},
-                {"key": "storyboard_review", "mode": "review", "approval": "required"},
-                {"key": "prompt_compile", "mode": "existing_pipeline", "approval": "auto"},
-                {"key": "media_generation", "mode": "existing_pipeline", "approval": "auto"},
-                {"key": "artifact_selection", "mode": "review", "approval": "required"},
-                {"key": "assembly", "mode": "existing_pipeline", "approval": "auto"},
-                {"key": "delivery", "mode": "existing_pipeline", "approval": "auto"},
-            ],
-        })
-        recipe.save()
 
     def _deployment(self, key: str, *, priority: int = 0, is_default: bool = False):
         profile = ModelProfileVersion(
@@ -708,7 +644,7 @@ class HostRecommendationTests(TestCase):
             expires_at=timezone.now() + timedelta(minutes=10),
         )
 
-    def test_four_candidate_states_and_override_decision_create_drafts(self):
+    def test_four_resource_states_and_decision_create_only_configuration_draft(self):
         recommended_deployment, recommended_artifact, _ = self._deployment(
             "rec-a", priority=100, is_default=True,
         )
@@ -752,6 +688,9 @@ class HostRecommendationTests(TestCase):
         self.assertIn("artifact_missing", reason_codes)
 
         candidate = recommendation.candidates.get(status=RecommendationCandidate.Status.RECOMMENDED)
+        recipe_count = ProductionRecipeVersion.objects.count()
+        instance_count = ModelExecutionInstanceVersion.objects.count()
+        self.assertNotIn("route", candidate.suggested_values)
         decision = decide_recommendation(
             recommendation,
             candidate=candidate,
@@ -761,7 +700,7 @@ class HostRecommendationTests(TestCase):
             override_values={
                 "configuration": {"production.task_max_attempts": 2},
             },
-            reason="管理员接受路由并收紧尝试次数",
+            reason="管理员参考资源推荐并收紧尝试次数",
             decided_by=self.admin,
         )
         self.assertEqual(decision.config_revision.status, ConfigRevision.Status.DRAFT)
@@ -772,16 +711,32 @@ class HostRecommendationTests(TestCase):
         for key, value in candidate.suggested_values["configuration"].items():
             self.assertEqual(config_values[key], value)
         self.assertEqual(config_values["production.task_max_attempts"], 2)
-        self.assertEqual(decision.recipe_version.status, ProductionRecipeVersion.Status.DRAFT)
-        self.assertEqual(
-            decision.recipe_version.definition["stages"][6]["routing"]["routes"][0]["model_deployment_id"],
-            str(recommended_deployment.id),
-        )
+        self.assertEqual(ProductionRecipeVersion.objects.count(), recipe_count)
+        self.assertEqual(ModelExecutionInstanceVersion.objects.count(), instance_count)
+        self.assertNotIn("recipe_version", RecommendationDecisionSerializer(decision).data)
         client = APIClient()
         client.force_authenticate(self.admin)
         detail = client.get(f"/api/v1/recommendations/{recommendation.id}/")
         self.assertEqual(detail.status_code, 200, detail.data)
         self.assertEqual(len(detail.data["candidates"]), 4)
+        decision_count = RecommendationDecision.objects.count()
+        config_count = ConfigRevision.objects.count()
+        for kind, override in (
+            ("override", {"route": {"model_deployment_id": str(candidate.deployment_id)}}),
+            ("override", {"configuration": []}),
+            ("accept", {"configuration": {"production.task_max_attempts": 1}}),
+            ("reject", {"configuration": {"production.task_max_attempts": 1}}),
+        ):
+            with self.subTest(decision=kind, override=override):
+                invalid = client.post(f"/api/v1/recommendations/{recommendation.id}/decide/", {
+                    "candidate_id": str(candidate.pk), "decision": kind, "scope_type": "system",
+                    "override_values": override,
+                }, format="json")
+                self.assertEqual(invalid.status_code, 400, invalid.data)
+                self.assertEqual(RecommendationDecision.objects.count(), decision_count)
+                self.assertEqual(ConfigRevision.objects.count(), config_count)
+                self.assertEqual(ProductionRecipeVersion.objects.count(), recipe_count)
+                self.assertEqual(ModelExecutionInstanceVersion.objects.count(), instance_count)
         unavailable = recommendation.candidates.get(
             status=RecommendationCandidate.Status.UNAVAILABLE,
         )
@@ -921,7 +876,7 @@ class HostRecommendationTests(TestCase):
         )
 
     @override_settings(AI_PROVIDER_ALLOWED_HOSTS=("api.example.com", "cdn.example.com"))
-    def test_workflowless_async_video_uses_declared_t2v_capability(self):
+    def test_workflowless_async_video_rejects_unbacked_legacy_smoke_snapshot(self):
         credential = create_test_secret(
             key="recommend.async-video",
             actor=self.admin,
@@ -1013,24 +968,30 @@ class HostRecommendationTests(TestCase):
         assign_json_contract(deployment, "runtime_config", {})
         deployment.save()
         snapshot = self._snapshot()
-        record_deployment_capability_snapshot(
-            deployment,
-            probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
-            status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
-            operations=["video.text_to_video"],
-            evidence={"schema_version": 1, "execution_submitted": True},
-        )
+        with self.assertRaisesMessage(ValidationError, "仅记录健康探测"):
+            record_deployment_capability_snapshot(
+                deployment,
+                probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
+                status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
+                operations=["video.text_to_video"],
+                evidence={"schema_version": 1, "execution_submitted": True},
+            )
         recommendation = recommend_for_host(
             snapshot, project=self.project, created_by=self.admin,
         )
 
         candidate = recommendation.candidates.get(deployment=deployment)
         self.assertEqual(candidate.capability_key, "video.text_to_video")
-        self.assertEqual(candidate.status, RecommendationCandidate.Status.RECOMMENDED)
+        self.assertEqual(candidate.status, RecommendationCandidate.Status.SMOKE_TEST_REQUIRED)
         self.assertIsNone(candidate.workflow_version_id)
 
-    def test_text_recommendation_requires_credential_and_fresh_health_evidence(self):
-        profile = ModelProfileVersion.objects.get(profile_key="deepseek-text", version=1)
+    def test_text_recommendation_requires_smoke_instead_of_connection_health(self):
+        from studio.tests.test_execution_text_contracts import text_specification
+        provider = ModelProfileVersion.objects.get(profile_key="deepseek-text", version=1).provider
+        profile = ModelProfileVersion(profile_key="recommend-text-contract", version=1, provider=provider,
+            model_identifier="declared-model", modality="text", status="published")
+        assign_json_contract(profile, "specification", text_specification())
+        profile.save()
         deployment = ModelDeployment(
             key="recommend-text-health",
             name="Recommendation text health",
@@ -1065,6 +1026,7 @@ class HostRecommendationTests(TestCase):
         self.assertEqual(
             without_evidence.status,
             RecommendationCandidate.Status.SMOKE_TEST_REQUIRED,
+            without_evidence.reason_code,
         )
         record_deployment_capability_snapshot(
             deployment,
@@ -1076,7 +1038,8 @@ class HostRecommendationTests(TestCase):
         ready = recommend_for_host(
             snapshot, project=self.project, created_by=self.admin,
         ).candidates.get(deployment=deployment)
-        self.assertEqual(ready.status, RecommendationCandidate.Status.RECOMMENDED)
+        self.assertEqual(ready.status, RecommendationCandidate.Status.SMOKE_TEST_REQUIRED)
+        self.assertEqual(ready.reason_code, "text_resource_smoke_required")
 
     def test_text_recommendation_rejects_fresh_health_for_incomplete_execution_contract(self):
         profile = ModelProfileVersion.objects.get(profile_key="deepseek-text", version=1)
@@ -1096,6 +1059,8 @@ class HostRecommendationTests(TestCase):
         assign_json_contract(deployment, "runtime_config", {
             "runtime_source": "openai_compatible_endpoint",
             "base_url": "http://127.0.0.1:19002",
+            "chat_path": "/v1/chat/completions",
+            "timeout_seconds": 30,
             "capability_ttl_seconds": 3600,
         })
         deployment.save()
@@ -1107,6 +1072,14 @@ class HostRecommendationTests(TestCase):
             evidence={"schema_version": 1, "execution_submitted": False},
         )
         self.assertGreater(fresh_health.expires_at, timezone.now())
+
+        # Record health only for a valid connection, then invalidate its
+        # execution configuration. A fresh old observation cannot repair it.
+        config = dict(deployment.runtime_config)
+        config.pop("chat_path")
+        assign_json_contract(deployment, "runtime_config", config)
+        deployment.save(update_fields=("runtime_config", "runtime_config_schema_version",
+            "runtime_config_size_bytes", "runtime_config_sha256", "updated_at"))
 
         candidate = recommend_for_host(
             self._snapshot(), project=self.project, created_by=self.admin,

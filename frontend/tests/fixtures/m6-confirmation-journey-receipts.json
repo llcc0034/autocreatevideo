@@ -1,0 +1,3204 @@
+{
+  "candidate": {
+    "preparation": {
+      "id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+      "stage_run": null,
+      "asset_job": "ce32b66a-4438-4bf9-be93-c69805a1600b",
+      "deployment_smoke": null,
+      "workflow_smoke": null,
+      "execution_instance_version": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+      "purpose": "production",
+      "unit_key": "composition",
+      "request_key": "candidate-1",
+      "revision": 3,
+      "status": "preparing",
+      "intent_sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+      "request_sha256": null,
+      "request_frozen_at": null,
+      "next_check_at": "2026-10-05T16:04:52.211355+08:00",
+      "reason_code": "",
+      "reason": "",
+      "evaluation_revision": null,
+      "evaluated_at": null,
+      "created_by": 1,
+      "created_at": "2026-10-05T16:04:50.428229+08:00",
+      "updated_at": "2026-10-05T16:04:52.212352+08:00",
+      "presentation": null,
+      "outcome": {
+        "message": "主调用任务已登记，仍在准备输入，尚未进入执行队列。",
+        "artifact_count": 0,
+        "selected_count": 0
+      },
+      "intent": {
+        "schema_version": 1,
+        "request": {
+          "schema_version": 1,
+          "version_id": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+          "definition_sha256": "8b0ac1ce58af11239c58f2cf6cd8e834014dc7bc69198dec2a24c30c65cd239c",
+          "unit_key": "composition",
+          "request_key": "candidate-1",
+          "requested": {
+            "inputs": {
+              "units": {
+                "kind": "literal",
+                "value": {
+                  "schema_version": 1,
+                  "ordered_units": [
+                    {
+                      "unit_key": "first",
+                      "duration_ms": 1000,
+                      "subject_keys": [],
+                      "dialogue": [],
+                      "voice_profiles": [],
+                      "continuity_notes": "",
+                      "requires_first_frame_continuity": false,
+                      "requires_last_frame_continuity": false,
+                      "ambient_sound": "",
+                      "structured_input": {
+                        "direction": "A courier arrives."
+                      }
+                    },
+                    {
+                      "unit_key": "second",
+                      "duration_ms": 1000,
+                      "subject_keys": [],
+                      "dialogue": [],
+                      "voice_profiles": [],
+                      "continuity_notes": "",
+                      "requires_first_frame_continuity": false,
+                      "requires_last_frame_continuity": false,
+                      "ambient_sound": "",
+                      "structured_input": {
+                        "direction": "A parcel opens."
+                      }
+                    }
+                  ],
+                  "color_script": "",
+                  "extra_direction": "",
+                  "overall_soundscape": "",
+                  "non_diegetic_music": ""
+                }
+              },
+              "styles": {
+                "kind": "literal",
+                "value": {
+                  "first": {
+                    "palette": "blue"
+                  },
+                  "second": {
+                    "palette": "red"
+                  }
+                }
+              }
+            },
+            "parameters": {
+              "image.width": 512,
+              "image.height": 512,
+              "sampling.seed": 7,
+              "video.fps": 24,
+              "video.frames": 48
+            }
+          }
+        },
+        "resolved_inputs_sha256": "1a3843946068c1e591fc58d203529efc81a85438a63faf7b6cdd9895c2df5660",
+        "review_contract_sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0"
+      },
+      "resolved_inputs": {
+        "schema_version": 1,
+        "field_requests": [
+          {
+            "value": {
+              "schema_version": 1,
+              "operation": "prompt.fields.generate",
+              "profile": {
+                "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+                "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+              },
+              "profile_field_keys": [
+                "unit_description"
+              ],
+              "items": [
+                {
+                  "request_id": "86b41225470f7ecbd67bee9563a775eb361a5992df1deed4a03c36e1e3f3fb4c",
+                  "unit_key": "first",
+                  "field_contract": {
+                    "field_key": "unit_description",
+                    "field_value_type": "long_text",
+                    "field_definition": {
+                      "schema_version": 1,
+                      "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                      "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                      "key": "unit_description",
+                      "version": 1,
+                      "label": "Unit description",
+                      "category": "test",
+                      "description": "",
+                      "impact": "",
+                      "value_type": "long_text",
+                      "unit": "",
+                      "value_options": []
+                    },
+                    "field_value_options": [],
+                    "fixed_value": null,
+                    "has_default": false,
+                    "default_value": null,
+                    "source_selector": "projection.output",
+                    "channel": "positive_prompt",
+                    "position": 1,
+                    "label_style": "label_colon",
+                    "separator": "newline",
+                    "required": true,
+                    "omit_if_empty": true,
+                    "max_chars": 7000,
+                    "generation_mode": "model_generated",
+                    "generation_source_selector": "request.structured_input",
+                    "generation_instruction": "Use the declared facts for this unit only.",
+                    "generation_output_semantics": "contribution",
+                    "generation_required": true,
+                    "language_policy": "en",
+                    "length_unit": "none",
+                    "generation_min": null,
+                    "generation_max": null,
+                    "generation_validator_keys": [],
+                    "generation_context_selectors": [
+                      "project.style"
+                    ],
+                    "projection_primitive": "reference_context.detailed_description",
+                    "source_path": [
+                      "direction"
+                    ]
+                  },
+                  "source_text": "A courier arrives.",
+                  "source_language": "English",
+                  "target_language": "English",
+                  "context_facts": {
+                    "project.style": {
+                      "palette": "blue"
+                    }
+                  },
+                  "reference_facts": {
+                    "protected_tokens": [],
+                    "logical_inputs": [],
+                    "subject_facts": []
+                  }
+                },
+                {
+                  "request_id": "af48cfedc13b3ae41f8bbdc144caa1dd3ce69f784156848402ab7c67b3130883",
+                  "unit_key": "second",
+                  "field_contract": {
+                    "field_key": "unit_description",
+                    "field_value_type": "long_text",
+                    "field_definition": {
+                      "schema_version": 1,
+                      "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                      "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                      "key": "unit_description",
+                      "version": 1,
+                      "label": "Unit description",
+                      "category": "test",
+                      "description": "",
+                      "impact": "",
+                      "value_type": "long_text",
+                      "unit": "",
+                      "value_options": []
+                    },
+                    "field_value_options": [],
+                    "fixed_value": null,
+                    "has_default": false,
+                    "default_value": null,
+                    "source_selector": "projection.output",
+                    "channel": "positive_prompt",
+                    "position": 1,
+                    "label_style": "label_colon",
+                    "separator": "newline",
+                    "required": true,
+                    "omit_if_empty": true,
+                    "max_chars": 7000,
+                    "generation_mode": "model_generated",
+                    "generation_source_selector": "request.structured_input",
+                    "generation_instruction": "Use the declared facts for this unit only.",
+                    "generation_output_semantics": "contribution",
+                    "generation_required": true,
+                    "language_policy": "en",
+                    "length_unit": "none",
+                    "generation_min": null,
+                    "generation_max": null,
+                    "generation_validator_keys": [],
+                    "generation_context_selectors": [
+                      "project.style"
+                    ],
+                    "projection_primitive": "reference_context.detailed_description",
+                    "source_path": [
+                      "direction"
+                    ]
+                  },
+                  "source_text": "A parcel opens.",
+                  "source_language": "English",
+                  "target_language": "English",
+                  "context_facts": {
+                    "project.style": {
+                      "palette": "red"
+                    }
+                  },
+                  "reference_facts": {
+                    "protected_tokens": [],
+                    "logical_inputs": [],
+                    "subject_facts": []
+                  }
+                }
+              ]
+            },
+            "schema_version": 1,
+            "size_bytes": 3263,
+            "sha256": "e1ff5a017eeeecb7cc0eb5816055af0c8fd4b0dc1c0adb8e7a3d8fa6af8ae27b"
+          }
+        ],
+        "profile_sources": {
+          "profile": {
+            "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+            "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+          },
+          "unit_key": "composition",
+          "source_language": "English",
+          "target_language": "English",
+          "projection": {
+            "assembly_sources": {},
+            "generation_sources": {},
+            "generation_contexts": {},
+            "provenance": [
+              {
+                "input_key": "units",
+                "target_key": "reference_context.units",
+                "uses": [
+                  {
+                    "field_key": "unit_description",
+                    "usage": "reference_units",
+                    "selector": "reference_context.units",
+                    "source_path": [
+                      "direction"
+                    ]
+                  }
+                ],
+                "value_sha256": "12a747f63766d881988398b3e017f140617ffe95645b12412022a5fb625116c0"
+              },
+              {
+                "input_key": "styles",
+                "target_key": "context.project.style",
+                "uses": [
+                  {
+                    "field_key": "unit_description",
+                    "usage": "reference_generation_context",
+                    "selector": "project.style"
+                  }
+                ],
+                "value_sha256": "cdd9a564625c52f01cfddc0c1f4bf466de6606b1eee4be736752e8cc5fb1bad3"
+              }
+            ],
+            "omitted_targets": [],
+            "reference": {
+              "unit_input": {
+                "schema_version": 1,
+                "ordered_units": [
+                  {
+                    "unit_key": "first",
+                    "duration_ms": 1000,
+                    "subject_keys": [],
+                    "dialogue": [],
+                    "voice_profiles": [],
+                    "continuity_notes": "",
+                    "requires_first_frame_continuity": false,
+                    "requires_last_frame_continuity": false,
+                    "ambient_sound": "",
+                    "structured_input": {
+                      "direction": "A courier arrives."
+                    }
+                  },
+                  {
+                    "unit_key": "second",
+                    "duration_ms": 1000,
+                    "subject_keys": [],
+                    "dialogue": [],
+                    "voice_profiles": [],
+                    "continuity_notes": "",
+                    "requires_first_frame_continuity": false,
+                    "requires_last_frame_continuity": false,
+                    "ambient_sound": "",
+                    "structured_input": {
+                      "direction": "A parcel opens."
+                    }
+                  }
+                ],
+                "color_script": "",
+                "extra_direction": "",
+                "overall_soundscape": "",
+                "non_diegetic_music": ""
+              },
+              "generation_contexts": {
+                "project.style": {
+                  "first": {
+                    "palette": "blue"
+                  },
+                  "second": {
+                    "palette": "red"
+                  }
+                }
+              }
+            }
+          },
+          "reference_context": {
+            "value": {
+              "context": {
+                "color_script": "",
+                "conditioning_mode_contract": {
+                  "description": "explicit-unit-mode configured mode",
+                  "input_kind": "text_only",
+                  "inputs": {
+                    "entity_images": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    },
+                    "first_frame": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    },
+                    "last_frame": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    },
+                    "paired_video_audios": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    },
+                    "reference_audios": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    },
+                    "reference_videos": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    },
+                    "total_images": {
+                      "maximum_items": 0,
+                      "minimum_items": 0
+                    }
+                  },
+                  "key": "explicit-unit-mode",
+                  "label": "explicit-unit-mode",
+                  "requires_entity_reference_bible": false,
+                  "supports_native_audio": false
+                },
+                "extra_direction": "",
+                "frame_policy": {
+                  "alignment_modulus": 1,
+                  "alignment_remainder": 0,
+                  "fps": 24,
+                  "maximum_frames": 240,
+                  "minimum_frames": 1
+                },
+                "generation_contributions": {},
+                "include_audio": false,
+                "language": "English",
+                "mode": "explicit-unit-mode",
+                "non_diegetic_music": "",
+                "ordered_units": [
+                  {
+                    "ambient_sound": "",
+                    "continuity_notes": "",
+                    "dialogue": [],
+                    "duration_ms": 1000,
+                    "render_values": {
+                      "action": "",
+                      "camera": "",
+                      "color_palette": "",
+                      "description": "",
+                      "environment": "",
+                      "lighting": "",
+                      "music": "",
+                      "narrative": "",
+                      "sound_effects": "",
+                      "subjects": "",
+                      "visual_prompt": ""
+                    },
+                    "requires_first_frame_continuity": false,
+                    "requires_last_frame_continuity": false,
+                    "subject_keys": [],
+                    "unit_key": "first",
+                    "voice_profiles": []
+                  },
+                  {
+                    "ambient_sound": "",
+                    "continuity_notes": "",
+                    "dialogue": [],
+                    "duration_ms": 1000,
+                    "render_values": {
+                      "action": "",
+                      "camera": "",
+                      "color_palette": "",
+                      "description": "",
+                      "environment": "",
+                      "lighting": "",
+                      "music": "",
+                      "narrative": "",
+                      "sound_effects": "",
+                      "subjects": "",
+                      "visual_prompt": ""
+                    },
+                    "requires_first_frame_continuity": false,
+                    "requires_last_frame_continuity": false,
+                    "subject_keys": [],
+                    "unit_key": "second",
+                    "voice_profiles": []
+                  }
+                ],
+                "overall_soundscape": "",
+                "prompt_type": "video",
+                "reference_bindings": [],
+                "subject_facts": []
+              },
+              "schema_version": 1
+            },
+            "schema_version": 1,
+            "size_bytes": 1842,
+            "sha256": "84011d639ff2f5b70e6e67b7ee05f02f8ae0bfe29a8cab657e04fa6ae44aeb87"
+          },
+          "scope_units": []
+        },
+        "inputs": {
+          "schema_version": 1,
+          "logical_values": {
+            "units": {
+              "schema_version": 1,
+              "ordered_units": [
+                {
+                  "unit_key": "first",
+                  "duration_ms": 1000,
+                  "subject_keys": [],
+                  "dialogue": [],
+                  "voice_profiles": [],
+                  "continuity_notes": "",
+                  "requires_first_frame_continuity": false,
+                  "requires_last_frame_continuity": false,
+                  "ambient_sound": "",
+                  "structured_input": {
+                    "direction": "A courier arrives."
+                  }
+                },
+                {
+                  "unit_key": "second",
+                  "duration_ms": 1000,
+                  "subject_keys": [],
+                  "dialogue": [],
+                  "voice_profiles": [],
+                  "continuity_notes": "",
+                  "requires_first_frame_continuity": false,
+                  "requires_last_frame_continuity": false,
+                  "ambient_sound": "",
+                  "structured_input": {
+                    "direction": "A parcel opens."
+                  }
+                }
+              ],
+              "color_script": "",
+              "extra_direction": "",
+              "overall_soundscape": "",
+              "non_diegetic_music": ""
+            },
+            "styles": {
+              "first": {
+                "palette": "blue"
+              },
+              "second": {
+                "palette": "red"
+              }
+            }
+          },
+          "input_provenance": [
+            {
+              "input_key": "units",
+              "kind": "literal",
+              "value_sha256": "12a747f63766d881988398b3e017f140617ffe95645b12412022a5fb625116c0"
+            },
+            {
+              "input_key": "styles",
+              "kind": "literal",
+              "value_sha256": "cdd9a564625c52f01cfddc0c1f4bf466de6606b1eee4be736752e8cc5fb1bad3"
+            }
+          ],
+          "workflow_slots": {},
+          "operation_inputs": {},
+          "model_input_counts": {
+            "total_images": 0,
+            "first_frame": 0,
+            "last_frame": 0,
+            "entity_images": 0,
+            "reference_videos": 0,
+            "paired_video_audios": 0,
+            "reference_audios": 0
+          }
+        },
+        "parameters": {
+          "values": {
+            "audio.enabled": false,
+            "image.width": 512,
+            "image.height": 512,
+            "sampling.seed": 7,
+            "video.fps": 24,
+            "video.frames": 48
+          },
+          "sources": {
+            "audio.enabled": "workflow.static_semantics",
+            "image.width": "request",
+            "image.height": "request",
+            "sampling.seed": "request",
+            "video.fps": "request",
+            "video.frames": "request"
+          },
+          "contracts": {
+            "image.width": {
+              "rule": {
+                "type": "integer",
+                "required": true,
+                "alignments": [
+                  {
+                    "modulus": 8,
+                    "remainder": 0
+                  }
+                ]
+              },
+              "value_source": null,
+              "layers": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "alignments": [
+                      {
+                        "modulus": 8,
+                        "remainder": 0
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "image.height": {
+              "rule": {
+                "type": "integer",
+                "required": true,
+                "alignments": [
+                  {
+                    "modulus": 8,
+                    "remainder": 0
+                  }
+                ]
+              },
+              "value_source": null,
+              "layers": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "alignments": [
+                      {
+                        "modulus": 8,
+                        "remainder": 0
+                      }
+                    ]
+                  }
+                }
+              ]
+            },
+            "sampling.seed": {
+              "rule": {
+                "type": "integer",
+                "required": true,
+                "minimum": 0
+              },
+              "value_source": null,
+              "layers": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 0
+                  }
+                }
+              ]
+            },
+            "video.fps": {
+              "rule": {
+                "type": "number",
+                "required": true
+              },
+              "value_source": null,
+              "layers": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                  "rule": {
+                    "type": "number",
+                    "required": true
+                  }
+                }
+              ]
+            },
+            "video.frames": {
+              "rule": {
+                "type": "integer",
+                "required": true,
+                "minimum": 1,
+                "maximum": 240
+              },
+              "value_source": null,
+              "layers": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 1,
+                    "maximum": 240
+                  }
+                }
+              ]
+            }
+          },
+          "generated_values": {},
+          "resolved_source_contracts": {}
+        }
+      },
+      "review_contract": {
+        "schema_version": 1,
+        "mode": "manual"
+      },
+      "review_summary": {
+        "mode": "manual",
+        "label": "人工确认字段",
+        "description": "校验通过后仍需确认并采用。保存字段不会自动批准，也不会覆盖已采用内容。"
+      },
+      "prepared_request": null,
+      "evaluation": null,
+      "field_selections": [],
+      "capacity_sample": null,
+      "field_slots": [
+        {
+          "unit_key": "first",
+          "field_key": "unit_description",
+          "field_label": "Unit description",
+          "latest_value_id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+          "effective_language": "en",
+          "next_revision": 2,
+          "field_contract": {
+            "field_key": "unit_description",
+            "field_value_type": "long_text",
+            "field_definition": {
+              "schema_version": 1,
+              "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+              "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+              "key": "unit_description",
+              "version": 1,
+              "label": "Unit description",
+              "category": "test",
+              "description": "",
+              "impact": "",
+              "value_type": "long_text",
+              "unit": "",
+              "value_options": []
+            },
+            "field_value_options": [],
+            "fixed_value": null,
+            "has_default": false,
+            "default_value": null,
+            "source_selector": "projection.output",
+            "channel": "positive_prompt",
+            "position": 1,
+            "label_style": "label_colon",
+            "separator": "newline",
+            "required": true,
+            "omit_if_empty": true,
+            "max_chars": 7000,
+            "generation_mode": "model_generated",
+            "generation_source_selector": "request.structured_input",
+            "generation_instruction": "Use the declared facts for this unit only.",
+            "generation_output_semantics": "contribution",
+            "generation_required": true,
+            "language_policy": "en",
+            "length_unit": "none",
+            "generation_min": null,
+            "generation_max": null,
+            "generation_validator_keys": [],
+            "generation_context_selectors": [
+              "project.style"
+            ],
+            "projection_primitive": "reference_context.detailed_description",
+            "source_path": [
+              "direction"
+            ]
+          },
+          "source_language": "English",
+          "target_language": "English"
+        },
+        {
+          "unit_key": "second",
+          "field_key": "unit_description",
+          "field_label": "Unit description",
+          "latest_value_id": "e743daae-286d-49fe-b7f9-0379e119807d",
+          "effective_language": "en",
+          "next_revision": 2,
+          "field_contract": {
+            "field_key": "unit_description",
+            "field_value_type": "long_text",
+            "field_definition": {
+              "schema_version": 1,
+              "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+              "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+              "key": "unit_description",
+              "version": 1,
+              "label": "Unit description",
+              "category": "test",
+              "description": "",
+              "impact": "",
+              "value_type": "long_text",
+              "unit": "",
+              "value_options": []
+            },
+            "field_value_options": [],
+            "fixed_value": null,
+            "has_default": false,
+            "default_value": null,
+            "source_selector": "projection.output",
+            "channel": "positive_prompt",
+            "position": 1,
+            "label_style": "label_colon",
+            "separator": "newline",
+            "required": true,
+            "omit_if_empty": true,
+            "max_chars": 7000,
+            "generation_mode": "model_generated",
+            "generation_source_selector": "request.structured_input",
+            "generation_instruction": "Use the declared facts for this unit only.",
+            "generation_output_semantics": "contribution",
+            "generation_required": true,
+            "language_policy": "en",
+            "length_unit": "none",
+            "generation_min": null,
+            "generation_max": null,
+            "generation_validator_keys": [],
+            "generation_context_selectors": [
+              "project.style"
+            ],
+            "projection_primitive": "reference_context.detailed_description",
+            "source_path": [
+              "direction"
+            ]
+          },
+          "source_language": "English",
+          "target_language": "English"
+        }
+      ],
+      "auxiliary_batches": [
+        {
+          "field_batch_key": "e1ff5a017eeeecb7cc0eb5816055af0c8fd4b0dc1c0adb8e7a3d8fa6af8ae27b",
+          "purpose": "generate_fields",
+          "field_keys": [
+            "unit_description",
+            "unit_description"
+          ],
+          "attempt_number": 0,
+          "task_id": null,
+          "preparation_id": null,
+          "status": "not_started",
+          "reason": "尚未开始；检查并继续后按本次授权准备辅助任务。",
+          "can_retry": false
+        }
+      ],
+      "response_diagnostic": null,
+      "cancellation": null,
+      "resource_review": null,
+      "text_response_review": null
+    },
+    "prompt": {
+      "preparation_id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+      "preparation_revision": 3,
+      "mode": "diagnostic",
+      "request_sha256": null,
+      "frozen_at": null,
+      "channels": [
+        {
+          "key": "system_instruction",
+          "text": "",
+          "character_count": 0
+        },
+        {
+          "key": "positive_prompt",
+          "text": "unit_description: Visual style: \nColor design:\n[Shot 1] Subjects: .\nCafé 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café \n\nFirst-frame continuity required: False; last-frame continuity required: False.\n[Shot 2] At 00:01.000, Subjects: .\nRésumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum\n\nFirst-frame continuity required: False; last-frame continuity required: False.",
+          "character_count": 4264
+        },
+        {
+          "key": "negative_prompt",
+          "text": "",
+          "character_count": 0
+        },
+        {
+          "key": "structured_input",
+          "text": "",
+          "character_count": 0
+        }
+      ],
+      "field_basis": [
+        {
+          "unit_key": "first",
+          "field_key": "unit_description",
+          "field_value_id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+          "revision": 1,
+          "origin": "candidate",
+          "status": "pending"
+        },
+        {
+          "unit_key": "second",
+          "field_key": "unit_description",
+          "field_value_id": "e743daae-286d-49fe-b7f9-0379e119807d",
+          "revision": 1,
+          "origin": "candidate",
+          "status": "pending"
+        }
+      ],
+      "sources": {
+        "references": [],
+        "dialogue": []
+      },
+      "issues": [
+        "通道 positive_prompt 装配后为 4264 字符，超过配置上限 4000"
+      ],
+      "length_diagnostics": [
+        {
+          "channel": "system_instruction",
+          "character_count": 0,
+          "max_chars": null,
+          "over_by": 0,
+          "fragments": [],
+          "limit_sources": []
+        },
+        {
+          "channel": "positive_prompt",
+          "character_count": 4264,
+          "max_chars": 4000,
+          "over_by": 264,
+          "fragments": [
+            {
+              "field_key": "unit_description",
+              "label": "Unit description",
+              "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+              "source_selector": "projection.output",
+              "max_chars": 7000,
+              "text_chars": 4264,
+              "separator_chars": 0
+            }
+          ],
+          "limit_sources": [
+            {
+              "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.prompt.positive",
+              "max_chars": null
+            },
+            {
+              "source": "profile.90f19937-b442-4c9c-8ea2-b91e9ca98972.positive_prompt",
+              "max_chars": 4000
+            }
+          ]
+        },
+        {
+          "channel": "negative_prompt",
+          "character_count": 0,
+          "max_chars": null,
+          "over_by": 0,
+          "fragments": [],
+          "limit_sources": []
+        },
+        {
+          "channel": "structured_input",
+          "character_count": 0,
+          "max_chars": null,
+          "over_by": 0,
+          "fragments": [],
+          "limit_sources": []
+        }
+      ],
+      "prompt_mode": "profile",
+      "content_kind": "channels",
+      "messages": [],
+      "profile_basis": {
+        "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+        "version": 1,
+        "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+      }
+    },
+    "metrics": {
+      "preparation_id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+      "preparation_revision": 3,
+      "observed_at": "2026-10-05T16:04:53.682362+08:00",
+      "items": [
+        {
+          "key": "intent",
+          "label": "原始输入意图",
+          "state": "recorded",
+          "basis": "canonical_json_utf8",
+          "schema_version": 1,
+          "size_bytes": 1338,
+          "sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+          "current_limit_bytes": 65536,
+          "over_current_limit_bytes": 0
+        },
+        {
+          "key": "resolved_inputs",
+          "label": "已解析输入与来源",
+          "state": "recorded",
+          "basis": "canonical_json_utf8",
+          "schema_version": 1,
+          "size_bytes": 9979,
+          "sha256": "1a3843946068c1e591fc58d203529efc81a85438a63faf7b6cdd9895c2df5660",
+          "current_limit_bytes": 262144,
+          "over_current_limit_bytes": 0
+        },
+        {
+          "key": "review_contract",
+          "label": "字段审核合同",
+          "state": "recorded",
+          "basis": "canonical_json_utf8",
+          "schema_version": 1,
+          "size_bytes": 36,
+          "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+          "current_limit_bytes": 65536,
+          "over_current_limit_bytes": 0
+        },
+        {
+          "key": "evaluation",
+          "label": "准备评估",
+          "state": "not_generated",
+          "basis": "canonical_json_utf8",
+          "schema_version": null,
+          "size_bytes": null,
+          "sha256": null,
+          "current_limit_bytes": 65536,
+          "over_current_limit_bytes": null
+        },
+        {
+          "key": "prepared_request",
+          "label": "最终冻结请求文件",
+          "state": "not_generated",
+          "basis": "canonical_request_file_utf8",
+          "schema_version": null,
+          "size_bytes": null,
+          "sha256": null,
+          "current_limit_bytes": 8388608,
+          "over_current_limit_bytes": null
+        }
+      ]
+    }
+  },
+  "fields": [
+    {
+      "id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+      "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+      "unit_key": "first",
+      "field_key": "unit_description",
+      "revision": 1,
+      "source_sha256": "6e84763514093bdc151897e5d1c810d86d13a96e158ab083e0003b78d223947f",
+      "field_contract_sha256": "2467caf4802cc3a2ed9ddbf458ad00901e7610db84ebc96e26ddad099fae259b",
+      "text_sha256": "eb707fb89f974a44e1933ae3850a9c0cb60d0d7f12a0a9098e7e296a79dd9d11",
+      "origin_kind": "manual",
+      "origin_attempt": null,
+      "origin_asset_job": null,
+      "status": "pending",
+      "approval_kind": null,
+      "approval_label": "待确认",
+      "reviewed_by": null,
+      "reviewed_at": null,
+      "approval_policy_sha256": null,
+      "created_by": 1,
+      "created_at": "2026-10-05T16:04:50.791395+08:00",
+      "updated_at": "2026-10-05T16:04:50.791395+08:00",
+      "text": "Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café ",
+      "warnings": []
+    },
+    {
+      "id": "e743daae-286d-49fe-b7f9-0379e119807d",
+      "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+      "unit_key": "second",
+      "field_key": "unit_description",
+      "revision": 1,
+      "source_sha256": "76002b0b95bf5187289275936334e943e1025b3c6a5b3d094513aefaefe8a8f3",
+      "field_contract_sha256": "2467caf4802cc3a2ed9ddbf458ad00901e7610db84ebc96e26ddad099fae259b",
+      "text_sha256": "d3060574c0bf74c7f206ce60836eeeee457f36165b79af01cd12cd28e445f166",
+      "origin_kind": "manual",
+      "origin_attempt": null,
+      "origin_asset_job": null,
+      "status": "pending",
+      "approval_kind": null,
+      "approval_label": "待确认",
+      "reviewed_by": null,
+      "reviewed_at": null,
+      "approval_policy_sha256": null,
+      "created_by": 1,
+      "created_at": "2026-10-05T16:04:52.211355+08:00",
+      "updated_at": "2026-10-05T16:04:52.211355+08:00",
+      "text": "Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum",
+      "warnings": []
+    }
+  ],
+  "confirmations": [
+    {
+      "response": {
+        "field": {
+          "id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+          "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "unit_key": "first",
+          "field_key": "unit_description",
+          "revision": 1,
+          "source_sha256": "6e84763514093bdc151897e5d1c810d86d13a96e158ab083e0003b78d223947f",
+          "field_contract_sha256": "2467caf4802cc3a2ed9ddbf458ad00901e7610db84ebc96e26ddad099fae259b",
+          "text_sha256": "eb707fb89f974a44e1933ae3850a9c0cb60d0d7f12a0a9098e7e296a79dd9d11",
+          "origin_kind": "manual",
+          "origin_attempt": null,
+          "origin_asset_job": null,
+          "status": "confirmed",
+          "approval_kind": "human",
+          "approval_label": "人工审核",
+          "reviewed_by": 1,
+          "reviewed_at": "2026-10-05T16:04:56.896025+08:00",
+          "approval_policy_sha256": null,
+          "created_by": 1,
+          "created_at": "2026-10-05T16:04:50.791395+08:00",
+          "updated_at": "2026-10-05T16:04:56.897527+08:00",
+          "text": "Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café ",
+          "warnings": []
+        },
+        "preparation": {
+          "id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "stage_run": null,
+          "asset_job": "ce32b66a-4438-4bf9-be93-c69805a1600b",
+          "deployment_smoke": null,
+          "workflow_smoke": null,
+          "execution_instance_version": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+          "purpose": "production",
+          "unit_key": "composition",
+          "request_key": "candidate-1",
+          "revision": 5,
+          "status": "preparing",
+          "intent_sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+          "request_sha256": null,
+          "request_frozen_at": null,
+          "next_check_at": "2026-10-05T16:04:56.918048+08:00",
+          "reason_code": "",
+          "reason": "",
+          "evaluation_revision": null,
+          "evaluated_at": null,
+          "created_by": 1,
+          "created_at": "2026-10-05T16:04:50.428229+08:00",
+          "updated_at": "2026-10-05T16:04:56.919046+08:00"
+        },
+        "selection": {
+          "id": "e7b9b3e7-7e6f-4850-8c0b-ce8821d92773",
+          "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "unit_key": "first",
+          "field_key": "unit_description",
+          "field_value": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+          "revision": 1,
+          "selected_by": 1,
+          "selected_at": "2026-10-05T16:04:56.917049+08:00"
+        }
+      },
+      "after": {
+        "preparation": {
+          "id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "stage_run": null,
+          "asset_job": "ce32b66a-4438-4bf9-be93-c69805a1600b",
+          "deployment_smoke": null,
+          "workflow_smoke": null,
+          "execution_instance_version": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+          "purpose": "production",
+          "unit_key": "composition",
+          "request_key": "candidate-1",
+          "revision": 5,
+          "status": "preparing",
+          "intent_sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+          "request_sha256": null,
+          "request_frozen_at": null,
+          "next_check_at": "2026-10-05T16:04:56.918048+08:00",
+          "reason_code": "",
+          "reason": "",
+          "evaluation_revision": null,
+          "evaluated_at": null,
+          "created_by": 1,
+          "created_at": "2026-10-05T16:04:50.428229+08:00",
+          "updated_at": "2026-10-05T16:04:56.919046+08:00",
+          "presentation": null,
+          "outcome": {
+            "message": "主调用任务已登记，仍在准备输入，尚未进入执行队列。",
+            "artifact_count": 0,
+            "selected_count": 0
+          },
+          "intent": {
+            "schema_version": 1,
+            "request": {
+              "schema_version": 1,
+              "version_id": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+              "definition_sha256": "8b0ac1ce58af11239c58f2cf6cd8e834014dc7bc69198dec2a24c30c65cd239c",
+              "unit_key": "composition",
+              "request_key": "candidate-1",
+              "requested": {
+                "inputs": {
+                  "units": {
+                    "kind": "literal",
+                    "value": {
+                      "schema_version": 1,
+                      "ordered_units": [
+                        {
+                          "unit_key": "first",
+                          "duration_ms": 1000,
+                          "subject_keys": [],
+                          "dialogue": [],
+                          "voice_profiles": [],
+                          "continuity_notes": "",
+                          "requires_first_frame_continuity": false,
+                          "requires_last_frame_continuity": false,
+                          "ambient_sound": "",
+                          "structured_input": {
+                            "direction": "A courier arrives."
+                          }
+                        },
+                        {
+                          "unit_key": "second",
+                          "duration_ms": 1000,
+                          "subject_keys": [],
+                          "dialogue": [],
+                          "voice_profiles": [],
+                          "continuity_notes": "",
+                          "requires_first_frame_continuity": false,
+                          "requires_last_frame_continuity": false,
+                          "ambient_sound": "",
+                          "structured_input": {
+                            "direction": "A parcel opens."
+                          }
+                        }
+                      ],
+                      "color_script": "",
+                      "extra_direction": "",
+                      "overall_soundscape": "",
+                      "non_diegetic_music": ""
+                    }
+                  },
+                  "styles": {
+                    "kind": "literal",
+                    "value": {
+                      "first": {
+                        "palette": "blue"
+                      },
+                      "second": {
+                        "palette": "red"
+                      }
+                    }
+                  }
+                },
+                "parameters": {
+                  "image.width": 512,
+                  "image.height": 512,
+                  "sampling.seed": 7,
+                  "video.fps": 24,
+                  "video.frames": 48
+                }
+              }
+            },
+            "resolved_inputs_sha256": "1a3843946068c1e591fc58d203529efc81a85438a63faf7b6cdd9895c2df5660",
+            "review_contract_sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0"
+          },
+          "resolved_inputs": {
+            "schema_version": 1,
+            "field_requests": [
+              {
+                "value": {
+                  "schema_version": 1,
+                  "operation": "prompt.fields.generate",
+                  "profile": {
+                    "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+                    "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+                  },
+                  "profile_field_keys": [
+                    "unit_description"
+                  ],
+                  "items": [
+                    {
+                      "request_id": "86b41225470f7ecbd67bee9563a775eb361a5992df1deed4a03c36e1e3f3fb4c",
+                      "unit_key": "first",
+                      "field_contract": {
+                        "field_key": "unit_description",
+                        "field_value_type": "long_text",
+                        "field_definition": {
+                          "schema_version": 1,
+                          "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                          "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                          "key": "unit_description",
+                          "version": 1,
+                          "label": "Unit description",
+                          "category": "test",
+                          "description": "",
+                          "impact": "",
+                          "value_type": "long_text",
+                          "unit": "",
+                          "value_options": []
+                        },
+                        "field_value_options": [],
+                        "fixed_value": null,
+                        "has_default": false,
+                        "default_value": null,
+                        "source_selector": "projection.output",
+                        "channel": "positive_prompt",
+                        "position": 1,
+                        "label_style": "label_colon",
+                        "separator": "newline",
+                        "required": true,
+                        "omit_if_empty": true,
+                        "max_chars": 7000,
+                        "generation_mode": "model_generated",
+                        "generation_source_selector": "request.structured_input",
+                        "generation_instruction": "Use the declared facts for this unit only.",
+                        "generation_output_semantics": "contribution",
+                        "generation_required": true,
+                        "language_policy": "en",
+                        "length_unit": "none",
+                        "generation_min": null,
+                        "generation_max": null,
+                        "generation_validator_keys": [],
+                        "generation_context_selectors": [
+                          "project.style"
+                        ],
+                        "projection_primitive": "reference_context.detailed_description",
+                        "source_path": [
+                          "direction"
+                        ]
+                      },
+                      "source_text": "A courier arrives.",
+                      "source_language": "English",
+                      "target_language": "English",
+                      "context_facts": {
+                        "project.style": {
+                          "palette": "blue"
+                        }
+                      },
+                      "reference_facts": {
+                        "protected_tokens": [],
+                        "logical_inputs": [],
+                        "subject_facts": []
+                      }
+                    },
+                    {
+                      "request_id": "af48cfedc13b3ae41f8bbdc144caa1dd3ce69f784156848402ab7c67b3130883",
+                      "unit_key": "second",
+                      "field_contract": {
+                        "field_key": "unit_description",
+                        "field_value_type": "long_text",
+                        "field_definition": {
+                          "schema_version": 1,
+                          "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                          "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                          "key": "unit_description",
+                          "version": 1,
+                          "label": "Unit description",
+                          "category": "test",
+                          "description": "",
+                          "impact": "",
+                          "value_type": "long_text",
+                          "unit": "",
+                          "value_options": []
+                        },
+                        "field_value_options": [],
+                        "fixed_value": null,
+                        "has_default": false,
+                        "default_value": null,
+                        "source_selector": "projection.output",
+                        "channel": "positive_prompt",
+                        "position": 1,
+                        "label_style": "label_colon",
+                        "separator": "newline",
+                        "required": true,
+                        "omit_if_empty": true,
+                        "max_chars": 7000,
+                        "generation_mode": "model_generated",
+                        "generation_source_selector": "request.structured_input",
+                        "generation_instruction": "Use the declared facts for this unit only.",
+                        "generation_output_semantics": "contribution",
+                        "generation_required": true,
+                        "language_policy": "en",
+                        "length_unit": "none",
+                        "generation_min": null,
+                        "generation_max": null,
+                        "generation_validator_keys": [],
+                        "generation_context_selectors": [
+                          "project.style"
+                        ],
+                        "projection_primitive": "reference_context.detailed_description",
+                        "source_path": [
+                          "direction"
+                        ]
+                      },
+                      "source_text": "A parcel opens.",
+                      "source_language": "English",
+                      "target_language": "English",
+                      "context_facts": {
+                        "project.style": {
+                          "palette": "red"
+                        }
+                      },
+                      "reference_facts": {
+                        "protected_tokens": [],
+                        "logical_inputs": [],
+                        "subject_facts": []
+                      }
+                    }
+                  ]
+                },
+                "schema_version": 1,
+                "size_bytes": 3263,
+                "sha256": "e1ff5a017eeeecb7cc0eb5816055af0c8fd4b0dc1c0adb8e7a3d8fa6af8ae27b"
+              }
+            ],
+            "profile_sources": {
+              "profile": {
+                "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+                "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+              },
+              "unit_key": "composition",
+              "source_language": "English",
+              "target_language": "English",
+              "projection": {
+                "assembly_sources": {},
+                "generation_sources": {},
+                "generation_contexts": {},
+                "provenance": [
+                  {
+                    "input_key": "units",
+                    "target_key": "reference_context.units",
+                    "uses": [
+                      {
+                        "field_key": "unit_description",
+                        "usage": "reference_units",
+                        "selector": "reference_context.units",
+                        "source_path": [
+                          "direction"
+                        ]
+                      }
+                    ],
+                    "value_sha256": "12a747f63766d881988398b3e017f140617ffe95645b12412022a5fb625116c0"
+                  },
+                  {
+                    "input_key": "styles",
+                    "target_key": "context.project.style",
+                    "uses": [
+                      {
+                        "field_key": "unit_description",
+                        "usage": "reference_generation_context",
+                        "selector": "project.style"
+                      }
+                    ],
+                    "value_sha256": "cdd9a564625c52f01cfddc0c1f4bf466de6606b1eee4be736752e8cc5fb1bad3"
+                  }
+                ],
+                "omitted_targets": [],
+                "reference": {
+                  "unit_input": {
+                    "schema_version": 1,
+                    "ordered_units": [
+                      {
+                        "unit_key": "first",
+                        "duration_ms": 1000,
+                        "subject_keys": [],
+                        "dialogue": [],
+                        "voice_profiles": [],
+                        "continuity_notes": "",
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "ambient_sound": "",
+                        "structured_input": {
+                          "direction": "A courier arrives."
+                        }
+                      },
+                      {
+                        "unit_key": "second",
+                        "duration_ms": 1000,
+                        "subject_keys": [],
+                        "dialogue": [],
+                        "voice_profiles": [],
+                        "continuity_notes": "",
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "ambient_sound": "",
+                        "structured_input": {
+                          "direction": "A parcel opens."
+                        }
+                      }
+                    ],
+                    "color_script": "",
+                    "extra_direction": "",
+                    "overall_soundscape": "",
+                    "non_diegetic_music": ""
+                  },
+                  "generation_contexts": {
+                    "project.style": {
+                      "first": {
+                        "palette": "blue"
+                      },
+                      "second": {
+                        "palette": "red"
+                      }
+                    }
+                  }
+                }
+              },
+              "reference_context": {
+                "value": {
+                  "context": {
+                    "color_script": "",
+                    "conditioning_mode_contract": {
+                      "description": "explicit-unit-mode configured mode",
+                      "input_kind": "text_only",
+                      "inputs": {
+                        "entity_images": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "first_frame": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "last_frame": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "paired_video_audios": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "reference_audios": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "reference_videos": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "total_images": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        }
+                      },
+                      "key": "explicit-unit-mode",
+                      "label": "explicit-unit-mode",
+                      "requires_entity_reference_bible": false,
+                      "supports_native_audio": false
+                    },
+                    "extra_direction": "",
+                    "frame_policy": {
+                      "alignment_modulus": 1,
+                      "alignment_remainder": 0,
+                      "fps": 24,
+                      "maximum_frames": 240,
+                      "minimum_frames": 1
+                    },
+                    "generation_contributions": {},
+                    "include_audio": false,
+                    "language": "English",
+                    "mode": "explicit-unit-mode",
+                    "non_diegetic_music": "",
+                    "ordered_units": [
+                      {
+                        "ambient_sound": "",
+                        "continuity_notes": "",
+                        "dialogue": [],
+                        "duration_ms": 1000,
+                        "render_values": {
+                          "action": "",
+                          "camera": "",
+                          "color_palette": "",
+                          "description": "",
+                          "environment": "",
+                          "lighting": "",
+                          "music": "",
+                          "narrative": "",
+                          "sound_effects": "",
+                          "subjects": "",
+                          "visual_prompt": ""
+                        },
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "subject_keys": [],
+                        "unit_key": "first",
+                        "voice_profiles": []
+                      },
+                      {
+                        "ambient_sound": "",
+                        "continuity_notes": "",
+                        "dialogue": [],
+                        "duration_ms": 1000,
+                        "render_values": {
+                          "action": "",
+                          "camera": "",
+                          "color_palette": "",
+                          "description": "",
+                          "environment": "",
+                          "lighting": "",
+                          "music": "",
+                          "narrative": "",
+                          "sound_effects": "",
+                          "subjects": "",
+                          "visual_prompt": ""
+                        },
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "subject_keys": [],
+                        "unit_key": "second",
+                        "voice_profiles": []
+                      }
+                    ],
+                    "overall_soundscape": "",
+                    "prompt_type": "video",
+                    "reference_bindings": [],
+                    "subject_facts": []
+                  },
+                  "schema_version": 1
+                },
+                "schema_version": 1,
+                "size_bytes": 1842,
+                "sha256": "84011d639ff2f5b70e6e67b7ee05f02f8ae0bfe29a8cab657e04fa6ae44aeb87"
+              },
+              "scope_units": []
+            },
+            "inputs": {
+              "schema_version": 1,
+              "logical_values": {
+                "units": {
+                  "schema_version": 1,
+                  "ordered_units": [
+                    {
+                      "unit_key": "first",
+                      "duration_ms": 1000,
+                      "subject_keys": [],
+                      "dialogue": [],
+                      "voice_profiles": [],
+                      "continuity_notes": "",
+                      "requires_first_frame_continuity": false,
+                      "requires_last_frame_continuity": false,
+                      "ambient_sound": "",
+                      "structured_input": {
+                        "direction": "A courier arrives."
+                      }
+                    },
+                    {
+                      "unit_key": "second",
+                      "duration_ms": 1000,
+                      "subject_keys": [],
+                      "dialogue": [],
+                      "voice_profiles": [],
+                      "continuity_notes": "",
+                      "requires_first_frame_continuity": false,
+                      "requires_last_frame_continuity": false,
+                      "ambient_sound": "",
+                      "structured_input": {
+                        "direction": "A parcel opens."
+                      }
+                    }
+                  ],
+                  "color_script": "",
+                  "extra_direction": "",
+                  "overall_soundscape": "",
+                  "non_diegetic_music": ""
+                },
+                "styles": {
+                  "first": {
+                    "palette": "blue"
+                  },
+                  "second": {
+                    "palette": "red"
+                  }
+                }
+              },
+              "input_provenance": [
+                {
+                  "input_key": "units",
+                  "kind": "literal",
+                  "value_sha256": "12a747f63766d881988398b3e017f140617ffe95645b12412022a5fb625116c0"
+                },
+                {
+                  "input_key": "styles",
+                  "kind": "literal",
+                  "value_sha256": "cdd9a564625c52f01cfddc0c1f4bf466de6606b1eee4be736752e8cc5fb1bad3"
+                }
+              ],
+              "workflow_slots": {},
+              "operation_inputs": {},
+              "model_input_counts": {
+                "total_images": 0,
+                "first_frame": 0,
+                "last_frame": 0,
+                "entity_images": 0,
+                "reference_videos": 0,
+                "paired_video_audios": 0,
+                "reference_audios": 0
+              }
+            },
+            "parameters": {
+              "values": {
+                "audio.enabled": false,
+                "image.width": 512,
+                "image.height": 512,
+                "sampling.seed": 7,
+                "video.fps": 24,
+                "video.frames": 48
+              },
+              "sources": {
+                "audio.enabled": "workflow.static_semantics",
+                "image.width": "request",
+                "image.height": "request",
+                "sampling.seed": "request",
+                "video.fps": "request",
+                "video.frames": "request"
+              },
+              "contracts": {
+                "image.width": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "alignments": [
+                      {
+                        "modulus": 8,
+                        "remainder": 0
+                      }
+                    ]
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "alignments": [
+                          {
+                            "modulus": 8,
+                            "remainder": 0
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "image.height": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "alignments": [
+                      {
+                        "modulus": 8,
+                        "remainder": 0
+                      }
+                    ]
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "alignments": [
+                          {
+                            "modulus": 8,
+                            "remainder": 0
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "sampling.seed": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 0
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "minimum": 0
+                      }
+                    }
+                  ]
+                },
+                "video.fps": {
+                  "rule": {
+                    "type": "number",
+                    "required": true
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "number",
+                        "required": true
+                      }
+                    }
+                  ]
+                },
+                "video.frames": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 1,
+                    "maximum": 240
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "minimum": 1,
+                        "maximum": 240
+                      }
+                    }
+                  ]
+                }
+              },
+              "generated_values": {},
+              "resolved_source_contracts": {}
+            }
+          },
+          "review_contract": {
+            "schema_version": 1,
+            "mode": "manual"
+          },
+          "review_summary": {
+            "mode": "manual",
+            "label": "人工确认字段",
+            "description": "校验通过后仍需确认并采用。保存字段不会自动批准，也不会覆盖已采用内容。"
+          },
+          "prepared_request": null,
+          "evaluation": null,
+          "field_selections": [
+            {
+              "id": "e7b9b3e7-7e6f-4850-8c0b-ce8821d92773",
+              "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+              "unit_key": "first",
+              "field_key": "unit_description",
+              "field_value": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+              "revision": 1,
+              "selected_by": 1,
+              "selected_at": "2026-10-05T16:04:56.917049+08:00"
+            }
+          ],
+          "capacity_sample": null,
+          "field_slots": [
+            {
+              "unit_key": "first",
+              "field_key": "unit_description",
+              "field_label": "Unit description",
+              "latest_value_id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+              "effective_language": "en",
+              "next_revision": 2,
+              "field_contract": {
+                "field_key": "unit_description",
+                "field_value_type": "long_text",
+                "field_definition": {
+                  "schema_version": 1,
+                  "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                  "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                  "key": "unit_description",
+                  "version": 1,
+                  "label": "Unit description",
+                  "category": "test",
+                  "description": "",
+                  "impact": "",
+                  "value_type": "long_text",
+                  "unit": "",
+                  "value_options": []
+                },
+                "field_value_options": [],
+                "fixed_value": null,
+                "has_default": false,
+                "default_value": null,
+                "source_selector": "projection.output",
+                "channel": "positive_prompt",
+                "position": 1,
+                "label_style": "label_colon",
+                "separator": "newline",
+                "required": true,
+                "omit_if_empty": true,
+                "max_chars": 7000,
+                "generation_mode": "model_generated",
+                "generation_source_selector": "request.structured_input",
+                "generation_instruction": "Use the declared facts for this unit only.",
+                "generation_output_semantics": "contribution",
+                "generation_required": true,
+                "language_policy": "en",
+                "length_unit": "none",
+                "generation_min": null,
+                "generation_max": null,
+                "generation_validator_keys": [],
+                "generation_context_selectors": [
+                  "project.style"
+                ],
+                "projection_primitive": "reference_context.detailed_description",
+                "source_path": [
+                  "direction"
+                ]
+              },
+              "source_language": "English",
+              "target_language": "English"
+            },
+            {
+              "unit_key": "second",
+              "field_key": "unit_description",
+              "field_label": "Unit description",
+              "latest_value_id": "e743daae-286d-49fe-b7f9-0379e119807d",
+              "effective_language": "en",
+              "next_revision": 2,
+              "field_contract": {
+                "field_key": "unit_description",
+                "field_value_type": "long_text",
+                "field_definition": {
+                  "schema_version": 1,
+                  "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                  "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                  "key": "unit_description",
+                  "version": 1,
+                  "label": "Unit description",
+                  "category": "test",
+                  "description": "",
+                  "impact": "",
+                  "value_type": "long_text",
+                  "unit": "",
+                  "value_options": []
+                },
+                "field_value_options": [],
+                "fixed_value": null,
+                "has_default": false,
+                "default_value": null,
+                "source_selector": "projection.output",
+                "channel": "positive_prompt",
+                "position": 1,
+                "label_style": "label_colon",
+                "separator": "newline",
+                "required": true,
+                "omit_if_empty": true,
+                "max_chars": 7000,
+                "generation_mode": "model_generated",
+                "generation_source_selector": "request.structured_input",
+                "generation_instruction": "Use the declared facts for this unit only.",
+                "generation_output_semantics": "contribution",
+                "generation_required": true,
+                "language_policy": "en",
+                "length_unit": "none",
+                "generation_min": null,
+                "generation_max": null,
+                "generation_validator_keys": [],
+                "generation_context_selectors": [
+                  "project.style"
+                ],
+                "projection_primitive": "reference_context.detailed_description",
+                "source_path": [
+                  "direction"
+                ]
+              },
+              "source_language": "English",
+              "target_language": "English"
+            }
+          ],
+          "auxiliary_batches": [
+            {
+              "field_batch_key": "e1ff5a017eeeecb7cc0eb5816055af0c8fd4b0dc1c0adb8e7a3d8fa6af8ae27b",
+              "purpose": "generate_fields",
+              "field_keys": [
+                "unit_description",
+                "unit_description"
+              ],
+              "attempt_number": 0,
+              "task_id": null,
+              "preparation_id": null,
+              "status": "not_started",
+              "reason": "尚未开始；检查并继续后按本次授权准备辅助任务。",
+              "can_retry": false
+            }
+          ],
+          "response_diagnostic": null,
+          "cancellation": null,
+          "resource_review": null,
+          "text_response_review": null
+        },
+        "prompt": {
+          "preparation_id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "preparation_revision": 5,
+          "mode": "diagnostic",
+          "request_sha256": null,
+          "frozen_at": null,
+          "channels": [
+            {
+              "key": "system_instruction",
+              "text": "",
+              "character_count": 0
+            },
+            {
+              "key": "positive_prompt",
+              "text": "unit_description: Visual style: \nColor design:\n[Shot 1] Subjects: .\nCafé 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café \n\nFirst-frame continuity required: False; last-frame continuity required: False.\n[Shot 2] At 00:01.000, Subjects: .\nRésumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum\n\nFirst-frame continuity required: False; last-frame continuity required: False.",
+              "character_count": 4264
+            },
+            {
+              "key": "negative_prompt",
+              "text": "",
+              "character_count": 0
+            },
+            {
+              "key": "structured_input",
+              "text": "",
+              "character_count": 0
+            }
+          ],
+          "field_basis": [
+            {
+              "unit_key": "first",
+              "field_key": "unit_description",
+              "field_value_id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+              "revision": 1,
+              "origin": "adopted",
+              "status": "confirmed"
+            },
+            {
+              "unit_key": "second",
+              "field_key": "unit_description",
+              "field_value_id": "e743daae-286d-49fe-b7f9-0379e119807d",
+              "revision": 1,
+              "origin": "candidate",
+              "status": "pending"
+            }
+          ],
+          "sources": {
+            "references": [],
+            "dialogue": []
+          },
+          "issues": [
+            "通道 positive_prompt 装配后为 4264 字符，超过配置上限 4000"
+          ],
+          "length_diagnostics": [
+            {
+              "channel": "system_instruction",
+              "character_count": 0,
+              "max_chars": null,
+              "over_by": 0,
+              "fragments": [],
+              "limit_sources": []
+            },
+            {
+              "channel": "positive_prompt",
+              "character_count": 4264,
+              "max_chars": 4000,
+              "over_by": 264,
+              "fragments": [
+                {
+                  "field_key": "unit_description",
+                  "label": "Unit description",
+                  "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                  "source_selector": "projection.output",
+                  "max_chars": 7000,
+                  "text_chars": 4264,
+                  "separator_chars": 0
+                }
+              ],
+              "limit_sources": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.prompt.positive",
+                  "max_chars": null
+                },
+                {
+                  "source": "profile.90f19937-b442-4c9c-8ea2-b91e9ca98972.positive_prompt",
+                  "max_chars": 4000
+                }
+              ]
+            },
+            {
+              "channel": "negative_prompt",
+              "character_count": 0,
+              "max_chars": null,
+              "over_by": 0,
+              "fragments": [],
+              "limit_sources": []
+            },
+            {
+              "channel": "structured_input",
+              "character_count": 0,
+              "max_chars": null,
+              "over_by": 0,
+              "fragments": [],
+              "limit_sources": []
+            }
+          ],
+          "prompt_mode": "profile",
+          "content_kind": "channels",
+          "messages": [],
+          "profile_basis": {
+            "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+            "version": 1,
+            "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+          }
+        },
+        "metrics": {
+          "preparation_id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "preparation_revision": 5,
+          "observed_at": "2026-10-05T16:04:58.500488+08:00",
+          "items": [
+            {
+              "key": "intent",
+              "label": "原始输入意图",
+              "state": "recorded",
+              "basis": "canonical_json_utf8",
+              "schema_version": 1,
+              "size_bytes": 1338,
+              "sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+              "current_limit_bytes": 65536,
+              "over_current_limit_bytes": 0
+            },
+            {
+              "key": "resolved_inputs",
+              "label": "已解析输入与来源",
+              "state": "recorded",
+              "basis": "canonical_json_utf8",
+              "schema_version": 1,
+              "size_bytes": 9979,
+              "sha256": "1a3843946068c1e591fc58d203529efc81a85438a63faf7b6cdd9895c2df5660",
+              "current_limit_bytes": 262144,
+              "over_current_limit_bytes": 0
+            },
+            {
+              "key": "review_contract",
+              "label": "字段审核合同",
+              "state": "recorded",
+              "basis": "canonical_json_utf8",
+              "schema_version": 1,
+              "size_bytes": 36,
+              "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+              "current_limit_bytes": 65536,
+              "over_current_limit_bytes": 0
+            },
+            {
+              "key": "evaluation",
+              "label": "准备评估",
+              "state": "not_generated",
+              "basis": "canonical_json_utf8",
+              "schema_version": null,
+              "size_bytes": null,
+              "sha256": null,
+              "current_limit_bytes": 65536,
+              "over_current_limit_bytes": null
+            },
+            {
+              "key": "prepared_request",
+              "label": "最终冻结请求文件",
+              "state": "not_generated",
+              "basis": "canonical_request_file_utf8",
+              "schema_version": null,
+              "size_bytes": null,
+              "sha256": null,
+              "current_limit_bytes": 8388608,
+              "over_current_limit_bytes": null
+            }
+          ]
+        }
+      }
+    },
+    {
+      "response": {
+        "field": {
+          "id": "e743daae-286d-49fe-b7f9-0379e119807d",
+          "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "unit_key": "second",
+          "field_key": "unit_description",
+          "revision": 1,
+          "source_sha256": "76002b0b95bf5187289275936334e943e1025b3c6a5b3d094513aefaefe8a8f3",
+          "field_contract_sha256": "2467caf4802cc3a2ed9ddbf458ad00901e7610db84ebc96e26ddad099fae259b",
+          "text_sha256": "d3060574c0bf74c7f206ce60836eeeee457f36165b79af01cd12cd28e445f166",
+          "origin_kind": "manual",
+          "origin_attempt": null,
+          "origin_asset_job": null,
+          "status": "confirmed",
+          "approval_kind": "human",
+          "approval_label": "人工审核",
+          "reviewed_by": 1,
+          "reviewed_at": "2026-10-05T16:04:59.957291+08:00",
+          "approval_policy_sha256": null,
+          "created_by": 1,
+          "created_at": "2026-10-05T16:04:52.211355+08:00",
+          "updated_at": "2026-10-05T16:04:59.958290+08:00",
+          "text": "Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum",
+          "warnings": []
+        },
+        "preparation": {
+          "id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "stage_run": null,
+          "asset_job": "ce32b66a-4438-4bf9-be93-c69805a1600b",
+          "deployment_smoke": null,
+          "workflow_smoke": null,
+          "execution_instance_version": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+          "purpose": "production",
+          "unit_key": "composition",
+          "request_key": "candidate-1",
+          "revision": 7,
+          "status": "preparing",
+          "intent_sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+          "request_sha256": null,
+          "request_frozen_at": null,
+          "next_check_at": "2026-10-05T16:04:59.981551+08:00",
+          "reason_code": "",
+          "reason": "",
+          "evaluation_revision": null,
+          "evaluated_at": null,
+          "created_by": 1,
+          "created_at": "2026-10-05T16:04:50.428229+08:00",
+          "updated_at": "2026-10-05T16:04:59.982548+08:00"
+        },
+        "selection": {
+          "id": "a04e7977-0620-4562-a98b-2928e0ad58bf",
+          "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "unit_key": "second",
+          "field_key": "unit_description",
+          "field_value": "e743daae-286d-49fe-b7f9-0379e119807d",
+          "revision": 1,
+          "selected_by": 1,
+          "selected_at": "2026-10-05T16:04:59.980552+08:00"
+        }
+      },
+      "after": {
+        "preparation": {
+          "id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "stage_run": null,
+          "asset_job": "ce32b66a-4438-4bf9-be93-c69805a1600b",
+          "deployment_smoke": null,
+          "workflow_smoke": null,
+          "execution_instance_version": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+          "purpose": "production",
+          "unit_key": "composition",
+          "request_key": "candidate-1",
+          "revision": 7,
+          "status": "preparing",
+          "intent_sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+          "request_sha256": null,
+          "request_frozen_at": null,
+          "next_check_at": "2026-10-05T16:04:59.981551+08:00",
+          "reason_code": "",
+          "reason": "",
+          "evaluation_revision": null,
+          "evaluated_at": null,
+          "created_by": 1,
+          "created_at": "2026-10-05T16:04:50.428229+08:00",
+          "updated_at": "2026-10-05T16:04:59.982548+08:00",
+          "presentation": null,
+          "outcome": {
+            "message": "主调用任务已登记，仍在准备输入，尚未进入执行队列。",
+            "artifact_count": 0,
+            "selected_count": 0
+          },
+          "intent": {
+            "schema_version": 1,
+            "request": {
+              "schema_version": 1,
+              "version_id": "8bdd9e55-6450-4611-b444-9d7b3cd9740c",
+              "definition_sha256": "8b0ac1ce58af11239c58f2cf6cd8e834014dc7bc69198dec2a24c30c65cd239c",
+              "unit_key": "composition",
+              "request_key": "candidate-1",
+              "requested": {
+                "inputs": {
+                  "units": {
+                    "kind": "literal",
+                    "value": {
+                      "schema_version": 1,
+                      "ordered_units": [
+                        {
+                          "unit_key": "first",
+                          "duration_ms": 1000,
+                          "subject_keys": [],
+                          "dialogue": [],
+                          "voice_profiles": [],
+                          "continuity_notes": "",
+                          "requires_first_frame_continuity": false,
+                          "requires_last_frame_continuity": false,
+                          "ambient_sound": "",
+                          "structured_input": {
+                            "direction": "A courier arrives."
+                          }
+                        },
+                        {
+                          "unit_key": "second",
+                          "duration_ms": 1000,
+                          "subject_keys": [],
+                          "dialogue": [],
+                          "voice_profiles": [],
+                          "continuity_notes": "",
+                          "requires_first_frame_continuity": false,
+                          "requires_last_frame_continuity": false,
+                          "ambient_sound": "",
+                          "structured_input": {
+                            "direction": "A parcel opens."
+                          }
+                        }
+                      ],
+                      "color_script": "",
+                      "extra_direction": "",
+                      "overall_soundscape": "",
+                      "non_diegetic_music": ""
+                    }
+                  },
+                  "styles": {
+                    "kind": "literal",
+                    "value": {
+                      "first": {
+                        "palette": "blue"
+                      },
+                      "second": {
+                        "palette": "red"
+                      }
+                    }
+                  }
+                },
+                "parameters": {
+                  "image.width": 512,
+                  "image.height": 512,
+                  "sampling.seed": 7,
+                  "video.fps": 24,
+                  "video.frames": 48
+                }
+              }
+            },
+            "resolved_inputs_sha256": "1a3843946068c1e591fc58d203529efc81a85438a63faf7b6cdd9895c2df5660",
+            "review_contract_sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0"
+          },
+          "resolved_inputs": {
+            "schema_version": 1,
+            "field_requests": [
+              {
+                "value": {
+                  "schema_version": 1,
+                  "operation": "prompt.fields.generate",
+                  "profile": {
+                    "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+                    "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+                  },
+                  "profile_field_keys": [
+                    "unit_description"
+                  ],
+                  "items": [
+                    {
+                      "request_id": "86b41225470f7ecbd67bee9563a775eb361a5992df1deed4a03c36e1e3f3fb4c",
+                      "unit_key": "first",
+                      "field_contract": {
+                        "field_key": "unit_description",
+                        "field_value_type": "long_text",
+                        "field_definition": {
+                          "schema_version": 1,
+                          "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                          "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                          "key": "unit_description",
+                          "version": 1,
+                          "label": "Unit description",
+                          "category": "test",
+                          "description": "",
+                          "impact": "",
+                          "value_type": "long_text",
+                          "unit": "",
+                          "value_options": []
+                        },
+                        "field_value_options": [],
+                        "fixed_value": null,
+                        "has_default": false,
+                        "default_value": null,
+                        "source_selector": "projection.output",
+                        "channel": "positive_prompt",
+                        "position": 1,
+                        "label_style": "label_colon",
+                        "separator": "newline",
+                        "required": true,
+                        "omit_if_empty": true,
+                        "max_chars": 7000,
+                        "generation_mode": "model_generated",
+                        "generation_source_selector": "request.structured_input",
+                        "generation_instruction": "Use the declared facts for this unit only.",
+                        "generation_output_semantics": "contribution",
+                        "generation_required": true,
+                        "language_policy": "en",
+                        "length_unit": "none",
+                        "generation_min": null,
+                        "generation_max": null,
+                        "generation_validator_keys": [],
+                        "generation_context_selectors": [
+                          "project.style"
+                        ],
+                        "projection_primitive": "reference_context.detailed_description",
+                        "source_path": [
+                          "direction"
+                        ]
+                      },
+                      "source_text": "A courier arrives.",
+                      "source_language": "English",
+                      "target_language": "English",
+                      "context_facts": {
+                        "project.style": {
+                          "palette": "blue"
+                        }
+                      },
+                      "reference_facts": {
+                        "protected_tokens": [],
+                        "logical_inputs": [],
+                        "subject_facts": []
+                      }
+                    },
+                    {
+                      "request_id": "af48cfedc13b3ae41f8bbdc144caa1dd3ce69f784156848402ab7c67b3130883",
+                      "unit_key": "second",
+                      "field_contract": {
+                        "field_key": "unit_description",
+                        "field_value_type": "long_text",
+                        "field_definition": {
+                          "schema_version": 1,
+                          "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                          "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                          "key": "unit_description",
+                          "version": 1,
+                          "label": "Unit description",
+                          "category": "test",
+                          "description": "",
+                          "impact": "",
+                          "value_type": "long_text",
+                          "unit": "",
+                          "value_options": []
+                        },
+                        "field_value_options": [],
+                        "fixed_value": null,
+                        "has_default": false,
+                        "default_value": null,
+                        "source_selector": "projection.output",
+                        "channel": "positive_prompt",
+                        "position": 1,
+                        "label_style": "label_colon",
+                        "separator": "newline",
+                        "required": true,
+                        "omit_if_empty": true,
+                        "max_chars": 7000,
+                        "generation_mode": "model_generated",
+                        "generation_source_selector": "request.structured_input",
+                        "generation_instruction": "Use the declared facts for this unit only.",
+                        "generation_output_semantics": "contribution",
+                        "generation_required": true,
+                        "language_policy": "en",
+                        "length_unit": "none",
+                        "generation_min": null,
+                        "generation_max": null,
+                        "generation_validator_keys": [],
+                        "generation_context_selectors": [
+                          "project.style"
+                        ],
+                        "projection_primitive": "reference_context.detailed_description",
+                        "source_path": [
+                          "direction"
+                        ]
+                      },
+                      "source_text": "A parcel opens.",
+                      "source_language": "English",
+                      "target_language": "English",
+                      "context_facts": {
+                        "project.style": {
+                          "palette": "red"
+                        }
+                      },
+                      "reference_facts": {
+                        "protected_tokens": [],
+                        "logical_inputs": [],
+                        "subject_facts": []
+                      }
+                    }
+                  ]
+                },
+                "schema_version": 1,
+                "size_bytes": 3263,
+                "sha256": "e1ff5a017eeeecb7cc0eb5816055af0c8fd4b0dc1c0adb8e7a3d8fa6af8ae27b"
+              }
+            ],
+            "profile_sources": {
+              "profile": {
+                "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+                "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+              },
+              "unit_key": "composition",
+              "source_language": "English",
+              "target_language": "English",
+              "projection": {
+                "assembly_sources": {},
+                "generation_sources": {},
+                "generation_contexts": {},
+                "provenance": [
+                  {
+                    "input_key": "units",
+                    "target_key": "reference_context.units",
+                    "uses": [
+                      {
+                        "field_key": "unit_description",
+                        "usage": "reference_units",
+                        "selector": "reference_context.units",
+                        "source_path": [
+                          "direction"
+                        ]
+                      }
+                    ],
+                    "value_sha256": "12a747f63766d881988398b3e017f140617ffe95645b12412022a5fb625116c0"
+                  },
+                  {
+                    "input_key": "styles",
+                    "target_key": "context.project.style",
+                    "uses": [
+                      {
+                        "field_key": "unit_description",
+                        "usage": "reference_generation_context",
+                        "selector": "project.style"
+                      }
+                    ],
+                    "value_sha256": "cdd9a564625c52f01cfddc0c1f4bf466de6606b1eee4be736752e8cc5fb1bad3"
+                  }
+                ],
+                "omitted_targets": [],
+                "reference": {
+                  "unit_input": {
+                    "schema_version": 1,
+                    "ordered_units": [
+                      {
+                        "unit_key": "first",
+                        "duration_ms": 1000,
+                        "subject_keys": [],
+                        "dialogue": [],
+                        "voice_profiles": [],
+                        "continuity_notes": "",
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "ambient_sound": "",
+                        "structured_input": {
+                          "direction": "A courier arrives."
+                        }
+                      },
+                      {
+                        "unit_key": "second",
+                        "duration_ms": 1000,
+                        "subject_keys": [],
+                        "dialogue": [],
+                        "voice_profiles": [],
+                        "continuity_notes": "",
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "ambient_sound": "",
+                        "structured_input": {
+                          "direction": "A parcel opens."
+                        }
+                      }
+                    ],
+                    "color_script": "",
+                    "extra_direction": "",
+                    "overall_soundscape": "",
+                    "non_diegetic_music": ""
+                  },
+                  "generation_contexts": {
+                    "project.style": {
+                      "first": {
+                        "palette": "blue"
+                      },
+                      "second": {
+                        "palette": "red"
+                      }
+                    }
+                  }
+                }
+              },
+              "reference_context": {
+                "value": {
+                  "context": {
+                    "color_script": "",
+                    "conditioning_mode_contract": {
+                      "description": "explicit-unit-mode configured mode",
+                      "input_kind": "text_only",
+                      "inputs": {
+                        "entity_images": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "first_frame": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "last_frame": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "paired_video_audios": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "reference_audios": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "reference_videos": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        },
+                        "total_images": {
+                          "maximum_items": 0,
+                          "minimum_items": 0
+                        }
+                      },
+                      "key": "explicit-unit-mode",
+                      "label": "explicit-unit-mode",
+                      "requires_entity_reference_bible": false,
+                      "supports_native_audio": false
+                    },
+                    "extra_direction": "",
+                    "frame_policy": {
+                      "alignment_modulus": 1,
+                      "alignment_remainder": 0,
+                      "fps": 24,
+                      "maximum_frames": 240,
+                      "minimum_frames": 1
+                    },
+                    "generation_contributions": {},
+                    "include_audio": false,
+                    "language": "English",
+                    "mode": "explicit-unit-mode",
+                    "non_diegetic_music": "",
+                    "ordered_units": [
+                      {
+                        "ambient_sound": "",
+                        "continuity_notes": "",
+                        "dialogue": [],
+                        "duration_ms": 1000,
+                        "render_values": {
+                          "action": "",
+                          "camera": "",
+                          "color_palette": "",
+                          "description": "",
+                          "environment": "",
+                          "lighting": "",
+                          "music": "",
+                          "narrative": "",
+                          "sound_effects": "",
+                          "subjects": "",
+                          "visual_prompt": ""
+                        },
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "subject_keys": [],
+                        "unit_key": "first",
+                        "voice_profiles": []
+                      },
+                      {
+                        "ambient_sound": "",
+                        "continuity_notes": "",
+                        "dialogue": [],
+                        "duration_ms": 1000,
+                        "render_values": {
+                          "action": "",
+                          "camera": "",
+                          "color_palette": "",
+                          "description": "",
+                          "environment": "",
+                          "lighting": "",
+                          "music": "",
+                          "narrative": "",
+                          "sound_effects": "",
+                          "subjects": "",
+                          "visual_prompt": ""
+                        },
+                        "requires_first_frame_continuity": false,
+                        "requires_last_frame_continuity": false,
+                        "subject_keys": [],
+                        "unit_key": "second",
+                        "voice_profiles": []
+                      }
+                    ],
+                    "overall_soundscape": "",
+                    "prompt_type": "video",
+                    "reference_bindings": [],
+                    "subject_facts": []
+                  },
+                  "schema_version": 1
+                },
+                "schema_version": 1,
+                "size_bytes": 1842,
+                "sha256": "84011d639ff2f5b70e6e67b7ee05f02f8ae0bfe29a8cab657e04fa6ae44aeb87"
+              },
+              "scope_units": []
+            },
+            "inputs": {
+              "schema_version": 1,
+              "logical_values": {
+                "units": {
+                  "schema_version": 1,
+                  "ordered_units": [
+                    {
+                      "unit_key": "first",
+                      "duration_ms": 1000,
+                      "subject_keys": [],
+                      "dialogue": [],
+                      "voice_profiles": [],
+                      "continuity_notes": "",
+                      "requires_first_frame_continuity": false,
+                      "requires_last_frame_continuity": false,
+                      "ambient_sound": "",
+                      "structured_input": {
+                        "direction": "A courier arrives."
+                      }
+                    },
+                    {
+                      "unit_key": "second",
+                      "duration_ms": 1000,
+                      "subject_keys": [],
+                      "dialogue": [],
+                      "voice_profiles": [],
+                      "continuity_notes": "",
+                      "requires_first_frame_continuity": false,
+                      "requires_last_frame_continuity": false,
+                      "ambient_sound": "",
+                      "structured_input": {
+                        "direction": "A parcel opens."
+                      }
+                    }
+                  ],
+                  "color_script": "",
+                  "extra_direction": "",
+                  "overall_soundscape": "",
+                  "non_diegetic_music": ""
+                },
+                "styles": {
+                  "first": {
+                    "palette": "blue"
+                  },
+                  "second": {
+                    "palette": "red"
+                  }
+                }
+              },
+              "input_provenance": [
+                {
+                  "input_key": "units",
+                  "kind": "literal",
+                  "value_sha256": "12a747f63766d881988398b3e017f140617ffe95645b12412022a5fb625116c0"
+                },
+                {
+                  "input_key": "styles",
+                  "kind": "literal",
+                  "value_sha256": "cdd9a564625c52f01cfddc0c1f4bf466de6606b1eee4be736752e8cc5fb1bad3"
+                }
+              ],
+              "workflow_slots": {},
+              "operation_inputs": {},
+              "model_input_counts": {
+                "total_images": 0,
+                "first_frame": 0,
+                "last_frame": 0,
+                "entity_images": 0,
+                "reference_videos": 0,
+                "paired_video_audios": 0,
+                "reference_audios": 0
+              }
+            },
+            "parameters": {
+              "values": {
+                "audio.enabled": false,
+                "image.width": 512,
+                "image.height": 512,
+                "sampling.seed": 7,
+                "video.fps": 24,
+                "video.frames": 48
+              },
+              "sources": {
+                "audio.enabled": "workflow.static_semantics",
+                "image.width": "request",
+                "image.height": "request",
+                "sampling.seed": "request",
+                "video.fps": "request",
+                "video.frames": "request"
+              },
+              "contracts": {
+                "image.width": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "alignments": [
+                      {
+                        "modulus": 8,
+                        "remainder": 0
+                      }
+                    ]
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "alignments": [
+                          {
+                            "modulus": 8,
+                            "remainder": 0
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "image.height": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "alignments": [
+                      {
+                        "modulus": 8,
+                        "remainder": 0
+                      }
+                    ]
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "alignments": [
+                          {
+                            "modulus": 8,
+                            "remainder": 0
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                },
+                "sampling.seed": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 0
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "minimum": 0
+                      }
+                    }
+                  ]
+                },
+                "video.fps": {
+                  "rule": {
+                    "type": "number",
+                    "required": true
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "number",
+                        "required": true
+                      }
+                    }
+                  ]
+                },
+                "video.frames": {
+                  "rule": {
+                    "type": "integer",
+                    "required": true,
+                    "minimum": 1,
+                    "maximum": 240
+                  },
+                  "value_source": null,
+                  "layers": [
+                    {
+                      "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.parameters",
+                      "rule": {
+                        "type": "integer",
+                        "required": true,
+                        "minimum": 1,
+                        "maximum": 240
+                      }
+                    }
+                  ]
+                }
+              },
+              "generated_values": {},
+              "resolved_source_contracts": {}
+            }
+          },
+          "review_contract": {
+            "schema_version": 1,
+            "mode": "manual"
+          },
+          "review_summary": {
+            "mode": "manual",
+            "label": "人工确认字段",
+            "description": "校验通过后仍需确认并采用。保存字段不会自动批准，也不会覆盖已采用内容。"
+          },
+          "prepared_request": null,
+          "evaluation": null,
+          "field_selections": [
+            {
+              "id": "e7b9b3e7-7e6f-4850-8c0b-ce8821d92773",
+              "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+              "unit_key": "first",
+              "field_key": "unit_description",
+              "field_value": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+              "revision": 1,
+              "selected_by": 1,
+              "selected_at": "2026-10-05T16:04:56.917049+08:00"
+            },
+            {
+              "id": "a04e7977-0620-4562-a98b-2928e0ad58bf",
+              "preparation": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+              "unit_key": "second",
+              "field_key": "unit_description",
+              "field_value": "e743daae-286d-49fe-b7f9-0379e119807d",
+              "revision": 1,
+              "selected_by": 1,
+              "selected_at": "2026-10-05T16:04:59.980552+08:00"
+            }
+          ],
+          "capacity_sample": null,
+          "field_slots": [
+            {
+              "unit_key": "first",
+              "field_key": "unit_description",
+              "field_label": "Unit description",
+              "latest_value_id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+              "effective_language": "en",
+              "next_revision": 2,
+              "field_contract": {
+                "field_key": "unit_description",
+                "field_value_type": "long_text",
+                "field_definition": {
+                  "schema_version": 1,
+                  "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                  "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                  "key": "unit_description",
+                  "version": 1,
+                  "label": "Unit description",
+                  "category": "test",
+                  "description": "",
+                  "impact": "",
+                  "value_type": "long_text",
+                  "unit": "",
+                  "value_options": []
+                },
+                "field_value_options": [],
+                "fixed_value": null,
+                "has_default": false,
+                "default_value": null,
+                "source_selector": "projection.output",
+                "channel": "positive_prompt",
+                "position": 1,
+                "label_style": "label_colon",
+                "separator": "newline",
+                "required": true,
+                "omit_if_empty": true,
+                "max_chars": 7000,
+                "generation_mode": "model_generated",
+                "generation_source_selector": "request.structured_input",
+                "generation_instruction": "Use the declared facts for this unit only.",
+                "generation_output_semantics": "contribution",
+                "generation_required": true,
+                "language_policy": "en",
+                "length_unit": "none",
+                "generation_min": null,
+                "generation_max": null,
+                "generation_validator_keys": [],
+                "generation_context_selectors": [
+                  "project.style"
+                ],
+                "projection_primitive": "reference_context.detailed_description",
+                "source_path": [
+                  "direction"
+                ]
+              },
+              "source_language": "English",
+              "target_language": "English"
+            },
+            {
+              "unit_key": "second",
+              "field_key": "unit_description",
+              "field_label": "Unit description",
+              "latest_value_id": "e743daae-286d-49fe-b7f9-0379e119807d",
+              "effective_language": "en",
+              "next_revision": 2,
+              "field_contract": {
+                "field_key": "unit_description",
+                "field_value_type": "long_text",
+                "field_definition": {
+                  "schema_version": 1,
+                  "field_definition_id": "e32f734b-54b0-48a7-bf8a-6435d53ae02b",
+                  "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                  "key": "unit_description",
+                  "version": 1,
+                  "label": "Unit description",
+                  "category": "test",
+                  "description": "",
+                  "impact": "",
+                  "value_type": "long_text",
+                  "unit": "",
+                  "value_options": []
+                },
+                "field_value_options": [],
+                "fixed_value": null,
+                "has_default": false,
+                "default_value": null,
+                "source_selector": "projection.output",
+                "channel": "positive_prompt",
+                "position": 1,
+                "label_style": "label_colon",
+                "separator": "newline",
+                "required": true,
+                "omit_if_empty": true,
+                "max_chars": 7000,
+                "generation_mode": "model_generated",
+                "generation_source_selector": "request.structured_input",
+                "generation_instruction": "Use the declared facts for this unit only.",
+                "generation_output_semantics": "contribution",
+                "generation_required": true,
+                "language_policy": "en",
+                "length_unit": "none",
+                "generation_min": null,
+                "generation_max": null,
+                "generation_validator_keys": [],
+                "generation_context_selectors": [
+                  "project.style"
+                ],
+                "projection_primitive": "reference_context.detailed_description",
+                "source_path": [
+                  "direction"
+                ]
+              },
+              "source_language": "English",
+              "target_language": "English"
+            }
+          ],
+          "auxiliary_batches": [
+            {
+              "field_batch_key": "e1ff5a017eeeecb7cc0eb5816055af0c8fd4b0dc1c0adb8e7a3d8fa6af8ae27b",
+              "purpose": "generate_fields",
+              "field_keys": [
+                "unit_description",
+                "unit_description"
+              ],
+              "attempt_number": 0,
+              "task_id": null,
+              "preparation_id": null,
+              "status": "not_started",
+              "reason": "尚未开始；检查并继续后按本次授权准备辅助任务。",
+              "can_retry": false
+            }
+          ],
+          "response_diagnostic": null,
+          "cancellation": null,
+          "resource_review": null,
+          "text_response_review": null
+        },
+        "prompt": {
+          "preparation_id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "preparation_revision": 7,
+          "mode": "diagnostic",
+          "request_sha256": null,
+          "frozen_at": null,
+          "channels": [
+            {
+              "key": "system_instruction",
+              "text": "",
+              "character_count": 0
+            },
+            {
+              "key": "positive_prompt",
+              "text": "unit_description: Visual style: \nColor design:\n[Shot 1] Subjects: .\nCafé 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café 😀 turns slowly. Café \n\nFirst-frame continuity required: False; last-frame continuity required: False.\n[Shot 2] At 00:01.000, Subjects: .\nRésumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résumé 😀 opens here. Résum\n\nFirst-frame continuity required: False; last-frame continuity required: False.",
+              "character_count": 4264
+            },
+            {
+              "key": "negative_prompt",
+              "text": "",
+              "character_count": 0
+            },
+            {
+              "key": "structured_input",
+              "text": "",
+              "character_count": 0
+            }
+          ],
+          "field_basis": [
+            {
+              "unit_key": "first",
+              "field_key": "unit_description",
+              "field_value_id": "5548d522-4264-4f3d-92f7-9e05db3ad4e6",
+              "revision": 1,
+              "origin": "adopted",
+              "status": "confirmed"
+            },
+            {
+              "unit_key": "second",
+              "field_key": "unit_description",
+              "field_value_id": "e743daae-286d-49fe-b7f9-0379e119807d",
+              "revision": 1,
+              "origin": "adopted",
+              "status": "confirmed"
+            }
+          ],
+          "sources": {
+            "references": [],
+            "dialogue": []
+          },
+          "issues": [
+            "通道 positive_prompt 装配后为 4264 字符，超过配置上限 4000"
+          ],
+          "length_diagnostics": [
+            {
+              "channel": "system_instruction",
+              "character_count": 0,
+              "max_chars": null,
+              "over_by": 0,
+              "fragments": [],
+              "limit_sources": []
+            },
+            {
+              "channel": "positive_prompt",
+              "character_count": 4264,
+              "max_chars": 4000,
+              "over_by": 264,
+              "fragments": [
+                {
+                  "field_key": "unit_description",
+                  "label": "Unit description",
+                  "field_definition_version_id": "1ff5dec7-04d3-47cb-90b5-bb186c4cde09",
+                  "source_selector": "projection.output",
+                  "max_chars": 7000,
+                  "text_chars": 4264,
+                  "separator_chars": 0
+                }
+              ],
+              "limit_sources": [
+                {
+                  "source": "workflow.558b38ce-e6b6-4194-b99d-cdd47ff40f2e.prompt.positive",
+                  "max_chars": null
+                },
+                {
+                  "source": "profile.90f19937-b442-4c9c-8ea2-b91e9ca98972.positive_prompt",
+                  "max_chars": 4000
+                }
+              ]
+            },
+            {
+              "channel": "negative_prompt",
+              "character_count": 0,
+              "max_chars": null,
+              "over_by": 0,
+              "fragments": [],
+              "limit_sources": []
+            },
+            {
+              "channel": "structured_input",
+              "character_count": 0,
+              "max_chars": null,
+              "over_by": 0,
+              "fragments": [],
+              "limit_sources": []
+            }
+          ],
+          "prompt_mode": "profile",
+          "content_kind": "channels",
+          "messages": [],
+          "profile_basis": {
+            "version_id": "90f19937-b442-4c9c-8ea2-b91e9ca98972",
+            "version": 1,
+            "contract_sha256": "0d6dfc9e3212d52cc60ab9a30b52a3613dc177ab11603e8cd4a39ea807d2217d"
+          }
+        },
+        "metrics": {
+          "preparation_id": "0c0d39d0-1585-4d4a-9452-60c0d6eccf1f",
+          "preparation_revision": 7,
+          "observed_at": "2026-10-05T16:05:01.488394+08:00",
+          "items": [
+            {
+              "key": "intent",
+              "label": "原始输入意图",
+              "state": "recorded",
+              "basis": "canonical_json_utf8",
+              "schema_version": 1,
+              "size_bytes": 1338,
+              "sha256": "fd097e77161b11de32ce2b2a297eb95c890fa9a1afb311bb3cfec59cbcc2b578",
+              "current_limit_bytes": 65536,
+              "over_current_limit_bytes": 0
+            },
+            {
+              "key": "resolved_inputs",
+              "label": "已解析输入与来源",
+              "state": "recorded",
+              "basis": "canonical_json_utf8",
+              "schema_version": 1,
+              "size_bytes": 9979,
+              "sha256": "1a3843946068c1e591fc58d203529efc81a85438a63faf7b6cdd9895c2df5660",
+              "current_limit_bytes": 262144,
+              "over_current_limit_bytes": 0
+            },
+            {
+              "key": "review_contract",
+              "label": "字段审核合同",
+              "state": "recorded",
+              "basis": "canonical_json_utf8",
+              "schema_version": 1,
+              "size_bytes": 36,
+              "sha256": "f1805138515b0c0762ac6be5085e328ef4e1a0a6b657b6755121e30303b3f3e0",
+              "current_limit_bytes": 65536,
+              "over_current_limit_bytes": 0
+            },
+            {
+              "key": "evaluation",
+              "label": "准备评估",
+              "state": "not_generated",
+              "basis": "canonical_json_utf8",
+              "schema_version": null,
+              "size_bytes": null,
+              "sha256": null,
+              "current_limit_bytes": 65536,
+              "over_current_limit_bytes": null
+            },
+            {
+              "key": "prepared_request",
+              "label": "最终冻结请求文件",
+              "state": "not_generated",
+              "basis": "canonical_request_file_utf8",
+              "schema_version": null,
+              "size_bytes": null,
+              "sha256": null,
+              "current_limit_bytes": 8388608,
+              "over_current_limit_bytes": null
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

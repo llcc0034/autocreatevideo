@@ -13,9 +13,8 @@ from studio.services.model_profile_contracts import (
     verified_frozen_model_profile_specification,
     verified_model_profile_specification,
 )
-from studio.services.prompt_normalization import route_state
-from studio.services.production_runs import _freeze_stage_routing
-from studio.tests.factories import create_ready_prompt_normalization_test_deployment
+from studio.services.prompt_normalization import validate_prompt_normalization_model_profile
+from studio.tests.factories import create_prompt_normalization_test_deployment
 
 
 def _profile(specification: object) -> ModelProfileVersion:
@@ -100,11 +99,9 @@ class ModelProfileSpecificationIntegrityTests(SimpleTestCase):
 
 
 class ModelProfileRuntimeIntegrityTests(TestCase):
-    def test_prompt_route_and_deployment_target_reject_raw_database_drift(self):
-        deployment = create_ready_prompt_normalization_test_deployment()
-        state, reason, route = route_state(deployment)
-        self.assertEqual((state, reason), ("ready", "ready"))
-        self.assertIsNotNone(route)
+    def test_native_policy_and_deployment_target_reject_raw_database_drift(self):
+        deployment = create_prompt_normalization_test_deployment()
+        self.assertIsNotNone(validate_prompt_normalization_model_profile(deployment.profile_version))
         deployment_target_payload(deployment)
 
         drifted = deepcopy(deployment.profile_version.specification)
@@ -117,29 +114,8 @@ class ModelProfileRuntimeIntegrityTests(TestCase):
         with patch(
             "studio.services.prompt_normalization.driver_for",
         ) as driver_for_mock:
-            state, reason, route = route_state(deployment)
-
-        self.assertEqual(state, "unavailable")
-        self.assertEqual(reason, "model_profile_contract_invalid")
-        self.assertIsNone(route)
+            with self.assertRaises(ValidationError):
+                validate_prompt_normalization_model_profile(deployment.profile_version)
         driver_for_mock.assert_not_called()
         with self.assertRaises(ValidationError):
             deployment_target_payload(deployment)
-
-    def test_production_route_freeze_rejects_raw_database_drift(self):
-        deployment = create_ready_prompt_normalization_test_deployment()
-        drifted = deepcopy(deployment.profile_version.specification)
-        drifted["prompt_normalization"]["timeout_seconds"] = 181.0
-        ModelProfileVersion.objects.filter(
-            pk=deployment.profile_version_id,
-        ).update(specification=drifted)
-
-        with self.assertRaises(ValidationError):
-            _freeze_stage_routing({
-                "mode": "fixed",
-                "routes": [{
-                    "model_deployment_id": str(deployment.id),
-                }],
-                "variant_count": 1,
-                "evaluator": None,
-            }, stage_key="script_generate")

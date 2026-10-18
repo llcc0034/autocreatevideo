@@ -3,6 +3,8 @@ import { computed } from 'vue'
 import ModelContractFields from '@/components/ModelContractFields.vue'
 import PlatformStatusPill from '@/components/PlatformStatusPill.vue'
 import PromptPrimitiveConfiguration from '@/components/PromptPrimitiveConfiguration.vue'
+import PromptSourceHelp from '@/components/PromptSourceHelp.vue'
+import PromptRuleFlow from '@/components/PromptRuleFlow.vue'
 import { contractFieldsExcept, isContractObject } from '@/services/modelCapabilityContract'
 import { promptConfigurationLabel } from '@/services/promptProfileConfiguration'
 import { operationLabel, modeLabel } from '@/services/presentationLabels'
@@ -17,7 +19,7 @@ const emptyProjection = computed(() => isContractObject(projection.value) && !Ob
 const metadata = computed(() => contractFieldsExcept(props.profile, ['sourceProjectionConfig', 'channelLimits']))
 const sourceName = computed(() => props.options?.sourceProjectionKeys.find(item => item.value === props.profile.sourceProjectionKey)?.label)
 const technicalData = computed(() => JSON.stringify({ profile: props.profile, fieldRules: versionRules.value }, null, 2))
-const ruleIdentityKeys = ['id', 'createdAt', 'updatedAt', 'profileVersion', 'fieldDefinition']
+const ruleIdentityKeys = ['id', 'createdAt', 'updatedAt', 'profileVersion', 'fieldDefinition', 'fieldDefinitionVersion']
 const ruleIdentity = (rule: PromptProfileFieldRule) => Object.fromEntries(Object.entries(rule).filter(([key]) => ruleIdentityKeys.includes(key)))
 </script>
 
@@ -29,8 +31,8 @@ const ruleIdentity = (rule: PromptProfileFieldRule) => Object.fromEntries(Object
     </div>
     <p class="configuration-note">只读展示此版本已保存的配置，不补入新版默认值，不执行预览或模型调用。查看历史配置不代表当前可执行；当时依赖的内置代码文案不属于已保存配置，不能在这里还原。</p>
     <p v-if="profile.status === 'draft'" class="configuration-note">此版本尚未发布，展示的是已保存草稿，不包含编辑器中未保存的修改。</p>
-    <PromptPrimitiveConfiguration v-if="focusRule" :profile="profile" :rules="versionRules" :options="options" :focus-rule="focusRule" />
-    <p v-else-if="focusRuleId" role="alert">未读取到指定字段规则，请重新读取页面。以下仅展示当前版本的配置。</p>
+    <PromptPrimitiveConfiguration v-if="focusRule?.sourceSelector==='projection.output'" :profile="profile" :rules="versionRules" :options="options" :focus-rule="focusRule" />
+    <p v-else-if="focusRuleId&&!focusRule" role="alert">未读取到指定字段规则，请重新读取页面。以下仅展示当前版本的配置。</p>
     <details :open="!focusRule" aria-label="来源投影配置">
       <summary>来源投影配置与模板</summary>
       <p>{{ sourceName ? `${sourceName} · ` : '' }}<code>{{ profile.sourceProjectionKey }}</code></p>
@@ -49,8 +51,11 @@ const ruleIdentity = (rule: PromptProfileFieldRule) => Object.fromEntries(Object
       <h4>字段规则 · {{ versionRules.length }} 条</h4>
       <p v-if="versionRules.length !== profile.fieldRuleCount" role="alert">字段规则数据不完整：版本声明 {{ profile.fieldRuleCount }} 条，当前读取 {{ versionRules.length }} 条。请关闭后重新读取页面。</p>
       <p v-if="!versionRules.length" class="configuration-note">当前未读取到字段规则。</p>
-      <details v-for="rule in versionRules" :key="rule.id" class="rule-configuration">
+      <details v-for="rule in versionRules" :key="rule.id" class="rule-configuration" :open="rule.id===focusRuleId">
         <summary>{{ rule.position }} · {{ rule.fieldLabel || rule.fieldKey }} <small>{{ rule.fieldKey }} · {{ label(rule.channel) }}</small></summary>
+        <PromptRuleFlow :rule="rule" :profile="profile" :options="options" />
+        <PromptSourceHelp :selector="rule.sourceSelector" :sources="options?.sourceSelectors" :field-key="rule.fieldKey" :field-label="rule.fieldLabel" :channel="label(rule.channel)" :generation-mode="rule.generationMode" :generation-output-semantics="rule.generationOutputSemantics" />
+        <p v-if="rule.sourceVersion">引用来源版本：{{ rule.sourceDefinition?.name }} · v{{ rule.sourceDefinition?.version }} · {{ rule.sourceVersion }}。新版本不会自动替换此引用。</p>
         <ModelContractFields :value="contractFieldsExcept(rule, ruleIdentityKeys)" :label-for-key="label" />
         <details><summary>规则标识与记录时间</summary><ModelContractFields :value="ruleIdentity(rule)" :label-for-key="label" /></details>
       </details>

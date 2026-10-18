@@ -6,6 +6,9 @@ param(
     [switch]$ForcePortTakeover,
     [switch]$OpenBrowser,
     [switch]$SkipMigrate,
+    [string]$ExecutionCutoverReview = '',
+    [string]$ResourceCutoverReview = '',
+    [string]$ProductionRunCleanupReview = '',
     [int]$StartupTimeoutSeconds = 180,
     [ValidateRange(0, 128)]
     [double]$ComfyUIVramHeadroomGB = 0,
@@ -36,6 +39,126 @@ if ($ForceComfyUIRestart -and -not $RestartComfyUI) {
 }
 if ($StartupTimeoutSeconds -lt 10) {
     throw 'StartupTimeoutSeconds must be at least 10.'
+}
+if ($ExecutionCutoverReview -and ($SkipMigrate -or -not $SkipComfyUI -or $RestartComfyUI)) {
+    throw 'ExecutionCutoverReview requires -SkipComfyUI and database migrations; it never restarts GPU services.'
+}
+
+if ($ResourceCutoverReview -and ($ExecutionCutoverReview -or $SkipMigrate -or -not $SkipComfyUI -or $RestartComfyUI)) {
+    throw 'ResourceCutoverReview requires -SkipComfyUI, migrations, and no other cutover.'
+}
+
+if ($ProductionRunCleanupReview -and ($ExecutionCutoverReview -or $ResourceCutoverReview -or -not $SkipMigrate -or -not $SkipComfyUI -or $RestartComfyUI)) {
+    throw 'ProductionRunCleanupReview requires -SkipComfyUI -SkipMigrate and no other cutover.'
+}
+
+function Read-ProductionRunCleanupReview([string]$Path) {
+    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($file.PSIsContainer -or $file.Length -gt 65536) { throw 'Invalid production run cleanup review file.' }
+    $review = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    $keys = @($review.PSObject.Properties.Name | Sort-Object)
+    if (($keys -join ',') -cne 'backup_manifest,confirmation,detach_script_provenance,operator,plan_sha256,recipe_id,run_id') {
+        throw 'Unexpected production run cleanup review fields.'
+    }
+    foreach ($key in @('run_id', 'recipe_id')) {
+        if ($review.$key -isnot [string] -or $review.$key -cnotmatch '^[a-f0-9]{8}(-[a-f0-9]{4}){3}-[a-f0-9]{12}$') { throw 'Exact target UUIDs required.' }
+    }
+    if ($review.detach_script_provenance -isnot [bool]) { throw 'Explicit provenance detachment decision required.' }
+    if ($review.plan_sha256 -isnot [string] -or $review.plan_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Exact reviewed plan required.' }
+    if ($review.confirmation -cne 'DELETE_ONE_REVIEWED_RUN_AND_RECIPE_PRESERVE_CONTENT') { throw 'Explicit cleanup confirmation required.' }
+    if ($review.operator -isnot [string] -or [string]::IsNullOrWhiteSpace($review.operator) -or
+        $review.backup_manifest -isnot [string] -or [string]::IsNullOrWhiteSpace($review.backup_manifest)) { throw 'Existing operator and backup manifest required.' }
+    return $review
+}
+
+function Invoke-ProductionRunCleanup([object]$Review, [switch]$Execute) {
+    $arguments = @('manage.py', 'purge_incompatible_workflows', '--production-run', $Review.run_id,
+        '--recipe-version', $Review.recipe_id, '--backup-manifest', $Review.backup_manifest)
+    if ($Review.detach_script_provenance) { $arguments += '--detach-script-provenance' }
+    if ($Execute) { $arguments += @('--execute', '--writers-stopped', '--operator', $Review.operator,
+        '--expected-plan-sha256', $Review.plan_sha256, '--confirmation', $Review.confirmation) }
+    Push-Location $BackendRoot
+    try {
+        $output = & $BackendPython @arguments
+        Assert-LastExitCode 'Reviewed production run cleanup'
+        $report = ($output -join "`n") | ConvertFrom-Json
+        if ($report.plan_sha256 -cne $Review.plan_sha256) { throw 'Production run cleanup scope changed; review again.' }
+        if (-not $Execute -and @($report.blockers).Count -gt 0) { throw 'Production run cleanup has blocking references or unsettled work.' }
+        if ($Execute -and $report.mode -cne 'production_run_cleanup_completed') { throw 'Production run cleanup did not complete.' }
+        return $report
+    } finally { Pop-Location }
+}
+
+function Read-ResourceCutoverReview([string]$Path) {
+    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($file.PSIsContainer -or $file.Length -gt 65536) { throw 'Invalid resource review file.' }
+    $review = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    $keys = @($review.PSObject.Properties.Name | Sort-Object)
+    if (($keys -join ',') -cne 'backup_manifest,confirmation,operator,plan_sha256') { throw 'Unexpected resource review fields.' }
+    if ($review.plan_sha256 -isnot [string] -or $review.plan_sha256 -cnotmatch '^[a-f0-9]{64}$') { throw 'Exact reviewed plan required.' }
+    if ($review.confirmation -cne 'REPLACE_REVIEWED_RESOURCE_CONFIG_PRESERVE_CONTENT') { throw 'Explicit resource cleanup confirmation required.' }
+    if ([string]::IsNullOrWhiteSpace($review.operator) -or [string]::IsNullOrWhiteSpace($review.backup_manifest)) { throw 'Existing operator and backup manifest required.' }
+    return $review
+}
+
+function Invoke-ResourceCutover([object]$Review, [switch]$Execute) {
+    $arguments = @('manage.py', 'purge_incompatible_workflows', '--resource-policy-cutover',
+        '--operator', $Review.operator, '--backup-manifest', $Review.backup_manifest)
+    if ($Execute) { $arguments += @('--execute', '--expected-plan-sha256', $Review.plan_sha256, '--confirmation', $Review.confirmation) }
+    Push-Location $BackendRoot
+    try {
+        $output = & $BackendPython @arguments
+        Assert-LastExitCode 'Reviewed resource policy cleanup'
+        $report = ($output -join "`n") | ConvertFrom-Json
+        if (-not $Execute -and $report.plan_sha256 -cne $Review.plan_sha256) { throw 'Resource cleanup scope changed; review again.' }
+        if ($Execute -and $report.mode -cne 'resource_cutover_completed') { throw 'Resource cleanup did not complete.' }
+        return $report
+    } finally { Pop-Location }
+}
+
+function Read-ExecutionCutoverReview([string]$Path) {
+    $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+    if ($file.PSIsContainer -or $file.Length -gt 65536) { throw 'Invalid execution cutover review file.' }
+    $review = Get-Content -LiteralPath $file.FullName -Raw -Encoding UTF8 | ConvertFrom-Json
+    $keys = @($review.PSObject.Properties.Name | Sort-Object)
+    $expectedKeys = @('confirmation', 'obsolete_prompt_version_ids', 'operator', 'plan_sha256')
+    if (($keys -join ',') -ne ($expectedKeys -join ',')) { throw 'Unexpected execution cutover review fields.' }
+    if ($review.plan_sha256 -isnot [string] -or $review.plan_sha256 -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'The exact reviewed plan SHA256 is required.'
+    }
+    if ($review.confirmation -cne 'DELETE_REVIEWED_0144_EXECUTION_DATA_WITHOUT_BACKUP') {
+        throw 'Explicit irreversible execution cutover confirmation is required.'
+    }
+    if ($review.operator -isnot [string] -or [string]::IsNullOrWhiteSpace($review.operator)) {
+        throw 'An explicit existing platform operator is required.'
+    }
+    if ($review.obsolete_prompt_version_ids -isnot [array]) { throw 'Prompt version IDs must be an explicit array.' }
+    $ids = @($review.obsolete_prompt_version_ids | ForEach-Object { ([guid]$_).ToString() })
+    if (@($ids | Sort-Object -Unique).Count -ne $ids.Count) { throw 'Duplicate prompt version IDs in review.' }
+    $review.obsolete_prompt_version_ids = $ids
+    return $review
+}
+
+function Invoke-ExecutionCutover([object]$Review, [switch]$Execute) {
+    $arguments = @('manage.py', 'purge_incompatible_workflows', '--execution-cutover', '--operator', $Review.operator)
+    foreach ($id in $Review.obsolete_prompt_version_ids) { $arguments += @('--obsolete-prompt-version', $id) }
+    if ($Execute) {
+        $arguments += @('--execute', '--irreversible-without-backup',
+            '--expected-plan-sha256', $Review.plan_sha256, '--confirmation', $Review.confirmation)
+    }
+    Push-Location $BackendRoot
+    try {
+        $output = & $BackendPython @arguments
+        Assert-LastExitCode 'Reviewed execution cutover'
+        $report = ($output -join "`n") | ConvertFrom-Json
+        if ($Execute -and $report.mode -cne 'execution_cutover_deleted') { throw 'Execution cutover did not complete.' }
+        if (-not $Execute -and $report.plan_sha256 -cne $Review.plan_sha256) {
+            throw 'Execution cutover scope changed. Review a new exact plan before stopping services.'
+        }
+        return $report
+    } finally {
+        Pop-Location
+    }
 }
 
 function Normalize-PathEnvironment {
@@ -345,9 +468,9 @@ function Start-ServiceProcess(
     return $process
 }
 
-function Test-Http([string]$Url) {
+function Test-Http([string]$Url, [int]$TimeoutSeconds = 3) {
     try {
-        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 3
+        $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec $TimeoutSeconds
         return $response.StatusCode -ge 200 -and $response.StatusCode -lt 300
     } catch {
         return $false
@@ -369,7 +492,11 @@ function Get-ComfyUIQueueActivity {
 function Wait-Http([string]$Name, [string]$Url, [int]$TimeoutSeconds) {
     $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
     while ((Get-Date) -lt $deadline) {
-        if (Test-Http $Url) {
+        # A valid readiness response can take longer than a quick liveness
+        # probe. Use the remaining startup budget; repeatedly abandoning it
+        # after three seconds also piles up concurrent server evaluations.
+        $remainingSeconds = [Math]::Max(1, [int][Math]::Ceiling(($deadline - (Get-Date)).TotalSeconds))
+        if (Test-Http $Url -TimeoutSeconds $remainingSeconds) {
             Write-Host "$Name is ready: $Url" -ForegroundColor Green
             return
         }
@@ -462,7 +589,27 @@ if (-not $SkipComfyUI -and $RestartComfyUI -and @(Get-PortOwners 8188).Count -gt
 Write-Step 'Validating JWT signing-key separation before stopping services'
 Assert-JwtSigningKeyConfiguration -PythonPath $BackendPython -WorkingDirectory $BackendRoot
 
+if ($ExecutionCutoverReview) {
+    Write-Step 'Rechecking reviewed execution cleanup before stopping services (read only)'
+    $cutoverReview = Read-ExecutionCutoverReview -Path $ExecutionCutoverReview
+    $cutoverPreview = Invoke-ExecutionCutover -Review $cutoverReview
+    Write-Host ($cutoverPreview.counts | ConvertTo-Json -Compress) -ForegroundColor DarkGray
+}
+
+if ($ResourceCutoverReview) {
+    Write-Step 'Rechecking reviewed resource cleanup and backup before stopping services'
+    $resourceReview = Read-ResourceCutoverReview -Path $ResourceCutoverReview
+    $resourcePreview = Invoke-ResourceCutover -Review $resourceReview
+    Write-Host ($resourcePreview.counts | ConvertTo-Json -Compress) -ForegroundColor DarkGray
+}
+
 Write-Step 'Stopping previous AutoPrompt application services'
+if ($ProductionRunCleanupReview) {
+    Write-Step 'Rechecking exact production run cleanup and backup before stopping services'
+    $productionCleanupReview = Read-ProductionRunCleanupReview -Path $ProductionRunCleanupReview
+    $productionCleanupPreview = Invoke-ProductionRunCleanup -Review $productionCleanupReview
+    Write-Host ($productionCleanupPreview.counts | ConvertTo-Json -Compress) -ForegroundColor DarkGray
+}
 Stop-RecordedServices
 Stop-ProjectPythonProcesses
 Stop-PortListener 8000 @('python', 'pythonw') 'Django'
@@ -479,6 +626,18 @@ if (-not $SkipComfyUI -and $RestartComfyUI) {
     Stop-PortListener 8188 @('python', 'pythonw') 'ComfyUI'
 }
 
+if ($ExecutionCutoverReview) {
+    Write-Step 'Executing reviewed cleanup with platform writers stopped'
+    $cutoverResult = Invoke-ExecutionCutover -Review $cutoverReview -Execute
+    Write-Host ($cutoverResult | ConvertTo-Json -Depth 8)
+}
+
+if ($ProductionRunCleanupReview) {
+    Write-Step 'Deleting only the reviewed cancelled run and retired recipe with platform writers stopped'
+    $productionCleanupResult = Invoke-ProductionRunCleanup -Review $productionCleanupReview -Execute
+    Write-Host ($productionCleanupResult | ConvertTo-Json -Depth 8)
+}
+
 if (-not $SkipMigrate) {
     Write-Step 'Applying database migrations'
     Push-Location $BackendRoot
@@ -488,6 +647,12 @@ if (-not $SkipMigrate) {
     } finally {
         Pop-Location
     }
+}
+
+if ($ResourceCutoverReview) {
+    Write-Step 'Replacing reviewed resource configuration with platform writers stopped'
+    $resourceResult = Invoke-ResourceCutover -Review $resourceReview -Execute
+    Write-Host ($resourceResult | ConvertTo-Json -Depth 8)
 }
 
 Write-Step 'Recovering interrupted assembly records'

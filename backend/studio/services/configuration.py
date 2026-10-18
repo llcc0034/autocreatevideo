@@ -19,7 +19,7 @@ from studio.models import (
     ConfigDefinition,
     ConfigRevision,
     ConfigValue,
-    ModelDeployment,
+    ModelExecutionInstanceVersion,
     ModelProfileVersion,
     ProductionRun,
     SeriesProject,
@@ -39,6 +39,7 @@ from studio.services.model_profile_contracts import (
     verified_model_profile_specification,
 )
 from studio.services.provider_registry import credential_reference_digest
+from studio.services.security_boundaries import security_boundary_resolution_cache
 
 
 class ConfigurationResolutionError(RuntimeError):
@@ -62,7 +63,7 @@ PROJECT_CREATION_POLICY_CONFIG_KEYS = (
     "production.default_include_audio",
 )
 
-PROJECT_CREATION_POLICY_SCHEMA_VERSION = 2
+PROJECT_CREATION_POLICY_SCHEMA_VERSION = 3
 
 SECURITY_BOUNDARY_DOMAIN = "security"
 
@@ -171,7 +172,6 @@ def project_creation_policy(
         "default_episode_count",
         "default_shots_per_episode",
         "default_episode_duration_seconds",
-        "default_max_generation_tasks",
         "continuity_seed_policy",
     }
     if (
@@ -242,7 +242,6 @@ def project_creation_policy(
         "default_episode_count",
         "default_shots_per_episode",
         "default_episode_duration_seconds",
-        "default_max_generation_tasks",
     )
     if any(type(raw[field]) is not int or raw[field] < 1 for field in integer_fields):
         raise ConfigurationResolutionError(
@@ -341,9 +340,9 @@ def redact_sensitive_bindings(
     """Defensively remove credential binding identifiers from API snapshots."""
 
     if _usage_max_count is None:
-        resolved = resolve_security_boundaries(
-            required_keys=("security.prompt.max_usage_count",),
-        )
+        from studio.services.security_boundaries import boundary_resolution
+
+        resolved = boundary_resolution(("security.prompt.max_usage_count",))
         raw_maximum = resolved.values["security.prompt.max_usage_count"]
         if type(raw_maximum) is not int or raw_maximum < 1:
             raise ConfigurationResolutionError(
@@ -570,6 +569,9 @@ def validate_config_value(
         raise ValidationError({definition.key: f"值类型必须为 {expected}"})
 
     schema = definition.value_schema if isinstance(definition.value_schema, dict) else {}
+    if definition.key == "execution.resources.review_policy":
+        from studio.services.execution_resource_policy import validate_resource_policy
+        validate_resource_policy(value)
     if schema.get("closed_contract") is True:
         _validate_closed_configuration_contract(
             value,
@@ -693,6 +695,54 @@ def _validate_closed_configuration_contract(
             )
 
 
+def validate_config_resource_reference_schema(resource_ref: Any) -> dict[str, Any]:
+    """Only explicit version recommendations; never a deployment/Smoke gate."""
+    if not isinstance(resource_ref, dict):
+        raise ValidationError("resource_ref 必须是对象")
+    extra = set(resource_ref) - {"resource", "capability", "allow_empty"}
+    capability = resource_ref.get("capability")
+    if extra:
+        raise ValidationError(f"resource_ref 包含未注册字段: {', '.join(sorted(extra))}")
+    if (
+        resource_ref.get("resource") != "execution_instance_version"
+        or not isinstance(capability, str)
+        or not re.fullmatch(r"[a-z][a-z0-9_.-]{1,99}", capability)
+        or type(resource_ref.get("allow_empty", False)) is not bool
+    ):
+        raise ValidationError("resource_ref 必须声明精确执行实例版本、执行能力与 allow_empty 布尔约束")
+    return resource_ref
+
+
+def _config_resource_reference(definition):
+    schema = definition.value_schema if isinstance(definition.value_schema, dict) else {}
+    try:
+        return validate_config_resource_reference_schema(schema.get("resource_ref"))
+    except ValidationError as exc:
+        raise ValidationError({definition.key: exc.messages}) from exc
+
+
+def _config_execution_reference_state(version):
+    """Local published identity only, not admission, capacity, or Smoke."""
+    from studio.services.execution_definitions import verify_stored_execution_definition
+    from studio.models import ExecutionVersionContract
+
+    if not version.instance.is_active or version.status != "published":
+        return "unavailable", "execution_instance_inactive"
+    if (
+        version.deployment.status != "active"
+        or version.deployment.profile_version.status != "published"
+        or not version.deployment.profile_version.provider.is_active
+        or (version.prompt_profile_version_id and version.prompt_profile_version.status != "published")
+        or (version.workflow_version_id and version.workflow_version.status != "published")
+    ):
+        return "unavailable", "execution_resource_inactive"
+    try:
+        verify_stored_execution_definition(version.contract)
+    except (ExecutionVersionContract.DoesNotExist, ValidationError):
+        return "unavailable", "execution_definition_conflict"
+    return "configured", ""
+
+
 def _validate_config_resource_reference(
     *,
     definition: ConfigDefinition,
@@ -700,101 +750,57 @@ def _validate_config_resource_reference(
     resource_ref: Any,
     validate_resource_state: bool,
 ) -> None:
-    """Validate a machine-readable dependency selected by configuration UI.
-
-    The schema extension is intentionally closed and server-owned.  It keeps
-    configuration values as ordinary immutable JSON while ensuring a UUID is
-    not accepted merely because it has the right shape.
-    """
-
-    if not isinstance(resource_ref, dict):
-        raise ValidationError({definition.key: "resource_ref 必须是对象"})
-    resource = str(resource_ref.get("resource") or "").strip()
-    capability = str(resource_ref.get("capability") or "").strip()
-    allow_empty = resource_ref.get("allow_empty", False)
-    require_ready = resource_ref.get("require_ready", True)
-    if type(allow_empty) is not bool or type(require_ready) is not bool:
-        raise ValidationError({definition.key: "resource_ref 的布尔约束无效"})
-    if resource != "model_deployment" or not capability:
-        raise ValidationError({
-            definition.key: "当前仅支持声明 capability 的 model_deployment 资源引用",
-        })
+    try:
+        reference = validate_config_resource_reference_schema(resource_ref)
+    except ValidationError as exc:
+        raise ValidationError({definition.key: exc.messages}) from exc
     if not value:
-        if allow_empty:
+        if reference.get("allow_empty", False):
             return
-        raise ValidationError({definition.key: "必须选择一个可用的模型部署"})
+        raise ValidationError({definition.key: "请选择一个精确执行实例版本"})
     if not validate_resource_state:
-        # Revision resolution is an integrity read, not a deployment health
-        # gate.  The immutable JSON value and its checksum remain auditable
-        # even after the referenced deployment is disabled or its smoke
-        # evidence expires.  Consumers re-check the live route before use.
+        # Integrity reads keep the immutable value; only a newly selected
+        # recommendation rechecks its target. Every task has its own admission.
         return
     try:
-        deployment = ModelDeployment.objects.select_related(
-            "profile_version__provider",
-        ).get(id=value)
-    except (ModelDeployment.DoesNotExist, ValueError, TypeError):
-        raise ValidationError({definition.key: "所选模型部署不存在"})
-
-    if capability == "prompt.normalize":
-        from studio.services.prompt_normalization import (
-            ROUTE_CONTEXT_DURABLE_ATTEMPT,
-            route_state,
-        )
-
-        state, reason_code, _route = route_state(
-            deployment,
-            execution_context=ROUTE_CONTEXT_DURABLE_ATTEMPT,
-        )
-        if require_ready and state != "ready":
-            raise ValidationError({
-                definition.key: f"所选模型部署尚不可用于 prompt.normalize: {reason_code}",
-            })
-        if not require_ready and state == "unavailable":
-            raise ValidationError({
-                definition.key: f"所选模型部署不兼容 prompt.normalize: {reason_code}",
-            })
-        return
-    raise ValidationError({definition.key: f"尚未注册资源能力: {capability}"})
+        version = config_resource_reference_candidates(definition).get(pk=value)
+    except (ModelExecutionInstanceVersion.DoesNotExist, ValueError, TypeError, ValidationError):
+        raise ValidationError({definition.key: "所选执行实例版本不存在或执行能力不匹配"})
+    state, reason = _config_execution_reference_state(version)
+    if state != "configured":
+        raise ValidationError({definition.key: f"所选执行实例版本不可推荐: {reason}"})
+    from studio.services.execution_definitions import verify_current_execution_definition
+    try:
+        verify_current_execution_definition(version.contract)
+    except ValidationError as exc:
+        raise ValidationError({definition.key: "精确执行实例合同已变化，请选择当前有效版本"}) from exc
 
 
-def config_resource_reference_options(definition: ConfigDefinition) -> list[dict[str, Any]]:
-    """Return safe, server-validated choices for a resource_ref definition."""
+def config_resource_reference_candidates(definition):
+    reference = _config_resource_reference(definition)
+    return ModelExecutionInstanceVersion.objects.filter(
+        operation=reference["capability"],
+    ).select_related(
+        "instance", "contract", "deployment__profile_version__provider",
+        "prompt_profile_version", "workflow_version",
+    ).order_by("instance__key", "-version", "pk")
 
-    schema = definition.value_schema if isinstance(definition.value_schema, dict) else {}
-    resource_ref = schema.get("resource_ref")
-    if not isinstance(resource_ref, dict):
-        return []
-    resource = str(resource_ref.get("resource") or "").strip()
-    capability = str(resource_ref.get("capability") or "").strip()
-    require_ready = resource_ref.get("require_ready", True)
-    if resource != "model_deployment" or not capability or type(require_ready) is not bool:
-        raise ValidationError({definition.key: "resource_ref 定义无效"})
 
-    if capability != "prompt.normalize":
-        raise ValidationError({definition.key: f"尚未注册资源能力: {capability}"})
-    from studio.services.prompt_normalization import (
-        ROUTE_CONTEXT_DURABLE_ATTEMPT,
-        route_state,
-    )
-
-    rows: list[dict[str, Any]] = []
-    deployments = ModelDeployment.objects.select_related(
-        "profile_version__provider",
-    ).order_by("name", "key")
-    for deployment in deployments:
-        state, reason_code, _route = route_state(
-            deployment,
-            execution_context=ROUTE_CONTEXT_DURABLE_ATTEMPT,
-        )
+@security_boundary_resolution_cache()
+def config_resource_reference_options(definition, versions) -> list[dict[str, Any]]:
+    """Render only the requested SQL page; no provider or worker I/O."""
+    reference = _config_resource_reference(definition)
+    rows = []
+    for version in versions:
+        state, reason = _config_execution_reference_state(version)
         rows.append({
-            "value": str(deployment.id),
-            "label": f"{deployment.name} · {deployment.profile_version.model_identifier}",
-            "resource": resource,
-            "capability": capability,
+            "value": str(version.pk),
+            "label": f"{version.instance.name} · v{version.version} · {version.operation}",
+            "resource": reference["resource"],
+            "capability": reference["capability"],
             "state": state,
-            "reason_code": reason_code,
-            "is_selectable": state == "ready" if require_ready else state != "unavailable",
+            "reason_code": reason,
+            "is_selectable": state == "configured",
         })
     return rows
 
@@ -999,6 +1005,19 @@ def create_config_revision(
     return revision
 
 
+def verify_config_value_storage_contract(row):
+    """Check stored non-secret configuration bytes without resolving configuration.
+
+    This is the shared bootstrap integrity check, including maintenance of a
+    retired configuration. It does not validate that a retired key is usable.
+    """
+    return verify_json_contract(
+        row.value, schema_version=row.value_schema_version,
+        size_bytes=row.value_size_bytes, sha256=row.value_sha256,
+        max_bytes=DEFAULT_JSON_LIMIT_BYTES,
+    )
+
+
 def _verify_revision(
     revision: ConfigRevision,
     *,
@@ -1047,15 +1066,7 @@ def _verify_revision(
                 "credential_binding_sha256": credential_reference_digest(row.credential_version),
             }
         else:
-            verify_json_contract(
-                row.value,
-                schema_version=row.value_schema_version,
-                size_bytes=row.value_size_bytes,
-                sha256=row.value_sha256,
-                # See create_config_revision: this is the bootstrap integrity
-                # path for the boundary registry, not a runtime payload.
-                max_bytes=DEFAULT_JSON_LIMIT_BYTES,
-            )
+            verify_config_value_storage_contract(row)
             value = row.value
         resolved[definition.key] = (value, row)
         digest_values[definition.key] = value

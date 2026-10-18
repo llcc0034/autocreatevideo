@@ -1,6 +1,5 @@
 from copy import deepcopy
 
-from studio.tests.reference_rendering_fixtures import LEGACY_H3_SELECTOR_TO_PRIMITIVE
 from uuid import uuid4
 
 from django.contrib.auth import get_user_model
@@ -10,10 +9,7 @@ from studio.models import (
     Asset,
     CharacterBible,
     Episode,
-    GenerationTask,
-    GeneratedWorkflow,
     ModelDeployment,
-    ModelDeploymentCapabilitySnapshot,
     ModelProfileVersion,
     ProviderProfile,
     RuntimeHost,
@@ -21,26 +17,12 @@ from studio.models import (
     SeriesProject,
     Shot,
     Style,
-    WorkflowTemplateVersion,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    StyleCategory,
     PromptProfileFieldRule,
     PromptProfileVersion,
 )
-from studio.services.deployment_smoke import record_deployment_capability_snapshot
-from studio.services.json_contracts import assign_json_contract, json_contract
+from studio.services.json_contracts import assign_json_contract
 from studio.services.prompt_normalization_contract import PROMPT_NORMALIZE_OPERATION
-from studio.services.prompt_profiles import (
-    DECLARATIVE_SOURCE_PROJECTION_KEY,
-    DIRECT_SOURCE_PROJECTION_KEY,
-    PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
-    model_family_for_profile,
-    publish_prompt_profile,
-    refresh_prompt_profile_contract,
-)
-from studio.services.source_projection_primitives import (
-    REFERENCE_CONTEXT_ENGINE_KEY,
-)
 
 
 # Canonical v15 example data.  This belongs to tests/seed fixtures rather than
@@ -78,54 +60,6 @@ H3_REF2VA_OFFICIAL_RULE_SPECS = (
         PromptProfileFieldRule.LabelStyle.LABEL_COLON,
     ),
 )
-
-
-def series_concept_field_contract() -> dict:
-    return deepcopy({
-        "schema_version": 1,
-        "idea": {"max_chars": 6_000, "required": True, "single_line": False},
-        "style_hint": {"max_chars": 2_000, "required": False, "single_line": False},
-        "title": {"max_chars": 60, "required": True, "single_line": True},
-        "logline": {"max_chars": 500, "required": True, "single_line": True},
-        "bible.entity.name": {"max_chars": 160, "required": True, "single_line": True},
-        "bible.entity.description": {"max_chars": 2_000, "required": False, "single_line": True},
-        "bible.entity.visual_identity_en": {"max_chars": 3_000, "required": False, "single_line": True},
-        "episode.title": {"max_chars": 80, "required": True, "single_line": True},
-        "shot.setting": {"max_chars": 200, "required": True, "single_line": True},
-        "shot.action": {"max_chars": 500, "required": True, "single_line": True},
-        "shot.dialogue.speaker": {"max_chars": 80, "required": False, "single_line": True},
-        "shot.dialogue.delivery": {"max_chars": 120, "required": False, "single_line": True},
-        "shot.dialogue.text": {"max_chars": 240, "required": False, "single_line": True},
-    })
-
-
-def series_concept_resource_advisory() -> dict:
-    return {
-        "schema_version": 1,
-        "input_protocol_overhead_chars": 2_048,
-        "output_base_units": 512,
-        "output_units_per_shot": 200,
-        "minimum_output_units": 1_024,
-        "output_hint_warning_percent": 80,
-        "script_breakdown_reference_chars": 1_000_000,
-    }
-
-
-def script_structure_field_contract() -> dict:
-    return deepcopy({
-        "schema_version": 1,
-        "title": {"max_chars": 200, "required": True, "single_line": True},
-        "logline": {"max_chars": 2_000, "required": True, "single_line": True},
-        "bible.entity.name": {"max_chars": 160, "required": True, "single_line": True},
-        "bible.entity.description": {"max_chars": 2_000, "required": False, "single_line": True},
-        "bible.entity.visual_identity_en": {"max_chars": 3_000, "required": False, "single_line": True},
-        "episode.title": {"max_chars": 200, "required": True, "single_line": True},
-        "shot.setting": {"max_chars": 500, "required": True, "single_line": True},
-        "shot.action": {"max_chars": 4_000, "required": True, "single_line": True},
-        "shot.dialogue.speaker": {"max_chars": 160, "required": False, "single_line": True},
-        "shot.dialogue.delivery": {"max_chars": 240, "required": False, "single_line": True},
-        "shot.dialogue.text": {"max_chars": 2_000, "required": False, "single_line": True},
-    })
 
 
 def conditioning_contract(
@@ -385,189 +319,10 @@ def workflow_primary_output(graph: dict, *, kind: str) -> dict:
     }
 
 
-def create_test_prompt_profile_binding(
-    *,
-    actor,
-    model_profile_version,
-    operation: str,
-    mode: str = "",
-) -> PromptProfileBinding:
-    """Create one explicit reviewed PromptProfile for a production test route."""
-
-    family = model_family_for_profile(model_profile_version)
-    suffix = f"{model_profile_version.id.hex[:12]}-{operation.replace('.', '-')}-{mode or 'default'}"
-    from studio.tests.reference_rendering_fixtures import rendering_config
-
-    profile = PromptProfileVersion.objects.create(
-        profile_key=f"test.{suffix}"[:191],
-        version=1,
-        name=f"Test {operation} {mode or 'default'}",
-        model_family=family,
-        operation=operation,
-        mode=mode,
-        source_projection_key=(
-            DECLARATIVE_SOURCE_PROJECTION_KEY
-            if operation == "video.generate" and mode == "Ref2VA"
-            else DIRECT_SOURCE_PROJECTION_KEY
-        ),
-        source_projection_config=(
-            {
-                "schema_version": 5,
-                "primitive_options": {REFERENCE_CONTEXT_ENGINE_KEY: {
-                    "rendering": rendering_config()["primitive_options"]["reference_context_ir_v1"]["rendering"],
-                }},
-            }
-            if operation == "video.generate" and mode == "Ref2VA"
-            else {}
-        ),
-        review_state=PromptProfileVersion.ReviewState.READY,
-        contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
-    )
-    if operation == "video.generate" and mode == "Ref2VA":
-        generated_sources = {
-            "detailed_description": (
-                "shot.detailed_description", 140, 220,
-                "Expand only the frozen visible shot facts in chronological order.",
-            ),
-            "overall_soundscape": (
-                "shot.sound_effects", 1, 80,
-                "Describe only supported diegetic ambience and synchronized sounds.",
-            ),
-            "non_diegetic_music": (
-                "shot.music", 1, 60,
-                "Describe only supported non-diegetic music and silence.",
-            ),
-        }
-        for position, (selector, field_key, label_style) in enumerate(
-            H3_REF2VA_OFFICIAL_RULE_SPECS,
-            start=1,
-        ):
-            definition, _ = PromptFieldDefinition.objects.get_or_create(
-                key=field_key,
-                defaults={
-                    "label": field_key,
-                    "category": "test_h3_ref2va",
-                    "description": "Official H3 Ref2VA Context-IR test field.",
-                    "impact": "Affects the frozen H3 Ref2VA model prompt.",
-                    "value_type": PromptFieldDefinition.ValueType.LONG_TEXT,
-                },
-            )
-            PromptProfileFieldRule.objects.create(
-                profile_version=profile,
-                field_definition=definition,
-                source_selector=PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT,
-                projection_primitive=LEGACY_H3_SELECTOR_TO_PRIMITIVE[selector],
-                channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
-                position=position,
-                label_style=label_style,
-                separator=PromptProfileFieldRule.Separator.NEWLINE,
-                required=True,
-                omit_if_empty=False,
-                max_chars=7000,
-                generation_mode=(
-                    PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
-                    if field_key in generated_sources
-                    else PromptProfileFieldRule.GenerationMode.SERVER_LOCKED
-                ),
-                generation_source_selector=(
-                    generated_sources[field_key][0]
-                    if field_key in generated_sources
-                    else PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
-                ),
-                generation_instruction=(
-                    generated_sources[field_key][3]
-                    if field_key in generated_sources else ""
-                ),
-                generation_output_semantics=(
-                    PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
-                    if field_key in generated_sources
-                    else PromptProfileFieldRule.GenerationOutputSemantics.FINAL
-                ),
-                generation_required=True,
-                language_policy="en" if field_key in generated_sources else "any",
-                length_unit=(
-                    PromptProfileFieldRule.LengthUnit.ENGLISH_WORDS
-                    if field_key in generated_sources
-                    else PromptProfileFieldRule.LengthUnit.NONE
-                ),
-                generation_min=(
-                    generated_sources[field_key][1]
-                    if field_key in generated_sources else None
-                ),
-                generation_max=(
-                    generated_sources[field_key][2]
-                    if field_key in generated_sources else None
-                ),
-                generation_validator_keys=(
-                    [
-                        PromptProfileFieldRule.GenerationValidator.NON_EMPTY,
-                        PromptProfileFieldRule.GenerationValidator.NO_CONTROL_CHARACTERS,
-                        PromptProfileFieldRule.GenerationValidator.NO_UNRESOLVED_PLACEHOLDERS,
-                    ]
-                    if field_key in generated_sources else []
-                ),
-                generation_context_selectors=(
-                    [
-                        PromptProfileFieldRule.GenerationContextSelector.PROJECT_STYLE,
-                        PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_CORE,
-                        PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_DIALOGUE_METADATA,
-                        PromptProfileFieldRule.GenerationContextSelector.TARGET_SHOT_LINKED_BIBLE,
-                    ]
-                    if field_key in generated_sources else []
-                ),
-            )
-    else:
-        definition = PromptFieldDefinition.objects.create(
-            key=f"test_policy_{suffix}"[:191],
-            label="Reviewed test policy",
-            category="test",
-            description="Explicit test-only policy required by the production PromptProfile gate.",
-            impact="Affects the frozen model request in this test only.",
-            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
-            default_value="Use the strict fixture contract without adding unsupported facts.",
-        )
-        PromptProfileFieldRule.objects.create(
-            profile_version=profile,
-            field_definition=definition,
-            source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
-            channel=(
-                PromptProfileFieldRule.Channel.POSITIVE_PROMPT
-                if operation in {"image.generate", "video.generate"}
-                else PromptProfileFieldRule.Channel.SYSTEM_INSTRUCTION
-            ),
-            position=1,
-            max_chars=4000,
-            generation_mode=PromptProfileFieldRule.GenerationMode.PASSTHROUGH,
-            generation_source_selector=(
-                PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT
-            ),
-        )
-    refresh_prompt_profile_contract(
-        profile,
-        schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
-    )
-    profile = publish_prompt_profile(profile, actor=actor)
-    return PromptProfileBinding.objects.create(
-        key=f"test-binding-{suffix}"[:191],
-        name=f"Test binding {operation} {mode or 'default'}",
-        operation=operation,
-        model_family=family,
-        mode=mode,
-        model_profile_version=model_profile_version,
-        prompt_profile_version=profile,
-        is_active=True,
-    )
 
 
-def create_ready_prompt_normalization_test_deployment() -> ModelDeployment:
-    """Create one exact, selectable prompt.normalize route for API tests.
-
-    Tests that exercise translation orchestration mock the actual model call, but
-    their configuration still has to reference a real active deployment with a
-    published capability contract and fresh smoke evidence.  Keeping that
-    control-plane state realistic prevents a random UUID from bypassing the
-    production resource-reference gate.
-    """
+def create_prompt_normalization_test_deployment() -> ModelDeployment:
+    """Create a native protocol fixture, not route or Smoke evidence."""
 
     suffix = uuid4().hex[:12]
     host = RuntimeHost.objects.create(
@@ -605,7 +360,6 @@ def create_ready_prompt_normalization_test_deployment() -> ModelDeployment:
         "capabilities": [PROMPT_NORMALIZE_OPERATION],
         "prompt_normalization": {
             "max_input_bytes": 29_000,
-            "max_output_tokens": 8_192,
             "max_items_per_batch": 4,
             "timeout_seconds": 180.0,
             "chat_request_options": {
@@ -624,260 +378,14 @@ def create_ready_prompt_normalization_test_deployment() -> ModelDeployment:
     )
     assign_json_contract(deployment, "runtime_config", {})
     deployment.save()
-    from studio.services.deployment_smoke_profiles import select_smoke_profile, smoke_profile_reference
-    actor = get_user_model().objects.filter(is_superuser=True).first()
-    if actor is None:
-        actor = get_user_model().objects.create(username=f"fixture-reviewer-{suffix}", is_superuser=True, is_staff=True)
-    binding = create_test_prompt_profile_binding(actor=actor, model_profile_version=profile, operation=PROMPT_NORMALIZE_OPERATION)
-    selected = select_smoke_profile(deployment, PROMPT_NORMALIZE_OPERATION, binding.id)
-    record_deployment_capability_snapshot(
-        deployment,
-        probe_kind=ModelDeploymentCapabilitySnapshot.ProbeKind.SMOKE,
-        status=ModelDeploymentCapabilitySnapshot.Status.PASSED,
-        operations=[PROMPT_NORMALIZE_OPERATION],
-        evidence={
-            "schema_version": 1,
-            "execution_submitted": True,
-            "test_fixture": True,
-            "prompt_profile": smoke_profile_reference(deployment, PROMPT_NORMALIZE_OPERATION, selected),
-        },
-    )
     return deployment
-
-
-def freeze_current_task_contract(
-    task: GenerationTask,
-    *,
-    resolved_semantics: dict | None = None,
-    asset_bindings: list[dict] | None = None,
-    continuity_assets: list[dict] | None = None,
-    resolution_multiple: int = 1,
-) -> GenerationTask:
-    """Give a task the same immutable projection contract as current production."""
-
-    workflow: GeneratedWorkflow = task.generated_workflow
-    prompt = workflow.prompt_artifact
-    template = workflow.template
-    graph_contract = json_contract(workflow.workflow_json)
-    input_contract = {
-        "schema_version": 2,
-        "compiler": {"id": "generic.comfy", "version": 1},
-        "workflow_mode": "semantic",
-        "required_dimension_multiple": int(resolution_multiple),
-    }
-    input_contract_json = json_contract(input_contract)
-    version = workflow.workflow_template_version
-    if version is None:
-        execution_contract_sha256 = json_contract({
-            "graph_sha256": graph_contract.sha256,
-            "input_contract_sha256": input_contract_json.sha256,
-        }).sha256
-        version = WorkflowTemplateVersion.objects.create(
-            template=template,
-            version=max(
-                template.platform_versions.values_list("version", flat=True),
-                default=0,
-            ) + 1,
-            graph=deepcopy(workflow.workflow_json),
-            graph_size_bytes=graph_contract.size_bytes,
-            graph_sha256=graph_contract.sha256,
-            input_contract=input_contract,
-            input_contract_size_bytes=input_contract_json.size_bytes,
-            input_contract_sha256=input_contract_json.sha256,
-            compiler_id="generic.comfy",
-            compiler_version=1,
-            semantic_bindings_sha256=json_contract([]).sha256,
-            model_requirements_sha256=json_contract([]).sha256,
-            execution_contract_sha256=execution_contract_sha256,
-        )
-    execution_contract_sha256 = str(version.execution_contract_sha256 or "")
-    if not execution_contract_sha256:
-        execution_contract_sha256 = json_contract({
-            "version_id": str(version.id),
-            "graph_sha256": graph_contract.sha256,
-        }).sha256
-        version.execution_contract_sha256 = execution_contract_sha256
-        version.save(update_fields=("execution_contract_sha256", "updated_at"))
-
-    is_image = task.kind == GenerationTask.Kind.IMAGE
-    width = int(task.project.width)
-    height = int(task.project.height)
-    duration_ms = int(
-        task.effective_duration_ms
-        or prompt.total_duration_ms
-        or getattr(prompt.shot, "duration_ms", 0)
-        or 1000
-    )
-    fps = int(task.project.fps or 24)
-    frames = int(task.effective_frames or max(1, round(duration_ms * fps / 1000)))
-    semantics = deepcopy(resolved_semantics) if resolved_semantics is not None else {
-        "prompt.positive": str(prompt.prompt_text or "fixture prompt"),
-        "image.width": width,
-        "image.height": height,
-        "sampling.seed": int(task.seed),
-    }
-    if prompt.negative_prompt and "prompt.negative" not in semantics:
-        semantics["prompt.negative"] = str(prompt.negative_prompt)
-    if not is_image:
-        semantics.update({
-            "video.fps": fps,
-            "video.duration_ms": duration_ms,
-            "video.frames": frames,
-            "audio.enabled": bool(prompt.include_audio),
-        })
-
-    payload = prompt.structured_payload if isinstance(prompt.structured_payload, dict) else {}
-    mode = (
-        "TEXT_ONLY" if is_image else str(
-            payload.get("effective_conditioning_mode")
-            or prompt.conditioning_mode
-            or "test_video"
-        )
-    )
-    selected_mode = None if is_image else {"key": mode}
-    conditioning = {
-        "schema_version": 1,
-        "modes": [] if is_image else [selected_mode],
-    }
-    monitoring = {"schema_version": 1, "stages": []}
-    model_identifier = str(
-        task.model_profile or prompt.model or template.model or "fixture-model"
-    )
-    execution_metadata = {
-        "schema_version": 1,
-        "workflow_version_id": str(version.id),
-        "workflow_version": int(version.version),
-        "template": {
-            "id": str(template.id),
-            "slug": template.slug,
-            "name": template.name,
-            "output_kind": task.kind,
-        },
-        "model_identifier": model_identifier,
-        "workflow_mode": "semantic",
-        "source_workflow": "",
-        "required_dimension_multiple": int(resolution_multiple),
-        "conditioning_contract": conditioning,
-        "conditioning_contract_sha256": json_contract(conditioning).sha256,
-        "conditioning_mode_contract": selected_mode,
-        "conditioning_mode_contract_sha256": (
-            json_contract(selected_mode).sha256 if selected_mode else ""
-        ),
-        "execution_monitoring": monitoring,
-        "execution_monitoring_sha256": json_contract(monitoring).sha256,
-    }
-    references = deepcopy(asset_bindings or [])
-    continuity = deepcopy(continuity_assets or [])
-    model_requirements: list[dict] = []
-    output_contract = {
-        "schema_version": 1,
-        "primary": {
-            "node_id": str(next(iter(workflow.workflow_json))),
-            "kind": task.kind,
-            "required": True,
-        },
-    }
-    semantics_sha256 = json_contract(semantics).sha256
-    bindings_sha256 = json_contract(references).sha256
-    requirements_sha256 = json_contract(model_requirements).sha256
-    metadata_sha256 = json_contract(execution_metadata).sha256
-    route_sha256 = str(workflow.route_snapshot_sha256 or json_contract({
-        "fixture_route": str(workflow.id),
-    }).sha256)
-
-    workflow.workflow_template_version = version
-    workflow.injected_values = {
-        "schema_version": 2,
-        "resolved_semantics": semantics,
-        "asset_bindings": references,
-        "model_requirements": model_requirements,
-        "output_contract": output_contract,
-        "execution_metadata": execution_metadata,
-        "execution_metadata_sha256": metadata_sha256,
-    }
-    workflow.content_hash = graph_contract.sha256
-    workflow.compiler_id = "generic.comfy"
-    workflow.compiler_version = 1
-    workflow.route_snapshot_sha256 = route_sha256
-    workflow.workflow_contract_sha256 = execution_contract_sha256
-    workflow.resolved_semantics_sha256 = semantics_sha256
-    workflow.asset_bindings_sha256 = bindings_sha256
-    workflow.model_requirements_sha256 = requirements_sha256
-    workflow.save(update_fields=(
-        "workflow_template_version", "injected_values", "content_hash",
-        "compiler_id", "compiler_version", "route_snapshot_sha256",
-        "workflow_contract_sha256", "resolved_semantics_sha256",
-        "asset_bindings_sha256", "model_requirements_sha256", "updated_at",
-    ))
-
-    request_shot_ids = (prompt.request_options or {}).get("shot_ids")
-    shot_ids = (
-        [str(value) for value in request_shot_ids]
-        if isinstance(request_shot_ids, list)
-        else ([str(prompt.shot_id)] if prompt.shot_id else [])
-    )
-    task.backend = task.backend or "comfyui_local"
-    task.model_profile = model_identifier
-    task.workflow_version = version.version
-    if not is_image:
-        task.effective_frames = frames
-        task.effective_duration_ms = duration_ms
-    task.capability_snapshot = {
-        **(task.capability_snapshot or {}),
-        "generated_workflow_id": str(workflow.id),
-        "workflow_hash": graph_contract.sha256,
-        "prompt_artifact_id": str(prompt.id),
-        "prompt_content_hash": prompt.content_hash,
-        "template_id": str(template.id),
-        "template_slug": template.slug,
-        "model": model_identifier,
-        "conditioning_mode": "" if is_image else str(prompt.conditioning_mode or mode),
-        "effective_conditioning_mode": mode,
-        "prompt_template_key": str(payload.get("prompt_template_key") or ""),
-        "workflow_mode": "semantic",
-        "source_workflow": "",
-        "workflow_parameters": semantics,
-        "resolution_profile": "semantic_contract",
-        "resolution_multiple": int(resolution_multiple),
-        "width": width,
-        "height": height,
-        "shot_ids": shot_ids,
-        "shot_count": len(shot_ids),
-        "whole_episode": bool((prompt.request_options or {}).get("whole_episode", False)),
-        "workflow_template_version_id": str(version.id),
-        "workflow_contract_sha256": execution_contract_sha256,
-        "route_snapshot_sha256": route_sha256,
-        "asset_bindings": references,
-        "asset_bindings_sha256": bindings_sha256,
-        "continuity_assets": continuity,
-        "continuity_assets_sha256": json_contract(continuity).sha256,
-        "model_requirements": model_requirements,
-        "model_requirements_sha256": requirements_sha256,
-        "resolved_semantics_sha256": semantics_sha256,
-        "output_contract": output_contract,
-        "execution_metadata": execution_metadata,
-        "execution_metadata_sha256": metadata_sha256,
-    }
-    if is_image:
-        for key in ("fps", "requested_duration_ms", "include_audio"):
-            task.capability_snapshot.pop(key, None)
-    else:
-        task.capability_snapshot.update({
-            "fps": fps,
-            "requested_duration_ms": duration_ms,
-            "include_audio": bool(prompt.include_audio),
-        })
-    task.save(update_fields=(
-        "backend", "model_profile", "workflow_version", "effective_frames",
-        "effective_duration_ms", "capability_snapshot", "updated_at",
-    ))
-    return task
 
 
 def build_story(username="alice"):
     user = get_user_model().objects.create_user(username=username, password="StrongPass123!")
+    category, _ = StyleCategory.objects.get_or_create(key="detective", defaults={"name": "侦探"})
     style = Style.objects.create(
-        slug=f"noir-{username}", name="黑色侦探", category=Style.Category.DETECTIVE,
+        slug=f"noir-{username}", name="黑色侦探", category=category,
         visual_prompt="rainy neo-noir, amber practical lights",
         negative_prompt="face drift, costume drift",
     )
@@ -897,13 +405,13 @@ def build_story(username="alice"):
     )
     character = CharacterBible.objects.create(
         project=project, slug="lin", name="林默", stable_speaker_id="S1",
-        visual_identity="三十岁短发女侦探，左眼下小痣", wardrobe="炭灰风衣",
+        wardrobe="炭灰风衣",
         voice_profile="冷静低声", face_identity="高颧骨，深棕眼睛",
         anchor_asset=portrait,
     )
     scene = SceneBible.objects.create(
         project=project, slug="archive", name="旧档案室",
-        visual_identity="狭窄高架档案室，尘埃漂浮", lighting="绿色台灯和窗外闪电",
+        lighting="绿色台灯和窗外闪电",
         ambient_sound="雨打玻璃，老钟滴答",
         anchor_asset=scene_reference,
     )
@@ -915,17 +423,15 @@ def build_story(username="alice"):
         prompt_settings={"include_audio": True},
     )
     shot1 = Shot.objects.create(
-        episode=episode, number=1, title="证物", narrative="林默展开烧焦的信纸。",
-        camera="俯拍信纸后推近面部", dialogue=[{"speaker_id": "S1", "text": "这封信不是昨晚烧的。"}],
-        scene=scene, duration_ms=3500, sound_effects="纸张摩擦", music="低音弦乐",
+        episode=episode, number=1, title="证物",
+        dialogue=[{"speaker_id": "S1", "text": "这封信不是昨晚烧的。"}],
+        scene=scene, duration_ms=3500,
         media_type=Shot.MediaType.VIDEO, include_audio=True,
     )
-    shot1.characters.add(character)
     shot2 = Shot.objects.create(
-        episode=episode, number=2, title="闪电", narrative="闪电照亮门后的人影。",
-        camera="快速摇镜到门口", dialogue=[{"speaker_id": "S1", "text": "别动。"}],
-        scene=scene, duration_ms=2100, sound_effects="近雷炸响",
+        episode=episode, number=2, title="闪电",
+        dialogue=[{"speaker_id": "S1", "text": "别动。"}],
+        scene=scene, duration_ms=2100,
         media_type=Shot.MediaType.VIDEO, include_audio=True,
     )
-    shot2.characters.add(character)
     return user, project, character, scene, episode, shot1, shot2

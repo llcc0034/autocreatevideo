@@ -23,21 +23,6 @@ from django.utils import timezone
 from studio.media_signing import classify_task_output
 from studio.models import AssemblyJob, GenerationTask
 from studio.services.json_contracts import json_contract
-from studio.services.bible_reference_contract import (
-    RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,
-    retired_bible_image_candidate_snapshot,
-)
-from studio.services.security_boundaries import boundary_int
-
-
-def _workflow_graph_max_bytes() -> int:
-    return boundary_int("security.workflow.max_graph_bytes")
-
-
-def _stage_snapshot_max_bytes() -> int:
-    return boundary_int("security.snapshot.stage_max_bytes")
-
-
 PROVENANCE_SCHEMA = "https://autoprompt.local/schemas/provenance/v1"
 PROVENANCE_SIGNING_SALT = "autoprompt.provenance.v1"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -226,239 +211,63 @@ def _ordered_assembly_shot_ids(job: AssemblyJob, expected_count: int) -> list[st
     return shot_ids
 
 
-def _source_media_snapshot(task: GenerationTask) -> list[dict]:
-    sources: dict[tuple[str, str, str], dict] = {}
-    for row in task.staged_inputs or []:
-        if not isinstance(row, dict):
-            continue
-        source_sha256 = str(row.get("source_sha256") or row.get("checksum") or "").casefold()
-        submitted_sha256 = str(row.get("submitted_sha256") or source_sha256).casefold()
-        if not _SHA256_RE.fullmatch(source_sha256):
-            continue
-        if not _SHA256_RE.fullmatch(submitted_sha256):
-            submitted_sha256 = source_sha256
-        asset_id = str(row.get("asset_id") or "")
-        role = str(row.get("media_role") or "reference")[:80]
-        item = {
-            "asset_id": asset_id or None,
-            "role": role,
-            "source_sha256": source_sha256,
-            "submitted_sha256": submitted_sha256,
-        }
-        sources[(asset_id, role, submitted_sha256)] = item
-    return [sources[key] for key in sorted(sources)]
+def _prepared_task_generation(task, context, definition):
+    """Public identity from this actual frozen request, never today's routing."""
+    attempt, media = context.attempt, context.media
+    compiled = media["payload"]["compiled_workflow"]
+    target = definition.value["target"]
+    return {
+        "task_id": str(task.pk), "generation_attempt_id": str(attempt.pk),
+        "preparation_id": str(attempt.preparation_id),
+        "execution_instance_version_id": str(attempt.execution_instance_version_id),
+        "project_id": str(task.project_id), "production_run_id": str(attempt.stage_run.production_run_id),
+        "stage_run_id": str(attempt.stage_run_id),
+        "production_unit": media["production_unit"],
+        "workflow_version_id": target["workflow"]["id"],
+        "model_profile_version_id": target["model"]["id"],
+        "model": _public_identifier(target["model"]["identifier"]),
+        "definition_sha256": media["definition_sha256"],
+        "request_sha256": attempt.request_sha256,
+        "resolved_inputs_sha256": media["resolved_inputs_sha256"],
+        "workflow_sha256": compiled["graph_sha256"],
+        "workflow_contract_sha256": compiled["workflow_contract_sha256"],
+        "resolved_semantics_sha256": compiled["resolved_semantics_sha256"],
+        "asset_bindings_sha256": compiled["asset_bindings_sha256"],
+        "model_requirements_sha256": compiled["model_requirements_sha256"],
+        "config_snapshot_sha256": media["execution_deadlines"]["configuration_sha256"],
+    }
 
 
 def _task_body(
     task: GenerationTask, *, output_index: int, item: dict, artifact_path: Path,
     generated_at,
 ) -> dict:
-    workflow = task.generated_workflow
-    prompt = workflow.prompt_artifact
-    template = workflow.template
-    injected = workflow.injected_values if isinstance(workflow.injected_values, dict) else {}
-    sources = _source_media_snapshot(task)
-    capability = task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
-    workflow_sha256 = _canonical_sha256(workflow.workflow_json)
-    semantic_compiled = bool(
-        workflow.workflow_template_version_id
-        and workflow.compiler_id
-        and capability.get("workflow_contract_sha256")
-    )
-    if semantic_compiled:
-        resolved = injected.get("resolved_semantics")
-        asset_bindings = injected.get("asset_bindings")
-        model_requirements = injected.get("model_requirements")
-        execution_metadata = injected.get("execution_metadata")
-        if (
-            not isinstance(resolved, dict)
-            or not isinstance(asset_bindings, list)
-            or not isinstance(model_requirements, list)
-            or not isinstance(execution_metadata, dict)
-        ):
-            raise ProvenanceError("Semantic workflow frozen inputs are invalid")
-        checks = (
-            (workflow_sha256, workflow.content_hash, "workflow"),
-            (capability.get("workflow_hash"), workflow.content_hash, "task workflow"),
-            (capability.get("workflow_contract_sha256"), workflow.workflow_contract_sha256, "workflow contract"),
-            (json_contract(resolved, max_bytes=_workflow_graph_max_bytes()).sha256, workflow.resolved_semantics_sha256, "resolved semantics"),
-            (capability.get("resolved_semantics_sha256"), workflow.resolved_semantics_sha256, "task semantics"),
-            (json_contract(asset_bindings, max_bytes=_workflow_graph_max_bytes()).sha256, workflow.asset_bindings_sha256, "asset bindings"),
-            (json_contract(capability.get("asset_bindings") or [], max_bytes=_workflow_graph_max_bytes()).sha256, workflow.asset_bindings_sha256, "task asset bindings"),
-            (json_contract(model_requirements, max_bytes=_workflow_graph_max_bytes()).sha256, workflow.model_requirements_sha256, "model requirements"),
-            (json_contract(capability.get("model_requirements") or [], max_bytes=_workflow_graph_max_bytes()).sha256, workflow.model_requirements_sha256, "task model requirements"),
-            (json_contract(execution_metadata, max_bytes=_stage_snapshot_max_bytes()).sha256, injected.get("execution_metadata_sha256"), "execution metadata"),
-            (json_contract(capability.get("execution_metadata") or {}, max_bytes=_stage_snapshot_max_bytes()).sha256, injected.get("execution_metadata_sha256"), "task execution metadata"),
-            (capability.get("route_snapshot_sha256"), workflow.route_snapshot_sha256, "route snapshot"),
-        )
-        for actual, expected, label in checks:
-            if not expected or actual != expected:
-                raise ProvenanceError(f"Semantic {label} hash is invalid")
-        output_contract = injected.get("output_contract")
-        if output_contract != capability.get("output_contract"):
-            raise ProvenanceError("Semantic output contract copy is invalid")
-        if capability.get("model_deployment_id"):
-            provider_config = capability.get("provider_config")
-            deployment_config = capability.get("deployment_config")
-            deployment_summary = capability.get("deployment_summary")
-            if not all(isinstance(value, dict) for value in (
-                provider_config, deployment_config, deployment_summary,
-            )):
-                raise ProvenanceError("Semantic deployment/config summary is invalid")
-            deployment_checks = (
-                (json_contract(provider_config, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("provider_config_sha256")),
-                (json_contract(deployment_config, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("deployment_config_sha256")),
-                (json_contract({
-                    "provider_config": provider_config,
-                    "deployment_config": deployment_config,
-                }, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("frozen_execution_config_sha256")),
-                (json_contract(deployment_summary, max_bytes=_stage_snapshot_max_bytes()).sha256, capability.get("deployment_summary_sha256")),
-            )
-            if any(not expected or actual != expected for actual, expected in deployment_checks):
-                raise ProvenanceError("Semantic deployment/config summary hash is invalid")
-            for key in (
-                "model_deployment_id", "model_profile_version_id", "provider_profile_id",
-                "provider_config_sha256", "deployment_config_sha256",
-                "credential_binding_sha256", "endpoint_is_external",
-                "effective_timeout_seconds", "route_index",
-            ):
-                if deployment_summary.get(key) != capability.get(key):
-                    raise ProvenanceError("Semantic deployment summary copy is inconsistent")
-        prompt_text = resolved.get("prompt.positive", resolved.get("PROMPT", ""))
-        negative_prompt = resolved.get(
-            "prompt.negative", resolved.get("NEGATIVE_PROMPT", ""),
-        )
-        if not isinstance(prompt_text, str) or not isinstance(negative_prompt, str):
-            raise ProvenanceError("Semantic prompt must come from frozen resolved semantics")
-    else:
-        prompt_text = str(injected.get("PROMPT", prompt.prompt_text) or "")
-        negative_prompt = str(injected.get("NEGATIVE_PROMPT", prompt.negative_prompt) or "")
-    prompt_sha256 = hashlib.sha256(prompt_text.encode("utf-8")).hexdigest()
-    if semantic_compiled:
-        reserved_candidate = None
-        if capability.get("generation_purpose") == RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE:
-            reserved_candidate = {
-                key: deepcopy(capability.get(key)) for key in (
-                    "generation_purpose", "request_fingerprint", "bible_target",
-                    "source_snapshot_sha256",
-                )
-            }
-    else:
-        try:
-            reserved_candidate = retired_bible_image_candidate_snapshot(prompt)
-        except ValidationError as exc:
-            raise ProvenanceError("历史 Bible 图片候选 Prompt 来源无效") from exc
-    candidate_generation = {}
-    if reserved_candidate is not None:
-        if workflow_sha256 != workflow.content_hash:
-            raise ProvenanceError("Generated workflow content hash is invalid")
-        if (
-            capability.get("generated_workflow_id") != str(workflow.id)
-            or capability.get("workflow_hash") != workflow.content_hash
-            or capability.get("prompt_artifact_id") != str(prompt.id)
-            or capability.get("prompt_content_hash") != prompt_sha256
-        ):
-            raise ProvenanceError("Frozen task input identifiers do not match its workflow")
-        for key in (
-            "generation_purpose", "request_fingerprint", "bible_target",
-            "source_snapshot_sha256",
-        ):
-            if capability.get(key) != reserved_candidate.get(key):
-                raise ProvenanceError(
-                    "Bible image candidate task and Prompt provenance do not match"
-                )
-        candidate_generation = {
-            "generation_purpose": RETIRED_BIBLE_IMAGE_CANDIDATE_PURPOSE,
-            "request_fingerprint": reserved_candidate["request_fingerprint"],
-            "bible_target": deepcopy(reserved_candidate["bible_target"]),
-        }
-    safe_input_snapshot = {
-        "prompt_sha256": prompt_sha256,
-        "negative_prompt_sha256": (
-            hashlib.sha256(negative_prompt.encode("utf-8")).hexdigest()
-            if negative_prompt else None
-        ),
-        "workflow_sha256": workflow.content_hash,
-        "seed": task.seed,
-        "sources": sources,
-        **candidate_generation,
-    }
-    artifact_sha256 = sha256_file(artifact_path)
-    observed_media = item.get("observed_media")
-    if not isinstance(observed_media, dict):
-        observed_media = None
+    """Seal actual Preparation identity; old trace/PromptArtifact is not evidence."""
+    from studio.services.execution_production_workflow_queue import read_prepared_generation_task
+    from studio.services.execution_preparations import read_frozen_execution_request
+    from studio.services.execution_workflow_staging import read_execution_workflow_receipt_sources
+    from studio.services.execution_instances import execution_resolved_inputs_max_bytes
+
+    context = read_prepared_generation_task(task)
+    attempt, media = context.attempt, context.media
+    detail, definition, transport = read_frozen_execution_request(attempt.preparation)
+    sources = read_execution_workflow_receipt_sources(definition=definition,
+        resolved_inputs=json_contract(detail.resolved_inputs["inputs"], max_bytes=execution_resolved_inputs_max_bytes()),
+        transport=transport, owner_id=task.owner_id, root_id=task.pk, receipts=task.staged_inputs)
+    observed = item.get("observed_media")
+    if not isinstance(observed, dict):
+        raise ProvenanceError("生成产物缺少真实媒体观测，不能封存")
     return {
         "schema": PROVENANCE_SCHEMA,
-        "subject": {"type": "generation_task_output", "id": str(task.id)},
-        "disclosure": {
-            "ai_generated": True,
-            "label": "AI-generated",
-            "method": "mandatory-signed-sidecar",
-        },
+        "subject": {"type": "generation_task_output", "id": str(task.pk)},
+        "disclosure": {"ai_generated": True, "label": "AI-generated", "method": "mandatory-signed-sidecar"},
         "artifact": {
-            "output_index": output_index,
-            "media_kind": classify_task_output(item),
-            "filename": Path(str(item.get("filename") or "output")).name,
-            "sha256": artifact_sha256,
-            "byte_size": artifact_path.stat().st_size,
-            "generated_at": _iso(generated_at),
-            **(
-                {"observed_media": deepcopy(observed_media)}
-                if observed_media is not None else {}
-            ),
+            "output_index": output_index, "media_kind": media["output_kind"],
+            "filename": artifact_path.name, "sha256": sha256_file(artifact_path),
+            "byte_size": artifact_path.stat().st_size, "generated_at": _iso(generated_at),
+            "observed_media": deepcopy(observed),
         },
-        "generation": {
-            "task_id": str(task.id),
-            "generated_workflow_id": str(workflow.id),
-            "project_id": str(task.project_id),
-            "episode_id": str(task.episode_id) if task.episode_id else None,
-            "shot_ids": [str(value) for value in (
-                capability.get("shot_ids") or []
-                if semantic_compiled else capability.get("shot_ids")
-                or (prompt.request_options or {}).get("shot_ids")
-                or ([prompt.shot_id] if prompt.shot_id else [])
-            )],
-            "model": _public_identifier(
-                capability.get("model")
-                if semantic_compiled else capability.get("model")
-                or (workflow.injected_values or {}).get("MODEL")
-                or template.model
-            ),
-            "model_profile": _public_identifier(task.model_profile),
-            "template_id": str(
-                capability.get("template_id")
-                if semantic_compiled else capability.get("template_id") or workflow.template_id
-            ),
-            "template_hash": str(capability.get("template_hash") or ""),
-            "template_slug": str(
-                capability.get("template_slug")
-                if semantic_compiled else capability.get("template_slug") or template.slug
-            ),
-            "template_version": task.workflow_version,
-            "workflow_sha256": workflow.content_hash,
-            "workflow_contract_sha256": (
-                workflow.workflow_contract_sha256 if semantic_compiled else ""
-            ),
-            "route_snapshot_sha256": (
-                workflow.route_snapshot_sha256 if semantic_compiled else ""
-            ),
-            "resolved_semantics_sha256": (
-                workflow.resolved_semantics_sha256 if semantic_compiled else ""
-            ),
-            "asset_bindings_sha256": (
-                workflow.asset_bindings_sha256 if semantic_compiled else ""
-            ),
-            "model_requirements_sha256": (
-                workflow.model_requirements_sha256 if semantic_compiled else ""
-            ),
-            "config_snapshot_sha256": str(capability.get("config_snapshot_sha256") or ""),
-            "model_deployment_id": str(capability.get("model_deployment_id") or ""),
-            "prompt_artifact_id": str(prompt.id),
-            "prompt_sha256": safe_input_snapshot["prompt_sha256"],
-            "negative_prompt_sha256": safe_input_snapshot["negative_prompt_sha256"],
-            "input_snapshot_sha256": _canonical_sha256(safe_input_snapshot),
-            **candidate_generation,
-        },
+        "generation": _prepared_task_generation(task, context, definition),
         "source_media": sources,
     }
 
@@ -547,7 +356,9 @@ def _verify_document(
 
 
 def verified_task_manifest(task: GenerationTask, output_index: int) -> dict:
-    item = task.outputs[output_index] if isinstance(task.outputs, list) else None
+    if type(output_index) is not int or not isinstance(task.outputs, list) or not 0 <= output_index < len(task.outputs):
+        raise ProvenanceError("Task output index is unavailable")
+    item = task.outputs[output_index]
     provenance = item.get("provenance") if isinstance(item, dict) else None
     if not isinstance(provenance, dict) or provenance.get("ai_generated") is not True:
         raise ProvenanceError("Task output has no sealed provenance")
@@ -555,7 +366,7 @@ def verified_task_manifest(task: GenerationTask, output_index: int) -> dict:
         document = json.loads(task_manifest_path(task, output_index).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise ProvenanceError("Task provenance sidecar is unavailable") from exc
-    return _verify_document(
+    verified = _verify_document(
         document,
         artifact_path=resolve_task_output_path(task, output_index),
         subject_type="generation_task_output",
@@ -563,82 +374,45 @@ def verified_task_manifest(task: GenerationTask, output_index: int) -> dict:
         expected_artifact_sha256=str(provenance.get("artifact_sha256") or ""),
         expected_manifest_sha256=str(provenance.get("manifest_sha256") or ""),
     )
+    from studio.services.execution_preparations import read_frozen_execution_request
+    from studio.services.execution_production_workflow_queue import read_prepared_generation_task
+    try:
+        context = read_prepared_generation_task(task)
+        _detail, definition, _transport = read_frozen_execution_request(context.attempt.preparation)
+    except ValidationError as exc:
+        raise ProvenanceError("Task source preparation cannot be verified") from exc
+    if verified.get("generation") != _prepared_task_generation(task, context, definition):
+        raise ProvenanceError("Task provenance does not match its actual frozen preparation")
+    artifact = verified.get("artifact")
+    if (not isinstance(artifact, dict) or artifact.get("output_index") != output_index
+            or artifact.get("media_kind") != context.media["output_kind"]):
+        raise ProvenanceError("Task provenance output does not match its frozen contract")
+    return verified
 
 
-def resolve_declared_task_output(
-    task: GenerationTask,
-    role: str = "primary_video",
-) -> dict:
-    """Resolve one frozen output role without output-index or filename guessing."""
-
+def resolve_declared_task_output(task: GenerationTask, role: str = "primary") -> dict:
+    """Resolve the one frozen primary using the same verifier as archival."""
+    if role != "primary":
+        raise ProvenanceError("Only the frozen primary output role is supported")
     if task.status != GenerationTask.Status.SUCCEEDED:
         raise ProvenanceError("Source generation task has not succeeded")
-    capability = (
-        task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
-    )
-    contract = capability.get("output_contract")
-    semantic_compiled = bool(
-        task.generated_workflow.workflow_template_version_id
-        and task.generated_workflow.compiler_id
-        and capability.get("workflow_contract_sha256")
-    )
-    resolved_role = "primary" if semantic_compiled else role
-    if not isinstance(contract, dict) or set(contract) != {"schema_version", resolved_role}:
-        raise ProvenanceError("Source task has no supported frozen output contract")
-    if contract.get("schema_version") != 1:
-        raise ProvenanceError("Source task output contract version is unsupported")
-    declaration = contract.get(resolved_role)
-    expected_keys = {"node_id", "kind", "required"} if semantic_compiled else {
-        "node_id", "media_kind", "required",
-    }
-    media_kind = declaration.get("kind") if semantic_compiled and isinstance(declaration, dict) else (
-        declaration.get("media_kind") if isinstance(declaration, dict) else None
-    )
-    if (
-        not isinstance(declaration, dict)
-        or set(declaration) != expected_keys
-        or not isinstance(declaration.get("node_id"), str)
-        or not declaration["node_id"]
-        or media_kind != "video"
-        or declaration.get("required") is not True
-    ):
-        raise ProvenanceError("Source task output role declaration is invalid")
-    outputs = task.outputs if isinstance(task.outputs, list) else []
-    matches = [
-        (index, item)
-        for index, item in enumerate(outputs)
-        if isinstance(item, dict)
-        and str(item.get("node_id") or "") == declaration["node_id"]
-        and classify_task_output(item) == media_kind
-    ]
-    if len(matches) != 1:
-        raise ProvenanceError(
-            "Source task declared output must resolve to exactly one persisted video"
-        )
-    output_index, item = matches[0]
+    from studio.services.generated_artifacts import _prepared_task_primary
+    from studio.services.provider_registry import ProviderDriverError
+    try:
+        context, output_index, item, source, facts, _limit = _prepared_task_primary(task, task.outputs)
+    except (ValidationError, ProviderDriverError) as exc:
+        raise ProvenanceError("Source task primary output contract cannot be verified") from exc
     manifest = verified_task_manifest(task, output_index)
-    artifact = manifest.get("artifact") if isinstance(manifest, dict) else None
-    integrity = manifest.get("integrity") if isinstance(manifest, dict) else None
-    if (
-        not isinstance(artifact, dict)
-        or artifact.get("output_index") != output_index
-        or artifact.get("media_kind") != media_kind
-        or not isinstance(integrity, dict)
-    ):
-        raise ProvenanceError("Source task signed output does not match its declaration")
-    artifact_sha256 = str(artifact.get("sha256") or "")
-    manifest_sha256 = str(integrity.get("payload_sha256") or "")
-    if not _SHA256_RE.fullmatch(artifact_sha256) or not _SHA256_RE.fullmatch(
-        manifest_sha256
-    ):
-        raise ProvenanceError("Source task signed output digests are invalid")
+    artifact = manifest["artifact"]
+    integrity = manifest["integrity"]
+    if (artifact["media_kind"] != context.media["output_kind"]
+            or artifact["sha256"] != facts["sha256"]
+            or artifact.get("observed_media") != facts["observed_media"]):
+        raise ProvenanceError("Source task signed media does not match its actual primary output")
     return {
-        "output_index": output_index,
-        "item": deepcopy(item),
-        "path": resolve_task_output_path(task, output_index),
-        "manifest": manifest,
-        "artifact_sha256": artifact_sha256,
-        "manifest_sha256": manifest_sha256,
+        "output_index": output_index, "item": deepcopy(item), "path": source,
+        "manifest": manifest, "artifact_sha256": artifact["sha256"],
+        "manifest_sha256": integrity["payload_sha256"],
     }
 
 
@@ -646,33 +420,10 @@ def persist_assembly_provenance(job: AssemblyJob, *, generated_at=None) -> dict:
     output = Path(job.output_path).resolve()
     if not output.is_file():
         raise ProvenanceError("Assembly output media is unavailable")
-    source_tasks = list(
-        job.source_tasks.select_related(
-            "generated_workflow__prompt_artifact", "generated_workflow__template",
-        ).order_by("id")
-    )
     source_outputs = []
     models = set()
-    output_lookup: dict[Path, tuple[GenerationTask, int]] = {}
-    for task in source_tasks:
-        prompt = task.generated_workflow.prompt_artifact
-        capability = (
-            task.capability_snapshot if isinstance(task.capability_snapshot, dict) else {}
-        )
-        models.add(_public_identifier(
-            capability.get("model")
-            or (task.generated_workflow.injected_values or {}).get("MODEL")
-            or task.generated_workflow.template.model
-        ))
-        for index, item in enumerate(task.outputs or []):
-            if not isinstance(item, dict) or classify_task_output(item) != "video":
-                continue
-            output_lookup[resolve_task_output_path(task, index)] = (task, index)
-
-    # FFmpeg's ordered ``-i`` arguments are the exact media inputs.  Using
-    # those paths avoids falsely listing every video emitted by a source task
-    # when assembly selected only one of them, and preserves repeated
-    # multi-shot inputs as distinct clip records.
+    # Command inputs must equal the ordered frozen artifact members. Never
+    # reconstruct them from old tasks, PromptArtifacts or output filenames.
     command = list(job.ffmpeg_command or [])
     filter_complex_values = [
         str(command[index + 1])
@@ -703,96 +454,56 @@ def persist_assembly_provenance(job: AssemblyJob, *, generated_at=None) -> dict:
         if value == "-i"
     ]
     source_items = list(job.source_items.select_related(
-        "shot",
-        "generation_task__generated_workflow__prompt_artifact",
-        "generated_artifact__generation_attempt__model_deployment__profile_version",
+        "shot__episode", "generated_artifact__generation_attempt__preparation",
     ).order_by("ordinal"))
-    if (source_items or source_tasks) and not input_paths:
-        raise ProvenanceError("Assembly command has no auditable source inputs")
-    if source_items:
-        if len(source_items) != len(input_paths):
-            raise ProvenanceError("Assembly frozen source count does not match FFmpeg inputs")
-        for clip_index, (source, input_path) in enumerate(zip(source_items, input_paths, strict=True)):
-            shot_id = str(source.shot_id)
-            if source.generated_artifact_id:
-                generated = source.generated_artifact
-                attempt = generated.generation_attempt
-                expected = (Path(settings.MEDIA_ROOT).resolve() / source.object_key).resolve()
-                if (
-                    input_path != expected
-                    or attempt is None
-                    or generated.object_key != source.object_key
-                    or generated.sha256 != source.sha256
-                    or generated.size_bytes != source.size_bytes
-                    or generated.mime_type != source.mime_type
-                    or sha256_file(input_path) != source.sha256
-                ):
-                    raise ProvenanceError("Assembly managed artifact source facts do not match")
-                deployment = attempt.model_deployment
-                if deployment is not None:
-                    models.add(_public_identifier(deployment.profile_version.model_identifier))
-                source_outputs.append({
-                    "clip_index": clip_index,
-                    "shot_id": shot_id,
-                    "media_kind": source.media_kind,
-                    "generated_artifact_id": str(generated.id),
-                    "generation_attempt_id": str(attempt.id),
-                    "artifact_sha256": source.sha256,
-                    "manifest_sha256": generated.manifest_metadata_sha256,
-                    "prompt_sha256": attempt.request_sha256,
-                })
-                continue
-            task = source.generation_task
-            match = output_lookup.get(input_path)
-            if task is None or match is None or match[0].id != task.id:
-                raise ProvenanceError("Assembly input does not match its frozen source task")
-            task, output_index = match
-            item = task.outputs[output_index]
-            provenance = item.get("provenance") if isinstance(item, dict) else None
-            if not isinstance(provenance, dict):
-                task.outputs = persist_task_provenance(
-                    task, list(task.outputs or []), generated_at=task.finished_at,
-                )
-            verified = verified_task_manifest(task, output_index)
-            generation = verified.get("generation") or {}
-            artifact = verified.get("artifact") or {}
-            signed_shot_ids = generation.get("shot_ids")
-            if (
-                task.owner_id != job.owner_id
-                or task.project_id != job.project_id
-                or str(generation.get("task_id") or "") != str(task.id)
-                or str(generation.get("project_id") or "") != str(job.project_id)
-                or str(generation.get("episode_id") or "") != str(task.episode_id or "")
-                or not isinstance(signed_shot_ids, list)
-                or shot_id not in {str(value) for value in signed_shot_ids}
-                or artifact.get("output_index") != output_index
-                or artifact.get("media_kind") != source.media_kind
-                or source.sha256 != verified["artifact"]["sha256"]
-            ):
-                raise ProvenanceError(
-                    "Assembly source shot/task/output binding does not match signed task provenance"
-                )
-            source_outputs.append({
-                "clip_index": clip_index,
-                "shot_id": shot_id,
-                "media_kind": source.media_kind,
-                "task_id": str(task.id),
-                "output_index": output_index,
-                "artifact_sha256": verified["artifact"]["sha256"],
-                "manifest_sha256": verified["integrity"]["payload_sha256"],
-                "prompt_sha256": verified["generation"]["prompt_sha256"],
-            })
-    else:
-        # Historical succeeded assemblies keep their already-signed provenance.
-        # New executable jobs always have AssemblySourceItem rows.
-        if source_tasks:
-            raise ProvenanceError("Legacy assembly job lacks immutable source items")
+    if not source_items or len(source_items) != len(input_paths):
+        raise ProvenanceError("Assembly requires a complete ordered frozen artifact manifest")
+    from studio.services.assembly import AssemblyError, _assembly_artifact_evidence
+    from studio.services.execution_preparations import read_frozen_execution_request
+    for clip_index, (source, input_path) in enumerate(zip(source_items, input_paths, strict=True)):
+        generated = source.generated_artifact
+        if generated is None:
+            raise ProvenanceError("Assembly source must be an explicitly adopted managed artifact")
+        try:
+            evidence, _ = _assembly_artifact_evidence(generated, source.shot)
+        except AssemblyError as exc:
+            raise ProvenanceError(str(exc)) from exc
+        expected = (Path(settings.MEDIA_ROOT).resolve() / source.object_key).resolve()
+        if (
+            input_path != expected or input_path != evidence["path"]
+            or generated.storage_backend != source.storage_backend
+            or generated.object_key != source.object_key
+            or generated.sha256 != source.sha256
+            or generated.size_bytes != source.size_bytes
+            or generated.mime_type != source.mime_type
+            or sha256_file(input_path) != source.sha256
+        ):
+            raise ProvenanceError("Assembly managed artifact source facts do not match")
+        attempt = generated.generation_attempt
+        if evidence["source_kind"] == "execution":
+            _, definition, _ = read_frozen_execution_request(attempt.preparation)
+            models.add(_public_identifier(definition.value["target"]["model"]["identifier"]))
+        source_outputs.append({
+            "clip_index": clip_index, "shot_id": str(source.shot_id),
+            "media_kind": source.media_kind, "generated_artifact_id": str(generated.pk),
+            "source_kind": evidence["source_kind"],
+            "generation_attempt_id": str(attempt.pk) if attempt is not None else None,
+            "execution_instance_version_id": str(attempt.execution_instance_version_id) if attempt is not None else None,
+            "preparation_id": evidence["preparation_id"],
+            "asset_id": str(generated.asset_id) if evidence["source_kind"] == "asset" else None,
+            "artifact_sha256": source.sha256, "manifest_sha256": generated.manifest_metadata_sha256,
+            "request_sha256": evidence["request_sha256"],
+        })
+    # A library Asset may itself be AI-generated, but adoption does not prove
+    # it. True means at least one verified model-produced source; null means
+    # origin is not established, never an invented human-authored claim.
+    ai_generated = True if any(row["source_kind"] == "execution" for row in source_outputs) else None
     body = {
         "schema": PROVENANCE_SCHEMA,
         "subject": {"type": "assembly_output", "id": str(job.id)},
         "disclosure": {
-            "ai_generated": True,
-            "label": metadata_comment or "AI-generated",
+            "ai_generated": ai_generated,
+            "label": metadata_comment or None,
             "method": (
                 "visible-overlay+mp4-metadata+mandatory-signed-sidecar"
                 if visible_overlay and mp4_metadata
@@ -819,7 +530,6 @@ def persist_assembly_provenance(job: AssemblyJob, *, generated_at=None) -> dict:
             "source_signature": job.source_signature,
             "source_contract_version": job.source_contract_version,
             "models": sorted(filter(None, models)),
-            "source_task_count": sum(1 for item in source_items if item.generation_task_id),
             "source_artifact_count": sum(1 for item in source_items if item.generated_artifact_id),
         },
         "source_outputs": source_outputs,
@@ -828,7 +538,7 @@ def persist_assembly_provenance(job: AssemblyJob, *, generated_at=None) -> dict:
     _write_atomic(assembly_manifest_path(job), document)
     return {
         "schema": PROVENANCE_SCHEMA,
-        "ai_generated": True,
+        "ai_generated": ai_generated,
         "artifact_sha256": document["artifact"]["sha256"],
         "manifest_sha256": document["integrity"]["payload_sha256"],
     }

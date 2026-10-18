@@ -5,9 +5,9 @@ import math
 import re
 from typing import Any
 
-from studio.models import Asset, PromptArtifact, SeriesProject
 from studio.services.comfyui_artifacts import safe_model_relative_filename
 from studio.services.json_contracts import json_contract
+from studio.services.workflow_media_tokens import is_workflow_media_use_token
 from studio.services.security_boundaries import boundary_int
 
 
@@ -364,7 +364,7 @@ def _validate_value(key: str, value: Any, definition: dict[str, Any], value_type
         if not isinstance(value, str) or not value:
             raise WorkflowSemanticError(f"{key} 缺少冻结模型文件名")
     elif value_type.startswith("asset_"):
-        if not isinstance(value, str) or not value.startswith(ASSET_TOKEN_PREFIX):
+        if not isinstance(value, str) or not (value.startswith(ASSET_TOKEN_PREFIX) or is_workflow_media_use_token(value)):
             raise WorkflowSemanticError(f"{key} 缺少受控资产引用")
     else:
         raise WorkflowSemanticError(f"{key} 使用不支持的类型 {value_type!r}")
@@ -403,72 +403,6 @@ def _validate_value(key: str, value: Any, definition: dict[str, Any], value_type
     return value
 
 
-def _asset_for_semantic(
-    key: str,
-    definition: dict[str, Any],
-    *,
-    prompt: PromptArtifact,
-) -> tuple[str, dict[str, Any]] | tuple[None, None]:
-    match = _ASSET_KEY_RE.fullmatch(key)
-    if not match:
-        raise WorkflowSemanticError(f"无效资产 semantic key: {key}")
-    media_kind, slot = match.groups()
-    records = prompt.structured_payload.get(
-        "reference_bindings",
-        prompt.structured_payload.get("reference_assets", []),
-    )
-    if not isinstance(records, list):
-        raise WorkflowSemanticError("Prompt 资产引用快照必须是数组")
-    requested_category = str(definition.get("asset_category") or "").strip()
-    requested_slot = definition.get("input_slot")
-    if isinstance(requested_slot, bool) or not isinstance(requested_slot, int) or requested_slot <= 0:
-        raise WorkflowSemanticError(f"{key} 缺少合法 input_slot")
-    candidates = []
-    for record in records:
-        if not isinstance(record, dict):
-            continue
-        if record.get("input_slot") != requested_slot:
-            continue
-        recorded_semantic = str(record.get("semantic_key") or "")
-        if recorded_semantic and recorded_semantic != key:
-            continue
-        category = str(record.get("category") or "")
-        if requested_category not in {"image", "video", "audio"} and category != requested_category:
-            continue
-        asset_id = record.get("asset_id") or record.get("id")
-        if asset_id:
-            candidates.append((str(asset_id), record))
-    if not candidates:
-        return None, None
-    if len(candidates) > 1:
-        raise WorkflowSemanticError(f"{key} 匹配到多个资产；generic compiler 要求单一固定槽位")
-    asset_id, record = candidates[0]
-    try:
-        asset = Asset.objects.get(pk=asset_id, is_active=True)
-    except (Asset.DoesNotExist, ValueError) as exc:
-        raise WorkflowSemanticError(f"{key} 引用的资产不存在或已停用") from exc
-    if asset.owner_id not in (None, prompt.project.owner_id):
-        raise WorkflowSemanticError(f"{key} 引用的资产不属于当前项目租户")
-    checksum = str(asset.checksum or "").casefold()
-    recorded_checksum = str(record.get("checksum") or "").casefold()
-    if len(checksum) != 64 or (recorded_checksum and recorded_checksum != checksum):
-        raise WorkflowSemanticError(f"{key} 引用的资产 checksum 未冻结或已漂移")
-    mime_type = str(asset.mime_type or "").casefold()
-    if not mime_type.startswith(f"{media_kind}/"):
-        raise WorkflowSemanticError(f"{key} 资产 MIME 与声明类型不匹配")
-    token = f"{ASSET_TOKEN_PREFIX}{asset.id}"
-    return token, {
-        "semantic_key": key,
-        "asset_id": str(asset.id),
-        "token": token,
-        "media_kind": media_kind,
-        "mime_type": asset.mime_type,
-        "checksum": checksum,
-        "category": str(record.get("category") or ""),
-        "input_slot": requested_slot,
-        "audio_asset_id": record.get("audio_asset_id"),
-        "use_embedded_audio": bool(record.get("use_embedded_audio", False)),
-    }
 
 
 def _frozen_model_submission_value(
@@ -527,72 +461,23 @@ def _frozen_model_submission_value(
     return exact_values[0]
 
 
-def resolve_workflow_semantics(
-    *,
-    graph: dict[str, Any],
-    contract: dict[str, Any],
-    bindings: list[dict[str, Any]],
-    requirements: list[dict[str, Any]],
-    prompt: PromptArtifact,
-    project: SeriesProject,
-    overrides: dict[str, Any] | None = None,
-    output_prefix: str | None = None,
-) -> ResolvedWorkflowSemantics:
+
+
+def resolve_workflow_semantic_values(*, graph, contract, bindings, requirements, resolve_scalar, resolve_asset):
+    """Shared typed resolver; callers supply facts, not fake ORM objects.
+
+    Model filenames always come from the same frozen graph/requirement reader.
+    Scalar precedence and authorized media resolution belong to the source
+    adapter. This core never fetches project defaults or grants media access.
+    """
     if not isinstance(graph, dict) or not graph:
         raise WorkflowSemanticError("workflow graph 必须是非空冻结对象")
     parameters = contract.get("parameters")
     if not isinstance(parameters, dict) or not parameters:
         raise WorkflowSemanticError("input_contract.parameters 必须是非空对象")
-    overrides = dict(overrides or {})
-    unknown_overrides = sorted(set(overrides) - set(parameters))
-    if unknown_overrides:
-        raise WorkflowSemanticError("未声明的 semantic override: " + ", ".join(unknown_overrides))
     requirement_map = {row["alias"]: row for row in canonical_requirement_rows(requirements)}
     references: list[dict[str, Any]] = []
     values: dict[str, Any] = {}
-    def project_fps() -> int:
-        raw = getattr(project, "fps", None)
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-            raise WorkflowSemanticError(
-                "video.fps 必须来自项目或冻结 workflow override 的正整数",
-            )
-        return raw
-
-    def project_dimension(name: str) -> int:
-        raw = getattr(project, name, None)
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
-            raise WorkflowSemanticError(
-                f"image.{name} 必须来自项目或冻结 workflow override 的正整数",
-            )
-        return raw
-
-    def duration_ms() -> int:
-        raw = getattr(prompt, "total_duration_ms", None)
-        if isinstance(raw, bool) or not isinstance(raw, int) or raw < 0:
-            raise WorkflowSemanticError("video.duration_ms 必须是冻结的非负整数")
-        return raw
-
-    # Resolve built-ins lazily. Smoke compilation supplies every editable
-    # scalar as a frozen override, so an unrelated text/image workflow must
-    # never acquire synthetic dimensions or FPS merely because this mapping is
-    # initialized.
-    builtin_resolvers = {
-        "prompt.positive": lambda: prompt.prompt_text,
-        "prompt.negative": lambda: prompt.negative_prompt,
-        "sampling.seed": lambda: int(project.continuity_seed),
-        "image.width": lambda: project_dimension("width"),
-        "image.height": lambda: project_dimension("height"),
-        "image.aspect_ratio": lambda: str(project.aspect_ratio),
-        "image.megapixels": lambda: round(
-            project_dimension("width") * project_dimension("height") / (1024 * 1024),
-            6,
-        ),
-        "video.fps": project_fps,
-        "video.duration_ms": duration_ms,
-        "video.frames": lambda: max(1, round(duration_ms() * project_fps() / 1000)),
-        "audio.enabled": lambda: bool(prompt.include_audio),
-        "output.prefix": lambda: output_prefix or f"autoprompt/{project.id}/{prompt.id}",
-    }
     bound_keys = {row["semantic_key"] for row in bindings}
     for key in sorted(bound_keys):
         validate_semantic_key(key)
@@ -607,40 +492,23 @@ def resolve_workflow_semantics(
             key == "video.fps" and value_type == "integer"
         ):
             raise WorkflowSemanticError(f"{key} 必须使用 {expected} 类型")
-        if key in overrides:
-            if value_type in {"model_artifact", "asset_image", "asset_video", "asset_audio"}:
-                raise WorkflowSemanticError(f"{key} 禁止运行时覆盖")
-            value = overrides[key]
-        elif definition.get("use_source_default") is True:
-            if value_type in {"model_artifact", "asset_image", "asset_video", "asset_audio"}:
-                raise WorkflowSemanticError(f"{key} 禁止通过 source default 绕过受管引用")
-            if "default" not in definition:
-                raise WorkflowSemanticError(f"{key} 声明 source default 但缺少冻结 default")
-            value = definition["default"]
-        elif key in builtin_resolvers:
-            value = builtin_resolvers[key]()
+        if value_type in {"model_artifact", "asset_image", "asset_video", "asset_audio"} and definition.get("use_source_default") is True:
+            raise WorkflowSemanticError(f"{key} 禁止通过 source default 绕过受管引用")
+        model_match = _MODEL_KEY_RE.fullmatch(key)
+        asset_match = _ASSET_KEY_RE.fullmatch(key)
+        if model_match:
+            alias = str(definition.get("requirement_alias") or model_match.group(1))
+            requirement = requirement_map.get(alias)
+            if not requirement or not requirement.get("expected_filename"):
+                raise WorkflowSemanticError(f"{key} 找不到冻结的 ModelRequirement alias {alias}")
+            value = _frozen_model_submission_value(
+                key, requirement=requirement, graph=graph, bindings=bindings)
+        elif asset_match:
+            value, manifest = resolve_asset(key, definition)
+            if manifest is not None:
+                references.append(manifest)
         else:
-            model_match = _MODEL_KEY_RE.fullmatch(key)
-            asset_match = _ASSET_KEY_RE.fullmatch(key)
-            if model_match:
-                alias = str(definition.get("requirement_alias") or model_match.group(1))
-                requirement = requirement_map.get(alias)
-                if not requirement or not requirement.get("expected_filename"):
-                    raise WorkflowSemanticError(f"{key} 找不到冻结的 ModelRequirement alias {alias}")
-                value = _frozen_model_submission_value(
-                    key,
-                    requirement=requirement,
-                    graph=graph,
-                    bindings=bindings,
-                )
-            elif asset_match:
-                value, manifest = _asset_for_semantic(key, definition, prompt=prompt)
-                if manifest is not None:
-                    references.append(manifest)
-            elif "default" in definition:
-                value = definition["default"]
-            else:
-                value = None
+            value = resolve_scalar(key, definition, value_type)
         required = bool(definition.get("required", True))
         if value is None:
             if required:

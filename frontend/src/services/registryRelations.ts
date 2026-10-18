@@ -1,8 +1,9 @@
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { api } from './api'
 import { apiErrorSummary } from './apiErrorPresentation'
+import { canonicalSettingsResourceUrl } from './executionPath'
 
-export const relationKinds = { model: '模型版本', deployment: '运行实例', workflow: '工作流', prompt: '提示词策略', binding: '提示词绑定', projector: 'Projector', recipe: '配方与路由' } as const
+export const relationKinds = { field: '字段身份', field_version: '字段定义版本', structure: '输入／输出结构', source: '内容来源版本', execution: '执行实例版本', model: '模型版本', deployment: '模型部署', workflow: '工作流', prompt: '提示词策略', output: '业务输出版本', projector: 'Projector', recipe: '生产配方' } as const
 export type RelationKind = keyof typeof relationKinds
 export interface RelationGroup { key: string; label: string; kind: RelationKind; count: number; url: string }
 export interface RelationRow { id: string; kind: RelationKind; label: string; status: string; config_url: string; overview_url: string; acceptance_url: string; groups: RelationGroup[]; notices: string[]; capabilities: string[] }
@@ -41,7 +42,11 @@ export function adaptRelationPage(value: unknown): RelationPage {
   }
 }
 export const relationOverviewUrl = (kind: RelationKind, id?: string) => '/settings/acceptance-smoke?' + new URLSearchParams({ view: 'relations', kind, ...(id ? { ids: id } : {}) })
-export const relationConfigUrl = (row: RelationRow) => row.config_url + (row.config_url.includes('?') ? '&' : '?') + new URLSearchParams({ relation_context: `${row.kind}:${row.id}` })
+export const relationConfigUrl = (row: RelationRow) => {
+  const url = new URL(canonicalSettingsResourceUrl(row.config_url), 'https://navigation.invalid')
+  url.searchParams.set('relation_context', `${row.kind}:${row.id}`)
+  return url.pathname + url.search + url.hash
+}
 export async function getRelationPage(params: Record<string, string | number>, signal?: AbortSignal) {
   const response = await api.get('/registry-relations/', { params, signal })
   return adaptRelationPage(response.data)

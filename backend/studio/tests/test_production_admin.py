@@ -4,13 +4,12 @@ from django.test import RequestFactory, SimpleTestCase
 from studio.models import (
     AssemblyJob,
     ConfigDefinition,
-    DeferredGenerationRequest,
-    GeneratedWorkflow,
+    GenerationAttempt,
+    GeneratedArtifact,
     GenerationTask,
     ModelArtifact,
     ModelDeployment,
     ModelProfileVersion,
-    PromptArtifact,
     PromptFieldTranslation,
     ProviderProfile,
     ReleaseBundle,
@@ -24,8 +23,8 @@ class ImmutableProductionAuditAdminTests(SimpleTestCase):
         request = RequestFactory().get("/admin/")
 
         for model in (
-            PromptArtifact,
-            GeneratedWorkflow,
+            GenerationAttempt,
+            GeneratedArtifact,
             GenerationTask,
             AssemblyJob,
             ReleaseBundle,
@@ -37,7 +36,6 @@ class ImmutableProductionAuditAdminTests(SimpleTestCase):
             ProviderProfile,
             ModelDeployment,
             ConfigDefinition,
-            DeferredGenerationRequest,
         ):
             with self.subTest(model=model.__name__):
                 model_admin = admin.site._registry[model]
@@ -53,18 +51,17 @@ class ImmutableProductionAuditAdminTests(SimpleTestCase):
     def test_sensitive_candidate_fields_are_explicitly_read_only(self):
         request = RequestFactory().get("/admin/")
         expected = {
-            PromptArtifact: {
-                "project", "episode", "shot", "created_by", "model",
-                "prompt_text", "request_options", "structured_payload",
-                "consistency_snapshot", "content_hash",
+            GenerationAttempt: {
+                "stage_run", "preparation", "execution_instance_version", "role",
+                "request_snapshot", "request_sha256", "prompt_profile_version",
             },
-            GeneratedWorkflow: {
-                "project", "episode", "prompt_artifact", "template", "created_by",
-                "workflow_json", "injected_values", "content_hash",
+            GeneratedArtifact: {
+                "production_run", "stage_run", "generation_attempt", "generation_task",
+                "manifest_metadata", "manifest_metadata_sha256", "sha256",
             },
             GenerationTask: {
-                "owner", "project", "episode", "generated_workflow",
-                "capability_snapshot", "outputs", "status",
+                "owner", "project", "episode", "outputs", "status",
+                "submission_token", "remote_state", "distribution_state",
             },
         }
         for model, fields in expected.items():

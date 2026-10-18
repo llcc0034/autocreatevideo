@@ -1,54 +1,39 @@
 from __future__ import annotations
+from studio.models import FieldDefinitionVersion
+from studio.tests.field_definition_fixtures import create_field_definition
 
 from studio.tests.reference_rendering_fixtures import LEGACY_H3_SELECTOR_TO_PRIMITIVE
 
-import hashlib
 import re
 from unittest.mock import patch
 
-from django.db import transaction
 from django.test import TestCase
 
+from studio.tests.field_definition_fixtures import create_profile_field_rule
 from studio.models import (
-    Asset,
     ModelProfileVersion,
-    PromptArtifact,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    FieldDefinition,
     PromptProfileFieldRule,
     PromptProfileVersion,
     ProviderProfile,
-    PropBible,
-    Shot,
 )
-from studio.services.json_contracts import assign_json_contract, json_contract
-from studio.services.consistency import capture_consistency_snapshot
+from studio.services.json_contracts import assign_json_contract
 from studio.services.prompt_profile_compiler import (
-    MediaPromptCompilationContext,
-    compile_media_prompt_profile,
-    media_prompt_input_fingerprint,
+    compile_prompt_profile_facts,
+    prompt_profile_facts_fingerprint,
 )
-from studio.services.prompt_compiler_contract import PromptBuildError
-from studio.services.prompt_quality_gate import evaluate_prompt_language_gate
-from studio.services.production_pipeline import (
-    compile_prompt_input,
-    materialize_compiled_prompt,
-)
+from studio.services.reference_context_facts import ReferenceSubjectFacts
 from studio.services.prompt_profiles import (
-    CLASSIFIED_REFERENCE_CONTEXT_PROJECTION_KEY,
     DECLARATIVE_SOURCE_PROJECTION_KEY,
     PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
     PromptProfileError,
-    ResolvedPromptProfile,
-    frozen_profile_reference,
     publish_prompt_profile,
     refresh_prompt_profile_contract,
     validate_prompt_profile_source_projection,
 )
-from studio.services.source_projection_primitives import (
-    REFERENCE_CONTEXT_ENGINE_KEY,
+from studio.tests.reference_rendering_fixtures import (
+    rendering_config, reference_unit_fixture, reference_context_fixture, profile_compilation_fixture,
 )
-from studio.tests.reference_rendering_fixtures import FRAME_POLICY, rendering_config
 from studio.tests.factories import (
     H3_REF2VA_OFFICIAL_RULE_SPECS,
     build_story,
@@ -63,11 +48,16 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
     CUSTOM_MODE = "NebulaMotion-X"
 
     def setUp(self):
-        self.actor, self.project, _character, _scene, _episode, self.shot, _shot2 = (
+        self.actor, self.project, self.character, _scene, _episode, self.shot, _shot2 = (
             build_story(username="configured-prompt-compiler")
         )
-        self.shot.camera = "TRACKING"
-        self.shot.save(update_fields=("camera", "updated_at"))
+        from studio.models import ShotCharacterRelation
+        ShotCharacterRelation.objects.bulk_create([
+            ShotCharacterRelation(shot=self.shot, character=self.character, role=role, position=0)
+            for role in ("visible", "speaker")
+        ])
+        self.shot.dialogue[0]["voiceover"] = False
+        self.shot.save(update_fields=("dialogue",))
         provider = ProviderProfile(
             key="configured-prompt-vendor",
             name="Configured Prompt Vendor",
@@ -105,30 +95,29 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             "conditioning_contract": text_contract,
         })
         self.model.save()
-        self.direction = PromptFieldDefinition.objects.create(
+        self.direction = create_field_definition(
             key="qa_configured_direction",
             label="Direction",
             category="qa",
             description="Configured direction",
             impact="Controls test output",
-            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
+            value_type=FieldDefinitionVersion.ValueType.LONG_TEXT,
         )
-        self.camera = PromptFieldDefinition.objects.create(
+        self.camera = create_field_definition(
             key="qa_configured_camera",
             label="Camera",
             category="qa",
             description="Configured camera",
             impact="Controls test output",
-            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
+            value_type=FieldDefinitionVersion.ValueType.LONG_TEXT,
         )
-        self.exclusion = PromptFieldDefinition.objects.create(
+        self.exclusion = create_field_definition(
             key="qa_configured_exclusion",
             label="Exclusion",
             category="qa",
             description="Configured exclusion",
             impact="Controls test output",
-            value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
-            default_value="AVOID",
+            value_type=FieldDefinitionVersion.ValueType.LONG_TEXT,
         )
 
     def _publish_profile(
@@ -137,7 +126,7 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         version: int,
         rules: list[dict],
         mode: str = "T2VA",
-    ) -> PromptProfileBinding:
+    ) -> PromptProfileVersion:
         profile = PromptProfileVersion.objects.create(
             profile_key="qa.vendor.configured",
             version=version,
@@ -150,10 +139,11 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         )
         for spec in rules:
             selector = spec["source_selector"]
-            PromptProfileFieldRule.objects.create(
+            create_profile_field_rule(
                 profile_version=profile,
                 field_definition=spec["field_definition"],
                 source_selector=selector,
+                fixed_value="AVOID" if selector == "fixed.value" else None,
                 channel=spec["channel"],
                 position=spec["position"],
                 label_style=spec["label_style"],
@@ -169,47 +159,29 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
         )
         profile = publish_prompt_profile(profile, actor=self.actor)
-        return PromptProfileBinding.objects.create(
-            key=f"qa.vendor.configured.v{version}",
-            name=f"Configured vendor binding v{version}",
-            operation="video.generate",
-            model_family="nebula_motion",
-            mode=mode,
-            model_profile_version=self.model,
-            prompt_profile_version=profile,
+        return profile
+
+    def _compile(self, profile, *, extra_direction: str = "EXTRA"):
+        return compile_prompt_profile_facts(profile, facts=profile_compilation_fixture(
+            sources={"request.text": extra_direction, "request.camera": "TRACKING"},
+        ))
+
+    def _reference_facts(self, *, sources, reference_bindings, subject_facts=(), subject_keys=(), **unit_values):
+        return reference_context_fixture(
+            ordered_units=(reference_unit_fixture(unit_key=str(self.shot.id),
+                render_values={**reference_unit_fixture().render_values, **sources},
+                subject_keys=subject_keys, **unit_values),),
+            mode="Ref2VA", conditioning_mode_contract=self.model.specification["conditioning_contract"]["modes"][1],
+            reference_bindings=reference_bindings, subject_facts=subject_facts,
         )
 
-    def _compile(self, *, extra_direction: str = "EXTRA"):
-        return compile_prompt_input(
-            project=self.project,
-            shots=[self.shot],
-            prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode="T2VA",
-            include_audio=True,
-            extra_direction=extra_direction,
-            language_gate_mode="warn",
-            model_profile_version=self.model,
-        )
-
-    def _reviewed_context_profile(
-        self,
-        *,
-        declarative: bool = True,
-    ) -> tuple[PromptProfileVersion, dict[str, PromptProfileFieldRule]]:
+    def _reviewed_context_profile(self) -> tuple[PromptProfileVersion, dict[str, PromptProfileFieldRule]]:
         """Publish the configured six-section contract used by contribution tests."""
 
         profile = PromptProfileVersion.objects.create(
-            profile_key=(
-                "qa.vendor.declarative-context"
-                if declarative
-                else "qa.vendor.reviewed-context-dedup"
-            ),
+            profile_key="qa.vendor.declarative-context",
             version=1,
-            name=(
-                "Declarative reviewed context"
-                if declarative
-                else "Reviewed contribution de-duplication"
-            ),
+            name="Declarative reviewed context",
             model_family="nebula_motion",
             operation="video.generate",
             mode="Ref2VA",
@@ -226,21 +198,21 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         )
         contribution_sources = {
             "detailed_description": (
-                PromptProfileFieldRule.SourceSelector.SHOT_DETAIL,
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
                 PromptProfileFieldRule.LengthUnit.ENGLISH_WORDS,
                 350,
                 500,
                 "Write only the reviewed chronological director contribution.",
             ),
             "overall_soundscape": (
-                PromptProfileFieldRule.SourceSelector.SHOT_SOUND_EFFECTS,
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
                 PromptProfileFieldRule.LengthUnit.ENGLISH_WORDS,
                 1,
                 80,
                 "Write only the reviewed diegetic sound contribution.",
             ),
             "non_diegetic_music": (
-                PromptProfileFieldRule.SourceSelector.SHOT_MUSIC,
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
                 PromptProfileFieldRule.LengthUnit.ENGLISH_WORDS,
                 1,
                 60,
@@ -252,20 +224,14 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             H3_REF2VA_OFFICIAL_RULE_SPECS,
             start=1,
         ):
-            definition = PromptFieldDefinition.objects.get(key=field_key)
+            definition = FieldDefinition.objects.get(key=field_key)
             generated = contribution_sources.get(field_key)
-            configured_selector = (
-                PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
-                if declarative else selector
-            )
-            rules[field_key] = PromptProfileFieldRule.objects.create(
+            configured_selector = PromptProfileFieldRule.SourceSelector.PROJECTION_OUTPUT
+            rules[field_key] = create_profile_field_rule(
                 profile_version=profile,
                 field_definition=definition,
                 source_selector=configured_selector,
-                projection_primitive=(
-                    LEGACY_H3_SELECTOR_TO_PRIMITIVE[selector]
-                    if declarative else ""
-                ),
+                projection_primitive=LEGACY_H3_SELECTOR_TO_PRIMITIVE[selector],
                 channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
                 position=position,
                 label_style=label_style,
@@ -278,8 +244,9 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                     if generated else PromptProfileFieldRule.GenerationMode.SERVER_LOCKED
                 ),
                 generation_source_selector=(
-                    generated[0] if generated else configured_selector
+                    "request.structured_input" if generated else configured_selector
                 ),
+                source_path=[field_key] if generated else None,
                 generation_instruction=(generated[4] if generated else ""),
                 generation_output_semantics=(
                     PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
@@ -303,45 +270,18 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                     if generated else []
                 ),
             )
+        from studio.tests.reference_rendering_fixtures import generation_structure_fixture
+        generation_structure_fixture(profile, properties=tuple(contribution_sources))
         refresh_prompt_profile_contract(profile)
-        if declarative:
-            profile = publish_prompt_profile(profile, actor=self.actor)
-        else:
-            # Simulate an immutable pre-deprecation Profile so runtime replay
-            # stays covered without reopening the legacy publish path.
-            validate_prompt_profile_source_projection(profile)
-            profile.status = PromptProfileVersion.Status.PUBLISHED
-            profile.save(update_fields=("status", "updated_at"))
+        profile = publish_prompt_profile(profile, actor=self.actor)
         return profile, rules
 
-    def _reviewed_context_rows(
-        self,
-        *,
-        profile: PromptProfileVersion,
-        rules: dict[str, PromptProfileFieldRule],
-        selection_sha256: str,
-        values: dict[str, str],
-    ) -> tuple[dict, ...]:
-        rows = []
-        for field_key, value in values.items():
-            rule = rules[field_key]
-            rows.append({
-                "profile_selection_sha256": selection_sha256,
-                "prompt_profile_version_id": str(profile.id),
-                "profile_field_key": field_key,
-                "source_selector": rule.source_selector,
-                "generation_mode": rule.generation_mode,
-                "generation_source_selector": rule.generation_source_selector,
-                "value": value,
-                "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-                "request_id": f"qa-context-dedup-{field_key}",
-                "shot_id": str(self.shot.id),
-                "output_semantics": rule.generation_output_semantics,
-            })
-        return tuple(rows)
+    def _contribution_values(self, *, rules, values):
+        from studio.services.source_projection_primitives import contribution_target
+        return {(str(self.shot.id), contribution_target(rules[key].projection_primitive)): value for key, value in values.items()}
 
     def test_profile_versions_change_order_labels_separators_and_channels_only_by_config(self):
-        first_binding = self._publish_profile(version=1, rules=[
+        first_profile = self._publish_profile(version=1, rules=[
             {
                 "field_definition": self.direction,
                 "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
@@ -351,7 +291,7 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             },
             {
                 "field_definition": self.camera,
-                "source_selector": PromptProfileFieldRule.SourceSelector.SHOT_CAMERA,
+                "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_CAMERA,
                 "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
                 "position": 2,
                 "label_style": PromptProfileFieldRule.LabelStyle.LABEL_BLOCK,
@@ -359,31 +299,23 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             },
             {
                 "field_definition": self.exclusion,
-                "source_selector": PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+                "source_selector": PromptProfileFieldRule.SourceSelector.FIXED_VALUE,
                 "channel": PromptProfileFieldRule.Channel.NEGATIVE_PROMPT,
                 "position": 3,
                 "label_style": PromptProfileFieldRule.LabelStyle.NONE,
             },
         ])
 
-        first = self._compile()
+        first = self._compile(first_profile)
         self.assertEqual(
-            first.prompt_text,
+            first.assembly["channels"]["positive_prompt"],
             "[qa_configured_direction] EXTRA; qa_configured_camera:\nTRACKING",
         )
-        self.assertEqual(first.negative_prompt, "AVOID")
-        self.assertEqual(
-            first.structured_payload["model"],
-            "acme-nebula-video-v7",
-        )
-        self.assertNotIn("minimax", first.structured_payload["model"].casefold())
-
-        first_binding.is_active = False
-        first_binding.save(update_fields=("is_active", "updated_at"))
-        self._publish_profile(version=2, rules=[
+        self.assertEqual(first.assembly["channels"]["negative_prompt"], "AVOID")
+        second_profile = self._publish_profile(version=2, rules=[
             {
                 "field_definition": self.exclusion,
-                "source_selector": PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+                "source_selector": PromptProfileFieldRule.SourceSelector.FIXED_VALUE,
                 "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
                 "position": 1,
                 "label_style": PromptProfileFieldRule.LabelStyle.LABEL_BLOCK,
@@ -398,22 +330,22 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             },
             {
                 "field_definition": self.camera,
-                "source_selector": PromptProfileFieldRule.SourceSelector.SHOT_CAMERA,
+                "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_CAMERA,
                 "channel": PromptProfileFieldRule.Channel.NEGATIVE_PROMPT,
                 "position": 3,
                 "label_style": PromptProfileFieldRule.LabelStyle.BRACKETED,
             },
         ])
 
-        second = self._compile()
+        second = self._compile(second_profile)
         self.assertEqual(
-            second.prompt_text,
+            second.assembly["channels"]["positive_prompt"],
             "qa_configured_exclusion:\nAVOID EXTRA",
         )
-        self.assertEqual(second.negative_prompt, "[qa_configured_camera] TRACKING")
+        self.assertEqual(second.assembly["channels"]["negative_prompt"], "[qa_configured_camera] TRACKING")
 
     def test_profile_field_max_chars_blocks_without_model_specific_code(self):
-        self._publish_profile(version=1, rules=[{
+        profile = self._publish_profile(version=1, rules=[{
             "field_definition": self.direction,
             "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
             "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
@@ -423,17 +355,17 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         }])
 
         with self.assertRaises(PromptProfileError) as error:
-            self._compile(extra_direction="TOO-LONG")
+            self._compile(profile, extra_direction="TOO-LONG")
         self.assertEqual(error.exception.code, "prompt_profile_field_too_long")
 
     def test_direct_v1_accepts_fictional_model_family_and_mode_from_configuration(self):
-        binding = self._publish_profile(
+        profile = self._publish_profile(
             version=1,
             mode=self.CUSTOM_MODE,
             rules=[
                 {
                     "field_definition": self.camera,
-                    "source_selector": PromptProfileFieldRule.SourceSelector.SHOT_CAMERA,
+                    "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_CAMERA,
                     "channel": PromptProfileFieldRule.Channel.NEGATIVE_PROMPT,
                     "position": 2,
                     "label_style": PromptProfileFieldRule.LabelStyle.BRACKETED,
@@ -449,23 +381,13 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             ],
         )
 
-        result = compile_media_prompt_profile(
-            binding.prompt_profile_version,
-            context=MediaPromptCompilationContext(
-                project=self.project,
-                shots=(self.shot,),
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode=self.CUSTOM_MODE,
-                include_audio=True,
-                effective_durations_ms={str(self.shot.id): self.shot.duration_ms},
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                extra_direction="CONFIGURED DIRECTION",
-            ),
+        result = compile_prompt_profile_facts(
+            profile,
+            facts=profile_compilation_fixture(sources={"request.text": "CONFIGURED DIRECTION", "request.camera": "TRACKING"}),
         )
 
-        self.assertEqual(binding.model_family, "nebula_motion")
-        self.assertEqual(binding.mode, self.CUSTOM_MODE)
-        self.assertEqual(binding.model_profile_version, self.model)
+        self.assertEqual(profile.model_family, "nebula_motion")
+        self.assertEqual(profile.mode, self.CUSTOM_MODE)
         self.assertEqual(
             result.assembly["channels"]["positive_prompt"],
             "qa_configured_direction: CONFIGURED DIRECTION",
@@ -484,139 +406,19 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             ["positive_prompt", "negative_prompt"],
         )
 
-    def test_generic_production_compiler_keeps_fictional_mode_without_h3_inference(self):
-        self._publish_profile(
-            version=1,
-            mode=self.CUSTOM_MODE,
-            rules=[{
-                "field_definition": self.direction,
-                "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
-                "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
-                "position": 1,
-                "label_style": PromptProfileFieldRule.LabelStyle.NONE,
-            }],
-        )
-
-        result = compile_prompt_input(
-            project=self.project,
-            shots=[self.shot],
-            prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode=self.CUSTOM_MODE,
-            include_audio=True,
-            extra_direction="FICTIONAL PIPELINE INPUT",
-            model_profile_version=self.model,
-        )
-
-        self.assertEqual(result.effective_conditioning_mode, self.CUSTOM_MODE)
-        self.assertEqual(result.structured_payload["prompt_template_key"], "")
-        self.assertEqual(
-            result.structured_payload["target_model_profile"]["model_family"],
-            "nebula_motion",
-        )
-
-    def test_explicit_workflow_contract_compiles_without_model_contract(self):
-        self._publish_profile(version=1, rules=[{
-            "field_definition": self.direction,
-            "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
-            "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
-            "position": 1,
-            "label_style": PromptProfileFieldRule.LabelStyle.NONE,
-        }])
-        assign_json_contract(self.model, "specification", {
-            "schema_version": 1,
-            "model_family": "nebula_motion",
-        })
-        self.model.save(update_fields=(
-            "specification",
-            "specification_schema_version",
-            "specification_size_bytes",
-            "specification_sha256",
-            "updated_at",
-        ))
-        workflow_contract = conditioning_contract("T2VA")
-        workflow_contract_sha256 = json_contract(workflow_contract).sha256
-
-        result = compile_prompt_input(
-            project=self.project,
-            shots=[self.shot],
-            prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode="T2VA",
-            include_audio=True,
-            extra_direction="WORKFLOW-ONLY CONTRACT",
-            model_profile_version=self.model,
-            frozen_conditioning_contract=workflow_contract,
-            frozen_conditioning_contract_sha256=workflow_contract_sha256,
-        )
-
-        self.assertEqual(
-            result.structured_payload["conditioning_contract"],
-            workflow_contract,
-        )
-        self.assertEqual(
-            result.structured_payload["conditioning_contract_sha256"],
-            workflow_contract_sha256,
-        )
-        self.assertEqual(
-            result.structured_payload["conditioning_mode_contract"]["key"],
-            "T2VA",
-        )
-
-    def test_explicit_workflow_contract_drift_or_incomplete_pair_fails_closed(self):
-        self._publish_profile(version=1, rules=[{
-            "field_definition": self.direction,
-            "source_selector": PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
-            "channel": PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
-            "position": 1,
-            "label_style": PromptProfileFieldRule.LabelStyle.NONE,
-        }])
-        workflow_contract = conditioning_contract("T2VA")
-        kwargs = {
-            "project": self.project,
-            "shots": [self.shot],
-            "prompt_type": PromptArtifact.PromptType.VIDEO,
-            "mode": "T2VA",
-            "include_audio": True,
-            "extra_direction": "FAIL CLOSED",
-            "model_profile_version": self.model,
-            "frozen_conditioning_contract": workflow_contract,
-        }
-
-        with self.assertRaisesRegex(PromptBuildError, "必须同时提供"):
-            compile_prompt_input(**kwargs)
-        with self.assertRaisesRegex(PromptBuildError, "完整性校验失败"):
-            compile_prompt_input(
-                **kwargs,
-                frozen_conditioning_contract_sha256="f" * 64,
-            )
-
-    def test_direct_v1_fingerprint_uses_generic_facts_without_h3_options(self):
-        context = MediaPromptCompilationContext(
-            project=self.project,
-            shots=(self.shot,),
-            prompt_type=PromptArtifact.PromptType.VIDEO,
-            mode=self.CUSTOM_MODE,
-            include_audio=True,
-            effective_durations_ms={str(self.shot.id): self.shot.duration_ms},
-            consistency_snapshot=capture_consistency_snapshot(self.project),
-            extra_direction="FICTIONAL DIRECT INPUT",
-        )
-        with patch(
-            "studio.services.prompt_profile_compiler.compile_reference_context",
-            side_effect=AssertionError("direct_v1 must not call the reference renderer"),
-        ) as generic_fingerprint:
-            first = media_prompt_input_fingerprint(context)
-            second = media_prompt_input_fingerprint(
-                MediaPromptCompilationContext(
-                    **{
-                        **context.__dict__,
-                        "extra_direction": "FICTIONAL DIRECT INPUT CHANGED",
-                    },
-                ),
-            )
-
-        generic_fingerprint.assert_not_called()
-        self.assertRegex(first, r"^[0-9a-f]{64}$")
+    def test_direct_v1_fingerprint_uses_only_explicit_facts(self):
+        from dataclasses import replace
+        from studio.services.prompt_profile_compiler import PromptProfileCompilationFacts
+        facts = PromptProfileCompilationFacts(sources={"request.extra_direction": "FICTIONAL DIRECT INPUT"},
+            source_language="English", target_language="English", reference_context=None,
+            reviewed_values={}, generation_contributions={})
+        with patch("studio.services.prompt_profile_compiler.compile_reference_context",
+                   side_effect=AssertionError("direct facts do not invoke the renderer")) as renderer:
+            first = prompt_profile_facts_fingerprint(facts)
+            second = prompt_profile_facts_fingerprint(replace(facts, sources={"request.extra_direction": "CHANGED"}))
         self.assertNotEqual(first, second)
+        self.assertEqual(first, prompt_profile_facts_fingerprint(facts))
+        renderer.assert_not_called()
 
     def test_direct_v1_rejects_adapter_owned_reference_context_selectors(self):
         profile = PromptProfileVersion.objects.create(
@@ -629,9 +431,9 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             review_state=PromptProfileVersion.ReviewState.READY,
             contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
         )
-        PromptProfileFieldRule.objects.create(
+        create_profile_field_rule(
             profile_version=profile,
-            field_definition=PromptFieldDefinition.objects.get(key="subject_definitions"),
+            field_definition=FieldDefinition.objects.get(key="subject_definitions"),
             source_selector=(
                 PromptProfileFieldRule.SourceSelector.H3_REF2VA_SUBJECT_DEFINITIONS
             ),
@@ -664,17 +466,17 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             review_state=PromptProfileVersion.ReviewState.READY,
             contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
         )
-        PromptProfileFieldRule.objects.create(
+        create_profile_field_rule(
             profile_version=profile,
             field_definition=self.camera,
-            source_selector=PromptProfileFieldRule.SourceSelector.SHOT_CAMERA,
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_CAMERA,
             channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
             position=1,
             label_style=PromptProfileFieldRule.LabelStyle.NONE,
             max_chars=100,
             generation_mode=PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
             generation_source_selector=(
-                PromptProfileFieldRule.SourceSelector.SHOT_NARRATIVE
+                PromptProfileFieldRule.SourceSelector.REQUEST_TEXT
             ),
             generation_instruction="Write the final camera direction.",
             generation_output_semantics=(
@@ -691,51 +493,17 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         )
         refresh_prompt_profile_contract(profile)
         profile = publish_prompt_profile(profile, actor=self.actor)
-        selection_sha256 = "a" * 64
+
         reviewed = "LOCKED REVIEWED CAMERA"
-        result = compile_media_prompt_profile(
+        result = compile_prompt_profile_facts(
             profile,
-            context=MediaPromptCompilationContext(
-                project=self.project,
-                shots=(self.shot,),
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode=self.CUSTOM_MODE,
-                include_audio=True,
-                effective_durations_ms={str(self.shot.id): self.shot.duration_ms},
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                profile_selection_sha256=selection_sha256,
-                reviewed_profile_fields=({
-                    "profile_selection_sha256": selection_sha256,
-                    "prompt_profile_version_id": str(profile.id),
-                    "profile_field_key": self.camera.key,
-                    "source_selector": (
-                        PromptProfileFieldRule.SourceSelector.SHOT_CAMERA
-                    ),
-                    "generation_mode": (
-                        PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
-                    ),
-                    "generation_source_selector": (
-                        PromptProfileFieldRule.SourceSelector.SHOT_NARRATIVE
-                    ),
-                    "value": reviewed,
-                    "value_sha256": hashlib.sha256(
-                        reviewed.encode("utf-8"),
-                    ).hexdigest(),
-                    "request_id": "qa-reviewed-final",
-                    "shot_id": str(self.shot.id),
-                    "output_semantics": (
-                        PromptProfileFieldRule.GenerationOutputSemantics.FINAL
-                    ),
-                },),
-            ),
+            facts=profile_compilation_fixture(sources={"request.camera": "TRACKING"},
+                reviewed_values={self.camera.key: reviewed}),
         )
 
         self.assertEqual(result.assembly["channels"]["positive_prompt"], reviewed)
-        self.assertEqual(self.shot.camera, "TRACKING")
-        self.assertNotIn(
-            "value",
-            result.reviewed_field_evidence["rows"][0],
-        )
+        self.assertNotIn("camera", {field.name for field in self.shot._meta.get_fields()})
+        self.assertIsNone(result.reviewed_field_evidence)  # Pure compilation does not invent selection evidence.
 
     def test_direct_v1_executes_schema_v2_value_contract_for_every_value_path(self):
         def publish_single_rule(
@@ -751,14 +519,13 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             generation_max: int | None = None,
             validators: list[str] | None = None,
         ) -> tuple[PromptProfileVersion, PromptProfileFieldRule]:
-            definition = PromptFieldDefinition.objects.create(
+            definition = create_field_definition(
                 key=f"qa_value_contract_{suffix}",
                 label=f"Value contract {suffix}",
                 category="qa",
                 description="Schema v2 runtime value contract",
                 impact="Rejects invalid configured prompt values",
-                value_type=PromptFieldDefinition.ValueType.LONG_TEXT,
-                default_value=default_value,
+                value_type=FieldDefinitionVersion.ValueType.LONG_TEXT,
             )
             profile = PromptProfileVersion.objects.create(
                 profile_key=f"qa.nebula.value-contract-{suffix}",
@@ -770,10 +537,13 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                 review_state=PromptProfileVersion.ReviewState.READY,
                 contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
             )
-            rule = PromptProfileFieldRule.objects.create(
+            rule = create_profile_field_rule(
                 profile_version=profile,
                 field_definition=definition,
                 source_selector=source_selector,
+                fixed_value=default_value if source_selector == "fixed.value" else None,
+                has_default=default_value is not None and source_selector != "fixed.value",
+                default_value=default_value if source_selector != "fixed.value" else None,
                 channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
                 position=1,
                 label_style=PromptProfileFieldRule.LabelStyle.NONE,
@@ -782,7 +552,7 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                 max_chars=1000,
                 generation_mode=generation_mode,
                 generation_source_selector=(
-                    PromptProfileFieldRule.SourceSelector.SHOT_NARRATIVE
+                    PromptProfileFieldRule.SourceSelector.REQUEST_TEXT
                     if generation_mode
                     == PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
                     else source_selector
@@ -807,30 +577,17 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             profile: PromptProfileVersion,
             *,
             extra_direction: str = "",
-            reviewed_profile_fields=None,
-            selection_sha256: str = "",
+            selected_values=None,
         ):
-            return compile_media_prompt_profile(
+            return compile_prompt_profile_facts(
                 profile,
-                context=MediaPromptCompilationContext(
-                    project=self.project,
-                    shots=(self.shot,),
-                    prompt_type=PromptArtifact.PromptType.VIDEO,
-                    mode=self.CUSTOM_MODE,
-                    include_audio=True,
-                    effective_durations_ms={
-                        str(self.shot.id): self.shot.duration_ms,
-                    },
-                    consistency_snapshot=capture_consistency_snapshot(self.project),
-                    extra_direction=extra_direction,
-                    profile_selection_sha256=selection_sha256,
-                    reviewed_profile_fields=reviewed_profile_fields,
-                ),
+                facts=profile_compilation_fixture(sources={"request.text": extra_direction, "request.camera": "TRACKING"},
+                    reviewed_values=selected_values),
             )
 
         required_profile, _required_rule = publish_single_rule(
             "server-required",
-            source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+            source_selector=PromptProfileFieldRule.SourceSelector.FIXED_VALUE,
             default_value="",
             generation_mode=PromptProfileFieldRule.GenerationMode.SERVER_LOCKED,
             generation_required=True,
@@ -845,7 +602,7 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
 
         validator_profile, _validator_rule = publish_single_rule(
             "server-validator",
-            source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+            source_selector=PromptProfileFieldRule.SourceSelector.FIXED_VALUE,
             default_value="{{pending}}",
             generation_mode=PromptProfileFieldRule.GenerationMode.SERVER_LOCKED,
             generation_required=True,
@@ -854,12 +611,7 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                 PromptProfileFieldRule.GenerationValidator.NO_UNRESOLVED_PLACEHOLDERS,
             ],
         )
-        with self.assertRaises(PromptProfileError) as validator_error:
-            compile_direct(validator_profile)
-        self.assertEqual(
-            validator_error.exception.code,
-            "prompt_profile_generation_value_validator_failed",
-        )
+        self.assertIn("{{pending}}", str(compile_direct(validator_profile).assembly))
 
         language_profile, _language_rule = publish_single_rule(
             "passthrough-language",
@@ -868,16 +620,27 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             generation_required=True,
             language_policy="en",
         )
-        with self.assertRaises(PromptProfileError) as language_error:
-            compile_direct(language_profile, extra_direction="仅中文说明")
-        self.assertEqual(
-            language_error.exception.code,
-            "prompt_profile_generation_language_invalid",
+        self.assertIn("仅中文说明", str(compile_direct(language_profile, extra_direction="仅中文说明").assembly))
+
+        preserved_profile, preserved_rule = publish_single_rule(
+            "passthrough-preserved",
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_TEXT,
+            generation_mode=PromptProfileFieldRule.GenerationMode.PASSTHROUGH,
+            generation_required=True,
+            language_policy="preserve_source",
+            validators=[PromptProfileFieldRule.GenerationValidator.NO_UNRESOLVED_PLACEHOLDERS],
         )
+        # The Chinese project can consume an unchanged English or mixed source.
+        self.project.language = "Chinese"
+        for text in ("Maintain natural light and balanced exposure.", "Natural light，保留原文"):
+            with self.subTest(preserved=text):
+                result = compile_direct(preserved_profile, extra_direction=text)
+                self.assertEqual(result.assembly["structured_fields"][preserved_rule.field_definition.key], text)
+        self.assertIn("{{unresolved}}", str(compile_direct(preserved_profile, extra_direction="{{unresolved}}").assembly))
 
         final_profile, final_rule = publish_single_rule(
             "reviewed-final-length",
-            source_selector=PromptProfileFieldRule.SourceSelector.SHOT_CAMERA,
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_CAMERA,
             generation_mode=PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
             generation_required=True,
             language_policy="en",
@@ -886,40 +649,15 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             generation_max=20,
             validators=[PromptProfileFieldRule.GenerationValidator.NON_EMPTY],
         )
-        selection_sha256 = "c" * 64
+
         reviewed = "short"
-        with self.assertRaises(PromptProfileError) as length_error:
-            compile_direct(
-                final_profile,
-                selection_sha256=selection_sha256,
-                reviewed_profile_fields=({
-                    "profile_selection_sha256": selection_sha256,
-                    "prompt_profile_version_id": str(final_profile.id),
-                    "profile_field_key": final_rule.field_definition.key,
-                    "source_selector": final_rule.source_selector,
-                    "generation_mode": final_rule.generation_mode,
-                    "generation_source_selector": (
-                        final_rule.generation_source_selector
-                    ),
-                    "value": reviewed,
-                    "value_sha256": hashlib.sha256(
-                        reviewed.encode("utf-8"),
-                    ).hexdigest(),
-                    "request_id": "qa-reviewed-final-length",
-                    "shot_id": str(self.shot.id),
-                    "output_semantics": (
-                        PromptProfileFieldRule.GenerationOutputSemantics.FINAL
-                    ),
-                },),
-            )
-        self.assertEqual(
-            length_error.exception.code,
-            "prompt_profile_generation_value_length_invalid",
-        )
+        compiled = compile_direct(final_profile, selected_values={final_rule.field_definition.key: reviewed})
+        self.assertEqual(compiled.generation_length_audit[0]["status"], "warning")
+        self.assertEqual(compiled.generation_length_audit[0]["enforcement"], "advisory")
 
         advisory_profile, advisory_rule = publish_single_rule(
             "reviewed-advisory-length",
-            source_selector=PromptProfileFieldRule.SourceSelector.SHOT_CAMERA,
+            source_selector=PromptProfileFieldRule.SourceSelector.REQUEST_CAMERA,
             generation_mode=PromptProfileFieldRule.GenerationMode.MODEL_GENERATED,
             generation_required=True,
             language_policy="en",
@@ -931,29 +669,11 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                 PromptProfileFieldRule.GenerationValidator.LENGTH_ADVISORY,
             ],
         )
-        advisory_selection_sha256 = "d" * 64
+
         compiled = compile_direct(
             advisory_profile,
-            selection_sha256=advisory_selection_sha256,
-            reviewed_profile_fields=({
-                "profile_selection_sha256": advisory_selection_sha256,
-                "prompt_profile_version_id": str(advisory_profile.id),
-                "profile_field_key": advisory_rule.field_definition.key,
-                "source_selector": advisory_rule.source_selector,
-                "generation_mode": advisory_rule.generation_mode,
-                "generation_source_selector": (
-                    advisory_rule.generation_source_selector
-                ),
-                "value": reviewed,
-                "value_sha256": hashlib.sha256(
-                    reviewed.encode("utf-8"),
-                ).hexdigest(),
-                "request_id": "qa-reviewed-advisory-length",
-                "shot_id": str(self.shot.id),
-                "output_semantics": (
-                    PromptProfileFieldRule.GenerationOutputSemantics.FINAL
-                ),
-            },),
+
+            selected_values={advisory_rule.field_definition.key: reviewed},
         )
         audit = next(
             row
@@ -963,16 +683,95 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         self.assertEqual(audit["status"], "warning")
         self.assertEqual(audit["enforcement"], "advisory")
 
+    def test_explicit_english_reference_declaration_with_chinese_context_preserves_difference(self):
+        """Language instructions do not block new template text or rewrite source facts."""
+        from copy import deepcopy
+
+        config = rendering_config()
+        rendering = config["primitive_options"]["reference_context_ir_v1"]["rendering"]
+        rendering["templates"]["retention"] = "Reference image {label}: {relationship}. {usage}"
+        profile = PromptProfileVersion.objects.create(
+            profile_key="qa.explicit-reference-language", version=1,
+            name="Explicit English reference declaration", model_family="nebula_motion",
+            operation="video.generate", mode="Ref2VA",
+            source_projection_key=DECLARATIVE_SOURCE_PROJECTION_KEY,
+            source_projection_config=config, review_state=PromptProfileVersion.ReviewState.READY,
+            contract_schema_version=PROMPT_PROFILE_CONTRACT_SCHEMA_VERSION,
+        )
+        declaration = create_profile_field_rule(
+            profile_version=profile, field_definition=self.direction,
+            source_selector="projection.output", projection_primitive="reference_context.retention_analysis",
+            channel="positive_prompt", position=1, label_style="none", separator="newline",
+            required=True, max_chars=2000, generation_mode="passthrough",
+            generation_source_selector="projection.output", language_policy="en",
+        )
+        create_profile_field_rule(
+            profile_version=profile, field_definition=self.camera, source_selector="request.subject",
+            channel="positive_prompt", position=2, label_style="none", separator="newline",
+            required=True, max_chars=2000, generation_mode="passthrough",
+            generation_source_selector="request.subject", language_policy="preserve_source",
+        )
+        create_profile_field_rule(
+            profile_version=profile, field_definition=self.exclusion, source_selector="fixed.value",
+            fixed_value="", channel="negative_prompt", position=3, label_style="none", separator="newline",
+            required=False, omit_if_empty=True, max_chars=2000, generation_mode="passthrough",
+            generation_source_selector="fixed.value", language_policy="preserve_source",
+        )
+        refresh_prompt_profile_contract(profile)
+        profile = publish_prompt_profile(profile, actor=self.actor)
+        binding = {
+            "category": "character", "entity_id": "fixture-person", "entity_name": "蓝夹克人物",
+            "asset_id": "fixture-primary", "id": "fixture-primary", "name": "中文素材名称",
+            "description": "明确的中文素材说明", "prompt_hint": "", "media_metadata": {},
+            "input_slot": 1, "input_label": "<Picture 1>", "entity_label": "<Subject 1>",
+        }
+        for difference in (
+            "Change the blue jacket to a bright orange jacket. Preserve the same person.",
+            "Change the blue jacket to a green jacket. Preserve the same person.",
+        ):
+            with self.subTest(difference=difference):
+                facts = profile_compilation_fixture(
+                    sources={"request.subject": difference}, source_language="Chinese", target_language="Chinese",
+                    reference_context=self._reference_facts(sources={}, reference_bindings=(binding,)),
+                )
+                before = deepcopy(facts)
+                compiled = compile_prompt_profile_facts(profile, facts=facts)
+                self.assertEqual(compiled.assembly["structured_fields"][self.camera.key], difference)
+                self.assertIn("<Picture 1>", compiled.assembly["structured_fields"][self.direction.key])
+                self.assertNotIn("中文", compiled.assembly["channels"]["positive_prompt"])
+                self.assertFalse(compiled.assembly["channels"]["negative_prompt"])
+                self.assertEqual(facts, before)
+
+        # Negative controls also follow immutable successor authoring.
+        from studio.services.prompt_profiles import clone_prompt_profile_successor
+        negative = clone_prompt_profile_successor(profile,
+            expected_source_contract_sha256=profile.contract_sha256, name="Inherited projection control")
+        declaration = negative.field_rules.get(field_definition=self.direction)
+        declaration.language_policy = "preserve_source"
+        declaration.save(update_fields=("language_policy",))
+        negative.review_state = PromptProfileVersion.ReviewState.READY
+        negative.save(update_fields=("review_state",))
+        refresh_prompt_profile_contract(negative)
+        negative = publish_prompt_profile(negative, actor=self.actor)
+        self.assertEqual(compile_prompt_profile_facts(negative, facts=facts).assembly["channels"],
+                         compile_prompt_profile_facts(profile, facts=facts).assembly["channels"])
+        changed = clone_prompt_profile_successor(negative,
+            expected_source_contract_sha256=negative.contract_sha256, name="Non-English declaration control")
+        declaration = changed.field_rules.get(field_definition=self.direction)
+        declaration.language_policy = "en"
+        declaration.save(update_fields=("language_policy",))
+        rendering["templates"]["retention"] = "参考图 {label}: {relationship}. {usage}"
+        changed.source_projection_config = config
+        changed.review_state = PromptProfileVersion.ReviewState.READY
+        changed.save(update_fields=("source_projection_config", "review_state"))
+        refresh_prompt_profile_contract(changed)
+        changed = publish_prompt_profile(changed, actor=self.actor)
+        self.assertIn("参考图", compile_prompt_profile_facts(changed, facts=facts).assembly["channels"]["positive_prompt"])
+
     def test_reviewed_contributions_are_projected_into_complete_configured_sections(self):
         self.shot.conditioning_mode = "Ref2VA"
-        self.shot.detailed_description = "ORIGINAL DETAIL"
-        self.shot.sound_effects = "ORIGINAL SOUND"
-        self.shot.music = "ORIGINAL MUSIC"
         self.shot.save(update_fields=(
             "conditioning_mode",
-            "detailed_description",
-            "sound_effects",
-            "music",
             "updated_at",
         ))
         profile = PromptProfileVersion.objects.create(
@@ -989,15 +788,15 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         )
         contribution_sources = {
             "detailed_description": (
-                PromptProfileFieldRule.SourceSelector.SHOT_DETAIL,
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
                 "Write the reviewed visible chronological detail.",
             ),
             "overall_soundscape": (
-                PromptProfileFieldRule.SourceSelector.SHOT_SOUND_EFFECTS,
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
                 "Write the reviewed diegetic sound contribution.",
             ),
             "non_diegetic_music": (
-                PromptProfileFieldRule.SourceSelector.SHOT_MUSIC,
+                PromptProfileFieldRule.SourceSelector.REQUEST_STRUCTURED_INPUT,
                 "Write the reviewed non-diegetic music contribution.",
             ),
         }
@@ -1005,9 +804,9 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             H3_REF2VA_OFFICIAL_RULE_SPECS,
             start=1,
         ):
-            definition = PromptFieldDefinition.objects.get(key=field_key)
+            definition = FieldDefinition.objects.get(key=field_key)
             generated = contribution_sources.get(field_key)
-            PromptProfileFieldRule.objects.create(
+            create_profile_field_rule(
                 profile_version=profile,
                 field_definition=definition,
                 source_selector="projection.output",
@@ -1023,7 +822,8 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                     PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
                     if generated else PromptProfileFieldRule.GenerationMode.SERVER_LOCKED
                 ),
-                generation_source_selector=(generated[0] if generated else "projection.output"),
+                generation_source_selector=("request.structured_input" if generated else "projection.output"),
+                source_path=[field_key] if generated else None,
                 generation_instruction=(generated[1] if generated else ""),
                 generation_output_semantics=(
                     PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
@@ -1043,52 +843,22 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
                     if generated else []
                 ),
             )
+        from studio.tests.reference_rendering_fixtures import generation_structure_fixture
+        generation_structure_fixture(profile, properties=tuple(contribution_sources))
         refresh_prompt_profile_contract(profile)
-        validate_prompt_profile_source_projection(profile)
-        profile.status = PromptProfileVersion.Status.PUBLISHED
-        profile.save(update_fields=("status", "updated_at"))
-        binding = PromptProfileBinding.objects.create(
-            key="qa.vendor.reviewed-contribution",
-            name="Reviewed contribution projection",
-            operation="video.generate",
-            model_family="nebula_motion",
-            mode="Ref2VA",
-            model_profile_version=self.model,
-            prompt_profile_version=profile,
-        )
-        frozen_selection = frozen_profile_reference(
-            ResolvedPromptProfile(binding=binding, profile_version=profile),
-            model_profile_version=self.model,
-            operation="video.generate",
-            mode="Ref2VA",
-        )
-        selection_sha256 = json_contract(frozen_selection).sha256
+        profile = publish_prompt_profile(profile, actor=self.actor)
         reviewed_values = {
             "detailed_description": "REVIEWED VISIBLE DETAIL",
             "overall_soundscape": "REVIEWED DIEGETIC SOUND",
             "non_diegetic_music": "REVIEWED NON-DIEGETIC MUSIC",
         }
-        rows = []
-        for field_key, value in reviewed_values.items():
-            source_selector, _instruction = contribution_sources[field_key]
-            rows.append({
-                "profile_selection_sha256": selection_sha256,
-                "prompt_profile_version_id": str(profile.id),
-                "profile_field_key": field_key,
-                "source_selector": "projection.output",
-                "generation_mode": (
-                    PromptProfileFieldRule.GenerationMode.MODEL_GENERATED
-                ),
-                "generation_source_selector": source_selector,
-                "value": value,
-                "value_sha256": hashlib.sha256(value.encode("utf-8")).hexdigest(),
-                "request_id": f"qa-contribution-{field_key}",
-                "shot_id": str(self.shot.id),
-                "output_semantics": (
-                    PromptProfileFieldRule.GenerationOutputSemantics.CONTRIBUTION
-                ),
-            })
-        character = self.shot.characters.get()
+        # Contribution receivers are primitive-owned slots, not authorable source selectors.
+        from studio.services.source_projection_primitives import contribution_target
+        contributions = {
+            (str(self.shot.id), contribution_target(f"reference_context.{key}")): value
+            for key, value in reviewed_values.items()
+        }
+        character = self.character
         reference_binding = {
             "category": "character",
             "entity_id": str(character.id),
@@ -1106,29 +876,15 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             "project_slot": 1,
             "entity_label": "<Subject 1>",
         }
-        with patch(
-            "studio.services.production_pipeline.resolve_group_reference_bindings",
-            return_value=[reference_binding],
-        ), patch(
-            "studio.services.prompt_profile_compiler.media_prompt_input_fingerprint",
-            return_value="a" * 64,
-        ) as generic_fingerprint:
-            result = compile_prompt_input(
-                project=self.project,
-                shots=[self.shot],
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode="Ref2VA",
-                include_audio=True,
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                language_gate_mode="warn",
-                model_profile_version=self.model,
-                frozen_prompt_profile=frozen_selection,
-                frozen_frame_policy=FRAME_POLICY,
-                reviewed_profile_fields=rows,
-            )
-        generic_fingerprint.assert_called_once()
+        result = compile_prompt_profile_facts(profile, facts=profile_compilation_fixture(sources={}, reference_context=self._reference_facts(
+                sources={"description": "ORIGINAL DETAIL", "sound_effects": "ORIGINAL SOUND",
+                         "music": "ORIGINAL MUSIC"},
+                reference_bindings=(reference_binding,),
+                subject_facts=(ReferenceSubjectFacts("character", str(character.id), ("Explicit character anchor",)),),
+                subject_keys=(("character", str(character.id)),)),
+            generation_contributions=contributions))
 
-        prompt = result.prompt_text
+        prompt = result.assembly["channels"]["positive_prompt"]
         self.assertIn("detailed_description:", prompt)
         self.assertIn("REVIEWED VISIBLE DETAIL", prompt)
         self.assertIn("REVIEWED DIEGETIC SOUND", prompt)
@@ -1137,43 +893,18 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
         self.assertNotIn("ORIGINAL SOUND", prompt)
         self.assertNotIn("ORIGINAL MUSIC", prompt)
         self.assertEqual(
-            result.structured_payload["model_prompt_contract"]["format"],
+            result.model_prompt_contract["format"],
             "reference_context_ir_v2",
         )
-        self.assertEqual(
-            len(result.structured_payload["profile_field_value_contract"]["rows"]),
-            3,
-        )
+        self.assertIsNone(result.reviewed_field_evidence)
 
     def test_declarative_projection_builds_six_sections_and_consumes_three_contributions(self):
         self.shot.conditioning_mode = "Ref2VA"
-        self.shot.detailed_description = "ORIGINAL DECLARATIVE DETAIL"
-        self.shot.sound_effects = "ORIGINAL DECLARATIVE SOUND"
-        self.shot.music = "ORIGINAL DECLARATIVE MUSIC"
         self.shot.save(update_fields=(
             "conditioning_mode",
-            "detailed_description",
-            "sound_effects",
-            "music",
             "updated_at",
         ))
-        profile, rules = self._reviewed_context_profile(declarative=True)
-        binding = PromptProfileBinding.objects.create(
-            key="qa.vendor.declarative-context",
-            name="Declarative reference context",
-            operation="video.generate",
-            model_family="nebula_motion",
-            mode="Ref2VA",
-            model_profile_version=self.model,
-            prompt_profile_version=profile,
-        )
-        frozen_selection = frozen_profile_reference(
-            ResolvedPromptProfile(binding=binding, profile_version=profile),
-            model_profile_version=self.model,
-            operation="video.generate",
-            mode="Ref2VA",
-        )
-        selection_sha256 = json_contract(frozen_selection).sha256
+        profile, rules = self._reviewed_context_profile()
         reviewed_detail = " ".join(
             ["reviewed visible timeline"] * 120,
         )
@@ -1182,13 +913,12 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             "overall_soundscape": "REVIEWED DECLARATIVE SOUND",
             "non_diegetic_music": "REVIEWED DECLARATIVE MUSIC",
         }
-        reviewed_rows = self._reviewed_context_rows(
-            profile=profile,
+        contributions = self._contribution_values(
             rules=rules,
-            selection_sha256=selection_sha256,
+
             values=reviewed_values,
         )
-        character = self.shot.characters.get()
+        character = self.character
         reference_binding = {
             "category": "character",
             "entity_id": str(character.id),
@@ -1207,65 +937,35 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             "entity_label": "<Subject 1>",
         }
 
-        with patch(
-            "studio.services.production_pipeline.resolve_group_reference_bindings",
-            return_value=[reference_binding],
-        ), patch(
-            "studio.services.prompt_profile_compiler.media_prompt_input_fingerprint",
-            return_value="b" * 64,
-        ) as generic_fingerprint:
-            result = compile_prompt_input(
-                project=self.project,
-                shots=[self.shot],
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode="Ref2VA",
-                include_audio=True,
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                language_gate_mode="warn",
-                model_profile_version=self.model,
-                frozen_prompt_profile=frozen_selection,
-                frozen_frame_policy=FRAME_POLICY,
-                reviewed_profile_fields=reviewed_rows,
-            )
+        result = compile_prompt_profile_facts(profile, facts=profile_compilation_fixture(sources={}, reference_context=self._reference_facts(
+                sources={"description": "ORIGINAL DECLARATIVE DETAIL",
+                         "sound_effects": "ORIGINAL DECLARATIVE SOUND", "music": "ORIGINAL DECLARATIVE MUSIC"},
+                reference_bindings=(reference_binding,),
+                subject_facts=(ReferenceSubjectFacts("character", str(character.id), ("Explicit character anchor",)),),
+                subject_keys=(("character", str(character.id)),)),
+            generation_contributions=contributions))
 
-        generic_fingerprint.assert_called_once()
         expected_fields = [
             field_key
             for _selector, field_key, _label_style
             in H3_REF2VA_OFFICIAL_RULE_SPECS
         ]
-        model_contract = result.structured_payload["model_prompt_contract"]
+        model_contract = result.model_prompt_contract
         self.assertEqual(model_contract["format"], "reference_context_ir_v2")
         self.assertEqual(model_contract["section_order"], expected_fields)
         self.assertTrue(
-            set(expected_fields).issubset(result.structured_payload["fields"]),
+            set(expected_fields).issubset(result.structured_fields),
         )
-        self.assertIn(reviewed_detail, result.prompt_text)
-        self.assertIn("REVIEWED DECLARATIVE SOUND", result.prompt_text)
-        self.assertIn("REVIEWED DECLARATIVE MUSIC", result.prompt_text)
-        self.assertNotIn("ORIGINAL DECLARATIVE DETAIL", result.prompt_text)
-        self.assertNotIn("ORIGINAL DECLARATIVE SOUND", result.prompt_text)
-        self.assertNotIn("ORIGINAL DECLARATIVE MUSIC", result.prompt_text)
-        self.assertEqual(
-            len(result.structured_payload["profile_field_value_contract"]["rows"]),
-            3,
-        )
+        self.assertIn(reviewed_detail, result.assembly["channels"]["positive_prompt"])
+        self.assertIn("REVIEWED DECLARATIVE SOUND", result.assembly["channels"]["positive_prompt"])
+        self.assertIn("REVIEWED DECLARATIVE MUSIC", result.assembly["channels"]["positive_prompt"])
+        self.assertNotIn("ORIGINAL DECLARATIVE DETAIL", result.assembly["channels"]["positive_prompt"])
+        self.assertNotIn("ORIGINAL DECLARATIVE SOUND", result.assembly["channels"]["positive_prompt"])
+        self.assertNotIn("ORIGINAL DECLARATIVE MUSIC", result.assembly["channels"]["positive_prompt"])
+        self.assertIsNone(result.reviewed_field_evidence)
 
     def test_profile_motion_advisory_reaches_projection_quality_without_blocking(self):
         profile, _rules = self._reviewed_context_profile()
-        binding = PromptProfileBinding.objects.create(
-            key="qa.vendor.reviewed-context-quality",
-            name="Reviewed context quality advisory",
-            operation="video.generate",
-            model_family="nebula_motion",
-            mode="Ref2VA",
-            model_profile_version=self.model,
-            prompt_profile_version=profile,
-        )
-        frozen_selection = frozen_profile_reference(
-            ResolvedPromptProfile(binding=binding, profile_version=profile),
-            model_profile_version=self.model,
-        )
         reference_binding = {
             "category": "video",
             "entity_id": "",
@@ -1285,248 +985,87 @@ class ConfiguredPromptProfileCompilerTests(TestCase):
             "audio_input_label": None,
         }
 
-        with patch(
-            "studio.services.production_pipeline.resolve_group_reference_bindings",
-            return_value=[reference_binding],
-        ):
-            compiled = compile_prompt_input(
-                project=self.project,
-                shots=[self.shot],
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode="Ref2VA",
-                include_audio=True,
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                language_gate_mode="warn",
-                model_profile_version=self.model,
-                frozen_prompt_profile=frozen_selection,
-                frozen_frame_policy=FRAME_POLICY,
-            )
-        with transaction.atomic():
-            artifact = materialize_compiled_prompt(
-                compiled=compiled,
-                created_by=self.actor,
-            )
-
-        quality = artifact.structured_payload["quality"]
+        compiled = compile_prompt_profile_facts(profile, facts=profile_compilation_fixture(sources={}, reference_context=self._reference_facts(
+                sources={"description": "Explicit motion sequence",
+                         "sound_effects": "Rain against glass", "music": "Low strings"},
+                reference_bindings=(reference_binding,))))
+        quality = compiled.assembly
         self.assertTrue(any(
             "运镜参考说明未达到本策略建议值" in warning
             for warning in quality.get("warnings", [])
         ))
-        self.assertFalse(any(
-            "prompt_hint" in field
-            for field in quality.get("hard_block_fields", [])
-        ))
-        self.assertFalse(
-            quality["production_language_gate"]["would_block_enqueue"],
-        )
-        self.assertEqual(artifact.prompt_profile_version_id, profile.id)
-        self.assertFalse(evaluate_prompt_language_gate(artifact).blocks_enqueue)
+        self.assertTrue(compiled.assembly["channels"]["positive_prompt"])
 
     def test_reviewed_detail_contribution_owns_creative_prose_without_repeating_locked_sections(self):
-        self.shot.conditioning_mode = "Ref2VA"
-        self.shot.detailed_description = "ORIGINAL DETERMINISTIC DETAIL"
-        self.shot.sound_effects = "ORIGINAL DETERMINISTIC SOUND"
-        self.shot.music = "ORIGINAL DETERMINISTIC MUSIC"
-        self.shot.metadata = {
-            "prompt_field_version": 2,
-            "negative_prompt": "identity drift",
-        }
-        self.shot.continuity_notes = "ORIGINAL VISIBLE CONTINUITY CHECKLIST"
-        self.shot.requires_first_frame_continuity = True
-        self.shot.requires_last_frame_continuity = True
-        self.shot.save(update_fields=(
-            "conditioning_mode",
-            "detailed_description",
-            "sound_effects",
-            "music",
-            "metadata",
-            "continuity_notes",
-            "requires_first_frame_continuity",
-            "requires_last_frame_continuity",
-            "updated_at",
-        ))
-        character = self.shot.characters.get()
-        scene = self.shot.scene
-        prop_asset = Asset.objects.create(
-            owner=self.actor,
-            style=self.project.style,
-            kind=Asset.Kind.PROP,
-            name="烧焦信纸标准图",
-            local_path="C:/fixtures/charred-letter.png",
-            checksum="fixture-charred-letter",
-            mime_type="image/png",
-        )
-        prop = PropBible.objects.create(
-            project=self.project,
-            slug="charred-letter",
-            name="烧焦信纸",
-            visual_identity="blackened folded evidence letter",
-            material="charred cotton paper",
-            distinctive_marks="one diagonal amber burn line",
-            continuity_state="partly unfolded on the archive desk",
-            anchor_asset=prop_asset,
-        )
-        self.shot.props.add(prop)
-        reference_bindings = ({
-            "category": "character",
-            "entity_id": str(character.id),
-            "entity_name": character.name,
-            "asset_id": str(character.anchor_asset_id),
-            "id": str(character.anchor_asset_id),
-            "name": "canonical character portrait",
-            "description": "",
-            "prompt_hint": "",
-            "media_metadata": {},
-            "local_path": "C:/fixtures/lin.png",
-            "checksum": "fixture-lin",
-            "input_slot": 1,
-            "input_label": "<Picture 1>",
-            "project_slot": 1,
-            "entity_label": "<Subject 1>",
-        }, {
-            "category": "scene",
-            "entity_id": str(scene.id),
-            "entity_name": scene.name,
-            "asset_id": str(scene.anchor_asset_id),
-            "id": str(scene.anchor_asset_id),
-            "name": "canonical archive room",
-            "description": "",
-            "prompt_hint": "",
-            "media_metadata": {},
-            "local_path": "C:/fixtures/archive.png",
-            "checksum": "fixture-archive",
-            "input_slot": 2,
-            "input_label": "<Picture 2>",
-            "project_slot": 2,
-            "entity_label": "<Subject 2>",
-        }, {
-            "category": "prop",
-            "entity_id": str(prop.id),
-            "entity_name": prop.name,
-            "asset_id": str(prop.anchor_asset_id),
-            "id": str(prop.anchor_asset_id),
-            "name": "canonical charred letter",
-            "description": "",
-            "prompt_hint": "",
-            "media_metadata": {},
-            "local_path": "C:/fixtures/charred-letter.png",
-            "checksum": "fixture-charred-letter",
-            "input_slot": 3,
-            "input_label": "<Picture 3>",
-            "project_slot": 3,
-            "entity_label": "<Subject 3>",
-        }, {
-            "category": "video",
-            "entity_id": "",
-            "entity_name": "",
-            "asset_id": "fixture-motion-video",
-            "id": "fixture-motion-video",
-            "name": "same-story camera reference",
-            "description": "",
-            "prompt_hint": (
-                "Use the slow forward dolly with restrained handheld sway and "
-                "one measured rack focus near the end"
-            ),
-            "media_metadata": {"fps": 24},
-            "local_path": "C:/fixtures/motion.mp4",
-            "checksum": "fixture-motion-video",
-            "purpose": "motion_camera_reference",
-            "input_slot": 1,
-            "input_label": "<Video 1>",
-            "entity_label": "<Video 1>",
-        })
-        profile, rules = self._reviewed_context_profile()
+        from dataclasses import replace
+        from copy import deepcopy
 
-        # With no reviewed contribution, the same adapter retains its previous
-        # deterministic projection path, including the detailed Bible anchor,
-        # continuity, and diegetic sound additions.
-        baseline = compile_media_prompt_profile(
-            profile,
-            context=MediaPromptCompilationContext(
-                project=self.project,
-                shots=(self.shot,),
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode="Ref2VA",
-                include_audio=True,
-                effective_durations_ms={str(self.shot.id): self.shot.duration_ms},
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                reference_bindings=reference_bindings,
-                model_identifier=self.model.model_identifier,
-                frame_policy=FRAME_POLICY,
-                conditioning_mode_contract=conditioning_contract("Ref2VA", input_kind="classified_references")["modes"][0],
-                language_gate_mode="warn",
-            ),
+        reference_bindings = tuple({
+            "category": kind, "entity_id": identity, "entity_name": identity,
+            "asset_id": "fixture-" + identity, "id": "fixture-" + identity,
+            "name": "explicit " + kind + " reference", "description": "", "prompt_hint": "",
+            "media_metadata": {}, "input_slot": index, "input_label": f"<Picture {index}>",
+            "entity_label": f"<Subject {index}>",
+        } for index, (kind, identity) in enumerate(
+            (("character", "character-1"), ("scene", "scene-1"), ("prop", "prop-1")), 1)) + ({
+            "category": "video", "entity_id": "", "entity_name": "",
+            "asset_id": "fixture-motion-video", "id": "fixture-motion-video",
+            "name": "same-story camera reference", "description": "",
+            "prompt_hint": "Use the slow forward dolly with restrained handheld sway and one measured rack focus near the end",
+            "media_metadata": {"fps": 24}, "purpose": "motion_camera_reference",
+            "input_slot": 1, "input_label": "<Video 1>", "entity_label": "<Video 1>",
+        },)
+        profile, rules = self._reviewed_context_profile()
+        subjects = (ReferenceSubjectFacts("character", "character-1", ("Original character",)),
+                    ReferenceSubjectFacts("scene", "scene-1", ("Original archive room",)),
+                    ReferenceSubjectFacts("prop", "prop-1", ("Original charred letter",)))
+        context = self._reference_facts(
+            sources={"visual_prompt": "Restrained detective noir",
+                     "environment": "Original archive room",
+                     "description": "ORIGINAL DETERMINISTIC DETAIL",
+                     "sound_effects": "ORIGINAL DETERMINISTIC SOUND", "music": "ORIGINAL DETERMINISTIC MUSIC"},
+            subject_facts=subjects, subject_keys=(("character", "character-1"), ("scene", "scene-1"), ("prop", "prop-1")),
+            reference_bindings=reference_bindings, continuity_notes="ORIGINAL VISIBLE CONTINUITY CHECKLIST",
+            requires_first_frame_continuity=True, requires_last_frame_continuity=True,
+            dialogue=({"speaker_id": "S1", "text": "这封信不是昨晚烧的。", "delivery": "controlled whisper",
+                       "language": "Chinese", "speaker_subject_key": ["character", "character-1"],
+                       "voiceover": False, "start_ms": 123, "end_ms": 987, "subject": "<Subject 1>",
+                       "voice_profile": "low calm voice"},), voice_profiles=("low calm voice",),
         )
+        # Explicit source rendering is not a claim that a missing required
+        # candidate can pass the Preparation/selection boundary.
+        baseline = compile_prompt_profile_facts(profile, facts=profile_compilation_fixture(sources={}, reference_context=context))
         baseline_detail = baseline.assembly["structured_fields"]["detailed_description"]
         self.assertIn("Environment:", baseline_detail)
         self.assertIn("ORIGINAL DETERMINISTIC SOUND", baseline.assembly["structured_fields"]["overall_soundscape"])
         self.assertIn("ORIGINAL VISIBLE CONTINUITY CHECKLIST", baseline_detail)
 
-        # Reproduce the real failure shape: the first three locked sections own
-        # long character/scene/prop anchors, while Layer 2 supplies a complete
-        # reviewed director contribution.  The detailed section must not project
-        # those independent facts a second time.
         anchor_clause = (
             "precise locked visual evidence with asymmetric weathering, stable "
             "material response, controlled amber highlights, measured scale, "
             "repeatable silhouette, and production continuity markers"
         )
-        character.visual_identity = "CHARACTER_LOCKED_ANCHOR " + " ".join(
-            [anchor_clause] * 2
-        )
-        character.save(update_fields=("visual_identity", "updated_at"))
-        scene.visual_identity = "SCENE_LOCKED_ANCHOR " + " ".join(
-            [anchor_clause] * 2
-        )
-        scene.save(update_fields=("visual_identity", "updated_at"))
-        prop.visual_identity = "PROP_LOCKED_ANCHOR " + " ".join(
-            [anchor_clause] * 2
-        )
-        prop.save(update_fields=("visual_identity", "updated_at"))
+        context = replace(context, subject_facts=tuple(
+            replace(subject, description_parts=(kind.upper() + "_LOCKED_ANCHOR " + " ".join([anchor_clause] * 2),))
+            for kind, subject in zip(("character", "scene", "prop"), subjects, strict=True)
+        ))
         contribution_words = (
             "camera observes deliberate motion through rain as the investigator "
             "opens evidence and follows a controlled visual beat with precise "
             "framing natural posture restrained expression and readable action"
         ).split()
         reviewed_detail = " ".join((contribution_words * 24)[:389])
-        self.assertEqual(
-            len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", reviewed_detail)),
-            389,
-        )
-        self.shot.detailed_description = reviewed_detail
-        self.shot.save(update_fields=("detailed_description", "updated_at"))
+        self.assertEqual(len(re.findall(r"[A-Za-z]+(?:[-'][A-Za-z]+)?", reviewed_detail)), 389)
         reviewed_sound = "Muted rain and paper friction stay synchronized to the visible hand movement."
         reviewed_music = "A sparse low cello pulse remains non-diegetic and restrained."
-        selection_sha256 = "d" * 64
-        reviewed_rows = self._reviewed_context_rows(
-            profile=profile,
-            rules=rules,
-            selection_sha256=selection_sha256,
-            values={
-                "detailed_description": reviewed_detail,
-                "overall_soundscape": reviewed_sound,
-                "non_diegetic_music": reviewed_music,
-            },
-        )
-        result = compile_media_prompt_profile(
-            profile,
-            context=MediaPromptCompilationContext(
-                project=self.project,
-                shots=(self.shot,),
-                prompt_type=PromptArtifact.PromptType.VIDEO,
-                mode="Ref2VA",
-                include_audio=True,
-                effective_durations_ms={str(self.shot.id): self.shot.duration_ms},
-                consistency_snapshot=capture_consistency_snapshot(self.project),
-                reference_bindings=reference_bindings,
-                profile_selection_sha256=selection_sha256,
-                reviewed_profile_fields=reviewed_rows,
-                model_identifier=self.model.model_identifier,
-                frame_policy=FRAME_POLICY,
-                conditioning_mode_contract=conditioning_contract("Ref2VA", input_kind="classified_references")["modes"][0],
-                language_gate_mode="warn",
-            ),
-        )
+        contributions = self._contribution_values(rules=rules, values={
+            "detailed_description": reviewed_detail,
+            "overall_soundscape": reviewed_sound, "non_diegetic_music": reviewed_music,
+        })
+        facts = profile_compilation_fixture(sources={}, reference_context=context, generation_contributions=contributions)
+        before = deepcopy(facts)
+        result = compile_prompt_profile_facts(profile, facts=facts)
+        self.assertEqual(facts, before)
 
         prompt = result.assembly["channels"]["positive_prompt"]
         detail = result.assembly["structured_fields"]["detailed_description"]

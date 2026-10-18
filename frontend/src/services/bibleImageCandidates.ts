@@ -66,22 +66,21 @@ const adaptCandidateHistory = (value: unknown): BibleImageLatestCandidate => {
     || !bindingRoles.includes(bindingRole)
     || !integrityStatuses.includes(integrityStatus)
   ) invalidContract()
-  const sourceSnapshotSha256 = stringValue(raw.source_snapshot_sha256)
-  if (sourceSnapshotSha256 && !SHA256_RE.test(sourceSnapshotSha256)) invalidContract()
   const candidate: BibleImageLatestCandidate = {
     artifactId: uuidValue(raw.artifact_id),
     productionRunId: uuidValue(raw.production_run_id),
     stageRunId: uuidValue(raw.stage_run_id),
-    generationAttemptId: nullableUuidValue(raw.generation_attempt_id),
+    generationAttemptId: uuidValue(raw.generation_attempt_id),
     generationTaskId: nullableUuidValue(raw.generation_task_id),
-    promptArtifactId: nullableUuidValue(raw.prompt_artifact_id),
+    preparationId: uuidValue(raw.preparation_id),
+    executionInstanceVersionId: uuidValue(raw.execution_instance_version_id),
+    executionInstanceName: stringValue(raw.execution_instance_name),
+    requestSha256: sha256Value(raw.request_sha256),
     workflowVersionId: nullableUuidValue(raw.workflow_version_id),
-    modelProfileVersionId: nullableUuidValue(raw.model_profile_version_id),
+    modelProfileVersionId: uuidValue(raw.model_profile_version_id),
     modelIdentifier: stringValue(raw.model_identifier),
     promptProfileVersionId: nullableUuidValue(raw.prompt_profile_version_id),
-    promptProfileBindingKey: stringValue(raw.prompt_profile_binding_key),
-    promptProfileContractSha256: stringValue(raw.prompt_profile_contract_sha256),
-    sourceSnapshotSha256,
+    targetSnapshotSha256: sha256Value(raw.target_snapshot_sha256),
     sourceCurrent: booleanValue(raw.source_current),
     integrityStatus,
     integrityErrorCode: stringValue(raw.integrity_error_code),
@@ -97,8 +96,7 @@ const adaptCandidateHistory = (value: unknown): BibleImageLatestCandidate => {
     mimeType: stringValue(raw.mime_type),
     createdAt: stringValue(raw.created_at),
   }
-  if (!candidate.variantGroup || !candidate.mimeType || !candidate.createdAt) invalidContract()
-  if (candidate.integrityStatus === 'valid' && !candidate.sourceSnapshotSha256) invalidContract()
+  if (!candidate.executionInstanceName || !candidate.variantGroup || !candidate.mimeType || !candidate.createdAt) invalidContract()
   if (candidate.integrityStatus === 'valid' && candidate.integrityErrorCode) invalidContract()
   if (candidate.integrityStatus === 'invalid' && !candidate.integrityErrorCode) invalidContract()
   if (candidate.bindingRole !== 'unbound' && candidate.materializedAsset === null) invalidContract()

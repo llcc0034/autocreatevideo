@@ -3,45 +3,93 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from copy import copy
 
 from django.core.management import call_command
-from django.db import connection
+from django.db import connection, migrations
 from django.db.migrations.executor import MigrationExecutor
-from django.test import TransactionTestCase
 from django.utils import timezone
 
+from studio.tests.transaction_fixtures import SeededTransactionTestCase
 
-class _MigrationTestCase(TransactionTestCase):
+
+# These forward-only data changes are not reversible in production. Historical
+# tests supply their own data; their setup needs only the older schema. Keep the
+# exception list explicit so an unlisted irreversible migration fails closed.
+_SCHEMA_FIXTURE_ONLY_DATA_MIGRATIONS = {
+    ("studio", "0172_remove_project_default_conditioning_mode"),
+    ("studio", "0175_configurable_style_categories"),
+    ("studio", "0186_freeze_business_output_parser"),
+    ("studio", "0188_freeze_content_source_reader"),
+    # Test setup stages an older schema before constructing its own request
+    # fixtures. It does not reconstruct archived requests or reverse 0194 data.
+    ("studio", "0194_managed_execution_requests"),
+}
+
+
+class _FixtureDefinitionColumn(migrations.RemoveField):
+    """Reconstruct discarded columns for historical schema fixtures only.
+
+    0202 cannot recover old identity content. Isolated migration tests provide
+    their own rows; empty text here is a staging value, never a data rollback.
+    """
+    def database_backwards(self, app_label, schema_editor, from_state, to_state):
+        field = to_state.apps.get_model(app_label, self.model_name)._meta.get_field(self.name)
+        original = field.default
+        if field.get_internal_type() in {"CharField", "TextField"}:
+            field.default = ""
+        try:
+            super().database_backwards(app_label, schema_editor, from_state, to_state)
+        finally:
+            field.default = original
+
+
+def _migrate_fixture_schema(targets):
+    """Stage a historical test schema, never claim a production data rollback.
+
+    Only setup/cleanup uses this helper. Each tested forward/reverse transition
+    still uses a normal MigrationExecutor and the unmodified migration files.
+    """
+    if not getattr(connection, "_test_serialized_contents", None):
+        raise RuntimeError("Historical schema fixtures require a serialized isolated test database")
+    executor = MigrationExecutor(connection)
+    replaced = []
+    try:
+        for migration, backwards in executor.migration_plan(targets):
+            if backwards and (migration.app_label, migration.name) == ("studio", "0202_field_identity_only"):
+                replaced.append((migration, migration.operations))
+                migration.operations = [
+                    _FixtureDefinitionColumn(model_name=operation.model_name, name=operation.name)
+                    if type(operation) is migrations.RemoveField else operation
+                    for operation in migration.operations
+                ]
+                continue
+            if not backwards or (migration.app_label, migration.name) not in _SCHEMA_FIXTURE_ONLY_DATA_MIGRATIONS:
+                continue
+            operations = []
+            for operation in migration.operations:
+                if type(operation) is migrations.RunPython and not operation.reversible:
+                    operation = copy(operation)
+                    operation.reverse_code = migrations.RunPython.noop
+                operations.append(operation)
+            replaced.append((migration, migration.operations))
+            migration.operations = operations
+        executor.migrate(targets)
+    finally:
+        for migration, operations in replaced:
+            migration.operations = operations
+    return executor
+
+
+class _MigrationTestCase(SeededTransactionTestCase):
     # Migration tests deliberately move the shared test database away from the
     # leaf schema.  Django flushes TransactionTestCase data after ``tearDown``;
     # restoring the serialized leaf data on the next case preserves data-
     # migration seeds that a flush cannot replay by itself.
-    serialized_rollback = True
-
     migrate_from: str
     migrate_to: str
     bootstrap_from: str = ""
     migrate_to_in_setup = True
-
-    @classmethod
-    def _fixture_setup(cls):
-        # A regular TransactionTestCase flush emits post_migrate and therefore
-        # recreates django_content_type/auth_permission rows.  Deserializing
-        # Django's leaf-schema snapshot on top of those rows raises their
-        # uniqueness constraints when a serialized migration test follows a
-        # regular transaction test.  Start snapshot restoration from an empty
-        # database and inhibit post_migrate so the snapshot remains the only
-        # source of the baseline rows.
-        for db_name in cls._databases_names(include_mirrors=False):
-            call_command(
-                "flush",
-                verbosity=0,
-                interactive=False,
-                database=db_name,
-                reset_sequences=False,
-                inhibit_post_migrate=True,
-            )
-        super()._fixture_setup()
 
     def setUp(self):
         super().setUp()
@@ -53,11 +101,18 @@ class _MigrationTestCase(TransactionTestCase):
         # Cleanups also run when setUp or the test body fails, so no following
         # test observes a historical schema.
         self.addCleanup(self._restore_leaf_schema)
-        executor = MigrationExecutor(connection)
         if self.bootstrap_from:
-            executor.migrate([("studio", self.bootstrap_from)])
+            # Forward-only data migrations cannot be undone by schema rollback.
+            # A requested historical bootstrap therefore starts with no studio
+            # data/schema; otherwise newer configuration rows collide with the
+            # original seed contracts while replaying the old migrations.
+            call_command("flush", verbosity=0, interactive=False,
+                database=connection.alias, reset_sequences=False,
+                inhibit_post_migrate=True)
+            _migrate_fixture_schema([("studio", None)])
             executor = MigrationExecutor(connection)
-        executor.migrate([("studio", self.migrate_from)])
+            executor.migrate([("studio", self.bootstrap_from)])
+        executor = _migrate_fixture_schema([("studio", self.migrate_from)])
         old_apps = executor.loader.project_state([
             ("studio", self.migrate_from),
         ]).apps
@@ -97,8 +152,7 @@ class _MigrationTestCase(TransactionTestCase):
             reset_sequences=False,
             inhibit_post_migrate=True,
         )
-        executor = MigrationExecutor(connection)
-        executor.migrate([("studio", None)])
+        _migrate_fixture_schema([("studio", None)])
         executor = MigrationExecutor(connection)
         executor.migrate(executor.loader.graph.leaf_nodes())
 
@@ -112,6 +166,25 @@ class ConfigureProductionCapabilitiesMigrationTests(_MigrationTestCase):
 
     def set_up_before_migration(self, apps):
         ConfigRevision = apps.get_model("studio", "ConfigRevision")
+        Definition = apps.get_model("studio", "ConfigDefinition")
+        Value = apps.get_model("studio", "ConfigValue")
+        # 0166 deliberately removes this value. Reconstruct the complete
+        # historical fixture explicitly, without reversing a production purge
+        # or teaching the current runtime to accept the removed key.
+        key = "production.prompt_normalization_deployment_id"
+        definition, _ = Definition.objects.get_or_create(key=key, defaults={
+            "domain": "production", "value_type": "string", "value_schema": {},
+        })
+        active = ConfigRevision.objects.get(scope_type="system", activation_state="active")
+        raw = json.dumps("", ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        Value.objects.get_or_create(revision=active, definition=definition, defaults={
+            "value": "", "value_schema_version": 1, "value_size_bytes": len(raw),
+            "value_sha256": hashlib.sha256(raw).hexdigest(),
+        })
+        values = {row.definition.key: row.value for row in active.values.select_related("definition")}
+        active.values_sha256 = hashlib.sha256(json.dumps(values, ensure_ascii=False,
+            sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        active.save(update_fields=("values_sha256",))
         self.failed_revision_id = ConfigRevision.objects.create(
             scope_type="system",
             revision=999,

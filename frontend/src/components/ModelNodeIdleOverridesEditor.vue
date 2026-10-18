@@ -88,15 +88,15 @@ function remove(id: number) {
 <template>
   <div class="node-idle-editor">
     <p>通常无需设置。仅在确认某类 ComfyUI 节点正常计算、却因长时间没有有效进展反馈而提前超时时添加。不改变生成参数，也不能突破任务总超时。</p>
-    <p v-if="!rows.length && !malformed" class="hint">未设置特殊规则，沿用生效的默认等待时限；工作流有更具体规则时优先使用。无需为此创建运行实例。</p>
+    <p v-if="!rows.length && !malformed" class="hint">未设置特殊规则，沿用生效的默认等待时限；工作流有更具体规则时优先使用。无需为此创建模型部署。</p>
     <p v-if="malformed" role="alert">现有节点等待规则格式异常，未自动清空；请在完整模型规格中修复 node_type_overrides。</p>
     <p v-if="!validNodeIdleLimits(limits)" role="alert">安全上限尚未读取，暂不能新增或修改时长；请重新读取系统设置。不设置规则不受影响。</p>
     <div class="catalog-source">
-      <label>节点目录来源（仅供查询）<select v-model="sourceId" :disabled="disabled || !sources.length"><option value="">选择同服务提供方的 ComfyUI 实例</option><option v-for="item in sources" :key="item.id" :value="item.id">{{ item.name || item.key }}</option></select></label>
+      <label>节点目录来源（仅供查询）<select v-model="sourceId" :disabled="disabled || !sources.length"><option value="">选择同服务提供方的 ComfyUI 部署</option><option v-for="item in sources" :key="item.id" :value="item.id">{{ item.name || item.key }}</option></select></label>
       <button type="button" class="button ghost small" :disabled="disabled || loading || !selectedSource" @click="loadCatalog"><RefreshCw :size="13"/>{{ loading ? '读取中…' : '读取节点目录' }}</button>
     </div>
     <p class="hint">只读取节点类型，不关联新模型，不加载模型文件或启动生成。</p>
-    <p v-if="!sources.length" class="hint">当前服务提供方没有可查询的启用 ComfyUI 实例，可先保持不设置；已有规则仍保留。</p>
+    <p v-if="!sources.length" class="hint">当前服务提供方没有可查询的启用 ComfyUI 部署，可先保持不设置；已有规则仍保留。</p>
     <p v-if="loadError" role="alert">节点目录读取失败：{{ loadError }}。可重新读取；未替换任何已配置规则。</p>
     <label v-if="catalog">筛选节点类型<input v-model="search" type="search" :disabled="disabled" placeholder="搜索节点名称或类型"/><small>已读取 {{ catalog.totalCount }} 类，筛选匹配 {{ options.length }} 类。</small></label>
     <p v-if="catalog && !catalog.items.length" class="hint">目录中没有节点类型，暂不能新增规则。</p>

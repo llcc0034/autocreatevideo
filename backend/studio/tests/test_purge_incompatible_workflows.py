@@ -14,6 +14,7 @@ from studio.models import (
     GenerationAttempt, ScriptRevision, SeriesProject,
     WorkflowTemplate, WorkflowTemplateVersion,
     WorkflowProjector, WorkflowProjectorVersion,
+    ModelExecutionInstance, ModelExecutionInstanceVersion, ModelDeployment, ModelProfileVersion, ProviderProfile,
 )
 
 
@@ -94,6 +95,19 @@ class ScopedWorkflowPurgeTests(TestCase):
     def test_empty_scope_cannot_become_global_cleanup(self):
         with self.assertRaisesRegex(CommandError, "范围不能为空"):
             purge.build_purge_plan(frozenset())
+
+    def test_scoped_workflow_purge_cannot_cascade_current_execution_instances(self):
+        provider = ProviderProfile.objects.create(key="purge-shared-provider", name="Shared", driver_type="comfyui")
+        profile = ModelProfileVersion.objects.create(profile_key="purge-shared-model", version=1,
+            provider=provider, model_identifier="isolated", modality="image")
+        deployment = ModelDeployment.objects.create(key="purge-shared-deployment", name="Shared", profile_version=profile)
+        instance = ModelExecutionInstance.objects.create(key="purge-protected-instance", name="Protected")
+        version = ModelExecutionInstanceVersion.objects.create(instance=instance, version=1,
+            deployment=deployment, workflow_version=self.target, operation="image.generate", prompt_mode="manual")
+        with self.assertRaises(CommandError):
+            purge.build_purge_plan(frozenset({self.target.pk}))
+        self.assertTrue(ModelExecutionInstanceVersion.objects.filter(pk=version.pk).exists())
+        self.assertTrue(WorkflowTemplateVersion.objects.filter(pk=self.target.pk).exists())
 
     def test_unknown_uuid_fails_before_preview_or_deletion(self):
         with self.assertRaisesRegex(CommandError, "版本不存在"):

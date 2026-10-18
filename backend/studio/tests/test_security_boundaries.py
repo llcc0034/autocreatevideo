@@ -18,7 +18,7 @@ from studio.platform_serializers import (
     ConfigRevisionSerializer,
     ProductionRunCreateSerializer,
     SelectRouteInputSerializer,
-    WorkflowSmokeFixtureInputSerializer,
+    WorkflowExecutionInputSerializer,
 )
 from studio.models import (
     ConfigDefinition,
@@ -45,15 +45,13 @@ from studio.services.bible_reference_contract import (
     bible_candidate_unit_key,
     parse_bible_candidate_unit_key,
 )
-from studio.services.comfyui import ComfyUIError
 from studio.services.prompt_normalization_contract import (
     PromptNormalizationContractError,
     _replace_protected_tokens_in_fact_tree,
     _validated_fact_tree,
 )
-from studio.services.provider_registry import _safe_chat_usage
-from studio.services.script_review import _verified_snapshot
-from studio.services.task_queue import _validated_comfy_timeout
+from studio.services.provider_registry import safe_chat_usage, restricted_comfyui_runtime_budget
+from studio.services.production_runs import _verify_stage_snapshot
 from studio.services.workflow_semantics import WorkflowSemanticError, _safe_output_prefix
 from studio.services.workflow_smoke_fixtures import (
     _fixture_max_assets,
@@ -371,6 +369,8 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
 
     def test_existing_runtime_caps_follow_lower_and_higher_active_values(self):
         snapshot = json_contract({"payload": "x" * 100})
+        rest_request = SimpleNamespace(runtime_budget={"max_poll_seconds": 21},
+            transport=json_contract({"driver_type": "async_rest"}))
         stage = SimpleNamespace(
             output_snapshot=snapshot.value,
             output_snapshot_schema_version=snapshot.schema_version,
@@ -383,17 +383,18 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "security.runtime.max_timeout_seconds": 21_600,
             "security.snapshot.stage_max_bytes": 64,
         })
-        self.assertEqual(_safe_chat_usage({"prompt_tokens": 6}), {})
+        self.assertEqual(safe_chat_usage({"prompt_tokens": 6}), {})
         self.assertEqual(
             redact_sensitive_bindings({"usage": {"prompt_tokens": 6}}),
             {"usage": {}},
         )
         with self.assertRaises(ValidationError):
-            _frozen_max_poll_seconds({"max_poll_seconds": 21})
-        with self.assertRaises(ComfyUIError):
-            _validated_comfy_timeout(30_000)
+            _frozen_max_poll_seconds(rest_request)
+        comfy_budget = {"timeout_seconds": 30_000, "poll_interval_seconds": 1, "max_poll_seconds": 21}
         with self.assertRaises(ValidationError):
-            _verified_snapshot(stage)
+            restricted_comfyui_runtime_budget(comfy_budget)
+        with self.assertRaises(ValidationError):
+            _verify_stage_snapshot(stage, "output_snapshot")
 
         self._publish({
             "security.prompt.max_usage_count": 100,
@@ -402,7 +403,7 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "security.snapshot.stage_max_bytes": 1_024,
         })
         self.assertEqual(
-            _safe_chat_usage({"prompt_tokens": 6}),
+            safe_chat_usage({"prompt_tokens": 6}),
             {"prompt_tokens": 6},
         )
         self.assertEqual(
@@ -410,11 +411,11 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             {"usage": {"prompt_tokens": 6}},
         )
         self.assertEqual(
-            _frozen_max_poll_seconds({"max_poll_seconds": 21}),
+            _frozen_max_poll_seconds(rest_request),
             21,
         )
-        self.assertEqual(_validated_comfy_timeout(30_000), 30_000.0)
-        self.assertEqual(_verified_snapshot(stage), snapshot.value)
+        self.assertEqual(restricted_comfyui_runtime_budget(comfy_budget)["timeout_seconds"], 30_000.0)
+        self.assertEqual(_verify_stage_snapshot(stage, "output_snapshot"), snapshot.value)
 
     def test_production_capability_projects_current_security_limits(self):
         client = APIClient()
@@ -462,11 +463,6 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "execution_monitoring_max_node_type_overrides",
             "execution_monitoring_max_node_overrides",
             "execution_monitoring_max_idle_timeout_seconds",
-            "prompt_review_max_candidates",
-            "prompt_review_max_advisories",
-            "prompt_review_max_input_bytes",
-            "prompt_review_max_field_characters",
-            "prompt_review_max_usage_count",
             "audit_note_min_characters",
             "audit_note_max_characters",
         }.issubset(response.data["effective_limits"]))
@@ -474,7 +470,6 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "episode_count": 1,
             "shots_per_episode": 8,
             "episode_duration_seconds": 90,
-            "max_generation_tasks": 20,
             "fps": 24,
             "width": 768,
             "height": 1344,
@@ -527,6 +522,7 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "security.workflow_smoke.fixture_max_assets": 36,
         })
         create_serializer = ProductionRunCreateSerializer(data={
+            "plan_source": "recipe",
             "project_id": str(uuid.uuid4()),
             "recipe_version_id": str(uuid.uuid4()),
             "idempotency_key": "api-effective-limit-regression",
@@ -535,14 +531,6 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "episode_count": 101,
             "shots_per_episode": 101,
             "episode_duration_seconds": 3_601,
-            "reference_inputs": [
-                {
-                    "asset_id": str(uuid.uuid4()),
-                    "purpose": "motion_camera_reference",
-                    "use_embedded_audio": False,
-                }
-                for _ in range(65)
-            ],
         })
         self.assertTrue(create_serializer.is_valid(), create_serializer.errors)
         route_serializer = SelectRouteInputSerializer(data={
@@ -555,13 +543,15 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
                 {
                     "source_path": f"workflow-{index}.json",
                     "expected_sha256": f"{index + 1:064x}",
+                    "expected_source_scope_schema_version": 1,
+                    "expected_source_scope_sha256": "a" * 64,
                     "import_kind": "ignored",
                 }
                 for index in range(21)
             ],
         })
         self.assertTrue(batch_serializer.is_valid(), batch_serializer.errors)
-        smoke_serializer = WorkflowSmokeFixtureInputSerializer(data={
+        smoke_serializer = WorkflowExecutionInputSerializer(data={
             "schema_version": 2,
             "assets": [
                 {"semantic_key": f"asset.{index}", "asset_id": str(uuid.uuid4())}
@@ -605,7 +595,7 @@ class ConfigurableSecurityBoundaryRuntimeTests(TestCase):
             "anchor_library_asset_id": None,
         })
         self.assertFalse(tightened.is_valid())
-        self.assertIn("最多选择 1 张参考图", str(tightened.errors))
+        self.assertIn("明确选择 1..1 张图片", str(tightened.errors))
 
 
 class SecurityBoundaryPermissionTests(TestCase):
@@ -823,21 +813,10 @@ class SecurityBoundaryEffectiveResolutionTests(TestCase):
         )
 
     def _run(self, project: SeriesProject, suffix: str) -> ProductionRun:
-        recipe = ProductionRecipeVersion(
-            recipe_key=f"security-boundary-{suffix}",
-            version=1,
-            name=f"Security boundary {suffix}",
-            status=ProductionRecipeVersion.Status.PUBLISHED,
-        )
-        assign_json_contract(recipe, "definition", {
-            "schema_version": 1,
-            "stages": [],
-        })
-        recipe.save()
         run = ProductionRun(
             owner=self.owner,
             project=project,
-            recipe_version=recipe,
+            plan_source="manual",
             idempotency_key=f"security-boundary-{suffix}",
             request_sha256="a" * 64,
         )

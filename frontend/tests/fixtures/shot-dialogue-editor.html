@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>隔离分镜人物编辑验证</title></head>
+<body><div id="app"></div><script type="module">
+import {createApp, h, reactive, ref} from 'vue'
+import Component from '/src/components/ShotDialogueEditor.vue'
+import {visibleCharacterIds, toggleVisibleCharacter} from '/src/services/shotCharacters.ts'
+import {adaptShot, shotPersistencePayload} from '/src/services/backendAdapters.ts'
+import {api} from '/src/services/api.ts'
+import '/src/styles.css'
+api.interceptors.request.use(()=>{throw new Error('隔离夹具禁止真实业务API')})
+const id=n=>`10000000-0000-0000-0000-${String(n).padStart(12,'0')}`
+const characters=[{id:id(1),name:'同名人物',stableSpeakerId:'S1'},{id:id(2),name:'同名人物',stableSpeakerId:'S2'}]
+const raw={id:id(3),number:1,title:'隔离镜头',narrative:'隔离描述',media_type:'video',duration_ms:6000,
+  include_audio:true,episode_start_ms:1200,episode_end_ms:7200,dialogue:[{speaker_id:'S2',text:'  门后传来声音。  ',delivery:' softly ',voiceover:true,start_ms:123,end_ms:987}],
+  character_relations:[{role:'visible',position:0,character_id:id(1)},{role:'speaker',position:0,character_id:id(2)}],props:[]}
+const shot=reactive(adaptShot(raw)), result=ref('未校验'), error=ref(''), readonly=ref(false)
+function validate(){try{result.value=JSON.stringify(shotPersistencePayload({bible:{characters,scenes:[],props:[]}},shot),null,2);error.value=''}catch(e){error.value=e.message}}
+createApp({setup:()=>()=>h('main',{style:'max-width:780px;margin:20px auto;padding:12px;min-width:0'},[
+  h('h1','隔离夹具：分镜人物与对白'),h('p','正式编辑组件及保存适配器；只校验内存请求，不访问数据库或模型。'),
+  h('div',{style:'display:flex;flex-wrap:wrap;gap:8px'},characters.map(item=>h('button',{disabled:readonly.value,onClick:()=>toggleVisibleCharacter(shot,item.id)},`${visibleCharacterIds(shot).includes(item.id)?'取消出镜':'设为出镜'} ${item.stableSpeakerId}`))),
+  h('p',{id:'visibility'},'出镜：'+visibleCharacterIds(shot).map(value=>characters.find(row=>row.id===value)?.stableSpeakerId).join(', ')),
+  h(Component,{shot,characters,disabled:readonly.value}),
+  h('div',{style:'display:flex;gap:8px;margin-top:16px'},[h('button',{onClick:validate},'校验保存请求（不提交）'),h('button',{onClick:()=>readonly.value=!readonly.value},'切换只读')]),
+  error.value?h('p',{role:'alert'},error.value):null,
+  h('pre',{id:'payload',style:'white-space:pre-wrap;overflow-wrap:anywhere'},result.value)
+])}).mount('#app')
+</script></body></html>

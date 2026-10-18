@@ -42,6 +42,12 @@ class AcceptanceSmokeApiTests(TestCase):
         # Reuse the canonical valid generic.comfy workflow fixture without
         # inheriting the large API test suite itself.
         _workflow_fixture_setup(self)
+        # This suite exercises the current execution contract, not the catalog
+        # snapshot originally seeded by migration 0031.
+        assign_json_contract(self.profile, "specification", {
+            "schema_version": 1, "capabilities": ["image.text_to_image"],
+        })
+        self.profile.save()
 
     def _import(self):
         return _workflow_fixture_import(self)
@@ -542,7 +548,7 @@ class AcceptanceSmokeApiTests(TestCase):
         with patch(
             "studio.services.acceptance_smoke.deployment_smoke_operations",
             return_value=("script.generate",),
-        ), patch("studio.services.deployment_smoke_profiles.smoke_profile_choices", return_value=[]):
+        ):
             row = deployment_acceptance_row(
                 self.deployment,
                 health_snapshot=None,
@@ -587,7 +593,7 @@ class AcceptanceSmokeApiTests(TestCase):
         }
 
         with patch(
-            "studio.services.acceptance_smoke.verified_model_profile_specification",
+            "studio.services.execution_instances.verified_model_profile_specification",
             side_effect=ValidationError("invalid contract"),
         ):
             invalid_contract = deployment_acceptance_row(
@@ -611,7 +617,7 @@ class AcceptanceSmokeApiTests(TestCase):
         self.assertFalse(invalid_contract["health"]["fresh"])
 
         with patch(
-            "studio.services.acceptance_smoke.deployment_target_sha256",
+            "studio.services.execution_identity.execution_target_contract",
             side_effect=ValidationError("invalid target"),
         ):
             invalid_target = deployment_acceptance_row(
@@ -663,7 +669,7 @@ class AcceptanceSmokeApiTests(TestCase):
             ),
         )
 
-    def test_direct_smoke_retains_each_operations_expiry_and_latest_task(self):
+    def test_unbound_history_cannot_certify_operations_or_hide_latest_task(self):
         now = timezone.now()
         operations = (
             "prompt.normalize", "script.generate", "visual_rules.generate",
@@ -694,11 +700,7 @@ class AcceptanceSmokeApiTests(TestCase):
             request_sha256="r" * 64, target_sha256="a" * 64,
         )
         with patch("studio.services.acceptance_smoke.deployment_smoke_operations", return_value=operations), patch(
-            "studio.services.acceptance_smoke.validate_deployment_execution_contract",
-        ), patch("studio.services.acceptance_smoke.deployment_target_sha256", return_value="a" * 64), patch(
-            "studio.platform_views.deployment_target_sha256", return_value="a" * 64,
-        ), patch("studio.services.acceptance_smoke.timezone.now", return_value=now), patch(
-            "studio.services.deployment_smoke_profiles.smoke_profile_choices", return_value=[],
+            "studio.services.acceptance_smoke.timezone.now", return_value=now,
         ), CaptureQueriesContext(connection) as queries:
             response = self.client.get("/api/v1/acceptance-smoke/", {
                 "subject": "deployment", "deployment_id": str(self.deployment.id),
@@ -706,18 +708,14 @@ class AcceptanceSmokeApiTests(TestCase):
         self.assertEqual(response.status_code, 200, response.data)
         rows = {item["operation"]: item for item in response.data["results"][0]["deployment_smoke"]["operations"]}
         self.assertEqual(set(rows), set(operations))
-        self.assertEqual(rows["prompt.normalize"]["evidence_state"], "unverified", "unscoped history does not certify a strategy")
-        self.assertEqual(rows["script.generate"]["evidence_state"], "unverified")
-        self.assertEqual(rows["script.structure"]["evidence_state"], "failed")
-        self.assertEqual(rows["video.text_to_video"]["evidence_state"], "drifted")
-        self.assertEqual(rows["audio.text_to_audio"]["evidence_state"], "missing")
-        self.assertEqual(rows["image.text_to_image"]["evidence_state"], "unverified")
-        self.assertEqual(rows["visual_rules.generate"]["evidence_state"], "unverified")
+        for row in rows.values():
+            self.assertEqual(row["evidence_state"], "unavailable", "unbound history has no verifiable preparation")
+            self.assertIsNone(row["fresh_passed_snapshot"])
         self.assertEqual(rows["visual_rules.generate"]["latest_attempt"]["id"], str(queued.id))
         self.assertEqual(rows["visual_rules.generate"]["latest_attempt"]["status"], "queued")
         self.assertFalse(rows["visual_rules.generate"]["action"]["enabled"])
         self.assertIsNone(rows["script.generate"]["fresh_passed_snapshot"])
-        self.assertEqual(rows["script.generate"]["latest_snapshot"]["id"], str(snapshots[1].id))
+        self.assertEqual(rows["script.generate"]["latest_snapshot"]["id"], str(snapshots[-1].id))
         self.assertIn("expires_at", rows["script.generate"]["latest_snapshot"])
         self.assertNotIn("_execution_confirmed", rows["script.generate"]["latest_snapshot"])
         if connection.vendor == "sqlite":

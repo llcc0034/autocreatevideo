@@ -41,14 +41,15 @@ const resourceTypes = new Set<RegistryDeletionResourceType>([
   'provider_profile',
   'model_profile_version',
   'model_deployment',
+  'model_execution_instance',
+  'model_execution_instance_version',
   'model_artifact',
   'workflow_template_version',
   'production_recipe_version',
   'config_definition',
-  'prompt_field_definition',
+  'field_definition',
   'prompt_profile_version',
   'prompt_profile_field_rule',
-  'prompt_profile_binding',
 ])
 
 const adaptDependency = (value: unknown, index: number): RegistryDeletionDependency => {

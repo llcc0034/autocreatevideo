@@ -109,15 +109,9 @@ class H3QualityAdvisoriesMigrationTests(_MigrationTestCase):
         self.assertEqual(binding.name, migration.TARGET_BINDING_NAME)
         self.assertTrue(binding.is_active)
 
-        from studio.models import PromptProfileVersion as RuntimeProfile
-        from studio.services.prompt_profiles import (
-            validate_prompt_profile_source_projection,
-            verify_prompt_profile_contract,
-        )
-
-        runtime_target = RuntimeProfile.objects.get(pk=target.id)
-        verify_prompt_profile_contract(runtime_target)
-        validate_prompt_profile_source_projection(runtime_target)
+        # The migration's own canonical bytes above prove its historical
+        # result. Current execution deliberately rejects this old schema;
+        # historical migration tests must not require a runtime reader for it.
 
         migration.publish_quality_advisory_successor(self.apps, None)
         self.assertEqual(

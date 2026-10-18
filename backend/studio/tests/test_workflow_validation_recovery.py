@@ -138,6 +138,17 @@ class WorkflowValidationRecoveryApiTests(TestCase):
             model_requirements=[],
         )
 
+    def test_validate_response_retains_authoritative_relation_counts(self):
+        # The service returns an unannotated locked model, not the view queryset.
+        with patch("studio.platform_views.validate_workflow_version", return_value=(self.version, {})):
+            response = self.client.post(f"/api/v1/workflow-template-versions/{self.version.id}/validate/",
+                {"deployment_id": str(self.deployment.id)}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        version = response.data["version"]
+        self.assertEqual(version["semantic_binding_count"], 4)
+        self.assertEqual(version["semantic_binding_count"], len(version["semantic_bindings"]))
+        self.assertEqual(version["model_requirement_count"], len(version["model_requirements"]))
+
     def _failure(self):
         return WorkflowModelEvidenceUnavailable(
             reason_code="host_snapshot_stale",

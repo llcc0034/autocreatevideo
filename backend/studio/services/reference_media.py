@@ -23,6 +23,22 @@ from studio.services.media_processing_profiles import (
     resolve_reference_media_profile,
     validate_reference_profile,
 )
+from studio.services.security_boundaries import boundary_int, boundary_values
+
+
+REFERENCE_PREPROCESSING_ADAPTERS = {
+    "videos": frozenset({"cfr_video_v1", "passthrough_video_v1"}),
+    "paired_video_audios": frozenset({"aligned_audio_v1"}),
+    "reference_audios": frozenset({"passthrough_audio_v1"}),
+}
+
+# Shared by authoring options and the read-only task explanation. Not model rules.
+REFERENCE_PREPROCESSING_DESCRIPTIONS = {
+    "cfr_video_v1": ("恒定帧率视频", "生成任务专用恒定帧率副本，原素材保留。", "required"),
+    "passthrough_video_v1": ("原样视频", "核验源视频后使用原文件，不指定目标帧率。", "forbidden"),
+    "aligned_audio_v1": ("对齐父视频音轨", "按明确父视频的已核验时长补齐或裁切任务专用音轨。", "not_applicable"),
+    "passthrough_audio_v1": ("原样独立音频", "核验源音频后使用原文件，不分配父视频。", "not_applicable"),
+}
 
 
 class ReferenceMediaNormalizationError(RuntimeError):
@@ -471,7 +487,6 @@ def normalize_paired_audio(
     source: str | Path,
     output: str | Path,
     *,
-    paired_video_asset_id: str,
     effective_duration_seconds: float,
     effective_fps: int | float | None,
     minimum_duration_ms: int,
@@ -532,7 +547,6 @@ def normalize_paired_audio(
         "staging_version": 2,
         "media_role": "paired_reference_audio",
         "preprocessing_adapter_key": "aligned_audio_v1",
-        "paired_video_asset_id": str(paired_video_asset_id),
         "source_duration_ms": round(source_duration * 1000),
         "effective_fps": effective_fps,
         "effective_duration_ms": round(effective_duration_seconds * 1000),
@@ -542,3 +556,54 @@ def normalize_paired_audio(
         "media_processing_profile_key": REFERENCE_PROFILE_KEY,
         "media_processing_profile_sha256": media_profile_sha256(profile),
     }
+
+
+def inspect_reference_video_contract(path, contract, media_profile):
+    """One registered video inspector for all task roots; no model-name dispatch."""
+    adapter = contract.get("adapter_key")
+    if adapter not in REFERENCE_PREPROCESSING_ADAPTERS["videos"]:
+        raise ReferenceMediaNormalizationError("参考视频使用了未注册的预处理 adapter")
+    limits = boundary_values("security.media.max_fps", "security.media.max_duration_ms")
+    arguments = {"minimum_duration_ms": contract["minimum_duration_ms"],
+        "maximum_duration_ms": contract["maximum_duration_ms"],
+        "security_max_duration_ms": limits["security.media.max_duration_ms"], "media_profile": media_profile}
+    if adapter == "cfr_video_v1":
+        return inspect_reference_video(path, target_fps=contract["target_fps"],
+            security_max_fps=limits["security.media.max_fps"], **arguments)
+    if contract.get("target_fps") is not None or type(contract.get("requires_source_fps")) is not bool:
+        raise ReferenceMediaNormalizationError("原样视频合同必须明确源FPS要求，且不能指定目标FPS")
+    return inspect_passthrough_reference_video(path, requires_source_fps=contract["requires_source_fps"], **arguments)
+
+
+def preprocess_reference_input(source, output_directory, *, slot, contract, media_profile,
+                               video_plan=None, include_embedded_audio=None):
+    """Prepare local bytes and observed metadata, without assigning a source identity.
+
+    The owning task records its real Asset or per-use Artifact relationship.
+    Callers keep the temporary output directory alive until upload completes.
+    """
+    adapter = contract.get("adapter_key")
+    if adapter not in REFERENCE_PREPROCESSING_ADAPTERS.get(slot, ()):
+        raise ReferenceMediaNormalizationError("素材槽位使用了未注册的预处理 adapter")
+    source, output_directory = Path(source), Path(output_directory)
+    if slot == "videos":
+        if type(include_embedded_audio) is not bool:
+            raise ReferenceMediaNormalizationError("必须明确本次视频是否使用内嵌音轨")
+        plan = video_plan if video_plan is not None else inspect_reference_video_contract(source, contract, media_profile)
+        if adapter == "cfr_video_v1":
+            output = output_directory / "reference-cfr.mp4"
+            return output, normalize_reference_video(source, output, include_embedded_audio=include_embedded_audio,
+                plan=plan, media_profile=media_profile)
+        return source, passthrough_reference_video_metadata(plan=plan, include_embedded_audio=include_embedded_audio,
+            media_profile=media_profile)
+    arguments = {"minimum_duration_ms": contract["minimum_duration_ms"],
+        "maximum_duration_ms": contract["maximum_duration_ms"],
+        "security_max_duration_ms": boundary_int("security.media.max_duration_ms"), "media_profile": media_profile}
+    if slot == "paired_video_audios":
+        if not isinstance(video_plan, (ReferenceVideoPlan, PassthroughVideoPlan)):
+            raise ReferenceMediaNormalizationError("配套音轨必须提供其明确父视频的已核验时钟")
+        output = output_directory / "reference-paired.wav"
+        fps = video_plan.target_fps if isinstance(video_plan, ReferenceVideoPlan) else video_plan.source_fps
+        return output, normalize_paired_audio(source, output, effective_duration_seconds=video_plan.effective_duration_seconds,
+            effective_fps=fps, **arguments)
+    return source, passthrough_reference_audio_metadata(source, **arguments)

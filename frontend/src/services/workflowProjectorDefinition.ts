@@ -257,10 +257,15 @@ export const workflowProjectorDefinitionErrors = (
   }
   if (!isJsonObject(projection.config)) errors.push('projection.config 必须是对象')
   else if (engine.projectionKind === 'generic_fixed') {
-    if (Object.keys(projection.config).some(key => key !== 'image_resolution')) errors.push('Generic 固定引擎只支持图片尺寸配置')
+    if (Object.keys(projection.config).some(key => !['image_resolution','capability'].includes(key))) errors.push('Generic 固定引擎只支持执行能力与图片尺寸配置')
+    const capability = projection.config.capability
+    if ('capability' in projection.config && !options.definitionEditor.choices.executionCapabilities.some(row => row.value === capability)) errors.push('请选择已登记的执行能力')
     if ('image_resolution' in projection.config) errors.push(...resolutionPolicyErrors(projection.config.image_resolution, options.imageResolution))
   }
   else if (engine.projectionKind === 'generic_references') {
+    if (Object.keys(projection.config).some(key => !['groups', 'capability'].includes(key))) errors.push('通用动态引擎只支持执行能力与动态素材组配置')
+    const capability = projection.config.capability
+    if ('capability' in projection.config && !options.definitionEditor.choices.executionCapabilities.some(row => row.value === capability)) errors.push('请选择已登记的执行能力')
     const groups = isJsonObject(projection.config) && Array.isArray(projection.config.groups) ? projection.config.groups : []
     const keys = new Set<string>()
     if (!groups.length || groups.length !== slots.length) errors.push('动态素材组须非空，且与素材槽逐项对应；请在执行引擎配置中添加动态素材组')
@@ -275,10 +280,14 @@ export const workflowProjectorDefinitionErrors = (
         || !branches.includes(String(row.source_role)) || !branches.includes(String(row.output_role)) || !targets.length
         || targets.some(role => branches.includes(role)) || !list('input_names').length) errors.push(`${key || '动态素材组'}：请补齐唯一 Key、模板角色、目标角色和有序端口`)
       keys.add(key)
+      if (!Number.isSafeInteger(row.output_index) || Number(row.output_index) < 0
+        || (row.wiring === 'reduce' && (!Number.isSafeInteger(row.reducer_output_index) || Number(row.reducer_output_index) < 0))) errors.push(`${key}：模板与合并输出索引须为非负整数`)
       if (slot?.contract_source === 'workflow' && (!Number.isSafeInteger(row.minimum_items) || !Number.isSafeInteger(row.maximum_items)
         || Number(row.minimum_items) < 0 || Number(row.maximum_items) < Math.max(1, Number(row.minimum_items))
         || (row.wiring === 'ordered_ports' && Number(row.maximum_items) !== list('input_names').length))) errors.push(`${key}：数量范围无效，顺序接线的最大数量须等于端口数`)
       if (slot?.contract_source === 'model_profile' && (!row.conditioning_mode || !row.model_input)) errors.push(`${key}：请指定模型版本合同的 mode/input 数量来源`)
+      if (slot?.contract_source === 'model_profile' && row.model_input
+        && !options.definitionEditor.choices.modelQuantityInputs?.some(input => input.value === row.model_input && input.mediaKind === slot.media_kind)) errors.push(`${key}：模型数量输入未注册或与素材类型不匹配，请在执行引擎表单重新选择`)
       if (row.wiring === 'reduce' && (!row.reducer_role || list('reducer_inputs').length !== 2 || list('reducer_inputs').some(name => !name) || list('input_names').length !== 1)) errors.push(`${key}：合并接线须选择合并节点、两个输入和一个目标端口`)
     }
   }
@@ -300,10 +309,27 @@ export const workflowProjectorDefinitionErrors = (
 
 export const parseWorkflowProjectorJson = (
   text: string,
+  baseline?: JsonObject,
 ): { value: JsonObject | null; error: string } => {
   try {
     const value: unknown = JSON.parse(text)
     if (!isJsonObject(value)) return { value: null, error: '完整 Definition 必须是 JSON 对象' }
+    const before = baseline && isJsonObject(baseline.projection) ? baseline.projection : {}
+    const after = isJsonObject(value.projection) ? value.projection : {}
+    if (baseline && (before.kind === 'generic_references' || after.kind === 'generic_references')) {
+      const canonical = (item: unknown): string => {
+        if (Array.isArray(item)) return `[${item.map(canonical).join(',')}]`
+        if (isJsonObject(item)) return `{${Object.keys(item).sort().map(key => `${JSON.stringify(key)}:${canonical(item[key])}`).join(',')}}`
+        return JSON.stringify(item) ?? 'undefined'
+      }
+      const protectedFields = (definition: JsonObject, projection: JsonObject) => ({
+        kind: projection.kind, asset_slots: definition.asset_slots,
+        groups: isJsonObject(projection.config) ? projection.config.groups : undefined,
+      })
+      if (canonical(protectedFields(baseline, before)) !== canonical(protectedFields(value, after))) {
+        return { value: null, error: '动态素材组、槽声明和数量映射只能在执行引擎表单修改，完整 JSON 仅核对这些字段。' }
+      }
+    }
     return { value, error: '' }
   } catch (cause) {
     const message = cause instanceof Error ? cause.message : 'JSON 无法解析'

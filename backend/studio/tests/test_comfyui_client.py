@@ -492,8 +492,12 @@ class ComfyUIClientWorkflowLibraryTests(TestCase):
         })
         self.assertEqual(outputs[1]["kind"], "images")
 
-    def test_extract_outputs_rejects_empty_or_oversized_text(self):
-        with self.assertRaises(ComfyUIError):
-            ComfyUIClient.extract_outputs({"outputs": {"7": {"text": ["   "]}}})
+    def test_extract_outputs_preserves_empty_and_whitespace_but_rejects_oversized_text(self):
+        for text in ("", "   ", "  actual\r\nresponse  "):
+            with self.subTest(text=text):
+                item = ComfyUIClient.extract_outputs({"outputs": {"7": {"text": [text]}}})[0]
+                self.assertEqual(item["text"], text)
+                self.assertEqual(item["size_bytes"], len(text.encode("utf-8")))
+                self.assertEqual(item["sha256"], sha256(text.encode("utf-8")).hexdigest())
         with self.assertRaises(ComfyUIError):
             ComfyUIClient.extract_outputs({"outputs": {"7": {"text": ["x" * (64 * 1024 + 1)]}}})

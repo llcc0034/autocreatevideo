@@ -1,19 +1,14 @@
 """Registered, versioned resolution primitives; never infer size from model names."""
 from __future__ import annotations
 
-import hashlib
 from copy import deepcopy
 from pathlib import Path
 import warnings
 
-from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
 from PIL import Image, ImageOps, UnidentifiedImageError
 
-from studio.models import Asset
-from studio.services.reference_bindings import authorized_asset_source, ReferenceBindingError
 from studio.services.security_boundaries import boundary_int
-from studio.services.smoke_assets import managed_smoke_asset_eligibility, ManagedSmokeAssetBudget
 
 
 class WorkflowResolutionError(ValueError):
@@ -205,17 +200,10 @@ def validate_source_image_resolution(graph: dict, contract: dict, bindings: list
         raise WorkflowResolutionError("输入图推导尺寸暂不支持动态素材组改写尺寸链；请保留固定的尺寸驱动图片槽")
 
 
-def _decoded_dimensions(path: Path, *, expected_checksum: str | None = None) -> tuple[int, int]:
+def _decoded_dimensions(path: Path) -> tuple[int, int]:
     try:
         with warnings.catch_warnings(), path.open("rb") as stream:
             warnings.simplefilter("error", Image.DecompressionBombWarning)
-            if expected_checksum is not None:
-                digest = hashlib.sha256()
-                for block in iter(lambda: stream.read(1024 * 1024), b""):
-                    digest.update(block)
-                if digest.hexdigest() != expected_checksum:
-                    raise WorkflowResolutionError("尺寸来源图片真实内容与冻结 checksum 不一致")
-                stream.seek(0)
             with Image.open(stream) as image:
                 if getattr(image, "n_frames", 1) != 1:
                     raise WorkflowResolutionError("尺寸来源只支持静态单帧图片")
@@ -228,37 +216,40 @@ def _decoded_dimensions(path: Path, *, expected_checksum: str | None = None) -> 
         raise WorkflowResolutionError("图片无法安全解码并证明尺寸") from exc
 
 
-def resolve_source_image_resolution(strategy: dict, asset_bindings: list, *, owner_id) -> dict:
-    key = strategy["asset_semantic_keys"][0]
-    matches = [row for row in asset_bindings if row.get("semantic_key") == key]
-    if len(matches) != 1:
-        raise WorkflowResolutionError("缺少决定输出尺寸的唯一参考图片")
-    binding = matches[0]
-    try:
-        if owner_id is None:
-            asset = Asset.objects.get(pk=binding["asset_id"], is_active=True)
-            eligible, reason = managed_smoke_asset_eligibility(asset, budget=ManagedSmokeAssetBudget())
-            if not eligible:
-                raise WorkflowResolutionError(f"尺寸来源 Smoke 素材不可用: {reason}")
-            path = Path(asset.local_path).resolve()
-        else:
-            owner = get_user_model().objects.get(pk=owner_id)
-            asset, path = authorized_asset_source(owner=owner, asset_id=binding["asset_id"])
-        if path.stat().st_size > boundary_int("security.workflow_smoke.asset_max_file_bytes"):
-            raise WorkflowResolutionError("尺寸来源图片超过受管素材读取上限")
-        width, height = _decoded_dimensions(path, expected_checksum=binding["checksum"])
-    except (Asset.DoesNotExist, get_user_model().DoesNotExist, OSError, ReferenceBindingError) as exc:
-        raise WorkflowResolutionError("无法读取授权的尺寸来源图片；请核对素材权限、受管存储和 checksum") from exc
+
+
+def source_image_resolution_facts(strategy, *, source, width, height):
+    """Build output-size evidence using the one registered resolution rule."""
     target_width, target_height = resolution_dimensions(strategy, width, height)
     return {
         "adapter": strategy["adapter"],
         **({"sizes": deepcopy(strategy["sizes"])} if "sizes" in strategy else {}),
-        "source_semantic_key": key,
-        "source_asset_id": str(asset.id),
-        "source_checksum": binding["checksum"],
+        "source_semantic_key": strategy["asset_semantic_keys"][0],
+        **source,
         "source_width": width, "source_height": height,
         "width": target_width, "height": target_height,
     }
+
+
+def resolve_prepared_image_resolution(strategy, asset_bindings):
+    """Use already verified per-use observations, never original graph sizes."""
+    key = strategy["asset_semantic_keys"][0]
+    matches = [row for row in asset_bindings if row.get("semantic_key") == key]
+    if len(matches) != 1:
+        raise WorkflowResolutionError("缺少决定输出尺寸的唯一参考图片使用")
+    binding = matches[0]
+    media = binding.get("media_facts")
+    observed = media.get("observed_media") if isinstance(media, dict) else None
+    if (binding.get("kind") != "image" or not isinstance(observed, dict)
+            or observed.get("observation_source") != "image_decoder" or type(observed.get("frame_count")) is not int
+            or observed["frame_count"] != 1):
+        raise WorkflowResolutionError("尺寸来源缺少真实单帧图片观测，不能按文件名或导入示例猜测")
+    if not binding.get("item_key") or not (binding.get("asset_id") or binding.get("artifact_id")) or not media.get("sha256"):
+        raise WorkflowResolutionError("尺寸来源缺少明确素材使用与内容身份")
+    return source_image_resolution_facts(strategy, source={"source_item_key": binding["item_key"],
+        "source_asset_id": binding.get("asset_id"), "source_artifact_id": binding.get("artifact_id"),
+        "source_checksum": media["sha256"], "source_sha256": binding["source_sha256"]},
+        width=observed.get("width"), height=observed.get("height"))
 
 
 def validate_resolved_image_output(path: Path, output_contract: dict) -> None:

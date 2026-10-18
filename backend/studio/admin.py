@@ -14,10 +14,8 @@ from studio.models import (
     ConfigDefinition,
     ConfigRevision,
     ConsistencyLock,
-    DeferredGenerationRequest,
     Episode,
     GeneratedArtifact,
-    GeneratedWorkflow,
     GenerationAttempt,
     GenerationAttemptResolution,
     GenerationTask,
@@ -26,7 +24,6 @@ from studio.models import (
     ModelDeployment,
     ModelProfileVersion,
     PlatformLifecycleAuditEvent,
-    PromptArtifact,
     PromptFieldTranslation,
     PropBible,
     ProductionAssemblyLink,
@@ -97,11 +94,17 @@ class SecurityAuditAdmin(ImmutableProductionAuditAdmin):
 
 
 class BibleAdminForm(forms.ModelForm):
-    """Keep reserved Script Bible provenance exclusive to the apply API."""
+    """Edit entity metadata, not setting text or retired source provenance."""
 
     class Meta:
         model = CharacterBible
         fields = "__all__"
+
+    def clean(self):
+        data = super().clean()
+        if "visual_identity" in self.data:
+            raise forms.ValidationError("旧视觉锚点字段已停用；请在工作室主图/变体设定中另存修订。")
+        return data
 
     def clean_metadata(self):
         incoming = self.cleaned_data.get("metadata")
@@ -140,7 +143,7 @@ class BibleAdmin(admin.ModelAdmin):
     form = BibleAdminForm
     list_display = ("name", "project", "slug", "is_locked", "updated_at")
     list_filter = ("is_locked",)
-    search_fields = ("name", "slug", "visual_identity")
+    search_fields = ("name", "slug", "description")
 
     def save_model(self, request, obj, form, change):
         """Recheck reserved provenance against the locked latest row."""
@@ -208,14 +211,7 @@ class EpisodeAdmin(admin.ModelAdmin):
 class ShotAdmin(admin.ModelAdmin):
     list_display = ("episode", "number", "title", "media_type", "conditioning_mode", "duration_ms", "include_audio")
     list_filter = ("media_type", "conditioning_mode", "include_audio")
-    search_fields = ("title", "narrative", "action")
-
-
-@admin.register(PromptArtifact)
-class PromptArtifactAdmin(ImmutableProductionAuditAdmin):
-    list_display = ("project", "episode", "shot", "prompt_type", "conditioning_mode", "revision", "created_at")
-    list_filter = ("prompt_type", "conditioning_mode", "is_multi_shot", "include_audio")
-    search_fields = ("prompt_text", "content_hash")
+    search_fields = ("title",)
 
 
 @admin.register(PromptFieldTranslation)
@@ -237,30 +233,11 @@ class WorkflowTemplateAdmin(ImmutableProductionAuditAdmin):
     search_fields = ("name", "slug", "description")
 
 
-@admin.register(GeneratedWorkflow)
-class GeneratedWorkflowAdmin(ImmutableProductionAuditAdmin):
-    list_display = ("project", "episode", "template", "content_hash", "created_at")
-    search_fields = ("project__title", "content_hash")
-
-
 @admin.register(GenerationTask)
 class GenerationTaskAdmin(ImmutableProductionAuditAdmin):
     list_display = ("id", "project", "kind", "status", "progress", "attempts", "priority", "queued_at")
     list_filter = ("kind", "status")
     search_fields = ("comfy_prompt_id", "project__title", "error_message")
-
-
-@admin.register(DeferredGenerationRequest)
-class DeferredGenerationRequestAdmin(ImmutableProductionAuditAdmin):
-    list_display = (
-        "id", "project", "source_task", "target_shot", "frame_slot",
-        "status", "attempts", "priority", "created_at",
-    )
-    list_filter = ("status", "frame_slot")
-    search_fields = (
-        "project__title", "idempotency_key", "request_fingerprint",
-        "target_input_fingerprint", "error_code",
-    )
 
 
 @admin.register(AssemblyJob)

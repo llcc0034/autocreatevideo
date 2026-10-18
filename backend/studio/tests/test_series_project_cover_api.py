@@ -314,7 +314,7 @@ class SeriesProjectCoverAPITests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400, response.data)
-        self.assertIn("展示专用素材", str(response.data))
+        self.assertIn("旧镜头素材绑定已停用", str(response.data))
 
     def test_project_list_cover_query_count_does_not_grow_per_card(self):
         asset, _ = self.upload_cover()

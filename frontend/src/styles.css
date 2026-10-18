@@ -1,6 +1,9 @@
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Noto+Sans+SC:wght@400;500;600;700&family=Playfair+Display:ital,wght@0,600;1,600&display=swap');
 
 :root {
+  --config-title-size:20px;--config-section-size:16px;--config-body-size:14px;--config-help-size:12px;
+  --config-space-xs:4px;--config-space-sm:8px;--config-space-md:12px;--config-space-lg:16px;--config-space-xl:24px;
+  --config-control-height:36px;--config-radius:6px;
   --bg:#080a0d;--bg-soft:#0d1014;--surface:#111419;--surface-2:#161a20;--surface-3:#1b2027;
   --border:rgba(255,255,255,.075);--border-strong:rgba(255,255,255,.13);
   --text:#f0ede8;--text-secondary:#aaaeb5;--text-muted:#6f747c;

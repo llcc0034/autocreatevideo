@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>隔离译文审核：原文不回写</title></head>
+<body><div id="app"></div><script type="module">
+import {createApp,h,ref} from 'vue'
+import {createRouter,createMemoryHistory} from 'vue-router'
+import Review from '/src/components/TranslationReviewPanel.vue'
+import {repository} from '/src/services/repository.ts'
+import {api} from '/src/services/api.ts'
+import '/src/styles.css'
+const id=n=>`30000000-0000-0000-0000-${String(n).padStart(12,'0')}`
+const source=ref('  原文：门外的低声对白。  '), denied=ref(false), writes=ref(0), blocked=ref(0), refresh=ref(0)
+const row=ref({id:id(3),projectId:id(1),scopeType:'project',scopeId:id(1),fieldKey:'project.continuity_summary',
+  sourceText:source.value,translatedText:'A quiet voice behind the door.',status:'draft_translation',revision:1,
+  confirmationTarget:'field_review',contextCurrent:true})
+const originalShot={title:'隔离镜头',dialogue:[{text:'  别动。  ',delivery:'压低声音',start_ms:123,end_ms:456}],duration_ms:6000}
+api.interceptors.request.use(()=>{blocked.value++;throw new Error('隔离夹具禁止真实API')})
+repository.getProjectTranslations=async()=>[{...row.value}]
+repository.confirmProjectTranslation=async(entryId,text,revision)=>{
+  if(denied.value)throw new Error('隔离审核拒绝：未写入候选或原文')
+  if(entryId!==row.value.id||revision!==row.value.revision)throw new Error('隔离候选修订冲突')
+  writes.value++;row.value={...row.value,translatedText:text,status:'confirmed',revision:revision+1,confirmedAt:new Date().toISOString()}
+  return {...row.value}
+}
+repository.revokeProjectTranslation=async()=>{writes.value++;row.value={...row.value,status:'draft_translation',revision:row.value.revision+1,confirmedAt:undefined};return {...row.value}}
+const router=createRouter({history:createMemoryHistory(),routes:[{path:'/:pathMatch(.*)*',component:{render:()=>null}}]})
+await router.push('/')
+await router.isReady()
+createApp({setup:()=>()=>h('main',{style:'max-width:1000px;margin:auto;padding:16px;overflow-wrap:anywhere'},[
+  h('h1',{style:'font-size:18px'},'隔离译文审核 · 不连接业务数据库'),
+  h('button',{onClick:()=>denied.value=!denied.value},denied.value?'恢复审核':'模拟审核失败'),
+  h('button',{onClick:()=>{source.value='原文已修改，旧候选不可确认';refresh.value++}},'模拟来源变化'),
+  h('p',`候选隔离写入：${writes.value}；意外API拦截：${blocked.value}`),
+  h('p','下方正式组件确认只更新候选，原文与镜头事实保持独立。'),
+  h(Review,{projectId:id(1),refreshKey:refresh.value,fields:[{fieldKey:'project.continuity_summary',scopeType:'project',scopeId:id(1),
+    label:'连续性说明（隔离字段）',sourceText:source.value,impact:'continuity'}]}),
+  h('h2',{style:'font-size:14px'},'只读原镜头事实（未被候选回执修改）'),
+  h('pre',{style:'white-space:pre-wrap'},JSON.stringify({source:source.value,shot:originalShot},null,2))
+]) }).use(router).mount('#app')
+</script></body></html>

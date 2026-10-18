@@ -59,9 +59,9 @@ export const workflowAssociationLabel = (
   >,
 ): string => {
   if (association.level === 'executed' || association.hasSmokeAttempt) return '已有精确 Workflow Smoke 执行历史'
-  if (association.validatedDeploymentMatches) return '已冻结验收实例'
+  if (association.validatedDeploymentMatches) return '已冻结验收部署'
   if (association.profileMatches) return '仅模型合同兼容'
-  return association.level || '尚无实例关联'
+  return association.level || '尚无部署关联'
 }
 
 export const deploymentHealthDisplayStatus = (

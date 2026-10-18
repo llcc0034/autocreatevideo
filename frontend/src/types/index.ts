@@ -1,12 +1,13 @@
-import type { WorkflowExecutionInputSchema } from '@/services/platformTypes'
+import type { ExecutionPreparationSummary } from '@/services/executionPreparation'
 
 export type AssetType = 'character' | 'scene' | 'prop' | 'image' | 'video' | 'audio' | 'script'
 export type ReferenceEntityCategory = 'character' | 'scene' | 'prop'
 export type ConditioningMode = string
 export type ProjectStatus = 'draft' | 'writing' | 'producing' | 'paused' | 'completed' | 'archived'
-export type WorkflowStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed'
+export type WorkflowStatus = 'queued' | 'running' | 'paused' | 'completed' | 'failed' | 'cancel_requested' | 'cancelled'
 
 export interface StylePreset {
+  isActive: boolean
   id: string
   backendId?: string
   slug: string
@@ -54,55 +55,35 @@ export interface Asset {
 
 export type AssetGenerationJobType = 'prompt' | 'asset'
 export type AssetGenerationMediaType = 'image' | 'video' | 'audio' | 'script'
-export type AssetGenerationStatus = 'queued' | 'submitting' | 'submitted' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'cancelled' | 'uncertain'
+export type AssetGenerationStatus = 'preparing' | 'queued' | 'submitting' | 'submitted' | 'running' | 'cancel_requested' | 'succeeded' | 'failed' | 'cancelled' | 'uncertain'
 export type AssetGenerationResolutionOutcome = 'confirmed_not_submitted' | 'confirmed_remote_failed' | 'confirmed_remote_cancelled' | 'confirmed_remote_succeeded'
 
 export type AssetGenerationExecutionKind = 'deployment' | 'comfy_workflow'
 
-interface AssetGenerationRouteOptionBase {
-  targetId: string
+export interface AssetGenerationOption {
+  versionId: string
   key: string
   name: string
-  modelDeploymentId: string
-  modelDeploymentName: string
-  modelIdentifier: string
+  version: number
   operation: string
-  isExternal: boolean
-  smokeEvidenceId: string
-  requestSchema: Record<string, unknown> | null
-  parameterDefaults: Record<string, unknown>
-  workflowInputSchema: WorkflowExecutionInputSchema | null
-  acceptsNegativePrompt: boolean
+  mode: string
+  promptMode: 'profile' | 'manual' | 'none'
+  definitionSha256: string
 }
-
-export interface AssetGenerationDeploymentRouteOption extends AssetGenerationRouteOptionBase {
-  targetKind: 'deployment'
-  smokeExpiresAt: string
-  workflowVersionId: ''
-  workflowName: ''
-  workflowVersion: null
-}
-
-export interface AssetGenerationComfyRouteOption extends AssetGenerationRouteOptionBase {
-  targetKind: 'comfy_workflow'
-  smokeExpiresAt: null
-  workflowVersionId: string
-  workflowName: string
-  workflowVersion: number
-}
-
-export type AssetGenerationRouteOption = AssetGenerationDeploymentRouteOption | AssetGenerationComfyRouteOption
 
 export interface AssetGenerationJob {
   id: string
-  jobType: AssetGenerationJobType
-  mediaType: AssetGenerationMediaType
+  retryOf: string | null
+  retries: Array<{ id: string; status: AssetGenerationStatus }>
+  jobType: AssetGenerationJobType | 'field'
+  mediaType: AssetGenerationMediaType | 'text'
   imageCategory: '' | 'character' | 'scene' | 'prop' | 'reference'
   name: string
   description: string
-  prompt: string
-  negativePrompt: string
-  parameters: Record<string, unknown>
+  executionInstanceVersionId: string
+  executionInstanceName: string
+  executionVersion: number
+  preparation: ExecutionPreparationSummary
   styleId: string
   executionKind: AssetGenerationExecutionKind
   modelDeploymentId: string
@@ -177,16 +158,17 @@ export interface BibleImageLatestCandidate {
   artifactId: string
   productionRunId: string
   stageRunId: string
-  generationAttemptId: string | null
+  generationAttemptId: string
   generationTaskId: string | null
-  promptArtifactId: string | null
+  preparationId: string
+  executionInstanceVersionId: string
+  executionInstanceName: string
+  requestSha256: string
   workflowVersionId: string | null
-  modelProfileVersionId: string | null
+  modelProfileVersionId: string
   modelIdentifier: string
   promptProfileVersionId: string | null
-  promptProfileBindingKey: string
-  promptProfileContractSha256: string
-  sourceSnapshotSha256: string
+  targetSnapshotSha256: string
   sourceCurrent: boolean
   integrityStatus: 'valid' | 'invalid'
   integrityErrorCode: string
@@ -225,52 +207,6 @@ export interface BibleImageCandidatesResult {
   }
 }
 
-export type DeferredFrameSlot = 'first_frame' | 'last_frame'
-export type DeferredGenerationStatus =
-  | 'preparing_prompt'
-  | 'waiting_upstream'
-  | 'extracting'
-  | 'materializing'
-  | 'materialized'
-  | 'failed'
-  | 'stale'
-  | 'cancelled'
-
-export interface DeferredGenerationRequest {
-  id: string
-  projectId: string
-  sourceTaskId: string
-  sourceOutputRole: 'primary_video'
-  targetShotId: string
-  frameSlot: DeferredFrameSlot
-  targetWorkflowVersionId: string
-  targetWorkflowSnapshotSha256: string
-  idempotencyKey: string
-  requestFingerprint: string
-  targetInputFingerprint: string
-  status: DeferredGenerationStatus
-  resolvedSourceOutputIndex: number | null
-  sourceArtifactSha256: string | null
-  sourceManifestSha256: string | null
-  derivedAssetId: string | null
-  materializedTaskId: string | null
-  materializedPromptArtifactId: string | null
-  materializedWorkflowId: string | null
-  priority: number
-  attempts: number
-  maxAttempts: number
-  nextAttemptAt: string | null
-  extendedGenerationConfirmed: boolean
-  errorCode: string
-  errorMessage: string
-  startedAt: string | null
-  finishedAt: string | null
-  createdAt: string
-  updatedAt: string
-  provisionalPromptText?: string
-  provisionalNegativePrompt?: string
-  provisionalPromptSha256?: string
-}
 
 export interface BibleItem {
   id: string
@@ -278,7 +214,6 @@ export interface BibleItem {
   stableSpeakerId?: string
   name: string
   description: string
-  visualPrompt: string
   /** Canonical identity anchor. It is never inferred from referenceAssetIds. */
   anchorAssetId?: string | null
   /** Supplemental, human-managed reference images; excludes the anchor role. */
@@ -311,74 +246,23 @@ export interface ContinuityBible {
 }
 
 export interface ShotAudio {
-  dialogue: string
-  soundscape: string
-  music: string
-}
-
-export interface ReferenceEntityBinding {
-  entityId: string
-  assetId: string
-}
-
-export type ReferencePurpose = string
-
-export interface ReferenceVideoBinding {
-  assetId: string
-  purpose: ReferencePurpose
-  useEmbeddedAudio: boolean
-  audioAssetId?: string
-  audioPurpose?: ReferencePurpose
-}
-
-export interface ReferenceAudioBinding {
-  assetId: string
-  purpose: ReferencePurpose
-}
-
-/**
- * Typed material bindings persisted with a shot. Asset IDs always come from
- * the platform material library; the UI never accepts a local filesystem path.
- */
-export interface ReferenceBindings {
-  firstFrameAssetId?: string
-  lastFrameAssetId?: string
-  firstFrameReferenceAssetId?: string
-  characters: ReferenceEntityBinding[]
-  scene?: ReferenceEntityBinding
-  props: ReferenceEntityBinding[]
-  videos: ReferenceVideoBinding[]
-  audios: ReferenceAudioBinding[]
+  dialogue: import('../services/dialogue').DialogueLinePayload[]
 }
 
 export interface Shot {
+  /** Explicit episode-relative interval; null pair means duration-only. */
+  episodeStartMs?: number | null
+  episodeEndMs?: number | null
   id: string
   order: number
   title: string
   mediaType: 'video' | 'image'
   duration: number
   mode: ConditioningMode
-  framing: string
-  camera: string
-  action: string
-  /**
-   * Optional long-form, manually reviewed director description from the formal
-   * `Shot.detailed_description` field. A configured prompt adapter may prefer
-   * it over the compact storyboard fields.
-   */
-  detailedDescription?: string
-  continuityDirection?: string
-  prompt: string
-  generatedPrompt?: PromptArtifactPayload
-  /** Ephemeral editor hint; never persisted by the shot sync payload. */
-  promptRefreshReason?: 'compiler_updated' | 'translations_changed' | 'inputs_changed'
-  negativePrompt: string
-  characterIds: string[]
+  characterRelations: import('../services/shotCharacters').ShotCharacterRelation[]
   sceneId?: string
   propIds: string[]
-  referenceAssetIds: string[]
-  referenceBindings?: ReferenceBindings
-  /** Continuity intent only; concrete frame assets remain in referenceBindings. */
+  /** Continuity intent only; exact materials are chosen through per-run uses. */
   requiresFirstFrameContinuity: boolean
   requiresLastFrameContinuity: boolean
   metadata?: Record<string, unknown>
@@ -397,6 +281,7 @@ export interface Episode {
   status: 'draft' | 'ready' | 'rendering' | 'completed'
   audioEnabled: boolean
   shots: Shot[]
+  promptSettings?: Record<string, unknown>
   shotVersions?: EpisodeShotVersion[]
   activeShotVersionKey?: string
   createdAt: string
@@ -431,7 +316,6 @@ export interface SeriesProject {
   resolution: '720p' | '1080p' | '4K'
   width?: number
   height?: number
-  defaultMode: ConditioningMode
   bible: ContinuityBible
   episodes: Episode[]
   /** List endpoints provide aggregate counts without loading every episode and shot. */
@@ -466,55 +350,6 @@ export interface PromptWritingGuideProfile {
   fieldRules: PromptWritingGuideFieldRule[]
 }
 
-export interface PromptArtifactPayload {
-  /** Backend-authoritative compiler compatibility for persisted artifacts. */
-  compiler_current?: boolean
-  /** Immutable PromptArtifact metadata used only for preview freshness checks. */
-  artifact_id?: string
-  artifact_revision?: number
-  artifact_created_at?: string
-  model: string
-  mediaType: 'video' | 'image'
-  /** Immutable PromptArtifact.include_audio fact. */
-  includeAudio: boolean
-  /** Immutable PromptArtifact.is_multi_shot fact. */
-  isMultiShot: boolean
-  mode?: ConditioningMode
-  effective_conditioning_mode?: ConditioningMode
-  prompt_template_key?: string
-  prompt_profile_guide?: PromptWritingGuideProfile
-  reference_bindings?: Array<Record<string, unknown>>
-  duration?: number
-  /** Exact text persisted in PromptArtifact.prompt_text and injected into ComfyUI. */
-  prompt_text: string
-  integrated_multimodal_description: string
-  subject_definitions?: string[]
-  summary?: string
-  retention_analysis?: string[]
-  detailed_description?: string[]
-  overall_soundscape?: string
-  non_diegetic_music?: string
-  quality?: {
-    status: 'ready' | 'needs_attention'
-    language_policy: string
-    dialogue_language?: string
-    prompt_character_count: number
-    prompt_character_limit?: number
-    prompt_word_count?: number
-    prompt_word_count_is_approximate?: boolean
-    detailed_description_word_count?: number
-    warnings: string[]
-    fields_requiring_english_rewrite: string[]
-    production_language_gate?: {
-      mode: 'block' | 'warn'
-      would_block_enqueue: boolean
-      message: string
-    }
-  }
-  negative_prompt: string
-  continuity: Record<string, unknown>
-}
-
 export type TranslationReviewStatus = 'untranslated' | 'translating' | 'pending_review' | 'confirmed' | 'failed' | 'source_changed'
 export type TranslationBackendStatus = 'draft_translation' | 'confirmed' | 'needs_retranslation' | 'failed'
 
@@ -526,12 +361,6 @@ export interface PromptTranslationField {
   scopeId: string
   impact: 'prompt' | 'continuity'
   help?: string
-}
-
-export interface PromptTranslationPromotedField {
-  fieldKey: string
-  value: string
-  dialogueIndex: number | null
 }
 
 export interface PromptTranslationEntry {
@@ -551,116 +380,15 @@ export interface PromptTranslationEntry {
   error?: string
   runtimeMetadata?: Record<string, unknown>
   contextCurrent?: boolean
-  /** Authoritative Shot fields atomically promoted by confirm. */
-  promotedFields?: PromptTranslationPromotedField[]
+  confirmationTarget?: 'field_review' | 'canonical_glossary'
+  canonicalValue?: string | null
 }
 
-export interface ShotTranslationPromotionResult {
-  shotId: string
-  promotedFields: PromptTranslationPromotedField[]
-  entries: PromptTranslationEntry[]
-}
-
-export interface PromptNormalizationDeployment {
-  modelDeploymentId: string
-  deploymentKey: string
-  label: string
-  providerKey: string
-  providerLabel: string
-  providerDriver: string
-  modelProfileVersionId: string
-  modelIdentifier: string
-  capability: 'prompt.normalize'
-  state: 'ready' | 'smoke_test_required' | 'unavailable'
-  ready: boolean
-  reasonCode: string
-  transport: 'local_endpoint' | 'remote_api'
-  dataEgress: boolean
-  dataEgressNotice: string
-  estimatedCost?: string
-  costCurrency: string
-  costBasis: string
-  smokeSnapshotId?: string
-  smokeExpiresAt?: string
-}
-
-export interface TranslationCapability {
-  schemaVersion: 2
-  capabilityKey: 'prompt.normalize'
-  reviewRequired: boolean
-  defaultModelDeploymentId?: string
-  configurationPublicSha256: string
-  deployments: PromptNormalizationDeployment[]
-}
-
-export type CanonicalGlossaryScope = 'character' | 'scene' | 'prop'
-export type CanonicalGlossaryEnsureStatus = 'generated' | 'reused' | 'conflict' | 'failed'
-export type BibleVisualTranslationEnsureStatus = 'generated' | 'reused' | 'not_required' | 'failed' | 'conflict'
-
-export interface BibleVisualTranslationEnsureEntry {
-  scopeType: CanonicalGlossaryScope
-  scopeId: string
-  fieldKey: string
-  sourceText: string
-  translatedText: string
-  translationId?: string
-  translationStatus?: TranslationBackendStatus
-  revision?: number
-  status: BibleVisualTranslationEnsureStatus
-  origin: 'model' | 'existing' | 'source_english' | 'none'
-  contextCurrent: boolean
-  retryable: boolean
-  errorCode?: string
-  message?: string
-  translation?: PromptTranslationEntry
-}
-
-export interface CanonicalGlossaryEnsureEntry {
-  scopeType: CanonicalGlossaryScope
-  scopeId: string
-  name: string
-  canonicalEnglish: string
-  status: CanonicalGlossaryEnsureStatus
-  origin: 'model' | 'existing' | 'source_english' | 'none'
-  retryable: boolean
-  errorCode?: string
-  message?: string
-}
-
-export interface CanonicalGlossaryEnsureResult {
-  projectId: string
-  updatedAt?: string
-  translationGlossary: Record<string, string>
-  summary: {
-    requested: number
-    generated: number
-    reused: number
-    conflict: number
-    failed: number
-  }
-  entries: CanonicalGlossaryEnsureEntry[]
-  visualSummary: {
-    requested: number
-    generated: number
-    reused: number
-    notRequired: number
-    conflict: number
-    failed: number
-  }
-  visualTranslations: BibleVisualTranslationEnsureEntry[]
-  runtime?: {
-    invocationAttempted: boolean
-    submissionUncertain: boolean
-    modelDeploymentId?: string
-    provider?: string
-    dataEgress: boolean
-  }
-}
 
 export interface WorkflowNode {
   id: string
   label: string
-  status: 'pending' | 'running' | 'completed' | 'failed'
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'cancel_requested' | 'cancelled'
   type: 'script' | 'prompt' | 'image' | 'video' | 'audio' | 'compose' | 'export'
   progress: number
 }
@@ -686,37 +414,33 @@ export interface TaskOutputMedia {
 }
 
 export interface TaskReferenceAssetSummary {
+  referenceBinding: import('../services/frozenReferenceBinding').FrozenReferenceBinding
+  itemKey: string
+  inputKey: string
   assetId?: string
+  artifactId?: string
   displayName: string
   mediaKind: 'image' | 'video' | 'audio'
   previewUrl: string
-  category?: string
   inputLabel?: string
-  entityLabel?: string
-  useEmbeddedAudio?: boolean
-  sourceFps?: number
-  effectiveFps?: number
-  effectiveDurationMs?: number
-  cfrGuaranteed?: boolean
-  pairedAudioDurationAligned?: boolean
+  purpose?: string
+  pairedTo?: string
+  checksum: string
+  sourceSha256: string
+  ports: Array<{ targetKey: string; port: Record<string, unknown> }>
+  stagingStatus: 'staged' | 'not_staged' | 'not_applicable'
 }
 
 export interface TaskInputPrompt {
   taskId: string
-  promptArtifactId?: string
-  promptType?: string
-  model?: string
-  conditioningMode?: string
-  effectiveConditioningMode?: string
-  promptTemplateKey?: string
-  contentHash?: string
-  prompt: string
-  negativePrompt: string
-  promptCharacterCount: number
-  negativePromptCharacterCount: number
-  negativePromptSubmitted: boolean
-  promptSource?: string
-  negativePromptSource?: string
+  attemptId: string
+  preparationId: string
+  executionInstanceVersionId: string
+  requestSha256: string
+  promptMode: 'manual' | 'profile' | 'none'
+  promptProfileVersionId: string | null
+  channels: Array<{ key: string; semanticKey: string; text: string; characterCount: number; valueSource: string }>
+  declaredReferenceLabels: string[]
 }
 
 export interface WorkflowTimelineEvent {
@@ -730,33 +454,23 @@ export interface WorkflowTimelineEvent {
 export type WorkflowProgressSource = 'none' | 'submission' | 'comfyui' | 'terminal'
 export type WorkflowProgressTelemetryState = 'unknown' | 'connected' | 'receiving' | 'unavailable'
 export type WorkflowInputContractStatus = 'available' | 'unavailable'
-export type WorkflowInputContractCode = '' | 'legacy_schema_unsupported' | 'frozen_contract_invalid'
+export type WorkflowInputContractCode = '' | 'frozen_contract_invalid'
 
 export interface Workflow {
+  execution: TaskExecutionIdentity | null
   id: string
   taskId?: string
-  kind?: 'video' | 'image'
+  kind?: 'video' | 'image' | 'audio'
   backendStatus?: string
-  generatedWorkflowId?: string
   comfyPromptId?: string
   submissionToken?: string
   submissionState?: string
-  backend?: string
-  modelProfile?: string
-  workflowVersion?: number
-  seed?: number
-  effectiveFrames?: number
-  effectiveDurationMs?: number
   inputParameters?: Record<string, unknown>
   inputContractStatus?: WorkflowInputContractStatus
   inputContractCode?: WorkflowInputContractCode
   referenceAssets: TaskReferenceAssetSummary[]
-  continuityAssets: TaskReferenceAssetSummary[]
-  promptAvailable?: boolean
-  promptCharacterCount?: number
-  negativePromptCharacterCount?: number
+  contextMediaUses: TaskReferenceAssetSummary[]
   errorMessage?: string
-  outputs?: unknown[]
   outputMedia?: TaskOutputMedia[]
   queuedAt?: string
   startedAt?: string
@@ -792,77 +506,38 @@ export interface Workflow {
   createdAt: string
   eta?: string
   attempts?: number
-  maxAttempts?: number
-  batchId?: string
-  batchIndex?: number
-  batchSize?: number
-  batchKind?: string
-  shotVersionKey?: string
-  shotVersionLabel?: string
-  batchSlots?: WorkflowBatchSlot[]
-  batchTaskIds?: string[]
-  productionRunId?: string
-  productionVariantNumber?: number
-  isVirtualProductionUnit?: boolean
-  virtualProductionUnitKind?: 'deferred_first_frame_continuity' | 'waiting_for_deferred_first_frame_source' | 'waiting_for_deferred_first_frame_chain'
-  deferredGenerationRequestId?: string
-  deferredGenerationStatus?: string
-  deferredSourceTaskId?: string
-  deferredUpstreamRequestId?: string
-  deferredFrameSlot?: 'first_frame' | 'last_frame'
-  batchWorkflows?: Workflow[]
   episodeId?: string
   episodeNumber?: number
   episodeTitle?: string
-  shotId?: string
-  shotIds?: string[]
-  shotNumber?: number
-  shotTitle?: string
 }
 
-export type WorkflowBatchSlotStatus =
-  | 'materialized'
-  | 'waiting_deferred'
-  | 'cancelled'
-  | 'cancelled_by_upstream'
-  | 'not_created'
-
-export interface WorkflowBatchSlot {
-  batchId?: string
-  batchKind?: string
-  shotVersionKey?: string
-  shotVersionLabel?: string
-  batchIndex: number
-  batchSize: number
-  slotStatus: WorkflowBatchSlotStatus
-  message?: string
-  workflowMode?: string
-  taskId?: string
-  taskStatus?: string
-  workflowId?: string
-  deferredGenerationRequestId?: string
-  deferredGenerationStatus?: string
-  deferredUpstreamRequestId?: string
-  episodeId?: string
-  episodeNumber?: number
-  episodeTitle?: string
-  shotId?: string
-  shotNumber?: number
-  shotTitle?: string
-  createdAt?: string
-  updatedAt?: string
+export interface TaskExecutionIdentity {
+  productionRunId: string
+  stageRunId: string
+  stageKey: string
+  stageOrdinal: number
+  unitKey: string
+  attemptId: string
+  attemptNumber: number
+  preparationId: string
+  executionInstanceVersionId: string
+  operation: string
 }
 
-export interface GeneratedWorkflowExport {
+export interface TaskWorkflowExport {
   taskId: string
-  generatedWorkflowId: string
+  attemptId: string
+  preparationId: string
+  executionInstanceVersionId: string
+  workflowVersionId: string
+  requestSha256: string
+  definitionSha256: string
+  graphState: 'prepared' | 'staged'
+  missingReceiptCount: number
   workflowJson: Record<string, unknown>
-  injectedValues: Record<string, unknown>
   contentHash: string
   filename: string
   format?: string
-  templateSlug?: string
-  templateVersion?: number
   importReady?: boolean
   comfyPromptId?: string
   comfyuiUrl?: string
@@ -879,16 +554,6 @@ export interface GeneratedWorkflowExport {
   openReason?: string
 }
 
-export interface ComfyUIWorkflowSyncResult {
-  taskId: string
-  generatedWorkflowId: string
-  synced: boolean
-  workflowPath: string
-  filename: string
-  comfyuiUrl: string
-  openReason: string
-}
-
 export interface AssemblyResult {
   id: string
   status: 'planned' | 'queued' | 'running' | 'succeeded' | 'failed'
@@ -899,7 +564,7 @@ export interface AssemblyResult {
   downloadUrl?: string
   aiGenerated?: boolean
   provenanceUrl?: string
-  sourceTaskIds?: string[]
+  sourceMediaCount?: number
   createdAt?: string
   queuedAt?: string
   startedAt?: string
@@ -912,29 +577,29 @@ export interface AssemblyResult {
 
 export interface ReleaseShotSelection {
   shotId: string
-  taskId: string
-  outputIndex: number
+  artifactId: string
 }
 
 export interface ReleaseEpisodeSelection {
   episodeId: string
-  assemblyId: string
+  artifactId: string
 }
 
 export interface ReleaseSelection {
   shots: ReleaseShotSelection[]
   episodes: ReleaseEpisodeSelection[]
-  seriesAssemblyId?: string
 }
 
 export interface ReleaseBundle {
   id: string
   projectId: string
+  productionRunId: string
   version: number
   title: string
   notes: string
   status: 'draft' | 'sealed' | 'released' | 'superseded'
   selection: ReleaseSelection
+  assemblySources?: { episodeId: string; artifactId: string; assemblyId: string }[]
   manifestSha256?: string
   verificationStatus: 'draft' | 'verified' | 'invalid'
   sealedAt?: string

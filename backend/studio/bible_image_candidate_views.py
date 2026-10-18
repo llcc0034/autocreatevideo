@@ -64,6 +64,7 @@ class ProjectBibleImageCandidatesView(APIView):
         responses={
             200: BibleImageCandidatesResponseSerializer,
             404: BibleImageCandidateErrorResponseSerializer,
+            409: BibleImageCandidateErrorResponseSerializer,
         },
         description=(
             "Read the current Bible bindings and every formal ProductionRun "
@@ -80,4 +81,6 @@ class ProjectBibleImageCandidatesView(APIView):
             raise BibleImageCandidateIntegrityConflict() from exc
         response_serializer = BibleImageCandidatesResponseSerializer(data=payload)
         response_serializer.is_valid(raise_exception=True)
-        return Response(response_serializer.validated_data)
+        response = Response(response_serializer.validated_data)
+        response["Cache-Control"] = "private, no-store"
+        return response

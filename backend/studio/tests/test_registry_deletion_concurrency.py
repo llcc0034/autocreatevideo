@@ -1,4 +1,6 @@
 from __future__ import annotations
+from studio.models import FieldDefinitionVersion
+from studio.tests.field_definition_fixtures import create_field_definition
 
 import threading
 import uuid
@@ -9,10 +11,11 @@ from django.db import close_old_connections, transaction
 from django.test import TransactionTestCase, skipUnlessDBFeature
 from rest_framework.test import APIClient
 
+from studio.tests.field_definition_fixtures import create_profile_field_rule
 from studio.models import (
     ModelProfileVersion,
-    PromptFieldDefinition,
-    PromptProfileBinding,
+    FieldDefinition,
+    ModelArtifact,
     PromptProfileFieldRule,
     PromptProfileVersion,
     ProviderProfile,
@@ -130,7 +133,7 @@ class RegistryDeletionConcurrencyTests(TransactionTestCase):
         response = result["execute"]
         return response.status_code, response.data
 
-    def test_inactive_binding_enabled_after_discovery_is_not_deleted(self):
+    def test_artifact_verified_after_discovery_is_not_deleted(self):
         provider = ProviderProfile(
             key=f"delete-race-{uuid.uuid4().hex[:10]}",
             name="Deletion race provider",
@@ -154,49 +157,34 @@ class RegistryDeletionConcurrencyTests(TransactionTestCase):
         )
         assign_json_contract(model_profile, "specification", {"schema_version": 1})
         model_profile.save()
-        prompt_profile = PromptProfileVersion.objects.create(
-            profile_key=f"delete.race.prompt.{uuid.uuid4().hex[:8]}",
-            version=1,
-            name="Delete race prompt",
-            model_family="delete-race-family",
-            operation="image.generate",
-            status=PromptProfileVersion.Status.PUBLISHED,
-        )
-        binding = PromptProfileBinding.objects.create(
-            key=f"delete-race-binding-{uuid.uuid4().hex[:8]}",
-            name="Delete race binding",
-            operation="image.generate",
-            model_family="delete-race-family",
-            model_profile_version=model_profile,
-            prompt_profile_version=prompt_profile,
-            is_active=False,
-        )
+        artifact = ModelArtifact.objects.create(profile_version=model_profile, role="checkpoint",
+            logical_name="race-checkpoint", filename="checkpoint.safetensors", status="declared")
         impact = self._preview("model_profile_version", model_profile.id)
         self.assertTrue(impact["can_execute"])
 
-        def enable_binding():
+        def verify_artifact():
             with transaction.atomic():
-                PromptProfileBinding.objects.filter(pk=binding.pk).update(is_active=True)
+                ModelArtifact.objects.filter(pk=artifact.pk).update(status="available")
 
         status_code, data = self._assert_lifecycle_change_wins_before_dependency_lock(
             resource_type="model_profile_version",
             object_id=model_profile.id,
             impact=impact,
-            mutate=enable_binding,
+            mutate=verify_artifact,
         )
 
         self.assertEqual(status_code, 409, data)
         self.assertEqual(data["error"]["code"], "deletion_impact_changed")
-        binding.refresh_from_db()
-        self.assertTrue(binding.is_active)
+        artifact.refresh_from_db()
+        self.assertEqual(artifact.status, "available")
         self.assertTrue(ModelProfileVersion.objects.filter(pk=model_profile.pk).exists())
 
     def test_rule_parent_published_after_discovery_is_not_deleted(self):
-        field = PromptFieldDefinition.objects.create(
+        field = create_field_definition(
             key=f"delete_race_field_{uuid.uuid4().hex[:8]}",
             label="Delete race field",
             category="test",
-            value_type=PromptFieldDefinition.ValueType.TEXT,
+            value_type=FieldDefinitionVersion.ValueType.TEXT,
             is_active=False,
         )
         prompt_profile = PromptProfileVersion.objects.create(
@@ -207,14 +195,14 @@ class RegistryDeletionConcurrencyTests(TransactionTestCase):
             operation="image.generate",
             status=PromptProfileVersion.Status.DRAFT,
         )
-        rule = PromptProfileFieldRule.objects.create(
+        rule = create_profile_field_rule(
             profile_version=prompt_profile,
             field_definition=field,
-            source_selector=PromptProfileFieldRule.SourceSelector.DEFINITION_DEFAULT,
+            source_selector=PromptProfileFieldRule.SourceSelector.FIXED_VALUE,
             channel=PromptProfileFieldRule.Channel.POSITIVE_PROMPT,
             position=1,
         )
-        impact = self._preview("prompt_field_definition", field.id)
+        impact = self._preview("field_definition", field.id)
         self.assertTrue(impact["can_execute"])
 
         def publish_parent():
@@ -224,7 +212,7 @@ class RegistryDeletionConcurrencyTests(TransactionTestCase):
                 )
 
         status_code, data = self._assert_lifecycle_change_wins_before_dependency_lock(
-            resource_type="prompt_field_definition",
+            resource_type="field_definition",
             object_id=field.id,
             impact=impact,
             mutate=publish_parent,
@@ -235,4 +223,4 @@ class RegistryDeletionConcurrencyTests(TransactionTestCase):
         prompt_profile.refresh_from_db()
         self.assertEqual(prompt_profile.status, PromptProfileVersion.Status.PUBLISHED)
         self.assertTrue(PromptProfileFieldRule.objects.filter(pk=rule.pk).exists())
-        self.assertTrue(PromptFieldDefinition.objects.filter(pk=field.pk).exists())
+        self.assertTrue(FieldDefinition.objects.filter(pk=field.pk).exists())

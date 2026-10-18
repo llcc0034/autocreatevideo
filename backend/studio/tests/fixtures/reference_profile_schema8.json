@@ -1,0 +1,364 @@
+{
+  "schema_version": 8,
+  "profile_key": "minimax_h3.video.ref2va",
+  "version": 21,
+  "model_family": "minimax_h3",
+  "operation": "video.generate",
+  "mode": "Ref2VA",
+  "rules": [
+    {
+      "field_key": "subject_definitions",
+      "field_value_type": "long_text",
+      "field_value_options": [],
+      "source_selector": "projection.output",
+      "channel": "positive_prompt",
+      "position": 1,
+      "label_style": "label_block",
+      "separator": "newline",
+      "required": true,
+      "omit_if_empty": false,
+      "max_chars": 7000,
+      "generation_mode": "server_locked",
+      "generation_source_selector": "projection.output",
+      "generation_instruction": "",
+      "generation_output_semantics": "final",
+      "generation_required": true,
+      "language_policy": "any",
+      "length_unit": "none",
+      "generation_min": null,
+      "generation_max": null,
+      "generation_validator_keys": [
+        "protected_tokens_preserve_count"
+      ],
+      "generation_context_selectors": [],
+      "projection_primitive": "reference_context.subject_definitions",
+      "fixed_value": null,
+      "has_default": false,
+      "default_value": null
+    },
+    {
+      "field_key": "summary",
+      "field_value_type": "long_text",
+      "field_value_options": [],
+      "source_selector": "projection.output",
+      "channel": "positive_prompt",
+      "position": 2,
+      "label_style": "label_colon",
+      "separator": "newline",
+      "required": true,
+      "omit_if_empty": false,
+      "max_chars": 7000,
+      "generation_mode": "server_locked",
+      "generation_source_selector": "projection.output",
+      "generation_instruction": "",
+      "generation_output_semantics": "final",
+      "generation_required": true,
+      "language_policy": "any",
+      "length_unit": "none",
+      "generation_min": null,
+      "generation_max": null,
+      "generation_validator_keys": [
+        "protected_tokens_preserve_count"
+      ],
+      "generation_context_selectors": [],
+      "projection_primitive": "reference_context.summary",
+      "fixed_value": null,
+      "has_default": false,
+      "default_value": null
+    },
+    {
+      "field_key": "retention_analysis",
+      "field_value_type": "long_text",
+      "field_value_options": [],
+      "source_selector": "projection.output",
+      "channel": "positive_prompt",
+      "position": 3,
+      "label_style": "label_block",
+      "separator": "newline",
+      "required": true,
+      "omit_if_empty": false,
+      "max_chars": 7000,
+      "generation_mode": "server_locked",
+      "generation_source_selector": "projection.output",
+      "generation_instruction": "",
+      "generation_output_semantics": "final",
+      "generation_required": true,
+      "language_policy": "any",
+      "length_unit": "none",
+      "generation_min": null,
+      "generation_max": null,
+      "generation_validator_keys": [
+        "protected_tokens_preserve_count"
+      ],
+      "generation_context_selectors": [],
+      "projection_primitive": "reference_context.retention_analysis",
+      "fixed_value": null,
+      "has_default": false,
+      "default_value": null
+    },
+    {
+      "field_key": "detailed_description",
+      "field_value_type": "long_text",
+      "field_value_options": [],
+      "source_selector": "projection.output",
+      "channel": "positive_prompt",
+      "position": 4,
+      "label_style": "label_block",
+      "separator": "newline",
+      "required": true,
+      "omit_if_empty": false,
+      "max_chars": 7000,
+      "generation_mode": "model_generated",
+      "generation_source_selector": "request.structured_input",
+      "source_path": ["visual"],
+      "generation_instruction": "This is generation, not translation or summarization; the Chinese source is a frozen fact ledger. Write only the detailed_description as one continuous playback-order English director-prose block. Target twelve complete sentences, each targeting 30-36 English words, for a target total of 360-432 English words; the returned contribution itself, excluding server-appended authored-literal blocks, should target the official recommended 350-500 English word range; falling outside that range produces an advisory review warning rather than blocking a complete truthful result. A single shot does not reduce this budget. Do not output sentence numbers, headings, section labels, bullets, an outline, a checklist, or word-count commentary. Keep the twelve sentences as natural playback-order prose in the order of the supplied shot and timeline facts, and distribute their focus without labeling them: the first establishes supported composition and screen position; the second records referenced subject appearance, materials, and reference relationships; the third establishes supported subject-object and environment depth relationships; the fourth develops supported lighting and surface response; the fifth follows the earliest supplied action phase; the sixth follows mechanically necessary intermediate motion inside that supplied interval; the seventh follows the next supplied action phase and its supported physical consequence; the eighth follows camera framing, movement, focus, and camera-subject geometry; the ninth follows synchronized physical sound, supported speaker delivery or lip motion, and their supplied timing; the tenth follows supported reference-effect timing; the eleventh carries the last supplied action phase into its continuity state; and the twelfth resolves only the supported ending composition and continuity facts. For multiple shots or timeline phases, continue this allocation across them in their supplied playback order instead of grouping details by category. Preserve only [Shot N] and time markers already present in the frozen facts; never create a new numbered marker or timestamp. Preserve every server-provided protected_tokens placeholder exactly as presented, at least once and in its supplied order; the server restores official reference labels after validation. When the frozen ledger is compact, expand only observable spatial relationships, supported material or surface and light response, mechanically necessary causal motion between supplied states, camera-subject geometry, depth, framing, and timing inside supplied intervals. These are authorized elaborations, not new story facts. Do not add an unsupported identity, age, color, material, expression, object, sound, location, weather, event, action, dialogue, or outcome. Do not emit, translate, paraphrase, quote, wrap, or reconstruct authored dialogue, lyrics, or visible text; the deterministic server projection appends those frozen original-language blocks after review. Count and revise the target sentences before returning so their contribution aims for both the sentence targets and the recommended 350-500 English word range without violating frozen facts; when those goals conflict, preserve complete frozen facts and allow the server to record an advisory warning. The final deterministic renderer places one or two locked visual-style sentences before [Shot 1]; do not duplicate that opening or invent a new style. Mention each supplied protected Subject token at its first clear visual appearance in playback order. If the frozen input does not expose a Subject token to this contribution, do not invent or renumber one; the configured server projection inserts the locked reference label at that subject's first shot appearance. Only target-shot facts are authoritative. Dialogue metadata covers speaker identity, delivery, timing and voiceover, not text. Never infer, quote, translate, or use other-shot dialogue; server locks and separately assembles authored dialogue.",
+      "generation_output_semantics": "contribution",
+      "generation_required": true,
+      "language_policy": "en",
+      "length_unit": "english_words",
+      "generation_min": 350,
+      "generation_max": 500,
+      "generation_validator_keys": [
+        "non_empty",
+        "no_control_characters",
+        "no_unresolved_placeholders",
+        "protected_tokens_at_least_once",
+        "length_advisory"
+      ],
+      "generation_context_selectors": [
+        "project.style",
+        "target_shot.core",
+        "target_shot.dialogue_metadata",
+        "target_shot.linked_bible"
+      ],
+      "projection_primitive": "reference_context.detailed_description",
+      "fixed_value": null,
+      "has_default": false,
+      "default_value": null
+    },
+    {
+      "field_key": "overall_soundscape",
+      "field_value_type": "long_text",
+      "field_value_options": [],
+      "source_selector": "projection.output",
+      "channel": "positive_prompt",
+      "position": 5,
+      "label_style": "label_colon",
+      "separator": "newline",
+      "required": true,
+      "omit_if_empty": false,
+      "max_chars": 7000,
+      "generation_mode": "model_generated",
+      "generation_source_selector": "request.structured_input",
+      "source_path": ["sfx"],
+      "generation_instruction": "Summarize only diegetic ambience and physical or synchronized sound effects supported by the frozen shot facts. Keep the result in English, do not repeat complete dialogue, and output N/A when no diegetic sound is requested. Treat the configured length minimum and maximum as a recommended target; never omit a complete truthful result solely to satisfy that target. Only target-shot facts are authoritative. Dialogue metadata covers speaker identity, delivery, timing and voiceover, not text. Never infer, quote, translate, or use other-shot dialogue; server locks and separately assembles authored dialogue.",
+      "generation_output_semantics": "contribution",
+      "generation_required": true,
+      "language_policy": "en",
+      "length_unit": "english_words",
+      "generation_min": 1,
+      "generation_max": 80,
+      "generation_validator_keys": [
+        "non_empty",
+        "no_control_characters",
+        "no_unresolved_placeholders",
+        "protected_tokens_preserve_count",
+        "length_advisory"
+      ],
+      "generation_context_selectors": [
+        "project.style",
+        "target_shot.core",
+        "target_shot.dialogue_metadata",
+        "target_shot.linked_bible"
+      ],
+      "projection_primitive": "reference_context.overall_soundscape",
+      "fixed_value": null,
+      "has_default": false,
+      "default_value": null
+    },
+    {
+      "field_key": "non_diegetic_music",
+      "field_value_type": "long_text",
+      "field_value_options": [],
+      "source_selector": "projection.output",
+      "channel": "positive_prompt",
+      "position": 6,
+      "label_style": "label_colon",
+      "separator": "newline",
+      "required": true,
+      "omit_if_empty": false,
+      "max_chars": 7000,
+      "generation_mode": "model_generated",
+      "generation_source_selector": "request.structured_input",
+      "source_path": ["music"],
+      "generation_instruction": "Describe only audience-only non-diegetic music supported by the frozen shot facts, including instrumentation, tempo, intensity, transitions, ducking, and silence. Keep the result in English and output N/A when no music is requested. Treat the configured length minimum and maximum as a recommended target; never omit a complete truthful result solely to satisfy that target. Only target-shot facts are authoritative. Dialogue metadata covers speaker identity, delivery, timing and voiceover, not text. Never infer, quote, translate, or use other-shot dialogue; server locks and separately assembles authored dialogue.",
+      "generation_output_semantics": "contribution",
+      "generation_required": true,
+      "language_policy": "en",
+      "length_unit": "english_words",
+      "generation_min": 1,
+      "generation_max": 60,
+      "generation_validator_keys": [
+        "non_empty",
+        "no_control_characters",
+        "no_unresolved_placeholders",
+        "protected_tokens_preserve_count",
+        "length_advisory"
+      ],
+      "generation_context_selectors": [
+        "project.style",
+        "target_shot.core",
+        "target_shot.dialogue_metadata",
+        "target_shot.linked_bible"
+      ],
+      "projection_primitive": "reference_context.non_diegetic_music",
+      "fixed_value": null,
+      "has_default": false,
+      "default_value": null
+    }
+  ],
+  "source_projection_key": "declarative_v1",
+  "channel_limits": {
+    "positive_prompt": {
+      "max_chars": 7000,
+      "warn_at_chars": 6200
+    }
+  },
+  "source_projection_config": {
+    "schema_version": 5,
+    "primitive_options": {
+      "reference_context_ir_v1": {
+        "rendering": {
+          "templates": {
+            "reference": "{label}: {subject}; category={category}; purpose={purpose}; source={source_kind}; paired video={parent_label}; {description}; {guidance}",
+            "retention": "{label} (shots {shots}): {relationship} - {usage} {guidance}",
+            "summary": "[{task_types}] Generate {shot_count} shots over {duration_seconds} seconds. Mode: {mode}; {reference_count} supplied references. {reference_relationships}",
+            "shot": "{shot_marker} {narrative} {description} Action: {action} Camera: {camera} Subjects: {subjects} Environment: {environment} Lighting: {lighting} Colors: {color_palette} References: {references} Continuity: {continuity} Voice profiles: {voice_profiles} First-frame continuity required: {requires_first_frame_continuity}; last-frame continuity required: {requires_last_frame_continuity}. {dialogue}\n{reference_usage}",
+            "dialogue": "{subject} ({speaker_id}) {start_ms}–{end_ms} ms; voice={voice_profile}; delivery={delivery}: <d>[{language}] {text}</d>",
+            "style": "Visual style: {visual_prompt}\nColor design: {color_script}",
+            "sound": "[Shot {index}] {description}",
+            "music": "[Shot {index}] {description}",
+            "direction": "Across all shots: {description}",
+            "empty_references": "No reference media supplied; use the text-defined scene.",
+            "empty_retention": "No external reference relationships to preserve.",
+            "silent_sound": "No audio output.",
+            "silent_music": "No music output.",
+            "reviewed_shot": "{shot_marker} Subjects: {subject_labels}.\n{description}\n{reference_usage}\nFirst-frame continuity required: {requires_first_frame_continuity}; last-frame continuity required: {requires_last_frame_continuity}.\n{dialogue}",
+            "voiceover_dialogue": "Off-screen voiceover {subject} ({speaker_id}) {start_ms}–{end_ms} ms; voice={voice_profile}; delivery={delivery}: <d>[{language}] {text}</d>. No on-screen lip movement for this speech.",
+            "entity_reference": "{subject} from {label}: {description}. {guidance}",
+            "reference_usage": "{label}: {usage} {guidance}",
+            "shot_opening": "[Shot {index}]",
+            "shot_transition": "[Shot {index}] At {timecode},"
+          },
+          "separator": "\n",
+          "list_prefix": "- ",
+          "prompt_template_key": "reference_context_configured_v1",
+          "task_separator": " + ",
+          "unreferenced_task": "reference generation",
+          "unit_text_bindings": {},
+          "reference_rules": [
+            {
+              "category": "character",
+              "purpose": "",
+              "task": "reference generation",
+              "relationship": "fully_preserved",
+              "usage": "Preserve the referenced character identity."
+            },
+            {
+              "category": "scene",
+              "purpose": "",
+              "task": "reference generation",
+              "relationship": "fully_preserved",
+              "usage": "Preserve the referenced environment."
+            },
+            {
+              "category": "prop",
+              "purpose": "",
+              "task": "reference generation",
+              "relationship": "fully_preserved",
+              "usage": "Preserve the referenced prop."
+            },
+            {
+              "category": "continuity_frame",
+              "purpose": "",
+              "task": "keyframe completion",
+              "relationship": "fully_preserved",
+              "usage": "Begin the shot from this frame."
+            },
+            {
+              "category": "first_frame",
+              "purpose": "",
+              "task": "keyframe completion",
+              "relationship": "fully_preserved",
+              "usage": "Begin the shot from this frame."
+            },
+            {
+              "category": "last_frame",
+              "purpose": "",
+              "task": "keyframe completion",
+              "relationship": "fully_preserved",
+              "usage": "End the shot on this frame."
+            },
+            {
+              "category": "video",
+              "purpose": "motion_camera_reference",
+              "task": "reference generation",
+              "relationship": "weak_reference",
+              "usage": "Use the declared camera motion and timing as guidance, not a replacement story."
+            },
+            {
+              "category": "video",
+              "purpose": "video_editing",
+              "task": "video editing",
+              "relationship": "partially_preserved",
+              "usage": "Edit this source video according to the declared changes."
+            },
+            {
+              "category": "video",
+              "purpose": "video_continuation",
+              "task": "video continuation",
+              "relationship": "fully_preserved",
+              "usage": "Continue from the final state of this source video."
+            },
+            {
+              "category": "audio",
+              "purpose": "audio_reference",
+              "task": "audio reference",
+              "relationship": "reference",
+              "usage": "Use the declared audio characteristics as guidance without copying the signal."
+            },
+            {
+              "category": "audio",
+              "purpose": "audio_reuse",
+              "task": "audio reuse",
+              "relationship": "partially_copy",
+              "usage": "Reuse the selected audio in the target timeline alongside other declared sound layers."
+            }
+          ]
+        }
+      }
+    },
+    "quality_advisories": {
+      "schema_version": 1,
+      "positive_negative_token_overlap": {
+        "minimum_shared_tokens": 6,
+        "minimum_overlap_ratio": 0.65
+      },
+      "short_shot_action_density": {
+        "maximum_action_characters": 420,
+        "maximum_duration_ms": 5500,
+        "minimum_clause_separators": 6
+      },
+      "motion_camera_reference_guidance": {
+        "minimum_english_words": 5,
+        "generic_values": [
+          "reference video",
+          "motion reference",
+          "camera reference",
+          "workflow smoke fixture",
+          "test fixture"
+        ]
+      }
+    }
+  }
+}

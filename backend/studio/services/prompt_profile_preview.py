@@ -48,6 +48,7 @@ def preview_prompt_profile(
         ):
             setattr(profile, field_name, deepcopy(candidate[field_name]))
         profile.status = PromptProfileVersion.Status.DRAFT
+        profile.input_structure_version = candidate.get("input_structure_version")
 
         persisted_rule_ids = {
             str(value)
@@ -93,10 +94,7 @@ def preview_prompt_profile(
                 profile_version=profile,
                 **values,
             )
-            validate_profile_rule(
-                rule,
-                enforce_current_generation_source=True,
-            )
+            validate_profile_rule(rule)
             candidate_rules.append(rule)
 
         preview = assemble_prompt_profile(

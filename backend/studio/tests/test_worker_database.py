@@ -118,7 +118,7 @@ class WorkerDatabaseTests(SimpleTestCase):
             )))
             stack.enter_context(patch.object(command, "WorkerHeartbeat"))
             for name in ("recover_stale_async_media_attempts", "recover_stale_deployment_smokes",
-                         "recover_stale_asset_generation_jobs"):
+                         "recover_stale_asset_generation_jobs", "advance_next_execution_preparation"):
                 stack.enter_context(patch.object(command, name, return_value=0))
             stack.enter_context(patch.object(command, "claim_next_async_media_attempt", side_effect=[
                 OperationalError("database is locked"), None,
@@ -137,3 +137,71 @@ class WorkerDatabaseTests(SimpleTestCase):
             with self.assertRaises(OperationalError):
                 command.Command().handle(once=True, poll_seconds=0.1, recover_minutes=1)
             process.assert_called_once_with(smoke)
+
+    def test_maintenance_database_steps_recover_without_replaying_work(self):
+        from studio.management.commands import run_platform_maintenance as command
+
+        terminal = SimpleNamespace(id="probe", host_id="host", status="succeeded")
+        for conflicting_step in (
+            "_acquire_single_flight", "_renew_single_flight", "_release_single_flight",
+            "recover_stale_runtime_host_probes", "enqueue_due_runtime_host_probes",
+            "claim_next_runtime_host_probe",
+        ):
+            with self.subTest(step=conflicting_step), ExitStack() as stack:
+                actions = {}
+                for name, result in (
+                    ("_acquire_single_flight", True), ("_renew_single_flight", None),
+                    ("_release_single_flight", None), ("recover_stale_runtime_host_probes", 0),
+                    ("enqueue_due_runtime_host_probes", 0),
+                ):
+                    actions[name] = stack.enter_context(patch.object(command, name, return_value=result))
+                    if name == conflicting_step:
+                        actions[name].side_effect = [OperationalError("database is locked"), result]
+                # Renew also runs before each claim and from probe heartbeats.
+                if conflicting_step == "_renew_single_flight":
+                    actions[conflicting_step].side_effect = [OperationalError("database is locked")] + [None] * 6
+                claim_results = [terminal, None]
+                if conflicting_step == "claim_next_runtime_host_probe":
+                    claim_results.insert(0, OperationalError("database is locked"))
+                stack.enter_context(patch.object(command, "claim_next_runtime_host_probe", side_effect=claim_results))
+                advance = stack.enter_context(patch.object(command, "advance_active_recipe_runs", return_value=1))
+
+                def probe(attempt, *, worker_heartbeat):
+                    worker_heartbeat()
+                    return attempt
+
+                process = stack.enter_context(patch.object(command, "process_runtime_host_probe", side_effect=probe))
+                sleep = stack.enter_context(patch.object(database.time, "sleep"))
+                stack.enter_context(patch.object(database, "close_old_connections"))
+                command.Command().handle(once=True, poll=0.1)
+                advance.assert_called_once()
+                process.assert_called_once()
+                sleep.assert_called_once_with(0.1)
+                self.assertEqual(actions["_release_single_flight"].call_count,
+                                 2 if conflicting_step == "_release_single_flight" else 1)
+
+    def test_maintenance_does_not_retry_probe_execution_or_unknown_database_errors(self):
+        from studio.management.commands import run_platform_maintenance as command
+
+        for failing_step, message in (
+            ("process_runtime_host_probe", "database is locked"),
+            ("advance_active_recipe_runs", "database is locked"),
+            ("_acquire_single_flight", "disk I/O error"),
+        ):
+            with self.subTest(step=failing_step), ExitStack() as stack:
+                actions = {}
+                for name, result in (
+                    ("_acquire_single_flight", True), ("_renew_single_flight", None),
+                    ("_release_single_flight", None), ("recover_stale_runtime_host_probes", 0),
+                    ("enqueue_due_runtime_host_probes", 0), ("advance_active_recipe_runs", 1),
+                    ("claim_next_runtime_host_probe", object()), ("process_runtime_host_probe", None),
+                ):
+                    actions[name] = stack.enter_context(patch.object(command, name, return_value=result))
+                actions[failing_step].side_effect = OperationalError(message)
+                sleep = stack.enter_context(patch.object(database.time, "sleep"))
+                with self.assertRaises(OperationalError):
+                    command.Command().handle(once=True, poll=0.1)
+                actions[failing_step].assert_called_once()
+                sleep.assert_not_called()
+                self.assertEqual(actions["_release_single_flight"].call_count,
+                                 0 if failing_step == "_acquire_single_flight" else 1)

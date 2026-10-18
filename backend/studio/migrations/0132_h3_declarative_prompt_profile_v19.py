@@ -420,6 +420,10 @@ def restore_v18_route(apps, schema_editor):
     target_binding = Binding.objects.select_for_update().filter(
         key=TARGET_BINDING_KEY,
     ).first()
+    if not any((source, target, source_binding, target_binding)):
+        # Forward migration does nothing on installations without this route.
+        # Its inverse must likewise leave an empty installation unchanged.
+        return
     if not all((source, target, source_binding, target_binding)):
         raise RuntimeError("Cannot restore H3 v18 route: migrated facts are missing")
     if (

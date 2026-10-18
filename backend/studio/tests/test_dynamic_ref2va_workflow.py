@@ -2,7 +2,6 @@ import hashlib
 from copy import deepcopy
 from pathlib import Path
 import tempfile
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from django.contrib.auth import get_user_model
@@ -18,26 +17,17 @@ from studio.models import (
     WorkflowTemplate,
     WorkflowTemplateVersion,
 )
-from studio.services.comfyui_artifacts import exact_object_info_model_option
 from studio.services.json_contracts import assign_json_contract, json_contract
-from studio.services.media_capabilities import (
-    conditioning_mode_contract,
-    resolve_conditioning_contract,
-)
 from studio.services.workflow_compiler import (
     WorkflowCompilerError,
-    compile_frozen_workflow,
+    compile_frozen_workflow_values,
 )
 from studio.services.workflow_smoke_fixtures import (
-    _default_smoke_value,
-    finalize_workflow_smoke_fixture,
+    _execution_default_value,
     normalize_workflow_execution_inputs,
-    normalize_workflow_smoke_fixture,
     workflow_execution_input_schema,
-    workflow_smoke_fixture_schema,
 )
 from studio.services.workflow_versions import (
-    _materialize_smoke_graph,
     import_workflow_version,
     validate_workflow_version,
     workflow_version_execution_snapshot,
@@ -49,15 +39,22 @@ from studio.tests.factories import (
 from studio.tests.workflow_projector_fixtures import workflow_projector_reference
 
 
-class WorkflowSmokeDefaultTests(SimpleTestCase):
-    def test_normalizes_custom_multiple_constraint(self):
+class WorkflowDeclaredDefaultTests(SimpleTestCase):
+    def test_does_not_repair_a_declared_default_that_violates_alignment(self):
         self.assertEqual(
-            _default_smoke_value("parameter.h3.length", {
+            _execution_default_value("parameter.h3.length", {
                 "type": "integer", "default": 124, "min": 5,
                 "max": 3600, "multiple_of": 17,
             }),
-            119,
+            124,
         )
+
+    def test_no_smoke_specific_seed_size_or_prompt_defaults(self):
+        for key, value in (("sampling.seed", 42), ("parameter.text.max_length", 2048),
+                ("parameter.seedvr2.resolution", 2048), ("parameter.image.scale_megapixels", 2.0)):
+            self.assertEqual(_execution_default_value(key, {"type": "number", "default": value}), value)
+        for key in ("prompt.positive", "image.width", "video.frames", "sampling.seed"):
+            self.assertIsNone(_execution_default_value(key, {"type": "integer", "min": 1}))
 
 
 class DynamicRef2VAWorkflowTests(TestCase):
@@ -85,7 +82,7 @@ class DynamicRef2VAWorkflowTests(TestCase):
         assign_json_contract(self.profile, "specification", {
             "schema_version": 1,
             "capabilities": ["video.reference_to_video"],
-            "conditioning_contract": conditioning_contract("Ref2VA", input_kind="classified_references", requires_bible=True, first_frame=(0, 1), entity_images=(0, 9), reference_videos=(0, 3), paired_video_audios=(0, 3), reference_audios=(0, 3)),
+            "conditioning_contract": conditioning_contract("Ref2VA", input_kind="classified_references", requires_bible=getattr(self, "requires_bible", True), first_frame=(0, 1), entity_images=(0, 9), reference_videos=(0, 3), paired_video_audios=(0, 3), reference_audios=(0, 3)),
         })
         self.profile.save()
         self.artifacts = {}
@@ -158,7 +155,7 @@ class DynamicRef2VAWorkflowTests(TestCase):
             "conditioning_contract": conditioning_contract(
                 "Ref2VA",
                 input_kind="classified_references",
-                requires_bible=True,
+                requires_bible=getattr(self, "requires_bible", True),
                 first_frame=(0, 1),
                 entity_images=(0, 9),
                 reference_videos=(0, 3),
@@ -276,6 +273,14 @@ class DynamicRef2VAWorkflowTests(TestCase):
             metadata=metadata or {},
         )
 
+    def test_declared_invalid_frame_default_is_not_silently_rounded(self):
+        self.version.input_contract["parameters"]["video.frames"]["default"] = 60
+        schema = workflow_execution_input_schema(self.version)
+        frame = next(row for row in schema["parameters"] if row["semantic_key"] == "video.frames")
+        self.assertEqual(frame["recommended_value"], 60)
+        with self.assertRaises(ValidationError):
+            normalize_workflow_execution_inputs(self.version, {"schema_version": 2, "values": {}}, owner=self.user)
+
     def test_dynamic_fixture_materializes_image_video_sparse_pair_and_audio(self):
         with tempfile.TemporaryDirectory() as temp_root:
             root = Path(temp_root)
@@ -298,15 +303,19 @@ class DynamicRef2VAWorkflowTests(TestCase):
                 },
             }
             with override_settings(ASSET_LIBRARY_ROOT=root):
-                frozen = normalize_workflow_smoke_fixture(self.version, fixture_request)
-                compiled = _materialize_smoke_graph(
-                    self.version,
-                    fixture_values=frozen.values,
-                    fixture_reference_bindings=frozen.reference_bindings,
-                    fixture_asset_facts=frozen.asset_facts,
-                )
-                frozen = finalize_workflow_smoke_fixture(
-                    frozen, materialized_graph_sha256=compiled.graph_sha256,
+                frozen = normalize_workflow_execution_inputs(self.version, fixture_request, owner=self.user)
+                from studio.services.workflow_classified_references import asset_reference_groups
+                scalar_values = dict(frozen.values)
+                # This selection chooses the reference contract; it is not a node input.
+                self.assertEqual(scalar_values.pop("CONDITIONING_MODE"), "Ref2VA")
+                compiled = compile_frozen_workflow_values(
+                    workflow_snapshot=workflow_version_execution_snapshot(self.version),
+                    scalar_values={**scalar_values, "prompt.positive": "Follow the supplied reference media.",
+                        "output.prefix": "test/explicit-dynamic-inputs"},
+                    resolve_asset=lambda *_: self.fail("Classified inputs are not fixed slots"),
+                    classified_groups=asset_reference_groups(frozen.reference_bindings),
+                    classified_bindings=list(frozen.reference_bindings),
+                    output_kind="video", total_duration_ms=None,
                 )
             inputs = compiled.graph["6"]["inputs"]
             self.assertIn("ref_images.ref_image_0", inputs)
@@ -316,10 +325,10 @@ class DynamicRef2VAWorkflowTests(TestCase):
             self.assertIn("ref_video_audios.ref_video_audio_1", inputs)
             self.assertIn("ref_audios.ref_audio_0", inputs)
             self.assertEqual(len(frozen.asset_facts), 5)
-            self.assertEqual(frozen.persisted_values["parameters"]["sampling.steps"], 4)
-            self.assertEqual(frozen.materialized_graph_sha256, compiled.graph_sha256)
-            self.assertEqual(len(frozen.fixture_sha256), 64)
-            schema = workflow_smoke_fixture_schema(self.version)
+            self.assertEqual(frozen.request["values"]["sampling.steps"], 4)
+            self.assertEqual(frozen.request["references"], fixture_request["references"])
+            self.assertEqual(len(compiled.graph_sha256), 64)
+            schema = workflow_execution_input_schema(self.version)
             self.assertEqual(schema["schema_version"], 2)
             self.assertEqual(schema["dynamic_references"]["pictures"]["max_items"], 9)
             self.assertEqual(schema["dynamic_references"]["maximum_physical_assets"], 18)
@@ -338,174 +347,20 @@ class DynamicRef2VAWorkflowTests(TestCase):
             self.assertEqual(compiled.compiler_version, 3)
             self.assertTrue(compiled.resolved_semantics["audio.enabled"])
 
-    def test_validated_materialization_uses_exact_frozen_object_info_model_option(self):
-        target_definitions = {}
-        requirements = list(
-            self.version.model_requirements.select_related("artifact").all()
-        )
-        bindings = {
-            row.semantic_key: row
-            for row in self.version.semantic_bindings.all()
-        }
-        for requirement in requirements:
-            binding = bindings[f"model.{requirement.alias}.filename"]
-            node_type = self.version.graph[str(binding.node_id)]["class_type"]
-            key = (node_type, binding.input_name)
-            target_definitions.setdefault(key, []).append(
-                requirement.expected_filename.replace(
-                    "/",
-                    "\\",
-                ) if requirement.alias == "h3-turbo-lora" else requirement.expected_filename,
-            )
-        object_info = {}
-        for (node_type, input_name), options in target_definitions.items():
-            object_info.setdefault(node_type, {"input": {"required": {}}})[
-                "input"
-            ]["required"][input_name] = [options, {}]
-
-        checked = []
-        for requirement in requirements:
-            semantic_key = f"model.{requirement.alias}.filename"
-            binding = bindings[semantic_key]
-            node_type = self.version.graph[str(binding.node_id)]["class_type"]
-            submission_filename = exact_object_info_model_option(
-                object_info,
-                node_type=node_type,
-                input_name=binding.input_name,
-                expected_filename=requirement.expected_filename,
-            )
-            checked.append({
-                "requirement_id": str(requirement.id),
-                "artifact_id": str(requirement.artifact_id),
-                "filename": requirement.expected_filename,
-                "submission_filename": submission_filename,
-                "sha256": requirement.artifact.sha256,
-                "folder": requirement.artifact.inventory_folder,
-                "inventory_source": "models_api",
-                "semantic_key": semantic_key,
-                "node_id": str(binding.node_id),
-                "node_type": node_type,
-                "input_name": binding.input_name,
-            })
-        evidence = {
-            "schema_version": 1,
-            "inventory": {
-                "schema_version": 2,
-                "checked_requirements": checked,
-            },
-        }
-        self.version.validation_state = WorkflowTemplateVersion.ValidationState.PASSED
-        self.version.validation_evidence = evidence
-        self.version.validation_evidence_sha256 = json_contract(evidence).sha256
-
-        frozen = normalize_workflow_smoke_fixture(self.version, {
-            "schema_version": 2,
-            "values": {
-                "image.width": 352,
-                "image.height": 608,
-                "video.frames": 56,
-                "video.fps": 24,
-                "sampling.steps": 4,
-            },
-            "assets": [],
-            "references": {"pictures": [], "videos": [], "audios": []},
-        })
-        compiled = _materialize_smoke_graph(
-            self.version,
-            fixture_values=frozen.values,
-            fixture_reference_bindings=frozen.reference_bindings,
-            fixture_asset_facts=frozen.asset_facts,
-        )
-
-        expected_submission = (
-            "MiniMax-H3-Turbo-Lora-Pruned-ComfyUI\\"
-            "minimax_h3_turbo_4step_ckpt600_ema_V4.safetensors"
-        )
-        self.assertEqual(
-            compiled.graph["2"]["inputs"]["lora_name"],
-            expected_submission,
-        )
-        lora_requirement = next(
-            row for row in requirements if row.alias == "h3-turbo-lora"
-        )
-        self.assertIn("/", lora_requirement.expected_filename)
-        self.assertEqual(
-            lora_requirement.artifact.filename,
-            lora_requirement.expected_filename,
-        )
-
-        evidence["inventory"]["checked_requirements"] = [
-            row for row in checked
-            if row["semantic_key"] != "model.h3-turbo-lora.filename"
-        ]
-        self.version.validation_evidence_sha256 = json_contract(evidence).sha256
-        with self.assertRaisesRegex(Exception, "精确模型提交枚举证据"):
-            _materialize_smoke_graph(
-                self.version,
-                fixture_values=frozen.values,
-                fixture_reference_bindings=frozen.reference_bindings,
-                fixture_asset_facts=frozen.asset_facts,
-            )
-
-        legacy_evidence = {
-            "schema_version": 1,
-            "inventory": {
-                "schema_version": 1,
-                "checked_requirements": checked,
-            },
-        }
-        self.version.status = WorkflowTemplateVersion.Status.PUBLISHED
-        self.version.validation_evidence = legacy_evidence
-        self.version.validation_evidence_sha256 = json_contract(
-            legacy_evidence,
-        ).sha256
-        with self.assertRaisesRegex(Exception, "已发布版本需新建版本"):
-            _materialize_smoke_graph(
-                self.version,
-                fixture_values=frozen.values,
-                fixture_reference_bindings=frozen.reference_bindings,
-                fixture_asset_facts=frozen.asset_facts,
-            )
 
     def test_runtime_compile_preserves_exact_frozen_model_widget_option(self):
-        project = SimpleNamespace(
-            id="00000000-0000-0000-0000-000000000201",
-            owner_id=self.user.id,
-            width=352,
-            height=608,
-            fps=24,
-            continuity_seed=23,
-            aspect_ratio="9:16",
-        )
-        prompt = SimpleNamespace(
-            id="00000000-0000-0000-0000-000000000202",
-            project=project,
-            prompt_text="A locked elevator descends in silence.",
-            negative_prompt="",
-            total_duration_ms=5000,
-            include_audio=True,
-            prompt_type="video",
-            conditioning_mode="Ref2VA",
-            model=self.profile.model_identifier,
-            structured_payload={
-                "reference_bindings": [],
-                "prompt_template_key": "h3_r2v_zero_reference_v1",
-                "effective_conditioning_mode": "Ref2VA",
-            },
-        )
-        compiled = compile_frozen_workflow(
-            workflow_snapshot=workflow_version_execution_snapshot(self.version),
-            prompt=prompt,
-            project=project,
-            overrides={
-                "video.frames": 124,
-                "output.prefix": "autoprompt/runtime/exact-model-option",
-            },
-            video_duration_policy={
-                "minimum_duration_ms": 5000,
-                "maximum_duration_ms": 15000,
-            },
-        )
+        request = {
+            "scalar_values": {"prompt.positive": "A locked elevator descends in silence.",
+                "image.width": 352, "image.height": 608, "video.frames": 124, "video.fps": 24,
+                "sampling.seed": 23, "sampling.steps": 4, "parameter.lora.strength": 1,
+                "output.prefix": "autoprompt/runtime/exact-model-option"},
+            "resolve_asset": lambda *_: self.fail("No fixed media slot"),
+            "classified_groups": {"images": [], "videos": [], "audios": []}, "classified_bindings": [],
+            "output_kind": "video", "total_duration_ms": 5000,
+            "video_duration_policy": {"minimum_duration_ms": 5000, "maximum_duration_ms": 15000},
+        }
+        compiled = compile_frozen_workflow_values(
+            workflow_snapshot=workflow_version_execution_snapshot(self.version), **request)
         exact_lora_option = self.version.graph["2"]["inputs"]["lora_name"]
         semantic_key = "model.h3-turbo-lora.filename"
         self.assertEqual(compiled.graph["2"]["inputs"]["lora_name"], exact_lora_option)
@@ -527,29 +382,17 @@ class DynamicRef2VAWorkflowTests(TestCase):
             "/", "\\",
         )
         with self.assertRaisesRegex(WorkflowCompilerError, "graph hash"):
-            compile_frozen_workflow(
-                workflow_snapshot=tampered,
-                prompt=prompt,
-                project=project,
-                overrides={
-                    "video.frames": 124,
-                    "output.prefix": "autoprompt/runtime/tampered-model-option",
-                },
-                video_duration_policy={
-                    "minimum_duration_ms": 5000,
-                    "maximum_duration_ms": 15000,
-                },
-            )
+            compile_frozen_workflow_values(workflow_snapshot=tampered, **request)
 
     def test_generic_validator_rejects_configured_edge_drift(self):
-        from studio.services.workflow_versions import _validate_classified_definition
+        from studio.services.workflow_versions import _validate_projector_model_definition
         graph = deepcopy(self.version.graph)
         graph["8"]["inputs"]["model"] = ["1", 0]
         with self.assertRaises(ValidationError):
-            _validate_classified_definition(graph, self.version.input_contract, self.profile.specification, list(self.version.semantic_bindings.values()), list(self.version.model_requirements.values()))
+            _validate_projector_model_definition(graph, self.version.input_contract, self.profile.specification, list(self.version.semantic_bindings.values()), list(self.version.model_requirements.values()))
 
     def test_generic_validator_rejects_frozen_plan_and_parameter_drift(self):
-        from studio.services.workflow_versions import _validate_classified_definition
+        from studio.services.workflow_versions import _validate_projector_model_definition
         for mutate in (
             lambda contract: contract["classified_references"]["groups"]["images"].update(max_items=20),
             lambda contract: contract["parameters"]["video.frames"].update(alignment_modulus=1),
@@ -558,15 +401,15 @@ class DynamicRef2VAWorkflowTests(TestCase):
             contract = deepcopy(self.version.input_contract)
             mutate(contract)
             with self.assertRaises(ValidationError):
-                _validate_classified_definition(self.version.graph, contract, self.profile.specification, list(self.version.semantic_bindings.values()), list(self.version.model_requirements.values()))
+                _validate_projector_model_definition(self.version.graph, contract, self.profile.specification, list(self.version.semantic_bindings.values()), list(self.version.model_requirements.values()))
 
     def test_configured_optional_attention_node_is_not_a_separate_compiler(self):
-        from studio.services.workflow_versions import _validate_classified_definition
+        from studio.services.workflow_versions import _validate_projector_model_definition
         graph = deepcopy(self.version.graph)
         attention = next(key for key,node in graph.items() if node["class_type"] == "MiniMaxLowVRAMAttention")
         del graph[attention]
         graph["7"]["inputs"]["model"] = ["2", 0]
-        _validate_classified_definition(graph, self.version.input_contract, self.profile.specification, list(self.version.semantic_bindings.values()), list(self.version.model_requirements.values()))
+        _validate_projector_model_definition(graph, self.version.input_contract, self.profile.specification, list(self.version.semantic_bindings.values()), list(self.version.model_requirements.values()))
 
     def test_dynamic_fixture_rejects_embedded_and_external_audio_together(self):
         with tempfile.TemporaryDirectory() as temp_root:
@@ -574,7 +417,7 @@ class DynamicRef2VAWorkflowTests(TestCase):
             video = self._write_asset(root, name="motion.mp4", kind=Asset.Kind.REFERENCE_VIDEO, mime="video/mp4", metadata={"duration_ms": 4000, "has_audio": True, "fps": 24})
             audio = self._write_asset(root, name="voice.wav", kind=Asset.Kind.REFERENCE_AUDIO, mime="audio/wav", metadata={"duration_ms": 4000})
             with override_settings(ASSET_LIBRARY_ROOT=root), self.assertRaises(Exception):
-                normalize_workflow_smoke_fixture(self.version, {
+                normalize_workflow_execution_inputs(self.version, {
                     "schema_version": 2,
                     "values": {},
                     "assets": [],
@@ -583,4 +426,4 @@ class DynamicRef2VAWorkflowTests(TestCase):
                         "use_embedded_audio": True,
                         "audio_asset_id": str(audio.id),
                     }]},
-                })
+                }, owner=self.user)

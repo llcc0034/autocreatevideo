@@ -10,9 +10,8 @@ from django.db import connection, transaction
 
 # One database-wide lock protects references that cannot be enforced by a
 # database foreign key.  FK references remain protected by PostgreSQL itself;
-# this lock closes the gap for recipe/config JSON and immutable Prompt Binding
-# identities frozen into production runs, prompt artifacts, generation
-# attempts and deployment-smoke request snapshots.
+# this lock closes the gap for recipe/config JSON and precise execution
+# identities frozen into run plans, preparations and Smoke requests.
 _REGISTRY_REFERENCE_LOCK_CLASS = 1_296_381_989
 _REGISTRY_REFERENCE_LOCK_ID = 1
 _LOCAL_REFERENCE_LOCK = RLock()

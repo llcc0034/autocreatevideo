@@ -64,20 +64,18 @@ from studio.services.runtime_platform import (
     verified_artifact_availability,
 )
 from studio.services.workflow_versions import (
-    _materialize_smoke_graph,
     import_workflow_version,
     verify_workflow_version_integrity,
     workflow_version_execution_snapshot,
 )
 from studio.services.workflow import aligned_frames
 from studio.services.workflow_smoke_fixtures import (
-    normalize_workflow_smoke_fixture,
     normalize_workflow_execution_inputs,
     workflow_execution_input_schema,
 )
 from studio.services.workflow_compiler import (
     WorkflowCompilerError,
-    compile_frozen_workflow,
+    compile_frozen_workflow_values,
 )
 from studio.services.draft_model_artifact_attestation import (
     _create_or_reuse_attempt,
@@ -92,6 +90,154 @@ from studio.tests.factories import (
 
 
 class ComfySavedWorkflowImportApiTests(TestCase):
+    def test_contract_receipt_ready_recovery_and_explicit_promotion(self):
+        from django.db import connection
+        from studio.models import ComfyWorkflowPreviewReceipt
+        driver = self._driver()
+        original_invoke = driver.invoke.side_effect
+        depth = len(connection.savepoint_ids)
+        def invoke(*args, **kwargs):
+            self.assertEqual(len(connection.savepoint_ids), depth, "host access must precede receipt write transaction")
+            return original_invoke(*args, **kwargs)
+        # Candidate registration has its own transaction; this assertion only
+        # covers the preview host read introduced by the receipt path.
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=driver):
+            self._admit_candidate()
+            driver.invoke.side_effect = invoke
+            payload = {"source_path": "saved/example.json", "expected_sha256": self.raw_sha,
+                **self._expected_source_scope_fields(), "primary_output_node_ids": [123],
+                "model_profile_version": str(self.profile.pk), "request_key": "ready:proof"}
+            original = self.client.post(f"/api/v1/model-deployments/{self.deployment.pk}/saved-workflows/preview/", payload, format="json")
+        self.assertEqual(original.status_code, 200, original.data)
+        self.assertEqual(original.data["actionability"], "ready_for_executable_import")
+        self.assertTrue(original.data["suggested_input_contract"])
+        with patch("studio.services.comfyui_workflow_imports.driver_for", side_effect=AssertionError("no host recovery")):
+            recovered = self.client.get(f"/api/v1/model-deployments/{self.deployment.pk}/saved-workflows/preview-receipt/", {"request_key": "ready:proof"})
+        self.assertEqual(recovered.data, original.data)
+        self.assertEqual(recovered.data["request_receipt"]["request"]["model_profile_version"], str(self.profile.pk))
+        row = ComfyWorkflowPreviewReceipt.objects.get()
+        self.assertEqual(str(row.contract_draft_id), original.data["contract_draft_id"])
+        # The recovery itself creates no executable version; promotion remains
+        # a separate explicit business action through the existing endpoint.
+        count_before = WorkflowTemplateVersion.objects.count()
+        item = {**{key: value for key, value in payload.items() if key != "request_key"},
+            "import_kind": "template_version", "template": str(self.template.pk),
+            "contract_draft": original.data["contract_draft_id"]}
+        for name in ("object_info_schema", "converted_graph", "parameter_schema", "structural_contract"):
+            item[f"expected_{name}_sha256"] = recovered.data[f"{name}_sha256"]
+        with patch("studio.services.comfyui_workflow_imports.driver_for", side_effect=AssertionError("promotion uses frozen contract")):
+            promoted = self.client.post(f"/api/v1/model-deployments/{self.deployment.pk}/saved-workflows/batch-import/", {"items": [item]}, format="json")
+        self.assertEqual(promoted.status_code, 200, promoted.data)
+        self.assertEqual(promoted.data["items"][0]["result"], "created", promoted.data)
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), count_before + 1)
+
+    def test_contract_receipt_rechecks_interleaved_completion_before_save_and_after_failure(self):
+        from studio.models import ComfyWorkflowPreviewReceipt
+        from studio.services.comfy_workflow_preview_receipts import commit_preview_receipt, PreviewReceiptConflict
+        payload = {"source_path": "saved/example.json", "expected_sha256": self.raw_sha,
+            **self._expected_source_scope_fields(), "primary_output_node_ids": [123], "request_key": "baseline"}
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=self._driver()):
+            self.assertEqual(self._post_managed_preview(payload).status_code, 200)
+        baseline = ComfyWorkflowPreviewReceipt.objects.get()
+        for key, fail, mismatch in (("before-save", False, False), ("after-error", True, False), ("conflict", True, True)):
+            def build(_data, persist):
+                response = deepcopy(baseline.response)
+                response["request_receipt"]["request_key"] = key
+                row = ComfyWorkflowPreviewReceipt(owner=self.admin, deployment=self.deployment,
+                    contract_draft=baseline.contract_draft, request_key=key,
+                    request_sha256=("0" * 64 if mismatch else baseline.request_sha256))
+                assign_json_contract(row, "response", response); row.save()
+                if fail:
+                    raise RuntimeError("host failed after competing commit")
+                return persist(lambda: self.fail("must reuse committed receipt, not save another draft"))
+            if mismatch:
+                with self.assertRaises(PreviewReceiptConflict):
+                    commit_preview_receipt(owner=self.admin, deployment=self.deployment, data={**payload, "request_key": key}, build=build)
+            else:
+                result = commit_preview_receipt(owner=self.admin, deployment=self.deployment, data={**payload, "request_key": key}, build=build)
+                self.assertEqual(result["request_receipt"]["request_key"], key)
+        self.assertEqual(ComfyWorkflowContractDraft.objects.count(), 1)
+
+    def test_contract_receipt_recovers_exact_response_without_host_access(self):
+        from studio.models import ComfyWorkflowPreviewReceipt
+        payload = {"source_path": "saved/example.json", "expected_sha256": self.raw_sha,
+            **self._expected_source_scope_fields(), "primary_output_node_ids": [123],
+            "request_key": "lost-response:1"}
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=self._driver()):
+            original = self._post_managed_preview(payload)
+        self.assertEqual(original.status_code, 200, original.data)
+        url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/"
+        with patch("studio.services.comfyui_workflow_imports.driver_for", side_effect=AssertionError("must not access host")):
+            recovered = self.client.get(url + "preview-receipt/", {"request_key": payload["request_key"]})
+            replay = self.client.post(url + "preview/", payload, format="json")
+        self.assertEqual(recovered.status_code, 200, recovered.data)
+        self.assertEqual(replay.status_code, 200, replay.data)
+        self.assertEqual(recovered.data, original.data)
+        self.assertEqual(replay.data, original.data)
+        self.assertEqual(recovered["Cache-Control"], "private, no-store")
+        self.assertEqual(ComfyWorkflowPreviewReceipt.objects.count(), 1)
+        self.assertEqual(ComfyWorkflowContractDraft.objects.count(), 1)
+        self.assertEqual(recovered.data["request_receipt"]["request"]["model_profile_version"], None)
+        self.assertNotIn("executable_graph", recovered.data)
+        self.assertNotIn("source_document", recovered.data)
+        from django.db import connection
+        if connection.vendor == "sqlite":
+            plan = ComfyWorkflowPreviewReceipt.objects.filter(owner=self.admin,
+                deployment=self.deployment, request_key=payload["request_key"]).explain()
+            self.assertIn("USING INDEX", plan)
+            self.assertNotIn("SCAN studio_comfyworkflowpreviewreceipt", plan)
+
+    def test_contract_receipt_is_scoped_conflict_checked_and_integrity_verified(self):
+        from studio.models import ComfyWorkflowPreviewReceipt
+        payload = {"source_path": "saved/example.json", "expected_sha256": self.raw_sha,
+            **self._expected_source_scope_fields(), "primary_output_node_ids": [123], "request_key": "receipt:2"}
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=self._driver()):
+            original = self._post_managed_preview(payload)
+        self.assertEqual(original.status_code, 200, original.data)
+        url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/"
+        with patch("studio.services.comfyui_workflow_imports.driver_for", side_effect=AssertionError("must not access host")):
+            changed = self.client.post(url + "preview/", {**payload, "expected_sha256": "0" * 64}, format="json")
+            self.assertEqual(changed.status_code, 409, changed.data)
+            self.assertEqual(self.client.get(url + "preview-receipt/", {"request_key": "absent"}).status_code, 404)
+            self.assertEqual(self.client.get(url + "preview-receipt/").status_code, 400)
+            other = get_user_model().objects.create_superuser(username="receipt-other", password="test")
+            self.client.force_authenticate(other)
+            self.assertEqual(self.client.get(url + "preview-receipt/", {"request_key": "receipt:2"}).status_code, 404)
+            self.client.force_authenticate(None)
+            self.assertIn(self.client.get(url + "preview-receipt/", {"request_key": "receipt:2"}).status_code, (401, 403))
+            self.client.force_authenticate(self.admin)
+            row = ComfyWorkflowPreviewReceipt.objects.get()
+            row.response["suggested_input_contract"] = {"tampered": True}
+            # Deliberate DB corruption proves the read guard, not a supported writer.
+            ComfyWorkflowPreviewReceipt.objects.filter(pk=row.pk).update(response=row.response)
+            self.assertEqual(self.client.get(url + "preview-receipt/", {"request_key": "receipt:2"}).status_code, 400)
+
+    def test_contract_receipt_reused_draft_has_distinct_request_proof(self):
+        from studio.models import ComfyWorkflowPreviewReceipt
+        payload = {"source_path": "saved/example.json", "expected_sha256": self.raw_sha,
+            **self._expected_source_scope_fields(), "primary_output_node_ids": [123], "request_key": "first"}
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=self._driver()):
+            first = self._post_managed_preview(payload)
+            second = self._post_managed_preview({**payload, "request_key": "second"})
+        self.assertEqual(first.status_code, 200, first.data)
+        self.assertEqual(second.status_code, 200, second.data)
+        self.assertEqual(first.data["contract_draft_id"], second.data["contract_draft_id"])
+        self.assertNotEqual(first.data["request_receipt"]["request_key"], second.data["request_receipt"]["request_key"])
+        self.assertEqual(ComfyWorkflowPreviewReceipt.objects.count(), 2)
+        self.assertEqual(ComfyWorkflowContractDraft.objects.count(), 1)
+
+    def test_contract_receipt_write_failure_rolls_back_new_contract(self):
+        from studio.models import ComfyWorkflowPreviewReceipt
+        payload = {"source_path": "saved/example.json", "expected_sha256": self.raw_sha,
+            **self._expected_source_scope_fields(), "primary_output_node_ids": [123], "request_key": "failed"}
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=self._driver()):
+            self._admit_candidate()
+            with patch.object(ComfyWorkflowPreviewReceipt, "save", side_effect=RuntimeError("receipt persistence failed")):
+                with self.assertRaisesRegex(RuntimeError, "receipt persistence failed"):
+                    self.client.post(f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/preview/", payload, format="json")
+        self.assertEqual(ComfyWorkflowContractDraft.objects.count(), 0)
+        self.assertEqual(ComfyWorkflowPreviewReceipt.objects.count(), 0)
+
     def _publish_projector_successor(self, current, definition):
         created = self.client.post(
             f"/api/v1/workflow-projector-versions/{current.id}/draft-next/", {}, format="json",
@@ -105,9 +251,9 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         return WorkflowProjectorVersion.objects.get(pk=created.data["id"])
 
     def _validate_projected_definition(self, *, graph, contract, bindings, requirements, output_kind):
-        from studio.services.workflow_versions import _validate_classified_definition
+        from studio.services.workflow_versions import _validate_projector_model_definition
         try:
-            _validate_classified_definition(graph, contract, {"conditioning_contract": contract["conditioning_contract"]}, bindings, requirements)
+            _validate_projector_model_definition(graph, contract, {"conditioning_contract": contract["conditioning_contract"]}, bindings, requirements)
         except ValidationError as exc:
             raise WorkflowCompilerError(str(exc)) from exc
 
@@ -121,6 +267,26 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         self.client.force_authenticate(self.admin)
         self.provider = ProviderProfile.objects.get(key="local-comfyui")
         self.profile = ModelProfileVersion.objects.get(profile_key="sdxl-image", version=1)
+        # The fixture declares image-to-image explicitly instead of inferring
+        # an operation from the output kind or the legacy model seed name.
+        specification = deepcopy(self.profile.specification)
+        specification["capabilities"] = ["image.image_to_image"]
+        assign_json_contract(self.profile, "specification", specification)
+        self.profile.save()
+        projector = WorkflowProjectorVersion.objects.get(projector__key="generic.comfy.fixed", is_current=True)
+        definition = deepcopy(projector.definition)
+        definition["projection"]["config"]["capability"] = "image.image_to_image"
+        projector.is_current = False
+        projector.save(update_fields=("is_current", "updated_at"))
+        projector = WorkflowProjectorVersion(
+            projector=projector.projector, version=2, provider_driver_type=projector.provider_driver_type,
+            operation=projector.operation, output_kind=projector.output_kind,
+            engine_key=projector.engine_key, engine_version=projector.engine_version,
+            status=WorkflowProjectorVersion.Status.PUBLISHED, is_current=True,
+            published_at=timezone.now(), published_by=self.admin,
+        )
+        assign_json_contract(projector, "definition", definition)
+        projector.save()
         self.host = RuntimeHost.objects.create(key="comfy-import-host", name="Comfy import host")
         self.deployment = ModelDeployment(
             key="comfy-import-source",
@@ -567,6 +733,7 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         *,
         key="comfy-import-source-secondary",
         modality=ModelProfileVersion.Modality.IMAGE,
+        capabilities=("image.image_to_image",),
     ):
         profile = ModelProfileVersion(
             profile_key=f"{key}-profile",
@@ -576,7 +743,7 @@ class ComfySavedWorkflowImportApiTests(TestCase):
             modality=modality,
             status=ModelProfileVersion.Status.PUBLISHED,
         )
-        assign_json_contract(profile, "specification", {"schema_version": 1})
+        assign_json_contract(profile, "specification", {"schema_version": 1, "capabilities": list(capabilities)})
         profile.save()
         deployment = ModelDeployment(
             key=key,
@@ -970,6 +1137,31 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         self.assertEqual(denied.status_code, 403)
         lookup.assert_not_called()
 
+    def test_recommendation_keeps_declared_model_inputs_out_of_runtime_parameters(self):
+        canvas = self._canvas()
+        canvas["nodes"][1]["inputs"].append({"name": "weights", "type": "COMBO", "widget": {"name": "weights"}, "link": None})
+        canvas["nodes"][1]["widgets_values"].append("reviewed.safetensors")
+        info = self._object_info()
+        info["SaveImage"]["input"]["required"]["weights"] = [["reviewed.safetensors"], {}]
+        info["SaveImage"]["input_order"]["required"].append("weights")
+        selector = {"node_type": "SaveImage", "input_name": "weights", "role": "checkpoint",
+            "inventory_node_type": "SaveImage", "inventory_input_name": "weights", "inventory_folder": ""}
+        driver = self._driver(canvas=canvas, object_info=info)
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=driver), patch(
+            "studio.services.comfyui_workflow_imports._projector_recommendation_model_selectors", return_value=([selector], [])
+        ):
+            admitted = self._admit_candidate()
+            response = self.client.post("/api/v1/workflow-projector-versions/recommendation/", {
+                "candidate_source_id": admitted.data["items"][0]["source_id"],
+                **self._expected_source_scope_fields(), "expected_source_sha256": self.raw_sha,
+                "primary_output_node_id": "123", "output_kind": "image",
+            }, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["definition"]["model_selectors"], [selector])
+        parameters = response.data["definition"]["parameter_policies"]
+        self.assertNotIn("weights", [row["input_name"] for row in parameters])
+        self.assertIn("seed", [row["input_name"] for row in parameters])
+
     def test_projector_recommendation_uses_managed_candidate_and_returns_unsaved_safe_draft(self):
         driver = self._driver()
         with patch(
@@ -1091,7 +1283,6 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         self.assertEqual(item["matched_primary_output_node_id"], "123")
         self.assertEqual(item["matched_output_kind"], "image")
         self.assertEqual(item["output_candidates"][0]["canvas_node_id"], "123")
-        self.assertEqual(len(item["model_profile_candidates"]), 1)
         matched_profile = item["model_profile_candidates"][0]
         self.assertEqual(
             matched_profile["model_profile_version_id"],
@@ -1123,6 +1314,50 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         self.assertEqual(recommendation.status_code, 200, recommendation.data)
         self.assertEqual(recommendation.data["persistence"], "unsaved_draft")
         self.assertTrue(recommendation.data["requires_human_confirmation"])
+
+    def test_imported_candidate_lists_successor_models_without_rebinding_frozen_target(self):
+        promotion = self.client.post(
+            f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/batch-import/",
+            self._batch_payload(), format="json",
+        )
+        self.assertEqual(promotion.data["items"][0]["result"], "created")
+        original_id = promotion.data["items"][0]["workflow_version_id"]
+        corrected = ModelProfileVersion(
+            profile_key=self.profile.profile_key, version=2,
+            provider=self.provider, model_identifier=self.profile.model_identifier,
+            modality=self.profile.modality, status=ModelProfileVersion.Status.DRAFT,
+        )
+        assign_json_contract(corrected, "specification", deepcopy(self.profile.specification))
+        corrected.save()
+        with patch(
+            "studio.services.comfyui_workflow_imports.driver_for",
+            return_value=self._driver(),
+        ):
+            listing = self.client.get("/api/v1/comfy-workflow-sources/discover/")
+        self.assertEqual(listing.status_code, 200, listing.data)
+        item = listing.data["items"][0]
+        self.assertEqual(item["match_status"], "matched")
+        self.assertEqual(item["matched_model_profile_version_id"], str(self.profile.id))
+        self.assertEqual(item["matched_target_deployment_id"], str(self.deployment.id))
+        candidates = {
+            row["model_profile_version_id"]: row
+            for row in item["model_profile_candidates"]
+        }
+        candidate = candidates[str(corrected.id)]
+        # This read/write-image-only canvas contains no model selector. The
+        # alternative must be visible without inheriting the frozen admission.
+        self.assertFalse(candidate["eligible"], candidate)
+        self.assertEqual(candidate["eligible_output_node_ids"], [])
+        self.assertIn("model_identity_evidence_missing", candidate["rejection_codes"])
+        self.assertFalse(candidate["live_validate_ready"])
+        self.assertEqual(candidate["target_deployment_id"], "")
+        self.assertIn("model_profile_not_published", candidate["live_validate_rejection_codes"])
+        self.assertEqual(
+            WorkflowTemplateVersion.objects.get(pk=original_id).model_profile_version_id,
+            self.profile.id,
+        )
+        self.deployment.refresh_from_db()
+        self.assertEqual(self.deployment.profile_version_id, self.profile.id)
 
     def test_preview_without_model_profile_persists_candidate_only_contract_draft(self):
         """Model selection belongs to contract completion, not source admission."""
@@ -2163,6 +2398,34 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         self.assertEqual(imported.data["items"][0]["workflow_version_id"], "")
         self.assertEqual(WorkflowTemplateVersion.objects.count(), original_version_count)
 
+    def test_execution_snapshot_links_native_task_without_a_legacy_generated_workflow(self):
+        from studio.models import GenerationTask, SeriesProject
+        from studio.tests.test_execution_context_inputs import PROJECT_CONFIG
+
+        project = SeriesProject.objects.create(owner=self.admin, title="Native task import", **PROJECT_CONFIG)
+        task = GenerationTask.objects.create(owner=self.admin, project=project, kind="video", status="succeeded")
+        path = f"autoprompt-task-{task.pk}-comfyui-ui.json"
+        driver = self._driver(paths=[path])
+        version_count = WorkflowTemplateVersion.objects.count()
+        with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=driver):
+            listing = self.client.get("/api/v1/comfy-workflow-sources/discover/")
+            result = self.client.post(
+                f"/api/v1/model-deployments/{self.deployment.pk}/saved-workflows/batch-import/",
+                {"items": [{"source_path": path, "expected_sha256": self.raw_sha,
+                    **self._expected_source_scope_fields(), "import_kind": "execution_snapshot"}]}, format="json")
+        self.assertEqual(listing.status_code, 200, listing.data)
+        self.assertEqual(result.status_code, 200, result.data)
+        source = ComfyWorkflowSource.objects.get(source_path=path)
+        self.assertEqual(source.generation_task_id, task.pk)
+        self.assertTrue(source.conversion_report["linked_task"])
+        self.assertNotIn("linked_generated_workflow", source.conversion_report)
+        self.assertIsNone(source.workflow_version_id)
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), version_count)
+        detail = self.client.get(f"/api/v1/comfy-workflow-sources/{source.pk}/")
+        self.assertEqual(detail.status_code, 200, detail.data)
+        self.assertEqual(str(detail.data["generation_task"]), str(task.pk))
+        self.assertNotIn("generated_workflow", detail.data)
+
     def test_saved_workflow_batch_limit_follows_current_security_boundary(self):
         lowered = create_config_revision(
             scope_type="system",
@@ -2646,7 +2909,7 @@ class ComfySavedWorkflowImportApiTests(TestCase):
                     0.04,
                 )
 
-    def test_seedvr_chain_materializes_safe_smoke_but_freezes_source_production_defaults(self):
+    def test_seedvr_chain_uses_explicit_test_values_and_keeps_source_defaults(self):
         canvas = {
             "id": "33333333-3333-4333-8333-333333333333",
             "revision": 0,
@@ -2771,38 +3034,33 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         version = WorkflowTemplateVersion.objects.get(
             pk=imported.data["items"][0]["workflow_version_id"],
         )
-        fixture = normalize_workflow_smoke_fixture(version, {
-            "schema_version": 2, "values": {}, "assets": [],
-        })
-        smoke = _materialize_smoke_graph(
-            version,
-            fixture_values=fixture.values,
-            fixture_asset_facts=fixture.asset_facts,
+        fixture = normalize_workflow_execution_inputs(version, {
+            "schema_version": 2, "values": {
+                "image.width": 464, "image.height": 768,
+                "parameter.image.scale_megapixels": 0.25,
+                "parameter.seedvr2.resolution": 1024, "parameter.seedvr2.max_resolution": 1024,
+            }, "assets": [],
+        }, owner=self.admin)
+        smoke = compile_frozen_workflow_values(
+            workflow_snapshot=workflow_version_execution_snapshot(version),
+            # This import fixture has a SaveImage node without a prefix widget.
+            # Pure compilation must not invent an unbound server input.
+            scalar_values={**fixture.values, "generation.batch_size": 1},
+            resolve_asset=lambda *_: self.fail("This graph declares no source media"),
+            classified_groups=None, classified_bindings=[], output_kind="image", total_duration_ms=None,
         ).graph
         self.assertEqual((smoke["1"]["inputs"]["width"], smoke["1"]["inputs"]["height"]), (464, 768))
         self.assertEqual(smoke["2"]["inputs"]["megapixels"], 0.25)
         self.assertEqual(smoke["3"]["inputs"]["resolution"], 1024)
         self.assertEqual(smoke["3"]["inputs"]["max_resolution"], 1024)
 
-        prompt = SimpleNamespace(
-            id=version.id,
-            prompt_text="production prompt",
-            negative_prompt="",
-            total_duration_ms=1000,
-            include_audio=False,
-            prompt_type="image",
-            structured_payload={},
-            project=SimpleNamespace(owner_id=None),
-        )
-        project = SimpleNamespace(
-            id=version.id, owner_id=None, width=768, height=1280,
-            fps=24, continuity_seed=1, aspect_ratio="3:5",
-        )
-        production = compile_frozen_workflow(
+        production = compile_frozen_workflow_values(
             workflow_snapshot=workflow_version_execution_snapshot(version),
-            prompt=prompt,
-            project=project,
-            overrides={},
+            scalar_values={**fixture.values, "image.width": 768, "image.height": 1280,
+                "generation.batch_size": 1, "parameter.image.scale_megapixels": 1.0,
+                "parameter.seedvr2.resolution": 2048, "parameter.seedvr2.max_resolution": 2048},
+            resolve_asset=lambda *_: self.fail("No source media"),
+            classified_groups=None, classified_bindings=[], output_kind="image", total_duration_ms=None,
         ).graph
         self.assertEqual(production["2"]["inputs"]["megapixels"], 1.0)
         self.assertEqual(production["3"]["inputs"]["resolution"], 2048)
@@ -2853,18 +3111,21 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         )
         self.assertNotIn("smoke_inputs", version.input_contract)
         self.assertNotIn("smoke_asset_bindings", version.input_contract)
-        fixture = normalize_workflow_smoke_fixture(version, {
+        fixture = normalize_workflow_execution_inputs(version, {
             "schema_version": 2,
             "values": {"image.width": 512, "image.height": 512},
             "assets": [{
                 "semantic_key": "asset.image.source",
                 "asset_id": str(self.smoke_asset.id),
             }],
-        })
-        compiled = _materialize_smoke_graph(
-            version,
-            fixture_values=fixture.values,
-            fixture_asset_facts=fixture.asset_facts,
+        }, owner=self.admin)
+        source = fixture.asset_facts[0]
+        compiled = compile_frozen_workflow_values(
+            workflow_snapshot=workflow_version_execution_snapshot(version),
+            scalar_values={**fixture.values, "output.prefix": "test/explicit-source-inputs"},
+            resolve_asset=lambda key, _rule: (f"__AUTOPROMPT_ASSET__:{source['asset_id']}", source)
+                if key == source["semantic_key"] else self.fail("Undeclared media input"),
+            classified_groups=None, classified_bindings=[], output_kind="image", total_duration_ms=None,
         )
         self.assertEqual(compiled.graph["2"]["inputs"]["width"], 512)
         self.assertEqual(compiled.graph["2"]["inputs"]["height"], 512)
@@ -2942,9 +3203,15 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         video_deployment = self._second_same_scope_deployment(
             key="browser-safe-video",
             modality=ModelProfileVersion.Modality.VIDEO,
+            capabilities=("video.image_to_video",),
         )
         for label, canvas, object_info, output_kind, source_path in cases:
             with self.subTest(label=label):
+                if output_kind == "video":
+                    current = WorkflowProjectorVersion.objects.get(projector__key="generic.comfy.fixed", is_current=True)
+                    definition = deepcopy(current.definition)
+                    definition["projection"]["config"]["capability"] = "video.image_to_video"
+                    self._publish_projector_successor(current, definition)
                 target_profile = (
                     self.profile
                     if output_kind == "image"
@@ -3492,18 +3759,21 @@ class ComfySavedWorkflowImportApiTests(TestCase):
             },
             {("image.width", "2", "width"), ("image.height", "2", "height")},
         )
-        fixture = normalize_workflow_smoke_fixture(version, {
+        fixture = normalize_workflow_execution_inputs(version, {
             "schema_version": 2,
             "values": {},
             "assets": [{
                 "semantic_key": "asset.image.source",
                 "asset_id": str(self.smoke_asset.id),
             }],
-        })
-        compiled = _materialize_smoke_graph(
-            version,
-            fixture_values=fixture.values,
-            fixture_asset_facts=fixture.asset_facts,
+        }, owner=self.admin)
+        source = fixture.asset_facts[0]
+        compiled = compile_frozen_workflow_values(
+            workflow_snapshot=workflow_version_execution_snapshot(version),
+            scalar_values={**fixture.values, "output.prefix": "test/explicit-source-dimensions"},
+            resolve_asset=lambda key, _rule: (f"__AUTOPROMPT_ASSET__:{source['asset_id']}", source)
+                if key == source["semantic_key"] else self.fail("Undeclared media input"),
+            classified_groups=None, classified_bindings=[], output_kind="image", total_duration_ms=None,
         )
         self.assertEqual(
             compiled.graph["1"]["inputs"]["image"],
@@ -5198,6 +5468,88 @@ class ComfySavedWorkflowImportApiTests(TestCase):
             self.initial_workflow_version_count,
         )
 
+    def test_explicit_successor_preserves_published_version_and_replays_receipt(self):
+        payload = self._batch_payload()
+        url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/batch-import/"
+        first = self.client.post(url, payload, format="json")
+        original_id = first.data["items"][0]["workflow_version_id"]
+        WorkflowTemplateVersion.objects.filter(pk=original_id).update(status="published")
+        original = WorkflowTemplateVersion.objects.get(pk=original_id)
+        original_source = ComfyWorkflowSource.objects.get(pk=first.data["items"][0]["source_id"])
+        original_report = deepcopy(original_source.conversion_report)
+        payload["items"][0]["successor_of"] = original_id
+        before = WorkflowTemplateVersion.objects.count()
+        created = self.client.post(url, payload, format="json")
+        self.assertEqual(created.data["status"], "complete", created.data)
+        successor_id = created.data["items"][0]["workflow_version_id"]
+        self.assertNotEqual(successor_id, original_id)
+        successor = WorkflowTemplateVersion.objects.get(pk=successor_id)
+        self.assertEqual(successor.version, original.version + 1)
+        self.assertEqual(successor.status, "draft")
+        self.assertEqual(successor.validation_state, "not_run")
+        self.assertEqual(successor.smoke_test_state, "not_run")
+        self.assertEqual(successor.validation_evidence, {})
+        self.assertEqual(successor.smoke_test_evidence, {})
+        self.assertIsNone(successor.validated_deployment_id)
+        self.assertEqual(successor.graph_sha256, original.graph_sha256)
+        original.refresh_from_db()
+        self.assertEqual(original.status, "published")
+        original_source.refresh_from_db()
+        self.assertEqual(original_source.workflow_version_id, original.pk)
+        self.assertEqual(original_source.conversion_report, original_report)
+        repeated = self.client.post(url, payload, format="json")
+        self.assertEqual(repeated.data["items"][0]["result"], "reused")
+        self.assertEqual(repeated.data["items"][0]["workflow_version_id"], successor_id)
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), before + 1)
+
+    def test_successor_requires_original_template_and_exact_source_provenance(self):
+        payload = self._batch_payload()
+        url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/batch-import/"
+        first = self.client.post(url, payload, format="json")
+        original_id = first.data["items"][0]["workflow_version_id"]
+        unrelated = WorkflowTemplateVersion.objects.exclude(pk=original_id).first()
+        self.assertIsNotNone(unrelated)
+        payload["items"][0]["successor_of"] = str(unrelated.pk)
+        before = WorkflowTemplateVersion.objects.count()
+        response = self.client.post(url, payload, format="json")
+        self.assertEqual(response.data["status"], "failed", response.data)
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), before)
+
+    def test_successor_cannot_fork_old_predecessor_with_another_contract(self):
+        payload = self._batch_payload()
+        url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/batch-import/"
+        first = self.client.post(url, payload, format="json")
+        original_id = first.data["items"][0]["workflow_version_id"]
+        payload["items"][0]["successor_of"] = original_id
+        successor = self.client.post(url, payload, format="json")
+        self.assertEqual(successor.data["status"], "complete", successor.data)
+        object_info = self._object_info()
+        object_info["SaveImage"]["description"] = "Updated node catalog"
+        changed = self._batch_payload(object_info=object_info)
+        self.assertNotEqual(changed["items"][0]["contract_draft"], payload["items"][0]["contract_draft"])
+        changed["items"][0]["successor_of"] = original_id
+        before = WorkflowTemplateVersion.objects.count()
+        response = self.client.post(url, changed, format="json")
+        self.assertEqual(response.data["status"], "failed", response.data)
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), before)
+        repeated = self.client.post(url, payload, format="json")
+        self.assertEqual(repeated.data["items"][0]["workflow_version_id"], successor.data["items"][0]["workflow_version_id"])
+
+    def test_successor_rejects_different_source_path_without_writes(self):
+        payload = self._batch_payload("saved/a.json")
+        url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/batch-import/"
+        original = self.client.post(url, payload, format="json")
+        other = self._batch_payload("saved/b.json")
+        other["items"][0]["successor_of"] = original.data["items"][0]["workflow_version_id"]
+        versions_before = WorkflowTemplateVersion.objects.count()
+        sources_before = ComfyWorkflowSource.objects.count()
+        rejected = self.client.post(url, other, format="json")
+        self.assertEqual(rejected.data["status"], "failed", rejected.data)
+        self.assertEqual(rejected.data["items"][0]["code"], "workflow_successor_conflict")
+        self.assertIn("来源范围", rejected.data["items"][0]["detail"])
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), versions_before)
+        self.assertEqual(ComfyWorkflowSource.objects.count(), sources_before)
+
     def test_same_bytes_at_second_path_preserve_provenance_and_reuse_canonical_version(self):
         driver = self._driver(paths=["saved/a.json", "saved/b.json"])
         url = f"/api/v1/model-deployments/{self.deployment.id}/saved-workflows/batch-import/"
@@ -5330,7 +5682,7 @@ class ComfySavedWorkflowImportApiTests(TestCase):
             WorkflowTemplateVersion.objects.count(), self.initial_workflow_version_count,
         )
 
-    def test_bound_text_prompt_is_neutralized_before_persistence(self):
+    def test_unsupported_text_import_keeps_prompt_neutralized_and_blocks_promotion(self):
         text_template = WorkflowTemplate.objects.create(
             owner=None,
             slug="saved-text-import",
@@ -5404,6 +5756,7 @@ class ComfySavedWorkflowImportApiTests(TestCase):
         text_deployment = self._second_same_scope_deployment(
             key="bound-text-prompt",
             modality=ModelProfileVersion.Modality.TEXT,
+            capabilities=(),
         )
 
         with patch("studio.services.comfyui_workflow_imports.driver_for", return_value=driver):
@@ -5416,6 +5769,7 @@ class ComfySavedWorkflowImportApiTests(TestCase):
                     "model_profile_version": str(text_deployment.profile_version_id),
                 },
             )
+            self.assertEqual(preview.status_code, 200, preview.data)
             payload = {"items": [{
                 "source_path": "saved/example.json",
                 "expected_sha256": self.raw_sha,
@@ -5456,12 +5810,13 @@ class ComfySavedWorkflowImportApiTests(TestCase):
                 "is_required": True,
             }],
         )
-        self.assertEqual(response.data["status"], "complete", response.data)
-        version = WorkflowTemplateVersion.objects.get(
-            pk=response.data["items"][0]["workflow_version_id"],
-        )
-        self.assertNotIn("TOP SECRET PLOT", str(version.graph))
-        self.assertEqual(version.graph["1"]["inputs"]["prompt"], "managed prompt")
+        self.assertEqual(response.data["status"], "failed", response.data)
+        self.assertEqual(response.data["items"][0]["code"], "workflow_contract_blocked")
+        self.assertEqual(WorkflowTemplateVersion.objects.count(), self.initial_workflow_version_count)
+        self.assertIn("workflow_projector_capability_mismatch", {row["code"] for row in preview.data["blockers"]})
+        draft = ComfyWorkflowContractDraft.objects.get(pk=preview.data["contract_draft_id"])
+        self.assertNotIn("TOP SECRET PLOT", str(draft.projection))
+        self.assertEqual(draft.projection["executable_graph"], {}, "Blocked candidates must not persist an executable graph")
 
     def test_promotion_uses_frozen_contract_draft_when_object_info_changes(self):
         object_info_a = self._object_info()
@@ -5763,8 +6118,8 @@ class ComfySavedWorkflowImportApiTests(TestCase):
             pk=imported.data["items"][0]["workflow_version_id"],
         )
         unet = next(node for node in version.graph.values() if node["class_type"] == "UNETLoader")
-        self.assertEqual(unet["inputs"]["unet_name"], artifact.filename)
-        self.assertNotIn("\\", unet["inputs"]["unet_name"])
+        self.assertEqual(unet["inputs"]["unet_name"], "nested\\qwen.safetensors")
+        self.assertEqual(version.model_requirements.get().expected_filename, artifact.filename)
 
     def test_discovery_rejects_fresh_artifact_with_wrong_inventory_selector(self):
         snapshot = HostCapabilitySnapshot(

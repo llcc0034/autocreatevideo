@@ -7,7 +7,7 @@ from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.core.validators import MaxValueValidator, MinValueValidator, RegexValidator
 from django.db import models
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 
@@ -242,23 +242,28 @@ class PlatformLifecycleAuditEvent(UUIDTimeStampedModel):
     """Append-only, non-sensitive facts for platform registry mutations."""
 
     SAFE_SUMMARY_FIELDS = frozenset({
+        "preparation_id", "parent_preparation_id", "field_batch_key", "attempt_number",
+        "duplicate_billing_risk_acknowledged",
+        "task_id", "attempt_id", "error_code", "error_message_sha256", "task_error_sha256",
+        "finished_at", "receipt_sha256", "request_sha256", "new_model_call",
+        "allow_external_calls", "cost_currency",
         "activated_at", "activation_state", "based_on_revision_id",
         "credential_bound", "definition_sha256", "domain", "driver_type",
-        "category", "channel", "contract_sha256", "field_definition_id",
+        "category", "channel", "contract_sha256", "field_definition_id", "field_definition_version_id",
         "graph_sha256", "initial_value_sha256", "input_contract_sha256",
         "is_active", "is_current", "is_default", "is_required", "is_secret",
         "is_system", "key", "locator_sha256", "modality", "model_profile_version_id",
         "profile_key", "profile_version_id", "project_id", "provider_id",
         "configuration_class",
         "prompt_profile_version_id", "review_state", "source_selector",
-        "published_at", "recipe_key", "restart_required", "revision", "run_id",
+        "published_at", "recipe_key", "restart_required", "retirement_reason", "revision", "run_id",
         "role", "runtime_config_sha256", "runtime_host_id", "scope_type", "sha256",
-        "size_bytes",
+        "size_bytes", "sort_order",
         "smoke_test_evidence_sha256", "smoke_test_state", "specification_sha256",
         "status", "template_id", "validated_deployment_id", "validation_evidence_sha256",
         "validation_state", "value_schema_sha256", "value_type", "values_sha256", "verified_at",
         "verified_snapshot_id", "version", "position", "model_family", "mode",
-        "operation", "output_kind", "priority", "engine_key", "engine_version", "projector_id",
+        "operation", "output_kind", "priority", "engine_key", "engine_version", "projector_id", "parser_key",
     })
 
     actor = models.ForeignKey(
@@ -328,24 +333,26 @@ class PlatformLifecycleAuditEvent(UUIDTimeStampedModel):
         raise ValidationError("PlatformLifecycleAuditEvent 是不可变审计事实")
 
 
+class StyleCategory(UUIDTimeStampedModel):
+    key = models.SlugField(max_length=80, unique=True)
+    name = models.CharField(max_length=120, unique=True)
+    description = models.CharField(max_length=500, blank=True)
+    sort_order = models.PositiveIntegerField(default=0)
+    is_active = models.BooleanField(default=True)
+
+    class Meta:
+        ordering = ("sort_order", "name", "pk")
+
+    def __str__(self) -> str:
+        return self.name
+
+
 class Style(UUIDTimeStampedModel):
-    class Category(models.TextChoices):
-        WUXIA = "wuxia", "武侠"
-        XUANHUAN = "xuanhuan", "玄幻"
-        ANIME = "anime", "动漫"
-        THRILLER = "thriller", "惊悚"
-        DETECTIVE = "detective", "侦探"
-        DRAMA = "drama", "剧情"
-        SCIFI = "sci_fi", "科幻"
-        ROMANCE = "romance", "爱情"
-        COMEDY = "comedy", "喜剧"
-        HISTORICAL = "historical", "历史"
-        OTHER = "other", "其他"
 
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="styles")
     slug = models.SlugField(max_length=80)
     name = models.CharField(max_length=120)
-    category = models.CharField(max_length=32, choices=Category.choices, default=Category.OTHER)
+    category = models.ForeignKey(StyleCategory, to_field="key", db_column="category", null=True, blank=True, on_delete=models.PROTECT, related_name="styles")
     description = models.TextField(blank=True)
     visual_prompt = models.TextField(blank=True)
     negative_prompt = models.TextField(blank=True)
@@ -379,7 +386,7 @@ class Asset(UUIDTimeStampedModel):
         OUTPUT_VIDEO = "output_video", "生成视频"
 
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.CASCADE, related_name="assets")
-    style = models.ForeignKey(Style, null=True, blank=True, on_delete=models.SET_NULL, related_name="assets")
+    style = models.ForeignKey(Style, null=True, blank=True, on_delete=models.PROTECT, related_name="assets")
     kind = models.CharField(max_length=32, choices=Kind.choices)
     name = models.CharField(max_length=160)
     description = models.TextField(blank=True)
@@ -405,6 +412,103 @@ class Asset(UUIDTimeStampedModel):
         return self.name
 
 
+class AssetReferenceSeries(UUIDTimeStampedModel):
+    """One primary or named variant; its versions still point to ordinary Assets."""
+
+    class Role(models.TextChoices):
+        PRIMARY = "primary", "主图"
+        VARIANT = "variant", "变体"
+
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="asset_reference_series")
+    name = models.CharField(max_length=160)
+    role = models.CharField(max_length=8, choices=Role.choices)
+    primary_series = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="variants")
+    bible_variant = models.ForeignKey("BibleVariant", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="asset_reference_series")
+
+    class Meta:
+        ordering = ("name", "id")
+        indexes = [models.Index(fields=("owner", "role", "name"), name="idx_asset_series_owner_role")]
+        constraints = [
+            models.CheckConstraint(condition=(Q(role="primary", primary_series__isnull=True)
+                | Q(role="variant", primary_series__isnull=False)), name="ck_asset_series_role_parent"),
+            models.CheckConstraint(condition=~Q(primary_series=F("id")), name="ck_asset_series_not_self"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.primary_series_id:
+            primary = self.primary_series
+            if primary.role != self.Role.PRIMARY or primary.primary_series_id is not None:
+                raise ValidationError({"primary_series": "变体只能关联主图系列，不支持多级变体"})
+            if primary.owner_id != self.owner_id:
+                raise ValidationError({"primary_series": "主图与变体必须属于同一素材所有者"})
+        if self.bible_variant_id:
+            setting = self.bible_variant
+            if setting.appearance_role != self.role or setting.project.owner_id != self.owner_id:
+                raise ValidationError({"bible_variant": "设定角色或所属项目与素材系列不一致"})
+
+
+class AssetReferenceVersion(UUIDTimeStampedModel):
+    """A relation, not a second file, candidate, execution, or setting snapshot."""
+
+    class Source(models.TextChoices):
+        UPLOAD = "upload", "上传素材"
+        EXISTING = "existing", "已有素材"
+        GENERATED = "generated", "模型生成"
+
+    series = models.ForeignKey(AssetReferenceSeries, on_delete=models.CASCADE, related_name="versions")
+    version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    asset = models.ForeignKey(Asset, on_delete=models.PROTECT, related_name="reference_versions")
+    source = models.CharField(max_length=16, choices=Source.choices)
+    origin_history_cleared = models.BooleanField(default=False, editable=False,
+        help_text="生成来源历史已显式清理；保留素材和主图/变体关系，不伪造上传来源。")
+    generated_artifact = models.ForeignKey("GeneratedArtifact", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="reference_versions")
+    generation_job = models.ForeignKey("AssetGenerationJob", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="reference_versions")
+    generated_from = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="generated_variants")
+    setting_revision = models.ForeignKey("BibleVariantRevision", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="asset_reference_versions")
+
+    class Meta:
+        ordering = ("series_id", "-version", "id")
+        constraints = [
+            models.UniqueConstraint(fields=("series", "version"), name="uk_asset_series_version"),
+            models.CheckConstraint(condition=Q(version__gte=1), name="ck_asset_ref_version_positive"),
+            models.CheckConstraint(condition=(
+                Q(source="generated", origin_history_cleared=False, generated_artifact__isnull=False, generation_job__isnull=True)
+                | Q(source="generated", origin_history_cleared=False, generated_artifact__isnull=True, generation_job__isnull=False)
+                | Q(source="generated", origin_history_cleared=True, generated_artifact__isnull=True, generation_job__isnull=True)
+                | Q(source__in=("upload", "existing"), generated_artifact__isnull=True,
+                    generation_job__isnull=True, generated_from__isnull=True, origin_history_cleared=False)),
+                name="ck_asset_ref_source_origin"),
+            models.CheckConstraint(condition=~Q(generated_from=F("id")), name="ck_asset_ref_basis_not_self"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if not self.series_id or not self.asset_id:
+            return  # Field validation reports missing required relations.
+        if self.asset.owner_id is not None and self.asset.owner_id != self.series.owner_id:
+            raise ValidationError({"asset": "不能关联其他用户的素材"})
+        if self.setting_revision_id and self.setting_revision.variant_id != self.series.bible_variant_id:
+            raise ValidationError({"setting_revision": "设定修订不属于本系列明确关联的设定"})
+        if self.source == self.Source.GENERATED:
+            if self.generated_artifact_id and self.generated_artifact.asset_id != self.asset_id:
+                raise ValidationError({"generated_artifact": "生成产物不指向所选Asset"})
+            if self.generation_job_id and self.generation_job.output_asset_id != self.asset_id:
+                raise ValidationError({"generation_job": "素材任务输出不指向所选Asset"})
+            if self.series.role == AssetReferenceSeries.Role.VARIANT:
+                if not self.generated_from_id:
+                    raise ValidationError({"generated_from": "生成变体须记录确切主图素材版本"})
+                if self.generated_from.series_id != self.series.primary_series_id:
+                    raise ValidationError({"generated_from": "生成依据不属于本变体的主图系列"})
+            elif self.generated_from_id:
+                raise ValidationError({"generated_from": "主图版本不能记录变体生成依据"})
+
+
 class SeriesProject(UUIDTimeStampedModel):
     class Status(models.TextChoices):
         DRAFT = "draft", "草稿"
@@ -418,7 +522,7 @@ class SeriesProject(UUIDTimeStampedModel):
     logline = models.TextField(blank=True)
     master_script = models.TextField(blank=True)
     status = models.CharField(max_length=20, choices=Status.choices, default=Status.DRAFT)
-    style = models.ForeignKey(Style, null=True, blank=True, on_delete=models.SET_NULL, related_name="projects")
+    style = models.ForeignKey(Style, null=True, blank=True, on_delete=models.PROTECT, related_name="projects")
     cover_asset = models.ForeignKey(
         Asset,
         null=True,
@@ -454,10 +558,12 @@ class BibleBase(UUIDTimeStampedModel):
     slug = models.SlugField(max_length=80)
     name = models.CharField(max_length=160)
     description = models.TextField(blank=True)
-    visual_identity = models.TextField(blank=True)
     negative_constraints = models.TextField(blank=True)
     anchor_asset = models.ForeignKey(Asset, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     reference_assets = models.ManyToManyField(Asset, blank=True, related_name="+")
+    # Exact receipt for the current image bindings, not another Asset/version ledger.
+    image_binding_review = models.ForeignKey("StageRun", null=True, blank=True,
+        on_delete=models.RESTRICT, related_name="+")
     metadata = models.JSONField(default=dict, blank=True)
     is_locked = models.BooleanField(default=True)
 
@@ -515,6 +621,220 @@ class PropBible(BibleBase):
 
     def __str__(self) -> str:
         return self.name
+
+
+class BibleEntityIdentity(UUIDTimeStampedModel):
+    """Project-scoped declaration key; creative content stays on the Bible entity."""
+
+    project = models.ForeignKey(SeriesProject, on_delete=models.CASCADE, related_name="bible_entity_identities")
+    entity_key = models.CharField(max_length=64)
+    character = models.OneToOneField(CharacterBible, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="declaration_identity")
+    scene = models.OneToOneField(SceneBible, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="declaration_identity")
+    prop = models.OneToOneField(PropBible, null=True, blank=True, on_delete=models.CASCADE,
+        related_name="declaration_identity")
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("project", "entity_key"), name="uk_bible_project_entity_key"),
+            models.CheckConstraint(condition=~Q(entity_key=""), name="ck_bible_entity_key_nonempty"),
+            models.CheckConstraint(condition=(
+                Q(character__isnull=False, scene__isnull=True, prop__isnull=True)
+                | Q(character__isnull=True, scene__isnull=False, prop__isnull=True)
+                | Q(character__isnull=True, scene__isnull=True, prop__isnull=False)
+            ), name="ck_bible_identity_one_entity"),
+        ]
+
+    def clean(self):
+        super().clean()
+        for kind in ("character", "scene", "prop"):
+            if not getattr(self, f"{kind}_id"):
+                continue
+            try:
+                entity = getattr(self, kind)
+            except (CharacterBible.DoesNotExist, SceneBible.DoesNotExist, PropBible.DoesNotExist) as exc:
+                raise ValidationError({kind: "关联的Bible实体不存在"}) from exc
+            if entity.project_id != self.project_id:
+                raise ValidationError({kind: "声明key只能关联本项目的Bible实体"})
+        if not self._state.adding:
+            fields = ("project_id", "entity_key", "character_id", "scene_id", "prop_id")
+            previous = type(self).objects.filter(pk=self.pk).values(*fields).first()
+            if previous and any(previous[field] != getattr(self, field) for field in fields):
+                raise ValidationError("稳定声明key与实体的关联不能改写；名称和设定应在原实体中编辑")
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+
+class ScriptBibleEntityBinding(UUIDTimeStampedModel):
+    """One exact script declaration's receipt, not the project entity identity."""
+
+    script_revision = models.ForeignKey("ScriptRevision", on_delete=models.PROTECT, related_name="bible_bindings")
+    entity_key = models.CharField(max_length=64)
+    declaration_sha256 = models.CharField(max_length=64)
+    character = models.ForeignKey(CharacterBible, null=True, blank=True, on_delete=models.PROTECT, related_name="script_bindings")
+    scene = models.ForeignKey(SceneBible, null=True, blank=True, on_delete=models.PROTECT, related_name="script_bindings")
+    prop = models.ForeignKey(PropBible, null=True, blank=True, on_delete=models.PROTECT, related_name="script_bindings")
+    objects = AppendOnlyAuditEventManager()
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=("script_revision", "entity_key"), name="uk_script_bible_entity"),
+            *[models.UniqueConstraint(fields=("script_revision", kind),
+                name=f"uk_script_bible_{kind}") for kind in ("character", "scene", "prop")],
+            models.CheckConstraint(condition=(
+                Q(character__isnull=False, scene__isnull=True, prop__isnull=True)
+                | Q(character__isnull=True, scene__isnull=False, prop__isnull=True)
+                | Q(character__isnull=True, scene__isnull=True, prop__isnull=False)
+            ), name="ck_script_bible_one_entity"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("剧本声明来源绑定不可覆盖")
+        kwargs["force_insert"] = True
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("剧本声明来源绑定不可删除")
+
+
+class ScriptBibleAppearanceBinding(UUIDTimeStampedModel):
+    """Exact setting used for a source declaration; no duplicate creative body."""
+
+    source_binding = models.ForeignKey(ScriptBibleEntityBinding, on_delete=models.PROTECT, related_name="setting_bindings")
+    variant_key = models.CharField(max_length=64, blank=True)
+    declaration_sha256 = models.CharField(max_length=64)
+    setting = models.ForeignKey("BibleVariantRevision", on_delete=models.PROTECT, related_name="script_uses")
+    setting_sha256 = models.CharField(max_length=64)
+    objects = AppendOnlyAuditEventManager()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("source_binding", "variant_key"), name="uk_script_appearance_setting")]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("声明引用的确切设定修订不可覆盖")
+        kwargs["force_insert"] = True
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("声明设定引用不可删除")
+
+
+class BibleVariant(UUIDTimeStampedModel):
+    """A named appearance/state, never a generated candidate number."""
+
+    project = models.ForeignKey(SeriesProject, on_delete=models.PROTECT, related_name="bible_variants")
+    character = models.ForeignKey(CharacterBible, null=True, blank=True, on_delete=models.PROTECT, related_name="variants")
+    scene = models.ForeignKey(SceneBible, null=True, blank=True, on_delete=models.PROTECT, related_name="variants")
+    prop = models.ForeignKey(PropBible, null=True, blank=True, on_delete=models.PROTECT, related_name="variants")
+    appearance_role = models.CharField(max_length=8, choices=(("primary", "主图"), ("variant", "变体")), default="variant")
+    source_binding = models.ForeignKey(ScriptBibleEntityBinding, null=True, blank=True, on_delete=models.PROTECT, related_name="appearances")
+    source_variant_key = models.CharField(max_length=64, blank=True)
+    name = models.CharField(max_length=160)
+    reference_name = models.CharField(max_length=160)
+    reference_key = models.CharField(max_length=191)
+    revision = models.PositiveIntegerField(default=1)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="created_bible_variants")
+
+    class Meta:
+        ordering = ("created_at", "id")
+        constraints = [
+            models.CheckConstraint(condition=(
+                Q(character__isnull=False, scene__isnull=True, prop__isnull=True)
+                | Q(character__isnull=True, scene__isnull=False, prop__isnull=True)
+                | Q(character__isnull=True, scene__isnull=True, prop__isnull=False)
+            ), name="ck_bible_variant_one_entity"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_bible_variant_revision"),
+            models.UniqueConstraint(fields=("project", "reference_key"), name="uk_bible_variant_reference"),
+            models.CheckConstraint(condition=Q(appearance_role__in=("primary", "variant")), name="ck_bible_appearance_role"),
+            models.CheckConstraint(condition=(Q(source_binding__isnull=True, source_variant_key="")
+                | Q(source_binding__isnull=False, appearance_role="primary", source_variant_key="")
+                | (Q(source_binding__isnull=False, appearance_role="variant") & ~Q(source_variant_key=""))),
+                name="ck_bible_appearance_source"),
+            *[models.UniqueConstraint(fields=(kind, "source_variant_key"), condition=Q(source_binding__isnull=False),
+                name=f"uk_{kind}_declared_look") for kind in ("character", "scene", "prop")],
+            *[models.UniqueConstraint(fields=(kind,), condition=Q(appearance_role="primary"),
+                name=f"uk_bible_primary_{kind}") for kind in ("character", "scene", "prop")],
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            fields = ("project_id", "character_id", "scene_id", "prop_id", "appearance_role",
+                "source_binding_id", "source_variant_key", "created_by_id")
+            original = type(self).objects.filter(pk=self.pk).values(*fields).get()
+            if any(original[key] != getattr(self, key) for key in fields):
+                raise ValidationError("设定归属、主图/变体角色与声明来源不可改写")
+        return super().save(*args, **kwargs)
+
+    def clean(self):
+        super().clean()
+        entities = [getattr(self, key) for key in ("character", "scene", "prop") if getattr(self, f"{key}_id")]
+        if len(entities) != 1 or entities[0].project_id != self.project_id:
+            raise ValidationError("变体必须属于同一项目的一个 Bible 对象")
+
+
+class BibleVariantRevision(UUIDTimeStampedModel):
+    """Complete image-generation intent. Old revisions are never rewritten."""
+
+    variant = models.ForeignKey(BibleVariant, on_delete=models.PROTECT, related_name="revisions")
+    revision = models.PositiveIntegerField()
+    name = models.CharField(max_length=160)
+    reference_name = models.CharField(max_length=160)
+    identity_anchor = models.TextField(blank=True)
+    appearance_anchor = models.TextField()
+    basis_asset = models.ForeignKey(Asset, null=True, blank=True, on_delete=models.PROTECT, related_name="bible_variant_bases")
+    basis_asset_sha256 = models.CharField(max_length=64, blank=True)
+    payload_schema_version = models.PositiveSmallIntegerField(default=2)
+    source_declaration_sha256 = models.CharField(max_length=64, blank=True)
+    primary_setting_revision = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="derived_settings")
+    content_sha256 = models.CharField(max_length=64)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="bible_variant_revisions")
+    objects = AppendOnlyAuditEventManager()
+
+    class Meta:
+        ordering = ("-revision",)
+        constraints = [
+            models.UniqueConstraint(fields=("variant", "revision"), name="uk_bible_variant_revision"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_bible_variant_rev_positive"),
+            models.CheckConstraint(condition=(Q(basis_asset__isnull=True, basis_asset_sha256="")
+                | (Q(basis_asset__isnull=False) & ~Q(basis_asset_sha256=""))), name="ck_bible_variant_basis_sha"),
+            models.CheckConstraint(condition=Q(payload_schema_version__in=(1, 2)), name="ck_bible_setting_schema"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("变体设定修订不可覆盖；请另存新修订")
+        kwargs["force_insert"] = True
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("变体设定修订是不可删除的来源事实")
+
+
+class BibleVariantReview(UUIDTimeStampedModel):
+    """Human review of one exact setting revision, not adoption of an image."""
+
+    setting = models.OneToOneField(BibleVariantRevision, on_delete=models.PROTECT, related_name="review")
+    decision = models.CharField(max_length=8, choices=(("approve", "确认设定"), ("reject", "拒绝设定")))
+    comment = models.CharField(max_length=1000, blank=True)
+    decided_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="bible_variant_reviews")
+    objects = AppendOnlyAuditEventManager()
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=Q(decision__in=("approve", "reject")), name="ck_bible_variant_review")]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("变体设定审核不可覆盖")
+        kwargs["force_insert"] = True
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("变体设定审核是不可删除的人工决定")
 
 
 class ConsistencyLock(UUIDTimeStampedModel):
@@ -580,22 +900,14 @@ class Shot(UUIDTimeStampedModel):
     episode = models.ForeignKey(Episode, on_delete=models.CASCADE, related_name="shots")
     number = models.PositiveIntegerField()
     title = models.CharField(max_length=200, blank=True)
-    narrative = models.TextField()
-    # A review-gated, single-shot H3 director description.  This is kept
-    # separate from the compact storyboard narrative so an operator can opt
-    # into dense prompt prose without turning the timeline editor into a long
-    # free-form field.  Its source language is resolved through the normal
-    # PromptFieldTranslation overlay just like the other prompt-impacting
-    # Shot fields.
-    detailed_description = models.TextField(blank=True)
-    camera = models.TextField(blank=True)
-    action = models.TextField(blank=True)
     dialogue = models.JSONField(default=list, blank=True, help_text='[{"speaker_id":"S1","text":"..."}]')
-    sound_effects = models.TextField(blank=True)
-    music = models.TextField(blank=True)
     duration_ms = models.PositiveIntegerField(
         validators=[MinValueValidator(1)],
     )
+    episode_start_ms = models.PositiveIntegerField(null=True, blank=True,
+        help_text="镜头在本集中的明确开始时间（毫秒）；与结束时间成对填写，不是源视频截取时间")
+    episode_end_ms = models.PositiveIntegerField(null=True, blank=True,
+        help_text="镜头在本集中的明确结束时间（毫秒）；两者都为空表示只按时长顺序排列")
     media_type = models.CharField(max_length=12, choices=MediaType.choices)
     conditioning_mode = models.CharField(
         max_length=64,
@@ -605,84 +917,202 @@ class Shot(UUIDTimeStampedModel):
     )
     include_audio = models.BooleanField()
     scene = models.ForeignKey(SceneBible, null=True, blank=True, on_delete=models.SET_NULL, related_name="shots")
-    characters = models.ManyToManyField(CharacterBible, blank=True, related_name="shots")
     props = models.ManyToManyField(PropBible, blank=True, related_name="shots")
-    reference_assets = models.ManyToManyField(Asset, blank=True, related_name="shots")
-    # Explicit semantic bindings consumed by H3 image-conditioned workflows.
-    # ``reference_assets`` remains the selectable asset pool only; it must not
-    # be used to infer first/last/character/scene/prop meaning.
-    reference_bindings = models.JSONField(default=dict, blank=True)
     # These flags express a continuity requirement only. They never imply
-    # that a concrete first/last-frame Asset has already been generated or
-    # bound in ``reference_bindings``.
+    # that a concrete first/last-frame Asset has been selected for a call.
     requires_first_frame_continuity = models.BooleanField(default=False)
     requires_last_frame_continuity = models.BooleanField(default=False)
-    continuity_notes = models.TextField(blank=True)
     metadata = models.JSONField(default=dict, blank=True)
 
     class Meta:
         ordering = ("episode", "number")
-        constraints = [models.UniqueConstraint(fields=("episode", "number"), name="unique_shot_number")]
+        constraints = [models.UniqueConstraint(fields=("episode", "number"), name="unique_shot_number"),
+            models.CheckConstraint(condition=(
+                models.Q(episode_start_ms__isnull=True, episode_end_ms__isnull=True)
+                | (models.Q(episode_start_ms__isnull=False, episode_end_ms__isnull=False,
+                    episode_end_ms__gt=models.F("episode_start_ms"))
+                    & models.Q(duration_ms=models.F("episode_end_ms") - models.F("episode_start_ms")))
+            ), name="shot_episode_interval_valid")]
 
     def __str__(self) -> str:
-        return f"E{self.episode.number}S{self.number}: {self.title or self.narrative[:30]}"
+        return f"E{self.episode.number}S{self.number}: {self.title}"
 
 
-class PromptArtifact(UUIDTimeStampedModel):
-    class PromptType(models.TextChoices):
-        VIDEO = "video", "视频"
-        IMAGE = "image", "图片"
 
-    project = models.ForeignKey(SeriesProject, on_delete=models.CASCADE, related_name="prompt_artifacts")
-    episode = models.ForeignKey(Episode, null=True, blank=True, on_delete=models.CASCADE, related_name="prompt_artifacts")
-    shot = models.ForeignKey(Shot, null=True, blank=True, on_delete=models.CASCADE, related_name="prompt_artifacts")
-    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="prompt_artifacts")
-    # The published assembly strategy is frozen on the artifact.  Runtime
-    # consumers must never re-resolve a mutable binding when replaying an old
-    # prompt.
-    prompt_profile_version = models.ForeignKey(
-        "PromptProfileVersion",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="prompt_artifacts",
-    )
-    prompt_profile_binding_key = models.CharField(max_length=120, blank=True)
-    prompt_profile_contract_sha256 = models.CharField(max_length=64, blank=True)
-    prompt_type = models.CharField(max_length=12, choices=PromptType.choices)
-    model = models.CharField(max_length=80, blank=True, default="")
-    conditioning_mode = models.CharField(
-        max_length=64,
-        blank=True,
-        default="",
-        validators=[RegexValidator(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")],
-    )
-    revision = models.PositiveIntegerField(default=1)
-    is_multi_shot = models.BooleanField()
-    include_audio = models.BooleanField()
-    total_duration_ms = models.PositiveIntegerField()
-    prompt_text = models.TextField()
-    negative_prompt = models.TextField(blank=True)
-    structured_payload = models.JSONField(default=dict)
-    consistency_snapshot = models.JSONField(default=dict)
-    request_options = models.JSONField(default=dict)
-    content_hash = models.CharField(max_length=64, db_index=True)
+
+class ShotScriptSource(models.Model):
+    """Exact authored source of a materialized shot, without a second value store.
+
+    Coordinates address the saved semantic document, not mutable display numbers.
+    The original Stage/command owns execution/adoption receipts. These rows only
+    bind shots to that creation basis; they never imply approval or media success.
+    """
+
+    shot = models.OneToOneField(Shot, primary_key=True, on_delete=models.CASCADE, related_name="script_source")
+    structure = models.ForeignKey("ScriptRevisionStructure", on_delete=models.PROTECT, related_name="shot_sources")
+    stage = models.ForeignKey("StageRun", on_delete=models.PROTECT, related_name="shot_sources", db_index=False)
+    episode_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    shot_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    document_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[0-9a-f]{64}$")])
+    materialization_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[0-9a-f]{64}$")])
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        ordering = ("-created_at",)
         constraints = [
-            models.UniqueConstraint(
-                fields=("project", "episode", "shot", "prompt_type", "revision"),
-                name="unique_prompt_revision",
-            )
+            models.UniqueConstraint(fields=("stage", "episode_number", "shot_number"), name="uk_shot_script_coordinate"),
+            models.CheckConstraint(condition=Q(episode_number__gt=0, shot_number__gt=0), name="ck_shot_script_coordinate"),
         ]
+
+    def clean(self):
+        super().clean()
+        if self.shot_id and self.structure_id and self.stage_id:
+            project_id = self.shot.episode.project_id
+            if (self.structure.revision.source.project_id != project_id
+                    or self.stage.production_run.project_id != project_id or self.stage.stage_key != "storyboard"):
+                raise ValidationError("镜头、结构化修订和分镜阶段必须属于同一个项目")
+            if self.document_sha256 != self.structure.document_sha256:
+                raise ValidationError("镜头来源摘要与确切结构化修订不一致")
+
+
+class ShotFieldRevision(UUIDTimeStampedModel):
+    """An explicit manual revision of independent inputs, not another script."""
+
+    shot = models.ForeignKey(Shot, on_delete=models.CASCADE, related_name="field_revisions", db_index=False)
+    revision = models.PositiveIntegerField()
+    previous = models.ForeignKey("self", null=True, blank=True, on_delete=models.PROTECT, related_name="+")
+    source_sha256 = models.CharField(max_length=64)
+    overrides = models.JSONField()
+    content_schema_version = models.PositiveSmallIntegerField(default=1)
+    content_size_bytes = models.PositiveIntegerField()
+    content_sha256 = models.CharField(max_length=64)
+    request_id = models.UUIDField()
+    request_sha256 = models.CharField(max_length=64)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="shot_field_revisions")
+    objects = AppendOnlyAuditEventManager()
+
+    class Meta:
+        ordering = ("-revision",)
+        constraints = [
+            models.UniqueConstraint(fields=("shot", "revision"), name="uk_shot_field_revision"),
+            models.UniqueConstraint(fields=("shot", "request_id"), name="uk_shot_field_request"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_shot_field_revision"),
+            models.CheckConstraint(condition=Q(content_size_bytes__lte=65536), name="ck_shot_field_bytes"),
+            models.CheckConstraint(condition=Q(content_schema_version=1), name="ck_shot_field_schema"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            raise ValidationError("镜头独立字段修订不可覆盖，请另存新修订")
+        kwargs["force_insert"] = True
+        return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("镜头独立字段修订不能单独删除")
+
+
+class ShotCharacterRelation(UUIDTimeStampedModel):
+    """Authored visibility or dialogue identity, never inferred from a reference.
+
+    Speaker position addresses the original dialogue row; visible position is
+    authored visible-cast order. One character can independently have both roles.
+    The common storyboard writer owns these rows.
+    """
+
+    class Role(models.TextChoices):
+        VISIBLE = "visible", "可见人物"
+        SPEAKER = "speaker", "对白发言者"
+
+    shot = models.ForeignKey(Shot, on_delete=models.CASCADE, related_name="character_relations", db_index=False)
+    character = models.ForeignKey(CharacterBible, on_delete=models.PROTECT, related_name="shot_relations")
+    role = models.CharField(max_length=8, choices=Role.choices)
+    position = models.PositiveIntegerField()
+
+    class Meta:
+        ordering = ("role", "position")
+        constraints = [
+            models.UniqueConstraint(fields=("shot", "role", "position"), name="uk_shot_character_role_position"),
+            models.UniqueConstraint(fields=("shot", "character"), condition=Q(role="visible"),
+                name="uk_shot_visible_character"),
+            models.CheckConstraint(condition=Q(role__in=("visible", "speaker")), name="ck_shot_character_role"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if self.shot_id and self.character_id and self.character.project_id != self.shot.episode.project_id:
+            raise ValidationError({"character": "镜头人物必须属于同一项目"})
+        if self.shot_id and self.role == self.Role.SPEAKER and (
+                type(self.position) is not int or not isinstance(self.shot.dialogue, list)
+                or not 0 <= self.position < len(self.shot.dialogue)):
+            raise ValidationError({"position": "发言者位置必须指向本镜明确的对白行"})
+
+
+class ShotReferenceUse(UUIDTimeStampedModel):
+    """One ordered use of an exact setting and, when selected, an exact medium.
+
+    No media bytes, setting prose, model slots or fabricated execution records.
+    Blank source_mode means no choice yet, not automatic generation. Selection
+    mode is a shot-level choice, separate from the Asset's actual provenance.
+    """
+
+    shot = models.ForeignKey(Shot, on_delete=models.CASCADE, related_name="reference_uses", db_index=False)
+    use_key = models.CharField(max_length=64)
+    position = models.PositiveIntegerField()
+    media_kind = models.CharField(max_length=8, choices=(("image", "图片"), ("video", "视频"), ("audio", "音频")))
+    purpose = models.CharField(max_length=160, blank=True)
+    setting_revision = models.ForeignKey(BibleVariantRevision, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="shot_reference_uses")
+    source_mode = models.CharField(max_length=16, choices=AssetReferenceVersion.Source.choices, blank=True)
+    reference_version = models.ForeignKey(AssetReferenceVersion, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="shot_reference_uses")
+    # Independent image/video/audio Assets need not acquire a Bible or series.
+    asset = models.ForeignKey(Asset, null=True, blank=True, on_delete=models.PROTECT, related_name="shot_reference_uses")
+    asset_sha256 = models.CharField(max_length=64, blank=True, validators=[RegexValidator(r"^[0-9a-f]{64}$")])
+
+    class Meta:
+        ordering = ("position",)
+        constraints = [
+            models.UniqueConstraint(fields=("shot", "use_key"), name="uk_shot_reference_use_key"),
+            models.UniqueConstraint(fields=("shot", "position"), name="uk_shot_reference_use_position"),
+            models.CheckConstraint(condition=Q(media_kind__in=("image", "video", "audio")), name="ck_shot_use_media_kind"),
+            models.CheckConstraint(condition=~Q(use_key=""), name="ck_shot_use_identity"),
+            models.CheckConstraint(condition=Q(source_mode__in=("", "generated", "existing", "upload")),
+                name="ck_shot_use_source_mode"),
+            models.CheckConstraint(condition=(Q(reference_version__isnull=True, asset__isnull=True, asset_sha256="")
+                | ((Q(reference_version__isnull=False, asset__isnull=True)
+                    | Q(reference_version__isnull=True, asset__isnull=False))
+                    & ~Q(source_mode="") & ~Q(asset_sha256=""))), name="ck_shot_use_exact_source"),
+        ]
+
+    def clean(self):
+        super().clean()
+        if not self.shot_id:
+            return
+        project = self.shot.episode.project
+        if self.setting_revision_id and self.setting_revision.variant.project_id != project.pk:
+            raise ValidationError({"setting_revision": "逐镜设定修订必须属于同一项目"})
+        selected_asset = self.asset if self.asset_id else None
+        if self.reference_version_id:
+            version = self.reference_version
+            if version.series.owner_id != project.owner_id:
+                raise ValidationError({"reference_version": "不能使用其他用户的素材版本"})
+            if (version.setting_revision_id and self.setting_revision_id
+                    and version.setting_revision_id != self.setting_revision_id):
+                raise ValidationError({"reference_version": "素材版本关联的设定修订与本次用途不一致"})
+            selected_asset = version.asset
+        if selected_asset is not None:
+            if selected_asset.owner_id not in (None, project.owner_id):
+                raise ValidationError({"asset": "不能使用其他用户的素材"})
+            if selected_asset.mime_type.split("/", 1)[0] != self.media_kind:
+                raise ValidationError({"media_kind": "所选素材的已记录媒体类型与本次用途不一致"})
+            if self.asset_sha256 != selected_asset.checksum:
+                raise ValidationError({"asset_sha256": "所选素材指纹已改变或未明确指定"})
 
 
 class PromptFieldTranslation(UUIDTimeStampedModel):
     """Human-reviewed translation overlay for one prompt-impacting source field.
 
     Source records remain authoritative and are never rewritten by translation.
-    The H3 compiler may consume an overlay only when it is confirmed and its
+    A source adapter may consume an overlay only when it is confirmed and its
     source hash still matches the current field value.
     """
 
@@ -749,6 +1179,55 @@ class PromptFieldTranslation(UUIDTimeStampedModel):
         return f"{self.scope_type}:{self.scope_id}:{self.field_key}@{self.revision}"
 
 
+class ProjectTranslationRequest(UUIDTimeStampedModel):
+    """Project source ownership of one original text-candidate Job, not a queue."""
+
+    project = models.ForeignKey(SeriesProject, on_delete=models.CASCADE, related_name="translation_requests", db_index=False)
+    job = models.OneToOneField("AssetGenerationJob", on_delete=models.CASCADE, related_name="translation_request")
+    request_sha256 = models.CharField(max_length=64)
+    source_lang = models.CharField(max_length=40)
+    target_lang = models.CharField(max_length=40)
+
+    class Meta:
+        ordering = ("-created_at", "-id")
+        indexes = [models.Index(fields=("project", "-created_at", "-id"), name="idx_translation_request")]
+
+
+class ProjectTranslationSource(UUIDTimeStampedModel):
+    """Frozen write-back identity. Candidate text remains in the original Job."""
+
+    request = models.ForeignKey(ProjectTranslationRequest, on_delete=models.CASCADE, related_name="sources", db_index=False)
+    position = models.PositiveIntegerField()
+    scope_type = models.CharField(max_length=24, choices=PromptFieldTranslation.ScopeType.choices)
+    scope_id = models.UUIDField()
+    field_key = models.CharField(max_length=160)
+    expected_entry_id = models.UUIDField(null=True)
+    expected_revision = models.PositiveIntegerField()
+    source_text = models.TextField()
+    source_sha256 = models.CharField(max_length=64)
+    context_sha256 = models.CharField(max_length=64)
+    item_sha256 = models.CharField(max_length=64)
+    literals = models.JSONField()
+    literals_schema_version = models.PositiveIntegerField(default=1)
+    literals_size_bytes = models.PositiveIntegerField()
+    literals_sha256 = models.CharField(max_length=64)
+    adopted_entry = models.ForeignKey(PromptFieldTranslation, on_delete=models.RESTRICT, null=True, related_name="candidate_sources", db_index=False)
+    adopted_revision = models.PositiveIntegerField(null=True)
+    adopted_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name="adopted_translation_sources", db_index=False)
+    adopted_at = models.DateTimeField(null=True)
+
+    class Meta:
+        ordering = ("position",)
+        constraints = [
+            models.UniqueConstraint(fields=("request", "position"), name="uk_translation_source_position"),
+            models.UniqueConstraint(fields=("request", "scope_type", "scope_id", "field_key"), name="uk_translation_source_field"),
+            models.CheckConstraint(condition=Q(expected_entry_id__isnull=True, expected_revision=0)
+                | Q(expected_entry_id__isnull=False, expected_revision__gte=1), name="ck_translation_source_expected"),
+            models.CheckConstraint(condition=Q(adopted_entry__isnull=True, adopted_revision__isnull=True, adopted_at__isnull=True)
+                | Q(adopted_entry__isnull=False, adopted_revision__isnull=False, adopted_revision__gte=1, adopted_at__isnull=False), name="ck_translation_source_adopted"),
+        ]
+
+
 class WorkflowTemplate(UUIDTimeStampedModel):
     class OutputKind(models.TextChoices):
         VIDEO = "video", "视频"
@@ -782,32 +1261,6 @@ class WorkflowTemplate(UUIDTimeStampedModel):
         return f"{self.name} v{self.version}"
 
 
-class GeneratedWorkflow(UUIDTimeStampedModel):
-    project = models.ForeignKey(SeriesProject, on_delete=models.CASCADE, related_name="generated_workflows")
-    episode = models.ForeignKey(Episode, null=True, blank=True, on_delete=models.CASCADE, related_name="generated_workflows")
-    prompt_artifact = models.ForeignKey(PromptArtifact, on_delete=models.CASCADE, related_name="workflows")
-    template = models.ForeignKey(WorkflowTemplate, on_delete=models.PROTECT, related_name="generated_workflows")
-    workflow_template_version = models.ForeignKey(
-        "WorkflowTemplateVersion",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="generated_workflows",
-    )
-    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="generated_workflows")
-    workflow_json = models.JSONField(default=dict)
-    injected_values = models.JSONField(default=dict)
-    content_hash = models.CharField(max_length=64, db_index=True)
-    compiler_id = models.CharField(max_length=80, blank=True)
-    compiler_version = models.PositiveIntegerField(default=0)
-    route_snapshot_sha256 = models.CharField(max_length=64, blank=True)
-    workflow_contract_sha256 = models.CharField(max_length=64, blank=True)
-    resolved_semantics_sha256 = models.CharField(max_length=64, blank=True)
-    asset_bindings_sha256 = models.CharField(max_length=64, blank=True)
-    model_requirements_sha256 = models.CharField(max_length=64, blank=True)
-
-    class Meta:
-        ordering = ("-created_at",)
 
 
 class WorkerLease(models.Model):
@@ -820,6 +1273,13 @@ class WorkerLease(models.Model):
 
 
 class GenerationTask(UUIDTimeStampedModel):
+    class DistributionState(models.TextChoices):
+        NOT_REQUESTED = "not_requested", "尚未安排副本"
+        QUEUED = "queued", "副本等待处理"
+        RUNNING = "running", "正在处理副本"
+        READY = "ready", "副本已完成"
+        FAILED = "failed", "副本处理失败"
+
     class Status(models.TextChoices):
         QUEUED = "queued", "排队中"
         RUNNING = "running", "运行中"
@@ -831,12 +1291,14 @@ class GenerationTask(UUIDTimeStampedModel):
     class Kind(models.TextChoices):
         VIDEO = "video", "视频"
         IMAGE = "image", "图片"
+        AUDIO = "audio", "音频"
 
     class SubmissionState(models.TextChoices):
         UNPREPARED = "unprepared", "未准备"
         PREPARED = "prepared", "已持久化提交标识"
         SUBMITTED = "submitted", "已提交"
         RECOVERED = "recovered", "已恢复远端提交"
+        TERMINAL_SUCCEEDED = "terminal_succeeded", "远端执行已成功，平台产物另行验收"
         TERMINAL_FAILED = "terminal_failed", "远端执行已明确失败"
         TERMINAL_CANCELLED = "terminal_cancelled", "远端执行已明确取消"
 
@@ -869,17 +1331,7 @@ class GenerationTask(UUIDTimeStampedModel):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="generation_tasks")
     project = models.ForeignKey(SeriesProject, on_delete=models.CASCADE, related_name="generation_tasks")
     episode = models.ForeignKey(Episode, null=True, blank=True, on_delete=models.CASCADE, related_name="generation_tasks")
-    generated_workflow = models.ForeignKey(GeneratedWorkflow, on_delete=models.PROTECT, related_name="tasks")
     kind = models.CharField(max_length=12, choices=Kind.choices)
-    backend = models.CharField(max_length=80, blank=True, default="")
-    model_profile = models.CharField(max_length=120, blank=True, default="")
-    workflow_version = models.PositiveIntegerField(default=1)
-    seed = models.BigIntegerField(default=0)
-    # Immutable post-alignment request plan.  Actual returned-container facts
-    # live in GeneratedArtifact.manifest_metadata["observed_media"].
-    effective_frames = models.PositiveIntegerField(default=0)
-    effective_duration_ms = models.PositiveIntegerField(default=0)
-    capability_snapshot = models.JSONField(default=dict, blank=True)
     staged_inputs = models.JSONField(default=list, blank=True)
     submission_token = models.CharField(max_length=120, blank=True, db_index=True)
     submission_state = models.CharField(
@@ -910,10 +1362,19 @@ class GenerationTask(UUIDTimeStampedModel):
     )
     progress_telemetry_error = models.TextField(blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
-    max_attempts = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
     comfy_prompt_id = models.CharField(max_length=120, blank=True, db_index=True)
     client_id = models.CharField(max_length=120, blank=True)
     outputs = models.JSONField(default=list, blank=True)
+    # Scheduling state for this task's original post-processing phase, not a
+    # second generation task or a replacement for signed output provenance.
+    distribution_state = models.CharField(max_length=16, choices=DistributionState.choices, default=DistributionState.NOT_REQUESTED)
+    distribution_revision = models.PositiveIntegerField(default=0)
+    distribution_claim = models.UUIDField(null=True, blank=True)
+    distribution_requested_at = models.DateTimeField(null=True, blank=True)
+    distribution_started_at = models.DateTimeField(null=True, blank=True)
+    distribution_heartbeat_at = models.DateTimeField(null=True, blank=True)
+    distribution_finished_at = models.DateTimeField(null=True, blank=True)
+    distribution_error = models.CharField(max_length=500, blank=True)
     error_message = models.TextField(blank=True)
     heartbeat_at = models.DateTimeField(null=True, blank=True, db_index=True)
     stalled_at = models.DateTimeField(null=True, blank=True)
@@ -927,163 +1388,78 @@ class GenerationTask(UUIDTimeStampedModel):
 
     class Meta:
         ordering = ("-priority", "queued_at")
-        indexes = [models.Index(fields=("status", "priority", "queued_at"))]
+        indexes = [models.Index(fields=("status", "priority", "queued_at")),
+            models.Index(fields=("distribution_state", "distribution_requested_at", "id"), name="idx_task_distribution_work")]
+        constraints = [models.CheckConstraint(condition=(
+            Q(distribution_state="not_requested", distribution_claim__isnull=True, distribution_revision=0,
+                distribution_requested_at__isnull=True, distribution_started_at__isnull=True, distribution_finished_at__isnull=True)
+            | Q(status="succeeded", distribution_revision__gte=1, distribution_requested_at__isnull=False) & (
+                Q(distribution_state="queued", distribution_claim__isnull=True, distribution_started_at__isnull=True, distribution_finished_at__isnull=True)
+                | Q(distribution_state="running", distribution_claim__isnull=False, distribution_started_at__isnull=False, distribution_finished_at__isnull=True)
+                | Q(distribution_state__in=("ready", "failed"), distribution_claim__isnull=True, distribution_finished_at__isnull=False)
+            )), name="ck_task_distribution_phase"),
+            models.CheckConstraint(condition=~Q(distribution_state="running") | Q(distribution_heartbeat_at__isnull=False),
+                name="ck_task_distribution_beat")]
 
     def __str__(self) -> str:
         return f"{self.kind}:{self.id} [{self.status}]"
 
 
-class DeferredGenerationRequest(UUIDTimeStampedModel):
-    """Persisted first/last-frame dependency between two generation tasks.
+class GenerationTaskObservation(UUIDTimeStampedModel):
+    """Small per-check worker facts, never a second execution-input snapshot."""
 
-    The provisional prompt is reviewable immediately, while the formal
-    PromptArtifact -> GeneratedWorkflow -> GenerationTask chain is created only
-    after the declared upstream video output has a verified signed manifest and
-    its last decodable frame has been materialized as an Asset.
-    """
-
-    class FrameSlot(models.TextChoices):
-        FIRST_FRAME = "first_frame", "首帧"
-        LAST_FRAME = "last_frame", "尾帧"
+    class Kind(models.TextChoices):
+        PREFLIGHT = "preflight", "提交前节点检查"
+        RESOURCE_RELEASE = "resource_release", "提交前资源释放"
 
     class Status(models.TextChoices):
-        PREPARING_PROMPT = "preparing_prompt", "正在准备提示词"
-        WAITING_UPSTREAM = "waiting_upstream", "等待上游视频"
-        EXTRACTING = "extracting", "正在提取末帧"
-        MATERIALIZING = "materializing", "正在物化正式任务"
-        MATERIALIZED = "materialized", "已物化"
-        FAILED = "failed", "已失败"
-        STALE = "stale", "目标输入已过期"
-        CANCELLED = "cancelled", "已取消"
+        PASSED = "passed", "通过"
+        FAILED = "failed", "失败"
 
-    SOURCE_OUTPUT_ROLE_PRIMARY_VIDEO = "primary_video"
-    ACTIVE_STATUSES = (
-        Status.PREPARING_PROMPT,
-        Status.WAITING_UPSTREAM,
-        Status.EXTRACTING,
-        Status.MATERIALIZING,
-    )
-
-    owner = models.ForeignKey(
-        settings.AUTH_USER_MODEL,
-        on_delete=models.CASCADE,
-        related_name="deferred_generation_requests",
-    )
-    project = models.ForeignKey(
-        SeriesProject,
-        on_delete=models.CASCADE,
-        related_name="deferred_generation_requests",
-    )
-    source_task = models.ForeignKey(
-        GenerationTask,
-        on_delete=models.PROTECT,
-        related_name="downstream_deferred_requests",
-    )
-    source_output_role = models.CharField(
-        max_length=32,
-        default=SOURCE_OUTPUT_ROLE_PRIMARY_VIDEO,
-        editable=False,
-    )
-    target_shot = models.ForeignKey(
-        Shot,
-        on_delete=models.PROTECT,
-        related_name="deferred_generation_requests",
-    )
-    frame_slot = models.CharField(max_length=20, choices=FrameSlot.choices)
-    target_workflow_version = models.ForeignKey(
-        "WorkflowTemplateVersion",
-        on_delete=models.PROTECT,
-        related_name="deferred_generation_requests",
-    )
-    target_workflow_snapshot = models.JSONField(default=dict)
-    target_workflow_snapshot_sha256 = models.CharField(max_length=64)
-    idempotency_key = models.CharField(max_length=120)
-    request_fingerprint = models.CharField(max_length=64)
-    target_input_fingerprint = models.CharField(max_length=64)
-    target_workflow_overrides = models.JSONField(default=dict, blank=True)
-    status = models.CharField(
-        max_length=24,
-        choices=Status.choices,
-        default=Status.PREPARING_PROMPT,
-    )
-    provisional_prompt_text = models.TextField()
-    provisional_negative_prompt = models.TextField(blank=True)
-    provisional_prompt_sha256 = models.CharField(max_length=64)
-    resolved_source_output_index = models.PositiveIntegerField(null=True, blank=True)
-    source_artifact_sha256 = models.CharField(max_length=64, blank=True)
-    source_manifest_sha256 = models.CharField(max_length=64, blank=True)
-    derived_asset = models.ForeignKey(
-        Asset,
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="derived_deferred_generation_requests",
-    )
-    materialized_task = models.OneToOneField(
-        GenerationTask,
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="deferred_generation_request",
-    )
-    priority = models.SmallIntegerField(default=0)
-    attempts = models.PositiveSmallIntegerField(default=0)
-    max_attempts = models.PositiveSmallIntegerField(
-        validators=[MinValueValidator(1)],
-    )
-    retry_backoff_seconds = models.PositiveIntegerField(
-        validators=[MinValueValidator(1)],
-    )
-    next_attempt_at = models.DateTimeField(default=timezone.now)
-    extended_generation_confirmed = models.BooleanField(default=False)
-    worker_id = models.CharField(max_length=120, blank=True)
-    claim_token = models.CharField(max_length=64, blank=True)
-    claimed_at = models.DateTimeField(null=True, blank=True)
-    heartbeat_at = models.DateTimeField(null=True, blank=True)
-    error_code = models.CharField(max_length=80, blank=True)
-    error_message = models.TextField(blank=True)
-    started_at = models.DateTimeField(null=True, blank=True)
-    finished_at = models.DateTimeField(null=True, blank=True)
+    task = models.ForeignKey(GenerationTask, on_delete=models.CASCADE, related_name="observations", db_index=False)
+    kind = models.CharField(max_length=24, choices=Kind.choices)
+    status = models.CharField(max_length=16, choices=Status.choices)
+    claim_number = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
+    claim_started_at = models.DateTimeField()
+    started_at = models.DateTimeField()
+    finished_at = models.DateTimeField()
+    request_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    node_count = models.PositiveIntegerField(null=True, blank=True)
+    link_count = models.PositiveIntegerField(null=True, blank=True)
+    schema_sha256 = models.CharField(max_length=64, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    policy_sha256 = models.CharField(max_length=64, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    unload_models = models.BooleanField(null=True, blank=True)
+    free_memory = models.BooleanField(null=True, blank=True)
+    http_status = models.PositiveSmallIntegerField(null=True, blank=True, validators=[MinValueValidator(100), MaxValueValidator(599)])
+    error_code = models.CharField(max_length=100, blank=True, validators=[RegexValidator(r"^[a-z][a-z0-9_]{0,99}$")])
 
     class Meta:
-        ordering = ("-priority", "created_at")
+        ordering = ("-created_at", "-id")
+        indexes = [models.Index(fields=("task", "-created_at", "-id"), name="idx_task_observation")]
         constraints = [
-            models.UniqueConstraint(
-                fields=("project", "idempotency_key"),
-                name="uk_deferred_project_idem",
-            ),
-            models.UniqueConstraint(
-                fields=("target_shot", "frame_slot"),
-                condition=Q(status__in=(
-                    "preparing_prompt", "waiting_upstream", "extracting", "materializing",
-                )),
-                name="uk_deferred_active_slot",
-            ),
-            models.CheckConstraint(
-                condition=Q(attempts__lte=models.F("max_attempts")),
-                name="ck_deferred_attempts_lte_max",
-            ),
-            models.CheckConstraint(
-                condition=(
-                    Q(status="materialized", materialized_task__isnull=False)
-                    | (~Q(status="materialized") & Q(materialized_task__isnull=True))
-                ),
-                name="ck_deferred_materialized_task",
-            ),
-        ]
-        indexes = [
-            models.Index(
-                fields=("status", "next_attempt_at", "created_at"),
-                name="idx_deferred_due",
-            ),
-            models.Index(
-                fields=("source_task", "status"),
-                name="idx_deferred_source_status",
-            ),
+            models.CheckConstraint(condition=Q(claim_number__gte=1), name="ck_task_observation_claim"),
+            models.CheckConstraint(condition=Q(finished_at__gte=models.F("started_at")), name="ck_task_observation_time"),
+            models.CheckConstraint(condition=Q(status="passed", error_code="") | Q(status="failed") & ~Q(error_code=""),
+                name="ck_task_observation_result"),
         ]
 
-    def __str__(self) -> str:
-        return f"{self.source_task_id}->{self.target_shot_id}:{self.frame_slot} [{self.status}]"
+
+    def clean(self):
+        super().clean()
+        if self.kind == self.Kind.PREFLIGHT:
+            if self.status == self.Status.PASSED and (self.node_count is None or self.link_count is None or not self.schema_sha256):
+                raise ValidationError("通过的节点检查必须记录数量与节点目录摘要")
+            if self.policy_sha256 or self.unload_models is not None or self.free_memory is not None or self.http_status is not None:
+                raise ValidationError("节点检查不能携带资源释放事实")
+        elif self.kind == self.Kind.RESOURCE_RELEASE:
+            if not self.policy_sha256 or self.unload_models is None or self.free_memory is None:
+                raise ValidationError("资源释放必须记录策略摘要及实际操作")
+            if self.node_count is not None or self.link_count is not None or self.schema_sha256:
+                raise ValidationError("资源释放不能携带节点检查事实")
+            if self.status == self.Status.PASSED and (self.http_status is None or not 200 <= self.http_status < 300):
+                raise ValidationError("资源释放通过必须有成功的HTTP回执")
+
+
 
 
 class AssemblyJob(UUIDTimeStampedModel):
@@ -1101,7 +1477,6 @@ class AssemblyJob(UUIDTimeStampedModel):
     owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name="assembly_jobs")
     project = models.ForeignKey(SeriesProject, on_delete=models.CASCADE, related_name="assembly_jobs")
     episode = models.ForeignKey(Episode, null=True, blank=True, on_delete=models.CASCADE, related_name="assembly_jobs")
-    source_tasks = models.ManyToManyField(GenerationTask, blank=True, related_name="assembly_jobs")
     scope = models.CharField(max_length=16, choices=Scope.choices)
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.PLANNED, db_index=True)
     dry_run = models.BooleanField(default=True)
@@ -1110,7 +1485,13 @@ class AssemblyJob(UUIDTimeStampedModel):
     concat_manifest_path = models.CharField(max_length=1000, blank=True)
     ffmpeg_command = models.JSONField(default=list, blank=True)
     source_signature = models.CharField(max_length=64, blank=True, db_index=True)
-    source_contract_version = models.PositiveSmallIntegerField(default=2)
+    source_contract_version = models.PositiveSmallIntegerField(default=5)
+    # The consuming assembly step is not the step that generated a source clip.
+    # These creation facts survive replacement of the current per-episode link.
+    consumer_stage = models.ForeignKey(
+        "StageRun", null=True, blank=True, on_delete=models.PROTECT, related_name="assembly_jobs",
+    )
+    consumer_input_sha256 = models.CharField(max_length=64, blank=True)
     attempts = models.PositiveSmallIntegerField(default=0)
     max_attempts = models.PositiveSmallIntegerField(validators=[MinValueValidator(1)])
     worker_id = models.CharField(max_length=160, blank=True, db_index=True)
@@ -1128,6 +1509,11 @@ class AssemblyJob(UUIDTimeStampedModel):
             models.CheckConstraint(
                 condition=(Q(scope="episode", episode__isnull=False) | Q(scope="series", episode__isnull=True)),
                 name="assembly_scope_episode_consistency",
+            ),
+            models.CheckConstraint(
+                condition=(Q(consumer_stage__isnull=True, consumer_input_sha256="")
+                    | (Q(consumer_stage__isnull=False) & ~Q(consumer_input_sha256=""))),
+                name="assembly_consumer_input_pair",
             )
         ]
 
@@ -1162,8 +1548,6 @@ class ReleaseBundle(UUIDTimeStampedModel):
     )
     production_run = models.OneToOneField(
         "ProductionRun",
-        null=True,
-        blank=True,
         on_delete=models.PROTECT,
         related_name="release_bundle",
     )
@@ -1257,18 +1641,21 @@ class AssetGenerationJob(UUIDTimeStampedModel):
     class JobType(models.TextChoices):
         PROMPT = "prompt", "提示词候选"
         ASSET = "asset", "素材生成"
+        FIELD = "field", "准备字段生成"
 
     class MediaType(models.TextChoices):
         IMAGE = "image", "图片"
         VIDEO = "video", "视频"
         AUDIO = "audio", "音频"
         SCRIPT = "script", "剧本"
+        TEXT = "text", "文本候选"
 
     class ExecutionKind(models.TextChoices):
         DEPLOYMENT = "deployment", "模型部署"
         COMFY_WORKFLOW = "comfy_workflow", "ComfyUI 工作流"
 
     class Status(models.TextChoices):
+        PREPARING = "preparing", "准备请求"
         QUEUED = "queued", "排队中"
         SUBMITTING = "submitting", "正在提交"
         SUBMITTED = "submitted", "已提交"
@@ -1288,7 +1675,7 @@ class AssetGenerationJob(UUIDTimeStampedModel):
         Style,
         null=True,
         blank=True,
-        on_delete=models.SET_NULL,
+        on_delete=models.PROTECT,
         related_name="asset_generation_jobs",
     )
     model_deployment = models.ForeignKey(
@@ -1296,6 +1683,19 @@ class AssetGenerationJob(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="asset_generation_jobs",
     )
+    execution_instance_version = models.ForeignKey(
+        "ModelExecutionInstanceVersion", on_delete=models.PROTECT,
+        related_name="asset_generation_jobs",
+    )
+    parent_preparation = models.ForeignKey(
+        "ExecutionPreparation", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="auxiliary_asset_jobs", db_index=False,
+    )
+    retry_of = models.ForeignKey("self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="retries", db_index=False)
+    auxiliary_purpose = models.CharField(max_length=24, blank=True)
+    field_batch_key = models.CharField(max_length=191, blank=True)
+    attempt_number = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
     workflow_template_version = models.ForeignKey(
         "WorkflowTemplateVersion",
         null=True,
@@ -1326,7 +1726,7 @@ class AssetGenerationJob(UUIDTimeStampedModel):
     status = models.CharField(
         max_length=24,
         choices=Status.choices,
-        default=Status.QUEUED,
+        default=Status.PREPARING,
         db_index=True,
     )
     operation = models.CharField(max_length=100)
@@ -1387,8 +1787,24 @@ class AssetGenerationJob(UUIDTimeStampedModel):
                 fields=("status", "next_poll_at", "created_at"),
                 name="studio_asset_job_queue_idx",
             ),
+            models.Index(fields=("retry_of",), condition=Q(retry_of__isnull=False), name="idx_asset_retry_source"),
         ]
         constraints = [
+            models.CheckConstraint(condition=(
+                Q(job_type="field", media_type="text", parent_preparation__isnull=False,
+                    auxiliary_purpose__in=("generate_fields", "translate_fields"),
+                    attempt_number__isnull=False, attempt_number__gte=1) & ~Q(field_batch_key="")
+                | Q(job_type__in=("asset", "prompt"), parent_preparation__isnull=True,
+                    auxiliary_purpose="", field_batch_key="", attempt_number__isnull=True) & (Q(job_type="prompt") | ~Q(media_type="text"))
+            ), name="ck_asset_job_auxiliary"),
+            models.UniqueConstraint(fields=("parent_preparation", "auxiliary_purpose", "field_batch_key", "attempt_number"),
+                condition=Q(parent_preparation__isnull=False), name="uk_asset_job_field_attempt"),
+            models.CheckConstraint(condition=Q(retry_of__isnull=True) | (
+                Q(parent_preparation__isnull=True, job_type__in=("asset", "prompt")) & ~Q(id=F("retry_of"))
+            ), name="ck_asset_job_retry_source"),
+            models.UniqueConstraint(fields=("retry_of",), condition=Q(retry_of__isnull=False,
+                status__in=("preparing", "queued", "submitting", "submitted", "running", "cancel_requested", "uncertain")),
+                name="uk_asset_job_active_retry"),
             models.CheckConstraint(
                 condition=(
                     Q(
@@ -1421,6 +1837,11 @@ class AssetGenerationJob(UUIDTimeStampedModel):
     def __str__(self) -> str:
         return f"{self.job_type}:{self.media_type}:{self.id} [{self.status}]"
 
+    def clean(self):
+        super().clean()
+        from studio.services.execution_task_links import validate_execution_task_links
+        validate_execution_task_links(self)
+
 
 class AppendOnlyAssetGenerationResolutionQuerySet(models.QuerySet):
     def update(self, **kwargs):
@@ -1437,13 +1858,22 @@ class AppendOnlyAssetGenerationResolutionManager(
 
 
 class AssetGenerationJobResolution(UUIDTimeStampedModel):
-    """Append-only staff evidence resolving one uncertain library generation."""
+    """Append-only system observations and staff resolutions for one asset job."""
 
     class Outcome(models.TextChoices):
+        HTTP_BODY_PREPARED = "http_body_prepared", "HTTP正文已序列化（未证明送达）"
+        UNCERTAIN_RETRY_AUTHORIZED = "uncertain_retry_authorized", "保留原未决调用并授权新辅助尝试"
+        RESPONSE_RECEIVED = "response_received", "文本响应已返回（非扣费或采用证明）"
         CONFIRMED_NOT_SUBMITTED = "confirmed_not_submitted", "确认未提交"
         CONFIRMED_REMOTE_FAILED = "confirmed_remote_failed", "确认远端失败"
         CONFIRMED_REMOTE_CANCELLED = "confirmed_remote_cancelled", "确认远端取消"
         CONFIRMED_REMOTE_SUCCEEDED = "confirmed_remote_succeeded", "确认远端成功"
+
+    OPERATOR_OUTCOMES = (
+        Outcome.CONFIRMED_NOT_SUBMITTED, Outcome.CONFIRMED_REMOTE_FAILED,
+        Outcome.CONFIRMED_REMOTE_CANCELLED, Outcome.CONFIRMED_REMOTE_SUCCEEDED,
+    )
+    OPERATOR_CHOICES = tuple((value, value.label) for value in OPERATOR_OUTCOMES)
 
     job = models.ForeignKey(
         AssetGenerationJob,
@@ -1464,6 +1894,8 @@ class AssetGenerationJobResolution(UUIDTimeStampedModel):
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="asset_generation_job_resolutions",
+        null=True,
+        blank=True,
     )
     objects = AppendOnlyAssetGenerationResolutionManager()
 
@@ -1544,47 +1976,195 @@ class ModelProfileVersion(UUIDTimeStampedModel):
         return f"{self.profile_key} v{self.version}"
 
 
-class PromptFieldDefinition(UUIDTimeStampedModel):
-    """Typed, reusable prompt field exposed by the control plane.
-
-    The definition is data, not an executable template.  A published profile
-    may only reference these stable field identities through an allow-listed
-    rule model below.
-    """
-
-    class ValueType(models.TextChoices):
-        TEXT = "text", "短文本"
-        LONG_TEXT = "long_text", "长文本"
-        STRING_LIST = "string_list", "文本列表"
-        BOOLEAN = "boolean", "布尔值"
-        NUMBER = "number", "数值"
-        ENUM = "enum", "枚举"
+class FieldDefinition(UUIDTimeStampedModel):
+    """Stable identity shared by configurable business fields."""
 
     key = models.CharField(
         max_length=100,
         unique=True,
         validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
     )
-    label = models.CharField(max_length=160)
-    category = models.CharField(
-        max_length=80,
-        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,79}$")],
-    )
-    description = models.TextField(blank=True)
-    impact = models.TextField(blank=True)
-    value_type = models.CharField(max_length=24, choices=ValueType.choices)
-    default_value = models.JSONField(null=True, blank=True, default=None)
-    value_options = models.JSONField(default=list, blank=True)
-    is_required = models.BooleanField(default=False)
     is_active = models.BooleanField(default=True)
     display_order = models.PositiveIntegerField(default=0)
 
     class Meta:
         ordering = ("display_order", "key")
-        indexes = [models.Index(fields=("category", "is_active", "display_order"))]
+        indexes = [models.Index(fields=("is_active", "display_order", "key"), name="idx_field_active_order")]
 
     def __str__(self) -> str:
-        return self.label
+        return self.key
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            original_key = type(self).objects.values_list("key", flat=True).get(pk=self.pk)
+            if self.key != original_key:
+                raise ValidationError({"key": "字段身份key不可修改；显示名可在新版本中修改"})
+        return super().save(*args, **kwargs)
+
+
+class FieldDefinitionVersion(UUIDTimeStampedModel):
+    """Field meaning, without actual values or per-use required/default rules."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "草稿"
+        PUBLISHED = "published", "可用"
+        RETIRED = "retired", "停用"
+
+    class ValueType(models.TextChoices):
+        TEXT = "text", "短文本"
+        LONG_TEXT = "long_text", "长文本"
+        INTEGER = "integer", "整数"
+        DECIMAL = "decimal", "小数"
+        BOOLEAN = "boolean", "布尔值"
+        ENUM = "enum", "枚举"
+        OBJECT = "object", "对象"
+        LIST = "list", "列表"
+        MEDIA = "media", "媒体引用"
+
+    field_definition = models.ForeignKey(
+        FieldDefinition, on_delete=models.CASCADE, related_name="definition_versions",
+    )
+    version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    status = models.CharField(max_length=12, choices=Status.choices, default=Status.DRAFT)
+    label = models.CharField(max_length=160, blank=True)
+    category = models.CharField(
+        max_length=80, blank=True,
+        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,79}$")],
+    )
+    description = models.TextField(blank=True)
+    impact = models.TextField(blank=True)
+    value_type = models.CharField(max_length=24, blank=True, choices=ValueType.choices)
+    unit = models.CharField(max_length=80, blank=True)
+    value_options = models.JSONField(default=list, blank=True)
+
+    class Meta:
+        ordering = ("field_definition_id", "-version")
+        constraints = [
+            models.UniqueConstraint(fields=("field_definition", "version"), name="uk_field_definition_version"),
+            models.CheckConstraint(condition=Q(version__gte=1), name="ck_field_definition_version_pos"),
+        ]
+
+    @property
+    def key(self):
+        return self.field_definition.key
+
+    def clean(self):
+        super().clean()
+        if self.status != self.Status.DRAFT:
+            errors = {
+                name: "可用字段版本必须填写此项"
+                for name in ("label", "category", "value_type")
+                if not getattr(self, name).strip()
+            }
+            if errors:
+                raise ValidationError(errors)
+        options = self.value_options
+        if not isinstance(options, list) or any(
+            not isinstance(option, str) or not option.strip() for option in options
+        ):
+            raise ValidationError({"value_options": "枚举选项必须是非空文本数组"})
+        if len(options) != len(set(options)):
+            raise ValidationError({"value_options": "枚举选项不能重复"})
+        if self.value_type != self.ValueType.ENUM and options:
+            raise ValidationError({"value_options": "只有枚举字段可以设置枚举选项"})
+        if self.value_type == self.ValueType.ENUM and not options and self.status != self.Status.DRAFT:
+            raise ValidationError({"value_options": "可用枚举字段必须设置枚举选项"})
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            previous = type(self).objects.get(pk=self.pk)
+            if (self.field_definition_id, self.version) != (previous.field_definition_id, previous.version):
+                raise ValidationError("字段版本身份不可修改")
+            if previous.status != self.Status.DRAFT:
+                content_fields = ("label", "category", "description", "impact", "value_type", "unit", "value_options")
+                if any(getattr(self, name) != getattr(previous, name) for name in content_fields):
+                    raise ValidationError("可用或停用字段版本不可修改正文；请创建新版本")
+                if self.status not in {previous.status, self.Status.RETIRED}:
+                    raise ValidationError("已发布字段版本不能改回草稿或重新启用")
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+
+class DataStructureVersion(UUIDTimeStampedModel):
+    """One versioned shape shared by business inputs and outputs."""
+
+    structure_key = models.UUIDField(default=uuid.uuid4, editable=False)
+    version = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1)])
+    name = models.CharField(max_length=160, blank=True)
+    description = models.TextField(blank=True)
+    status = models.CharField(max_length=12, choices=FieldDefinitionVersion.Status.choices, default="draft")
+
+    class Meta:
+        ordering = ("structure_key", "-version", "id")
+        indexes = [models.Index(fields=("structure_key", "-version", "id"), name="idx_structure_version_order")]
+        constraints = [
+            models.UniqueConstraint(fields=("structure_key", "version"), name="uk_data_structure_version"),
+            models.CheckConstraint(condition=Q(version__gte=1), name="ck_data_structure_version_pos"),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self._state.adding:
+            previous = type(self).objects.get(pk=self.pk)
+            if (self.structure_key, self.version) != (previous.structure_key, previous.version):
+                raise ValidationError("结构版本身份不可修改")
+            if previous.status != "draft":
+                if (self.name, self.description) != (previous.name, previous.description):
+                    raise ValidationError("可用或停用结构不可修改；请创建新版本")
+                if self.status not in {previous.status, "retired"}:
+                    raise ValidationError("已发布结构不能返回草稿或重新启用")
+        if self.status != "draft" and not self.name.strip():
+            raise ValidationError({"name": "可用结构必须填写名称"})
+        if self.status == "published" and (self._state.adding or previous.status == "draft"):
+            from studio.services.data_structures import compile_data_structure
+            compile_data_structure(self, require_published_fields=True)
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+
+class DataStructureNode(UUIDTimeStampedModel):
+    """Field usage in a structure, not a second field dictionary or task value."""
+
+    structure = models.ForeignKey(DataStructureVersion, on_delete=models.CASCADE, related_name="nodes")
+    node_key = models.CharField(max_length=100, validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{0,99}$")])
+    parent = models.ForeignKey("self", null=True, blank=True, on_delete=models.CASCADE, related_name="children")
+    field_definition_version = models.ForeignKey(
+        FieldDefinitionVersion, null=True, blank=True, on_delete=models.PROTECT, related_name="structure_nodes",
+    )
+    property_name = models.CharField(max_length=160, blank=True)
+    position = models.PositiveIntegerField(default=0)
+    required = models.BooleanField(default=False)
+    allow_null = models.BooleanField(default=False)
+    allow_blank = models.BooleanField(default=True)
+    allow_empty = models.BooleanField(default=True)
+    has_default = models.BooleanField(default=False)
+    default_value = models.JSONField(null=True, blank=True)
+    constraints = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        ordering = ("position", "node_key")
+        constraints = [models.UniqueConstraint(fields=("structure", "node_key"), name="uk_structure_node_key")]
+
+    def save(self, *args, **kwargs):
+        from django.db import transaction
+        with transaction.atomic():
+            ids = {self.structure_id}
+            if not self._state.adding:
+                ids.add(type(self).objects.get(pk=self.pk).structure_id)
+            versions = DataStructureVersion.objects.select_for_update().filter(pk__in=ids)
+            if any(version.status != "draft" for version in versions):
+                raise ValidationError("可用或停用结构的节点不可修改")
+            if self.parent_id and self.parent.structure_id != self.structure_id:
+                raise ValidationError({"parent": "父节点必须属于同一结构版本"})
+            self.full_clean()
+            return super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        from django.db import transaction
+        with transaction.atomic():
+            structure = DataStructureVersion.objects.select_for_update().get(pk=self.structure_id)
+            if structure.status != "draft":
+                raise ValidationError("可用或停用结构的节点不可删除")
+            return super().delete(*args, **kwargs)
 
 
 class PromptProfileVersion(UUIDTimeStampedModel):
@@ -1633,6 +2213,10 @@ class PromptProfileVersion(UUIDTimeStampedModel):
         ),
     )
     official_reference = models.URLField(max_length=1000, blank=True)
+    input_structure_version = models.ForeignKey(
+        DataStructureVersion, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="prompt_profiles",
+    )
     channel_limits = models.JSONField(
         default=dict,
         blank=True,
@@ -1647,7 +2231,7 @@ class PromptProfileVersion(UUIDTimeStampedModel):
         choices=ReviewState.choices,
         default=ReviewState.NEEDS_REVIEW,
     )
-    contract_schema_version = models.PositiveIntegerField(default=1)
+    contract_schema_version = models.PositiveIntegerField(default=8)
     contract_size_bytes = models.PositiveIntegerField(default=2)
     contract_sha256 = models.CharField(max_length=64, blank=True)
     published_at = models.DateTimeField(null=True, blank=True)
@@ -1671,6 +2255,66 @@ class PromptProfileVersion(UUIDTimeStampedModel):
 
     def __str__(self) -> str:
         return f"{self.name} v{self.version}"
+
+
+class BusinessOutputVersion(UUIDTimeStampedModel):
+    """An immutable, authored contract consumed by the business output parser."""
+
+    output_key = models.UUIDField(default=uuid.uuid4, editable=False)
+    version = models.PositiveIntegerField(default=1)
+    name = models.CharField(max_length=120)
+    description = models.CharField(max_length=1000, blank=True)
+    parser_key = models.CharField(max_length=80)
+    parser_contract = models.JSONField(default=dict, editable=False)
+    data_structure_version = models.ForeignKey(
+        DataStructureVersion, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="business_output_versions",
+    )
+    quality_advisories = models.JSONField(default=dict, blank=True)
+    status = models.CharField(max_length=16, choices=(("draft", "草稿"), ("published", "已发布"), ("retired", "已退役")), default="draft")
+    revision = models.PositiveIntegerField(default=1)
+    contract_sha256 = models.CharField(max_length=64)
+    contract_size_bytes = models.PositiveIntegerField()
+    published_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.PROTECT, related_name="published_business_outputs")
+
+    class Meta:
+        ordering = ("-created_at", "id")
+        constraints = [models.UniqueConstraint(fields=("output_key", "version"), name="studio_output_version_unique")]
+        indexes = [models.Index(fields=("status", "-created_at", "id"), name="studio_output_status_idx")]
+
+
+class ContentSourceVersion(UUIDTimeStampedModel):
+    """An authored meaning bound to one platform-owned, permission-aware reader."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "草稿"
+        PUBLISHED = "published", "已发布"
+        RETIRED = "retired", "已退役"
+
+    source_key = models.UUIDField(default=uuid.uuid4, editable=False)
+    version = models.PositiveIntegerField(default=1)
+    name = models.CharField(max_length=120)
+    description = models.CharField(max_length=1000, blank=True)
+    reader_selector = models.CharField(max_length=80)
+    reader_contract = models.JSONField(default=dict, editable=False)
+    data_structure_version = models.ForeignKey(
+        DataStructureVersion, null=True, blank=True, on_delete=models.PROTECT,
+        related_name="content_source_versions",
+    )
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    revision = models.PositiveIntegerField(default=1)
+    contract_sha256 = models.CharField(max_length=64)
+    contract_size_bytes = models.PositiveIntegerField()
+    published_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.ForeignKey(settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.PROTECT, related_name="published_content_sources")
+
+    class Meta:
+        ordering = ("-created_at", "id")
+        constraints = [models.UniqueConstraint(fields=("source_key", "version"), name="studio_source_version_unique")]
+        indexes = [models.Index(fields=("status", "-created_at", "id"), name="studio_source_status_idx")]
 
 
 class PromptProfileFieldRule(UUIDTimeStampedModel):
@@ -1703,6 +2347,7 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
             "禁止未解析占位符 / No unresolved placeholders",
         )
         SINGLE_LINE = "single_line", "仅单行 / Single line"
+        NO_SHOT_HEADERS = "no_shot_headers", "不重复生成镜头标题 / No shot headers"
         VALID_JSON = "valid_json", "合法 JSON / Valid JSON"
         JSON_OBJECT = "json_object", "JSON 对象 / JSON object"
         JSON_ARRAY = "json_array", "JSON 数组 / JSON array"
@@ -1749,7 +2394,8 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
         )
 
     class SourceSelector(models.TextChoices):
-        DEFINITION_DEFAULT = "definition.default", "字段默认值"
+        FIXED_VALUE = "fixed.value", "本规则固定值"
+        REQUEST_STRUCTURED_INPUT = "request.structured_input", "本次结构化输入字段"
         PROJECTION_OUTPUT = "projection.output", "声明式投影输出"
         PROJECT_TITLE = "project.title", "项目名称"
         PROJECT_LOGLINE = "project.logline", "一句话梗概"
@@ -1760,15 +2406,12 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
         STYLE_DESCRIPTION = "style.description", "风格说明"
         STYLE_VISUAL_PROMPT = "style.visual_prompt", "风格视觉提示"
         STYLE_NEGATIVE_PROMPT = "style.negative_prompt", "风格负面提示"
+        REVIEWED_VISUAL_CONTINUITY = "reviewed_visual_rules.continuity_summary", "已审核连续性说明"
+        REVIEWED_VISUAL_COLOR = "reviewed_visual_rules.color_script", "已审核色彩脚本"
+        REVIEWED_VISUAL_NEGATIVE = "reviewed_visual_rules.negative_prompt", "已审核负面约束"
+        REVIEWED_VISUAL_CAMERA = "reviewed_visual_rules.camera_guidance", "已审核镜头指导"
         SHOT_TITLE = "shot.title", "镜头标题"
-        SHOT_NARRATIVE = "shot.narrative", "镜头叙事"
-        SHOT_DETAIL = "shot.detailed_description", "镜头详细描述"
-        SHOT_CAMERA = "shot.camera", "镜头语言"
-        SHOT_ACTION = "shot.action", "动作"
         SHOT_DIALOGUE = "shot.dialogue", "对白"
-        SHOT_SOUND_EFFECTS = "shot.sound_effects", "音效"
-        SHOT_MUSIC = "shot.music", "音乐"
-        SHOT_NEGATIVE_PROMPT = "shot.negative_prompt", "镜头负面提示"
         REQUEST_THEME = "request.theme", "请求主题"
         REQUEST_LIGHTING = "request.lighting", "请求灯光"
         REQUEST_ENVIRONMENT = "request.environment", "请求环境"
@@ -1835,11 +2478,18 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
         related_name="field_rules",
     )
     field_definition = models.ForeignKey(
-        PromptFieldDefinition,
+        FieldDefinition,
         on_delete=models.PROTECT,
         related_name="profile_rules",
     )
+    field_definition_version = models.ForeignKey(
+        FieldDefinitionVersion, null=True, blank=True,
+        on_delete=models.PROTECT, related_name="profile_rules",
+    )
+    source_version = models.ForeignKey(ContentSourceVersion, null=True, blank=True,
+        on_delete=models.PROTECT, related_name="profile_rules")
     source_selector = models.CharField(max_length=80, choices=SourceSelector.choices)
+    source_path = models.JSONField(null=True, blank=True, default=None)
     projection_primitive = models.CharField(
         max_length=80,
         blank=True,
@@ -1863,6 +2513,9 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
     )
     required = models.BooleanField(default=False)
     omit_if_empty = models.BooleanField(default=True)
+    fixed_value = models.JSONField(null=True, blank=True, default=None)
+    has_default = models.BooleanField(default=False)
+    default_value = models.JSONField(null=True, blank=True, default=None)
     max_chars = models.PositiveIntegerField(
         default=2000,
         validators=[MinValueValidator(1)],
@@ -1939,52 +2592,6 @@ class PromptProfileFieldRule(UUIDTimeStampedModel):
         ]
 
 
-class PromptProfileBinding(UUIDTimeStampedModel):
-    """Runtime selection rule for one published prompt profile version."""
-
-    key = models.CharField(
-        max_length=120,
-        unique=True,
-        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,119}$")],
-    )
-    name = models.CharField(max_length=160)
-    operation = models.CharField(
-        max_length=100,
-        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
-    )
-    model_family = models.CharField(
-        max_length=100,
-        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
-    )
-    mode = models.CharField(
-        max_length=40,
-        blank=True,
-        validators=[RegexValidator(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$")],
-    )
-    model_profile_version = models.ForeignKey(
-        ModelProfileVersion,
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="prompt_profile_bindings",
-    )
-    prompt_profile_version = models.ForeignKey(
-        PromptProfileVersion,
-        on_delete=models.PROTECT,
-        related_name="bindings",
-    )
-    priority = models.SmallIntegerField(
-        default=0,
-        validators=[MinValueValidator(-1000), MaxValueValidator(1000)],
-    )
-    is_active = models.BooleanField(default=True)
-
-    class Meta:
-        ordering = ("operation", "model_family", "-priority", "key")
-        indexes = [models.Index(fields=("operation", "model_family", "is_active"))]
-
-    def __str__(self) -> str:
-        return self.name
 
 
 class RuntimeHost(UUIDTimeStampedModel):
@@ -2329,6 +2936,666 @@ class WorkflowTemplateVersion(UUIDTimeStampedModel):
         return f"{self.template.slug} platform-v{self.version}"
 
 
+class ModelExecutionInstanceQuerySet(models.QuerySet):
+    def update(self, **kwargs):
+        if "key" in kwargs:
+            raise ValidationError("执行实例稳定 key 创建后不可修改")
+        return super().update(**kwargs)
+
+
+class ModelExecutionInstance(UUIDTimeStampedModel):
+    """A reusable business execution identity, not a second runtime deployment."""
+
+    key = models.CharField(
+        max_length=100, unique=True,
+        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
+    )
+    name = models.CharField(max_length=160)
+    description = models.TextField(blank=True)
+    is_active = models.BooleanField(default=True)
+    revision = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1)])
+    objects = ModelExecutionInstanceQuerySet.as_manager()
+
+    class Meta:
+        ordering = ("key",)
+        constraints = [
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_exec_instance_revision"),
+        ]
+
+    def save(self, *args, **kwargs):
+        previous = type(self).objects.filter(pk=self.pk).values_list("key", flat=True).first()
+        if previous is not None and previous != self.key:
+            raise ValidationError("执行实例稳定 key 创建后不可修改")
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return self.name
+
+
+class ModelExecutionInstanceVersion(UUIDTimeStampedModel):
+    """One execution capability; prompt purpose belongs to the referenced profile."""
+
+    class Status(models.TextChoices):
+        DRAFT = "draft", "草稿"
+        PUBLISHED = "published", "已发布"
+        RETIRED = "retired", "已退役"
+
+    class PromptMode(models.TextChoices):
+        PROFILE = "profile", "策略组装"
+        MANUAL = "manual", "人工完整提示词"
+        NONE = "none", "无需提示词"
+
+    instance = models.ForeignKey(ModelExecutionInstance, on_delete=models.PROTECT, related_name="versions")
+    version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    status = models.CharField(max_length=16, choices=Status.choices, default=Status.DRAFT)
+    deployment = models.ForeignKey(ModelDeployment, on_delete=models.PROTECT, related_name="execution_versions")
+    operation = models.CharField(
+        max_length=100,
+        validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")],
+        help_text="模型和工作流声明的精确执行能力；不是提示词策略的用途。",
+    )
+    mode = models.CharField(
+        max_length=40, blank=True,
+        validators=[RegexValidator(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$")],
+    )
+    prompt_mode = models.CharField(max_length=16, choices=PromptMode.choices)
+    prompt_profile_version = models.ForeignKey(
+        PromptProfileVersion, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="execution_versions",
+    )
+    workflow_version = models.ForeignKey(
+        WorkflowTemplateVersion, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="execution_versions",
+    )
+    output_version = models.ForeignKey(
+        BusinessOutputVersion, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="execution_versions",
+    )
+    revision = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1)])
+    published_at = models.DateTimeField(null=True, blank=True)
+    published_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="published_execution_instance_versions",
+    )
+
+    class Meta:
+        ordering = ("instance", "-version")
+        constraints = [
+            models.UniqueConstraint(fields=("instance", "version"), name="uk_exec_instance_version"),
+            models.CheckConstraint(condition=Q(version__gte=1, revision__gte=1), name="ck_exec_version_positive"),
+            models.CheckConstraint(
+                condition=(
+                    Q(prompt_mode="profile", prompt_profile_version__isnull=False)
+                    | Q(prompt_mode__in=("manual", "none"), prompt_profile_version__isnull=True)
+                ),
+                name="ck_exec_version_prompt_mode",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(status="draft", published_at__isnull=True, published_by__isnull=True)
+                    | Q(status__in=("published", "retired"), published_at__isnull=False, published_by__isnull=False)
+                ),
+                name="ck_exec_version_publication",
+            ),
+        ]
+        indexes = [models.Index(fields=("operation", "status"), name="idx_exec_operation_status")]
+
+    def __str__(self):
+        return f"{self.instance_id} v{self.version}"
+
+
+class ExecutionInputSpec(UUIDTimeStampedModel):
+    class Kind(models.TextChoices):
+        TEXT = "text", "文本"
+        JSON = "json", "结构化数据"
+        IMAGE = "image", "图片"
+        VIDEO = "video", "视频"
+        AUDIO = "audio", "音频"
+
+    version = models.ForeignKey(ModelExecutionInstanceVersion, on_delete=models.CASCADE, related_name="inputs")
+    key = models.CharField(max_length=100, validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")])
+    position = models.PositiveIntegerField()
+    kind = models.CharField(max_length=16, choices=Kind.choices)
+    required = models.BooleanField()
+    min_items = models.PositiveIntegerField()
+    max_items = models.PositiveIntegerField()
+    semantic_contract = models.JSONField()
+    media_source_policy = models.JSONField(null=True, blank=True)
+    data_structure_version = models.ForeignKey(
+        DataStructureVersion, null=True, blank=True, on_delete=models.PROTECT, related_name="execution_inputs",
+    )
+
+    class Meta:
+        ordering = ("position", "key")
+        constraints = [
+            models.UniqueConstraint(fields=("version", "key"), name="uk_exec_input_key"),
+            models.UniqueConstraint(fields=("version", "position"), name="uk_exec_input_position"),
+            models.CheckConstraint(condition=Q(min_items__lte=models.F("max_items")), name="ck_exec_input_count_range"),
+            models.CheckConstraint(condition=Q(required=False) | Q(min_items__gte=1), name="ck_exec_input_required"),
+            models.CheckConstraint(
+                condition=Q(kind__in=("image", "video", "audio")) | Q(kind__in=("text", "json"), max_items__lte=1),
+                name="ck_exec_input_scalar",
+            ),
+        ]
+
+    def clean(self):
+        from studio.services.execution_instances import validate_input_semantic_contract
+
+        super().clean()
+        validate_input_semantic_contract(self.semantic_contract)
+        from studio.services.execution_media_source_policy import execution_media_source_policy
+        execution_media_source_policy({"key": self.key, "kind": self.kind,
+            "min_items": self.min_items, "max_items": self.max_items,
+            "semantic_contract": self.semantic_contract, "media_source_policy": self.media_source_policy})
+        if self.data_structure_version_id:
+            from studio.services.execution_input_structures import input_structure_snapshot
+            input_structure_snapshot(self)
+
+
+class ExecutionInputTarget(UUIDTimeStampedModel):
+    class Kind(models.TextChoices):
+        WORKFLOW_SLOT = "workflow_slot", "工作流槽位"
+        OPERATION_INPUT = "operation_input", "执行输入"
+        PROFILE_INPUT = "profile_input", "策略输入"
+
+    input_spec = models.ForeignKey(ExecutionInputSpec, on_delete=models.CASCADE, related_name="targets")
+    target_kind = models.CharField(max_length=24, choices=Kind.choices)
+    target_key = models.CharField(max_length=191)
+    is_primary = models.BooleanField()
+
+    class Meta:
+        ordering = ("target_kind", "target_key")
+        constraints = [
+            models.UniqueConstraint(fields=("input_spec", "target_kind", "target_key"), name="uk_exec_input_target"),
+            models.UniqueConstraint(fields=("input_spec",), condition=Q(is_primary=True), name="uk_exec_input_primary"),
+            models.CheckConstraint(
+                condition=(
+                    Q(target_kind__in=("workflow_slot", "operation_input"))
+                    | Q(target_kind="profile_input", is_primary=False)
+                ),
+                name="ck_exec_primary_target_kind",
+            ),
+        ]
+
+
+class ExecutionParameterSpec(UUIDTimeStampedModel):
+    class ValueType(models.TextChoices):
+        BOOLEAN = "boolean", "布尔值"
+        INTEGER = "integer", "整数"
+        NUMBER = "number", "数值"
+        STRING = "string", "文本"
+
+    class Policy(models.TextChoices):
+        OVERRIDABLE = "overridable", "允许运行时配置"
+        LOCKED = "locked", "固定值"
+
+    class SeedPolicy(models.TextChoices):
+        FIXED = "fixed", "使用明确种子"
+        GENERATE_ONCE = "generate_once", "每次新请求生成一次"
+
+    version = models.ForeignKey(ModelExecutionInstanceVersion, on_delete=models.CASCADE, related_name="parameters")
+    key = models.CharField(max_length=100, validators=[RegexValidator(r"^[a-z][a-z0-9_.-]{1,99}$")])
+    value_type = models.CharField(max_length=16, choices=ValueType.choices)
+    minimum = models.JSONField(null=True, blank=True)
+    maximum = models.JSONField(null=True, blank=True)
+    enum_values = models.JSONField(default=list, blank=True)
+    step = models.JSONField(null=True, blank=True)
+    remainder = models.JSONField(null=True, blank=True)
+    policy = models.CharField(max_length=16, choices=Policy.choices)
+    default_value = models.JSONField(null=True, blank=True)
+    locked_value = models.JSONField(null=True, blank=True)
+    seed_policy = models.CharField(max_length=16, choices=SeedPolicy.choices, null=True, blank=True)
+
+    class Meta:
+        ordering = ("key",)
+        constraints = [
+            models.UniqueConstraint(fields=("version", "key"), name="uk_exec_parameter_key"),
+            models.CheckConstraint(
+                condition=(
+                    Q(policy="locked", default_value__isnull=True, locked_value__isnull=False)
+                    | Q(policy="overridable", locked_value__isnull=True)
+                ),
+                name="ck_exec_parameter_policy",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    Q(seed_policy__isnull=True)
+                    | Q(seed_policy="fixed", value_type="integer")
+                    | Q(seed_policy="generate_once", value_type="integer", policy="overridable",
+                        default_value__isnull=True, locked_value__isnull=True)
+                ),
+                name="ck_exec_parameter_seed_policy",
+            ),
+        ]
+
+    def clean(self):
+        from studio.services.execution_instances import validate_execution_parameter_spec
+
+        super().clean()
+        validate_execution_parameter_spec(self)
+
+
+class ExecutionAuxiliaryBinding(UUIDTimeStampedModel):
+    class Purpose(models.TextChoices):
+        GENERATE_FIELDS = "generate_fields", "生成字段"
+        TRANSLATE_FIELDS = "translate_fields", "翻译字段"
+
+    version = models.ForeignKey(ModelExecutionInstanceVersion, on_delete=models.CASCADE, related_name="auxiliaries")
+    purpose = models.CharField(max_length=24, choices=Purpose.choices)
+    target_version = models.ForeignKey(ModelExecutionInstanceVersion, on_delete=models.PROTECT, related_name="auxiliary_consumers")
+
+    class Meta:
+        ordering = ("purpose",)
+        constraints = [
+            models.UniqueConstraint(fields=("version", "purpose"), name="uk_exec_auxiliary_purpose"),
+            models.CheckConstraint(condition=~Q(version=models.F("target_version")), name="ck_exec_auxiliary_not_self"),
+        ]
+
+
+class ExecutionVersionContract(UUIDTimeStampedModel):
+    """Derived detail snapshot; never a second editable configuration source."""
+
+    version = models.OneToOneField(ModelExecutionInstanceVersion, on_delete=models.CASCADE, related_name="contract")
+    definition = models.JSONField()
+    schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    size_bytes = models.PositiveIntegerField(validators=[MaxValueValidator(65536)])
+    sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    target_fingerprint = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(schema_version__gte=1, size_bytes__lte=65536), name="ck_exec_contract_size_schema"),
+        ]
+
+    def clean(self):
+        from studio.services.json_contracts import verify_json_contract
+        from studio.services.execution_instances import execution_configuration_max_bytes
+
+        super().clean()
+        if not isinstance(self.definition, dict):
+            raise ValidationError({"definition": "执行实例合同必须是对象"})
+        verify_json_contract(
+            self.definition, schema_version=self.schema_version,
+            size_bytes=self.size_bytes, sha256=self.sha256, max_bytes=execution_configuration_max_bytes(),
+        )
+
+
+class ExecutionSnapshotQuerySet(models.QuerySet):
+    """Snapshot changes require the locked preparation service, not bulk writes."""
+
+    def update(self, **kwargs):
+        protected = self.model._SNAPSHOT_FIELDS | self.model._WRITE_ONCE_FIELDS | getattr(self.model, "_REVIEW_FIELDS", frozenset())
+        names = {self.model._meta.get_field(name).attname for name in kwargs}
+        if protected & names:
+            raise ValidationError("执行准备的冻结事实不能批量修改")
+        return super().update(**kwargs)
+
+
+def _validate_execution_snapshot_update(instance):
+    fields = instance._SNAPSHOT_FIELDS | instance._WRITE_ONCE_FIELDS
+    if instance._state.adding:
+        return
+    stored = type(instance).objects.filter(pk=instance.pk).values(*fields).get()
+    for name in fields:
+        if name in instance._WRITE_ONCE_FIELDS and stored[name] is None:
+            continue
+        if stored[name] != getattr(instance, name):
+            raise ValidationError({name: "已冻结的执行事实不可改写，请创建新准备或字段修订"})
+
+
+def _require_unfrozen_preparation(preparation_id):
+    preparation = ExecutionPreparation.objects.only("request_frozen_at", "status").get(pk=preparation_id)
+    if preparation.request_frozen_at is not None or preparation.status == "cancelled":
+        raise ValidationError("执行准备已冻结或取消，不能修改字段或采用结果", code="execution_preparation_conflict")
+
+
+class ExecutionPreparation(UUIDTimeStampedModel):
+    """A recoverable preparation, not a second remote execution queue."""
+
+    class Purpose(models.TextChoices):
+        PRODUCTION = "production", "业务执行"
+        INSTANCE_SMOKE = "instance_smoke", "实例组合验收"
+        RESOURCE_SMOKE = "resource_smoke", "基础资源验收"
+
+    class Status(models.TextChoices):
+        AWAITING_INPUT = "awaiting_input", "待填写"
+        PREPARING = "preparing", "准备中"
+        AWAITING_REVIEW = "awaiting_review", "待审核字段"
+        BLOCKED = "blocked", "准备受阻"
+        READY = "ready", "请求已就绪"
+        DISPATCHED = "dispatched", "已交给原任务队列"
+        CANCELLED = "cancelled", "已取消准备"
+
+    stage_run = models.ForeignKey("StageRun", on_delete=models.CASCADE, null=True, blank=True, db_index=False, related_name="execution_preparations")
+    asset_job = models.ForeignKey("AssetGenerationJob", on_delete=models.CASCADE, null=True, blank=True, db_index=False, related_name="execution_preparations")
+    deployment_smoke = models.ForeignKey("ModelDeploymentSmokeAttempt", on_delete=models.CASCADE, null=True, blank=True, db_index=False, related_name="execution_preparations")
+    workflow_smoke = models.ForeignKey("WorkflowSmokeAttempt", on_delete=models.CASCADE, null=True, blank=True, db_index=False, related_name="execution_preparations")
+    execution_instance_version = models.ForeignKey(ModelExecutionInstanceVersion, on_delete=models.PROTECT, null=True, blank=True, related_name="preparations")
+    purpose = models.CharField(max_length=24, choices=Purpose.choices)
+    unit_key = models.CharField(max_length=191)
+    request_key = models.CharField(max_length=191)
+    supersedes = models.OneToOneField("self", on_delete=models.PROTECT, null=True, blank=True,
+        related_name="replacement")
+    revision = models.PositiveIntegerField(default=1, validators=[MinValueValidator(1)])
+    status = models.CharField(max_length=24, choices=Status.choices)
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="execution_preparations")
+    next_check_at = models.DateTimeField(null=True, blank=True)
+    claim_token = models.UUIDField(null=True, blank=True)
+    claim_until = models.DateTimeField(null=True, blank=True)
+    intent_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    request_sha256 = models.CharField(max_length=64, null=True, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    request_frozen_at = models.DateTimeField(null=True, blank=True)
+    cancelled_at = models.DateTimeField(null=True, blank=True)
+    cancelled_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, db_index=False,
+        related_name="cancelled_execution_preparations")
+    reason_code = models.CharField(max_length=100, blank=True)
+    reason = models.CharField(max_length=500, blank=True)
+    evaluation_revision = models.PositiveIntegerField(null=True, blank=True)
+    evaluated_at = models.DateTimeField(null=True, blank=True)
+
+    _SNAPSHOT_FIELDS = frozenset((
+        "stage_run_id", "asset_job_id", "deployment_smoke_id", "workflow_smoke_id",
+        "execution_instance_version_id", "purpose", "unit_key", "request_key", "created_by_id", "intent_sha256", "supersedes_id",
+    ))
+    _WRITE_ONCE_FIELDS = frozenset(("request_sha256", "request_frozen_at", "cancelled_at", "cancelled_by_id"))
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        ordering = ("created_at", "id")
+        indexes = [models.Index(fields=("status", "next_check_at"), name="idx_exec_prep_due")]
+        constraints = [
+            models.CheckConstraint(condition=(
+                Q(stage_run__isnull=False, asset_job__isnull=True, deployment_smoke__isnull=True, workflow_smoke__isnull=True)
+                | Q(stage_run__isnull=True, asset_job__isnull=False, deployment_smoke__isnull=True, workflow_smoke__isnull=True)
+                | Q(stage_run__isnull=True, asset_job__isnull=True, deployment_smoke__isnull=False, workflow_smoke__isnull=True)
+                | Q(stage_run__isnull=True, asset_job__isnull=True, deployment_smoke__isnull=True, workflow_smoke__isnull=False)
+            ), name="ck_exec_prep_one_owner"),
+            models.CheckConstraint(condition=(
+                Q(purpose="production", execution_instance_version__isnull=False, deployment_smoke__isnull=True, workflow_smoke__isnull=True)
+                | Q(purpose="instance_smoke", execution_instance_version__isnull=False, stage_run__isnull=True, asset_job__isnull=True)
+                | Q(purpose="resource_smoke", execution_instance_version__isnull=True, stage_run__isnull=True, asset_job__isnull=True)
+            ), name="ck_exec_prep_purpose"),
+            models.UniqueConstraint(fields=("stage_run", "unit_key", "request_key"), condition=Q(stage_run__isnull=False), name="uk_exec_prep_stage_request"),
+            models.UniqueConstraint(fields=("asset_job",), condition=Q(asset_job__isnull=False), name="uk_exec_prep_asset_job"),
+            models.UniqueConstraint(fields=("deployment_smoke",), condition=Q(deployment_smoke__isnull=False), name="uk_exec_prep_deploy_smoke"),
+            models.UniqueConstraint(fields=("workflow_smoke",), condition=Q(workflow_smoke__isnull=False), name="uk_exec_prep_workflow_smoke"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_exec_prep_revision"),
+            models.CheckConstraint(condition=(Q(evaluation_revision__isnull=True, evaluated_at__isnull=True)
+                | Q(evaluation_revision__isnull=False, evaluation_revision__gte=1, evaluation_revision__lte=models.F("revision"), evaluated_at__isnull=False)), name="ck_exec_prep_evaluation"),
+            models.CheckConstraint(condition=Q(status__in=("awaiting_input", "preparing", "awaiting_review", "blocked", "ready", "dispatched", "cancelled")), name="ck_exec_prep_status"),
+            models.CheckConstraint(condition=(Q(claim_token__isnull=True, claim_until__isnull=True) | Q(claim_token__isnull=False, claim_until__isnull=False)), name="ck_exec_prep_claim"),
+            models.CheckConstraint(condition=(Q(request_sha256__isnull=True, request_frozen_at__isnull=True) | Q(request_sha256__isnull=False, request_frozen_at__isnull=False)), name="ck_exec_prep_frozen"),
+            models.CheckConstraint(condition=(~Q(status__in=("ready", "dispatched")) | Q(request_sha256__isnull=False, request_frozen_at__isnull=False)), name="ck_exec_prep_ready_request"),
+            models.CheckConstraint(condition=(Q(request_frozen_at__isnull=True) | Q(status__in=("ready", "dispatched", "cancelled"))), name="ck_exec_prep_frozen_status"),
+        ]
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
+
+
+class ExecutionResourceConfirmation(UUIDTimeStampedModel):
+    """Append-only, exact-request human acknowledgement of business thresholds."""
+
+    preparation = models.ForeignKey(ExecutionPreparation, on_delete=models.PROTECT, related_name="resource_confirmations")
+    fingerprint = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    policy_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    confirmed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT)
+    evidence = models.JSONField()
+    evidence_schema_version = models.PositiveIntegerField(default=1)
+    evidence_size_bytes = models.PositiveIntegerField(default=2, validators=[MaxValueValidator(65536)])
+    evidence_sha256 = models.CharField(max_length=64, default="", validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+
+    _SNAPSHOT_FIELDS = frozenset(("preparation_id", "fingerprint", "policy_sha256", "confirmed_by_id", "evidence",
+        "evidence_schema_version", "evidence_size_bytes", "evidence_sha256"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("preparation", "fingerprint"), name="uk_exec_resource_confirmation")]
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
+
+
+class ExecutionCapacityObservation(UUIDTimeStampedModel):
+    """One derived successful-call sample, owned by the original preparation.
+
+    A nullable match key means dimensions are incomplete, not certified zero.
+    Hot lookups select only the indexed key/time; details are read on demand.
+    Deleting the original preparation removes its derived observation.
+    """
+
+    preparation = models.OneToOneField(ExecutionPreparation, on_delete=models.CASCADE, related_name="capacity_observation")
+    execution_instance_version = models.ForeignKey(ModelExecutionInstanceVersion, on_delete=models.PROTECT,
+        db_index=False, related_name="capacity_observations")
+    request_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    signature_sha256 = models.CharField(max_length=64, null=True, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    observed_at = models.DateTimeField()
+    elapsed_ms = models.PositiveBigIntegerField()
+    details = models.JSONField()
+    details_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    details_size_bytes = models.PositiveIntegerField(validators=[MaxValueValidator(65536)])
+    details_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+
+    _SNAPSHOT_FIELDS = frozenset(("preparation_id", "execution_instance_version_id", "request_sha256",
+        "signature_sha256", "observed_at", "elapsed_ms", "details", "details_schema_version", "details_size_bytes", "details_sha256"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        ordering = ("-observed_at", "-id")
+        indexes = [models.Index(fields=("execution_instance_version", "signature_sha256", "-observed_at", "-id"), name="idx_exec_capacity_sample")]
+        constraints = [models.CheckConstraint(condition=Q(details_size_bytes__lte=65536), name="ck_exec_capacity_detail_size")]
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
+
+
+class ExecutionPreparationContract(UUIDTimeStampedModel):
+    """Low-frequency immutable intent and write-once finalized request."""
+
+    preparation = models.OneToOneField(ExecutionPreparation, on_delete=models.CASCADE, related_name="contract")
+    intent = models.JSONField()
+    intent_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    intent_size_bytes = models.PositiveIntegerField(validators=[MinValueValidator(2)])
+    intent_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    resolved_inputs = models.JSONField()
+    resolved_inputs_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    resolved_inputs_size_bytes = models.PositiveIntegerField(validators=[MinValueValidator(2)])
+    resolved_inputs_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    review_contract = models.JSONField()
+    review_contract_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    review_contract_size_bytes = models.PositiveIntegerField(validators=[MaxValueValidator(65536)])
+    review_contract_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    prepared_request_key = models.CharField(max_length=191, null=True, blank=True)
+    prepared_request_schema_version = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
+    prepared_request_size_bytes = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(2)])
+    prepared_request_sha256 = models.CharField(max_length=64, null=True, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    evaluation = models.JSONField(null=True, blank=True)
+    evaluation_schema_version = models.PositiveIntegerField(null=True, blank=True, validators=[MinValueValidator(1)])
+    evaluation_size_bytes = models.PositiveIntegerField(null=True, blank=True, validators=[MaxValueValidator(65536)])
+    evaluation_sha256 = models.CharField(max_length=64, null=True, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+
+    _SNAPSHOT_FIELDS = frozenset(("preparation_id",)) | frozenset(
+        name + suffix for name in ("intent", "resolved_inputs", "review_contract")
+        for suffix in ("", "_schema_version", "_size_bytes", "_sha256")
+    )
+    _WRITE_ONCE_FIELDS = frozenset("prepared_request" + suffix for suffix in ("_key", "_schema_version", "_size_bytes", "_sha256"))
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(condition=Q(intent_schema_version__gte=1, resolved_inputs_schema_version__gte=1, review_contract_schema_version__gte=1, intent_size_bytes__gte=2, resolved_inputs_size_bytes__gte=2, review_contract_size_bytes__lte=65536), name="ck_exec_prep_contract_size"),
+            models.CheckConstraint(condition=(
+                Q(prepared_request_key__isnull=True, prepared_request_schema_version__isnull=True, prepared_request_size_bytes__isnull=True, prepared_request_sha256__isnull=True)
+                | Q(prepared_request_key__isnull=False, prepared_request_schema_version__isnull=False, prepared_request_size_bytes__isnull=False, prepared_request_sha256__isnull=False, prepared_request_schema_version=1, prepared_request_size_bytes__gte=2)
+            ), name="ck_exec_prepared_metadata"),
+            models.CheckConstraint(condition=(
+                Q(evaluation__isnull=True, evaluation_schema_version__isnull=True, evaluation_size_bytes__isnull=True, evaluation_sha256__isnull=True)
+                | Q(evaluation__isnull=False, evaluation_schema_version__isnull=False, evaluation_size_bytes__isnull=False,
+                    evaluation_sha256__isnull=False, evaluation_schema_version__gte=1, evaluation_size_bytes__lte=65536)
+            ), name="ck_exec_evaluation_metadata"),
+        ]
+
+    def clean(self):
+        from studio.services.json_contracts import verify_json_contract
+        from studio.services.execution_instances import execution_configuration_max_bytes
+        from studio.services.execution_request_storage import execution_request_max_bytes
+
+        super().clean()
+        for name in ("intent", "resolved_inputs", "review_contract", "evaluation"):
+            value = getattr(self, name)
+            if name == "evaluation" and value is None:
+                continue
+            if not isinstance(value, dict):
+                raise ValidationError({name: "准备合同必须是明确对象"})
+            verify_json_contract(value, schema_version=getattr(self, f"{name}_schema_version"), size_bytes=getattr(self, f"{name}_size_bytes"), sha256=getattr(self, f"{name}_sha256"), max_bytes=(execution_request_max_bytes() if name in {"intent", "resolved_inputs"} else execution_configuration_max_bytes()))
+        if self.preparation_id and self.intent_sha256 != self.preparation.intent_sha256:
+            raise ValidationError({"intent_sha256": "准备索引与详情的意图摘要不一致"})
+        from studio.services.execution_request_storage import read_request
+        read_request(self, "prepared_request")
+
+    @property
+    def prepared_request(self):
+        from studio.services.execution_request_storage import read_request
+        return read_request(self, "prepared_request")
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        self.clean()
+        super().save(*args, **kwargs)
+
+
+class ExecutionFieldValue(UUIDTimeStampedModel):
+    class Origin(models.TextChoices):
+        SERVER = "server", "服务器派生"
+        MANUAL = "manual", "人工填写"
+        MODEL = "model", "真实模型结果"
+
+    class Status(models.TextChoices):
+        PENDING = "pending", "待确认"
+        CONFIRMED = "confirmed", "已确认"
+        REJECTED = "rejected", "已拒绝"
+
+    class Approval(models.TextChoices):
+        HUMAN = "human", "人工审核"
+        POLICY = "policy", "明确策略批准"
+        SERVER_DERIVED = "server_derived", "来源确定性派生"
+
+    preparation = models.ForeignKey(ExecutionPreparation, on_delete=models.CASCADE, related_name="field_values", db_index=False)
+    unit_key = models.CharField(max_length=191)
+    field_key = models.CharField(max_length=100)
+    revision = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    source_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    field_contract_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    text = models.TextField()
+    text_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    origin_kind = models.CharField(max_length=16, choices=Origin.choices)
+    origin_attempt = models.ForeignKey("GenerationAttempt", on_delete=models.PROTECT, null=True, blank=True, related_name="execution_field_values")
+    origin_asset_job = models.ForeignKey("AssetGenerationJob", on_delete=models.PROTECT, null=True, blank=True, related_name="execution_field_values")
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="execution_field_values")
+    status = models.CharField(max_length=16, choices=Status.choices)
+    approval_kind = models.CharField(max_length=24, choices=Approval.choices, null=True, blank=True)
+    reviewed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True, related_name="reviewed_execution_fields")
+    reviewed_at = models.DateTimeField(null=True, blank=True)
+    approval_policy_sha256 = models.CharField(max_length=64, null=True, blank=True, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+
+    _SNAPSHOT_FIELDS = frozenset((
+        "preparation_id", "unit_key", "field_key", "revision", "source_sha256", "field_contract_sha256",
+        "text", "text_sha256", "origin_kind", "origin_attempt_id", "origin_asset_job_id", "created_by_id",
+    ))
+    _WRITE_ONCE_FIELDS = frozenset()
+    _REVIEW_FIELDS = frozenset(("status", "approval_kind", "reviewed_by_id", "reviewed_at", "approval_policy_sha256"))
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        ordering = ("unit_key", "field_key", "revision")
+        constraints = [
+            models.UniqueConstraint(fields=("preparation", "unit_key", "field_key", "revision"), name="uk_exec_field_revision"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_exec_field_revision"),
+            models.CheckConstraint(condition=(
+                Q(origin_kind__in=("manual", "server"), origin_attempt__isnull=True, origin_asset_job__isnull=True)
+                | Q(origin_kind="model", origin_attempt__isnull=False, origin_asset_job__isnull=True)
+                | Q(origin_kind="model", origin_attempt__isnull=True, origin_asset_job__isnull=False)
+            ), name="ck_exec_field_origin"),
+            models.CheckConstraint(condition=(
+                Q(status="pending", approval_kind__isnull=True, reviewed_by__isnull=True, reviewed_at__isnull=True, approval_policy_sha256__isnull=True)
+                | Q(status="rejected", approval_kind__isnull=True, reviewed_by__isnull=False, reviewed_at__isnull=False, approval_policy_sha256__isnull=True)
+                | (Q(status="confirmed", reviewed_at__isnull=False) & (
+                    Q(approval_kind="human", reviewed_by__isnull=False, approval_policy_sha256__isnull=True)
+                    | Q(approval_kind="policy", approval_policy_sha256__isnull=False)
+                    | Q(approval_kind="server_derived", origin_kind="server", approval_policy_sha256__isnull=True)
+                ))
+            ), name="ck_exec_field_approval"),
+        ]
+
+    def clean(self):
+        import hashlib
+        from studio.services.execution_instances import execution_configuration_max_bytes
+
+        super().clean()
+        if not isinstance(self.text, str):
+            raise ValidationError({"text": "字段正文必须是文本"})
+        try:
+            encoded = self.text.encode("utf-8")
+        except UnicodeError as exc:
+            raise ValidationError({"text": "字段正文包含无效字符"}) from exc
+        if len(encoded) > execution_configuration_max_bytes():
+            raise ValidationError({"text": "字段正文超出存储边界，请使用受管内容引用"})
+        if hashlib.sha256(encoded).hexdigest() != self.text_sha256:
+            raise ValidationError({"text_sha256": "字段正文与摘要不一致"})
+
+    def save(self, *args, **kwargs):
+        _require_unfrozen_preparation(self.preparation_id)
+        _validate_execution_snapshot_update(self)
+        if not self._state.adding:
+            review_fields = ("status", "approval_kind", "reviewed_by_id", "reviewed_at", "approval_policy_sha256")
+            old = type(self).objects.filter(pk=self.pk).values(*review_fields).get()
+            if old["status"] != "pending" and any(old[name] != getattr(self, name) for name in review_fields):
+                raise ValidationError("已确认或拒绝的字段不可重新审批，请创建新修订")
+        self.clean()
+        super().save(*args, **kwargs)
+
+
+class ExecutionFieldSelection(UUIDTimeStampedModel):
+    """Explicit choice; a newer confirmed field never replaces it implicitly."""
+
+    preparation = models.ForeignKey(ExecutionPreparation, on_delete=models.CASCADE, related_name="field_selections", db_index=False)
+    unit_key = models.CharField(max_length=191)
+    field_key = models.CharField(max_length=100)
+    field_value = models.ForeignKey(ExecutionFieldValue, on_delete=models.PROTECT, related_name="selections")
+    revision = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    selected_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="execution_field_selections")
+    selected_at = models.DateTimeField()
+
+    _SNAPSHOT_FIELDS = frozenset(("preparation_id", "unit_key", "field_key"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    _REVIEW_FIELDS = frozenset(("field_value_id", "revision", "selected_by_id", "selected_at"))
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        ordering = ("unit_key", "field_key")
+        constraints = [
+            models.UniqueConstraint(fields=("preparation", "unit_key", "field_key"), name="uk_exec_field_selection"),
+            models.CheckConstraint(condition=Q(revision__gte=1), name="ck_exec_selection_revision"),
+        ]
+
+    def clean(self):
+        super().clean()
+        value = self.field_value
+        if value.status != "confirmed" or value.unit_key != self.unit_key or value.field_key != self.field_key:
+            raise ValidationError({"field_value": "只能采用相同单元与字段的已确认修订"})
+
+    def save(self, *args, **kwargs):
+        _require_unfrozen_preparation(self.preparation_id)
+        _validate_execution_snapshot_update(self)
+        self.clean()
+        super().save(*args, **kwargs)
+
+
 class WorkflowProjectorQuerySet(models.QuerySet):
     """Preserve the stable family identity outside the API serializer too."""
 
@@ -2563,13 +3830,6 @@ class ComfyWorkflowSource(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="comfy_sources",
     )
-    generated_workflow = models.ForeignKey(
-        GeneratedWorkflow,
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="comfy_sources",
-    )
     generation_task = models.ForeignKey(
         GenerationTask,
         null=True,
@@ -2599,20 +3859,17 @@ class ComfyWorkflowSource(UUIDTimeStampedModel):
                     Q(
                         import_kind="template_version",
                         workflow_version__isnull=False,
-                        generated_workflow__isnull=True,
                         generation_task__isnull=True,
                     )
                     | Q(import_kind="execution_snapshot", workflow_version__isnull=True)
                     | Q(
                         import_kind="candidate",
                         workflow_version__isnull=True,
-                        generated_workflow__isnull=True,
                         generation_task__isnull=True,
                     )
                     | Q(
                         import_kind="ignored",
                         workflow_version__isnull=True,
-                        generated_workflow__isnull=True,
                         generation_task__isnull=True,
                     )
                 ),
@@ -2639,6 +3896,28 @@ class ComfyWorkflowSource(UUIDTimeStampedModel):
 
     def delete(self, *args, **kwargs):
         raise ValidationError("ComfyWorkflowSource 是不可变来源事实")
+
+
+class ComfyWorkflowPreviewReceipt(UUIDTimeStampedModel):
+    """One actor's committed preview request; never a new execution contract."""
+
+    owner = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    request_key = models.CharField(max_length=191)
+    deployment = models.ForeignKey(ModelDeployment, on_delete=models.CASCADE)
+    contract_draft = models.ForeignKey("ComfyWorkflowContractDraft", on_delete=models.CASCADE)
+    request_sha256 = models.CharField(max_length=64)
+    response = models.JSONField()
+    response_schema_version = models.PositiveIntegerField(default=1)
+    response_size_bytes = models.PositiveIntegerField()
+    response_sha256 = models.CharField(max_length=64)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("owner", "request_key"), name="uk_comfy_preview_receipt_key")]
+
+    def save(self, *args, **kwargs):
+        if self.pk and type(self).objects.filter(pk=self.pk).exists():
+            raise ValidationError("工作流合同请求回执不可修改")
+        return super().save(*args, **kwargs)
 
 
 class ImmutableComfyWorkflowContractDraftQuerySet(models.QuerySet):
@@ -2748,6 +4027,7 @@ class WorkflowSmokeAttemptQuerySet(models.QuerySet):
         "workflow_version", "workflow_version_id",
         "deployment", "deployment_id", "created_by", "created_by_id",
         "submission_token",
+        "scope", "execution_instance_version", "execution_instance_version_id",
         "graph_sha256", "execution_contract_sha256",
         "validation_evidence_sha256", "target_sha256",
         "fixture_values", "fixture_values_schema_version",
@@ -2769,10 +4049,16 @@ class WorkflowSmokeAttemptManager(
     pass
 
 
+class ExecutionSmokeScope(models.TextChoices):
+    RESOURCE = "resource", "基础资源验收"
+    INSTANCE = "instance", "执行实例组合验收"
+
+
 class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     """Durable, single-submit execution of one workflow smoke test."""
 
     class Status(models.TextChoices):
+        PREPARING = "preparing", "准备请求"
         QUEUED = "queued", "排队中"
         SUBMITTING = "submitting", "正在提交"
         RUNNING = "running", "执行中"
@@ -2782,6 +4068,15 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
         CANCELLED = "cancelled", "已取消"
         UNCERTAIN = "uncertain", "远端状态不确定"
 
+    scope = models.CharField(max_length=16, choices=ExecutionSmokeScope.choices, default=ExecutionSmokeScope.RESOURCE)
+    idempotency_key = models.CharField(max_length=191, blank=True)
+    allow_external_calls = models.BooleanField(default=False)
+    budget_limit = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    estimated_cost = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    actual_cost = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    cost_currency = models.CharField(max_length=12, blank=True)
+    execution_instance_version = models.ForeignKey("ModelExecutionInstanceVersion", on_delete=models.PROTECT,
+        null=True, blank=True, db_index=False, related_name="workflow_smoke_attempts")
     workflow_version = models.ForeignKey(
         WorkflowTemplateVersion,
         on_delete=models.PROTECT,
@@ -2809,6 +4104,7 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     fixture_values_size_bytes = models.PositiveIntegerField(default=2)
     fixture_values_sha256 = models.CharField(max_length=64, blank=True)
     fixture_sha256 = models.CharField(max_length=64, blank=True)
+    staged_inputs = models.JSONField(default=list, blank=True)
     claim_token = models.UUIDField(null=True, blank=True, editable=False, db_index=True)
     worker_id = models.CharField(max_length=160, blank=True)
     claimed_at = models.DateTimeField(null=True, blank=True)
@@ -2819,10 +4115,10 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     next_poll_at = models.DateTimeField(null=True, blank=True, db_index=True)
     poll_count = models.PositiveIntegerField(default=0)
     remote_status = models.CharField(max_length=120, blank=True)
-    deadline_started_at = models.DateTimeField()
-    hard_deadline_at = models.DateTimeField(db_index=True)
-    idle_deadline_at = models.DateTimeField(db_index=True)
-    last_meaningful_progress_at = models.DateTimeField()
+    deadline_started_at = models.DateTimeField(null=True, blank=True)
+    hard_deadline_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    idle_deadline_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    last_meaningful_progress_at = models.DateTimeField(null=True, blank=True)
     progress_marker = models.CharField(max_length=191, blank=True)
     cancel_requested_at = models.DateTimeField(null=True, blank=True)
     cancel_submitted_at = models.DateTimeField(null=True, blank=True)
@@ -2831,14 +4127,22 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
     error_message = models.TextField(blank=True)
     result = models.JSONField(default=dict, blank=True)
     objects = WorkflowSmokeAttemptManager()
+    result_schema_version = models.PositiveIntegerField(default=1)
+    result_size_bytes = models.PositiveIntegerField(default=2)
+    result_sha256 = models.CharField(max_length=64, blank=True)
+    evidence_expires_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ("-created_at",)
         constraints = [
+            models.CheckConstraint(condition=(Q(scope="resource", execution_instance_version__isnull=True)
+                | Q(scope="instance", execution_instance_version__isnull=False)), name="ck_workflow_smoke_scope"),
+            models.UniqueConstraint(fields=("execution_instance_version", "idempotency_key"), condition=Q(scope="instance"), name="uq_workflow_instance_smoke_key"),
+            models.CheckConstraint(condition=Q(budget_limit__isnull=True) | Q(budget_limit__gte=0), name="ck_workflow_smoke_budget"),
             models.UniqueConstraint(
                 fields=("workflow_version", "deployment"),
                 condition=Q(status__in=(
-                    "queued", "submitting", "running", "cancel_requested",
+                    "preparing", "queued", "submitting", "running", "cancel_requested",
                 )),
                 name="one_active_workflow_smoke",
             ),
@@ -2846,10 +4150,12 @@ class WorkflowSmokeAttempt(UUIDTimeStampedModel):
         indexes = [models.Index(
             fields=("status", "next_poll_at"),
             name="studio_work_status_70a205_idx",
-        )]
+        ), models.Index(fields=("execution_instance_version", "-finished_at", "-id"),
+            condition=Q(execution_instance_version__isnull=False), name="idx_workflow_instance_smoke")]
 
     _IMMUTABLE_EXECUTION_FIELDS = (
         "workflow_version_id", "deployment_id", "created_by_id", "submission_token",
+        "scope", "execution_instance_version_id", "idempotency_key",
         "graph_sha256", "execution_contract_sha256",
         "validation_evidence_sha256", "target_sha256",
         "fixture_values", "fixture_values_schema_version",
@@ -3386,11 +4692,6 @@ class HostCapabilitySnapshot(UUIDTimeStampedModel):
 class ModelDeploymentCapabilitySnapshot(UUIDTimeStampedModel):
     """Immutable evidence from a real deployment probe or smoke-test."""
 
-    # Null means historical/unscoped evidence, never a certified prompt strategy.
-    prompt_profile_binding = models.ForeignKey(
-        "PromptProfileBinding", null=True, blank=True, on_delete=models.PROTECT,
-        related_name="deployment_smoke_snapshots",
-    )
     prompt_profile_version = models.ForeignKey(
         "PromptProfileVersion", null=True, blank=True, on_delete=models.PROTECT,
         related_name="deployment_smoke_snapshots",
@@ -3439,13 +4740,30 @@ class ModelDeploymentCapabilitySnapshot(UUIDTimeStampedModel):
         indexes = [models.Index(fields=("deployment", "probe_kind", "status", "expires_at"))]
 
 
+class ModelDeploymentSmokeAttemptQuerySet(models.QuerySet):
+    _IDENTITY_FIELDS = frozenset(("scope", "execution_instance_version", "execution_instance_version_id",
+        "deployment", "deployment_id", "operation", "target_sha256"))
+
+    def without_operator_resolution(self):
+        # System transport observations are not decisions about remote state.
+        return self.exclude(resolutions__outcome__in=ModelDeploymentSmokeAttemptResolution.OPERATOR_OUTCOMES)
+
+    def update(self, **kwargs):
+        if self._IDENTITY_FIELDS & set(kwargs):
+            raise ValidationError("部署验收范围与执行身份不能批量改写")
+        return super().update(**kwargs)
+
+
 class ModelDeploymentSmokeAttempt(UUIDTimeStampedModel):
     """Durable single-submit boundary for one real deployment smoke request."""
 
-    prompt_profile_binding = models.ForeignKey(
-        "PromptProfileBinding", null=True, blank=True, on_delete=models.PROTECT,
-        related_name="deployment_smoke_attempts",
-    )
+    scope = models.CharField(max_length=16, choices=ExecutionSmokeScope.choices, default=ExecutionSmokeScope.RESOURCE)
+    allow_external_calls = models.BooleanField(default=False)
+    budget_limit = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    actual_cost = models.DecimalField(max_digits=14, decimal_places=6, null=True, blank=True)
+    execution_instance_version = models.ForeignKey("ModelExecutionInstanceVersion", on_delete=models.PROTECT,
+        null=True, blank=True, db_index=False, related_name="deployment_smoke_attempts")
+
     prompt_profile_version = models.ForeignKey(
         "PromptProfileVersion", null=True, blank=True, on_delete=models.PROTECT,
         related_name="deployment_smoke_attempts",
@@ -3453,6 +4771,7 @@ class ModelDeploymentSmokeAttempt(UUIDTimeStampedModel):
     prompt_profile_contract_sha256 = models.CharField(max_length=64, blank=True)
 
     class Status(models.TextChoices):
+        PREPARING = "preparing", "准备请求"
         QUEUED = "queued", "排队中"
         SUBMITTING = "submitting", "正在提交"
         SUBMITTED = "submitted", "已提交"
@@ -3483,7 +4802,7 @@ class ModelDeploymentSmokeAttempt(UUIDTimeStampedModel):
     worker_id = models.CharField(max_length=160, blank=True)
     claimed_at = models.DateTimeField(null=True, blank=True)
     heartbeat_at = models.DateTimeField(null=True, blank=True)
-    submission_started_at = models.DateTimeField(default=timezone.now)
+    submission_started_at = models.DateTimeField(null=True, blank=True)
     submitted_at = models.DateTimeField(null=True, blank=True)
     last_polled_at = models.DateTimeField(null=True, blank=True)
     next_poll_at = models.DateTimeField(null=True, blank=True, db_index=True)
@@ -3506,29 +4825,51 @@ class ModelDeploymentSmokeAttempt(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="smoke_attempt",
     )
+    result = models.JSONField(default=dict, blank=True)
+    result_schema_version = models.PositiveIntegerField(default=1)
+    result_size_bytes = models.PositiveIntegerField(default=2)
+    result_sha256 = models.CharField(max_length=64, blank=True)
+    evidence_expires_at = models.DateTimeField(null=True, blank=True)
+    objects = models.Manager.from_queryset(ModelDeploymentSmokeAttemptQuerySet)()
+
+    def save(self, *args, **kwargs):
+        fields = ("scope", "execution_instance_version_id", "deployment_id", "operation", "target_sha256")
+        if self.pk:
+            prior = type(self).objects.filter(pk=self.pk).values(*fields).first()
+            if prior is not None and any(prior[key] != getattr(self, key) for key in fields):
+                raise ValidationError("部署验收范围与执行身份不可变")
+        return super().save(*args, **kwargs)
 
     class Meta:
         ordering = ("deployment", "-created_at")
-        constraints = [models.UniqueConstraint(
+        constraints = [models.CheckConstraint(condition=(Q(scope="resource", execution_instance_version__isnull=True)
+            | Q(scope="instance", execution_instance_version__isnull=False)), name="ck_deployment_smoke_scope"), models.UniqueConstraint(
+            fields=("execution_instance_version", "idempotency_key"), condition=Q(scope="instance"), name="uq_deploy_instance_smoke_key"), models.CheckConstraint(
+            condition=Q(budget_limit__isnull=True) | Q(budget_limit__gte=0), name="ck_deployment_smoke_budget"), models.UniqueConstraint(
             fields=("deployment", "operation"),
             condition=Q(status__in=(
-                "queued", "submitting", "submitted", "cancel_requested",
+                "preparing", "queued", "submitting", "submitted", "cancel_requested",
             )),
             name="one_active_deployment_smoke",
         )]
         indexes = [models.Index(
             fields=("deployment", "operation", "status", "created_at"),
             name="studio_smoke_unresolved_idx",
-        )]
+        ), models.Index(fields=("execution_instance_version", "-finished_at", "-id"),
+            condition=Q(execution_instance_version__isnull=False), name="idx_deploy_instance_smoke")]
 
 
 class ModelDeploymentSmokeAttemptResolution(UUIDTimeStampedModel):
-    """Append-only operator evidence resolving an uncertain smoke submission."""
+    """Append-only system observations and explicit operator decisions."""
 
     class Outcome(models.TextChoices):
+        HTTP_BODY_PREPARED = "http_body_prepared", "HTTP正文已序列化（未证明送达）"
         CONFIRMED_NOT_SUBMITTED = "confirmed_not_submitted", "确认未提交"
         CONFIRMED_REMOTE_SUBMITTED = "confirmed_remote_submitted", "确认远端已提交"
         CONFIRMED_REMOTE_FAILED = "confirmed_remote_failed", "确认远端失败"
+
+    OPERATOR_OUTCOMES = (Outcome.CONFIRMED_NOT_SUBMITTED, Outcome.CONFIRMED_REMOTE_SUBMITTED, Outcome.CONFIRMED_REMOTE_FAILED)
+    OPERATOR_CHOICES = tuple((outcome.value, outcome.label) for outcome in OPERATOR_OUTCOMES)
 
     attempt = models.ForeignKey(
         ModelDeploymentSmokeAttempt,
@@ -3545,6 +4886,8 @@ class ModelDeploymentSmokeAttemptResolution(UUIDTimeStampedModel):
     note = models.TextField(blank=True)
     decided_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
         on_delete=models.PROTECT,
         related_name="deployment_smoke_attempt_resolutions",
     )
@@ -3751,13 +5094,6 @@ class RecommendationDecision(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="recommendation_decisions",
     )
-    recipe_version = models.ForeignKey(
-        "ProductionRecipeVersion",
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="recommendation_decisions",
-    )
     override_values = models.JSONField(default=dict, blank=True)
     override_values_schema_version = models.PositiveIntegerField(default=1)
     override_values_size_bytes = models.PositiveIntegerField(default=2)
@@ -3885,6 +5221,20 @@ class ScriptRevision(UUIDTimeStampedModel):
         ]
 
 
+class ScriptRevisionStructure(models.Model):
+    """On-demand structured detail of the existing script revision, not a candidate queue."""
+
+    revision = models.OneToOneField(ScriptRevision, primary_key=True, on_delete=models.CASCADE,
+        related_name="structured_content")
+    output_version = models.ForeignKey(BusinessOutputVersion, on_delete=models.PROTECT,
+        related_name="script_revision_structures")
+    document = models.JSONField()
+    document_schema_version = models.PositiveIntegerField()
+    document_size_bytes = models.PositiveIntegerField()
+    document_sha256 = models.CharField(max_length=64)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+
 class ProductionRecipeVersion(UUIDTimeStampedModel):
     class Status(models.TextChoices):
         DRAFT = "draft", "草稿"
@@ -3925,8 +5275,13 @@ class ProductionRecipeVersion(UUIDTimeStampedModel):
 
 
 class ProductionRun(UUIDTimeStampedModel):
+    class PlanSource(models.TextChoices):
+        RECIPE = "recipe", "配方生产"
+        MANUAL = "manual", "人工逐步制作"
+
     class Status(models.TextChoices):
         QUEUED = "queued", "排队中"
+        AWAITING_INPUT = "awaiting_input", "等待人工操作"
         RUNNING = "running", "运行中"
         AWAITING_APPROVAL = "awaiting_approval", "待审批"
         BLOCKED = "blocked", "已阻塞"
@@ -3951,11 +5306,20 @@ class ProductionRun(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="production_runs",
     )
+    # Current manual choice references its original decision. Per-stage
+    # revisions are not a global ordering and timestamps are not selection.
+    script_adoption_decision = models.ForeignKey(
+        "ApprovalDecision", null=True, blank=True, on_delete=models.RESTRICT,
+        related_name="script_selected_by_runs", db_index=False,
+    )
     recipe_version = models.ForeignKey(
         ProductionRecipeVersion,
+        null=True,
+        blank=True,
         on_delete=models.PROTECT,
         related_name="production_runs",
     )
+    plan_source = models.CharField(max_length=6, choices=PlanSource.choices)
     config_revision = models.ForeignKey(
         ConfigRevision,
         null=True,
@@ -3970,12 +5334,10 @@ class ProductionRun(UUIDTimeStampedModel):
     blocked_code = models.CharField(max_length=100, blank=True)
     blocked_reason = models.TextField(blank=True)
     allow_external_calls = models.BooleanField(default=False)
-    budget_limit = models.DecimalField(max_digits=12, decimal_places=4, null=True, blank=True)
     cost_currency = models.CharField(max_length=12, blank=True)
     estimated_cost_total = models.DecimalField(max_digits=14, decimal_places=6, default=0)
     committed_cost_total = models.DecimalField(max_digits=14, decimal_places=6, default=0)
     actual_cost_total = models.DecimalField(max_digits=14, decimal_places=6, default=0)
-    max_generation_tasks = models.PositiveIntegerField(default=0)
     generation_task_count = models.PositiveIntegerField(default=0)
     config_snapshot = models.JSONField(default=dict)
     config_snapshot_schema_version = models.PositiveIntegerField(default=1)
@@ -3995,10 +5357,8 @@ class ProductionRun(UUIDTimeStampedModel):
                 fields=("owner", "idempotency_key"),
                 name="unique_production_run_idempotency",
             ),
-            models.CheckConstraint(
-                condition=Q(budget_limit__isnull=True) | Q(budget_limit__gte=0),
-                name="production_run_budget_nonnegative",
-            ),
+            models.CheckConstraint(condition=(Q(plan_source="recipe", recipe_version__isnull=False)
+                | Q(plan_source="manual", recipe_version__isnull=True)), name="ck_run_plan_source"),
             models.CheckConstraint(
                 condition=(
                     Q(estimated_cost_total__gte=0)
@@ -4008,7 +5368,167 @@ class ProductionRun(UUIDTimeStampedModel):
                 name="production_run_costs_nonnegative",
             ),
         ]
-        indexes = [models.Index(fields=("owner", "status", "created_at"))]
+        indexes = [
+            models.Index(fields=("owner", "status", "created_at")),
+            models.Index(fields=("plan_source", "status", "id"), name="idx_run_auto_advance"),
+        ]
+
+
+class ProductionRunPlan(UUIDTimeStampedModel):
+    """One immutable execution plan; recipe/catalog are its creation sources."""
+
+    run = models.OneToOneField(ProductionRun, on_delete=models.CASCADE, related_name="execution_plan")
+    source = models.CharField(max_length=6, choices=ProductionRun.PlanSource.choices)
+    stage_catalog_key = models.CharField(max_length=100)
+    stage_catalog_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    stage_catalog_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    definition = models.JSONField()
+    definition_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    definition_size_bytes = models.PositiveIntegerField(validators=[MaxValueValidator(65536)])
+    definition_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="production_run_plans")
+
+    _SNAPSHOT_FIELDS = frozenset(("run_id", "source", "stage_catalog_key", "stage_catalog_version", "stage_catalog_sha256",
+        "definition", "definition_schema_version", "definition_size_bytes", "definition_sha256", "created_by_id"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=Q(definition_schema_version=1, definition_size_bytes__lte=65536),
+            name="ck_run_plan_definition_size")]
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
+
+
+class ProductionStageInputAmendmentQuerySet(ExecutionSnapshotQuerySet):
+    def delete(self):
+        raise ValidationError("阶段输入修订是不可变审计事实，不能删除")
+
+
+class ProductionStageInputAmendment(UUIDTimeStampedModel):
+    """An explicit pre-execution correction; the original RunPlan stays immutable."""
+
+    stage_run = models.OneToOneField("StageRun", on_delete=models.PROTECT, related_name="input_amendment")
+    evidence = models.JSONField()
+    evidence_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    evidence_size_bytes = models.PositiveIntegerField(validators=[MaxValueValidator(65536)])
+    evidence_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT,
+        related_name="production_stage_input_amendments")
+
+    _SNAPSHOT_FIELDS = frozenset(("stage_run_id", "evidence", "evidence_schema_version",
+        "evidence_size_bytes", "evidence_sha256", "created_by_id"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    objects = models.Manager.from_queryset(ProductionStageInputAmendmentQuerySet)()
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=Q(evidence_schema_version=1, evidence_size_bytes__lte=65536),
+            name="ck_stage_input_amendment_size")]
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        raise ValidationError("阶段输入修订是不可变审计事实，不能删除")
+
+
+class ProductionManualCommand(UUIDTimeStampedModel):
+    """Atomic action receipt; never another task state or output store."""
+
+    class Action(models.TextChoices):
+        GENERATE = "generate", "生成候选"
+        RETRY = "retry", "重试失败主调用"
+        ADOPT = "adopt", "采用已有内容"
+        SELECT = "select", "选择镜头素材"
+        APPROVE = "approve", "批准"
+        ASSEMBLE = "assemble", "装配"
+        DELIVER = "deliver", "交付"
+
+    run = models.ForeignKey(ProductionRun, on_delete=models.CASCADE, related_name="manual_commands")
+    stage_run = models.ForeignKey("StageRun", null=True, blank=True, on_delete=models.PROTECT, related_name="manual_commands")
+    action = models.CharField(max_length=8, choices=Action.choices)
+    idempotency_key = models.CharField(max_length=191)
+    request_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    created_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name="production_manual_commands")
+    result_kind = models.CharField(max_length=40)
+    target_id = models.UUIDField()
+    result_refs = models.JSONField()
+    result_refs_schema_version = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    result_refs_size_bytes = models.PositiveIntegerField(validators=[MaxValueValidator(65536)])
+    result_refs_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+
+    _SNAPSHOT_FIELDS = frozenset(("run_id", "stage_run_id", "action", "idempotency_key", "request_sha256", "created_by_id",
+        "result_kind", "target_id", "result_refs", "result_refs_schema_version", "result_refs_size_bytes", "result_refs_sha256"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("run", "idempotency_key"), name="uk_manual_command_key"),
+            models.CheckConstraint(condition=Q(result_refs_schema_version=1, result_refs_size_bytes__lte=65536),
+                name="ck_manual_command_refs_size")]
+        ordering = ("-created_at", "-id")
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
+
+
+class ProductionMaterialFulfillment(UUIDTimeStampedModel):
+    """One explicit run choice of an existing version, not a task or approval."""
+
+    class SelectionMode(models.TextChoices):
+        MANUAL = "manual", "人工"
+        AUTOMATIC = "automatic", "自动"
+
+    stage_run = models.ForeignKey("StageRun", on_delete=models.CASCADE, db_index=False,
+        related_name="material_fulfillments")
+    unit_key = models.CharField(max_length=191)
+    requirement_key = models.CharField(max_length=191)
+    run_plan_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    reference_version = models.ForeignKey(AssetReferenceVersion, on_delete=models.PROTECT,
+        related_name="production_fulfillments")
+    target_sha256 = models.CharField(max_length=64, validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    selection_mode = models.CharField(max_length=16, choices=SelectionMode.choices, default=SelectionMode.MANUAL)
+    selected_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="production_material_fulfillments")
+
+    _SNAPSHOT_FIELDS = frozenset(("stage_run_id", "unit_key", "requirement_key", "run_plan_sha256",
+        "reference_version_id", "target_sha256", "selection_mode", "selected_by_id"))
+    _WRITE_ONCE_FIELDS = frozenset()
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=("stage_run", "unit_key"),
+            name="uk_material_fulfillment_unit"), models.CheckConstraint(
+            condition=(Q(selection_mode="manual", selected_by__isnull=False)
+                | Q(selection_mode="automatic", selected_by__isnull=True)),
+            name="material_fulfillment_actor_mode")]
+
+    def clean(self):
+        super().clean()
+        if not ((self.selection_mode == "manual" and self.selected_by_id is not None)
+                or (self.selection_mode == "automatic" and self.selected_by_id is None)):
+            raise ValidationError({"selected_by": "人工选择必须记录操作人，自动选择不能伪造人工身份"})
+        if not self.stage_run_id or not self.reference_version_id:
+            return
+        stage, version = self.stage_run, self.reference_version
+        if (stage.production_run.plan_source != "recipe" or stage.stage_key != "bible_image_generation"
+                or stage.mode != "existing_pipeline"):
+            raise ValidationError({"stage_run": "素材选择必须归属原配方素材阶段"})
+        # Reuse references the original immutable version, including its true
+        # generated origin. The shared reader verifies that origin and bytes.
+        version.clean()
+        if (version.series.owner_id != stage.production_run.owner_id or not version.setting_revision_id
+                or self.requirement_key != f"setting:{version.setting_revision_id}"
+                or self.unit_key != f"appearance:{version.setting_revision.variant_id}"):
+            raise ValidationError({"reference_version": "素材版本与本轮所有者或确切需求不一致"})
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
 
 
 class StageRun(UUIDTimeStampedModel):
@@ -4056,6 +5576,7 @@ class StageRun(UUIDTimeStampedModel):
     output_snapshot_size_bytes = models.PositiveIntegerField(default=2)
     output_snapshot_sha256 = models.CharField(max_length=64, blank=True)
     selected_route_index = models.PositiveSmallIntegerField(null=True, blank=True)
+    selected_variant_route_index = models.PositiveSmallIntegerField(null=True, blank=True)
     approved_estimated_cost = models.DecimalField(
         max_digits=14,
         decimal_places=6,
@@ -4171,7 +5692,12 @@ class ApprovalDecision(UUIDTimeStampedModel):
 
 
 class GenerationAttempt(UUIDTimeStampedModel):
+    class Role(models.TextChoices):
+        PRIMARY = "primary", "主调用"
+        AUXILIARY = "auxiliary", "准备字段调用"
+
     class Status(models.TextChoices):
+        AWAITING_REVIEW = "awaiting_review", "输出待人工处理"
         QUEUED = "queued", "排队中"
         RUNNING = "running", "执行中"
         SUBMITTING = "submitting", "正在提交"
@@ -4186,8 +5712,28 @@ class GenerationAttempt(UUIDTimeStampedModel):
         on_delete=models.CASCADE,
         related_name="generation_attempts",
     )
+    execution_instance_version = models.ForeignKey(
+        ModelExecutionInstanceVersion, on_delete=models.PROTECT, related_name="generation_attempts",
+    )
+    preparation = models.ForeignKey(
+        ExecutionPreparation, on_delete=models.PROTECT, related_name="generation_attempts", db_index=False,
+    )
+    parent_preparation = models.ForeignKey(
+        ExecutionPreparation, on_delete=models.PROTECT, related_name="auxiliary_generation_attempts",
+        null=True, blank=True, db_index=False,
+    )
+    role = models.CharField(max_length=16, choices=Role.choices)
+    auxiliary_purpose = models.CharField(max_length=24, blank=True)
+    field_batch_key = models.CharField(max_length=191, blank=True)
     unit_key = models.CharField(max_length=191)
     attempt_number = models.PositiveIntegerField(validators=[MinValueValidator(1)])
+    retry_of = models.OneToOneField(
+        "self", on_delete=models.PROTECT, null=True, blank=True, related_name="retry_successor",
+    )
+    retry_requested_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True,
+        related_name="requested_generation_retries",
+    )
     model_deployment = models.ForeignKey(
         ModelDeployment,
         null=True,
@@ -4202,7 +5748,6 @@ class GenerationAttempt(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="generation_attempts",
     )
-    prompt_profile_binding_key = models.CharField(max_length=120, blank=True)
     prompt_profile_contract_sha256 = models.CharField(max_length=64, blank=True)
     generation_task = models.ForeignKey(
         GenerationTask,
@@ -4210,6 +5755,7 @@ class GenerationAttempt(UUIDTimeStampedModel):
         blank=True,
         on_delete=models.PROTECT,
         related_name="platform_attempts",
+        db_index=False,
     )
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.QUEUED)
     route_index = models.PositiveSmallIntegerField(null=True, blank=True)
@@ -4217,7 +5763,7 @@ class GenerationAttempt(UUIDTimeStampedModel):
     is_external = models.BooleanField(default=False)
     provider_request_id = models.CharField(max_length=191, blank=True)
     request_sha256 = models.CharField(max_length=64)
-    request_snapshot = models.JSONField(default=dict)
+    request_snapshot_key = models.CharField(max_length=191)
     request_snapshot_schema_version = models.PositiveIntegerField(default=1)
     request_snapshot_size_bytes = models.PositiveIntegerField(default=2)
     request_snapshot_sha256 = models.CharField(max_length=64, blank=True)
@@ -4249,9 +5795,30 @@ class GenerationAttempt(UUIDTimeStampedModel):
     started_at = models.DateTimeField(default=timezone.now)
     finished_at = models.DateTimeField(null=True, blank=True)
 
+    @property
+    def request_snapshot(self):
+        from studio.services.execution_request_storage import read_request
+        return read_request(self, "request_snapshot")
+
     class Meta:
         ordering = ("stage_run", "unit_key", "-attempt_number")
         constraints = [
+            models.CheckConstraint(condition=(
+                Q(role="primary", auxiliary_purpose="", field_batch_key="", parent_preparation__isnull=True)
+                | Q(role="auxiliary", parent_preparation__isnull=False,
+                    auxiliary_purpose__in=("generate_fields", "translate_fields")) & ~Q(field_batch_key="")
+            ), name="ck_attempt_execution_role"),
+            models.CheckConstraint(condition=~Q(parent_preparation=models.F("preparation")), name="ck_attempt_distinct_parent"),
+            models.CheckConstraint(condition=~Q(retry_of=models.F("pk")), name="ck_attempt_retry_not_self"),
+            models.CheckConstraint(condition=(Q(retry_of__isnull=True, retry_requested_by__isnull=True)
+                | Q(retry_of__isnull=False, retry_requested_by__isnull=False, role="primary")), name="ck_attempt_retry_actor"),
+            models.UniqueConstraint(fields=("parent_preparation", "field_batch_key", "attempt_number"), name="uk_attempt_parent_batch"),
+            models.UniqueConstraint(fields=("generation_task",), name="uk_attempt_generation_task"),
+            models.CheckConstraint(condition=Q(generation_task__isnull=True) | Q(role="primary"),
+                name="ck_attempt_task_primary"),
+            models.UniqueConstraint(fields=("preparation",), condition=Q(
+                status__in=("queued", "running", "submitting", "submitted", "cancel_requested")),
+                name="uk_attempt_preparation_active"),
             models.UniqueConstraint(
                 fields=("stage_run", "unit_key", "attempt_number"),
                 name="unique_stage_generation_attempt",
@@ -4265,7 +5832,55 @@ class GenerationAttempt(UUIDTimeStampedModel):
                 name="generation_attempt_costs_nonnegative",
             ),
         ]
-        indexes = [models.Index(fields=("status", "next_poll_at"))]
+        indexes = [models.Index(fields=("status", "next_poll_at")),
+            models.Index(fields=("preparation", "-attempt_number"), name="idx_attempt_preparation")]
+
+    def clean(self):
+        super().clean()
+        from studio.services.execution_task_links import validate_execution_task_links
+        validate_execution_task_links(self)
+
+
+class ExecutionTextResponseReview(UUIDTimeStampedModel):
+    """Private original text/collect receipt; only eligible text permits recovery."""
+
+    attempt = models.OneToOneField(GenerationAttempt, on_delete=models.PROTECT, related_name="text_response_review", null=True, blank=True)
+    asset_job = models.OneToOneField(AssetGenerationJob, on_delete=models.PROTECT, related_name="text_response_review", null=True, blank=True)
+    original_file = models.CharField(max_length=191)
+    original_size = models.PositiveIntegerField()
+    original_sha256 = models.CharField(max_length=64)
+    diagnostics = models.JSONField()
+    diagnostics_schema_version = models.PositiveIntegerField(default=1)
+    diagnostics_size_bytes = models.PositiveIntegerField(default=2, validators=[MaxValueValidator(65536)])
+    diagnostics_sha256 = models.CharField(max_length=64, default="", validators=[RegexValidator(r"^[a-f0-9]{64}$")])
+    corrected_file = models.CharField(max_length=191, blank=True, null=True)
+    corrected_size = models.PositiveIntegerField(null=True)
+    corrected_sha256 = models.CharField(max_length=64, null=True)
+    confirmed_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, null=True, blank=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+    _SNAPSHOT_FIELDS = frozenset(("attempt_id", "asset_job_id", "original_file", "original_size", "original_sha256", "diagnostics",
+        "diagnostics_schema_version", "diagnostics_size_bytes", "diagnostics_sha256"))
+    _WRITE_ONCE_FIELDS = frozenset(("corrected_file", "corrected_size", "corrected_sha256", "confirmed_by_id", "confirmed_at"))
+    objects = models.Manager.from_queryset(ExecutionSnapshotQuerySet)()
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=(
+            models.Q(attempt__isnull=False, asset_job__isnull=True)
+            | models.Q(attempt__isnull=True, asset_job__isnull=False)), name="ck_text_response_single_owner")]
+
+    @property
+    def original_text(self):
+        from studio.services.execution_response_storage import read_response
+        return read_response(self.original_file, self.original_size, self.original_sha256)
+
+    @property
+    def corrected_text(self):
+        from studio.services.execution_response_storage import read_response
+        return read_response(self.corrected_file, self.corrected_size, self.corrected_sha256) if self.corrected_file else None
+
+    def save(self, *args, **kwargs):
+        _validate_execution_snapshot_update(self)
+        super().save(*args, **kwargs)
 
 
 class GenerationAttemptResolution(UUIDTimeStampedModel):
@@ -4277,6 +5892,8 @@ class GenerationAttemptResolution(UUIDTimeStampedModel):
         CANCEL_REQUESTED_IGNORE_LATE = "cancel_requested_ignore_late", "取消并忽略晚到结果"
         LATE_RESULT_IGNORED = "late_result_ignored", "已忽略晚到结果"
         KNOWN_RESPONSE_REJECTED = "known_response_rejected", "已知响应未通过校验"
+        RESPONSE_RECEIVED = "response_received", "已记录服务响应用量"
+        HTTP_BODY_PREPARED = "http_body_prepared", "已记录HTTP库序列化正文摘要"
 
     attempt = models.ForeignKey(
         GenerationAttempt,
@@ -4318,7 +5935,13 @@ class GenerationAttemptResolution(UUIDTimeStampedModel):
 
 
 class ArtifactSelectionDecision(UUIDTimeStampedModel):
-    """Append-only human/evaluator decision for one generated variant group."""
+    """Selection provenance for one generated variant group."""
+
+    class SelectionMode(models.TextChoices):
+        MANUAL = "manual", "人工选择"
+        AUTOMATIC = "automatic", "按配置自动选择"
+
+    selection_mode = models.CharField(max_length=16, choices=SelectionMode.choices, default=SelectionMode.MANUAL)
 
     stage_run = models.ForeignKey(
         StageRun,
@@ -4336,6 +5959,8 @@ class ArtifactSelectionDecision(UUIDTimeStampedModel):
         settings.AUTH_USER_MODEL,
         on_delete=models.PROTECT,
         related_name="artifact_selection_decisions",
+        null=True,
+        blank=True,
     )
 
     class Meta:
@@ -4344,6 +5969,11 @@ class ArtifactSelectionDecision(UUIDTimeStampedModel):
             models.UniqueConstraint(
                 fields=("stage_run", "variant_group", "revision"),
                 name="unique_artifact_selection_revision",
+            ),
+            models.CheckConstraint(
+                condition=(models.Q(selection_mode="manual", selected_by__isnull=False)
+                    | models.Q(selection_mode="automatic", selected_by__isnull=True)),
+                name="artifact_selection_actor_mode",
             ),
         ]
         indexes = [models.Index(
@@ -4510,7 +6140,7 @@ class GeneratedArtifact(UUIDTimeStampedModel):
 class AssemblySourceItem(UUIDTimeStampedModel):
     """Immutable, per-shot input frozen for one assembly job.
 
-    ComfyUI outputs and managed provider artifacts converge here.  The source
+    Generated and explicitly adopted media converge here. The source
     identity and verified byte facts are copied onto the item so an assembly
     never has to infer its inputs from whichever task or artifact looks newest.
     """
@@ -4526,17 +6156,8 @@ class AssemblySourceItem(UUIDTimeStampedModel):
         on_delete=models.PROTECT,
         related_name="assembly_source_items",
     )
-    generation_task = models.ForeignKey(
-        GenerationTask,
-        null=True,
-        blank=True,
-        on_delete=models.PROTECT,
-        related_name="assembly_source_items",
-    )
     generated_artifact = models.ForeignKey(
         GeneratedArtifact,
-        null=True,
-        blank=True,
         on_delete=models.PROTECT,
         related_name="assembly_source_items",
     )
@@ -4565,13 +6186,6 @@ class AssemblySourceItem(UUIDTimeStampedModel):
             models.UniqueConstraint(
                 fields=("assembly_job", "shot"),
                 name="unique_assembly_source_shot",
-            ),
-            models.CheckConstraint(
-                condition=(
-                    Q(generation_task__isnull=False, generated_artifact__isnull=True)
-                    | Q(generation_task__isnull=True, generated_artifact__isnull=False)
-                ),
-                name="assembly_source_exactly_one_origin",
             ),
         ]
         indexes = [
